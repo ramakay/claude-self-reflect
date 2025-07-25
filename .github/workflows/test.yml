@@ -36,7 +36,7 @@ jobs:
     
     - name: Upload test results
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: unit-test-results
         path: claude-self-reflection/test-results.xml
@@ -168,7 +168,7 @@ jobs:
         node test/performance-benchmark.js
     
     - name: Upload benchmark results
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: benchmark-results
         path: claude-self-reflection/benchmark-results.json
