@@ -4,10 +4,19 @@ Claude forgets everything. This fixes that.
 
 ## What You Get
 
-Ask Claude about past conversations. Get actual answers.
+Ask Claude about past conversations. Get actual answers. Local-first with no cloud dependencies, but cloud-enhanced search available when you need it.
 
 **Before**: "I don't have access to previous conversations"  
-**After**: "We discussed JWT auth on Tuesday. You decided on 15-minute tokens."
+**After**: 
+```
+⏺ reflection-specialist(Search FastEmbed vs cloud embedding decision)
+  ⎿ Done (3 tool uses · 8.2k tokens · 12.4s)
+
+"Found it! Yesterday we decided on FastEmbed for local mode - better privacy, 
+no API calls, 384-dimensional embeddings. Works offline too."
+```
+
+The reflection specialist is a specialized sub-agent that Claude automatically spawns when you ask about past conversations. It searches your conversation history in its own isolated context, keeping your main chat clean and focused.
 
 Your conversations become searchable. Your decisions stay remembered. Your context persists.
 
