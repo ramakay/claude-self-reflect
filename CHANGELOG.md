@@ -5,6 +5,17 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.6] - 2025-07-27
+
+### Changed
+- Updated README "After" example to show actual reflection specialist sub-agent format
+- Added explanation that reflection specialist is automatically spawned
+- Emphasized local-first approach with optional cloud enhancement
+
+### Documentation
+- Improved clarity on how sub-agents appear in Claude's interface
+- Better example using FastEmbed vs cloud decision instead of generic JWT auth
+
 ## [2.3.5] - 2025-07-27
 
 ### Changed
