@@ -19,7 +19,7 @@ WATCH_DIR = os.getenv("WATCH_DIR", "/logs")
 STATE_FILE = os.getenv("STATE_FILE", "/config/imported-files.json")
 WATCH_INTERVAL = int(os.getenv("WATCH_INTERVAL", "60"))  # seconds
 IMPORT_DELAY = int(os.getenv("IMPORT_DELAY", "30"))  # Wait before importing new files
-IMPORTER_SCRIPT = "/scripts/import-conversations-voyage-streaming.py"
+IMPORTER_SCRIPT = "/scripts/import-conversations-unified.py"
 
 # Set up logging
 logging.basicConfig(

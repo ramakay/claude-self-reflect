@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execSync, spawn } from 'child_process';
+import { execSync, spawn, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import fs from 'fs/promises';
@@ -11,19 +11,41 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const projectRoot = join(__dirname, '..');
 
+// Safe command execution helper
+function safeExec(command, args = [], options = {}) {
+  const result = spawnSync(command, args, {
+    ...options,
+    shell: false // Never use shell to prevent injection
+  });
+  
+  if (result.error) {
+    throw result.error;
+  }
+  
+  if (result.status !== 0) {
+    const error = new Error(`Command failed: ${command} ${args.join(' ')}`);
+    error.stdout = result.stdout;
+    error.stderr = result.stderr;
+    error.status = result.status;
+    throw error;
+  }
+  
+  return result.stdout?.toString() || '';
+}
+
 // Parse command line arguments
 const args = process.argv.slice(2);
 let voyageKey = null;
-let localMode = false;
 let mcpConfigured = false;
 
 for (const arg of args) {
   if (arg.startsWith('--voyage-key=')) {
     voyageKey = arg.split('=')[1];
-  } else if (arg === '--local') {
-    localMode = true;
   }
 }
+
+// Default to local mode unless Voyage key is provided
+let localMode = !voyageKey;
 
 const isInteractive = process.stdin.isTTY && process.stdout.isTTY;
 
@@ -43,31 +65,39 @@ const question = (query) => {
 async function checkPython() {
   console.log('\n📦 Checking Python installation...');
   try {
-    const version = execSync('python3 --version').toString().trim();
+    const version = safeExec('python3', ['--version']).trim();
     console.log(`✅ Found ${version}`);
     
     // Check if SSL module works
     try {
-      execSync('python3 -c "import ssl"', { stdio: 'pipe' });
+      safeExec('python3', ['-c', 'import ssl'], { stdio: 'pipe' });
       return true;
     } catch (sslError) {
       console.log('⚠️  Python SSL module not working');
       
       // Check if we're using pyenv
-      const whichPython = execSync('which python3').toString().trim();
+      const whichPython = safeExec('which', ['python3']).trim();
       if (whichPython.includes('pyenv')) {
         console.log('🔍 Detected pyenv Python with broken SSL');
         
         // Check if brew Python is available
         try {
-          const brewPrefix = execSync('brew --prefix python@3.11 2>/dev/null || brew --prefix python@3.10 2>/dev/null || brew --prefix python@3.12 2>/dev/null', { shell: true }).toString().trim();
+          let brewPrefix = '';
+          for (const pythonVersion of ['python@3.11', 'python@3.10', 'python@3.12']) {
+            try {
+              brewPrefix = safeExec('brew', ['--prefix', pythonVersion]).trim();
+              if (brewPrefix) break;
+            } catch {}
+          }
           if (brewPrefix) {
             // Find the actual python executable
             let pythonPath = null;
             for (const exe of ['python3.11', 'python3.10', 'python3.12', 'python3']) {
               try {
                 const fullPath = `${brewPrefix}/bin/${exe}`;
-                execSync(`test -f ${fullPath}`);
+                // Use fs.existsSync instead of shell test command
+                const { existsSync } = await import('fs');
+                if (!existsSync(fullPath)) throw new Error('File not found');
                 pythonPath = fullPath;
                 break;
               } catch {}
@@ -77,7 +107,7 @@ async function checkPython() {
               console.log(`✅ Found brew Python at ${pythonPath}`);
               // Test if SSL works with brew Python
               try {
-                execSync(`${pythonPath} -c "import ssl"`, { stdio: 'pipe' });
+                safeExec(pythonPath, ['-c', 'import ssl'], { stdio: 'pipe' });
                 process.env.PYTHON_PATH = pythonPath;
                 return true;
               } catch {
@@ -89,8 +119,8 @@ async function checkPython() {
         
         console.log('\n🔧 Attempting to install Python with brew...');
         try {
-          execSync('brew install python@3.11', { stdio: 'inherit' });
-          const brewPython = execSync('brew --prefix python@3.11').toString().trim();
+          safeExec('brew', ['install', 'python@3.11'], { stdio: 'inherit' });
+          const brewPython = safeExec('brew', ['--prefix', 'python@3.11']).trim();
           process.env.PYTHON_PATH = `${brewPython}/bin/python3`;
           console.log('✅ Installed Python 3.11 with brew');
           return true;
@@ -110,7 +140,7 @@ async function checkPython() {
 
 async function checkDocker() {
   try {
-    execSync('docker info', { stdio: 'ignore' });
+    safeExec('docker', ['info'], { stdio: 'ignore' });
     return true;
   } catch {
     return false;
@@ -152,15 +182,15 @@ async function checkQdrant() {
     try {
       // Check if a container named 'qdrant' already exists
       try {
-        execSync('docker container inspect qdrant', { stdio: 'ignore' });
+        safeExec('docker', ['container', 'inspect', 'qdrant'], { stdio: 'ignore' });
         console.log('Removing existing Qdrant container...');
-        execSync('docker rm -f qdrant', { stdio: 'ignore' });
+        safeExec('docker', ['rm', '-f', 'qdrant'], { stdio: 'ignore' });
       } catch {
         // Container doesn't exist, which is fine
       }
       
       console.log('Starting Qdrant...');
-      execSync('docker run -d --name qdrant -p 6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant:latest', { stdio: 'inherit' });
+      safeExec('docker', ['run', '-d', '--name', 'qdrant', '-p', '6333:6333', '-v', 'qdrant_storage:/qdrant/storage', 'qdrant/qdrant:latest'], { stdio: 'inherit' });
       
       // Wait for Qdrant to be ready
       console.log('Waiting for Qdrant to start...');
@@ -181,7 +211,9 @@ async function checkQdrant() {
             console.log(`   Still waiting... (${retries} seconds left)`);
             // Check if container is still running
             try {
-              execSync('docker ps | grep qdrant', { stdio: 'pipe' });
+              // Check if container is running without using shell pipes
+              const psOutput = safeExec('docker', ['ps', '--filter', 'name=qdrant', '--format', '{{.Names}}'], { stdio: 'pipe' });
+              if (!psOutput.includes('qdrant')) throw new Error('Container not running');
             } catch {
               console.log('❌ Qdrant container stopped unexpectedly');
               return false;
@@ -226,11 +258,22 @@ async function setupPythonEnvironment() {
       console.log('Creating virtual environment...');
       const pythonCmd = process.env.PYTHON_PATH || 'python3';
       try {
-        execSync(`cd "${mcpPath}" && ${pythonCmd} -m venv venv`, { stdio: 'inherit' });
+        // Use spawn with proper path handling instead of shell execution
+        const { spawnSync } = require('child_process');
+        const result = spawnSync(pythonCmd, ['-m', 'venv', 'venv'], {
+          cwd: mcpPath,
+          stdio: 'inherit'
+        });
+        if (result.error) throw result.error;
       } catch (venvError) {
         console.log('⚠️  Failed to create venv with python3, trying python...');
         try {
-          execSync(`cd "${mcpPath}" && python -m venv venv`, { stdio: 'inherit' });
+          const { spawnSync } = require('child_process');
+          const result = spawnSync('python', ['-m', 'venv', 'venv'], {
+            cwd: mcpPath,
+            stdio: 'inherit'
+          });
+          if (result.error) throw result.error;
         } catch {
           console.log('❌ Failed to create virtual environment');
           console.log('📚 Fix: Install python3-venv package');
@@ -241,19 +284,21 @@ async function setupPythonEnvironment() {
       }
     }
     
-    // Activate and upgrade pip first to avoid SSL issues
+    // Setup paths for virtual environment
     console.log('Setting up pip in virtual environment...');
-    const activateCmd = process.platform === 'win32' 
-      ? 'venv\\Scripts\\activate' 
-      : 'source venv/bin/activate';
+    const venvPython = process.platform === 'win32'
+      ? join(mcpPath, 'venv', 'Scripts', 'python.exe')
+      : join(mcpPath, 'venv', 'bin', 'python');
+    const venvPip = process.platform === 'win32'
+      ? join(mcpPath, 'venv', 'Scripts', 'pip.exe')
+      : join(mcpPath, 'venv', 'bin', 'pip');
     
     // First, try to install certifi to help with SSL issues
     console.log('Installing certificate handler...');
     try {
-      execSync(`cd "${mcpPath}" && ${activateCmd} && pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org certifi`, { 
-        stdio: 'pipe',
-        shell: true 
-      });
+      safeExec(venvPip, [
+        'install', '--trusted-host', 'pypi.org', '--trusted-host', 'files.pythonhosted.org', 'certifi'
+      ], { cwd: mcpPath, stdio: 'pipe' });
     } catch {
       // Continue even if certifi fails
     }
@@ -261,10 +306,9 @@ async function setupPythonEnvironment() {
     // Upgrade pip and install wheel first
     try {
       // Use --no-cache-dir and --timeout to fail faster
-      execSync(`cd "${mcpPath}" && ${activateCmd} && python -m pip install --no-cache-dir --timeout 5 --retries 1 --upgrade pip wheel setuptools`, { 
-        stdio: 'pipe',
-        shell: true 
-      });
+      safeExec(venvPython, [
+        '-m', 'pip', 'install', '--no-cache-dir', '--timeout', '5', '--retries', '1', '--upgrade', 'pip', 'wheel', 'setuptools'
+      ], { cwd: mcpPath, stdio: 'pipe' });
       console.log('✅ Pip upgraded successfully');
     } catch {
       // If upgrade fails due to SSL, skip it and continue
@@ -274,10 +318,9 @@ async function setupPythonEnvironment() {
     // Now install dependencies
     console.log('Installing MCP server dependencies...');
     try {
-      execSync(`cd "${mcpPath}" && ${activateCmd} && pip install --no-cache-dir --timeout 10 --retries 1 -e .`, { 
-        stdio: 'pipe',
-        shell: true 
-      });
+      safeExec(venvPip, [
+        'install', '--no-cache-dir', '--timeout', '10', '--retries', '1', '-e', '.'
+      ], { cwd: mcpPath, stdio: 'pipe' });
       console.log('✅ MCP server dependencies installed');
     } catch (error) {
       // Check for SSL errors
@@ -286,29 +329,31 @@ async function setupPythonEnvironment() {
         console.log('⚠️  SSL error detected. Attempting automatic fix...');
         
         // Try different approaches to fix SSL
-        const fixes = [
+        const sslFixes = [
           {
             name: 'Using trusted host flags',
-            cmd: `${activateCmd} && pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org --no-cache-dir -e .`
+            install: () => safeExec(venvPip, [
+              'install', '--trusted-host', 'pypi.org', '--trusted-host', 'files.pythonhosted.org',
+              '--no-cache-dir', '-e', '.'
+            ], { cwd: mcpPath, stdio: 'pipe' })
           },
           {
             name: 'Using index-url without SSL',
-            cmd: `${activateCmd} && pip config set global.index-url https://pypi.org/simple/ && pip config set global.trusted-host "pypi.org files.pythonhosted.org" && pip install --no-cache-dir -e .`
-          },
-          {
-            name: 'Using system certificates',
-            cmd: `${activateCmd} && export SSL_CERT_FILE=$(python -m certifi) && pip install --no-cache-dir -e .`
+            install: () => {
+              safeExec(venvPip, ['config', 'set', 'global.index-url', 'https://pypi.org/simple/'], 
+                { cwd: mcpPath, stdio: 'pipe' });
+              safeExec(venvPip, ['config', 'set', 'global.trusted-host', 'pypi.org files.pythonhosted.org'], 
+                { cwd: mcpPath, stdio: 'pipe' });
+              return safeExec(venvPip, ['install', '--no-cache-dir', '-e', '.'], 
+                { cwd: mcpPath, stdio: 'pipe' });
+            }
           }
         ];
         
-        for (const fix of fixes) {
+        for (const fix of sslFixes) {
           console.log(`\n   Trying: ${fix.name}...`);
           try {
-            execSync(`cd "${mcpPath}" && ${fix.cmd}`, { 
-              stdio: 'pipe',
-              shell: true,
-              env: { ...process.env, PYTHONWARNINGS: 'ignore:Unverified HTTPS request' }
-            });
+            fix.install();
             console.log('   ✅ Success! Dependencies installed using workaround');
             return true;
           } catch (e) {
@@ -327,17 +372,16 @@ async function setupPythonEnvironment() {
     // Install script dependencies
     console.log('Installing import script dependencies...');
     try {
-      execSync(`cd "${mcpPath}" && ${activateCmd} && pip install -r "${scriptsPath}/requirements.txt"`, { 
-        stdio: 'inherit',
-        shell: true 
-      });
+      safeExec(venvPip, [
+        'install', '-r', join(scriptsPath, 'requirements.txt')
+      ], { cwd: mcpPath, stdio: 'inherit' });
     } catch (error) {
       // Try with trusted host if SSL error
       try {
-        execSync(`cd "${mcpPath}" && ${activateCmd} && pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r "${scriptsPath}/requirements.txt"`, { 
-          stdio: 'inherit',
-          shell: true 
-        });
+        safeExec(venvPip, [
+          'install', '--trusted-host', 'pypi.org', '--trusted-host', 'files.pythonhosted.org',
+          '-r', join(scriptsPath, 'requirements.txt')
+        ], { cwd: mcpPath, stdio: 'inherit' });
       } catch {
         console.log('⚠️  Could not install script dependencies automatically');
         console.log('   You may need to install them manually later');
@@ -446,6 +490,9 @@ async function configureEnvironment() {
   if (!envContent.includes('DECAY_SCALE_DAYS=')) {
     envContent += 'DECAY_SCALE_DAYS=90\n';
   }
+  if (!envContent.includes('PREFER_LOCAL_EMBEDDINGS=')) {
+    envContent += `PREFER_LOCAL_EMBEDDINGS=${localMode ? 'true' : 'false'}\n`;
+  }
   
   await fs.writeFile(envPath, envContent.trim() + '\n');
   console.log('✅ Environment file created/updated');
@@ -460,7 +507,7 @@ async function setupClaude() {
   
   // Check if Claude CLI is available
   try {
-    execSync('which claude', { stdio: 'ignore' });
+    safeExec('which', ['claude'], { stdio: 'ignore' });
     
     // Try to add the MCP automatically
     try {
@@ -479,7 +526,16 @@ async function setupClaude() {
         ? `claude mcp add claude-self-reflect "${runScript}" -e QDRANT_URL="http://localhost:6333"`
         : `claude mcp add claude-self-reflect "${runScript}" -e VOYAGE_KEY="${voyageKeyValue}" -e QDRANT_URL="http://localhost:6333"`;
       
-      execSync(mcpCommand, { stdio: 'inherit' });
+      // Parse the MCP command properly
+      const mcpArgs = ['mcp', 'add', 'claude-self-reflect', runScript];
+      if (voyageKeyValue) {
+        mcpArgs.push('-e', `VOYAGE_KEY=${voyageKeyValue}`);
+      }
+      mcpArgs.push('-e', 'QDRANT_URL=http://localhost:6333');
+      if (localMode) {
+        mcpArgs.push('-e', 'PREFER_LOCAL_EMBEDDINGS=true');
+      }
+      safeExec('claude', mcpArgs, { stdio: 'inherit' });
       console.log('✅ MCP added successfully!');
       console.log('\n⚠️  You may need to restart Claude Code for the changes to take effect.');
       
@@ -540,7 +596,8 @@ async function showPreSetupInstructions() {
   console.log('📋 Before we begin, you\'ll need:');
   console.log('   1. Docker Desktop installed and running');
   console.log('   2. Python 3.10 or higher');
-  console.log('   3. A Voyage AI API key (we\'ll help you get one)\n');
+  console.log('\n🔒 By default, we use local embeddings (private but less accurate)');
+  console.log('   For better accuracy, run with: --voyage-key=<your-key>\n');
   
   if (isInteractive) {
     await question('Press Enter to continue...');
@@ -549,12 +606,7 @@ async function showPreSetupInstructions() {
 
 async function importConversations() {
   console.log('\n📚 Import Claude Conversations...');
-  
-  // Skip import in local mode
-  if (localMode) {
-    console.log('🏠 Skipping import in local mode (no API key for embeddings)');
-    return;
-  }
+  console.log(localMode ? '🏠 Using local embeddings for import' : '🌐 Using Voyage AI embeddings');
   
   // Check if Claude logs directory exists
   const logsDir = join(process.env.HOME || process.env.USERPROFILE, '.claude', 'projects');
@@ -694,7 +746,7 @@ async function showSystemDashboard() {
   
   // Docker status
   try {
-    execSync('docker info', { stdio: 'ignore' });
+    safeExec('docker', ['info'], { stdio: 'ignore' });
     status.docker = true;
   } catch {}
   
@@ -710,7 +762,7 @@ async function showSystemDashboard() {
   // Python status
   try {
     const pythonCmd = process.env.PYTHON_PATH || 'python3';
-    execSync(`${pythonCmd} --version`, { stdio: 'ignore' });
+    safeExec(pythonCmd, ['--version'], { stdio: 'ignore' });
     status.python = true;
   } catch {}
   
@@ -773,9 +825,9 @@ async function showSystemDashboard() {
   status.watcherErrors = [];
   status.lastImportTime = null;
   try {
-    const watcherLogs = execSync('docker logs claude-reflection-watcher --tail 50 2>&1', {
-      encoding: 'utf-8'
-    }).toString();
+    const watcherLogs = safeExec('docker', [
+      'logs', 'claude-reflection-watcher', '--tail', '50'
+    ], { encoding: 'utf-8' });
     
     // Check for recent errors
     const errorMatches = watcherLogs.match(/ERROR.*Import failed.*/g);
@@ -800,10 +852,9 @@ async function showSystemDashboard() {
     
     // Check if watcher is running via Docker
     try {
-      const dockerStatus = execSync('docker ps --filter "name=claude-reflection-watcher" --format "{{.Names}}" 2>/dev/null', {
-        cwd: projectRoot,
-        encoding: 'utf-8'
-      }).toString().trim();
+      const dockerStatus = safeExec('docker', [
+        'ps', '--filter', 'name=claude-reflection-watcher', '--format', '{{.Names}}'
+      ], { cwd: projectRoot, encoding: 'utf-8' }).trim();
       
       if (dockerStatus.includes('watcher')) {
         status.watcherRunning = true;
@@ -901,11 +952,8 @@ async function setupWatcher() {
     await fs.access(watcherScript);
     console.log('✅ Watcher script found');
     
-    // Skip in local mode
-    if (localMode) {
-      console.log('🏠 Skipping watcher in local mode');
-      return;
-    }
+    // Watcher works with both local and cloud embeddings
+    console.log(localMode ? '🏠 Watcher will use local embeddings' : '🌐 Watcher will use Voyage AI embeddings');
     
     // Ask if user wants to enable watcher
     let enableWatcher = 'y';
@@ -933,20 +981,26 @@ async function setupWatcher() {
           console.log('🧹 Cleaning up existing containers...');
           try {
             // Stop all claude-reflection containers
-            execSync('docker compose down 2>/dev/null || true', { 
-              cwd: projectRoot,
-              stdio: 'pipe' 
-            });
+            try {
+              safeExec('docker', ['compose', 'down'], { 
+                cwd: projectRoot,
+                stdio: 'pipe' 
+              });
+            } catch {}
             
             // Also stop any standalone containers
-            execSync('docker stop claude-reflection-watcher claude-reflection-qdrant qdrant 2>/dev/null || true', { 
-              stdio: 'pipe' 
-            });
+            try {
+              safeExec('docker', ['stop', 'claude-reflection-watcher', 'claude-reflection-qdrant', 'qdrant'], { 
+                stdio: 'pipe' 
+              });
+            } catch {}
             
             // Remove them
-            execSync('docker rm claude-reflection-watcher claude-reflection-qdrant qdrant 2>/dev/null || true', { 
-              stdio: 'pipe' 
-            });
+            try {
+              safeExec('docker', ['rm', 'claude-reflection-watcher', 'claude-reflection-qdrant', 'qdrant'], { 
+                stdio: 'pipe' 
+              });
+            } catch {}
             
             // Wait a moment for cleanup
             await new Promise(resolve => setTimeout(resolve, 2000));
@@ -954,7 +1008,7 @@ async function setupWatcher() {
           
           // Start both services with compose
           console.log('🚀 Starting Qdrant and Watcher services...');
-          execSync('docker compose --profile watch up -d', { 
+          safeExec('docker', ['compose', '--profile', 'watch', 'up', '-d'], { 
             cwd: projectRoot,
             stdio: 'pipe' // Use pipe to capture output 
           });
@@ -964,10 +1018,9 @@ async function setupWatcher() {
           
           // Check container status
           try {
-            const psOutput = execSync('docker ps --filter "name=claude-reflection" --format "table {{.Names}}\t{{.Status}}"', {
-              cwd: projectRoot,
-              encoding: 'utf8'
-            });
+            const psOutput = safeExec('docker', [
+              'ps', '--filter', 'name=claude-reflection', '--format', 'table {{.Names}}\t{{.Status}}'
+            ], { cwd: projectRoot, encoding: 'utf8' });
             
             const qdrantReady = psOutput.includes('claude-reflection-qdrant') && psOutput.includes('Up');
             const watcherReady = psOutput.includes('claude-reflection-watcher') && psOutput.includes('Up');
@@ -1033,7 +1086,7 @@ async function verifyMCP() {
   
   try {
     // Check if MCP is listed
-    const mcpList = execSync('claude mcp list', { encoding: 'utf8' });
+    const mcpList = safeExec('claude', ['mcp', 'list'], { encoding: 'utf8' });
     if (!mcpList.includes('claude-self-reflect')) {
       console.log('❌ MCP not found in Claude Code');
       return;
@@ -1103,10 +1156,15 @@ asyncio.run(test_mcp())
     // Run the test
     console.log('\n🧪 Testing MCP functionality...');
     try {
-      const testResult = execSync(`cd "${projectRoot}" && source mcp-server/venv/bin/activate && python test-mcp.py`, {
-        encoding: 'utf8',
-        shell: '/bin/bash'
+      // Create test script that activates venv and runs test
+      const testScriptPath = join(projectRoot, 'run-test.sh');
+      const testScript = `#!/bin/bash\nsource mcp-server/venv/bin/activate\npython test-mcp.py`;
+      await fs.writeFile(testScriptPath, testScript, { mode: 0o755 });
+      const testResult = safeExec('bash', [testScriptPath], {
+        cwd: projectRoot,
+        encoding: 'utf8'
       });
+      await fs.unlink(testScriptPath);
       console.log(testResult);
       
       // Clean up test script
@@ -1151,14 +1209,9 @@ async function main() {
     }
   }
   
-  // Check for non-interactive mode without required flags
-  if (!isInteractive && !voyageKey && !localMode) {
-    console.log('❌ Non-interactive mode requires either --voyage-key or --local flag\n');
-    console.log('Usage:');
-    console.log('  claude-self-reflect setup --voyage-key=<your-key>');
-    console.log('  claude-self-reflect setup --local\n');
-    console.log('Get your free API key at: https://www.voyageai.com/');
-    process.exit(1);
+  // In non-interactive mode, just use defaults (local mode unless key provided)
+  if (!isInteractive) {
+    console.log(voyageKey ? '🌐 Using Voyage AI embeddings' : '🔒 Using local embeddings for privacy');
   }
   
   await showPreSetupInstructions();

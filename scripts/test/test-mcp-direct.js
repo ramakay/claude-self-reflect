@@ -10,12 +10,19 @@ const TEST_QUERY = 'Voyage AI embeddings';
 async function testMCP() {
   console.log('Starting MCP server...');
   
+  // Check for required environment variable
+  if (!process.env.VOYAGE_KEY) {
+    console.error('Error: VOYAGE_KEY environment variable not set');
+    console.error('Please set: export VOYAGE_KEY="your-voyage-api-key"');
+    process.exit(1);
+  }
+
   // Start the MCP server
   const mcp = spawn('node', [MCP_PATH], {
     env: {
       ...process.env,
       QDRANT_URL: 'http://localhost:6333',
-      VOYAGE_KEY: 'pa-wdTYGObaxhs-XFKX2r7WCczRwEVNb9eYMTSO3yrQhZI'
+      VOYAGE_KEY: process.env.VOYAGE_KEY
     },
     stdio: ['pipe', 'pipe', 'pipe']
   });

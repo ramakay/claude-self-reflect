@@ -14,7 +14,8 @@ RUN pip install --no-cache-dir \
     backoff>=2.2.0 \
     requests>=2.31.0 \
     tqdm>=4.66.0 \
-    voyageai>=0.2.0
+    voyageai>=0.2.0 \
+    fastembed>=0.4.0
 
 # Create non-root user
 RUN useradd -m -u 1000 watcher
@@ -23,6 +24,7 @@ RUN useradd -m -u 1000 watcher
 COPY scripts/import-watcher.py /scripts/
 COPY scripts/import-conversations-voyage.py /scripts/
 COPY scripts/import-conversations-voyage-streaming.py /scripts/
+COPY scripts/import-conversations-unified.py /scripts/
 RUN chmod +x /scripts/*.py
 
 # Set working directory

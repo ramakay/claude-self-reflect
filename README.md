@@ -2,6 +2,22 @@
 
 Claude forgets everything. This fixes that.
 
+## 🔒 Security & Privacy Notice
+
+**v2.3.3 Security Update**: This version addresses critical security vulnerabilities. Please update immediately.
+
+### Privacy Modes
+- **Local Mode (Default)**: Your conversations stay on your machine. No external API calls.
+- **Cloud Mode**: Uses Voyage AI for better search accuracy. Conversations are sent to Voyage for embedding generation.
+
+### Security Improvements in v2.3.3
+- ✅ Removed all hardcoded API keys
+- ✅ Fixed command injection vulnerabilities 
+- ✅ Patched vulnerable dependencies
+- ✅ Local embeddings by default for privacy
+
+**Important**: If using cloud mode, review [Voyage AI's privacy policy](https://www.voyageai.com/privacy) to understand how your data is handled.
+
 ## What You Get
 
 Ask Claude about past conversations. Get actual answers.
@@ -13,28 +29,30 @@ Your conversations become searchable. Your decisions stay remembered. Your conte
 
 ## Install
 
-### Quick Start (Recommended)
+### Quick Start (Local Mode - Default)
 ```bash
-# Step 1: Get your free Voyage AI key
-# Sign up at https://www.voyageai.com/ - it takes 30 seconds
-
-# Step 2: Install and run automatic setup
+# Install and run automatic setup
 npm install -g claude-self-reflect
-claude-self-reflect setup --voyage-key=YOUR_ACTUAL_KEY_HERE
+claude-self-reflect setup
 
 # That's it! The setup will:
 # ✅ Configure everything automatically
 # ✅ Install the MCP in Claude Code  
 # ✅ Start monitoring for new conversations
 # ✅ Verify the reflection tools work
+# 🔒 Keep all data local - no API keys needed
 ```
 
-### Alternative: Local Mode (No API Key)
+### Cloud Mode (Better Search Accuracy)
 ```bash
+# Step 1: Get your free Voyage AI key
+# Sign up at https://www.voyageai.com/ - it takes 30 seconds
+
+# Step 2: Install with Voyage key
 npm install -g claude-self-reflect
-claude-self-reflect setup --local
+claude-self-reflect setup --voyage-key=YOUR_ACTUAL_KEY_HERE
 ```
-*Note: Local mode uses basic embeddings. Semantic search won't be as good.*
+*Note: Cloud mode provides more accurate semantic search but sends conversation data to Voyage AI for processing.*
 
 5 minutes. Everything automatic. Just works.
 

@@ -120,7 +120,8 @@ The behavior of these tools can be configured through environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VOYAGE_KEY` | required | Your Voyage AI API key for embeddings |
+| `VOYAGE_KEY` | optional | Your Voyage AI API key for cloud embeddings |
+| `PREFER_LOCAL_EMBEDDINGS` | true | Use local embeddings (no API key needed) |
 | `QDRANT_URL` | http://localhost:6333 | URL of your Qdrant instance |
 | `ENABLE_MEMORY_DECAY` | false | Enable time-based memory decay globally |
 | `DECAY_WEIGHT` | 0.3 | Weight of decay factor in scoring (0-1) |

@@ -32,10 +32,11 @@ Before installing Claude Self-Reflect, ensure you have:
    - Check version: `node --version`
    - Download from [nodejs.org](https://nodejs.org) if needed
 
-5. **Voyage AI API Key** (Free)
+5. **Voyage AI API Key** (Optional)
+   - Only needed for cloud mode (better search accuracy)
    - Sign up at [voyageai.com](https://www.voyageai.com/)
    - 200M free tokens per month
-   - Required for semantic search embeddings
+   - **Not required**: Local mode works without any API keys
 
 ## Installation Methods
 

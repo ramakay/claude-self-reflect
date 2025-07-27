@@ -23,7 +23,11 @@ for file in os.listdir(project_path):
 print(f"Found {len(recent_files)} recent files to import")
 
 # Set environment variable
-os.environ["VOYAGE_KEY"] = "pa-wdTYGObaxhs-XFKX2r7WCczRwEVNb9eYMTSO3yrQhZI"
+# VOYAGE_KEY must be set as environment variable
+if not os.getenv("VOYAGE_KEY"):
+    print("Error: VOYAGE_KEY environment variable not set")
+    print("Please set: export VOYAGE_KEY='your-voyage-api-key'")
+    sys.exit(1)
 
 # Import the whole project (the script will handle individual files)
 os.system(f"python {import_script} {project_path}")

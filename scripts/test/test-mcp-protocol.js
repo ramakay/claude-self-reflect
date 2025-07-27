@@ -6,11 +6,16 @@ import { createInterface } from 'readline';
 // Set environment variables
 const env = {
   ...process.env,
-  VOYAGE_KEY: 'pa-wdTYGObaxhs-XFKX2r7WCczRwEVNb9eYMTSO3yrQhZI',
-  VOYAGE_KEY_2: 'pa-wdTYGObaxhs-XFKX2r7WCczRwEVNb9eYMTSO3yrQhZI',
+  VOYAGE_KEY: process.env.VOYAGE_KEY || '',
   QDRANT_URL: 'http://localhost:6333',
   PREFER_LOCAL_EMBEDDINGS: 'false'
 };
+
+if (!env.VOYAGE_KEY) {
+  console.error('Error: VOYAGE_KEY environment variable not set');
+  console.error('Please set: export VOYAGE_KEY="your-voyage-api-key"');
+  process.exit(1);
+}
 
 console.log('Starting MCP server with environment:');
 console.log('VOYAGE_KEY:', env.VOYAGE_KEY ? 'Set' : 'Not set');

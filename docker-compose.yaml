@@ -39,14 +39,14 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
       - VOYAGE_KEY=${VOYAGE_KEY:-}
-      - USE_LOCAL_EMBEDDINGS=${USE_LOCAL_EMBEDDINGS:-false}
+      - PREFER_LOCAL_EMBEDDINGS=${PREFER_LOCAL_EMBEDDINGS:-false}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-voyage-3}
       - BATCH_SIZE=${BATCH_SIZE:-50}
       - CHUNK_SIZE=${CHUNK_SIZE:-10}
       - PYTHONUNBUFFERED=1
     restart: "no"
     profiles: ["import"]
-    command: python /scripts/import-openai-enhanced.py
+    command: python /scripts/import-conversations-unified.py
 
   # Continuous watcher service (optional)
   watcher:
@@ -66,14 +66,14 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
       - VOYAGE_KEY=${VOYAGE_KEY:-}
-      - USE_LOCAL_EMBEDDINGS=${USE_LOCAL_EMBEDDINGS:-false}
+      - PREFER_LOCAL_EMBEDDINGS=${PREFER_LOCAL_EMBEDDINGS:-false}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-voyage-3}
       - WATCH_INTERVAL=${WATCH_INTERVAL:-60}
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
     profiles: ["watch"]
-    mem_limit: 256m
-    memswap_limit: 256m
+    mem_limit: 2g
+    memswap_limit: 2g
 
 networks:
   default:

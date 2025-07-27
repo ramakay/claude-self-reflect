@@ -1,0 +1,2455 @@
+Directory structure:
+└── qdrant-mcp-server-qdrant/
+    ├── README.md
+    ├── Dockerfile
+    ├── LICENSE
+    ├── pyproject.toml
+    ├── .pre-commit-config.yaml
+    ├── .python-version
+    ├── src/
+    │   └── mcp_server_qdrant/
+    │       ├── __init__.py
+    │       ├── main.py
+    │       ├── mcp_server.py
+    │       ├── qdrant.py
+    │       ├── server.py
+    │       ├── settings.py
+    │       ├── common/
+    │       │   ├── __init__.py
+    │       │   ├── filters.py
+    │       │   ├── func_tools.py
+    │       │   └── wrap_filters.py
+    │       └── embeddings/
+    │           ├── __init__.py
+    │           ├── base.py
+    │           ├── factory.py
+    │           ├── fastembed.py
+    │           └── types.py
+    ├── tests/
+    │   ├── __init__.py
+    │   ├── test_fastembed_integration.py
+    │   ├── test_qdrant_integration.py
+    │   └── test_settings.py
+    └── .github/
+        └── workflows/
+            ├── pre-commit.yaml
+            ├── pypi-publish.yaml
+            └── pytest.yaml
+
+================================================
+FILE: README.md
+================================================
+# mcp-server-qdrant: A Qdrant MCP server
+
+[![smithery badge](https://smithery.ai/badge/mcp-server-qdrant)](https://smithery.ai/protocol/mcp-server-qdrant)
+
+> The [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) is an open protocol that enables
+> seamless integration between LLM applications and external data sources and tools. Whether you're building an
+> AI-powered IDE, enhancing a chat interface, or creating custom AI workflows, MCP provides a standardized way to
+> connect LLMs with the context they need.
+
+This repository is an example of how to create a MCP server for [Qdrant](https://qdrant.tech/), a vector search engine.
+
+## Overview
+
+An official Model Context Protocol server for keeping and retrieving memories in the Qdrant vector search engine.
+It acts as a semantic memory layer on top of the Qdrant database.
+
+## Components
+
+### Tools
+
+1. `qdrant-store`
+   - Store some information in the Qdrant database
+   - Input:
+     - `information` (string): Information to store
+     - `metadata` (JSON): Optional metadata to store
+     - `collection_name` (string): Name of the collection to store the information in. This field is required if there are no default collection name.
+                                   If there is a default collection name, this field is not enabled.
+   - Returns: Confirmation message
+2. `qdrant-find`
+   - Retrieve relevant information from the Qdrant database
+   - Input:
+     - `query` (string): Query to use for searching
+     - `collection_name` (string): Name of the collection to store the information in. This field is required if there are no default collection name.
+                                   If there is a default collection name, this field is not enabled.
+   - Returns: Information stored in the Qdrant database as separate messages
+
+## Environment Variables
+
+The configuration of the server is done using environment variables:
+
+| Name                     | Description                                                         | Default Value                                                     |
+|--------------------------|---------------------------------------------------------------------|-------------------------------------------------------------------|
+| `QDRANT_URL`             | URL of the Qdrant server                                            | None                                                              |
+| `QDRANT_API_KEY`         | API key for the Qdrant server                                       | None                                                              |
+| `COLLECTION_NAME`        | Name of the default collection to use.                              | None                                                              |
+| `QDRANT_LOCAL_PATH`      | Path to the local Qdrant database (alternative to `QDRANT_URL`)     | None                                                              |
+| `EMBEDDING_PROVIDER`     | Embedding provider to use (currently only "fastembed" is supported) | `fastembed`                                                       |
+| `EMBEDDING_MODEL`        | Name of the embedding model to use                                  | `sentence-transformers/all-MiniLM-L6-v2`                          |
+| `TOOL_STORE_DESCRIPTION` | Custom description for the store tool                               | See default in [`settings.py`](src/mcp_server_qdrant/settings.py) |
+| `TOOL_FIND_DESCRIPTION`  | Custom description for the find tool                                | See default in [`settings.py`](src/mcp_server_qdrant/settings.py) |
+
+Note: You cannot provide both `QDRANT_URL` and `QDRANT_LOCAL_PATH` at the same time.
+
+> [!IMPORTANT]
+> Command-line arguments are not supported anymore! Please use environment variables for all configuration.
+
+### FastMCP Environment Variables
+
+Since `mcp-server-qdrant` is based on FastMCP, it also supports all the FastMCP environment variables. The most
+important ones are listed below:
+
+| Environment Variable                  | Description                                               | Default Value |
+|---------------------------------------|-----------------------------------------------------------|---------------|
+| `FASTMCP_DEBUG`                       | Enable debug mode                                         | `false`       |
+| `FASTMCP_LOG_LEVEL`                   | Set logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) | `INFO`        |
+| `FASTMCP_HOST`                        | Host address to bind the server to                        | `127.0.0.1`   |
+| `FASTMCP_PORT`                        | Port to run the server on                                 | `8000`        |
+| `FASTMCP_WARN_ON_DUPLICATE_RESOURCES` | Show warnings for duplicate resources                     | `true`        |
+| `FASTMCP_WARN_ON_DUPLICATE_TOOLS`     | Show warnings for duplicate tools                         | `true`        |
+| `FASTMCP_WARN_ON_DUPLICATE_PROMPTS`   | Show warnings for duplicate prompts                       | `true`        |
+| `FASTMCP_DEPENDENCIES`                | List of dependencies to install in the server environment | `[]`          |
+
+## Installation
+
+### Using uvx
+
+When using [`uvx`](https://docs.astral.sh/uv/guides/tools/#running-tools) no specific installation is needed to directly run *mcp-server-qdrant*.
+
+```shell
+QDRANT_URL="http://localhost:6333" \
+COLLECTION_NAME="my-collection" \
+EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2" \
+uvx mcp-server-qdrant
+```
+
+#### Transport Protocols
+
+The server supports different transport protocols that can be specified using the `--transport` flag:
+
+```shell
+QDRANT_URL="http://localhost:6333" \
+COLLECTION_NAME="my-collection" \
+uvx mcp-server-qdrant --transport sse
+```
+
+Supported transport protocols:
+
+- `stdio` (default): Standard input/output transport, might only be used by local MCP clients
+- `sse`: Server-Sent Events transport, perfect for remote clients
+- `streamable-http`: Streamable HTTP transport, perfect for remote clients, more recent than SSE
+
+The default transport is `stdio` if not specified.
+
+When SSE transport is used, the server will listen on the specified port and wait for incoming connections. The default
+port is 8000, however it can be changed using the `FASTMCP_PORT` environment variable.
+
+```shell
+QDRANT_URL="http://localhost:6333" \
+COLLECTION_NAME="my-collection" \
+FASTMCP_PORT=1234 \
+uvx mcp-server-qdrant --transport sse
+```
+
+### Using Docker
+
+A Dockerfile is available for building and running the MCP server:
+
+```bash
+# Build the container
+docker build -t mcp-server-qdrant .
+
+# Run the container
+docker run -p 8000:8000 \
+  -e FASTMCP_HOST="0.0.0.0" \
+  -e QDRANT_URL="http://your-qdrant-server:6333" \
+  -e QDRANT_API_KEY="your-api-key" \
+  -e COLLECTION_NAME="your-collection" \
+  mcp-server-qdrant
+```
+
+> [!TIP]
+> Please note that we set `FASTMCP_HOST="0.0.0.0"` to make the server listen on all network interfaces. This is
+> necessary when running the server in a Docker container.
+
+### Installing via Smithery
+
+To install Qdrant MCP Server for Claude Desktop automatically via [Smithery](https://smithery.ai/protocol/mcp-server-qdrant):
+
+```bash
+npx @smithery/cli install mcp-server-qdrant --client claude
+```
+
+### Manual configuration of Claude Desktop
+
+To use this server with the Claude Desktop app, add the following configuration to the "mcpServers" section of your
+`claude_desktop_config.json`:
+
+```json
+{
+  "qdrant": {
+    "command": "uvx",
+    "args": ["mcp-server-qdrant"],
+    "env": {
+      "QDRANT_URL": "https://xyz-example.eu-central.aws.cloud.qdrant.io:6333",
+      "QDRANT_API_KEY": "your_api_key",
+      "COLLECTION_NAME": "your-collection-name",
+      "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2"
+    }
+  }
+}
+```
+
+For local Qdrant mode:
+
+```json
+{
+  "qdrant": {
+    "command": "uvx",
+    "args": ["mcp-server-qdrant"],
+    "env": {
+      "QDRANT_LOCAL_PATH": "/path/to/qdrant/database",
+      "COLLECTION_NAME": "your-collection-name",
+      "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2"
+    }
+  }
+}
+```
+
+This MCP server will automatically create a collection with the specified name if it doesn't exist.
+
+By default, the server will use the `sentence-transformers/all-MiniLM-L6-v2` embedding model to encode memories.
+For the time being, only [FastEmbed](https://qdrant.github.io/fastembed/) models are supported.
+
+## Support for other tools
+
+This MCP server can be used with any MCP-compatible client. For example, you can use it with
+[Cursor](https://docs.cursor.com/context/model-context-protocol) and [VS Code](https://code.visualstudio.com/docs), which provide built-in support for the Model Context
+Protocol.
+
+### Using with Cursor/Windsurf
+
+You can configure this MCP server to work as a code search tool for Cursor or Windsurf by customizing the tool
+descriptions:
+
+```bash
+QDRANT_URL="http://localhost:6333" \
+COLLECTION_NAME="code-snippets" \
+TOOL_STORE_DESCRIPTION="Store reusable code snippets for later retrieval. \
+The 'information' parameter should contain a natural language description of what the code does, \
+while the actual code should be included in the 'metadata' parameter as a 'code' property. \
+The value of 'metadata' is a Python dictionary with strings as keys. \
+Use this whenever you generate some code snippet." \
+TOOL_FIND_DESCRIPTION="Search for relevant code snippets based on natural language descriptions. \
+The 'query' parameter should describe what you're looking for, \
+and the tool will return the most relevant code snippets. \
+Use this when you need to find existing code snippets for reuse or reference." \
+uvx mcp-server-qdrant --transport sse # Enable SSE transport
+```
+
+In Cursor/Windsurf, you can then configure the MCP server in your settings by pointing to this running server using
+SSE transport protocol. The description on how to add an MCP server to Cursor can be found in the [Cursor
+documentation](https://docs.cursor.com/context/model-context-protocol#adding-an-mcp-server-to-cursor). If you are
+running Cursor/Windsurf locally, you can use the following URL:
+
+```
+http://localhost:8000/sse
+```
+
+> [!TIP]
+> We suggest SSE transport as a preferred way to connect Cursor/Windsurf to the MCP server, as it can support remote
+> connections. That makes it easy to share the server with your team or use it in a cloud environment.
+
+This configuration transforms the Qdrant MCP server into a specialized code search tool that can:
+
+1. Store code snippets, documentation, and implementation details
+2. Retrieve relevant code examples based on semantic search
+3. Help developers find specific implementations or usage patterns
+
+You can populate the database by storing natural language descriptions of code snippets (in the `information` parameter)
+along with the actual code (in the `metadata.code` property), and then search for them using natural language queries
+that describe what you're looking for.
+
+> [!NOTE]
+> The tool descriptions provided above are examples and may need to be customized for your specific use case. Consider
+> adjusting the descriptions to better match your team's workflow and the specific types of code snippets you want to
+> store and retrieve.
+
+**If you have successfully installed the `mcp-server-qdrant`, but still can't get it to work with Cursor, please
+consider creating the [Cursor rules](https://docs.cursor.com/context/rules-for-ai) so the MCP tools are always used when
+the agent produces a new code snippet.** You can restrict the rules to only work for certain file types, to avoid using
+the MCP server for the documentation or other types of content.
+
+### Using with Claude Code
+
+You can enhance Claude Code's capabilities by connecting it to this MCP server, enabling semantic search over your
+existing codebase.
+
+#### Setting up mcp-server-qdrant
+
+1. Add the MCP server to Claude Code:
+
+    ```shell
+    # Add mcp-server-qdrant configured for code search
+    claude mcp add code-search \
+    -e QDRANT_URL="http://localhost:6333" \
+    -e COLLECTION_NAME="code-repository" \
+    -e EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2" \
+    -e TOOL_STORE_DESCRIPTION="Store code snippets with descriptions. The 'information' parameter should contain a natural language description of what the code does, while the actual code should be included in the 'metadata' parameter as a 'code' property." \
+    -e TOOL_FIND_DESCRIPTION="Search for relevant code snippets using natural language. The 'query' parameter should describe the functionality you're looking for." \
+    -- uvx mcp-server-qdrant
+    ```
+
+2. Verify the server was added:
+
+    ```shell
+    claude mcp list
+    ```
+
+#### Using Semantic Code Search in Claude Code
+
+Tool descriptions, specified in `TOOL_STORE_DESCRIPTION` and `TOOL_FIND_DESCRIPTION`, guide Claude Code on how to use
+the MCP server. The ones provided above are examples and may need to be customized for your specific use case. However,
+Claude Code should be already able to:
+
+1. Use the `qdrant-store` tool to store code snippets with descriptions.
+2. Use the `qdrant-find` tool to search for relevant code snippets using natural language.
+
+### Run MCP server in Development Mode
+
+The MCP server can be run in development mode using the `mcp dev` command. This will start the server and open the MCP
+inspector in your browser.
+
+```shell
+COLLECTION_NAME=mcp-dev fastmcp dev src/mcp_server_qdrant/server.py
+```
+
+### Using with VS Code
+
+For one-click installation, click one of the install buttons below:
+
+[![Install with UVX in VS Code](https://img.shields.io/badge/VS_Code-UVX-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=qdrant&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22mcp-server-qdrant%22%5D%2C%22env%22%3A%7B%22QDRANT_URL%22%3A%22%24%7Binput%3AqdrantUrl%7D%22%2C%22QDRANT_API_KEY%22%3A%22%24%7Binput%3AqdrantApiKey%7D%22%2C%22COLLECTION_NAME%22%3A%22%24%7Binput%3AcollectionName%7D%22%7D%7D&inputs=%5B%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantUrl%22%2C%22description%22%3A%22Qdrant+URL%22%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantApiKey%22%2C%22description%22%3A%22Qdrant+API+Key%22%2C%22password%22%3Atrue%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22collectionName%22%2C%22description%22%3A%22Collection+Name%22%7D%5D) [![Install with UVX in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-UVX-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=qdrant&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22mcp-server-qdrant%22%5D%2C%22env%22%3A%7B%22QDRANT_URL%22%3A%22%24%7Binput%3AqdrantUrl%7D%22%2C%22QDRANT_API_KEY%22%3A%22%24%7Binput%3AqdrantApiKey%7D%22%2C%22COLLECTION_NAME%22%3A%22%24%7Binput%3AcollectionName%7D%22%7D%7D&inputs=%5B%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantUrl%22%2C%22description%22%3A%22Qdrant+URL%22%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantApiKey%22%2C%22description%22%3A%22Qdrant+API+Key%22%2C%22password%22%3Atrue%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22collectionName%22%2C%22description%22%3A%22Collection+Name%22%7D%5D&quality=insiders)
+
+[![Install with Docker in VS Code](https://img.shields.io/badge/VS_Code-Docker-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=qdrant&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22-p%22%2C%228000%3A8000%22%2C%22-i%22%2C%22--rm%22%2C%22-e%22%2C%22QDRANT_URL%22%2C%22-e%22%2C%22QDRANT_API_KEY%22%2C%22-e%22%2C%22COLLECTION_NAME%22%2C%22mcp-server-qdrant%22%5D%2C%22env%22%3A%7B%22QDRANT_URL%22%3A%22%24%7Binput%3AqdrantUrl%7D%22%2C%22QDRANT_API_KEY%22%3A%22%24%7Binput%3AqdrantApiKey%7D%22%2C%22COLLECTION_NAME%22%3A%22%24%7Binput%3AcollectionName%7D%22%7D%7D&inputs=%5B%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantUrl%22%2C%22description%22%3A%22Qdrant+URL%22%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantApiKey%22%2C%22description%22%3A%22Qdrant+API+Key%22%2C%22password%22%3Atrue%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22collectionName%22%2C%22description%22%3A%22Collection+Name%22%7D%5D) [![Install with Docker in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Docker-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=qdrant&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22-p%22%2C%228000%3A8000%22%2C%22-i%22%2C%22--rm%22%2C%22-e%22%2C%22QDRANT_URL%22%2C%22-e%22%2C%22QDRANT_API_KEY%22%2C%22-e%22%2C%22COLLECTION_NAME%22%2C%22mcp-server-qdrant%22%5D%2C%22env%22%3A%7B%22QDRANT_URL%22%3A%22%24%7Binput%3AqdrantUrl%7D%22%2C%22QDRANT_API_KEY%22%3A%22%24%7Binput%3AqdrantApiKey%7D%22%2C%22COLLECTION_NAME%22%3A%22%24%7Binput%3AcollectionName%7D%22%7D%7D&inputs=%5B%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantUrl%22%2C%22description%22%3A%22Qdrant+URL%22%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantApiKey%22%2C%22description%22%3A%22Qdrant+API+Key%22%2C%22password%22%3Atrue%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22collectionName%22%2C%22description%22%3A%22Collection+Name%22%7D%5D&quality=insiders)
+
+#### Manual Installation
+
+Add the following JSON block to your User Settings (JSON) file in VS Code. You can do this by pressing `Ctrl + Shift + P` and typing `Preferences: Open User Settings (JSON)`.
+
+```json
+{
+  "mcp": {
+    "inputs": [
+      {
+        "type": "promptString",
+        "id": "qdrantUrl",
+        "description": "Qdrant URL"
+      },
+      {
+        "type": "promptString",
+        "id": "qdrantApiKey",
+        "description": "Qdrant API Key",
+        "password": true
+      },
+      {
+        "type": "promptString",
+        "id": "collectionName",
+        "description": "Collection Name"
+      }
+    ],
+    "servers": {
+      "qdrant": {
+        "command": "uvx",
+        "args": ["mcp-server-qdrant"],
+        "env": {
+          "QDRANT_URL": "${input:qdrantUrl}",
+          "QDRANT_API_KEY": "${input:qdrantApiKey}",
+          "COLLECTION_NAME": "${input:collectionName}"
+        }
+      }
+    }
+  }
+}
+```
+
+Or if you prefer using Docker, add this configuration instead:
+
+```json
+{
+  "mcp": {
+    "inputs": [
+      {
+        "type": "promptString",
+        "id": "qdrantUrl",
+        "description": "Qdrant URL"
+      },
+      {
+        "type": "promptString",
+        "id": "qdrantApiKey",
+        "description": "Qdrant API Key",
+        "password": true
+      },
+      {
+        "type": "promptString",
+        "id": "collectionName",
+        "description": "Collection Name"
+      }
+    ],
+    "servers": {
+      "qdrant": {
+        "command": "docker",
+        "args": [
+          "run",
+          "-p", "8000:8000",
+          "-i",
+          "--rm",
+          "-e", "QDRANT_URL",
+          "-e", "QDRANT_API_KEY",
+          "-e", "COLLECTION_NAME",
+          "mcp-server-qdrant"
+        ],
+        "env": {
+          "QDRANT_URL": "${input:qdrantUrl}",
+          "QDRANT_API_KEY": "${input:qdrantApiKey}",
+          "COLLECTION_NAME": "${input:collectionName}"
+        }
+      }
+    }
+  }
+}
+```
+
+Alternatively, you can create a `.vscode/mcp.json` file in your workspace with the following content:
+
+```json
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "qdrantUrl",
+      "description": "Qdrant URL"
+    },
+    {
+      "type": "promptString",
+      "id": "qdrantApiKey",
+      "description": "Qdrant API Key",
+      "password": true
+    },
+    {
+      "type": "promptString",
+      "id": "collectionName",
+      "description": "Collection Name"
+    }
+  ],
+  "servers": {
+    "qdrant": {
+      "command": "uvx",
+      "args": ["mcp-server-qdrant"],
+      "env": {
+        "QDRANT_URL": "${input:qdrantUrl}",
+        "QDRANT_API_KEY": "${input:qdrantApiKey}",
+        "COLLECTION_NAME": "${input:collectionName}"
+      }
+    }
+  }
+}
+```
+
+For workspace configuration with Docker, use this in `.vscode/mcp.json`:
+
+```json
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "qdrantUrl",
+      "description": "Qdrant URL"
+    },
+    {
+      "type": "promptString",
+      "id": "qdrantApiKey",
+      "description": "Qdrant API Key",
+      "password": true
+    },
+    {
+      "type": "promptString",
+      "id": "collectionName",
+      "description": "Collection Name"
+    }
+  ],
+  "servers": {
+    "qdrant": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-p", "8000:8000",
+        "-i",
+        "--rm",
+        "-e", "QDRANT_URL",
+        "-e", "QDRANT_API_KEY",
+        "-e", "COLLECTION_NAME",
+        "mcp-server-qdrant"
+      ],
+      "env": {
+        "QDRANT_URL": "${input:qdrantUrl}",
+        "QDRANT_API_KEY": "${input:qdrantApiKey}",
+        "COLLECTION_NAME": "${input:collectionName}"
+      }
+    }
+  }
+}
+```
+
+## Contributing
+
+If you have suggestions for how mcp-server-qdrant could be improved, or want to report a bug, open an issue!
+We'd love all and any contributions.
+
+### Testing `mcp-server-qdrant` locally
+
+The [MCP inspector](https://github.com/modelcontextprotocol/inspector) is a developer tool for testing and debugging MCP
+servers. It runs both a client UI (default port 5173) and an MCP proxy server (default port 3000). Open the client UI in
+your browser to use the inspector.
+
+```shell
+QDRANT_URL=":memory:" COLLECTION_NAME="test" \
+fastmcp dev src/mcp_server_qdrant/server.py
+```
+
+Once started, open your browser to http://localhost:5173 to access the inspector interface.
+
+## License
+
+This MCP server is licensed under the Apache License 2.0. This means you are free to use, modify, and distribute the
+software, subject to the terms and conditions of the Apache License 2.0. For more details, please see the LICENSE file
+in the project repository.
+
+
+
+================================================
+FILE: Dockerfile
+================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install uv for package management
+RUN pip install --no-cache-dir uv
+
+# Install the mcp-server-qdrant package
+RUN uv pip install --system --no-cache-dir mcp-server-qdrant
+
+# Expose the default port for SSE transport
+EXPOSE 8000
+
+# Set environment variables with defaults that can be overridden at runtime
+ENV QDRANT_URL=""
+ENV QDRANT_API_KEY=""
+ENV COLLECTION_NAME="default-collection"
+ENV EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2"
+
+# Run the server with SSE transport
+CMD uvx mcp-server-qdrant --transport sse
+
+
+
+================================================
+FILE: LICENSE
+================================================
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright [yyyy] [name of copyright owner]
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+
+
+================================================
+FILE: pyproject.toml
+================================================
+[project]
+name = "mcp-server-qdrant"
+version = "0.8.0"
+description = "MCP server for retrieving context from a Qdrant vector database"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "fastembed>=0.6.0",
+    "qdrant-client>=1.12.0",
+    "pydantic>=2.10.6",
+    "fastmcp>=2.7.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "ipdb>=0.13.13",
+    "isort>=6.0.1",
+    "mypy>=1.9.0",
+    "pre-commit>=4.1.0",
+    "pyright>=1.1.389",
+    "pytest>=8.3.3",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+mcp-server-qdrant = "mcp_server_qdrant.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+asyncio_mode = "auto"
+
+
+
+================================================
+FILE: .pre-commit-config.yaml
+================================================
+ci:
+  autofix_prs: true
+  autoupdate_commit_msg: '[pre-commit.ci] pre-commit suggestions'
+  autoupdate_schedule: quarterly
+  # submodules: true
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-ast
+      - id: check-added-large-files
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.10
+    hooks:
+      - id: ruff
+        args: [ --fix ]
+      - id: ruff-format
+
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.12.0
+    hooks:
+      - id: isort
+        name: "Sort Imports"
+        args: [ "--profile", "black" ]
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.9.0
+    hooks:
+      - id: mypy
+        additional_dependencies: [tokenize-rt==3.2.0]
+
+
+
+================================================
+FILE: .python-version
+================================================
+3.10
+
+
+
+================================================
+FILE: src/mcp_server_qdrant/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: src/mcp_server_qdrant/main.py
+================================================
+import argparse
+
+
+def main():
+    """
+    Main entry point for the mcp-server-qdrant script defined
+    in pyproject.toml. It runs the MCP server with a specific transport
+    protocol.
+    """
+
+    # Parse the command-line arguments to determine the transport protocol.
+    parser = argparse.ArgumentParser(description="mcp-server-qdrant")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "streamable-http"],
+        default="stdio",
+    )
+    args = parser.parse_args()
+
+    # Import is done here to make sure environment variables are loaded
+    # only after we make the changes.
+    from mcp_server_qdrant.server import mcp
+
+    mcp.run(transport=args.transport)
+
+
+
+================================================
+FILE: src/mcp_server_qdrant/mcp_server.py
+================================================
+import json
+import logging
+from typing import Annotated, Any
+
+from fastmcp import Context, FastMCP
+from pydantic import Field
+from qdrant_client import models
+
+from mcp_server_qdrant.common.filters import make_indexes
+from mcp_server_qdrant.common.func_tools import make_partial_function
+from mcp_server_qdrant.common.wrap_filters import wrap_filters
+from mcp_server_qdrant.embeddings.factory import create_embedding_provider
+from mcp_server_qdrant.qdrant import ArbitraryFilter, Entry, Metadata, QdrantConnector
+from mcp_server_qdrant.settings import (
+    EmbeddingProviderSettings,
+    QdrantSettings,
+    ToolSettings,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# FastMCP is an alternative interface for declaring the capabilities
+# of the server. Its API is based on FastAPI.
+class QdrantMCPServer(FastMCP):
+    """
+    A MCP server for Qdrant.
+    """
+
+    def __init__(
+        self,
+        tool_settings: ToolSettings,
+        qdrant_settings: QdrantSettings,
+        embedding_provider_settings: EmbeddingProviderSettings,
+        name: str = "mcp-server-qdrant",
+        instructions: str | None = None,
+        **settings: Any,
+    ):
+        self.tool_settings = tool_settings
+        self.qdrant_settings = qdrant_settings
+        self.embedding_provider_settings = embedding_provider_settings
+
+        self.embedding_provider = create_embedding_provider(embedding_provider_settings)
+        self.qdrant_connector = QdrantConnector(
+            qdrant_settings.location,
+            qdrant_settings.api_key,
+            qdrant_settings.collection_name,
+            self.embedding_provider,
+            qdrant_settings.local_path,
+            make_indexes(qdrant_settings.filterable_fields_dict()),
+        )
+
+        super().__init__(name=name, instructions=instructions, **settings)
+
+        self.setup_tools()
+
+    def format_entry(self, entry: Entry) -> str:
+        """
+        Feel free to override this method in your subclass to customize the format of the entry.
+        """
+        entry_metadata = json.dumps(entry.metadata) if entry.metadata else ""
+        return f"<entry><content>{entry.content}</content><metadata>{entry_metadata}</metadata></entry>"
+
+    def setup_tools(self):
+        """
+        Register the tools in the server.
+        """
+
+        async def store(
+            ctx: Context,
+            information: Annotated[str, Field(description="Text to store")],
+            collection_name: Annotated[
+                str, Field(description="The collection to store the information in")
+            ],
+            # The `metadata` parameter is defined as non-optional, but it can be None.
+            # If we set it to be optional, some of the MCP clients, like Cursor, cannot
+            # handle the optional parameter correctly.
+            metadata: Annotated[
+                Metadata | None,
+                Field(
+                    description="Extra metadata stored along with memorised information. Any json is accepted."
+                ),
+            ] = None,
+        ) -> str:
+            """
+            Store some information in Qdrant.
+            :param ctx: The context for the request.
+            :param information: The information to store.
+            :param metadata: JSON metadata to store with the information, optional.
+            :param collection_name: The name of the collection to store the information in, optional. If not provided,
+                                    the default collection is used.
+            :return: A message indicating that the information was stored.
+            """
+            await ctx.debug(f"Storing information {information} in Qdrant")
+
+            entry = Entry(content=information, metadata=metadata)
+
+            await self.qdrant_connector.store(entry, collection_name=collection_name)
+            if collection_name:
+                return f"Remembered: {information} in collection {collection_name}"
+            return f"Remembered: {information}"
+
+        async def find(
+            ctx: Context,
+            query: Annotated[str, Field(description="What to search for")],
+            collection_name: Annotated[
+                str, Field(description="The collection to search in")
+            ],
+            query_filter: ArbitraryFilter | None = None,
+        ) -> list[str]:
+            """
+            Find memories in Qdrant.
+            :param ctx: The context for the request.
+            :param query: The query to use for the search.
+            :param collection_name: The name of the collection to search in, optional. If not provided,
+                                    the default collection is used.
+            :param query_filter: The filter to apply to the query.
+            :return: A list of entries found.
+            """
+
+            # Log query_filter
+            await ctx.debug(f"Query filter: {query_filter}")
+
+            query_filter = models.Filter(**query_filter) if query_filter else None
+
+            await ctx.debug(f"Finding results for query {query}")
+
+            entries = await self.qdrant_connector.search(
+                query,
+                collection_name=collection_name,
+                limit=self.qdrant_settings.search_limit,
+                query_filter=query_filter,
+            )
+            if not entries:
+                return [f"No information found for the query '{query}'"]
+            content = [
+                f"Results for the query '{query}'",
+            ]
+            for entry in entries:
+                content.append(self.format_entry(entry))
+            return content
+
+        find_foo = find
+        store_foo = store
+
+        filterable_conditions = (
+            self.qdrant_settings.filterable_fields_dict_with_conditions()
+        )
+
+        if len(filterable_conditions) > 0:
+            find_foo = wrap_filters(find_foo, filterable_conditions)
+        elif not self.qdrant_settings.allow_arbitrary_filter:
+            find_foo = make_partial_function(find_foo, {"query_filter": None})
+
+        if self.qdrant_settings.collection_name:
+            find_foo = make_partial_function(
+                find_foo, {"collection_name": self.qdrant_settings.collection_name}
+            )
+            store_foo = make_partial_function(
+                store_foo, {"collection_name": self.qdrant_settings.collection_name}
+            )
+
+        self.tool(
+            find_foo,
+            name="qdrant-find",
+            description=self.tool_settings.tool_find_description,
+        )
+
+        if not self.qdrant_settings.read_only:
+            # Those methods can modify the database
+            self.tool(
+                store_foo,
+                name="qdrant-store",
+                description=self.tool_settings.tool_store_description,
+            )
+
+
+
+================================================
+FILE: src/mcp_server_qdrant/qdrant.py
+================================================
+import logging
+import uuid
+from typing import Any
+
+from pydantic import BaseModel
+from qdrant_client import AsyncQdrantClient, models
+
+from mcp_server_qdrant.embeddings.base import EmbeddingProvider
+from mcp_server_qdrant.settings import METADATA_PATH
+
+logger = logging.getLogger(__name__)
+
+Metadata = dict[str, Any]
+ArbitraryFilter = dict[str, Any]
+
+
+class Entry(BaseModel):
+    """
+    A single entry in the Qdrant collection.
+    """
+
+    content: str
+    metadata: Metadata | None = None
+
+
+class QdrantConnector:
+    """
+    Encapsulates the connection to a Qdrant server and all the methods to interact with it.
+    :param qdrant_url: The URL of the Qdrant server.
+    :param qdrant_api_key: The API key to use for the Qdrant server.
+    :param collection_name: The name of the default collection to use. If not provided, each tool will require
+                            the collection name to be provided.
+    :param embedding_provider: The embedding provider to use.
+    :param qdrant_local_path: The path to the storage directory for the Qdrant client, if local mode is used.
+    """
+
+    def __init__(
+        self,
+        qdrant_url: str | None,
+        qdrant_api_key: str | None,
+        collection_name: str | None,
+        embedding_provider: EmbeddingProvider,
+        qdrant_local_path: str | None = None,
+        field_indexes: dict[str, models.PayloadSchemaType] | None = None,
+    ):
+        self._qdrant_url = qdrant_url.rstrip("/") if qdrant_url else None
+        self._qdrant_api_key = qdrant_api_key
+        self._default_collection_name = collection_name
+        self._embedding_provider = embedding_provider
+        self._client = AsyncQdrantClient(
+            location=qdrant_url, api_key=qdrant_api_key, path=qdrant_local_path
+        )
+        self._field_indexes = field_indexes
+
+    async def get_collection_names(self) -> list[str]:
+        """
+        Get the names of all collections in the Qdrant server.
+        :return: A list of collection names.
+        """
+        response = await self._client.get_collections()
+        return [collection.name for collection in response.collections]
+
+    async def store(self, entry: Entry, *, collection_name: str | None = None):
+        """
+        Store some information in the Qdrant collection, along with the specified metadata.
+        :param entry: The entry to store in the Qdrant collection.
+        :param collection_name: The name of the collection to store the information in, optional. If not provided,
+                                the default collection is used.
+        """
+        collection_name = collection_name or self._default_collection_name
+        assert collection_name is not None
+        await self._ensure_collection_exists(collection_name)
+
+        # Embed the document
+        # ToDo: instead of embedding text explicitly, use `models.Document`,
+        # it should unlock usage of server-side inference.
+        embeddings = await self._embedding_provider.embed_documents([entry.content])
+
+        # Add to Qdrant
+        vector_name = self._embedding_provider.get_vector_name()
+        payload = {"document": entry.content, METADATA_PATH: entry.metadata}
+        await self._client.upsert(
+            collection_name=collection_name,
+            points=[
+                models.PointStruct(
+                    id=uuid.uuid4().hex,
+                    vector={vector_name: embeddings[0]},
+                    payload=payload,
+                )
+            ],
+        )
+
+    async def search(
+        self,
+        query: str,
+        *,
+        collection_name: str | None = None,
+        limit: int = 10,
+        query_filter: models.Filter | None = None,
+    ) -> list[Entry]:
+        """
+        Find points in the Qdrant collection. If there are no entries found, an empty list is returned.
+        :param query: The query to use for the search.
+        :param collection_name: The name of the collection to search in, optional. If not provided,
+                                the default collection is used.
+        :param limit: The maximum number of entries to return.
+        :param query_filter: The filter to apply to the query, if any.
+
+        :return: A list of entries found.
+        """
+        collection_name = collection_name or self._default_collection_name
+        collection_exists = await self._client.collection_exists(collection_name)
+        if not collection_exists:
+            return []
+
+        # Embed the query
+        # ToDo: instead of embedding text explicitly, use `models.Document`,
+        # it should unlock usage of server-side inference.
+
+        query_vector = await self._embedding_provider.embed_query(query)
+        vector_name = self._embedding_provider.get_vector_name()
+
+        # Search in Qdrant
+        search_results = await self._client.query_points(
+            collection_name=collection_name,
+            query=query_vector,
+            using=vector_name,
+            limit=limit,
+            query_filter=query_filter,
+        )
+
+        return [
+            Entry(
+                content=result.payload["document"],
+                metadata=result.payload.get("metadata"),
+            )
+            for result in search_results.points
+        ]
+
+    async def _ensure_collection_exists(self, collection_name: str):
+        """
+        Ensure that the collection exists, creating it if necessary.
+        :param collection_name: The name of the collection to ensure exists.
+        """
+        collection_exists = await self._client.collection_exists(collection_name)
+        if not collection_exists:
+            # Create the collection with the appropriate vector size
+            vector_size = self._embedding_provider.get_vector_size()
+
+            # Use the vector name as defined in the embedding provider
+            vector_name = self._embedding_provider.get_vector_name()
+            await self._client.create_collection(
+                collection_name=collection_name,
+                vectors_config={
+                    vector_name: models.VectorParams(
+                        size=vector_size,
+                        distance=models.Distance.COSINE,
+                    )
+                },
+            )
+
+            # Create payload indexes if configured
+
+            if self._field_indexes:
+                for field_name, field_type in self._field_indexes.items():
+                    await self._client.create_payload_index(
+                        collection_name=collection_name,
+                        field_name=field_name,
+                        field_schema=field_type,
+                    )
+
+
+
+================================================
+FILE: src/mcp_server_qdrant/server.py
+================================================
+from mcp_server_qdrant.mcp_server import QdrantMCPServer
+from mcp_server_qdrant.settings import (
+    EmbeddingProviderSettings,
+    QdrantSettings,
+    ToolSettings,
+)
+
+mcp = QdrantMCPServer(
+    tool_settings=ToolSettings(),
+    qdrant_settings=QdrantSettings(),
+    embedding_provider_settings=EmbeddingProviderSettings(),
+)
+
+
+
+================================================
+FILE: src/mcp_server_qdrant/settings.py
+================================================
+from typing import Literal
+
+from pydantic import BaseModel, Field, model_validator
+from pydantic_settings import BaseSettings
+
+from mcp_server_qdrant.embeddings.types import EmbeddingProviderType
+
+DEFAULT_TOOL_STORE_DESCRIPTION = (
+    "Keep the memory for later use, when you are asked to remember something."
+)
+DEFAULT_TOOL_FIND_DESCRIPTION = (
+    "Look up memories in Qdrant. Use this tool when you need to: \n"
+    " - Find memories by their content \n"
+    " - Access memories for further analysis \n"
+    " - Get some personal information about the user"
+)
+
+METADATA_PATH = "metadata"
+
+
+class ToolSettings(BaseSettings):
+    """
+    Configuration for all the tools.
+    """
+
+    tool_store_description: str = Field(
+        default=DEFAULT_TOOL_STORE_DESCRIPTION,
+        validation_alias="TOOL_STORE_DESCRIPTION",
+    )
+    tool_find_description: str = Field(
+        default=DEFAULT_TOOL_FIND_DESCRIPTION,
+        validation_alias="TOOL_FIND_DESCRIPTION",
+    )
+
+
+class EmbeddingProviderSettings(BaseSettings):
+    """
+    Configuration for the embedding provider.
+    """
+
+    provider_type: EmbeddingProviderType = Field(
+        default=EmbeddingProviderType.FASTEMBED,
+        validation_alias="EMBEDDING_PROVIDER",
+    )
+    model_name: str = Field(
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        validation_alias="EMBEDDING_MODEL",
+    )
+
+
+class FilterableField(BaseModel):
+    name: str = Field(description="The name of the field payload field to filter on")
+    description: str = Field(
+        description="A description for the field used in the tool description"
+    )
+    field_type: Literal["keyword", "integer", "float", "boolean"] = Field(
+        description="The type of the field"
+    )
+    condition: Literal["==", "!=", ">", ">=", "<", "<=", "any", "except"] | None = (
+        Field(
+            default=None,
+            description=(
+                "The condition to use for the filter. If not provided, the field will be indexed, but no "
+                "filter argument will be exposed to MCP tool."
+            ),
+        )
+    )
+    required: bool = Field(
+        default=False,
+        description="Whether the field is required for the filter.",
+    )
+
+
+class QdrantSettings(BaseSettings):
+    """
+    Configuration for the Qdrant connector.
+    """
+
+    location: str | None = Field(default=None, validation_alias="QDRANT_URL")
+    api_key: str | None = Field(default=None, validation_alias="QDRANT_API_KEY")
+    collection_name: str | None = Field(
+        default=None, validation_alias="COLLECTION_NAME"
+    )
+    local_path: str | None = Field(default=None, validation_alias="QDRANT_LOCAL_PATH")
+    search_limit: int = Field(default=10, validation_alias="QDRANT_SEARCH_LIMIT")
+    read_only: bool = Field(default=False, validation_alias="QDRANT_READ_ONLY")
+
+    filterable_fields: list[FilterableField] | None = Field(default=None)
+
+    allow_arbitrary_filter: bool = Field(
+        default=False, validation_alias="QDRANT_ALLOW_ARBITRARY_FILTER"
+    )
+
+    def filterable_fields_dict(self) -> dict[str, FilterableField]:
+        if self.filterable_fields is None:
+            return {}
+        return {field.name: field for field in self.filterable_fields}
+
+    def filterable_fields_dict_with_conditions(self) -> dict[str, FilterableField]:
+        if self.filterable_fields is None:
+            return {}
+        return {
+            field.name: field
+            for field in self.filterable_fields
+            if field.condition is not None
+        }
+
+    @model_validator(mode="after")
+    def check_local_path_conflict(self) -> "QdrantSettings":
+        if self.local_path:
+            if self.location is not None or self.api_key is not None:
+                raise ValueError(
+                    "If 'local_path' is set, 'location' and 'api_key' must be None."
+                )
+        return self
+
+
+
+================================================
+FILE: src/mcp_server_qdrant/common/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: src/mcp_server_qdrant/common/filters.py
+================================================
+from typing import Any
+
+from qdrant_client import models
+
+from mcp_server_qdrant.qdrant import ArbitraryFilter
+from mcp_server_qdrant.settings import METADATA_PATH, FilterableField
+
+
+def make_filter(
+    filterable_fields: dict[str, FilterableField], values: dict[str, Any]
+) -> ArbitraryFilter:
+    must_conditions = []
+    must_not_conditions = []
+
+    for raw_field_name, field_value in values.items():
+        if raw_field_name not in filterable_fields:
+            raise ValueError(f"Field {raw_field_name} is not a filterable field")
+
+        field = filterable_fields[raw_field_name]
+
+        if field_value is None:
+            if field.required:
+                raise ValueError(f"Field {raw_field_name} is required")
+            else:
+                continue
+
+        field_name = f"{METADATA_PATH}.{raw_field_name}"
+
+        if field.field_type == "keyword":
+            if field.condition == "==":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, match=models.MatchValue(value=field_value)
+                    )
+                )
+            elif field.condition == "!=":
+                must_not_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, match=models.MatchValue(value=field_value)
+                    )
+                )
+            elif field.condition == "any":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, match=models.MatchAny(any=field_value)
+                    )
+                )
+            elif field.condition == "except":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name,
+                        match=models.MatchExcept(**{"except": field_value}),
+                    )
+                )
+            elif field.condition is not None:
+                raise ValueError(
+                    f"Invalid condition {field.condition} for keyword field {field_name}"
+                )
+
+        elif field.field_type == "integer":
+            if field.condition == "==":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, match=models.MatchValue(value=field_value)
+                    )
+                )
+            elif field.condition == "!=":
+                must_not_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, match=models.MatchValue(value=field_value)
+                    )
+                )
+            elif field.condition == ">":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, range=models.Range(gt=field_value)
+                    )
+                )
+            elif field.condition == ">=":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, range=models.Range(gte=field_value)
+                    )
+                )
+            elif field.condition == "<":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, range=models.Range(lt=field_value)
+                    )
+                )
+            elif field.condition == "<=":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, range=models.Range(lte=field_value)
+                    )
+                )
+            elif field.condition == "any":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, match=models.MatchAny(any=field_value)
+                    )
+                )
+            elif field.condition == "except":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name,
+                        match=models.MatchExcept(**{"except": field_value}),
+                    )
+                )
+            elif field.condition is not None:
+                raise ValueError(
+                    f"Invalid condition {field.condition} for integer field {field_name}"
+                )
+
+        elif field.field_type == "float":
+            # For float values, we only support range comparisons
+            if field.condition == ">":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, range=models.Range(gt=field_value)
+                    )
+                )
+            elif field.condition == ">=":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, range=models.Range(gte=field_value)
+                    )
+                )
+            elif field.condition == "<":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, range=models.Range(lt=field_value)
+                    )
+                )
+            elif field.condition == "<=":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, range=models.Range(lte=field_value)
+                    )
+                )
+            elif field.condition is not None:
+                raise ValueError(
+                    f"Invalid condition {field.condition} for float field {field_name}. "
+                    "Only range comparisons (>, >=, <, <=) are supported for float values."
+                )
+
+        elif field.field_type == "boolean":
+            if field.condition == "==":
+                must_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, match=models.MatchValue(value=field_value)
+                    )
+                )
+            elif field.condition == "!=":
+                must_not_conditions.append(
+                    models.FieldCondition(
+                        key=field_name, match=models.MatchValue(value=field_value)
+                    )
+                )
+            elif field.condition is not None:
+                raise ValueError(
+                    f"Invalid condition {field.condition} for boolean field {field_name}"
+                )
+
+        else:
+            raise ValueError(
+                f"Unsupported field type {field.field_type} for field {field_name}"
+            )
+
+    return models.Filter(
+        must=must_conditions, must_not=must_not_conditions
+    ).model_dump()
+
+
+def make_indexes(
+    filterable_fields: dict[str, FilterableField],
+) -> dict[str, models.PayloadSchemaType]:
+    indexes = {}
+
+    for field_name, field in filterable_fields.items():
+        if field.field_type == "keyword":
+            indexes[f"{METADATA_PATH}.{field_name}"] = models.PayloadSchemaType.KEYWORD
+        elif field.field_type == "integer":
+            indexes[f"{METADATA_PATH}.{field_name}"] = models.PayloadSchemaType.INTEGER
+        elif field.field_type == "float":
+            indexes[f"{METADATA_PATH}.{field_name}"] = models.PayloadSchemaType.FLOAT
+        elif field.field_type == "boolean":
+            indexes[f"{METADATA_PATH}.{field_name}"] = models.PayloadSchemaType.BOOL
+        else:
+            raise ValueError(
+                f"Unsupported field type {field.field_type} for field {field_name}"
+            )
+
+    return indexes
+
+
+
+================================================
+FILE: src/mcp_server_qdrant/common/func_tools.py
+================================================
+import inspect
+from functools import wraps
+from typing import Callable
+
+
+def make_partial_function(original_func: Callable, fixed_values: dict) -> Callable:
+    sig = inspect.signature(original_func)
+
+    @wraps(original_func)
+    def wrapper(*args, **kwargs):
+        # Start with fixed values
+        bound_args = dict(fixed_values)
+
+        # Bind positional/keyword args from caller
+        for name, value in zip(remaining_params, args):
+            bound_args[name] = value
+        bound_args.update(kwargs)
+
+        return original_func(**bound_args)
+
+    # Only keep parameters NOT in fixed_values
+    remaining_params = [name for name in sig.parameters if name not in fixed_values]
+    new_params = [sig.parameters[name] for name in remaining_params]
+
+    # Set the new __signature__ for introspection
+    wrapper.__signature__ = sig.replace(parameters=new_params)  # type:ignore
+
+    return wrapper
+
+
+
+================================================
+FILE: src/mcp_server_qdrant/common/wrap_filters.py
+================================================
+import inspect
+from functools import wraps
+from typing import Annotated, Callable, Optional
+
+from pydantic import Field
+
+from mcp_server_qdrant.common.filters import make_filter
+from mcp_server_qdrant.settings import FilterableField
+
+
+def wrap_filters(
+    original_func: Callable, filterable_fields: dict[str, FilterableField]
+) -> Callable:
+    """
+    Wraps the original_func function: replaces `filter` parameter with multiple parameters defined by `filterable_fields`.
+    """
+
+    sig = inspect.signature(original_func)
+
+    @wraps(original_func)
+    def wrapper(*args, **kwargs):
+        # Start with fixed values
+        filter_values = {}
+
+        for field_name in filterable_fields:
+            if field_name in kwargs:
+                filter_values[field_name] = kwargs.pop(field_name)
+
+        query_filter = make_filter(filterable_fields, filter_values)
+
+        return original_func(**kwargs, query_filter=query_filter)
+
+    # Replace `query_filter` signature with parameters from `filterable_fields`
+
+    param_names = []
+
+    for param_name in sig.parameters:
+        if param_name == "query_filter":
+            continue
+        param_names.append(param_name)
+
+    new_params = [sig.parameters[param_name] for param_name in param_names]
+    required_new_params = []
+    optional_new_params = []
+
+    # Create a new signature parameters from `filterable_fields`
+    for field in filterable_fields.values():
+        field_name = field.name
+        field_type: type
+        if field.field_type == "keyword":
+            field_type = str
+        elif field.field_type == "integer":
+            field_type = int
+        elif field.field_type == "float":
+            field_type = float
+        elif field.field_type == "boolean":
+            field_type = bool
+        else:
+            raise ValueError(f"Unsupported field type: {field.field_type}")
+
+        if field.condition in {"any", "except"}:
+            if field_type not in {str, int}:
+                raise ValueError(
+                    f'Only "keyword" and "integer" types are supported for "{field.condition}" condition'
+                )
+            field_type = list[field_type]  # type: ignore
+
+        if field.required:
+            annotation = Annotated[field_type, Field(description=field.description)]  # type: ignore
+            parameter = inspect.Parameter(
+                name=field_name,
+                kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                annotation=annotation,
+            )
+            required_new_params.append(parameter)
+        else:
+            annotation = Annotated[  # type: ignore
+                Optional[field_type], Field(description=field.description)
+            ]
+            parameter = inspect.Parameter(
+                name=field_name,
+                kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=None,
+                annotation=annotation,
+            )
+            optional_new_params.append(parameter)
+
+    new_params.extend(required_new_params)
+    new_params.extend(optional_new_params)
+
+    # Set the new __signature__ for introspection
+    new_signature = sig.replace(parameters=new_params)
+    wrapper.__signature__ = new_signature  # type: ignore
+
+    # Set the new __annotations__ for introspection
+    new_annotations = {}
+    for param in new_signature.parameters.values():
+        if param.annotation != inspect.Parameter.empty:
+            new_annotations[param.name] = param.annotation
+
+    # Add return type annotation if it exists
+    if new_signature.return_annotation != inspect.Parameter.empty:
+        new_annotations["return"] = new_signature.return_annotation
+
+    wrapper.__annotations__ = new_annotations
+
+    return wrapper
+
+
+if __name__ == "__main__":
+    from pydantic._internal._typing_extra import get_function_type_hints
+    from qdrant_client import models
+
+    def find(
+        query: Annotated[str, Field(description="What to search for")],
+        collection_name: Annotated[
+            str, Field(description="The collection to search in")
+        ],
+        query_filter: Optional[models.Filter] = None,
+    ) -> list[str]:
+        print("query", query)
+        print("collection_name", collection_name)
+        print("query_filter", query_filter)
+        return ["mypy rules"]
+
+    wrapped_find = wrap_filters(
+        find,
+        {
+            "color": FilterableField(
+                name="color",
+                description="The color of the object",
+                field_type="keyword",
+                condition="==",
+            ),
+            "size": FilterableField(
+                name="size",
+                description="The size of the object",
+                field_type="keyword",
+                condition="==",
+                required=True,
+            ),
+        },
+    )
+
+    wrapped_find(query="dress", collection_name="test", color="red")
+
+    print("get_function_type_hints(find)", get_function_type_hints(find))
+    print(
+        "get_function_type_hints(wrapped_find)", get_function_type_hints(wrapped_find)
+    )
+
+
+
+================================================
+FILE: src/mcp_server_qdrant/embeddings/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: src/mcp_server_qdrant/embeddings/base.py
+================================================
+from abc import ABC, abstractmethod
+
+
+class EmbeddingProvider(ABC):
+    """Abstract base class for embedding providers."""
+
+    @abstractmethod
+    async def embed_documents(self, documents: list[str]) -> list[list[float]]:
+        """Embed a list of documents into vectors."""
+        pass
+
+    @abstractmethod
+    async def embed_query(self, query: str) -> list[float]:
+        """Embed a query into a vector."""
+        pass
+
+    @abstractmethod
+    def get_vector_name(self) -> str:
+        """Get the name of the vector for the Qdrant collection."""
+        pass
+
+    @abstractmethod
+    def get_vector_size(self) -> int:
+        """Get the size of the vector for the Qdrant collection."""
+        pass
+
+
+
+================================================
+FILE: src/mcp_server_qdrant/embeddings/factory.py
+================================================
+from mcp_server_qdrant.embeddings.base import EmbeddingProvider
+from mcp_server_qdrant.embeddings.types import EmbeddingProviderType
+from mcp_server_qdrant.settings import EmbeddingProviderSettings
+
+
+def create_embedding_provider(settings: EmbeddingProviderSettings) -> EmbeddingProvider:
+    """
+    Create an embedding provider based on the specified type.
+    :param settings: The settings for the embedding provider.
+    :return: An instance of the specified embedding provider.
+    """
+    if settings.provider_type == EmbeddingProviderType.FASTEMBED:
+        from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
+
+        return FastEmbedProvider(settings.model_name)
+    else:
+        raise ValueError(f"Unsupported embedding provider: {settings.provider_type}")
+
+
+
+================================================
+FILE: src/mcp_server_qdrant/embeddings/fastembed.py
+================================================
+import asyncio
+
+from fastembed import TextEmbedding
+from fastembed.common.model_description import DenseModelDescription
+
+from mcp_server_qdrant.embeddings.base import EmbeddingProvider
+
+
+class FastEmbedProvider(EmbeddingProvider):
+    """
+    FastEmbed implementation of the embedding provider.
+    :param model_name: The name of the FastEmbed model to use.
+    """
+
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self.embedding_model = TextEmbedding(model_name)
+
+    async def embed_documents(self, documents: list[str]) -> list[list[float]]:
+        """Embed a list of documents into vectors."""
+        # Run in a thread pool since FastEmbed is synchronous
+        loop = asyncio.get_event_loop()
+        embeddings = await loop.run_in_executor(
+            None, lambda: list(self.embedding_model.passage_embed(documents))
+        )
+        return [embedding.tolist() for embedding in embeddings]
+
+    async def embed_query(self, query: str) -> list[float]:
+        """Embed a query into a vector."""
+        # Run in a thread pool since FastEmbed is synchronous
+        loop = asyncio.get_event_loop()
+        embeddings = await loop.run_in_executor(
+            None, lambda: list(self.embedding_model.query_embed([query]))
+        )
+        return embeddings[0].tolist()
+
+    def get_vector_name(self) -> str:
+        """
+        Return the name of the vector for the Qdrant collection.
+        Important: This is compatible with the FastEmbed logic used before 0.6.0.
+        """
+        model_name = self.embedding_model.model_name.split("/")[-1].lower()
+        return f"fast-{model_name}"
+
+    def get_vector_size(self) -> int:
+        """Get the size of the vector for the Qdrant collection."""
+        model_description: DenseModelDescription = (
+            self.embedding_model._get_model_description(self.model_name)
+        )
+        return model_description.dim
+
+
+
+================================================
+FILE: src/mcp_server_qdrant/embeddings/types.py
+================================================
+from enum import Enum
+
+
+class EmbeddingProviderType(Enum):
+    FASTEMBED = "fastembed"
+
+
+
+================================================
+FILE: tests/__init__.py
+================================================
+# This file can be empty, it just marks the directory as a Python package
+
+
+
+================================================
+FILE: tests/test_fastembed_integration.py
+================================================
+import numpy as np
+import pytest
+from fastembed import TextEmbedding
+
+from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
+
+
+@pytest.mark.asyncio
+class TestFastEmbedProviderIntegration:
+    """Integration tests for FastEmbedProvider."""
+
+    async def test_initialization(self):
+        """Test that the provider can be initialized with a valid model."""
+        provider = FastEmbedProvider("sentence-transformers/all-MiniLM-L6-v2")
+        assert provider.model_name == "sentence-transformers/all-MiniLM-L6-v2"
+        assert isinstance(provider.embedding_model, TextEmbedding)
+
+    async def test_embed_documents(self):
+        """Test that documents can be embedded."""
+        provider = FastEmbedProvider("sentence-transformers/all-MiniLM-L6-v2")
+        documents = ["This is a test document.", "This is another test document."]
+
+        embeddings = await provider.embed_documents(documents)
+
+        # Check that we got the right number of embeddings
+        assert len(embeddings) == len(documents)
+
+        # Check that embeddings have the expected shape
+        # The exact dimension depends on the model, but should be consistent
+        assert len(embeddings[0]) > 0
+        assert all(len(embedding) == len(embeddings[0]) for embedding in embeddings)
+
+        # Check that embeddings are different for different documents
+        # Convert to numpy arrays for easier comparison
+        embedding1 = np.array(embeddings[0])
+        embedding2 = np.array(embeddings[1])
+        assert not np.array_equal(embedding1, embedding2)
+
+    async def test_embed_query(self):
+        """Test that queries can be embedded."""
+        provider = FastEmbedProvider("sentence-transformers/all-MiniLM-L6-v2")
+        query = "This is a test query."
+
+        embedding = await provider.embed_query(query)
+
+        # Check that embedding has the expected shape
+        assert len(embedding) > 0
+
+        # Embed the same query again to check consistency
+        embedding2 = await provider.embed_query(query)
+        assert len(embedding) == len(embedding2)
+
+        # The embeddings should be identical for the same input
+        np.testing.assert_array_almost_equal(np.array(embedding), np.array(embedding2))
+
+    async def test_get_vector_name(self):
+        """Test that the vector name is generated correctly."""
+        provider = FastEmbedProvider("sentence-transformers/all-MiniLM-L6-v2")
+        vector_name = provider.get_vector_name()
+
+        # Check that the vector name follows the expected format
+        assert vector_name.startswith("fast-")
+        assert "minilm" in vector_name.lower()
+
+
+
+================================================
+FILE: tests/test_qdrant_integration.py
+================================================
+import uuid
+
+import pytest
+
+from mcp_server_qdrant.embeddings.fastembed import FastEmbedProvider
+from mcp_server_qdrant.qdrant import Entry, QdrantConnector
+
+
+@pytest.fixture
+async def embedding_provider():
+    """Fixture to provide a FastEmbed embedding provider."""
+    return FastEmbedProvider(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+
+@pytest.fixture
+async def qdrant_connector(embedding_provider):
+    """Fixture to provide a QdrantConnector with in-memory Qdrant client."""
+    # Use a random collection name to avoid conflicts between tests
+    collection_name = f"test_collection_{uuid.uuid4().hex}"
+
+    # Create connector with in-memory Qdrant
+    connector = QdrantConnector(
+        qdrant_url=":memory:",
+        qdrant_api_key=None,
+        collection_name=collection_name,
+        embedding_provider=embedding_provider,
+    )
+
+    yield connector
+
+
+@pytest.mark.asyncio
+async def test_store_and_search(qdrant_connector):
+    """Test storing an entry and then searching for it."""
+    # Store a test entry
+    test_entry = Entry(
+        content="The quick brown fox jumps over the lazy dog",
+        metadata={"source": "test", "importance": "high"},
+    )
+    await qdrant_connector.store(test_entry)
+
+    # Search for the entry
+    results = await qdrant_connector.search("fox jumps")
+
+    # Verify results
+    assert len(results) == 1
+    assert results[0].content == test_entry.content
+    assert results[0].metadata == test_entry.metadata
+
+
+@pytest.mark.asyncio
+async def test_search_empty_collection(qdrant_connector):
+    """Test searching in an empty collection."""
+    # Search in an empty collection
+    results = await qdrant_connector.search("test query")
+
+    # Verify results
+    assert len(results) == 0
+
+
+@pytest.mark.asyncio
+async def test_multiple_entries(qdrant_connector):
+    """Test storing and searching multiple entries."""
+    # Store multiple entries
+    entries = [
+        Entry(
+            content="Python is a programming language",
+            metadata={"topic": "programming"},
+        ),
+        Entry(content="The Eiffel Tower is in Paris", metadata={"topic": "landmarks"}),
+        Entry(content="Machine learning is a subset of AI", metadata={"topic": "AI"}),
+    ]
+
+    for entry in entries:
+        await qdrant_connector.store(entry)
+
+    # Search for programming-related entries
+    programming_results = await qdrant_connector.search("Python programming")
+    assert len(programming_results) > 0
+    assert any("Python" in result.content for result in programming_results)
+
+    # Search for landmark-related entries
+    landmark_results = await qdrant_connector.search("Eiffel Tower Paris")
+    assert len(landmark_results) > 0
+    assert any("Eiffel" in result.content for result in landmark_results)
+
+    # Search for AI-related entries
+    ai_results = await qdrant_connector.search(
+        "artificial intelligence machine learning"
+    )
+    assert len(ai_results) > 0
+    assert any("machine learning" in result.content.lower() for result in ai_results)
+
+
+@pytest.mark.asyncio
+async def test_ensure_collection_exists(qdrant_connector):
+    """Test that the collection is created if it doesn't exist."""
+    # The collection shouldn't exist yet
+    assert not await qdrant_connector._client.collection_exists(
+        qdrant_connector._default_collection_name
+    )
+
+    # Storing an entry should create the collection
+    test_entry = Entry(content="Test content")
+    await qdrant_connector.store(test_entry)
+
+    # Now the collection should exist
+    assert await qdrant_connector._client.collection_exists(
+        qdrant_connector._default_collection_name
+    )
+
+
+@pytest.mark.asyncio
+async def test_metadata_handling(qdrant_connector):
+    """Test that metadata is properly stored and retrieved."""
+    # Store entries with different metadata
+    metadata1 = {"source": "book", "author": "Jane Doe", "year": 2023}
+    metadata2 = {"source": "article", "tags": ["science", "research"]}
+
+    await qdrant_connector.store(
+        Entry(content="Content with structured metadata", metadata=metadata1)
+    )
+    await qdrant_connector.store(
+        Entry(content="Content with list in metadata", metadata=metadata2)
+    )
+
+    # Search and verify metadata is preserved
+    results = await qdrant_connector.search("metadata")
+
+    assert len(results) == 2
+
+    # Check that both metadata objects are present in the results
+    found_metadata1 = False
+    found_metadata2 = False
+
+    for result in results:
+        if result.metadata.get("source") == "book":
+            assert result.metadata.get("author") == "Jane Doe"
+            assert result.metadata.get("year") == 2023
+            found_metadata1 = True
+        elif result.metadata.get("source") == "article":
+            assert "science" in result.metadata.get("tags", [])
+            assert "research" in result.metadata.get("tags", [])
+            found_metadata2 = True
+
+    assert found_metadata1
+    assert found_metadata2
+
+
+@pytest.mark.asyncio
+async def test_entry_without_metadata(qdrant_connector):
+    """Test storing and retrieving entries without metadata."""
+    # Store an entry without metadata
+    await qdrant_connector.store(Entry(content="Entry without metadata"))
+
+    # Search and verify
+    results = await qdrant_connector.search("without metadata")
+
+    assert len(results) == 1
+    assert results[0].content == "Entry without metadata"
+    assert results[0].metadata is None
+
+
+@pytest.mark.asyncio
+async def test_custom_collection_store_and_search(qdrant_connector):
+    """Test storing and searching in a custom collection."""
+    # Define a custom collection name
+    custom_collection = f"custom_collection_{uuid.uuid4().hex}"
+
+    # Store a test entry in the custom collection
+    test_entry = Entry(
+        content="This is stored in a custom collection",
+        metadata={"custom": True},
+    )
+    await qdrant_connector.store(test_entry, collection_name=custom_collection)
+
+    # Search in the custom collection
+    results = await qdrant_connector.search(
+        "custom collection", collection_name=custom_collection
+    )
+
+    # Verify results
+    assert len(results) == 1
+    assert results[0].content == test_entry.content
+    assert results[0].metadata == test_entry.metadata
+
+    # Verify the entry is not in the default collection
+    default_results = await qdrant_connector.search("custom collection")
+    assert len(default_results) == 0
+
+
+@pytest.mark.asyncio
+async def test_multiple_collections(qdrant_connector):
+    """Test using multiple collections with the same connector."""
+    # Define two custom collection names
+    collection_a = f"collection_a_{uuid.uuid4().hex}"
+    collection_b = f"collection_b_{uuid.uuid4().hex}"
+
+    # Store entries in different collections
+    entry_a = Entry(
+        content="This belongs to collection A", metadata={"collection": "A"}
+    )
+    entry_b = Entry(
+        content="This belongs to collection B", metadata={"collection": "B"}
+    )
+    entry_default = Entry(content="This belongs to the default collection")
+
+    await qdrant_connector.store(entry_a, collection_name=collection_a)
+    await qdrant_connector.store(entry_b, collection_name=collection_b)
+    await qdrant_connector.store(entry_default)
+
+    # Search in collection A
+    results_a = await qdrant_connector.search("belongs", collection_name=collection_a)
+    assert len(results_a) == 1
+    assert results_a[0].content == entry_a.content
+
+    # Search in collection B
+    results_b = await qdrant_connector.search("belongs", collection_name=collection_b)
+    assert len(results_b) == 1
+    assert results_b[0].content == entry_b.content
+
+    # Search in default collection
+    results_default = await qdrant_connector.search("belongs")
+    assert len(results_default) == 1
+    assert results_default[0].content == entry_default.content
+
+
+@pytest.mark.asyncio
+async def test_nonexistent_collection_search(qdrant_connector):
+    """Test searching in a collection that doesn't exist."""
+    # Search in a collection that doesn't exist
+    nonexistent_collection = f"nonexistent_{uuid.uuid4().hex}"
+    results = await qdrant_connector.search(
+        "test query", collection_name=nonexistent_collection
+    )
+
+    # Verify results
+    assert len(results) == 0
+
+
+
+================================================
+FILE: tests/test_settings.py
+================================================
+import pytest
+
+from mcp_server_qdrant.embeddings.types import EmbeddingProviderType
+from mcp_server_qdrant.settings import (
+    DEFAULT_TOOL_FIND_DESCRIPTION,
+    DEFAULT_TOOL_STORE_DESCRIPTION,
+    EmbeddingProviderSettings,
+    QdrantSettings,
+    ToolSettings,
+)
+
+
+class TestQdrantSettings:
+    def test_default_values(self):
+        """Test that required fields raise errors when not provided."""
+
+        # Should not raise error because there are no required fields
+        QdrantSettings()
+
+    def test_minimal_config(self, monkeypatch):
+        """Test loading minimal configuration from environment variables."""
+        monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")
+        monkeypatch.setenv("COLLECTION_NAME", "test_collection")
+
+        settings = QdrantSettings()
+        assert settings.location == "http://localhost:6333"
+        assert settings.collection_name == "test_collection"
+        assert settings.api_key is None
+        assert settings.local_path is None
+
+    def test_full_config(self, monkeypatch):
+        """Test loading full configuration from environment variables."""
+        monkeypatch.setenv("QDRANT_URL", "http://qdrant.example.com:6333")
+        monkeypatch.setenv("QDRANT_API_KEY", "test_api_key")
+        monkeypatch.setenv("COLLECTION_NAME", "my_memories")
+        monkeypatch.setenv("QDRANT_SEARCH_LIMIT", "15")
+        monkeypatch.setenv("QDRANT_READ_ONLY", "1")
+
+        settings = QdrantSettings()
+        assert settings.location == "http://qdrant.example.com:6333"
+        assert settings.api_key == "test_api_key"
+        assert settings.collection_name == "my_memories"
+        assert settings.search_limit == 15
+        assert settings.read_only is True
+
+    def test_local_path_config(self, monkeypatch):
+        """Test loading local path configuration from environment variables."""
+        monkeypatch.setenv("QDRANT_LOCAL_PATH", "/path/to/local/qdrant")
+
+        settings = QdrantSettings()
+        assert settings.local_path == "/path/to/local/qdrant"
+
+    def test_local_path_is_exclusive_with_url(self, monkeypatch):
+        """Test that local path cannot be set if Qdrant URL is provided."""
+        monkeypatch.setenv("QDRANT_URL", "http://localhost:6333")
+        monkeypatch.setenv("QDRANT_LOCAL_PATH", "/path/to/local/qdrant")
+
+        with pytest.raises(ValueError):
+            QdrantSettings()
+
+        monkeypatch.delenv("QDRANT_URL", raising=False)
+        monkeypatch.setenv("QDRANT_API_KEY", "test_api_key")
+        with pytest.raises(ValueError):
+            QdrantSettings()
+
+
+class TestEmbeddingProviderSettings:
+    def test_default_values(self):
+        """Test default values are set correctly."""
+        settings = EmbeddingProviderSettings()
+        assert settings.provider_type == EmbeddingProviderType.FASTEMBED
+        assert settings.model_name == "sentence-transformers/all-MiniLM-L6-v2"
+
+    def test_custom_values(self, monkeypatch):
+        """Test loading custom values from environment variables."""
+        monkeypatch.setenv("EMBEDDING_MODEL", "custom_model")
+        settings = EmbeddingProviderSettings()
+        assert settings.provider_type == EmbeddingProviderType.FASTEMBED
+        assert settings.model_name == "custom_model"
+
+
+class TestToolSettings:
+    def test_default_values(self):
+        """Test that default values are set correctly when no env vars are provided."""
+        settings = ToolSettings()
+        assert settings.tool_store_description == DEFAULT_TOOL_STORE_DESCRIPTION
+        assert settings.tool_find_description == DEFAULT_TOOL_FIND_DESCRIPTION
+
+    def test_custom_store_description(self, monkeypatch):
+        """Test loading custom store description from environment variable."""
+        monkeypatch.setenv("TOOL_STORE_DESCRIPTION", "Custom store description")
+        settings = ToolSettings()
+        assert settings.tool_store_description == "Custom store description"
+        assert settings.tool_find_description == DEFAULT_TOOL_FIND_DESCRIPTION
+
+    def test_custom_find_description(self, monkeypatch):
+        """Test loading custom find description from environment variable."""
+        monkeypatch.setenv("TOOL_FIND_DESCRIPTION", "Custom find description")
+        settings = ToolSettings()
+        assert settings.tool_store_description == DEFAULT_TOOL_STORE_DESCRIPTION
+        assert settings.tool_find_description == "Custom find description"
+
+    def test_all_custom_values(self, monkeypatch):
+        """Test loading all custom values from environment variables."""
+        monkeypatch.setenv("TOOL_STORE_DESCRIPTION", "Custom store description")
+        monkeypatch.setenv("TOOL_FIND_DESCRIPTION", "Custom find description")
+        settings = ToolSettings()
+        assert settings.tool_store_description == "Custom store description"
+        assert settings.tool_find_description == "Custom find description"
+
+
+
+================================================
+FILE: .github/workflows/pre-commit.yaml
+================================================
+name: pre-commit
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, dev]
+
+jobs:
+  main:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - uses: actions/setup-python@v4
+      with:
+        python-version: 3.x
+    - uses: pre-commit/action@v3.0.1
+
+
+
+================================================
+FILE: .github/workflows/pypi-publish.yaml
+================================================
+# This workflow will upload a Python Package using Twine when a release is created
+# For more information see: https://help.github.com/en/actions/language-and-framework-guides/using-python-with-github-actions#publishing-to-package-registries
+
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+name: PyPI Publish
+
+on:
+  workflow_dispatch:
+  push:
+    # Pattern matched against refs/tags
+    tags:
+      - 'v*'           # Push events to every version tag
+
+env:
+  UV_PUBLISH_TOKEN: '${{ secrets.PYPI_API_TOKEN }}'
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.10.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install uv
+        uv sync
+
+    - name: Build package
+      run: uv build
+
+    - name: Publish package
+      run: uv publish
+
+
+
+================================================
+FILE: .github/workflows/pytest.yaml
+================================================
+name: Run Tests
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+
+    name: Python ${{ matrix.python-version }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install uv
+          uv sync
+
+      - name: Run tests
+        run: |
+          uv run pytest
+
+

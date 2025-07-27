@@ -1,6 +1,7 @@
 """Claude Reflect MCP Server with Memory Decay."""
 
 import os
+import asyncio
 from pathlib import Path
 from typing import Any, Optional, List, Dict, Union
 from datetime import datetime
@@ -30,8 +31,25 @@ DECAY_WEIGHT = float(os.getenv('DECAY_WEIGHT', '0.3'))
 DECAY_SCALE_DAYS = float(os.getenv('DECAY_SCALE_DAYS', '90'))
 USE_NATIVE_DECAY = os.getenv('USE_NATIVE_DECAY', 'false').lower() == 'true'
 
-# Initialize Voyage AI client
-voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY) if VOYAGE_API_KEY else None
+# Embedding configuration
+PREFER_LOCAL_EMBEDDINGS = os.getenv('PREFER_LOCAL_EMBEDDINGS', 'false').lower() == 'true'
+EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2')
+
+# Initialize Voyage AI client (only if not using local embeddings)
+voyage_client = None
+if not PREFER_LOCAL_EMBEDDINGS and VOYAGE_API_KEY:
+    voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY)
+
+# Initialize local embedding model if needed
+local_embedding_model = None
+if PREFER_LOCAL_EMBEDDINGS or not VOYAGE_API_KEY:
+    try:
+        from fastembed import TextEmbedding
+        local_embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL)
+        print(f"[DEBUG] Initialized local embedding model: {EMBEDDING_MODEL}")
+    except ImportError:
+        print("[ERROR] FastEmbed not available. Install with: pip install fastembed")
+        raise
 
 # Debug environment loading
 print(f"[DEBUG] Environment variables loaded:")
@@ -39,6 +57,8 @@ print(f"[DEBUG] ENABLE_MEMORY_DECAY: {ENABLE_MEMORY_DECAY}")
 print(f"[DEBUG] USE_NATIVE_DECAY: {USE_NATIVE_DECAY}")
 print(f"[DEBUG] DECAY_WEIGHT: {DECAY_WEIGHT}")
 print(f"[DEBUG] DECAY_SCALE_DAYS: {DECAY_SCALE_DAYS}")
+print(f"[DEBUG] PREFER_LOCAL_EMBEDDINGS: {PREFER_LOCAL_EMBEDDINGS}")
+print(f"[DEBUG] EMBEDDING_MODEL: {EMBEDDING_MODEL}")
 print(f"[DEBUG] env_path: {env_path}")
 
 
@@ -63,22 +83,50 @@ mcp = FastMCP(
 # Create Qdrant client
 qdrant_client = AsyncQdrantClient(url=QDRANT_URL)
     
-async def get_voyage_collections() -> List[str]:
-    """Get all Voyage collections."""
+async def get_all_collections() -> List[str]:
+    """Get all collections (both Voyage and local)."""
     collections = await qdrant_client.get_collections()
-    return [c.name for c in collections.collections if c.name.endswith('_voyage')]
+    # Support both _voyage and _local collections, plus reflections
+    return [c.name for c in collections.collections 
+            if c.name.endswith('_voyage') or c.name.endswith('_local') or c.name.startswith('reflections')]
 
 async def generate_embedding(text: str) -> List[float]:
-    """Generate embedding using Voyage AI."""
-    if not voyage_client:
-        raise ValueError("Voyage AI API key not configured")
-    
-    result = voyage_client.embed(
-        texts=[text],
-        model="voyage-3-large",
-        input_type="query"
-    )
-    return result.embeddings[0]
+    """Generate embedding using configured provider."""
+    if PREFER_LOCAL_EMBEDDINGS or not voyage_client:
+        # Use local embeddings
+        if not local_embedding_model:
+            raise ValueError("Local embedding model not initialized")
+        
+        # Run in executor since fastembed is synchronous
+        loop = asyncio.get_event_loop()
+        embeddings = await loop.run_in_executor(
+            None, lambda: list(local_embedding_model.embed([text]))
+        )
+        return embeddings[0].tolist()
+    else:
+        # Use Voyage AI
+        result = voyage_client.embed(
+            texts=[text],
+            model="voyage-3-large",
+            input_type="query"
+        )
+        return result.embeddings[0]
+
+def get_embedding_dimension() -> int:
+    """Get the dimension of embeddings based on the provider."""
+    if PREFER_LOCAL_EMBEDDINGS or not voyage_client:
+        # all-MiniLM-L6-v2 produces 384-dimensional embeddings
+        return 384
+    else:
+        # voyage-3-large produces 1024-dimensional embeddings
+        return 1024
+
+def get_collection_suffix() -> str:
+    """Get the collection suffix based on embedding provider."""
+    if PREFER_LOCAL_EMBEDDINGS or not voyage_client:
+        return "_local"
+    else:
+        return "_voyage"
     
 # Register tools
 @mcp.tool()
@@ -115,17 +163,18 @@ async def reflect_on_past(
         # Generate embedding
         query_embedding = await generate_embedding(query)
         
-        # Get all Voyage collections
-        voyage_collections = await get_voyage_collections()
-        if not voyage_collections:
+        # Get all collections
+        all_collections = await get_all_collections()
+        if not all_collections:
             return "No conversation collections found. Please import conversations first."
         
-        await ctx.debug(f"Searching across {len(voyage_collections)} collections")
+        await ctx.debug(f"Searching across {len(all_collections)} collections")
+        await ctx.debug(f"Using {'local' if PREFER_LOCAL_EMBEDDINGS or not voyage_client else 'Voyage AI'} embeddings")
         
         all_results = []
         
         # Search each collection
-        for collection_name in voyage_collections:
+        for collection_name in all_collections:
             try:
                 if should_use_decay and USE_NATIVE_DECAY:
                     # Use native Qdrant decay
@@ -179,7 +228,7 @@ async def reflect_on_past(
                             timestamp=point.payload.get('timestamp', datetime.now().isoformat()),
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
                             excerpt=(point.payload.get('text', '')[:500] + '...'),
-                            project_name=point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '')),
+                            project_name=point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', '')),
                             conversation_id=point.payload.get('conversation_id'),
                             collection_name=collection_name
                         ))
@@ -240,7 +289,7 @@ async def reflect_on_past(
                             timestamp=point.payload.get('timestamp', datetime.now().isoformat()),
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
                             excerpt=(point.payload.get('text', '')[:500] + '...'),
-                            project_name=point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '')),
+                            project_name=point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', '')),
                             conversation_id=point.payload.get('conversation_id'),
                             collection_name=collection_name
                         ))
@@ -261,7 +310,7 @@ async def reflect_on_past(
                             timestamp=point.payload.get('timestamp', datetime.now().isoformat()),
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
                             excerpt=(point.payload.get('text', '')[:500] + '...'),
-                            project_name=point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '')),
+                            project_name=point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', '')),
                             conversation_id=point.payload.get('conversation_id'),
                             collection_name=collection_name
                         ))
@@ -302,8 +351,46 @@ async def store_reflection(
     """Store an important insight or reflection for future reference."""
     
     try:
-        # TODO: Implement actual storage in a dedicated reflections collection
-        # For now, just acknowledge the storage
+        # Create reflections collection name
+        collection_name = f"reflections{get_collection_suffix()}"
+        
+        # Ensure collection exists
+        try:
+            collection_info = await qdrant_client.get_collection(collection_name)
+        except:
+            # Create collection if it doesn't exist
+            await qdrant_client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(
+                    size=get_embedding_dimension(),
+                    distance=Distance.COSINE
+                )
+            )
+            await ctx.debug(f"Created reflections collection: {collection_name}")
+        
+        # Generate embedding for the reflection
+        embedding = await generate_embedding(content)
+        
+        # Create point with metadata
+        point_id = datetime.now().timestamp()
+        point = PointStruct(
+            id=int(point_id),
+            vector=embedding,
+            payload={
+                "text": content,
+                "tags": tags,
+                "timestamp": datetime.now().isoformat(),
+                "type": "reflection",
+                "role": "user_reflection"
+            }
+        )
+        
+        # Store in Qdrant
+        await qdrant_client.upsert(
+            collection_name=collection_name,
+            points=[point]
+        )
+        
         tags_str = ', '.join(tags) if tags else 'none'
         return f"Reflection stored successfully with tags: {tags_str}"
         
