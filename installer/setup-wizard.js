@@ -596,8 +596,24 @@ async function showPreSetupInstructions() {
   console.log('📋 Before we begin, you\'ll need:');
   console.log('   1. Docker Desktop installed and running');
   console.log('   2. Python 3.10 or higher');
-  console.log('\n🔒 By default, we use local embeddings (private but less accurate)');
-  console.log('   For better accuracy, run with: --voyage-key=<your-key>\n');
+  
+  console.log('\n⚠️  IMPORTANT: Embedding Mode Choice');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('You must choose between Local or Cloud embeddings:');
+  console.log('\n🔒 Local Mode (Default):');
+  console.log('   • Privacy: All processing on your machine');
+  console.log('   • No API costs or internet required');
+  console.log('   • Good accuracy for most use cases');
+  console.log('\n☁️  Cloud Mode (Voyage AI):');
+  console.log('   • Better search accuracy');
+  console.log('   • Requires API key and internet');
+  console.log('   • Conversations sent to Voyage for processing');
+  console.log('\n⚠️  This choice is SEMI-PERMANENT. Switching later requires:');
+  console.log('   • Re-importing all conversations (30+ minutes)');
+  console.log('   • Separate storage for each mode');
+  console.log('   • Cannot search across modes\n');
+  console.log('For Cloud mode, run with: --voyage-key=<your-key>');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
   
   if (isInteractive) {
     await question('Press Enter to continue...');
@@ -1212,9 +1228,19 @@ async function main() {
   // In non-interactive mode, just use defaults (local mode unless key provided)
   if (!isInteractive) {
     console.log(voyageKey ? '🌐 Using Voyage AI embeddings' : '🔒 Using local embeddings for privacy');
+  } else if (!voyageKey) {
+    // In interactive mode without a key, confirm local mode choice
+    await showPreSetupInstructions();
+    const confirmLocal = await question('Continue with Local embeddings (privacy mode)? (y/n): ');
+    if (confirmLocal.toLowerCase() !== 'y') {
+      console.log('\nTo use Cloud mode, restart with: claude-self-reflect setup --voyage-key=<your-key>');
+      console.log('Get your free API key at: https://www.voyageai.com/');
+      if (rl) rl.close();
+      process.exit(0);
+    }
+  } else {
+    await showPreSetupInstructions();
   }
-  
-  await showPreSetupInstructions();
   
   // Check prerequisites
   const pythonOk = await checkPython();

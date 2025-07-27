@@ -2,22 +2,6 @@
 
 Claude forgets everything. This fixes that.
 
-## 🔒 Security & Privacy Notice
-
-**v2.3.3 Security Update**: This version addresses critical security vulnerabilities. Please update immediately.
-
-### Privacy Modes
-- **Local Mode (Default)**: Your conversations stay on your machine. No external API calls.
-- **Cloud Mode**: Uses Voyage AI for better search accuracy. Conversations are sent to Voyage for embedding generation.
-
-### Security Improvements in v2.3.3
-- ✅ Removed all hardcoded API keys
-- ✅ Fixed command injection vulnerabilities 
-- ✅ Patched vulnerable dependencies
-- ✅ Local embeddings by default for privacy
-
-**Important**: If using cloud mode, review [Voyage AI's privacy policy](https://www.voyageai.com/privacy) to understand how your data is handled.
-
 ## What You Get
 
 Ask Claude about past conversations. Get actual answers.
@@ -56,6 +40,24 @@ claude-self-reflect setup --voyage-key=YOUR_ACTUAL_KEY_HERE
 
 5 minutes. Everything automatic. Just works.
 
+> [!IMPORTANT]
+> **Security Update v2.3.3** - This version addresses critical security vulnerabilities. Please update immediately.
+>
+> ### 🔒 Privacy & Data Exchange
+> 
+> | Mode | Data Storage | External API Calls | Data Sent | Search Quality |
+> |------|--------------|-------------------|-----------|----------------|
+> | **Local (Default)** | Your machine only | None | Nothing leaves your computer | Good - uses efficient local embeddings |
+> | **Cloud (Opt-in)** | Your machine | Voyage AI | Conversation text for embedding generation | Better - uses state-of-the-art models |
+> 
+> **Disclaimer**: Cloud mode sends conversation content to Voyage AI for processing. Review their [privacy policy](https://www.voyageai.com/privacy) before enabling.
+> 
+> ### Security Fixes in v2.3.3
+> - ✅ Removed hardcoded API keys
+> - ✅ Fixed command injection vulnerabilities
+> - ✅ Patched vulnerable dependencies
+> - ✅ Local embeddings by default using FastEmbed
+ 
 ## The Magic
 
 ![Self Reflection vs The Grind](docs/images/red-reflection.webp)
@@ -141,11 +143,15 @@ Want to customize? See [Configuration Guide](docs/installation-guide.md).
 If you must know:
 
 - **Vector DB**: Qdrant (local, your data stays yours)
-- **Embeddings**: Voyage AI (200M free tokens/month)*
+- **Embeddings**: 
+  - Local (Default): FastEmbed with sentence-transformers/all-MiniLM-L6-v2
+  - Cloud (Optional): Voyage AI (200M free tokens/month)*
 - **MCP Server**: Python + FastMCP
 - **Search**: Semantic similarity with time decay
 
 *We chose Voyage AI for their excellent cost-effectiveness ([66.1% accuracy at one of the lowest costs](https://research.aimultiple.com/embedding-models/#:~:text=Cost%2Deffective%20alternatives%3A%20Voyage%2D3.5%2Dlite%20delivered%20solid%20accuracy%20(66.1%25)%20at%20one%20of%20the%20lowest%20costs%2C%20making%20it%20attractive%20for%20budget%2Dsensitive%20implementations.)). We are not affiliated with Voyage AI.
+
+**Note**: Local mode uses FastEmbed, the same efficient embedding library used by the Qdrant MCP server, ensuring fast and private semantic search without external dependencies.
 
 ### Want More Details?
 

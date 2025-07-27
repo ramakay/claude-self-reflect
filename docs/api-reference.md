@@ -23,7 +23,7 @@ Search for relevant past conversations using semantic search with optional time-
 
 #### Usage Examples
 
-```typescript
+```javascript
 // Basic search
 mcp__claude-self-reflect__reflect_on_past({
   query: "debugging React hooks"
@@ -86,7 +86,7 @@ Store an important insight or reflection for future reference.
 
 #### Usage Examples
 
-```typescript
+```javascript
 // Store a simple reflection
 mcp__claude-self-reflect__store_reflection({
   content: "Using React.memo significantly improved render performance in the dashboard"

@@ -215,6 +215,57 @@ sudo apt-get install --reinstall python3
    - Python dependency conflicts
    - Incorrect file permissions
 
+## Embedding Mode Issues
+
+### Switching Between Local and Cloud Embeddings
+
+**Symptom**: Changed PREFER_LOCAL_EMBEDDINGS but search returns no/wrong results
+
+**Problem**: Embedding modes use separate collections with different dimensions
+
+**Solution**:
+1. Understand that switching is a major operation:
+   - Local uses 384-dimensional vectors
+   - Cloud uses 1024-dimensional vectors
+   - Collections are completely separate
+
+2. To properly switch modes:
+   ```bash
+   # Stop everything
+   docker compose down
+   claude mcp remove claude-self-reflect
+   
+   # Update .env
+   # For local: PREFER_LOCAL_EMBEDDINGS=true
+   # For cloud: PREFER_LOCAL_EMBEDDINGS=false
+   
+   # Restart services
+   docker compose up -d
+   claude mcp add claude-self-reflect "/path/to/mcp-server/run-mcp.sh"
+   
+   # Re-import all conversations
+   python scripts/import-conversations-unified.py
+   ```
+
+3. See [Embedding Migration Guide](embedding-migration.md) for detailed steps
+
+### Collections Not Found After Mode Switch
+
+**Symptom**: Search returns no results after changing embedding mode
+
+**Cause**: MCP is searching for collections with wrong suffix (_local vs _voyage)
+
+**Solution**:
+1. Verify which collections exist:
+   ```bash
+   python scripts/check-collections.py
+   ```
+2. Ensure MCP server was restarted after env change
+3. Check Docker containers are using correct mode:
+   ```bash
+   docker compose exec watcher env | grep PREFER_LOCAL
+   ```
+
 ## Search and Reflection Issues
 
 ### Search returns no results

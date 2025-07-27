@@ -196,11 +196,31 @@ Combine with CLAUDE.md for best results:
 
 ## Advanced Configuration
 
+### Understanding Embedding Models
+
+Claude Self-Reflect supports two embedding modes, each with distinct characteristics:
+
+#### Local Embeddings (FastEmbed)
+- **Model**: sentence-transformers/all-MiniLM-L6-v2
+- **Dimensions**: 384
+- **Performance**: ~100ms for 1000 embeddings
+- **Storage**: ~1.5KB per conversation chunk
+- **Privacy**: Complete - no data leaves your machine
+- **Score Range**: Typically 0.02-0.2 (lower than cloud)
+
+#### Cloud Embeddings (Voyage AI)
+- **Model**: voyage-3-large
+- **Dimensions**: 1024
+- **Performance**: ~500ms for 1000 embeddings (includes network)
+- **Storage**: ~4KB per conversation chunk
+- **Privacy**: Conversations sent to Voyage for processing
+- **Score Range**: Typically 0.05-0.3 (higher accuracy)
+
 ### Custom Embedding Models
-While Voyage AI is recommended, you can use:
-- OpenAI embeddings
-- Local models (Sentence Transformers)
-- Google's Gecko embeddings
+While the two primary modes are supported, advanced users can implement:
+- OpenAI embeddings (requires code modification)
+- Custom FastEmbed models (change EMBEDDING_MODEL in .env)
+- Alternative cloud providers (requires new embedding client)
 
 ### Alternative Vector Databases
 Qdrant can be replaced with:

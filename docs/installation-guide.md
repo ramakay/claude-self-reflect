@@ -32,11 +32,36 @@ Before installing Claude Self-Reflect, ensure you have:
    - Check version: `node --version`
    - Download from [nodejs.org](https://nodejs.org) if needed
 
-5. **Voyage AI API Key** (Optional)
-   - Only needed for cloud mode (better search accuracy)
+5. **Voyage AI API Key** (Optional - for Cloud mode only)
    - Sign up at [voyageai.com](https://www.voyageai.com/)
    - 200M free tokens per month
    - **Not required**: Local mode works without any API keys
+
+## Choosing Your Embedding Mode
+
+> [!IMPORTANT]
+> Before installation, decide between Local or Cloud embeddings. This choice is semi-permanent - switching later requires re-importing all conversations (30+ minutes).
+
+### 🔒 Local Embeddings (Default - Recommended)
+- **Privacy**: All processing stays on your machine
+- **Cost**: Free, no API usage
+- **Offline**: Works without internet
+- **Accuracy**: Good for most use cases
+- **Model**: FastEmbed with all-MiniLM-L6-v2
+
+### ☁️ Cloud Embeddings (Voyage AI)
+- **Privacy**: Conversations sent to Voyage AI
+- **Cost**: Free tier available (200M tokens/month)
+- **Online**: Requires constant internet
+- **Accuracy**: Best semantic search quality
+- **Model**: voyage-3-large
+
+**Choose Cloud mode only if**:
+- Search accuracy is critical for your use case
+- You're comfortable with external data processing
+- You have reliable internet connectivity
+
+For detailed migration instructions, see [Embedding Migration Guide](embedding-migration.md).
 
 ## Installation Methods
 

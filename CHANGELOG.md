@@ -5,6 +5,39 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.3] - 2025-07-27
+
+### 🔒 Security Release
+
+### Changed
+- **BREAKING**: Complete migration from sentence-transformers to FastEmbed for local embeddings
+- **Default Mode**: Local embeddings now default for privacy (no external API calls)
+- **Docker Memory**: Increased container memory limits to 2GB for stability
+- **Security Fixes**:
+  - Removed all hardcoded API keys from codebase
+  - Fixed command injection vulnerabilities in installer
+  - Patched vulnerable dependencies (pydantic CVE-2024-3772)
+
+### Added
+- **Local Embeddings by Default**: Uses FastEmbed with sentence-transformers/all-MiniLM-L6-v2 model
+- **Unified Import System**: Single import script supports both local and cloud embeddings
+- **JSONL Parser Fix**: Proper line-by-line parsing for Claude conversation files
+- **Enhanced Documentation**:
+  - Privacy mode comparison table in README
+  - Security update notice with GitHub info block
+  - Clear warnings about data exchange in cloud mode
+
+### Fixed
+- Import failures due to incorrect JSON parsing (JSONL format)
+- Memory exhaustion in Docker containers when processing large files
+- MCP server initialization with local embeddings
+- Reflection specialist agent support for both embedding modes
+
+### Security
+- All API keys must now be provided via environment variables
+- No sensitive data in codebase
+- Local-first approach for privacy-conscious users
+
 ## [2.3.0] - Unreleased
 
 ### Added
