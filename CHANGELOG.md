@@ -5,6 +5,21 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.7] - 2025-07-27
+
+### Security
+- Major security cleanup to reduce attack surface
+- Removed archived TypeScript MCP implementation (31 files, no longer needed)
+- Removed 70+ internal scripts and test files from git tracking
+- Removed binary database directories (qdrant_storage/, data/) from git
+- Set secure permissions (600) on .env file containing API keys
+- Reduced codebase by ~17,000 lines and 250+ files
+
+### Changed
+- Updated .gitignore to prevent exposure of sensitive files and internal tools
+- Moved internal scripts to untracked directories
+- Kept only essential scripts needed for setup and validation
+
 ## [2.3.6] - 2025-07-27
 
 ### Changed
