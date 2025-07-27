@@ -67,7 +67,7 @@ Returns a JSON string containing an array of search results. Each result include
   "excerpt": "The conversation content...",
   "project_name": "my-project",
   "conversation_id": "abc123",
-  "collection_name": "conv_12345678_voyage"
+  "collection_name": "conv_12345678_local"  // or _voyage for cloud mode
 }
 ```
 
@@ -120,8 +120,8 @@ The behavior of these tools can be configured through environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VOYAGE_KEY` | optional | Your Voyage AI API key for cloud embeddings |
-| `PREFER_LOCAL_EMBEDDINGS` | true | Use local embeddings (no API key needed) |
+| `VOYAGE_KEY` | optional | Your Voyage AI API key (only for cloud mode) |
+| `PREFER_LOCAL_EMBEDDINGS` | true | Use local embeddings by default (no API needed) |
 | `QDRANT_URL` | http://localhost:6333 | URL of your Qdrant instance |
 | `ENABLE_MEMORY_DECAY` | false | Enable time-based memory decay globally |
 | `DECAY_WEIGHT` | 0.3 | Weight of decay factor in scoring (0-1) |
@@ -189,7 +189,7 @@ Common errors and their meanings:
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| "Voyage AI API key not configured" | Missing API key | Set VOYAGE_KEY environment variable |
+| "Voyage AI API key not configured" | Missing API key (cloud mode) | Set VOYAGE_KEY environment variable or use local mode |
 | "Collection not found" | No conversations imported | Run import script first |
 | "Rate limit exceeded" | Too many API calls | Wait and retry with smaller batches |
 

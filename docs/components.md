@@ -40,7 +40,9 @@ Each conversation chunk is stored as:
 ```
 
 ### Collections
-- One collection per project: `conv_<md5_hash>_voyage`
+- One collection per project:
+  - Local embeddings: `conv_<md5_hash>_local`
+  - Cloud embeddings: `conv_<md5_hash>_voyage`
 - Isolation prevents cross-project information leakage
 - MD5 hash ensures valid collection names
 
@@ -77,8 +79,9 @@ async def reflect_on_past(
 
 ### Configuration
 Environment variables:
-- `VOYAGE_KEY`: API key for embeddings
+- `VOYAGE_KEY`: API key for cloud embeddings (optional)
 - `QDRANT_URL`: Database URL (default: http://localhost:6333)
+- `PREFER_LOCAL_EMBEDDINGS`: Use local embeddings (default: true)
 - `ENABLE_MEMORY_DECAY`: Enable time-based decay (default: false)
 - `DECAY_WEIGHT`: How much recency matters (default: 0.3)
 - `DECAY_SCALE_DAYS`: Half-life for decay (default: 90)
@@ -89,7 +92,9 @@ Environment variables:
 1. **Discovery**: Find all conversation JSONL files
 2. **Parsing**: Extract messages from each file
 3. **Chunking**: Split into 500-token chunks
-4. **Embedding**: Generate vectors via Voyage AI
+4. **Embedding**: Generate vectors:
+   - Local mode: FastEmbed (default)
+   - Cloud mode: Voyage AI
 5. **Storage**: Save to Qdrant with metadata
 
 ### Import Scripts

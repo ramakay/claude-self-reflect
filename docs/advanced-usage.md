@@ -104,7 +104,19 @@ python scripts/import-single-project.py ~/.claude/projects/my-project
 ### Batch Import with Limits
 For large conversation sets:
 ```bash
-python scripts/import-conversations-voyage-streaming.py --limit 1000 --batch-size 50
+python scripts/import-conversations-unified.py --limit 1000 --batch-size 50
+```
+
+### Switching Between Embedding Modes
+```bash
+# Use local embeddings (default)
+python scripts/import-conversations-unified.py
+
+# Use cloud embeddings (requires Voyage key)
+python scripts/import-conversations-unified.py --cloud
+
+# Check which mode is active
+python scripts/check-collections.py
 ```
 
 ## Testing & Validation
@@ -112,7 +124,7 @@ python scripts/import-conversations-voyage-streaming.py --limit 1000 --batch-siz
 ### Dry-Run Mode
 Test without making changes:
 ```bash
-python scripts/import-openai-enhanced.py --dry-run --preview
+python scripts/import-conversations-unified.py --dry-run --preview
 ```
 
 ### Validate Setup

@@ -104,6 +104,23 @@ sudo apt-get install --reinstall python3
 
 ## Import Problems
 
+### Local Embedding Issues
+
+**Symptom**: Import fails with FastEmbed errors
+
+**Solution**:
+1. Ensure virtual environment is activated
+2. Reinstall FastEmbed: `pip install --upgrade fastembed`
+3. Check disk space (embeddings cache needs ~500MB)
+4. Try cloud mode as fallback: `--cloud` flag
+
+**Symptom**: "Model not found" errors
+
+**Solution**:
+- First run downloads the model (~90MB)
+- Ensure internet connection for initial download
+- Check `~/.cache/fastembed` for model files
+
 ### "Claude projects directory not found"
 
 **Symptom**: Import script can't find `~/.claude/projects`
@@ -118,10 +135,11 @@ sudo apt-get install --reinstall python3
 
 ### "VOYAGE_KEY environment variable not set"
 
-**Symptom**: Import fails with missing API key error
+**Symptom**: Import fails with missing API key error (cloud mode only)
 
 **Solution**:
-1. Get free API key from [voyageai.com](https://www.voyageai.com/)
+1. For local mode (default): No API key needed
+2. For cloud mode: Get free API key from [voyageai.com](https://www.voyageai.com/)
 2. Add to `.env` file in project root:
    ```
    VOYAGE_KEY=your-api-key-here

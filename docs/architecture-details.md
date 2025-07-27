@@ -23,8 +23,8 @@ For those who want to understand the plumbing.
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Qdrant Vector Database                       │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │  Collections: conv_<project_hash>_voyage                │  │
-│  │  - Conversation embeddings (1024 dims)                  │  │
+│  │  Collections: conv_<project_hash>_local/voyage          │  │
+│  │  - Conversation embeddings (384/1024 dims)             │  │
 │  │  - Metadata (timestamp, project, context)               │  │
 │  └─────────────────────────────────────────────────────────┘  │
 └────────────────────────────┬───────────────────────────────────┘
@@ -34,8 +34,8 @@ For those who want to understand the plumbing.
 │                     Import Pipeline                             │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐  │
 │  │  Read    │→ │  Chunk   │→ │ Embed    │→ │ Store in     │  │
-│  │  JSONL   │  │  (500    │  │ (Voyage  │  │ Qdrant       │  │
-│  │  Files   │  │  tokens) │  │  AI)     │  │              │  │
+│  │  JSONL   │  │  (500    │  │ (Local/  │  │ Qdrant       │  │
+│  │  Files   │  │  tokens) │  │ Voyage)  │  │              │  │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -54,7 +54,9 @@ Python-based service using FastMCP framework. Provides two simple tools:
 Python service that processes conversation logs:
 - Reads JSONL files from Claude conversation logs (`~/.claude/`)
 - Creates conversation chunks for context (500 tokens each)
-- Generates embeddings using Voyage AI (voyage-3-large, 1024 dimensions)
+- Generates embeddings using:
+  - **Local (Default)**: FastEmbed with all-MiniLM-L6-v2 (384 dimensions)
+  - **Cloud (Optional)**: Voyage AI voyage-3-large (1024 dimensions)
 - Stores directly in Qdrant with metadata
 
 ### 4. Qdrant Vector Database
@@ -91,8 +93,9 @@ Python service that processes conversation logs:
            └──────┬───────┘
                   ▼
            ┌──────────────┐
-           │ Voyage AI    │
+           │ Generate     │
            │ Embeddings   │
+           │(Local/Cloud) │
            └──────┬───────┘
                   ▼
            ┌──────────────┐
@@ -159,16 +162,28 @@ claude-self-reflect/
 ## Technical Specifications
 
 ### Embeddings
+
+#### Local Mode (Default)
+- **Model**: FastEmbed all-MiniLM-L6-v2
+- **Dimensions**: 384
+- **Context**: 500 tokens per chunk
+- **Cost**: Free (runs locally)
+- **Privacy**: All processing on your machine
+
+#### Cloud Mode (Optional)
 - **Model**: Voyage AI voyage-3-large
 - **Dimensions**: 1024
 - **Context**: 500 tokens per chunk
 - **Free tier**: 200M tokens/month
+- **Accuracy**: Better semantic search
 
 ### Vector Database
 - **Engine**: Qdrant
 - **Storage**: Local disk
 - **Collections**: Per-project isolation
-- **Naming**: `conv_<md5_hash>_voyage`
+- **Naming**: 
+  - Local: `conv_<md5_hash>_local`
+  - Cloud: `conv_<md5_hash>_voyage`
 
 ### Performance
 - **Search latency**: ~100ms for cross-collection search
@@ -179,8 +194,9 @@ claude-self-reflect/
 
 - All data stored locally
 - No cloud dependencies for core functionality
-- API keys only used for embedding generation
-- Conversations never leave your machine
+- Local mode (default): No external API calls
+- Cloud mode: API keys only used for embedding generation
+- Conversations stored locally in both modes
 
 ## Additional Details
 
@@ -205,9 +221,9 @@ claude-self-reflect/
 │     └─> Add overlap for continuity                     │
 │                                                         │
 │  4. Generate embeddings:                               │
-│     ├─> Batch API calls to Voyage AI                   │
-│     ├─> Handle rate limits gracefully                  │
-│     └─> Cache for efficiency                           │
+│     ├─> Local: Process with FastEmbed (no API)         │
+│     ├─> Cloud: Batch API calls to Voyage AI            │
+│     └─> Handle rate limits (cloud mode only)           │
 │                                                         │
 │  5. Store in Qdrant:                                   │
 │     ├─> Create/update collection                       │

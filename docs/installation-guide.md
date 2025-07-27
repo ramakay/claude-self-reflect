@@ -32,7 +32,7 @@ Before installing Claude Self-Reflect, ensure you have:
    - Check version: `node --version`
    - Download from [nodejs.org](https://nodejs.org) if needed
 
-5. **Voyage AI API Key** (Optional - for Cloud mode only)
+5. **Voyage AI API Key** (Only needed for Cloud mode)
    - Sign up at [voyageai.com](https://www.voyageai.com/)
    - 200M free tokens per month
    - **Not required**: Local mode works without any API keys
@@ -166,13 +166,14 @@ mcp-server\venv\Scripts\activate
 ### 3. Run the Import Script
 
 ```bash
-python scripts/import-conversations-voyage.py
+python scripts/import-conversations-unified.py
 ```
 
 The script will:
 - Find all Claude conversations in `~/.claude/projects`
 - Create vector embeddings for each conversation
 - Store them in Qdrant for semantic search
+- Use local embeddings by default (or cloud if configured)
 
 **Note**: First import may take a while depending on conversation history size.
 
@@ -182,10 +183,13 @@ For large conversation histories:
 
 ```bash
 # Import with streaming (memory efficient)
-python scripts/import-conversations-voyage-streaming.py
+python scripts/import-conversations-unified.py --streaming
 
 # Import only recent conversations
-python scripts/import-conversations-voyage-streaming.py --limit 10
+python scripts/import-conversations-unified.py --limit 10
+
+# Force cloud mode (if Voyage key configured)
+python scripts/import-conversations-unified.py --cloud
 ```
 
 ## Configuring Claude Code
