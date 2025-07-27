@@ -1,8 +1,0 @@
-{
-  "command": "/Users/ramakrishnanannaswamy/claude-self-reflect/qdrant-mcp-stack/claude-self-reflection/run-mcp.sh",
-  "args": [],
-  "env": {
-    "QDRANT_URL": "http://localhost:6333",
-    "VOYAGE_KEY": "pa-wdTYGObaxhs-XFKX2r7WCczRwEVNb9eYMTSO3yrQhZI"
-  }
-}

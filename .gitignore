@@ -16,6 +16,7 @@ build/
 .env
 .env.local
 .env.*.local
+.env.template
 
 # IDE files
 .vscode/
@@ -50,6 +51,30 @@ test-results/
 
 # Internal documentation
 .internal/
+
+# Archived code
+archived/
+
+# Internal scripts
+.scripts-internal/
+scripts/import-*.py
+scripts/test-*.py
+scripts/*decay*.py
+scripts/simple-importer.py
+scripts/streaming-importer*.py
+scripts/continuous-importer.py
+scripts/merge-config-files.py
+scripts/performance-*.py
+scripts/validate-decay-impact.py
+scripts/test/
+scripts/test-typescript/
+
+# Test directories
+mcp-server/test-fresh-install/
+
+# User-specific config
+config/imported-files.json
+config/imported-files-old.json
 
 # Temporary files
 *.tmp
