@@ -5,6 +5,25 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.4] - 2025-07-27
+
+### Added
+- Comprehensive embedding mode documentation
+- Migration guide for switching between local and cloud modes
+- Enhanced setup wizard with prominent embedding choice warnings
+- Confirmation prompt for embedding mode selection
+
+### Changed
+- Setup wizard now clearly explains that embedding choice is semi-permanent
+- Updated all documentation to emphasize the complexity of switching modes
+- Improved troubleshooting guide with embedding mode issues section
+
+### Documentation
+- Created detailed embedding migration guide
+- Updated installation guide with embedding mode selection
+- Enhanced advanced usage guide with technical embedding details
+- Added warnings throughout docs about mode switching implications
+
 ## [2.3.3] - 2025-07-27
 
 ### 🔒 Security Release
