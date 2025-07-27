@@ -145,13 +145,11 @@ If you must know:
 - **Vector DB**: Qdrant (local, your data stays yours)
 - **Embeddings**: 
   - Local (Default): FastEmbed with sentence-transformers/all-MiniLM-L6-v2
-  - Cloud (Optional): Voyage AI (200M free tokens/month)*
+  - Cloud (Optional): Voyage AI (200M free tokens/month)
 - **MCP Server**: Python + FastMCP
 - **Search**: Semantic similarity with time decay
 
-*We chose Voyage AI for their excellent cost-effectiveness ([66.1% accuracy at one of the lowest costs](https://research.aimultiple.com/embedding-models/#:~:text=Cost%2Deffective%20alternatives%3A%20Voyage%2D3.5%2Dlite%20delivered%20solid%20accuracy%20(66.1%25)%20at%20one%20of%20the%20lowest%20costs%2C%20making%20it%20attractive%20for%20budget%2Dsensitive%20implementations.)). We are not affiliated with Voyage AI.
-
-**Note**: Local mode uses FastEmbed, the same efficient embedding library used by the Qdrant MCP server, ensuring fast and private semantic search without external dependencies.
+Both embedding options work well. Local mode uses FastEmbed for privacy and offline use. Cloud mode uses Voyage AI for enhanced accuracy when internet is available. We are not affiliated with Voyage AI.
 
 ### Want More Details?
 
