@@ -6,8 +6,8 @@ WORKDIR /app
 COPY scripts/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy scripts
-COPY scripts/ .
+# Copy only the unified import script
+COPY scripts/import-conversations-unified.py .
 
-# Run the enhanced importer
-CMD ["python", "import-openai-enhanced.py"]
+# Run the unified importer
+CMD ["python", "import-conversations-unified.py"]
