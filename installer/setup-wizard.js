@@ -37,15 +37,36 @@ function safeExec(command, args = [], options = {}) {
 const args = process.argv.slice(2);
 let voyageKey = null;
 let mcpConfigured = false;
+let debugMode = false;
 
 for (const arg of args) {
   if (arg.startsWith('--voyage-key=')) {
     voyageKey = arg.split('=')[1];
+  } else if (arg === '--debug') {
+    debugMode = true;
   }
 }
 
 // Default to local mode unless Voyage key is provided
 let localMode = !voyageKey;
+
+// WSL Detection
+function isWSL() {
+  try {
+    const fsSync = require('fs');
+    const osRelease = fsSync.readFileSync('/proc/version', 'utf8');
+    return osRelease.toLowerCase().includes('microsoft') || osRelease.toLowerCase().includes('wsl');
+  } catch {
+    return false;
+  }
+}
+
+// Debug logging helper
+function debugLog(...args) {
+  if (debugMode) {
+    console.log('[DEBUG]', ...args);
+  }
+}
 
 const isInteractive = process.stdin.isTTY && process.stdout.isTTY;
 
@@ -238,6 +259,12 @@ async function checkQdrant() {
 async function setupPythonEnvironment() {
   console.log('\n🐍 Setting up Python MCP server...');
   
+  // Detect WSL environment
+  if (isWSL()) {
+    console.log('🐧 WSL environment detected');
+    debugLog('Running on WSL, may need special handling');
+  }
+  
   const mcpPath = join(projectRoot, 'mcp-server');
   const scriptsPath = join(projectRoot, 'scripts');
   
@@ -287,33 +314,115 @@ async function setupPythonEnvironment() {
     }
     
     if (!venvExists || !venvHealthy) {
+      // Pre-flight checks before creating venv
+      console.log('Checking Python environment...');
+      const pythonCmd = process.env.PYTHON_PATH || 'python3';
+      
+      // Check if Python is available and get version
+      try {
+        const pythonVersion = safeExec(pythonCmd, ['--version'], { stdio: 'pipe' });
+        debugLog(`Python version: ${pythonVersion.trim()}`);
+      } catch (e) {
+        console.log('❌ Python not found');
+        console.log('📚 Fix: Install Python 3.10 or higher');
+        return false;
+      }
+      
+      // Check if venv module is available
+      debugLog('Checking if venv module is available...');
+      try {
+        const venvCheck = spawnSync(pythonCmd, ['-c', 'import venv; print("venv module OK")'], {
+          cwd: mcpPath,
+          encoding: 'utf8'
+        });
+        
+        if (venvCheck.status !== 0) {
+          debugLog(`venv module check failed: ${venvCheck.stderr}`);
+          
+          // WSL-specific guidance
+          if (isWSL()) {
+            console.log('\n⚠️  WSL-specific issue detected');
+            console.log('Common WSL fixes:');
+            console.log('1. Install python3-venv: sudo apt install python3.10-venv');
+            console.log('2. Use specific Python version: export PYTHON_PATH=python3.10');
+            console.log('3. Check WSL Python paths: which python3');
+          }
+          
+          throw new Error('venv module not available');
+        }
+        debugLog('venv module is available');
+      } catch (moduleError) {
+        console.log('❌ Python venv module not found');
+        console.log('📚 Fix: Install python3-venv package');
+        console.log('   Ubuntu/Debian: sudo apt install python3-venv');
+        console.log('   WSL Ubuntu: sudo apt install python3.10-venv');
+        console.log('   macOS: Should be included with Python');
+        return false;
+      }
+      
       // Create virtual environment
       console.log('Creating virtual environment...');
-      const pythonCmd = process.env.PYTHON_PATH || 'python3';
       try {
-        // Use spawn with proper path handling instead of shell execution
-        const { spawnSync } = require('child_process');
+        debugLog(`Running: ${pythonCmd} -m venv venv in ${mcpPath}`);
+        
         const result = spawnSync(pythonCmd, ['-m', 'venv', 'venv'], {
           cwd: mcpPath,
-          stdio: 'inherit'
+          encoding: 'utf8'
         });
-        if (result.error) throw result.error;
+        
+        if (result.error) {
+          debugLog(`spawnSync error: ${result.error.message}`);
+          throw result.error;
+        }
+        
+        if (result.status !== 0) {
+          debugLog(`venv creation failed with status ${result.status}`);
+          debugLog(`stdout: ${result.stdout}`);
+          debugLog(`stderr: ${result.stderr}`);
+          
+          // Check for common WSL issues
+          if (isWSL() && result.stderr && result.stderr.includes('ensurepip')) {
+            console.log('\n⚠️  WSL pip installation issue detected');
+            console.log('Try: sudo apt install python3-pip python3.10-distutils');
+          }
+          
+          throw new Error(`venv creation failed: ${result.stderr}`);
+        }
+        
+        console.log('✅ Virtual environment created');
         needsInstall = true; // Mark that we need to install dependencies
       } catch (venvError) {
         console.log('⚠️  Failed to create venv with python3, trying python...');
         try {
-          const { spawnSync } = require('child_process');
           const result = spawnSync('python', ['-m', 'venv', 'venv'], {
             cwd: mcpPath,
-            stdio: 'inherit'
+            encoding: 'utf8'
           });
+          
           if (result.error) throw result.error;
+          if (result.status !== 0) {
+            debugLog(`Python venv creation failed: ${result.stderr}`);
+            throw new Error(result.stderr);
+          }
+          
           needsInstall = true; // Mark that we need to install dependencies
-        } catch {
+        } catch (fallbackError) {
           console.log('❌ Failed to create virtual environment');
-          console.log('📚 Fix: Install python3-venv package');
+          
+          if (debugMode) {
+            console.log('\n🔍 Debug Information:');
+            console.log(`Error: ${fallbackError.message}`);
+            console.log(`Working directory: ${mcpPath}`);
+            console.log(`Python command: ${pythonCmd}`);
+          }
+          
+          console.log('\n📚 Troubleshooting:');
+          console.log('1. Check Python installation: python3 --version');
+          console.log('2. Install venv package:');
           console.log('   Ubuntu/Debian: sudo apt install python3-venv');
-          console.log('   macOS: Should be included with Python');
+          console.log('   WSL: sudo apt install python3.10-venv python3-pip');
+          console.log('3. Try with specific Python: PYTHON_PATH=python3.10 npm run setup');
+          
           return false;
         }
       }

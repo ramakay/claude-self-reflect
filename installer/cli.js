@@ -118,10 +118,12 @@ function help() {
   console.log('\nSetup Options:');
   console.log('  --voyage-key=<key>   Provide Voyage AI API key (recommended)');
   console.log('  --local              Run in local mode without API key');
+  console.log('  --debug              Enable debug output for troubleshooting');
   
   console.log('\nExamples:');
   console.log('  claude-self-reflect setup --voyage-key=pa-1234567890');
   console.log('  claude-self-reflect setup --local');
+  console.log('  claude-self-reflect setup --debug  # For troubleshooting');
   
   console.log('\nFor more information: https://github.com/ramakay/claude-self-reflect');
 }
