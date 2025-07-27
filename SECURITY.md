@@ -1,0 +1,87 @@
+# Security Policy
+
+## Supported Versions
+
+| Version | Supported          |
+| ------- | ------------------ |
+| 2.3.x   | :white_check_mark: |
+| 2.2.x   | :x:                |
+| < 2.2   | :x:                |
+
+## Reporting a Vulnerability
+
+If you discover a security vulnerability, please **DO NOT** create a public issue. Instead:
+
+1. Email the details to the maintainer through GitHub
+2. Include:
+   - Description of the vulnerability
+   - Steps to reproduce
+   - Potential impact
+   - Suggested fix (if any)
+
+We aim to respond within 48 hours and will work with you to understand and address the issue promptly.
+
+## Security Measures
+
+### Code Security
+- No hardcoded API keys or secrets
+- Environment variables for sensitive configuration
+- Regular dependency updates
+- Automated security scanning in CI/CD
+
+### Repository Security
+- Branch protection on `main`
+- Required PR reviews
+- Automated security checks must pass
+- No direct commits to main branch
+
+### Data Security
+- Local embeddings by default (no data sent to cloud)
+- Optional cloud embeddings with explicit opt-in
+- No tracking or analytics
+- All data stored locally in Docker volumes
+
+### CI/CD Security
+- Secrets scanning with Gitleaks
+- Dependency vulnerability scanning
+- Docker image security scanning with Trivy
+- Code quality checks with Bandit
+- File permission validation
+
+## Best Practices for Contributors
+
+1. **Never commit secrets**: Use environment variables
+2. **Check dependencies**: Run `npm audit` and `pip-audit` before submitting PRs
+3. **Test locally**: Ensure all tests pass before pushing
+4. **Use .gitignore**: Don't commit generated files or local data
+5. **Review changes**: Double-check your commits for sensitive data
+
+## Recommended GitHub Settings
+
+For repository administrators:
+
+### Branch Protection Rules for `main`:
+- ✅ Require pull request reviews before merging
+- ✅ Dismiss stale pull request approvals when new commits are pushed
+- ✅ Require status checks to pass before merging:
+  - `python-test`
+  - `npm-package-test`
+  - `docker-build`
+  - `secrets-scan`
+  - `dependency-scan`
+- ✅ Require branches to be up to date before merging
+- ✅ Include administrators
+- ✅ Do not allow force pushes
+- ✅ Do not allow deletions
+
+### Security Settings:
+- ✅ Enable Dependabot security updates
+- ✅ Enable secret scanning
+- ✅ Enable push protection for secrets
+- ✅ Enable vulnerability alerts
+
+## Security Audit History
+
+- **v2.3.7**: Major security cleanup - removed 250+ internal files, secured .env permissions
+- **v2.3.3**: Migrated to local embeddings by default for privacy
+- **v2.0.0**: Complete rewrite with security-first design

@@ -1,0 +1,123 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run security scan weekly on Monday at 2 AM UTC
+    - cron: '0 2 * * 1'
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  secrets-scan:
+    name: Scan for secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-scan:
+    name: Scan dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Python Safety Check
+        uses: pyupio/safety-action@v1
+        with:
+          api-key: ${{ secrets.SAFETY_API_KEY }}
+          scan: 'full'
+          continue-on-error: true
+      
+      - name: Run npm audit
+        run: npm audit --audit-level=moderate
+        continue-on-error: true
+
+  code-quality:
+    name: Code quality checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit pylint
+      
+      - name: Run Bandit security linter
+        run: |
+          bandit -r mcp-server/src scripts/*.py -f json -o bandit-report.json || true
+        continue-on-error: true
+      
+      - name: Upload Bandit results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-results
+          path: bandit-report.json
+
+  docker-scan:
+    name: Scan Docker images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build Docker images
+        run: |
+          docker build -f Dockerfile.watcher -t claude-self-reflect-watcher .
+          docker build -f Dockerfile.importer -t claude-self-reflect-importer .
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'claude-self-reflect-watcher'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  permissions-check:
+    name: Check file permissions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check for sensitive files
+        run: |
+          # Check for any .env files that shouldn't be committed
+          if git ls-files | grep -E "^\.env$|^\.env\." | grep -v example | grep -v template; then
+            echo "ERROR: Found .env files in repository!"
+            exit 1
+          fi
+          
+          # Check for API keys in code
+          if grep -r "VOYAGE_KEY=" . --include="*.py" --include="*.js" --include="*.ts" | grep -v "os.getenv" | grep -v "process.env"; then
+            echo "ERROR: Found hardcoded API keys!"
+            exit 1
+          fi
+          
+          # Check for binary database files
+          if git ls-files | grep -E "qdrant_storage|data/qdrant"; then
+            echo "ERROR: Found database files in repository!"
+            exit 1
+          fi
