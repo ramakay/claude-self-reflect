@@ -39,6 +39,7 @@ config-isolated/
 
 # Docker volumes
 qdrant-storage/
+qdrant_storage/
 
 # Test artifacts
 coverage/
