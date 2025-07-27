@@ -5,7 +5,7 @@ Claude Self Reflect provides semantic search across all Claude conversations wit
 
 ## Architecture
 - **Vector Database**: Qdrant with per-project collections
-- **Embeddings**: Voyage AI (voyage-3-large, 1024 dimensions)
+- **Embeddings**: FastEmbed local embeddings (all-MiniLM-L6-v2, 384 dimensions) by default, Voyage AI optional
 - **Search**: Cross-collection semantic search with time-based decay
 - **Import**: Continuous file watcher for automatic updates
 - **MCP Server**: Python-based using FastMCP (located in `mcp-server/`)
@@ -28,8 +28,9 @@ Currently using client-side decay calculation (v1.3.1):
 ## Current Status
 - **Projects Imported**: 24
 - **Conversation Chunks**: 10,165+
-- **Collections**: Per-project isolation with `conv_<md5>_voyage` naming
+- **Collections**: Per-project isolation with `conv_<md5>_local` (FastEmbed) or `conv_<md5>_voyage` (Voyage AI) naming
 - **Search Accuracy**: 66.1% with cross-collection overhead ~100ms
+- **Default**: Local embeddings for privacy (v2.3.7+)
 
 ## Key Commands
 
@@ -166,3 +167,49 @@ claude-self-reflect/
 - Memory decay is opt-in (disabled by default)
 - Test files belong in organized directories, not root
 - **CRITICAL**: All agents MUST follow [MCP_REFERENCE.md](./MCP_REFERENCE.md) for MCP operations
+
+## Upgrade Guide for Existing Users
+
+### Key Changes in v2.3.7+
+1. **Local Embeddings by Default**: FastEmbed replaces Voyage AI for privacy
+2. **Setup Wizard Improvements**: Better handling of existing installations
+3. **Security Enhancements**: Automated scanning and vulnerability checks
+
+### Common Upgrade Issues & Solutions
+
+#### 1. Python Virtual Environment Conflicts
+**Problem**: Setup wizard fails with "Unable to symlink python3.13" or similar
+**Solution**: The setup wizard now includes health checks for existing venvs:
+- Detects if venv exists but is broken/incomplete
+- Checks if dependencies (fastmcp, qdrant_client) are installed
+- Automatically reinstalls missing dependencies
+
+#### 2. MCP Connection Issues After Upgrade
+**Problem**: Tools not accessible after upgrade
+**Solution**: 
+```bash
+# Remove and re-add the MCP server
+claude mcp remove claude-self-reflect
+claude mcp add claude-self-reflect "/path/to/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333"
+# Restart Claude Code for changes to take effect
+```
+
+#### 3. Mixed Collection Types
+**Problem**: Both _voyage and _local collections exist
+**Solution**: This is normal! The system handles both:
+- New imports use _local collections (FastEmbed)
+- Old _voyage collections remain searchable
+- Set PREFER_LOCAL_EMBEDDINGS=false to use Voyage AI
+
+#### 4. Import Script Changes
+**Path Changes**: 
+- Old: `import-conversations-voyage.py`
+- New: `import-conversations-unified.py`
+- The unified script handles both embedding types
+
+### Best Practices for Upgrading
+1. **Always backup your data directory** before major upgrades
+2. **Run the setup wizard** instead of manual installation
+3. **Check .env settings** - new variables may be added
+4. **Test with small imports first** using --limit flag
+5. **Monitor Docker logs** if using containerized setup

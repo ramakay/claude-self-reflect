@@ -245,15 +245,48 @@ async function setupPythonEnvironment() {
     // Check if venv already exists
     const venvPath = join(mcpPath, 'venv');
     let venvExists = false;
+    let venvHealthy = false;
+    let needsInstall = false;
+    
     try {
       await fs.access(venvPath);
       venvExists = true;
-      console.log('✅ Virtual environment already exists');
+      
+      // Check if existing venv is healthy
+      const venvPython = process.platform === 'win32'
+        ? join(venvPath, 'Scripts', 'python.exe')
+        : join(venvPath, 'bin', 'python');
+      
+      try {
+        // Try to run python --version to verify venv is functional
+        safeExec(venvPython, ['--version'], { stdio: 'pipe' });
+        
+        // Also check if MCP dependencies are installed
+        try {
+          safeExec(venvPython, ['-c', 'import fastmcp, qdrant_client'], { stdio: 'pipe' });
+          venvHealthy = true;
+          console.log('✅ Virtual environment already exists and is healthy');
+        } catch {
+          // Dependencies not installed, need to install them
+          console.log('⚠️  Virtual environment exists but missing dependencies');
+          needsInstall = true;
+          venvHealthy = true; // venv itself is healthy, just needs deps
+        }
+      } catch (healthError) {
+        console.log('⚠️  Existing virtual environment is corrupted');
+        console.log('   Removing and recreating...');
+        
+        // Remove broken venv
+        const { rmSync } = await import('fs');
+        rmSync(venvPath, { recursive: true, force: true });
+        venvExists = false;
+        venvHealthy = false;
+      }
     } catch {
       // venv doesn't exist, create it
     }
     
-    if (!venvExists) {
+    if (!venvExists || !venvHealthy) {
       // Create virtual environment
       console.log('Creating virtual environment...');
       const pythonCmd = process.env.PYTHON_PATH || 'python3';
@@ -265,6 +298,7 @@ async function setupPythonEnvironment() {
           stdio: 'inherit'
         });
         if (result.error) throw result.error;
+        needsInstall = true; // Mark that we need to install dependencies
       } catch (venvError) {
         console.log('⚠️  Failed to create venv with python3, trying python...');
         try {
@@ -274,6 +308,7 @@ async function setupPythonEnvironment() {
             stdio: 'inherit'
           });
           if (result.error) throw result.error;
+          needsInstall = true; // Mark that we need to install dependencies
         } catch {
           console.log('❌ Failed to create virtual environment');
           console.log('📚 Fix: Install python3-venv package');
@@ -285,7 +320,6 @@ async function setupPythonEnvironment() {
     }
     
     // Setup paths for virtual environment
-    console.log('Setting up pip in virtual environment...');
     const venvPython = process.platform === 'win32'
       ? join(mcpPath, 'venv', 'Scripts', 'python.exe')
       : join(mcpPath, 'venv', 'bin', 'python');
@@ -293,15 +327,19 @@ async function setupPythonEnvironment() {
       ? join(mcpPath, 'venv', 'Scripts', 'pip.exe')
       : join(mcpPath, 'venv', 'bin', 'pip');
     
-    // First, try to install certifi to help with SSL issues
-    console.log('Installing certificate handler...');
-    try {
-      safeExec(venvPip, [
-        'install', '--trusted-host', 'pypi.org', '--trusted-host', 'files.pythonhosted.org', 'certifi'
-      ], { cwd: mcpPath, stdio: 'pipe' });
-    } catch {
-      // Continue even if certifi fails
-    }
+    // Only install dependencies if we just created a new venv
+    if (needsInstall) {
+      console.log('Setting up pip in virtual environment...');
+      
+      // First, try to install certifi to help with SSL issues
+      console.log('Installing certificate handler...');
+      try {
+        safeExec(venvPip, [
+          'install', '--trusted-host', 'pypi.org', '--trusted-host', 'files.pythonhosted.org', 'certifi'
+        ], { cwd: mcpPath, stdio: 'pipe' });
+      } catch {
+        // Continue even if certifi fails
+      }
     
     // Upgrade pip and install wheel first
     try {
@@ -369,9 +407,9 @@ async function setupPythonEnvironment() {
       }
     }
     
-    // Install script dependencies
-    console.log('Installing import script dependencies...');
-    try {
+      // Install script dependencies
+      console.log('Installing import script dependencies...');
+      try {
       safeExec(venvPip, [
         'install', '-r', join(scriptsPath, 'requirements.txt')
       ], { cwd: mcpPath, stdio: 'inherit' });
@@ -387,6 +425,7 @@ async function setupPythonEnvironment() {
         console.log('   You may need to install them manually later');
       }
     }
+    } // End of needsInstall block
     
     console.log('✅ Python environment setup complete');
     return true;
@@ -679,7 +718,7 @@ async function importConversations() {
   
   try {
     const pythonCmd = process.env.PYTHON_PATH || 'python3';
-    const importScript = join(projectRoot, 'scripts', 'import-conversations-voyage.py');
+    const importScript = join(projectRoot, 'scripts', 'import-conversations-unified.py');
     
     // Use the venv Python directly - platform specific
     let venvPython;
@@ -961,12 +1000,13 @@ async function showSystemDashboard() {
 async function setupWatcher() {
   console.log('\n⚙️  Setting up Continuous Import (Watcher)...');
   
-  const watcherScript = join(projectRoot, 'scripts', 'import-watcher.py');
+  // Check if Docker compose file exists
+  const dockerComposeFile = join(projectRoot, 'docker-compose.yaml');
   
-  // Check if watcher exists
+  // Check if Docker watcher is available
   try {
-    await fs.access(watcherScript);
-    console.log('✅ Watcher script found');
+    await fs.access(dockerComposeFile);
+    console.log('✅ Docker-based watcher available');
     
     // Watcher works with both local and cloud embeddings
     console.log(localMode ? '🏠 Watcher will use local embeddings' : '🌐 Watcher will use Voyage AI embeddings');
@@ -1079,15 +1119,15 @@ async function setupWatcher() {
         // Fallback to manual Python execution
         console.log('\n📝 To enable the watcher, run:');
         console.log('   cd claude-self-reflect');
-        console.log('   source mcp-server/venv/bin/activate');
-        console.log('   python scripts/import-watcher.py &');
+        console.log('   docker compose --profile watch up -d');
       }
     } else {
       console.log('\n📝 You can enable the watcher later by running:');
       console.log('   docker compose --profile watch up -d');
     }
   } catch {
-    console.log('⚠️  Watcher script not found');
+    console.log('⚠️  Docker compose not found');
+    console.log('   The watcher requires Docker to run continuously');
   }
 }
 

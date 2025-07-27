@@ -4,7 +4,7 @@ Claude forgets everything. This fixes that.
 
 ## What You Get
 
-Ask Claude about past conversations. Get actual answers. Local-first with no cloud dependencies, but cloud-enhanced search available when you need it.
+Ask Claude about past conversations. Get actual answers. **100% local by default** - your conversations never leave your machine. Cloud-enhanced search available when you need it.
 
 **Before**: "I don't have access to previous conversations"  
 **After**: 
@@ -142,6 +142,21 @@ Built by developers tired of re-explaining context every conversation.
 - Claude Code or Claude Desktop
 - Python 3.10+
 - 5 minutes for setup
+
+## Upgrading from Earlier Versions
+
+**v2.3.7+ includes major improvements:**
+- **Privacy First**: Local embeddings by default - your data never leaves your machine
+- **Smarter Setup**: Handles existing installations gracefully
+- **Better Security**: Automated vulnerability scanning
+
+**To upgrade:**
+```bash
+npm update -g claude-self-reflect
+claude-self-reflect setup  # Re-run setup, it handles everything
+```
+
+The setup wizard now detects and fixes common upgrade issues automatically. Your existing conversations remain searchable.
 
 ## Advanced Setup
 
