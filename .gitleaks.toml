@@ -18,7 +18,7 @@ id = "generic-api-key"
 commits = ["0003ad17", "4ff652ae"]
 paths = ['''scripts/import-live-conversation\.py''']
 
-# Allow false positive sourcegraph tokens in SARIF file
+# Allow false positive sourcegraph tokens in SARIF file (commit 0b77b64)
 [[rules]]
 id = "sourcegraph-access-token"
 [rules.allowlist]
