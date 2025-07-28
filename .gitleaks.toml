@@ -11,6 +11,13 @@ id = "openai-api-key"
 [rules.allowlist]
 commits = ["39b40d74", "d21f2d07", "0003ad17", "cd159bde"]
 
+# Allow test Voyage key in old Python script
+[[rules]]
+id = "generic-api-key"
+[rules.allowlist]
+commits = ["0003ad17", "4ff652ae"]
+paths = ['''scripts/import-live-conversation\.py''']
+
 [allowlist]
 # Global allowlist configuration
 description = "Allowlists for Claude Self-Reflect"
@@ -41,8 +48,5 @@ regexes = [
     '''YOUR_VOYAGE_KEY''',
     '''EXAMPLE_.*_KEY''',
     '''no API calls''',
-    '''no API keys''',
-    '''pa-wdTYGObaxhs-XFKX2r7WCczRwEVNb9eYMTSO3yrQhZI''',
-    # Pattern to match revoked OpenAI keys in old commits
-    '''sk-proj-[a-zA-Z0-9\-_]{130,150}'''
+    '''no API keys'''
 ]
