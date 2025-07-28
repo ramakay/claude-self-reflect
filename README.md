@@ -223,4 +223,12 @@ Monitor the release at: https://github.com/ramakay/claude-self-reflect/actions
 
 Stop reading. Start installing. Your future self will thank you.
 
+## Contributors & Acknowledgments
+
+Special thanks to our contributors and security researchers:
+
+- **[@TheGordon](https://github.com/TheGordon)** - Fixed critical timestamp parsing bug for Claude conversation exports (#10)
+- **[@akamalov](https://github.com/akamalov)** - Highlighted Ubuntu WSL bug and helped educate about filesystem nuances
+- **[@kylesnowschwartz](https://github.com/kylesnowschwartz)** - Comprehensive security review leading to v2.3.3+ security improvements (#6)
+
 MIT License. Built with ❤️ for the Claude community.

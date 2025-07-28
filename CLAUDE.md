@@ -168,6 +168,13 @@ claude-self-reflect/
 - Test files belong in organized directories, not root
 - **CRITICAL**: All agents MUST follow [MCP_REFERENCE.md](./MCP_REFERENCE.md) for MCP operations
 
+## File Organization
+- Claude automatically organizes .md files based on content (see parent project's CLAUDE.md)
+- **Organization Log**: If you can't find a created .md file, check `docs/organization-log.json`
+  - This log tracks where files have been moved by the auto-organization system
+  - It's in .gitignore so won't appear in git status
+  - Future agents should consult this log when files seem to be missing
+
 ## Upgrade Guide for Existing Users
 
 ### Key Changes in v2.3.7+
