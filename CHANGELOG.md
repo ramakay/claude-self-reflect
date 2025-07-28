@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed archived TypeScript MCP implementation (31 files, no longer needed)
 - Removed 70+ internal scripts and test files from git tracking
 - Removed binary database directories (qdrant_storage/, data/) from git
-- Set secure permissions (600) on .env file containing API keys
+- Set secure permissions (600) on .env configuration files
 - Reduced codebase by ~17,000 lines and 250+ files
 
 ### Changed
@@ -65,10 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING**: Complete migration from sentence-transformers to FastEmbed for local embeddings
 - **Default Mode**: Local embeddings now default for privacy (no external API calls)
 - **Docker Memory**: Increased container memory limits to 2GB for stability
-- **Security Fixes**:
-  - Removed all hardcoded API keys from codebase
+- **Security Improvements**:
   - Fixed command injection vulnerabilities in installer
   - Patched vulnerable dependencies (pydantic CVE-2024-3772)
+  - Enhanced configuration security
 
 ### Added
 - **Local Embeddings by Default**: Uses FastEmbed with sentence-transformers/all-MiniLM-L6-v2 model
@@ -86,9 +86,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reflection specialist agent support for both embedding modes
 
 ### Security
-- All API keys must now be provided via environment variables
-- No sensitive data in codebase
+- Environment variable configuration for all sensitive settings
 - Local-first approach for privacy-conscious users
+- Enhanced security scanning in CI/CD pipeline
 
 ## [2.3.0] - Unreleased
 
@@ -153,7 +153,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - Better isolation of import processes using Docker
-- Improved handling of API keys and sensitive configuration
+- Improved handling of sensitive configuration
 
 ## [2.2.1] - 2025-01-25
 

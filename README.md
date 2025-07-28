@@ -49,23 +49,14 @@ claude-self-reflect setup --voyage-key=YOUR_ACTUAL_KEY_HERE
 
 5 minutes. Everything automatic. Just works.
 
-> [!IMPORTANT]
-> **Security Update v2.3.3** - This version addresses critical security vulnerabilities. Please update immediately.
->
-> ### 🔒 Privacy & Data Exchange
-> 
-> | Mode | Data Storage | External API Calls | Data Sent | Search Quality |
-> |------|--------------|-------------------|-----------|----------------|
-> | **Local (Default)** | Your machine only | None | Nothing leaves your computer | Good - uses efficient local embeddings |
-> | **Cloud (Opt-in)** | Your machine | Voyage AI | Conversation text for embedding generation | Better - uses state-of-the-art models |
-> 
-> **Disclaimer**: Cloud mode sends conversation content to Voyage AI for processing. Review their [privacy policy](https://www.voyageai.com/privacy) before enabling.
-> 
-> ### Security Fixes in v2.3.3
-> - ✅ Removed hardcoded API keys
-> - ✅ Fixed command injection vulnerabilities
-> - ✅ Patched vulnerable dependencies
-> - ✅ Local embeddings by default using FastEmbed
+### 🔒 Privacy & Data Exchange
+
+| Mode | Data Storage | External API Calls | Data Sent | Search Quality |
+|------|--------------|-------------------|-----------|----------------|
+| **Local (Default)** | Your machine only | None | Nothing leaves your computer | Good - uses efficient local embeddings |
+| **Cloud (Opt-in)** | Your machine | Voyage AI | Conversation text for embedding generation | Better - uses state-of-the-art models |
+
+**Note**: Cloud mode sends conversation content to Voyage AI for processing. Review their [privacy policy](https://www.voyageai.com/privacy) before enabling.
  
 ## The Magic
 
