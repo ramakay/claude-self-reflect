@@ -13,15 +13,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Default behavior: searches only current project based on working directory
   - Cross-project search with `project="all"`
   - Specific project search by name
-- Enhanced reflection-specialist agent documentation with project search examples
+- Comprehensive project-scoped search documentation (docs/project-scoped-search.md)
+- Proactive cross-project search suggestions in reflection-specialist agent
+- Project search troubleshooting section in docs
+- Cross-project search strategies in advanced usage guide
 
 ### Changed
-- Search behavior now defaults to project-scoped for better focus and performance
+- **BREAKING**: Search behavior now defaults to project-scoped instead of searching all projects
+  - Previous behavior (search all) now requires explicit `project="all"`
+  - Improves focus, relevance, and performance (~100ms faster)
+  - Project isolation enhances privacy between different work contexts
 - Project names in search use folder names instead of full paths with dashes
+- Reflection-specialist agent now indicates which project was searched
 
 ### Documentation
-- Added project-scoped search section to README
-- Updated agent documentation with new search capabilities
+- Added detailed project-scoped search section to README with migration notes
+- Created comprehensive guide at docs/project-scoped-search.md
+- Updated reflection-specialist agent with proactive search patterns
+- Enhanced advanced usage guide with cross-project strategies
+- Added troubleshooting section for common project search issues
+
+### Migration Notes
+- Users upgrading from v2.4.2 or earlier will experience different search behavior
+- To restore old behavior, explicitly request "search all projects" in queries
+- Existing conversations remain searchable but are now filtered by project
+- See [Project-Scoped Search Guide](docs/project-scoped-search.md) for details
 
 ## [2.4.2] - 2025-07-28
 

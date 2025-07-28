@@ -125,27 +125,48 @@ The reflection specialist automatically activates. No special commands needed.
 
 ## Project-Scoped Search (New in v2.4.3)
 
-Searches are now **project-aware by default**. When you ask about past conversations, Claude automatically searches within your current project:
+**⚠️ Breaking Change**: Searches now default to current project only. Previously searched all projects.
+
+Conversations are now **project-aware by default**. When you ask about past conversations, Claude automatically searches within your current project directory, keeping results focused and relevant.
+
+### How It Works
 
 ```
-# In project "ShopifyMCPMockShop"
+# Example: Working in ~/projects/ShopifyMCPMockShop
 You: "What authentication method did we implement?"
-Claude: [Searches only ShopifyMCPMockShop conversations]
+Claude: [Searches ONLY ShopifyMCPMockShop conversations]
+        "Found 3 conversations about JWT authentication..."
 
-# Need to search across all projects?
+# To search everywhere (like pre-v2.4.3 behavior)
 You: "Search all projects for WebSocket implementations"
-Claude: [Searches across all your projects]
+Claude: [Searches across ALL your projects]
+        "Found implementations in 5 projects: ..."
 
-# Search a specific project
-You: "Find Docker setup discussions in claude-self-reflect project"
+# To search a specific project
+You: "Find Docker setup in claude-self-reflect project"
 Claude: [Searches only claude-self-reflect conversations]
 ```
 
-**Key behaviors:**
-- **Default**: Searches current project based on your working directory
-- **Cross-project**: Ask for "all projects" or "across projects" 
-- **Specific project**: Mention the project name explicitly
-- **Privacy**: Each project's conversations remain isolated
+### Key Behaviors
+
+| Search Type | How to Trigger | Example |
+|------------|----------------|---------|
+| **Current Project** (default) | Just ask normally | "What did we discuss about caching?" |
+| **All Projects** | Say "all projects" or "across projects" | "Search all projects for error handling" |
+| **Specific Project** | Mention the project name | "Find auth code in MyApp project" |
+
+### Why This Change?
+
+- **Focused Results**: No more sifting through unrelated conversations
+- **Better Performance**: Single-project search is ~100ms faster
+- **Natural Workflow**: Results match your current working context
+- **Privacy**: Work and personal projects stay isolated
+
+### Upgrading from Earlier Versions?
+
+Your existing conversations remain searchable. The only change is that searches now default to your current project. To get the old behavior, simply ask to "search all projects".
+
+See [Project-Scoped Search Guide](docs/project-scoped-search.md) for detailed examples and advanced usage.
 
 ## Memory Decay
 

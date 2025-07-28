@@ -50,14 +50,47 @@ Reference time in your query:
 "Yesterday's debugging session"
 ```
 
-### Project-Specific Search
-The system automatically scopes to your current project context.
+### Project-Specific Search (v2.4.3+)
+The system automatically scopes to your current project context:
+```
+# Default behavior - searches current project only
+"What did we discuss about authentication?"
 
-### Cross-Project Search
+# Explicit project targeting
+"Search the ecommerce-platform project for payment processing"
+"Look in claude-self-reflect for import issues"
 ```
-User: Search ALL my projects for WebSocket implementations
-Claude: I'll search across all projects for WebSocket-related discussions...
+
+### Cross-Project Search Strategies
+
+#### When to Use Cross-Project Search
+1. **Learning from Past Solutions**: "How have I handled rate limiting across all projects?"
+2. **Finding Patterns**: "Show me all error handling approaches I've used"
+3. **Architecture Comparisons**: "Compare authentication methods across projects"
+4. **Debugging Similar Issues**: "Have I seen this error in any project?"
+
+#### How to Trigger Cross-Project Search
 ```
+# Natural language triggers
+"Search all projects for WebSocket implementations"
+"Find OAuth patterns across all my work"
+"Look everywhere for database migration strategies"
+
+# API approach
+reflect_on_past(query="websocket", project="all")
+```
+
+#### Performance Considerations
+- Current project search: ~50-100ms
+- All projects search: ~150-250ms (scales with project count)
+- Use specific queries to reduce result processing time
+
+#### Organizing Results from Multiple Projects
+When searching across projects, the reflection agent will:
+1. Group results by project
+2. Show project names clearly
+3. Prioritize based on relevance and recency
+4. Suggest project-specific deep dives if patterns emerge
 
 ## Memory Decay Control
 

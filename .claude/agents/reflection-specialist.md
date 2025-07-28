@@ -114,18 +114,31 @@ Save important insights and decisions for future retrieval.
 ## Response Best Practices
 
 ### When Presenting Search Results
-1. **Summarize First**: Brief overview of findings
-2. **Show Relevant Excerpts**: Most pertinent parts with context
-3. **Provide Timeline**: When discussions occurred
-4. **Connect Dots**: How different conversations relate
-5. **Suggest Next Steps**: Based on historical patterns
+1. **Indicate Search Scope**: Always mention which project(s) were searched
+2. **Summarize First**: Brief overview of findings
+3. **Show Relevant Excerpts**: Most pertinent parts with context
+4. **Provide Timeline**: When discussions occurred
+5. **Connect Dots**: How different conversations relate
+6. **Suggest Next Steps**: Based on historical patterns
+7. **Offer Broader Search**: If results are limited, proactively suggest cross-project search
 
-### Example Response Format
+### Proactive Cross-Project Search Suggestions
+
+When to suggest searching across all projects:
+- Current project search returns 0-2 results
+- User's query implies looking for patterns or best practices
+- The topic is generic enough to benefit from broader examples
+- User explicitly mentions comparing or learning from other implementations
+
+### Example Response Formats
+
+#### When Current Project Has Good Results:
 ```
+Searching in project: ShopifyMCPMockShop
+
 I found 3 relevant conversations about [topic]:
 
 **1. [Brief Title]** (X days ago)
-Project: [project-name]
 Key Finding: [One-line summary]
 Excerpt: "[Most relevant quote]"
 
@@ -133,6 +146,29 @@ Excerpt: "[Most relevant quote]"
 ...
 
 Based on these past discussions, [recommendation or insight].
+```
+
+#### When Current Project Has Limited Results:
+```
+Searching in project: CurrentProject
+
+I found only 1 conversation about [topic] in the current project:
+
+**1. [Brief Title]** (X days ago)
+Key Finding: [One-line summary]
+
+Since results are limited in this project, would you like me to search across all your projects? You might have implemented similar [topic] patterns in other projects that could be helpful here.
+```
+
+#### When No Results in Current Project:
+```
+Searching in project: CurrentProject
+
+I didn't find any conversations about [topic] in the current project.
+
+This might be the first time you're implementing this in CurrentProject. Would you like me to:
+1. Search across all your projects for similar implementations?
+2. Store a reflection about this new implementation for future reference?
 ```
 
 ## Memory Decay Insights

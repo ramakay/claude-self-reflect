@@ -233,6 +233,82 @@ sudo apt-get install --reinstall python3
    - Python dependency conflicts
    - Incorrect file permissions
 
+## Project-Scoped Search Issues (v2.4.3+)
+
+### "No results found" but conversation exists
+
+**Symptom**: Search returns no results for conversations you know exist
+
+**Cause**: Project-scoped search only looks in current project by default
+
+**Solutions**:
+1. Verify your current working directory:
+   ```bash
+   pwd  # Should be inside the project you're searching
+   ```
+
+2. Try cross-project search:
+   ```
+   "Search all projects for [your query]"
+   ```
+
+3. Check which project is detected:
+   ```python
+   # The system looks for 'projects' in your path
+   # /Users/you/projects/MyApp → searches MyApp only
+   ```
+
+### Getting results from wrong project
+
+**Symptom**: Results appear but from unexpected project
+
+**Causes**:
+1. Working directory might be in parent folder
+2. Project detection failed (no 'projects' in path)
+3. Explicitly searching wrong project name
+
+**Solutions**:
+1. Change to correct project directory:
+   ```bash
+   cd ~/projects/correct-project
+   ```
+
+2. Use explicit project name:
+   ```
+   "Search in ProjectName for [query]"
+   ```
+
+### Project not detected correctly
+
+**Symptom**: System can't determine current project
+
+**Common Scenarios**:
+```bash
+# Works: Standard structure
+/Users/you/projects/my-app ✓
+
+# Fails: Non-standard paths
+/Users/you/code/my-app ✗
+/Users/you/work/client/app ✗
+```
+
+**Solutions**:
+1. Use explicit project parameter
+2. Reorganize to standard structure
+3. Always specify "all projects" for non-standard paths
+
+### Cross-project search is slow
+
+**Symptom**: "Search all projects" takes much longer
+
+**Cause**: Searches multiple collections (24+ in typical setup)
+
+**Solutions**:
+1. Be more specific in queries
+2. Search individual projects when possible
+3. Increase min_score to reduce results
+4. Use project-specific search as default
+
 ## Embedding Mode Issues
 
 ### Switching Between Local and Cloud Embeddings
