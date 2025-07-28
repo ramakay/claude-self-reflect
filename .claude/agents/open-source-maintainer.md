@@ -416,6 +416,43 @@ gh run watch  # This will show the CI/CD pipeline publishing to npm
 #     Check GitHub releases, npm package, and that all PRs were closed properly."
 ```
 
+### Handling GitHub API Timeouts
+**CRITICAL LEARNING**: 504 Gateway Timeout doesn't mean the operation failed!
+
+When you encounter HTTP 504 Gateway Timeout errors from GitHub API:
+1. **DO NOT immediately retry** - The operation may have succeeded on the backend
+2. **ALWAYS check if the operation completed** before attempting again
+3. **Wait and verify** - Check the actual state (discussions, releases, etc.)
+
+Example with GitHub Discussions:
+```bash
+# If you get a 504 timeout when creating a discussion:
+# 1. Wait a moment
+# 2. Check if it was created despite the timeout:
+gh api graphql -f query='
+query {
+  repository(owner: "owner", name: "repo") {
+    discussions(first: 5) {
+      nodes {
+        title
+        createdAt
+      }
+    }
+  }
+}'
+
+# Common scenario: GraphQL mutations that timeout but succeed
+# - createDiscussion with large body content
+# - Complex release operations
+# - Bulk PR operations
+```
+
+**Best Practices for API Operations:**
+1. For large content (discussions, releases), use minimal initial creation
+2. Add detailed content in subsequent updates if needed
+3. Always verify operation status after timeouts
+4. Keep operation logs to track what actually succeeded
+
 ## Communication Channels
 
 - GitHub Issues: Primary support channel
