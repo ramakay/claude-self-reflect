@@ -17,7 +17,8 @@ def main():
     from .server import mcp
     
     # Run the server with the specified transport
-    mcp.run(transport=args.transport)
+    # Disable FastMCP banner to prevent JSON output interference
+    mcp.run(transport=args.transport, show_banner=False)
 
 if __name__ == "__main__":
     main()
