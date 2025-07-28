@@ -5,6 +5,24 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.3] - 2025-07-28
+
+### Added
+- Project-scoped search functionality in MCP server (#14)
+  - New optional `project` parameter for `reflect_on_past` tool
+  - Default behavior: searches only current project based on working directory
+  - Cross-project search with `project="all"`
+  - Specific project search by name
+- Enhanced reflection-specialist agent documentation with project search examples
+
+### Changed
+- Search behavior now defaults to project-scoped for better focus and performance
+- Project names in search use folder names instead of full paths with dashes
+
+### Documentation
+- Added project-scoped search section to README
+- Updated agent documentation with new search capabilities
+
 ## [2.4.2] - 2025-07-28
 
 ### Added
