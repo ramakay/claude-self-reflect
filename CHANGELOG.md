@@ -5,6 +5,20 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2025-07-28
+
+### Added
+- Gitleaks configuration (`.gitleaks.toml`) for better CI/CD security scanning
+- Support for handling false positives in security scans
+
+### Changed
+- Improved documentation clarity around privacy and security
+- Removed unnecessary security alerts from README
+
+### Security
+- Enhanced CI/CD pipeline with proper secret scanning configuration
+- Better handling of historical commits in security scans
+
 ## [2.3.7] - 2025-07-27
 
 ### Security
