@@ -7,6 +7,7 @@ from typing import Any, Optional, List, Dict, Union
 from datetime import datetime
 import json
 import numpy as np
+import hashlib
 
 from fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field
@@ -149,7 +150,8 @@ async def reflect_on_past(
     query: str = Field(description="The search query to find semantically similar conversations"),
     limit: int = Field(default=5, description="Maximum number of results to return"),
     min_score: float = Field(default=0.7, description="Minimum similarity score (0-1)"),
-    use_decay: Union[int, str] = Field(default=-1, description="Apply time-based decay: 1=enable, 0=disable, -1=use environment default (accepts int or str)")
+    use_decay: Union[int, str] = Field(default=-1, description="Apply time-based decay: 1=enable, 0=disable, -1=use environment default (accepts int or str)"),
+    project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects.")
 ) -> str:
     """Search for relevant past conversations using semantic search with optional time decay."""
     
@@ -167,7 +169,30 @@ async def reflect_on_past(
         else ENABLE_MEMORY_DECAY  # -1 or any other value
     )
     
+    # Determine project scope
+    target_project = project
+    if project is None:
+        # Try to detect current project from working directory
+        cwd = os.getcwd()
+        # Extract project name from path (e.g., /Users/.../projects/project-name)
+        path_parts = Path(cwd).parts
+        if 'projects' in path_parts:
+            idx = path_parts.index('projects')
+            if idx + 1 < len(path_parts):
+                target_project = path_parts[idx + 1]
+        elif '.claude' in path_parts:
+            # If we're in a .claude directory, go up to find project
+            for i, part in enumerate(path_parts):
+                if part == '.claude' and i > 0:
+                    target_project = path_parts[i - 1]
+                    break
+        
+        # If still no project detected, use the last directory name
+        if target_project is None:
+            target_project = Path(cwd).name
+    
     await ctx.debug(f"Searching for: {query}")
+    await ctx.debug(f"Project scope: {target_project if target_project != 'all' else 'all projects'}")
     await ctx.debug(f"Decay enabled: {should_use_decay}")
     await ctx.debug(f"Native decay mode: {USE_NATIVE_DECAY}")
     await ctx.debug(f"ENABLE_MEMORY_DECAY env: {ENABLE_MEMORY_DECAY}")
@@ -182,13 +207,34 @@ async def reflect_on_past(
         if not all_collections:
             return "No conversation collections found. Please import conversations first."
         
-        await ctx.debug(f"Searching across {len(all_collections)} collections")
+        # Filter collections by project if not searching all
+        project_collections = []  # Define at this scope for later use
+        if target_project != 'all':
+            # Generate the collection name pattern for this project
+            project_hash = hashlib.md5(target_project.encode()).hexdigest()[:8]
+            project_collections = [
+                c for c in all_collections 
+                if c.startswith(f"conv_{project_hash}_")
+            ]
+            
+            if not project_collections:
+                # Try to find collections with project metadata
+                # Fall back to searching all collections but filtering by project metadata
+                await ctx.debug(f"No collections found for project hash {project_hash}, will filter by metadata")
+                collections_to_search = all_collections
+            else:
+                await ctx.debug(f"Found {len(project_collections)} collections for project {target_project}")
+                collections_to_search = project_collections
+        else:
+            collections_to_search = all_collections
+        
+        await ctx.debug(f"Searching across {len(collections_to_search)} collections")
         await ctx.debug(f"Using {'local' if PREFER_LOCAL_EMBEDDINGS or not voyage_client else 'Voyage AI'} embeddings")
         
         all_results = []
         
         # Search each collection
-        for collection_name in all_collections:
+        for collection_name in collections_to_search:
             try:
                 if should_use_decay and USE_NATIVE_DECAY and NATIVE_DECAY_AVAILABLE:
                     # Use native Qdrant decay with newer API
@@ -285,13 +331,18 @@ async def reflect_on_past(
                         raw_timestamp = point.payload.get('timestamp', datetime.now().isoformat())
                         clean_timestamp = raw_timestamp.replace('Z', '+00:00') if raw_timestamp.endswith('Z') else raw_timestamp
                         
+                        # Check project filter if we're searching all collections but want specific project
+                        point_project = point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', ''))
+                        if target_project != 'all' and not project_collections and point_project != target_project:
+                            continue  # Skip results from other projects
+                            
                         all_results.append(SearchResult(
                             id=str(point.id),
                             score=point.score,  # Score already includes decay
                             timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
                             excerpt=(point.payload.get('text', '')[:500] + '...'),
-                            project_name=point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', '')),
+                            project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
                             collection_name=collection_name
                         ))
@@ -350,13 +401,18 @@ async def reflect_on_past(
                         raw_timestamp = point.payload.get('timestamp', datetime.now().isoformat())
                         clean_timestamp = raw_timestamp.replace('Z', '+00:00') if raw_timestamp.endswith('Z') else raw_timestamp
                         
+                        # Check project filter if we're searching all collections but want specific project
+                        point_project = point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', ''))
+                        if target_project != 'all' and not project_collections and point_project != target_project:
+                            continue  # Skip results from other projects
+                            
                         all_results.append(SearchResult(
                             id=str(point.id),
                             score=adjusted_score,  # Use adjusted score
                             timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
                             excerpt=(point.payload.get('text', '')[:500] + '...'),
-                            project_name=point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', '')),
+                            project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
                             collection_name=collection_name
                         ))
@@ -375,13 +431,18 @@ async def reflect_on_past(
                         raw_timestamp = point.payload.get('timestamp', datetime.now().isoformat())
                         clean_timestamp = raw_timestamp.replace('Z', '+00:00') if raw_timestamp.endswith('Z') else raw_timestamp
                         
+                        # Check project filter if we're searching all collections but want specific project
+                        point_project = point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', ''))
+                        if target_project != 'all' and not project_collections and point_project != target_project:
+                            continue  # Skip results from other projects
+                            
                         all_results.append(SearchResult(
                             id=str(point.id),
                             score=point.score,
                             timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
                             excerpt=(point.payload.get('text', '')[:500] + '...'),
-                            project_name=point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', '')),
+                            project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
                             collection_name=collection_name
                         ))
