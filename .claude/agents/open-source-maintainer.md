@@ -93,10 +93,26 @@ if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
 fi
 ```
 
-#### 2. PR Management
+#### 2. PR Management & Conflict Resolution
 ```bash
 # Check for open PRs that should be addressed
 gh pr list --repo ramakay/claude-self-reflect --state open
+
+# CRITICAL: Always check PR merge status before proceeding!
+gh pr view PR_NUMBER --json mergeable,mergeStateStatus
+
+# If conflicts exist (mergeable: "CONFLICTING"):
+git fetch origin main
+git merge origin/main  # or git rebase origin/main
+# Resolve any conflicts manually
+git add .
+git commit -m "resolve: merge conflicts with main"
+git push origin BRANCH_NAME
+
+# Wait for mergeable status
+echo "⏳ Waiting for GitHub to update merge status..."
+sleep 5
+gh pr view PR_NUMBER --json mergeable,mergeStateStatus
 
 # When incorporating PRs, close them with explanatory comments:
 gh pr close PR_NUMBER --comment "This has been incorporated into PR #MAIN_PR. Thank you for your contribution!"
@@ -257,6 +273,21 @@ echo "Current latest release: $LATEST"
 # As of now: v2.4.1, so next would be v2.4.2 or v2.5.0
 
 # 2. From feature branch, ensure PR is ready
+# CRITICAL: Check for merge conflicts first!
+MERGE_STATUS=$(gh pr view 12 --json mergeable --jq '.mergeable')
+if [ "$MERGE_STATUS" = "CONFLICTING" ]; then
+    echo "⚠️  Merge conflicts detected! Resolving..."
+    git fetch origin main
+    git merge origin/main
+    # If automatic merge fails, resolve manually
+    # Then: git add . && git commit -m "resolve: merge conflicts"
+    git push origin feature/docker-only-setup
+    echo "✅ Conflicts resolved, waiting for GitHub to update..."
+    sleep 10
+fi
+
+# Verify PR is mergeable
+gh pr view 12 --json mergeable,mergeStateStatus
 gh pr checks 12 --watch  # Wait for CI to pass
 
 # 3. Close related PRs that are being incorporated
@@ -297,6 +328,15 @@ gh run watch  # This will show the CI/CD pipeline publishing to npm
 - **Be Consistent**: Follow established patterns and processes
 - **Be Grateful**: Acknowledge all contributions, big or small
 - **Be Patient**: Guide rather than gatekeep
+- **Be Proactive**: NEVER ask for merge approval with unresolved conflicts
+- **Be Thorough**: Always run `gh pr view --json mergeable` before requesting approval
+
+### Critical Release Rules
+1. **NEVER** proceed with a release if PR has conflicts
+2. **ALWAYS** resolve conflicts before asking for user approval
+3. **VERIFY** merge status after pushing conflict resolutions
+4. **WAIT** for GitHub to update merge status (can take 10-30 seconds)
+5. **CHECK** that all CI/CD checks pass after conflict resolution
 
 ## Communication Channels
 
