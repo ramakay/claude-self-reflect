@@ -175,6 +175,22 @@ async function startDockerServices() {
       // Ignore errors if no containers exist
     }
     
+    // Check for existing bind mount data that needs migration
+    const bindMountPath = join(projectRoot, 'data', 'qdrant');
+    try {
+      await fs.access(bindMountPath);
+      const files = await fs.readdir(bindMountPath);
+      if (files.length > 0) {
+        console.log('\n⚠️  Found existing Qdrant data in ./data/qdrant');
+        console.log('📦 This will be automatically migrated to Docker volume on first start.');
+        
+        // Create a migration marker
+        await fs.writeFile(join(projectRoot, '.needs-migration'), 'true');
+      }
+    } catch {
+      // No existing data, nothing to migrate
+    }
+    
     // Start Qdrant and MCP server
     console.log('📦 Starting Qdrant database and MCP server...');
     safeExec('docker', ['compose', '--profile', 'mcp', 'up', '-d'], {
@@ -185,6 +201,43 @@ async function startDockerServices() {
     // Wait for services to be ready
     console.log('⏳ Waiting for services to start...');
     await new Promise(resolve => setTimeout(resolve, 5000));
+    
+    // Check if we need to migrate data
+    try {
+      await fs.access(join(projectRoot, '.needs-migration'));
+      console.log('\n🔄 Migrating data from bind mount to Docker volume...');
+      
+      // Stop Qdrant to perform migration
+      safeExec('docker', ['compose', 'stop', 'qdrant'], {
+        cwd: projectRoot,
+        stdio: 'pipe'
+      });
+      
+      // Copy data from bind mount to Docker volume
+      safeExec('docker', ['run', '--rm', 
+        '-v', `${projectRoot}/data/qdrant:/source:ro`,
+        '-v', 'claude-self-reflect_qdrant_data:/target',
+        'alpine', 'sh', '-c', 'cp -R /source/* /target/'
+      ], {
+        cwd: projectRoot,
+        stdio: 'inherit'
+      });
+      
+      console.log('✅ Data migration completed!');
+      
+      // Remove migration marker
+      await fs.unlink(join(projectRoot, '.needs-migration'));
+      
+      // Restart Qdrant
+      safeExec('docker', ['compose', '--profile', 'mcp', 'up', '-d', 'qdrant'], {
+        cwd: projectRoot,
+        stdio: 'pipe'
+      });
+      
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    } catch {
+      // No migration needed
+    }
     
     // Check if services are running
     const psOutput = safeExec('docker', ['compose', 'ps', '--format', 'table'], {

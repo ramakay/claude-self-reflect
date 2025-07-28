@@ -1,3 +1,6 @@
+volumes:
+  qdrant_data:
+
 services:
   # Qdrant vector database - the heart of semantic search
   qdrant:
@@ -6,7 +9,7 @@ services:
     ports:
       - "${QDRANT_PORT:-6333}:6333"
     volumes:
-      - ./data/qdrant:/qdrant/storage
+      - qdrant_data:/qdrant/storage
     environment:
       - QDRANT__LOG_LEVEL=INFO
       - QDRANT__SERVICE__HTTP_PORT=6333

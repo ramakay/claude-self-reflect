@@ -52,9 +52,9 @@ docker compose down
 
 # Restore Qdrant data
 echo "• Restoring Qdrant data..."
-docker volume rm qdrant-mcp-stack_qdrant-storage 2>/dev/null || true
-docker volume create qdrant-mcp-stack_qdrant-storage
-docker run --rm -v qdrant-mcp-stack_qdrant-storage:/data -v "$BACKUP_DIR":/backup alpine tar -xzf /backup/qdrant-data.tar.gz -C /data
+docker volume rm claude-self-reflect_qdrant_data 2>/dev/null || true
+docker volume create claude-self-reflect_qdrant_data
+docker run --rm -v claude-self-reflect_qdrant_data:/data -v "$BACKUP_DIR":/backup alpine tar -xzf /backup/qdrant-data.tar.gz -C /data
 
 # Restore configuration
 echo "• Restoring configuration..."

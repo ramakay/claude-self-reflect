@@ -93,3 +93,4 @@ Desktop.ini
 *.bak
 *~# Docker-only setup branch
 work/
+.needs-migration
