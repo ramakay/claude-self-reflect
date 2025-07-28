@@ -131,7 +131,7 @@ print_success "Python environment ready"
 echo ""
 
 # Create necessary directories
-mkdir -p config data/qdrant
+mkdir -p config
 
 # Pull Docker images
 print_info "Pulling Docker images..."

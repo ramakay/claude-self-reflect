@@ -1,3 +1,6 @@
+volumes:
+  qdrant_data:
+
 services:
   # Qdrant vector database - the heart of semantic search
   qdrant:
@@ -6,17 +9,11 @@ services:
     ports:
       - "${QDRANT_PORT:-6333}:6333"
     volumes:
-      - ./data/qdrant:/qdrant/storage
+      - qdrant_data:/qdrant/storage
     environment:
       - QDRANT__LOG_LEVEL=INFO
       - QDRANT__SERVICE__HTTP_PORT=6333
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:6333/readyz"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
     mem_limit: ${QDRANT_MEMORY:-1g}
     memswap_limit: ${QDRANT_MEMORY:-1g}
 
@@ -27,8 +24,7 @@ services:
       dockerfile: Dockerfile.importer
     container_name: claude-reflection-importer
     depends_on:
-      qdrant:
-        condition: service_healthy
+      - qdrant
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
       - ./config:/config
@@ -75,6 +71,28 @@ services:
     mem_limit: 2g
     memswap_limit: 2g
 
+  # MCP server for Claude integration
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp-server
+    container_name: claude-reflection-mcp
+    depends_on:
+      - qdrant
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - VOYAGE_KEY=${VOYAGE_KEY:-}
+      - PREFER_LOCAL_EMBEDDINGS=${PREFER_LOCAL_EMBEDDINGS:-true}
+      - ENABLE_MEMORY_DECAY=${ENABLE_MEMORY_DECAY:-true}
+      - DECAY_WEIGHT=${DECAY_WEIGHT:-0.3}
+      - DECAY_SCALE_DAYS=${DECAY_SCALE_DAYS:-90}
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    profiles: ["mcp"]
+
 networks:
   default:
     name: claude-reflection-network
+    external: false

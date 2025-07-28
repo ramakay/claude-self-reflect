@@ -14,12 +14,16 @@ Qdrant is a vector similarity search engine designed for production use. We chos
 ### Configuration
 ```yaml
 # docker-compose.yaml
-qdrant:
-  image: qdrant/qdrant:latest
-  ports:
-    - "6333:6333"
-  volumes:
-    - ./data/qdrant:/qdrant/storage
+volumes:
+  qdrant_data:
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
 ```
 
 ### Data Model

@@ -36,25 +36,40 @@ This directory contains specialized sub-agents that Claude will proactively use 
    - Similarity threshold optimization
    - A/B testing methodologies
 
+6. **[reflection-specialist](./reflection-specialist.md)** - Conversation memory expert
+   - Searching past conversations with MCP tools
+   - Storing insights and reflections
+   - Maintaining knowledge continuity
+   - Cross-project conversation search
+
 ### 🌟 Open Source Development Agents
 
-6. **[open-source-maintainer](./open-source-maintainer.md)** - Project governance expert
+7. **[open-source-maintainer](./open-source-maintainer.md)** - Project governance expert
    - Release management and versioning
    - Community building and engagement
    - Issue and PR triage
    - Contributor recognition
 
-7. **[documentation-writer](./documentation-writer.md)** - Technical documentation specialist
+8. **[documentation-writer](./documentation-writer.md)** - Technical documentation specialist
    - API documentation and references
    - Tutorial and guide creation
    - Architecture documentation
    - Example code development
 
-8. **[performance-tuner](./performance-tuner.md)** - Performance optimization specialist
+9. **[performance-tuner](./performance-tuner.md)** - Performance optimization specialist
    - Search latency optimization
    - Memory usage reduction
    - Scalability improvements
    - Benchmark creation and monitoring
+
+### 🧪 Testing and Validation Agents
+
+10. **[reflect-tester](./reflect-tester.md)** - Comprehensive testing specialist
+   - MCP configuration validation
+   - Tool functionality testing
+   - Collection health verification
+   - Import system validation
+   - Embedding mode testing
 
 ## How Agents Work
 
@@ -66,6 +81,8 @@ Claude automatically engages the appropriate agent based on context. For example
 - Discussing "import showing 0 messages" → `import-debugger`
 - Working on "release v1.2.0" → `open-source-maintainer`
 - Asking about "Qdrant collection errors" → `qdrant-specialist`
+- Requesting "test all reflection functionality" → `reflect-tester`
+- Searching "past conversations about X" → `reflection-specialist`
 
 ### Agent Capabilities
 

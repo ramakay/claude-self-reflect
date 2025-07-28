@@ -23,7 +23,7 @@ echo -e "${BLUE}📦 Creating backup in: $BACKUP_DIR${NC}"
 
 # Backup Qdrant data
 echo "• Backing up Qdrant data..."
-docker run --rm -v qdrant-mcp-stack_qdrant-storage:/data -v "$BACKUP_DIR":/backup alpine tar -czf /backup/qdrant-data.tar.gz -C /data .
+docker run --rm -v claude-self-reflect_qdrant_data:/data -v "$BACKUP_DIR":/backup alpine tar -czf /backup/qdrant-data.tar.gz -C /data .
 
 # Backup configuration
 echo "• Backing up configuration..."

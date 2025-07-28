@@ -91,4 +91,6 @@ Desktop.ini
 # Backup files
 *.backup
 *.bak
-*~
+*~# Docker-only setup branch
+work/
+.needs-migration

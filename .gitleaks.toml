@@ -18,6 +18,12 @@ id = "generic-api-key"
 commits = ["0003ad17", "4ff652ae"]
 paths = ['''scripts/import-live-conversation\.py''']
 
+# Allow false positive sourcegraph tokens in SARIF file (commit 0b77b64)
+[[rules]]
+id = "sourcegraph-access-token"
+[rules.allowlist]
+commits = ["0b77b64e29e5b8a899e723341947f7ebf44217fa"]
+
 [allowlist]
 # Global allowlist configuration
 description = "Allowlists for Claude Self-Reflect"
