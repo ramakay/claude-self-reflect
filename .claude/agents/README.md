@@ -56,6 +56,15 @@ This directory contains specialized sub-agents that Claude will proactively use 
    - Scalability improvements
    - Benchmark creation and monitoring
 
+### 🧪 Testing and Validation Agents
+
+9. **[reflect-tester](./reflect-tester.md)** - Comprehensive testing specialist
+   - MCP configuration validation
+   - Tool functionality testing
+   - Collection health verification
+   - Import system validation
+   - Embedding mode testing
+
 ## How Agents Work
 
 ### Automatic Activation
@@ -66,6 +75,7 @@ Claude automatically engages the appropriate agent based on context. For example
 - Discussing "import showing 0 messages" → `import-debugger`
 - Working on "release v1.2.0" → `open-source-maintainer`
 - Asking about "Qdrant collection errors" → `qdrant-specialist`
+- Requesting "test all reflection functionality" → `reflect-tester`
 
 ### Agent Capabilities
 
