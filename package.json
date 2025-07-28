@@ -32,8 +32,12 @@
     "mcp-server/src/**/*.py",
     "mcp-server/pyproject.toml",
     "mcp-server/run-mcp.sh",
+    "mcp-server/run-mcp-docker.sh",
     "scripts/import-*.py",
     ".claude/agents/*.md",
+    "docker-compose.yaml",
+    "Dockerfile.*",
+    ".env.example",
     "README.md",
     "LICENSE"
   ],

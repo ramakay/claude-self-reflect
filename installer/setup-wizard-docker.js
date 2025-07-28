@@ -271,6 +271,13 @@ async function importConversations() {
 
 async function showFinalInstructions() {
   console.log('\n✅ Setup complete!');
+  
+  console.log('\n🎯 Your Claude Self-Reflect System:');
+  console.log('   • 🌐 Qdrant Dashboard: http://localhost:6333/dashboard/');
+  console.log('   • 📊 Status: All services running');
+  console.log('   • 🔍 Search: Semantic search with memory decay enabled');
+  console.log('   • 🚀 Import: Watcher checking every 60 seconds');
+  
   console.log('\n📋 Quick Reference Commands:');
   console.log('   • Check status: docker compose ps');
   console.log('   • View logs: docker compose logs -f');
@@ -286,8 +293,52 @@ async function showFinalInstructions() {
   console.log('\n📚 Documentation: https://github.com/ramakay/claude-self-reflect');
 }
 
+async function checkExistingInstallation() {
+  try {
+    // Check if services are already running
+    const psResult = safeExec('docker', ['compose', '-f', 'docker-compose.yaml', 'ps', '--format', 'json'], {
+      cwd: projectRoot,
+      encoding: 'utf8'
+    });
+    
+    if (psResult && psResult.includes('claude-reflection-')) {
+      const services = psResult.split('\n').filter(line => line.trim());
+      const runningServices = services.filter(line => line.includes('"State":"running"')).length;
+      
+      if (runningServices >= 2) {  // At least Qdrant and MCP should be running
+        console.log('✅ Claude Self-Reflect is already installed and running!\n');
+        console.log('🎯 Your System Status:');
+        console.log('   • 🌐 Qdrant Dashboard: http://localhost:6333/dashboard/');
+        console.log('   • 📊 Services: ' + runningServices + ' containers running');
+        console.log('   • 🔍 Mode: ' + (localMode ? 'Local embeddings (privacy mode)' : 'Cloud embeddings (Voyage AI)'));
+        console.log('   • ⚡ Memory decay: Enabled (90-day half-life)');
+        
+        console.log('\n📋 Quick Commands:');
+        console.log('   • View status: docker compose ps');
+        console.log('   • View logs: docker compose logs -f');
+        console.log('   • Restart: docker compose restart');
+        console.log('   • Stop: docker compose down');
+        
+        console.log('\n💡 To re-run setup, first stop services with: docker compose down');
+        return true;
+      }
+    }
+  } catch (err) {
+    // Services not running, continue with setup
+  }
+  return false;
+}
+
 async function main() {
   console.log('🚀 Claude Self-Reflect Setup (Docker Edition)\n');
+  
+  // Check if already installed
+  const alreadyInstalled = await checkExistingInstallation();
+  if (alreadyInstalled) {
+    if (rl) rl.close();
+    process.exit(0);
+  }
+  
   console.log('This simplified setup runs everything in Docker.');
   console.log('No Python installation required!\n');
   

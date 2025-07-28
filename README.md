@@ -41,6 +41,8 @@ claude-self-reflect setup
 # ✅ Start monitoring for new conversations
 # ✅ Verify the reflection tools work
 # 🔒 Keep all data local - no API keys needed
+# 🚀 Import watcher runs every 60 seconds
+# ⚡ Memory decay enabled by default (90-day half-life)
 ```
 
 ### Cloud Mode (Better Search Accuracy)
@@ -138,15 +140,19 @@ Built by developers tired of re-explaining context every conversation.
 ## Requirements
 
 - Claude Code or Claude Desktop
-- Python 3.10+
+- Docker Desktop (macOS/Windows) or Docker Engine (Linux)
+- Node.js 16+ (for the setup wizard only)
 - 5 minutes for setup
 
 ## Upgrading from Earlier Versions
 
-**v2.3.7+ includes major improvements:**
+**v2.4.0+ includes major improvements:**
+- **Docker-Only Setup**: No more Python environment issues!
 - **Privacy First**: Local embeddings by default - your data never leaves your machine
 - **Smarter Setup**: Handles existing installations gracefully
 - **Better Security**: Automated vulnerability scanning
+- **Real-Time Import**: Watcher checks for new conversations every 60 seconds
+- **Fixed MCP Server**: Now uses correct server implementation with local embedding support
 
 **To upgrade:**
 ```bash
