@@ -328,4 +328,6 @@ Project-scoped search represents a significant improvement in how Claude Self-Re
 
 The breaking change is intentional and designed to match how developers naturally think about their work - in project contexts. We believe this change, while requiring some adjustment, significantly improves the daily experience of using Claude Self-Reflect.
 
-For questions or feedback, please visit our [GitHub Discussions](https://github.com/ramakay/claude-self-reflect/discussions).
+For questions or feedback:
+- Join the discussion: [Project-Scoped Search Feedback](https://github.com/ramakay/claude-self-reflect/discussions/18)
+- Report bugs: [GitHub Issues](https://github.com/ramakay/claude-self-reflect/issues)

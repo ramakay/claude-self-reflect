@@ -237,6 +237,11 @@ Both embedding options work well. Local mode uses FastEmbed for privacy and offl
 - [GitHub Issues](https://github.com/ramakay/claude-self-reflect/issues)
 - [Discussions](https://github.com/ramakay/claude-self-reflect/discussions)
 
+## Latest Updates
+
+- 📢 [v2.4.x Announcement](https://github.com/ramakay/claude-self-reflect/discussions/19) - Major improvements including Docker setup and project-scoped search
+- 💬 [Project-Scoped Search Feedback](https://github.com/ramakay/claude-self-reflect/discussions/18) - Share your experience with the breaking change
+
 ## Contributing
 
 See our [Contributing Guide](CONTRIBUTING.md) for development setup and guidelines.
