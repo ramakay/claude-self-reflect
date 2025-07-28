@@ -222,10 +222,14 @@ async def reflect_on_past(
                     
                     # Process results from native decay search
                     for point in results.points:
+                        # Clean timestamp for proper parsing
+                        raw_timestamp = point.payload.get('timestamp', datetime.now().isoformat())
+                        clean_timestamp = raw_timestamp.replace('Z', '+00:00') if raw_timestamp.endswith('Z') else raw_timestamp
+                        
                         all_results.append(SearchResult(
                             id=str(point.id),
                             score=point.score,  # Score already includes decay
-                            timestamp=point.payload.get('timestamp', datetime.now().isoformat()),
+                            timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
                             excerpt=(point.payload.get('text', '')[:500] + '...'),
                             project_name=point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', '')),
@@ -283,10 +287,14 @@ async def reflect_on_past(
                     
                     # Convert to SearchResult format
                     for adjusted_score, point in decay_results[:limit]:
+                        # Clean timestamp for proper parsing
+                        raw_timestamp = point.payload.get('timestamp', datetime.now().isoformat())
+                        clean_timestamp = raw_timestamp.replace('Z', '+00:00') if raw_timestamp.endswith('Z') else raw_timestamp
+                        
                         all_results.append(SearchResult(
                             id=str(point.id),
                             score=adjusted_score,  # Use adjusted score
-                            timestamp=point.payload.get('timestamp', datetime.now().isoformat()),
+                            timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
                             excerpt=(point.payload.get('text', '')[:500] + '...'),
                             project_name=point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', '')),
@@ -304,10 +312,14 @@ async def reflect_on_past(
                     )
                     
                     for point in results:
+                        # Clean timestamp for proper parsing
+                        raw_timestamp = point.payload.get('timestamp', datetime.now().isoformat())
+                        clean_timestamp = raw_timestamp.replace('Z', '+00:00') if raw_timestamp.endswith('Z') else raw_timestamp
+                        
                         all_results.append(SearchResult(
                             id=str(point.id),
                             score=point.score,
-                            timestamp=point.payload.get('timestamp', datetime.now().isoformat()),
+                            timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
                             excerpt=(point.payload.get('text', '')[:500] + '...'),
                             project_name=point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', '')),
@@ -330,7 +342,9 @@ async def reflect_on_past(
         result_text = f"Found {len(all_results)} relevant conversation(s) for '{query}':\n\n"
         for i, result in enumerate(all_results):
             result_text += f"**Result {i+1}** (Score: {result.score:.3f})\n"
-            result_text += f"Time: {datetime.fromisoformat(result.timestamp).strftime('%Y-%m-%d %H:%M:%S')}\n"
+            # Handle timezone suffix 'Z' properly
+            timestamp_clean = result.timestamp.replace('Z', '+00:00') if result.timestamp.endswith('Z') else result.timestamp
+            result_text += f"Time: {datetime.fromisoformat(timestamp_clean).strftime('%Y-%m-%d %H:%M:%S')}\n"
             result_text += f"Project: {result.project_name}\n"
             result_text += f"Role: {result.role}\n"
             result_text += f"Excerpt: {result.excerpt}\n"
