@@ -123,6 +123,30 @@ Once installed, just talk naturally:
 
 The reflection specialist automatically activates. No special commands needed.
 
+## Project-Scoped Search (New in v2.4.3)
+
+Searches are now **project-aware by default**. When you ask about past conversations, Claude automatically searches within your current project:
+
+```
+# In project "ShopifyMCPMockShop"
+You: "What authentication method did we implement?"
+Claude: [Searches only ShopifyMCPMockShop conversations]
+
+# Need to search across all projects?
+You: "Search all projects for WebSocket implementations"
+Claude: [Searches across all your projects]
+
+# Search a specific project
+You: "Find Docker setup discussions in claude-self-reflect project"
+Claude: [Searches only claude-self-reflect conversations]
+```
+
+**Key behaviors:**
+- **Default**: Searches current project based on your working directory
+- **Cross-project**: Ask for "all projects" or "across projects" 
+- **Specific project**: Mention the project name explicitly
+- **Privacy**: Each project's conversations remain isolated
+
 ## Memory Decay
 
 Recent conversations matter more. Old ones fade. Like your brain, but reliable.

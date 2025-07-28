@@ -41,7 +41,7 @@ You are a conversation memory specialist for the Claude Self Reflect project. Yo
 Search for relevant past conversations using semantic similarity.
 
 ```javascript
-// Basic search
+// Basic search (searches current project by default)
 {
   query: "streaming importer fixes",
   limit: 5,
@@ -55,7 +55,28 @@ Search for relevant past conversations using semantic similarity.
   min_score: 0.05,  // Common threshold for relevant results
   use_decay: 1  // Apply time-based relevance (1=enable, 0=disable, -1=default)
 }
+
+// Search specific project (NEW in v2.4.3)
+{
+  query: "Docker setup",
+  project: "ShopifyMCPMockShop",  // Use actual folder name
+  limit: 5
+}
+
+// Cross-project search (NEW in v2.4.3)
+{
+  query: "error handling patterns",
+  project: "all",  // Search across all projects
+  limit: 10
+}
 ```
+
+#### Default Behavior: Project-Scoped Search (NEW in v2.4.3)
+**IMPORTANT**: Searches are now scoped to the current project by default:
+- Auto-detects current project from your working directory
+- Only returns results from that project unless you specify otherwise
+- Use `project: "all"` to explicitly search across all projects
+- Use `project: "ProjectName"` to search a specific project (use the actual folder name)
 
 ### store_reflection
 Save important insights and decisions for future retrieval.

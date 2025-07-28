@@ -191,6 +191,13 @@ async def reflect_on_past(
         if target_project is None:
             target_project = Path(cwd).name
     
+    # For project matching, we need to handle the dash-encoded format
+    # Convert folder name to the format used in stored data
+    if target_project != 'all':
+        # The stored format uses full path with dashes, so we need to construct it
+        # For now, let's try to match based on the end of the project name
+        pass  # We'll handle this differently in the filtering logic
+    
     await ctx.debug(f"Searching for: {query}")
     await ctx.debug(f"Project scope: {target_project if target_project != 'all' else 'all projects'}")
     await ctx.debug(f"Decay enabled: {should_use_decay}")
@@ -333,8 +340,13 @@ async def reflect_on_past(
                         
                         # Check project filter if we're searching all collections but want specific project
                         point_project = point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', ''))
-                        if target_project != 'all' and not project_collections and point_project != target_project:
-                            continue  # Skip results from other projects
+                        
+                        # Handle project matching - check if the target project name appears at the end of the stored project path
+                        if target_project != 'all' and not project_collections:
+                            # The stored project name is like "-Users-ramakrishnanannaswamy-projects-ShopifyMCPMockShop"
+                            # We want to match just "ShopifyMCPMockShop"
+                            if not point_project.endswith(f"-{target_project}") and point_project != target_project:
+                                continue  # Skip results from other projects
                             
                         all_results.append(SearchResult(
                             id=str(point.id),
@@ -403,8 +415,13 @@ async def reflect_on_past(
                         
                         # Check project filter if we're searching all collections but want specific project
                         point_project = point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', ''))
-                        if target_project != 'all' and not project_collections and point_project != target_project:
-                            continue  # Skip results from other projects
+                        
+                        # Handle project matching - check if the target project name appears at the end of the stored project path
+                        if target_project != 'all' and not project_collections:
+                            # The stored project name is like "-Users-ramakrishnanannaswamy-projects-ShopifyMCPMockShop"
+                            # We want to match just "ShopifyMCPMockShop"
+                            if not point_project.endswith(f"-{target_project}") and point_project != target_project:
+                                continue  # Skip results from other projects
                             
                         all_results.append(SearchResult(
                             id=str(point.id),
@@ -433,8 +450,13 @@ async def reflect_on_past(
                         
                         # Check project filter if we're searching all collections but want specific project
                         point_project = point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', ''))
-                        if target_project != 'all' and not project_collections and point_project != target_project:
-                            continue  # Skip results from other projects
+                        
+                        # Handle project matching - check if the target project name appears at the end of the stored project path
+                        if target_project != 'all' and not project_collections:
+                            # The stored project name is like "-Users-ramakrishnanannaswamy-projects-ShopifyMCPMockShop"
+                            # We want to match just "ShopifyMCPMockShop"
+                            if not point_project.endswith(f"-{target_project}") and point_project != target_project:
+                                continue  # Skip results from other projects
                             
                         all_results.append(SearchResult(
                             id=str(point.id),

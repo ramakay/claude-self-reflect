@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - No vulnerabilities found in pip-audit scan
 - All dependencies now pinned to specific versions
 
+### Documentation
+- Clarified that per-project isolation already exists (#14)
+- Added workaround for npm global install path issues (#13)
+
 ## [2.4.0] - 2025-07-28
 
 ### Added

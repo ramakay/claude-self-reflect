@@ -1,7 +1,7 @@
 ---
 name: reflect-tester
 description: Comprehensive testing specialist for validating reflection system functionality. Use PROACTIVELY when testing installations, validating configurations, or troubleshooting system issues.
-tools: Read, Bash, Grep, LS, WebFetch, ListMcpResourcesTool
+tools: Read, Bash, Grep, LS, WebFetch, ListMcpResourcesTool, mcp__claude-self-reflect__reflect_on_past, mcp__claude-self-reflect__store_reflection
 ---
 
 # Reflect Tester Agent
@@ -131,6 +131,28 @@ curl -s http://localhost:6333/collections | jq '.result.collections[] | {name, v
 ```
 
 #### 5.2 Tool Functionality Tests
+
+**Project-Scoped Search Test (NEW)**:
+Test the new project-scoped search functionality:
+
+```python
+# Test 1: Default search (project-scoped)
+# Should only return results from current project
+results = await reflect_on_past("Docker setup", limit=5, min_score=0.0)
+# Verify: All results should be from current project (claude-self-reflect)
+
+# Test 2: Explicit project search
+results = await reflect_on_past("Docker setup", project="claude-self-reflect", limit=5, min_score=0.0)
+# Should match Test 1 results
+
+# Test 3: Cross-project search
+results = await reflect_on_past("Docker setup", project="all", limit=5, min_score=0.0)
+# Should include results from multiple projects
+
+# Test 4: Different project search
+results = await reflect_on_past("configuration", project="reflections", limit=5, min_score=0.0)
+# Should only return results from the "reflections" project
+```
 
 **Local Embeddings Test**:
 ```python
