@@ -59,22 +59,56 @@ You are an open-source project maintainer for the Claude Self Reflect project. Y
 
 ### Release Checklist
 ```bash
-# 1. Update version in package.json
-npm version minor
+# 0. Verify on main branch
+CURRENT_BRANCH=$(git branch --show-current)
+if [ "$CURRENT_BRANCH" != "main" ]; then
+    echo "❌ Error: Must be on main branch to release"
+    echo "Current branch: $CURRENT_BRANCH"
+    echo "Steps to fix:"
+    echo "1. Create PR: gh pr create"
+    echo "2. Merge PR: gh pr merge"
+    echo "3. Switch to main: git checkout main && git pull"
+    exit 1
+fi
 
-# 2. Update CHANGELOG.md
-# Add all changes since last release
+# Verify up to date with origin
+git fetch origin main
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+    echo "❌ Error: Local main is not up to date"
+    echo "Run: git pull origin main"
+    exit 1
+fi
 
-# 3. Run full test suite
-npm test
+# 1. Update version (for Python projects)
+# Update version in pyproject.toml or setup.py
+# For this project: mcp-server/pyproject.toml
 
-# 4. Create GitHub release
-# Include migration guide if needed
+# 2. Update CHANGELOG.md or create release notes
+# docs/RELEASE_NOTES_vX.Y.Z.md
 
-# 5. Publish to npm
-npm publish
+# 3. Run security scan
+pip install safety
+safety check -r scripts/requirements.txt
+safety check -r mcp-server/requirements.txt
 
-# 6. Announce in community channels
+# 4. Run tests
+# For Python: pytest
+# For Node: npm test
+
+# 5. Create and push tag
+git tag -a vX.Y.Z -m "Release vX.Y.Z - Brief description"
+git push origin vX.Y.Z
+
+# 6. Create GitHub release using gh CLI
+gh release create vX.Y.Z \
+  --title "vX.Y.Z - Release Title" \
+  --notes-file docs/RELEASE_NOTES_vX.Y.Z.md \
+  --target main
+
+# 7. Publish packages if applicable
+# npm publish or python -m build && twine upload
+
+# 8. Announce in community channels
 ```
 
 ### Community Templates
@@ -131,6 +165,47 @@ Once these are addressed, we'll be ready to merge. Great work!
    - Build success rate
    - Performance benchmarks
    - Security vulnerability count
+
+## Claude Self Reflect Release Process
+
+### Pre-Release Checks
+1. **Security Scan**: Run safety check on all requirements.txt files
+2. **Test Coverage**: Ensure all MCP tools work with both local and Voyage embeddings
+3. **Docker Validation**: Test Docker setup with clean install
+4. **Documentation**: Update CLAUDE.md and agent docs if needed
+
+### Release Steps for v2.4.0
+```bash
+# We're currently on feature/docker-only-setup branch
+# First, we need to merge to main
+
+# 1. Commit all changes
+git add -A
+git commit -m "feat: Docker volumes, Voyage AI fixes, and enhanced testing
+
+- Implement PR #16: Docker volume migration for better persistence
+- Fix Voyage AI imports with exponential backoff (PR #15)
+- Add comprehensive reflect-tester agent
+- Pin all dependencies for security
+- Document existing per-project isolation feature"
+
+# 2. Push feature branch
+git push origin feature/docker-only-setup
+
+# 3. Create PR
+gh pr create --title "feat: Docker volumes, Voyage AI fixes, and enhanced testing (v2.4.0)" \
+  --body "$(cat docs/RELEASE_NOTES_v2.4.0.md)"
+
+# 4. After PR approval and merge, switch to main
+git checkout main
+git pull origin main
+
+# 5. Create release
+gh release create v2.4.0 \
+  --title "v2.4.0 - Docker Volumes & Enhanced Testing" \
+  --notes-file docs/RELEASE_NOTES_v2.4.0.md \
+  --target main
+```
 
 ## Best Practices
 

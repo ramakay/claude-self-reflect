@@ -19,6 +19,12 @@ from qdrant_client.models import (
     Filter, FieldCondition, MatchValue
 )
 
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_random_exponential,
+)
+
 # Configuration
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 LOGS_DIR = os.getenv("LOGS_DIR", "/logs")
@@ -54,6 +60,15 @@ else:
 # Initialize Qdrant client
 client = QdrantClient(url=QDRANT_URL)
 
+
+def log_retry_state(retry_state):
+    print(f"Retrying function '{retry_state.fn.__name__}' for the {retry_state.attempt_number} time.")
+    print(f"----> Waiting for {retry_state.next_action.sleep} seconds before next attempt.")
+
+@retry(wait=wait_random_exponential(multiplier=2, min=30, max=120), stop=stop_after_attempt(6), before_sleep=log_retry_state)
+def embed_with_backoff(**kwargs):
+    return voyage_client.embed(**kwargs)
+
 def generate_embeddings(texts: List[str]) -> List[List[float]]:
     """Generate embeddings for a list of texts."""
     if PREFER_LOCAL_EMBEDDINGS or not VOYAGE_API_KEY:
@@ -62,7 +77,7 @@ def generate_embeddings(texts: List[str]) -> List[List[float]]:
         return [embedding.tolist() for embedding in embeddings]
     else:
         # Voyage AI embeddings
-        result = voyage_client.embed(
+        result = embed_with_backoff(
             texts=texts,
             model="voyage-3-large",
             input_type="document"
