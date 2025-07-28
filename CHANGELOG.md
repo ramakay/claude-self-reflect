@@ -5,6 +5,31 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.2] - 2025-07-28
+
+### Added
+- Docker volume migration from bind mounts for better data persistence (PR #16)
+- Exponential backoff for Voyage AI API calls with retry logic (PR #15)
+- New reflect-tester agent for comprehensive system validation
+- Performance baseline documentation for both embedding modes
+- Tenacity library (9.1.2) for safe retry handling
+
+### Changed
+- Updated backup/restore scripts to work with Docker named volumes
+- Enhanced testing infrastructure with phased approach
+- Pinned all dependencies to specific versions for reproducible builds
+- Fixed missing voyageai dependency in scripts/requirements.txt
+
+### Fixed
+- Agent documentation missing reflection-specialist
+- Voyage AI import failures in Docker setup
+- Collection naming for test projects
+- Security scan false positives from accidentally committed SARIF file
+
+### Security
+- No vulnerabilities found in pip-audit scan
+- All dependencies now pinned to specific versions
+
 ## [2.4.0] - 2025-07-28
 
 ### Added

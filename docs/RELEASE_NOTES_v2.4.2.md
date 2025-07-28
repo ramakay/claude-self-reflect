@@ -1,4 +1,4 @@
-# Claude Self-Reflect v2.4.0 Release Notes
+# Claude Self-Reflect v2.4.2 Release Notes
 
 ## 🎉 Major Improvements
 
@@ -153,4 +153,4 @@ None - all changes are backward compatible. Existing bind mount data automatical
 
 ---
 
-**Full Changelog**: https://github.com/ramakay/claude-self-reflect/compare/v2.3.7...v2.4.0
+**Full Changelog**: https://github.com/ramakay/claude-self-reflect/compare/v2.4.1...v2.4.2

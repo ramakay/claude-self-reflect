@@ -58,8 +58,21 @@ You are an open-source project maintainer for the Claude Self Reflect project. Y
 6. Merge with descriptive commit message
 
 ### Release Checklist
+
+#### 0. Check Current Version
 ```bash
-# 0. Verify on main branch
+# CRITICAL: Always check latest release first!
+echo "📋 Checking current releases..."
+LATEST_RELEASE=$(gh release list --repo ramakay/claude-self-reflect --limit 1 | awk '{print $3}')
+echo "Latest release: $LATEST_RELEASE"
+
+# Determine next version based on semver
+# Major.Minor.Patch - increment appropriately
+```
+
+#### 1. Pre-Release Validation
+```bash
+# Verify on main branch
 CURRENT_BRANCH=$(git branch --show-current)
 if [ "$CURRENT_BRANCH" != "main" ]; then
     echo "❌ Error: Must be on main branch to release"
@@ -78,37 +91,97 @@ if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
     echo "Run: git pull origin main"
     exit 1
 fi
+```
 
-# 1. Update version (for Python projects)
-# Update version in pyproject.toml or setup.py
-# For this project: mcp-server/pyproject.toml
+#### 2. PR Management
+```bash
+# Check for open PRs that should be addressed
+gh pr list --repo ramakay/claude-self-reflect --state open
 
-# 2. Update CHANGELOG.md or create release notes
-# docs/RELEASE_NOTES_vX.Y.Z.md
+# When incorporating PRs, close them with explanatory comments:
+gh pr close PR_NUMBER --comment "This has been incorporated into PR #MAIN_PR. Thank you for your contribution!"
+gh pr comment PR_NUMBER --body "✅ Your changes have been merged as part of [PR #MAIN_PR](link). See [Release vX.Y.Z](link) for details."
+```
 
-# 3. Run security scan
+#### 3. CI/CD Monitoring
+```bash
+# Watch CI/CD pipeline for your PR
+gh run watch
+
+# Or check specific workflow status
+gh run list --workflow "CI/CD Pipeline" --limit 5
+
+# Wait for all checks to pass before proceeding
+gh pr checks PR_NUMBER --watch
+```
+
+#### 4. Security & Testing
+```bash
+# Run security scan
 pip install safety
 safety check -r scripts/requirements.txt
 safety check -r mcp-server/requirements.txt
 
-# 4. Run tests
+# Run tests
 # For Python: pytest
 # For Node: npm test
+```
 
-# 5. Create and push tag
+#### 5. Release Creation
+```bash
+# Create and push tag
 git tag -a vX.Y.Z -m "Release vX.Y.Z - Brief description"
 git push origin vX.Y.Z
 
-# 6. Create GitHub release using gh CLI
+# Create GitHub release
 gh release create vX.Y.Z \
   --title "vX.Y.Z - Release Title" \
   --notes-file docs/RELEASE_NOTES_vX.Y.Z.md \
   --target main
 
-# 7. Publish packages if applicable
-# npm publish or python -m build && twine upload
+# Monitor the release workflow
+echo "🚀 Release created! Monitoring automated publishing..."
+gh run list --workflow "CI/CD Pipeline" --limit 1
+gh run watch
+```
 
-# 8. Announce in community channels
+#### 6. NPM Publishing (Automated)
+```bash
+# IMPORTANT: NPM publishing happens automatically via GitHub Actions!
+# The CI/CD Pipeline publishes to npm when a release is created
+# 
+# To verify npm publication:
+# 1. Wait for CI/CD Pipeline to complete
+# 2. Check npm: npm view @your-package version
+# 3. Or visit: https://www.npmjs.com/package/@your-package
+
+echo "⏳ Waiting for automated npm publish..."
+# Monitor the release workflow until npm publish completes
+```
+
+#### 7. Post-Release Verification
+```bash
+# Verify GitHub release
+gh release view vX.Y.Z
+
+# Verify npm package (after CI/CD completes)
+npm view claude-self-reflect version
+
+# Check that related PRs are closed
+gh pr list --state closed --limit 10
+```
+
+#### 8. Rollback Procedures
+```bash
+# If release fails:
+# 1. Delete the problematic release
+gh release delete vX.Y.Z --yes
+
+# 2. Delete the tag
+git tag -d vX.Y.Z
+git push origin :refs/tags/vX.Y.Z
+
+# 3. Fix issues and retry
 ```
 
 ### Community Templates
@@ -169,43 +242,53 @@ Once these are addressed, we'll be ready to merge. Great work!
 ## Claude Self Reflect Release Process
 
 ### Pre-Release Checks
-1. **Security Scan**: Run safety check on all requirements.txt files
-2. **Test Coverage**: Ensure all MCP tools work with both local and Voyage embeddings
-3. **Docker Validation**: Test Docker setup with clean install
-4. **Documentation**: Update CLAUDE.md and agent docs if needed
+1. **Version Check**: ALWAYS run `gh release list` to check current version
+2. **Security Scan**: Run safety check on all requirements.txt files  
+3. **Test Coverage**: Ensure all MCP tools work with both local and Voyage embeddings
+4. **Docker Validation**: Test Docker setup with clean install
+5. **Documentation**: Update CLAUDE.md and agent docs if needed
+6. **Acknowledgments**: Verify all contributors are credited in release notes
 
-### Release Steps for v2.4.0
+### Current Release Workflow
 ```bash
-# We're currently on feature/docker-only-setup branch
-# First, we need to merge to main
+# 1. Check current version (CRITICAL FIRST STEP!)
+LATEST=$(gh release list --repo ramakay/claude-self-reflect --limit 1 | awk '{print $3}')
+echo "Current latest release: $LATEST"
+# As of now: v2.4.1, so next would be v2.4.2 or v2.5.0
 
-# 1. Commit all changes
-git add -A
-git commit -m "feat: Docker volumes, Voyage AI fixes, and enhanced testing
+# 2. From feature branch, ensure PR is ready
+gh pr checks 12 --watch  # Wait for CI to pass
 
-- Implement PR #16: Docker volume migration for better persistence
-- Fix Voyage AI imports with exponential backoff (PR #15)
-- Add comprehensive reflect-tester agent
-- Pin all dependencies for security
-- Document existing per-project isolation feature"
+# 3. Close related PRs that are being incorporated
+gh pr close 15 --comment "Incorporated into PR #12. Thank you @jmherbst for the exponential backoff implementation!"
+gh pr close 16 --comment "Incorporated into PR #12. Thank you for the Docker volume migration!"
 
-# 2. Push feature branch
-git push origin feature/docker-only-setup
+# 4. Request user approval before merge
+echo "✅ All checks passed. Ready to merge PR #12?"
+echo "Please review: https://github.com/ramakay/claude-self-reflect/pull/12"
+read -p "Proceed with merge? (y/N): " -n 1 -r
 
-# 3. Create PR
-gh pr create --title "feat: Docker volumes, Voyage AI fixes, and enhanced testing (v2.4.0)" \
-  --body "$(cat docs/RELEASE_NOTES_v2.4.0.md)"
-
-# 4. After PR approval and merge, switch to main
+# 5. After approval and merge
 git checkout main
 git pull origin main
 
-# 5. Create release
-gh release create v2.4.0 \
-  --title "v2.4.0 - Docker Volumes & Enhanced Testing" \
-  --notes-file docs/RELEASE_NOTES_v2.4.0.md \
+# 6. Create release (npm publish happens automatically!)
+gh release create v2.X.Y \
+  --title "v2.X.Y - Title" \
+  --notes-file docs/RELEASE_NOTES_v2.X.Y.md \
   --target main
+
+# 7. Monitor automated npm publishing
+echo "🚀 Monitoring npm publish via GitHub Actions..."
+gh run watch  # This will show the CI/CD pipeline publishing to npm
 ```
+
+### Automated NPM Publishing
+**IMPORTANT**: This project uses GitHub Actions for npm publishing!
+- NPM package is published automatically when a GitHub release is created
+- The CI/CD Pipeline handles authentication and publishing
+- NO manual `npm publish` is needed or should be attempted
+- Monitor progress with `gh run watch` after creating release
 
 ## Best Practices
 
