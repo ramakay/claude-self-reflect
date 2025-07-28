@@ -13,5 +13,5 @@ RUN pip install --no-cache-dir -e .
 RUN useradd -m -u 1000 mcpuser
 USER mcpuser
 
-# The main entry point - using stdio transport by default
-CMD ["python", "-m", "src.server_v2"]
+# Keep the container running and wait for docker exec commands
+CMD ["tail", "-f", "/dev/null"]

@@ -42,11 +42,11 @@ DECAY_SCALE_DAYS = float(os.getenv('DECAY_SCALE_DAYS', '90'))
 # Initialize Voyage AI client
 voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY) if VOYAGE_API_KEY else None
 
-# Debug environment loading
-print(f"[DEBUG] Qdrant Native Decay Server v2.0.0")
-print(f"[DEBUG] ENABLE_MEMORY_DECAY: {ENABLE_MEMORY_DECAY}")
-print(f"[DEBUG] DECAY_WEIGHT: {DECAY_WEIGHT}")
-print(f"[DEBUG] DECAY_SCALE_DAYS: {DECAY_SCALE_DAYS}")
+# Debug environment loading (disabled for production)
+# print(f"[DEBUG] Qdrant Native Decay Server v2.0.0")
+# print(f"[DEBUG] ENABLE_MEMORY_DECAY: {ENABLE_MEMORY_DECAY}")
+# print(f"[DEBUG] DECAY_WEIGHT: {DECAY_WEIGHT}")
+# print(f"[DEBUG] DECAY_SCALE_DAYS: {DECAY_SCALE_DAYS}")
 
 
 class SearchResult(BaseModel):
@@ -246,5 +246,9 @@ async def store_reflection(
         return f"Failed to store reflection: {str(e)}"
 
 
-# Debug output
-print(f"[DEBUG] FastMCP server v2.0.0 created with native Qdrant decay")
+# Debug output (disabled for production)
+# print(f"[DEBUG] FastMCP server v2.0.0 created with native Qdrant decay")
+
+# Run the server when executed as main module
+if __name__ == "__main__":
+    mcp.run(transport="stdio", show_banner=False)
