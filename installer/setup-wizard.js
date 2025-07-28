@@ -4,6 +4,7 @@ import { execSync, spawn, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import fs from 'fs/promises';
+import fsSync from 'fs';
 import readline from 'readline';
 import path from 'path';
 
@@ -53,7 +54,6 @@ let localMode = !voyageKey;
 // WSL Detection
 function isWSL() {
   try {
-    const fsSync = require('fs');
     const osRelease = fsSync.readFileSync('/proc/version', 'utf8');
     return osRelease.toLowerCase().includes('microsoft') || osRelease.toLowerCase().includes('wsl');
   } catch {
@@ -304,8 +304,7 @@ async function setupPythonEnvironment() {
         console.log('   Removing and recreating...');
         
         // Remove broken venv
-        const { rmSync } = await import('fs');
-        rmSync(venvPath, { recursive: true, force: true });
+        fsSync.rmSync(venvPath, { recursive: true, force: true });
         venvExists = false;
         venvHealthy = false;
       }
