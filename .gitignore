@@ -92,3 +92,4 @@ Desktop.ini
 *.backup
 *.bak
 *~# Docker-only setup branch
+work/
