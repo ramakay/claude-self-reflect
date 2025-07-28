@@ -20,6 +20,12 @@ The reflection specialist is a specialized sub-agent that Claude automatically s
 
 Your conversations become searchable. Your decisions stay remembered. Your context persists.
 
+## Requirements
+
+- **Docker Desktop** (macOS/Windows) or **Docker Engine** (Linux)
+- **Node.js** 16+ (for the setup wizard)
+- **Claude Desktop** app
+
 ## Install
 
 ### Quick Start (Local Mode - Default)
@@ -29,6 +35,7 @@ npm install -g claude-self-reflect
 claude-self-reflect setup
 
 # That's it! The setup will:
+# ✅ Run everything in Docker (no Python issues!)
 # ✅ Configure everything automatically
 # ✅ Install the MCP in Claude Code  
 # ✅ Start monitoring for new conversations

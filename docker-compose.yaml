@@ -75,6 +75,28 @@ services:
     mem_limit: 2g
     memswap_limit: 2g
 
+  # MCP server for Claude integration
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp-server
+    container_name: claude-reflection-mcp
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - VOYAGE_KEY=${VOYAGE_KEY:-}
+      - PREFER_LOCAL_EMBEDDINGS=${PREFER_LOCAL_EMBEDDINGS:-true}
+      - ENABLE_MEMORY_DECAY=${ENABLE_MEMORY_DECAY:-false}
+      - DECAY_WEIGHT=${DECAY_WEIGHT:-0.3}
+      - DECAY_SCALE_DAYS=${DECAY_SCALE_DAYS:-90}
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    profiles: ["mcp"]
+
 networks:
   default:
     name: claude-reflection-network
