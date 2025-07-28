@@ -12,10 +12,24 @@ from fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.models import (
-    PointStruct, VectorParams, Distance, 
-    FormulaQuery, DecayParamsExpression, SumExpression,
-    DatetimeExpression, DatetimeKeyExpression
+    PointStruct, VectorParams, Distance
 )
+
+# Try to import newer Qdrant API for native decay
+try:
+    from qdrant_client.models import (
+        Query, Formula, Expression, MultExpression,
+        ExpDecayExpression, DecayParamsExpression,
+        SearchRequest, NamedQuery
+    )
+    NATIVE_DECAY_AVAILABLE = True
+except ImportError:
+    # Fall back to older API
+    from qdrant_client.models import (
+        FormulaQuery, DecayParamsExpression, SumExpression,
+        DatetimeExpression, DatetimeKeyExpression
+    )
+    NATIVE_DECAY_AVAILABLE = False
 import voyageai
 from dotenv import load_dotenv
 
@@ -176,11 +190,56 @@ async def reflect_on_past(
         # Search each collection
         for collection_name in all_collections:
             try:
-                if should_use_decay and USE_NATIVE_DECAY:
-                    # Use native Qdrant decay
-                    await ctx.debug(f"Using NATIVE Qdrant decay for {collection_name}")
+                if should_use_decay and USE_NATIVE_DECAY and NATIVE_DECAY_AVAILABLE:
+                    # Use native Qdrant decay with newer API
+                    await ctx.debug(f"Using NATIVE Qdrant decay (new API) for {collection_name}")
                     
-                    # Build the query with native Qdrant decay formula
+                    # Build the query with native Qdrant decay formula using newer API
+                    query_obj = Query(
+                        nearest=query_embedding,
+                        formula=Formula(
+                            sum=[
+                                # Original similarity score
+                                Expression(variable="score"),
+                                # Decay boost term
+                                Expression(
+                                    mult=MultExpression(
+                                        mult=[
+                                            # Decay weight
+                                            Expression(constant=DECAY_WEIGHT),
+                                            # Exponential decay function
+                                            Expression(
+                                                exp_decay=DecayParamsExpression(
+                                                    # Use timestamp field for decay
+                                                    x=Expression(datetime_key="timestamp"),
+                                                    # Decay from current time (server-side)
+                                                    target=Expression(datetime="now"),
+                                                    # Scale in milliseconds
+                                                    scale=DECAY_SCALE_DAYS * 24 * 60 * 60 * 1000,
+                                                    # Standard exponential decay midpoint
+                                                    midpoint=0.5
+                                                )
+                                            )
+                                        ]
+                                    )
+                                )
+                            ]
+                        )
+                    )
+                    
+                    # Execute query with native decay (new API)
+                    results = await qdrant_client.query_points(
+                        collection_name=collection_name,
+                        query=query_obj,
+                        limit=limit,
+                        score_threshold=min_score,
+                        with_payload=True
+                    )
+                elif should_use_decay and USE_NATIVE_DECAY and not NATIVE_DECAY_AVAILABLE:
+                    # Use native Qdrant decay with older API
+                    await ctx.debug(f"Using NATIVE Qdrant decay (legacy API) for {collection_name}")
+                    
+                    # Build the query with native Qdrant decay formula using older API
                     query_obj = FormulaQuery(
                         nearest=query_embedding,
                         formula=SumExpression(
