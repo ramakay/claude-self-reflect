@@ -175,23 +175,21 @@ The hash is derived from the project path for consistent identification.
 
 ## Best Practices
 
-### 1. Organize Projects Logically
+### 1. Understanding How Claude Organizes Your Conversations
 
-Structure your filesystem to take advantage of automatic detection:
+Claude automatically stores conversations based on your working directory when you start a conversation. The system detects your project from your current path:
 
 ```
-~/projects/
-  ├── work/
-  │   ├── client-a/
-  │   ├── client-b/
-  │   └── internal-tools/
-  ├── personal/
-  │   ├── blog/
-  │   └── side-project/
-  └── learning/
-      ├── rust-tutorial/
-      └── ml-experiments/
+# When you start Claude from these directories:
+~/projects/my-app         → Conversations stored under "my-app"
+~/projects/client/website → Conversations stored under "client"
+~/work/api-gateway       → Falls back to searching all projects
 ```
+
+To ensure proper project isolation:
+- Always start Claude from your project's root directory
+- Be consistent about where you launch Claude for each project
+- Check your current directory with `pwd` before starting important conversations
 
 ### 2. Use Natural Language Effectively
 
@@ -203,9 +201,9 @@ The reflection-specialist agent understands context:
 
 ### 3. Leverage Project Isolation
 
-- Keep sensitive client work isolated
-- Maintain clean boundaries between different contexts
-- Use project-specific searches for focused problem-solving
+- Work conversations stay separate from personal projects automatically
+- Client projects remain isolated from each other
+- Sensitive discussions don't leak into unrelated searches
 
 ### 4. Performance Optimization
 
