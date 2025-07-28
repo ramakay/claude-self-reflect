@@ -82,6 +82,16 @@ For repository administrators:
 
 ## Security Audit History
 
+- **v2.3.9**: Added gitleaks configuration to handle false positives and historical secrets
 - **v2.3.7**: Major security cleanup - removed 250+ internal files, secured .env permissions
 - **v2.3.3**: Migrated to local embeddings by default for privacy
 - **v2.0.0**: Complete rewrite with security-first design
+
+## Historical Security Notice
+
+During routine security scanning, some API keys were found in git history. These have been:
+- ✅ **Revoked** - All identified keys are no longer active
+- ✅ **Allowlisted** in `.gitleaks.toml` since they're already invalid
+- ✅ **Preserved in history** to avoid disrupting contributors
+
+No action is required from contributors. Your local clones remain safe.
