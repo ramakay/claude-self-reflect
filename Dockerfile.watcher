@@ -23,23 +23,9 @@ RUN useradd -m -u 1000 watcher
 # Create scripts directory and copy required files
 RUN mkdir -p /scripts
 
-# Copy the unified import script and create a simple watcher
+# Copy all necessary scripts
 COPY scripts/import-conversations-unified.py /scripts/
-
-# Create a minimal watcher script
-RUN echo '#!/usr/bin/env python3\n\
-import time\n\
-import subprocess\n\
-import os\n\
-\n\
-while True:\n\
-    try:\n\
-        print("Running import...", flush=True)\n\
-        subprocess.run(["/usr/local/bin/python", "/scripts/import-conversations-unified.py"], check=True)\n\
-        print("Import complete. Sleeping for 60 seconds...", flush=True)\n\
-    except Exception as e:\n\
-        print(f"Error: {e}", flush=True)\n\
-    time.sleep(60)\n' > /scripts/import-watcher.py
+COPY scripts/import-watcher.py /scripts/
 
 RUN chmod +x /scripts/*.py
 
