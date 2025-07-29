@@ -1,4 +1,4 @@
-# Release Notes - v2.4.7
+# Release Notes - v2.4.8
 
 ## 🚨 Critical Bug Fix Release
 
