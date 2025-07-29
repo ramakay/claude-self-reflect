@@ -111,16 +111,58 @@ Save important insights and decisions for future retrieval.
 4. **Use Context**: Include technology names, error messages, or specific terms
 5. **Cross-Project When Needed**: Similar problems may have been solved elsewhere
 
-## Response Best Practices
+## Response Format
 
-### When Presenting Search Results
-1. **Indicate Search Scope**: Always mention which project(s) were searched
-2. **Summarize First**: Brief overview of findings
-3. **Show Relevant Excerpts**: Most pertinent parts with context
-4. **Provide Timeline**: When discussions occurred
-5. **Connect Dots**: How different conversations relate
-6. **Suggest Next Steps**: Based on historical patterns
-7. **Offer Broader Search**: If results are limited, proactively suggest cross-project search
+### XML-Structured Output
+To facilitate better parsing and metadata handling, structure your responses using XML format:
+
+```xml
+<reflection-search>
+  <summary>
+    <query>original search query</query>
+    <scope>current|all|project-name</scope>
+    <total-results>number</total-results>
+    <score-range>min-max</score-range>
+    <embedding-type>local|voyage</embedding-type>
+  </summary>
+  
+  <results>
+    <result rank="1">
+      <score>0.725</score>
+      <project>ProjectName</project>
+      <timestamp>X days ago</timestamp>
+      <title>Brief descriptive title</title>
+      <key-finding>One-line summary of the main insight</key-finding>
+      <excerpt>Most relevant quote or context from the conversation</excerpt>
+      <conversation-id>optional-id</conversation-id>
+    </result>
+    
+    <result rank="2">
+      <!-- Additional results follow same structure -->
+    </result>
+  </results>
+  
+  <analysis>
+    <patterns>Common themes or patterns identified across results</patterns>
+    <recommendations>Suggested actions based on findings</recommendations>
+    <cross-project-insights>Insights when searching across projects</cross-project-insights>
+  </analysis>
+  
+  <metadata>
+    <search-latency-ms>optional performance metric</search-latency-ms>
+    <collections-searched>number of collections</collections-searched>
+    <decay-applied>true|false</decay-applied>
+  </metadata>
+</reflection-search>
+```
+
+### Response Best Practices
+
+1. **Always use XML structure** for main content
+2. **Indicate Search Scope** in the summary section
+3. **Order results by relevance** (highest score first)
+4. **Include actionable insights** in the analysis section
+5. **Provide metadata** for transparency
 
 ### Proactive Cross-Project Search Suggestions
 
@@ -133,42 +175,172 @@ When to suggest searching across all projects:
 ### Example Response Formats
 
 #### When Current Project Has Good Results:
-```
-Searching in project: ShopifyMCPMockShop
-
-I found 3 relevant conversations about [topic]:
-
-**1. [Brief Title]** (X days ago)
-Key Finding: [One-line summary]
-Excerpt: "[Most relevant quote]"
-
-**2. [Brief Title]** (Y days ago)
-...
-
-Based on these past discussions, [recommendation or insight].
+```xml
+<reflection-search>
+  <summary>
+    <query>authentication flow</query>
+    <scope>ShopifyMCPMockShop</scope>
+    <total-results>3</total-results>
+    <score-range>0.15-0.45</score-range>
+    <embedding-type>local</embedding-type>
+  </summary>
+  
+  <results>
+    <result rank="1">
+      <score>0.45</score>
+      <project>ShopifyMCPMockShop</project>
+      <timestamp>2 days ago</timestamp>
+      <title>OAuth Implementation Discussion</title>
+      <key-finding>Implemented OAuth2 with refresh token rotation</key-finding>
+      <excerpt>We decided to use refresh token rotation for better security...</excerpt>
+    </result>
+    <!-- More results -->
+  </results>
+  
+  <analysis>
+    <patterns>Authentication consistently uses OAuth2 with JWT tokens</patterns>
+    <recommendations>Continue with the established OAuth2 pattern for consistency</recommendations>
+  </analysis>
+</reflection-search>
 ```
 
 #### When Current Project Has Limited Results:
-```
-Searching in project: CurrentProject
-
-I found only 1 conversation about [topic] in the current project:
-
-**1. [Brief Title]** (X days ago)
-Key Finding: [One-line summary]
-
-Since results are limited in this project, would you like me to search across all your projects? You might have implemented similar [topic] patterns in other projects that could be helpful here.
+```xml
+<reflection-search>
+  <summary>
+    <query>specific feature implementation</query>
+    <scope>CurrentProject</scope>
+    <total-results>1</total-results>
+    <score-range>0.12</score-range>
+    <embedding-type>local</embedding-type>
+  </summary>
+  
+  <results>
+    <result rank="1">
+      <score>0.12</score>
+      <project>CurrentProject</project>
+      <timestamp>5 days ago</timestamp>
+      <title>Initial Feature Discussion</title>
+      <key-finding>Considered implementing but deferred</key-finding>
+      <excerpt>We discussed this feature but decided to wait...</excerpt>
+    </result>
+  </results>
+  
+  <analysis>
+    <patterns>Limited history in current project</patterns>
+    <recommendations>Consider searching across all projects for similar implementations</recommendations>
+    <cross-project-insights>Other projects may have relevant patterns</cross-project-insights>
+  </analysis>
+  
+  <suggestion>
+    <action>search-all-projects</action>
+    <reason>Limited results in current project - broader search may reveal useful patterns</reason>
+  </suggestion>
+</reflection-search>
 ```
 
 #### When No Results in Current Project:
+```xml
+<reflection-search>
+  <summary>
+    <query>new feature concept</query>
+    <scope>CurrentProject</scope>
+    <total-results>0</total-results>
+    <score-range>N/A</score-range>
+    <embedding-type>local</embedding-type>
+  </summary>
+  
+  <results>
+    <!-- No results found -->
+  </results>
+  
+  <analysis>
+    <patterns>No prior discussions found</patterns>
+    <recommendations>This appears to be a new topic for this project</recommendations>
+  </analysis>
+  
+  <suggestions>
+    <suggestion>
+      <action>search-all-projects</action>
+      <reason>Check if similar implementations exist in other projects</reason>
+    </suggestion>
+    <suggestion>
+      <action>store-reflection</action>
+      <reason>Document this new implementation for future reference</reason>
+    </suggestion>
+  </suggestions>
+</reflection-search>
 ```
-Searching in project: CurrentProject
 
-I didn't find any conversations about [topic] in the current project.
+### Error Response Formats
 
-This might be the first time you're implementing this in CurrentProject. Would you like me to:
-1. Search across all your projects for similar implementations?
-2. Store a reflection about this new implementation for future reference?
+#### Validation Errors
+```xml
+<reflection-search>
+  <error>
+    <type>validation-error</type>
+    <message>Invalid parameter value</message>
+    <details>
+      <parameter>min_score</parameter>
+      <value>2.5</value>
+      <constraint>Must be between 0.0 and 1.0</constraint>
+    </details>
+  </error>
+</reflection-search>
+```
+
+#### Connection Errors
+```xml
+<reflection-search>
+  <error>
+    <type>connection-error</type>
+    <message>Unable to connect to Qdrant</message>
+    <details>
+      <url>http://localhost:6333</url>
+      <suggestion>Check if Qdrant is running: docker ps | grep qdrant</suggestion>
+    </details>
+  </error>
+</reflection-search>
+```
+
+#### Empty Query Error
+```xml
+<reflection-search>
+  <error>
+    <type>validation-error</type>
+    <message>Query cannot be empty</message>
+    <suggestion>Provide a search query to find relevant conversations</suggestion>
+  </error>
+</reflection-search>
+```
+
+#### Project Not Found
+```xml
+<reflection-search>
+  <error>
+    <type>project-not-found</type>
+    <message>Project not found</message>
+    <details>
+      <requested-project>NonExistentProject</requested-project>
+      <available-projects>project1, project2, project3</available-projects>
+      <suggestion>Use one of the available projects or 'all' to search across all projects</suggestion>
+    </details>
+  </error>
+</reflection-search>
+```
+
+#### Rate Limit Error
+```xml
+<reflection-search>
+  <error>
+    <type>rate-limit</type>
+    <message>API rate limit exceeded</message>
+    <details>
+      <retry-after>60</retry-after>
+      <suggestion>Wait 60 seconds before retrying</suggestion>
+    </details>
+  </error>
+</reflection-search>
 ```
 
 ## Memory Decay Insights

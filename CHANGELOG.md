@@ -5,6 +5,27 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.4] - 2025-07-29
+
+### Added
+- XML-structured response format for reflection-specialist agent
+  - All search results now return structured XML instead of markdown
+  - Consistent error handling with XML format for all failure cases
+  - Metadata section includes search performance metrics
+  - Clear separation of summary, results, analysis, and metadata sections
+
+### Changed
+- Reflection-specialist agent completely restructured to use XML format
+  - Easier parsing for main agent without regex
+  - Structured data extraction with predictable field locations
+  - Error responses also follow XML format for consistency
+
+### Benefits
+- Main agent can extract specific fields like `<score>`, `<project>`, `<timestamp>` directly
+- No ambiguity in data boundaries or formatting
+- Extensible schema allows adding new fields without breaking parsers
+- Better integration capabilities for downstream tools
+
 ## [2.4.3] - 2025-07-28
 
 ### Added
