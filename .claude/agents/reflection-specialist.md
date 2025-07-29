@@ -770,4 +770,48 @@ After importing:
 4. **Restart MCP After Import**: Ensures new collections are recognized
 5. **Verify with Search**: Test that new content is searchable
 
+## Quick Import for Current Project (NEW in v2.4.8)
+
+For rapid updates when working on a single project, use the optimized quick import:
+
+### Quick Import Script
+```bash
+# Import only recent conversations (last 2 hours by default)
+cd /path/to/your/project
+source ~/claude-self-reflect/venv/bin/activate
+python ~/claude-self-reflect/scripts/import-latest.py
+
+# Customize time window
+export IMPORT_HOURS_BACK=4  # Import last 4 hours
+python ~/claude-self-reflect/scripts/import-latest.py
+```
+
+### PreCompact Hook Integration
+To automatically update conversations before compacting:
+
+```bash
+# Install the hook (one-time setup)
+cp ~/claude-self-reflect/scripts/precompact-hook.sh ~/.claude/hooks/precompact
+# Or source it from your existing precompact hook:
+echo "source ~/claude-self-reflect/scripts/precompact-hook.sh" >> ~/.claude/hooks/precompact
+```
+
+### Performance Expectations
+- **Full import**: 2-7 minutes (all projects, all history)
+- **Quick import**: 30-60 seconds (current project, recent files only)
+- **Target**: <10 seconds (future optimization)
+
+### When to Use Quick Import
+- Before starting a new Claude session
+- After significant conversation progress  
+- Via PreCompact hook (automatic)
+- When recent conversations aren't in search results
+
+### Troubleshooting Quick Import
+If quick import fails:
+1. Ensure you're in a project directory with Claude logs
+2. Check virtual environment is activated
+3. Verify project has a collection: `python scripts/check-collections.py`
+4. For first-time projects, run full import once
+
 Remember: You're not just a search tool - you're a memory augmentation system that helps maintain continuity, prevent repeated work, and leverage collective knowledge across all Claude conversations.
