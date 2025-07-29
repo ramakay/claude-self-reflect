@@ -123,6 +123,41 @@ Once installed, just talk naturally:
 
 The reflection specialist automatically activates. No special commands needed.
 
+## Performance & Usage Guide (v2.4.5)
+
+### 🚀 10-40x Faster Performance
+Search response times improved from 28.9s-2min down to **200-350ms** through optimizations:
+- Compressed XML response format (40% smaller)
+- Optimized excerpts (350 chars for context, 100 chars in brief mode)
+- Smart defaults (5 results to avoid missing relevant conversations)
+
+### 🎯 Recommended Usage: Through Reflection-Specialist Agent
+
+**Why use the agent instead of direct MCP tools?**
+- Rich formatted responses with analysis and insights
+- Proper handling of specialized search tools
+- Better user experience with streaming feedback
+- Automatic cross-project search suggestions
+
+**Example:**
+```
+You: "What Docker issues did we solve?"
+[Claude automatically spawns reflection-specialist agent]
+⏺ reflection-specialist(Search Docker issues)
+  ⎿ Searching 57 collections...
+  ⎿ Found 5 relevant conversations
+  ⎿ Done (1 tool use · 12k tokens · 2.3s)
+```
+
+### ⚡ Performance Baselines
+
+| Method | Search Time | Total Time | Best For |
+|--------|------------|------------|----------|
+| Direct MCP | 200-350ms | 200-350ms | Programmatic use, integrations |
+| Via Agent | 200-350ms | 2-3s | Interactive use, rich analysis |
+
+**Note**: The specialized tools (`quick_search`, `search_summary`, `get_more_results`) only work through the reflection-specialist agent due to MCP protocol limitations.
+
 ## Project-Scoped Search (New in v2.4.3)
 
 **⚠️ Breaking Change**: Searches now default to current project only. Previously searched all projects.

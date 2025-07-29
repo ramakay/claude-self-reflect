@@ -21,14 +21,14 @@ Investigation of performance issues revealed a significant gap between reported 
 ## Implemented Optimizations
 
 ### 1. Response Size Reduction (40% smaller)
-- **Excerpt length**: Reduced from 500 to 250 characters
+- **Excerpt length**: Optimized to 350 characters (from 500) - better balance of context vs size
 - **XML tag compression**: Single-letter tags (`<search>`, `<r>`, `<s>`, etc.)
-- **Brief mode**: Added option to truncate excerpts to 100 chars
+- **Brief mode**: Added option to truncate excerpts to 100 chars for existence checks
 - **Title/key-finding limits**: Reduced to 80/100 chars respectively
 
 ### 2. Smart Defaults
-- **Default limit**: Changed from 5 to 3 results
-- **Brief mode parameter**: Added for minimal responses
+- **Default limit**: Kept at 5 results (analysis showed tight score clustering)
+- **Brief mode parameter**: Added for minimal responses when needed
 - **Response format**: XML by default (more efficient than markdown)
 
 ### 3. Progress Reporting (UX improvement)
@@ -106,16 +106,18 @@ MCP Overhead            1,380-2,380 75-85%
 - UI behavior differs significantly between approaches
 
 ### 3. Default Values Impact UX
-- Reducing default limit from 5 to 3 improved response time
+- Kept default limit at 5 after analysis showed tight score clustering
 - Brief mode provides good balance for overview searches
-- Users can always request more when needed
+- Users can customize limit and excerpt length as needed
 
 ## Future Optimization Opportunities
 
-### 1. Specialized Search Tools
+### 1. Specialized Search Tools ✓ Implemented
 - `quick_search`: Returns only count and top result
 - `search_summary`: Aggregated insights without full results
 - `get_more_results`: Pagination through multiple calls
+
+**Note**: These tools work through the reflection-specialist agent but not via direct MCP calls due to FastMCP limitations with nested tool calls.
 
 ### 2. Result Chunking Pattern
 - Initial call returns first batch quickly

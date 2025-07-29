@@ -18,9 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Response format parameter supporting both XML and markdown (`response_format`)
 
 ### Changed
-- Default result limit reduced from 5 to 3 for better performance
-- XML tags compressed to single letters for smaller payload
-- Excerpt length reduced from 500 to 250 characters
+- XML tags compressed to single letters for smaller payload (40% size reduction)
+- Excerpt length optimized to 350 characters (was 500) for better context
+- Default result limit kept at 5 to avoid missing relevant results
 - Title and key-finding lengths optimized (80/100 chars)
 - Timezone handling fixed for proper datetime comparisons
 
@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed "0 tool uses" display issue with sub-agents
 - Improved real-time playback with markdown format
 - Better error handling for timezone-aware datetimes
+
+### Known Issues
+- Specialized search tools (`quick_search`, `search_summary`, `get_more_results`) work through the reflection-specialist agent but not via direct MCP calls due to FastMCP limitations with nested tool calls
 
 ## [2.4.4] - 2025-07-29
 

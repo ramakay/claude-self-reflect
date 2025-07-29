@@ -119,6 +119,8 @@ Save important insights and decisions for future retrieval.
 
 ### Specialized Search Tools (NEW in v2.4.5)
 
+**Note**: These specialized tools are available through this reflection-specialist agent. Due to FastMCP limitations, they cannot be called directly via MCP (e.g., `mcp__claude-self-reflect__quick_search`), but work perfectly when used through this agent.
+
 #### quick_search
 Fast search that returns only the count and top result. Perfect for quick checks and overview.
 

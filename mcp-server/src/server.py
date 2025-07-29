@@ -150,7 +150,7 @@ def get_collection_suffix() -> str:
 async def reflect_on_past(
     ctx: Context,
     query: str = Field(description="The search query to find semantically similar conversations"),
-    limit: int = Field(default=3, description="Maximum number of results to return"),
+    limit: int = Field(default=5, description="Maximum number of results to return"),
     min_score: float = Field(default=0.7, description="Minimum similarity score (0-1)"),
     use_decay: Union[int, str] = Field(default=-1, description="Apply time-based decay: 1=enable, 0=disable, -1=use environment default (accepts int or str)"),
     project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects."),
@@ -384,7 +384,7 @@ async def reflect_on_past(
                             score=point.score,  # Score already includes decay
                             timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
-                            excerpt=(point.payload.get('text', '')[:250] + '...' if len(point.payload.get('text', '')) > 250 else point.payload.get('text', '')),
+                            excerpt=(point.payload.get('text', '')[:350] + '...' if len(point.payload.get('text', '')) > 350 else point.payload.get('text', '')),
                             project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
                             collection_name=collection_name,
@@ -463,7 +463,7 @@ async def reflect_on_past(
                             score=adjusted_score,  # Use adjusted score
                             timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
-                            excerpt=(point.payload.get('text', '')[:250] + '...' if len(point.payload.get('text', '')) > 250 else point.payload.get('text', '')),
+                            excerpt=(point.payload.get('text', '')[:350] + '...' if len(point.payload.get('text', '')) > 350 else point.payload.get('text', '')),
                             project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
                             collection_name=collection_name,
@@ -499,7 +499,7 @@ async def reflect_on_past(
                             score=point.score,
                             timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
-                            excerpt=(point.payload.get('text', '')[:250] + '...' if len(point.payload.get('text', '')) > 250 else point.payload.get('text', '')),
+                            excerpt=(point.payload.get('text', '')[:350] + '...' if len(point.payload.get('text', '')) > 350 else point.payload.get('text', '')),
                             project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
                             collection_name=collection_name,
@@ -717,32 +717,33 @@ async def quick_search(
     project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects.")
 ) -> str:
     """Quick search that returns only the count and top result for fast overview."""
-    # Leverage reflect_on_past with optimized parameters
-    result = await reflect_on_past(
-        ctx=ctx,
-        query=query,
-        limit=1,  # Only get the top result
-        min_score=min_score,
-        project=project,
-        response_format="xml",
-        brief=True,  # Use brief mode for minimal response
-        include_raw=False
-    )
-    
-    # Parse and reformat for quick overview
-    import re
-    
-    # Extract count from metadata
-    count_match = re.search(r'<tc>(\d+)</tc>', result)
-    total_count = count_match.group(1) if count_match else "0"
-    
-    # Extract top result
-    score_match = re.search(r'<s>([\d.]+)</s>', result)
-    project_match = re.search(r'<p>([^<]+)</p>', result)
-    title_match = re.search(r'<t>([^<]+)</t>', result)
-    
-    if score_match and project_match and title_match:
-        return f"""<quick_search>
+    try:
+        # Leverage reflect_on_past with optimized parameters
+        result = await reflect_on_past(
+            ctx=ctx,
+            query=query,
+            limit=1,  # Only get the top result
+            min_score=min_score,
+            project=project,
+            response_format="xml",
+            brief=True,  # Use brief mode for minimal response
+            include_raw=False
+        )
+        
+        # Parse and reformat for quick overview
+        import re
+        
+        # Extract count from metadata
+        count_match = re.search(r'<tc>(\d+)</tc>', result)
+        total_count = count_match.group(1) if count_match else "0"
+        
+        # Extract top result
+        score_match = re.search(r'<s>([\d.]+)</s>', result)
+        project_match = re.search(r'<p>([^<]+)</p>', result)
+        title_match = re.search(r'<t>([^<]+)</t>', result)
+        
+        if score_match and project_match and title_match:
+            return f"""<quick_search>
 <total_matches>{total_count}</total_matches>
 <top_result>
 <score>{score_match.group(1)}</score>
@@ -750,11 +751,14 @@ async def quick_search(
 <title>{title_match.group(1)}</title>
 </top_result>
 </quick_search>"""
-    else:
-        return f"""<quick_search>
+        else:
+            return f"""<quick_search>
 <total_matches>{total_count}</total_matches>
 <message>No relevant matches found</message>
 </quick_search>"""
+    except Exception as e:
+        await ctx.error(f"Quick search failed: {str(e)}")
+        return f"<quick_search><error>{str(e)}</error></quick_search>"
 
 
 @mcp.tool()
@@ -883,3 +887,7 @@ async def get_more_results(
 
 # Debug output
 print(f"[DEBUG] FastMCP server created with name: {mcp.name}")
+
+# Run the server
+if __name__ == "__main__":
+    mcp.run()
