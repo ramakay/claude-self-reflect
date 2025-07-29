@@ -101,6 +101,23 @@ We're actively working on:
 - Performance analytics dashboard
 - Multi-language support
 
+## 🔧 Critical Fix: Local Mode (v2.4.7)
+
+We've just released v2.4.7 with an important fix for local mode users:
+
+### The Issue:
+- Setup wizard was using an outdated server module
+- Local mode (`--local` flag) still required Voyage API key
+- Affected users who wanted to use FastEmbed local embeddings
+
+### The Fix:
+- Corrected server module selection in setup wizard
+- Local embeddings now work properly without any API key
+- Removed obsolete code that caused the issue
+
+### Affected Users:
+If you experienced "Voyage AI API key not configured" errors when using `--local` mode, please update to v2.4.7.
+
 ## 💬 We Want Your Feedback
 
 These changes represent our vision for making Claude Self-Reflect more intuitive and reliable. We'd love to hear:
