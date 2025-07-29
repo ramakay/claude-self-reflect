@@ -262,7 +262,10 @@ async function configureClaude() {
   
   // Create a script that runs the MCP server in Docker
   const scriptContent = `#!/bin/bash
-docker exec -i claude-reflection-mcp python -m src.server_v2
+# Run the MCP server in the Docker container with stdin attached
+# Using python -u for unbuffered output
+# Using the main module which properly supports local embeddings
+docker exec -i claude-reflection-mcp python -u -m src
 `;
   
   await fs.writeFile(mcpScript, scriptContent, { mode: 0o755 });
