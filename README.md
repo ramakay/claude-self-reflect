@@ -123,21 +123,27 @@ Once installed, just talk naturally:
 
 The reflection specialist automatically activates. No special commands needed.
 
-## Performance & Usage Guide (v2.4.5)
+## Performance & Usage Guide
 
-### 🚀 10-40x Faster Performance
-Search response times improved from 28.9s-2min down to **200-350ms** through optimizations:
-- Compressed XML response format (40% smaller)
-- Optimized excerpts (350 chars for context, 100 chars in brief mode)
-- Smart defaults (5 results to avoid missing relevant conversations)
+### 🚀 Lightning Fast Search
+Optimized to deliver results in **200-350ms** (10-40x faster than v2.4.4)
 
 ### 🎯 Recommended Usage: Through Reflection-Specialist Agent
 
 **Why use the agent instead of direct MCP tools?**
-- Rich formatted responses with analysis and insights
-- Proper handling of specialized search tools
-- Better user experience with streaming feedback
-- Automatic cross-project search suggestions
+- **Preserves your main conversation context** - Search results don't clutter your working memory
+- **Rich formatted responses** - Clean markdown instead of raw XML in your conversation
+- **Better user experience** - Real-time streaming feedback and progress indicators
+- **Proper tool counting** - Shows actual tool usage instead of "0 tool uses"
+- **Automatic cross-project search** - Agent suggests searching across projects when relevant
+- **Specialized search tools** - Access to quick_search, search_summary, and pagination
+
+**Context Preservation Benefit:**
+When you use the reflection-specialist agent, all the search results and processing happen in an isolated context. This means:
+- Your main conversation stays clean and focused
+- No XML dumps or raw data in your chat history
+- Multiple searches won't exhaust your context window
+- You get just the insights, not the implementation details
 
 **Example:**
 ```
@@ -147,61 +153,40 @@ You: "What Docker issues did we solve?"
   ⎿ Searching 57 collections...
   ⎿ Found 5 relevant conversations
   ⎿ Done (1 tool use · 12k tokens · 2.3s)
+[Returns clean, formatted insights without cluttering your context]
 ```
 
 ### ⚡ Performance Baselines
 
-| Method | Search Time | Total Time | Best For |
-|--------|------------|------------|----------|
-| Direct MCP | 200-350ms | 200-350ms | Programmatic use, integrations |
-| Via Agent | 200-350ms | 2-3s | Interactive use, rich analysis |
+| Method | Search Time | Total Time | Context Impact | Best For |
+|--------|------------|------------|----------------|----------|
+| Direct MCP | 200-350ms | 200-350ms | Uses main context | Programmatic use, when context space matters |
+| Via Agent | 200-350ms | 24-30s* | Isolated context | Interactive use, exploration, multiple searches |
+
+*Note: The 24-30s includes context preservation overhead, which keeps your main conversation clean
 
 **Note**: The specialized tools (`quick_search`, `search_summary`, `get_more_results`) only work through the reflection-specialist agent due to MCP protocol limitations.
 
-## Project-Scoped Search (New in v2.4.3)
+## Key Features
 
-**⚠️ Breaking Change**: Searches now default to current project only. Previously searched all projects.
-
-Conversations are now **project-aware by default**. When you ask about past conversations, Claude automatically searches within your current project directory, keeping results focused and relevant.
-
-### How It Works
+### 🎯 Project-Scoped Search
+Searches are **project-aware by default** (v2.4.3+). Claude automatically searches within your current project:
 
 ```
-# Example: Working in ~/projects/ShopifyMCPMockShop
-You: "What authentication method did we implement?"
-Claude: [Searches ONLY ShopifyMCPMockShop conversations]
-        "Found 3 conversations about JWT authentication..."
+# In ~/projects/MyApp
+You: "What authentication method did we use?"
+Claude: [Searches ONLY MyApp conversations]
 
-# To search everywhere (like pre-v2.4.3 behavior)
+# To search everywhere
 You: "Search all projects for WebSocket implementations"
 Claude: [Searches across ALL your projects]
-        "Found implementations in 5 projects: ..."
-
-# To search a specific project
-You: "Find Docker setup in claude-self-reflect project"
-Claude: [Searches only claude-self-reflect conversations]
 ```
 
-### Key Behaviors
-
-| Search Type | How to Trigger | Example |
+| Search Scope | How to Trigger | Example |
 |------------|----------------|---------|
-| **Current Project** (default) | Just ask normally | "What did we discuss about caching?" |
-| **All Projects** | Say "all projects" or "across projects" | "Search all projects for error handling" |
-| **Specific Project** | Mention the project name | "Find auth code in MyApp project" |
-
-### Why This Change?
-
-- **Focused Results**: No more sifting through unrelated conversations
-- **Better Performance**: Single-project search is ~100ms faster
-- **Natural Workflow**: Results match your current working context
-- **Privacy**: Work and personal projects stay isolated
-
-### Upgrading from Earlier Versions?
-
-Your existing conversations remain searchable. The only change is that searches now default to your current project. To get the old behavior, simply ask to "search all projects".
-
-See [Project-Scoped Search Guide](docs/project-scoped-search.md) for detailed examples and advanced usage.
+| Current Project (default) | Just ask normally | "What did we discuss about caching?" |
+| All Projects | Say "all projects" | "Search all projects for error handling" |
+| Specific Project | Name the project | "Find auth code in MyApp project" |
 
 ## Memory Decay
 
@@ -272,10 +257,14 @@ Both embedding options work well. Local mode uses FastEmbed for privacy and offl
 - [GitHub Issues](https://github.com/ramakay/claude-self-reflect/issues)
 - [Discussions](https://github.com/ramakay/claude-self-reflect/discussions)
 
-## Latest Updates
+## What's New
 
-- 📢 [v2.4.x Announcement](https://github.com/ramakay/claude-self-reflect/discussions/19) - Major improvements including Docker setup and project-scoped search
-- 💬 [Project-Scoped Search Feedback](https://github.com/ramakay/claude-self-reflect/discussions/17) - Share your experience with the breaking change
+### Recent Updates
+- **v2.4.5** - 10-40x performance boost, context preservation
+- **v2.4.3** - Project-scoped search (breaking change) 
+- **v2.3.7** - Local embeddings by default for privacy
+
+📚 [Full Release History](docs/release-history.md) | 💬 [Discussions](https://github.com/ramakay/claude-self-reflect/discussions)
 
 ## Contributing
 
