@@ -77,6 +77,26 @@ Search for relevant past conversations using semantic similarity.
   limit: 5,
   include_raw: true  // Include full payload for debugging
 }
+
+// Choose response format (NEW in v2.4.5)
+{
+  query: "playwright issues",
+  limit: 5,
+  response_format: "xml"  // Use XML format (default)
+}
+
+{
+  query: "playwright issues",
+  limit: 5,
+  response_format: "markdown"  // Use original markdown format
+}
+
+// Brief mode for minimal responses (NEW in v2.4.5)
+{
+  query: "error handling patterns",
+  limit: 3,
+  brief: true  // Returns minimal excerpts (100 chars) for faster response
+}
 ```
 
 #### Default Behavior: Project-Scoped Search (NEW in v2.4.3)
@@ -96,6 +116,59 @@ Save important insights and decisions for future retrieval.
   tags: ["bug-fix", "streaming", "importer", "performance"]
 }
 ```
+
+### Specialized Search Tools (NEW in v2.4.5)
+
+#### quick_search
+Fast search that returns only the count and top result. Perfect for quick checks and overview.
+
+```javascript
+// Quick overview of matches
+{
+  query: "authentication patterns",
+  min_score: 0.5,  // Optional, defaults to 0.7
+  project: "all"    // Optional, defaults to current project
+}
+```
+
+Returns:
+- Total match count across all results
+- Details of only the top result
+- Minimal response size for fast performance
+
+#### search_summary
+Get aggregated insights without individual result details. Ideal for pattern analysis.
+
+```javascript
+// Analyze patterns across conversations
+{
+  query: "error handling",
+  project: "all",      // Optional
+  limit: 10           // Optional, how many results to analyze
+}
+```
+
+Returns:
+- Total matches and average relevance score
+- Project distribution (which projects contain matches)
+- Common themes extracted from results
+- No individual result details (faster response)
+
+#### get_more_results
+Pagination support for getting additional results after an initial search.
+
+```javascript
+// Get next batch of results
+{
+  query: "original search query",  // Must match original query
+  offset: 3,                      // Skip first 3 results
+  limit: 3,                       // Get next 3 results
+  min_score: 0.7,                 // Optional
+  project: "all"                  // Optional
+}
+```
+
+Note: Since Qdrant doesn't support true offset, this fetches offset+limit results and returns only the requested slice. Best used for exploring beyond initial results.
 
 ## Debug Mode (NEW in v2.4.5)
 
@@ -145,10 +218,23 @@ When search quality issues arise or you need to understand why certain results a
 4. **Use Context**: Include technology names, error messages, or specific terms
 5. **Cross-Project When Needed**: Similar problems may have been solved elsewhere
 
-## Response Format
+## Response Format (NEW in v2.4.5)
 
-### XML-Structured Output
-To facilitate better parsing and metadata handling, structure your responses using XML format:
+### Choosing Response Format
+The MCP server now supports two response formats:
+- **XML** (default): Structured format for better parsing and metadata handling
+- **Markdown**: Original format for compatibility and real-time playback
+
+Use the `response_format` parameter to select:
+```javascript
+{
+  query: "your search",
+  response_format: "xml"  // or "markdown"
+}
+```
+
+### XML-Structured Output (Default)
+The XML format provides better structure for parsing and includes performance metadata:
 
 ```xml
 <reflection-search>
@@ -200,13 +286,48 @@ To facilitate better parsing and metadata handling, structure your responses usi
 </reflection-search>
 ```
 
+### Markdown Format (For Compatibility)
+The original markdown format is simpler and enables real-time playback in Claude:
+
+```
+Found 3 relevant conversation(s) for 'your query':
+
+**Result 1** (Score: 0.725)
+Time: 2024-01-15 10:30:00
+Project: ProjectName
+Role: assistant
+Excerpt: The relevant excerpt from the conversation...
+---
+
+**Result 2** (Score: 0.612)
+Time: 2024-01-14 15:45:00
+Project: ProjectName
+Role: user
+Excerpt: Another relevant excerpt...
+---
+```
+
+### When to Use Each Format
+
+**Use XML format when:**
+- Main agent needs to parse and process results
+- Performance metrics are important
+- Debugging search quality issues
+- Need structured metadata access
+
+**Use Markdown format when:**
+- Testing real-time playback in Claude UI
+- Simple manual searches
+- Compatibility with older workflows
+- Prefer simpler output
+
 ### Response Best Practices
 
-1. **Always use XML structure** for main content
-2. **Indicate Search Scope** in the summary section
+1. **Use XML format by default** unless markdown is specifically requested
+2. **Indicate Search Scope** in the summary section (XML) or header (markdown)
 3. **Order results by relevance** (highest score first)
-4. **Include actionable insights** in the analysis section
-5. **Provide metadata** for transparency
+4. **Include actionable insights** in the analysis section (XML format)
+5. **Provide metadata** for transparency and debugging
 
 ### Proactive Cross-Project Search Suggestions
 

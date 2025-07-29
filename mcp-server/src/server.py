@@ -4,10 +4,11 @@ import os
 import asyncio
 from pathlib import Path
 from typing import Any, Optional, List, Dict, Union
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import numpy as np
 import hashlib
+import time
 
 from fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field
@@ -149,20 +150,28 @@ def get_collection_suffix() -> str:
 async def reflect_on_past(
     ctx: Context,
     query: str = Field(description="The search query to find semantically similar conversations"),
-    limit: int = Field(default=5, description="Maximum number of results to return"),
+    limit: int = Field(default=3, description="Maximum number of results to return"),
     min_score: float = Field(default=0.7, description="Minimum similarity score (0-1)"),
     use_decay: Union[int, str] = Field(default=-1, description="Apply time-based decay: 1=enable, 0=disable, -1=use environment default (accepts int or str)"),
     project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects."),
-    include_raw: bool = Field(default=False, description="Include raw Qdrant payload data for debugging (increases response size)")
+    include_raw: bool = Field(default=False, description="Include raw Qdrant payload data for debugging (increases response size)"),
+    response_format: str = Field(default="xml", description="Response format: 'xml' or 'markdown'"),
+    brief: bool = Field(default=False, description="Brief mode: returns minimal information for faster response")
 ) -> str:
     """Search for relevant past conversations using semantic search with optional time decay."""
     
+    # Start timing
+    start_time = time.time()
+    timing_info = {}
+    
     # Normalize use_decay to integer
+    timing_info['param_parsing_start'] = time.time()
     if isinstance(use_decay, str):
         try:
             use_decay = int(use_decay)
         except ValueError:
             raise ValueError("use_decay must be '1', '0', or '-1'")
+    timing_info['param_parsing_end'] = time.time()
     
     # Parse decay parameter using integer approach
     should_use_decay = (
@@ -209,10 +218,15 @@ async def reflect_on_past(
     
     try:
         # Generate embedding
+        timing_info['embedding_start'] = time.time()
         query_embedding = await generate_embedding(query)
+        timing_info['embedding_end'] = time.time()
         
         # Get all collections
+        timing_info['get_collections_start'] = time.time()
         all_collections = await get_all_collections()
+        timing_info['get_collections_end'] = time.time()
+        
         if not all_collections:
             return "No conversation collections found. Please import conversations first."
         
@@ -243,7 +257,22 @@ async def reflect_on_past(
         all_results = []
         
         # Search each collection
-        for collection_name in collections_to_search:
+        timing_info['search_all_start'] = time.time()
+        collection_timings = []
+        
+        # Report initial progress
+        await ctx.report_progress(progress=0, total=len(collections_to_search))
+        
+        for idx, collection_name in enumerate(collections_to_search):
+            collection_timing = {'name': collection_name, 'start': time.time()}
+            
+            # Report progress before searching each collection
+            await ctx.report_progress(
+                progress=idx, 
+                total=len(collections_to_search),
+                message=f"Searching {collection_name}"
+            )
+            
             try:
                 if should_use_decay and USE_NATIVE_DECAY and NATIVE_DECAY_AVAILABLE:
                     # Use native Qdrant decay with newer API
@@ -355,7 +384,7 @@ async def reflect_on_past(
                             score=point.score,  # Score already includes decay
                             timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
-                            excerpt=(point.payload.get('text', '')[:500] + '...'),
+                            excerpt=(point.payload.get('text', '')[:250] + '...' if len(point.payload.get('text', '')) > 250 else point.payload.get('text', '')),
                             project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
                             collection_name=collection_name,
@@ -375,7 +404,7 @@ async def reflect_on_past(
                     )
                     
                     # Apply decay scoring manually
-                    now = datetime.now()
+                    now = datetime.now(timezone.utc)
                     scale_ms = DECAY_SCALE_DAYS * 24 * 60 * 60 * 1000
                     
                     decay_results = []
@@ -385,6 +414,9 @@ async def reflect_on_past(
                             timestamp_str = point.payload.get('timestamp')
                             if timestamp_str:
                                 timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                                # Ensure timestamp is timezone-aware
+                                if timestamp.tzinfo is None:
+                                    timestamp = timestamp.replace(tzinfo=timezone.utc)
                                 age_ms = (now - timestamp).total_seconds() * 1000
                                 
                                 # Calculate decay factor
@@ -431,7 +463,7 @@ async def reflect_on_past(
                             score=adjusted_score,  # Use adjusted score
                             timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
-                            excerpt=(point.payload.get('text', '')[:500] + '...'),
+                            excerpt=(point.payload.get('text', '')[:250] + '...' if len(point.payload.get('text', '')) > 250 else point.payload.get('text', '')),
                             project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
                             collection_name=collection_name,
@@ -467,7 +499,7 @@ async def reflect_on_past(
                             score=point.score,
                             timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
-                            excerpt=(point.payload.get('text', '')[:500] + '...'),
+                            excerpt=(point.payload.get('text', '')[:250] + '...' if len(point.payload.get('text', '')) > 250 else point.payload.get('text', '')),
                             project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
                             collection_name=collection_name,
@@ -476,32 +508,149 @@ async def reflect_on_past(
             
             except Exception as e:
                 await ctx.debug(f"Error searching {collection_name}: {str(e)}")
-                continue
+                collection_timing['error'] = str(e)
+            
+            collection_timing['end'] = time.time()
+            collection_timings.append(collection_timing)
+        
+        timing_info['search_all_end'] = time.time()
+        
+        # Report completion of search phase
+        await ctx.report_progress(
+            progress=len(collections_to_search), 
+            total=len(collections_to_search),
+            message="Search complete, processing results"
+        )
         
         # Sort by score and limit
+        timing_info['sort_start'] = time.time()
         all_results.sort(key=lambda x: x.score, reverse=True)
         all_results = all_results[:limit]
+        timing_info['sort_end'] = time.time()
         
         if not all_results:
             return f"No conversations found matching '{query}'. Try different keywords or check if conversations have been imported."
         
-        # Format results
-        result_text = f"Found {len(all_results)} relevant conversation(s) for '{query}':\n\n"
-        for i, result in enumerate(all_results):
-            result_text += f"**Result {i+1}** (Score: {result.score:.3f})\n"
-            # Handle timezone suffix 'Z' properly
-            timestamp_clean = result.timestamp.replace('Z', '+00:00') if result.timestamp.endswith('Z') else result.timestamp
-            result_text += f"Time: {datetime.fromisoformat(timestamp_clean).strftime('%Y-%m-%d %H:%M:%S')}\n"
-            result_text += f"Project: {result.project_name}\n"
-            result_text += f"Role: {result.role}\n"
-            result_text += f"Excerpt: {result.excerpt}\n"
-            result_text += "---\n\n"
+        # Format results based on response_format
+        timing_info['format_start'] = time.time()
+        
+        if response_format == "xml":
+            # XML format (compact tags for performance)
+            result_text = "<search>\n"
+            result_text += f"  <meta>\n"
+            result_text += f"    <q>{query}</q>\n"
+            result_text += f"    <scope>{target_project if target_project != 'all' else 'all'}</scope>\n"
+            result_text += f"    <count>{len(all_results)}</count>\n"
+            if all_results:
+                result_text += f"    <range>{all_results[-1].score:.3f}-{all_results[0].score:.3f}</range>\n"
+            result_text += f"    <embed>{'local' if PREFER_LOCAL_EMBEDDINGS or not voyage_client else 'voyage'}</embed>\n"
+            
+            # Add timing metadata
+            total_time = time.time() - start_time
+            result_text += f"    <perf>\n"
+            result_text += f"      <ttl>{int(total_time * 1000)}</ttl>\n"
+            result_text += f"      <emb>{int((timing_info.get('embedding_end', 0) - timing_info.get('embedding_start', 0)) * 1000)}</emb>\n"
+            result_text += f"      <srch>{int((timing_info.get('search_all_end', 0) - timing_info.get('search_all_start', 0)) * 1000)}</srch>\n"
+            result_text += f"      <cols>{len(collections_to_search)}</cols>\n"
+            result_text += f"    </perf>\n"
+            result_text += f"  </meta>\n"
+            
+            result_text += "  <results>\n"
+            for i, result in enumerate(all_results):
+                result_text += f'    <r rank="{i+1}">\n'
+                result_text += f"      <s>{result.score:.3f}</s>\n"
+                result_text += f"      <p>{result.project_name}</p>\n"
+                
+                # Calculate relative time
+                timestamp_clean = result.timestamp.replace('Z', '+00:00') if result.timestamp.endswith('Z') else result.timestamp
+                timestamp_dt = datetime.fromisoformat(timestamp_clean)
+                # Ensure both datetimes are timezone-aware
+                if timestamp_dt.tzinfo is None:
+                    timestamp_dt = timestamp_dt.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                days_ago = (now - timestamp_dt).days
+                if days_ago == 0:
+                    time_str = "today"
+                elif days_ago == 1:
+                    time_str = "yesterday"
+                else:
+                    time_str = f"{days_ago}d"
+                result_text += f"      <t>{time_str}</t>\n"
+                
+                if not brief:
+                    # Extract title from first line of excerpt
+                    excerpt_lines = result.excerpt.split('\n')
+                    title = excerpt_lines[0][:80] + "..." if len(excerpt_lines[0]) > 80 else excerpt_lines[0]
+                    result_text += f"      <title>{title}</title>\n"
+                    
+                    # Key finding - summarize the main point
+                    key_finding = result.excerpt[:100] + "..." if len(result.excerpt) > 100 else result.excerpt
+                    result_text += f"      <key-finding>{key_finding.strip()}</key-finding>\n"
+                
+                # Always include excerpt, but shorter in brief mode
+                if brief:
+                    brief_excerpt = result.excerpt[:100] + "..." if len(result.excerpt) > 100 else result.excerpt
+                    result_text += f"      <excerpt>{brief_excerpt.strip()}</excerpt>\n"
+                else:
+                    result_text += f"      <excerpt><![CDATA[{result.excerpt}]]></excerpt>\n"
+                
+                if result.conversation_id:
+                    result_text += f"      <cid>{result.conversation_id}</cid>\n"
+                
+                # Include raw data if requested
+                if include_raw and result.raw_payload:
+                    result_text += "      <raw>\n"
+                    result_text += f"        <txt><![CDATA[{result.raw_payload.get('text', '')}]]></txt>\n"
+                    result_text += f"        <id>{result.id}</id>\n"
+                    result_text += f"        <dist>{1 - result.score:.3f}</dist>\n"
+                    result_text += "        <meta>\n"
+                    for key, value in result.raw_payload.items():
+                        if key != 'text':
+                            result_text += f"          <{key}>{value}</{key}>\n"
+                    result_text += "        </meta>\n"
+                    result_text += "      </raw>\n"
+                
+                result_text += "    </r>\n"
+            result_text += "  </results>\n"
+            result_text += "</search>"
+            
+        else:
+            # Markdown format (original)
+            result_text = f"Found {len(all_results)} relevant conversation(s) for '{query}':\n\n"
+            for i, result in enumerate(all_results):
+                result_text += f"**Result {i+1}** (Score: {result.score:.3f})\n"
+                # Handle timezone suffix 'Z' properly
+                timestamp_clean = result.timestamp.replace('Z', '+00:00') if result.timestamp.endswith('Z') else result.timestamp
+                result_text += f"Time: {datetime.fromisoformat(timestamp_clean).strftime('%Y-%m-%d %H:%M:%S')}\n"
+                result_text += f"Project: {result.project_name}\n"
+                result_text += f"Role: {result.role}\n"
+                result_text += f"Excerpt: {result.excerpt}\n"
+                result_text += "---\n\n"
+        
+        timing_info['format_end'] = time.time()
+        
+        # Log detailed timing breakdown
+        await ctx.debug(f"\n=== TIMING BREAKDOWN ===")
+        await ctx.debug(f"Total time: {(time.time() - start_time) * 1000:.1f}ms")
+        await ctx.debug(f"Embedding generation: {(timing_info.get('embedding_end', 0) - timing_info.get('embedding_start', 0)) * 1000:.1f}ms")
+        await ctx.debug(f"Get collections: {(timing_info.get('get_collections_end', 0) - timing_info.get('get_collections_start', 0)) * 1000:.1f}ms")
+        await ctx.debug(f"Search all collections: {(timing_info.get('search_all_end', 0) - timing_info.get('search_all_start', 0)) * 1000:.1f}ms")
+        await ctx.debug(f"Sorting results: {(timing_info.get('sort_end', 0) - timing_info.get('sort_start', 0)) * 1000:.1f}ms")
+        await ctx.debug(f"Formatting output: {(timing_info.get('format_end', 0) - timing_info.get('format_start', 0)) * 1000:.1f}ms")
+        
+        # Log per-collection timings
+        await ctx.debug(f"\n=== PER-COLLECTION TIMINGS ===")
+        for ct in collection_timings:
+            duration = (ct.get('end', 0) - ct.get('start', 0)) * 1000
+            status = "ERROR" if 'error' in ct else "OK"
+            await ctx.debug(f"{ct['name']}: {duration:.1f}ms ({status})")
         
         return result_text
         
     except Exception as e:
         await ctx.error(f"Search failed: {str(e)}")
         return f"Failed to search conversations: {str(e)}"
+
 
 @mcp.tool()
 async def store_reflection(
@@ -558,6 +707,178 @@ async def store_reflection(
     except Exception as e:
         await ctx.error(f"Store failed: {str(e)}")
         return f"Failed to store reflection: {str(e)}"
+
+
+@mcp.tool()
+async def quick_search(
+    ctx: Context,
+    query: str = Field(description="The search query to find semantically similar conversations"),
+    min_score: float = Field(default=0.7, description="Minimum similarity score (0-1)"),
+    project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects.")
+) -> str:
+    """Quick search that returns only the count and top result for fast overview."""
+    # Leverage reflect_on_past with optimized parameters
+    result = await reflect_on_past(
+        ctx=ctx,
+        query=query,
+        limit=1,  # Only get the top result
+        min_score=min_score,
+        project=project,
+        response_format="xml",
+        brief=True,  # Use brief mode for minimal response
+        include_raw=False
+    )
+    
+    # Parse and reformat for quick overview
+    import re
+    
+    # Extract count from metadata
+    count_match = re.search(r'<tc>(\d+)</tc>', result)
+    total_count = count_match.group(1) if count_match else "0"
+    
+    # Extract top result
+    score_match = re.search(r'<s>([\d.]+)</s>', result)
+    project_match = re.search(r'<p>([^<]+)</p>', result)
+    title_match = re.search(r'<t>([^<]+)</t>', result)
+    
+    if score_match and project_match and title_match:
+        return f"""<quick_search>
+<total_matches>{total_count}</total_matches>
+<top_result>
+<score>{score_match.group(1)}</score>
+<project>{project_match.group(1)}</project>
+<title>{title_match.group(1)}</title>
+</top_result>
+</quick_search>"""
+    else:
+        return f"""<quick_search>
+<total_matches>{total_count}</total_matches>
+<message>No relevant matches found</message>
+</quick_search>"""
+
+
+@mcp.tool()
+async def search_summary(
+    ctx: Context,
+    query: str = Field(description="The search query to find semantically similar conversations"),
+    project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects.")
+) -> str:
+    """Get aggregated insights from search results without individual result details."""
+    # Get more results for better summary
+    result = await reflect_on_past(
+        ctx=ctx,
+        query=query,
+        limit=10,  # Get more results for analysis
+        min_score=0.6,  # Lower threshold for broader context
+        project=project,
+        response_format="xml",
+        brief=False,  # Get full excerpts for analysis
+        include_raw=False
+    )
+    
+    # Parse results for summary generation
+    import re
+    from collections import Counter
+    
+    # Extract all projects
+    projects = re.findall(r'<p>([^<]+)</p>', result)
+    project_counts = Counter(projects)
+    
+    # Extract scores for statistics
+    scores = [float(s) for s in re.findall(r'<s>([\d.]+)</s>', result)]
+    avg_score = sum(scores) / len(scores) if scores else 0
+    
+    # Extract themes from titles and excerpts
+    titles = re.findall(r'<t>([^<]+)</t>', result)
+    excerpts = re.findall(r'<e>([^<]+)</e>', result)
+    
+    # Extract metadata
+    count_match = re.search(r'<tc>(\d+)</tc>', result)
+    total_count = count_match.group(1) if count_match else "0"
+    
+    # Generate summary
+    summary = f"""<search_summary>
+<total_matches>{total_count}</total_matches>
+<searched_projects>{len(project_counts)}</searched_projects>
+<average_relevance>{avg_score:.2f}</average_relevance>
+<project_distribution>"""
+    
+    for proj, count in project_counts.most_common(3):
+        summary += f"\n  <project name='{proj}' matches='{count}'/>"
+    
+    summary += f"""
+</project_distribution>
+<common_themes>"""
+    
+    # Simple theme extraction from titles
+    theme_words = []
+    for title in titles[:5]:  # Top 5 results
+        words = [w.lower() for w in title.split() if len(w) > 4]
+        theme_words.extend(words)
+    
+    theme_counts = Counter(theme_words)
+    for theme, count in theme_counts.most_common(5):
+        if count > 1:  # Only show repeated themes
+            summary += f"\n  <theme>{theme}</theme>"
+    
+    summary += """
+</common_themes>
+</search_summary>"""
+    
+    return summary
+
+
+@mcp.tool()
+async def get_more_results(
+    ctx: Context,
+    query: str = Field(description="The original search query"),
+    offset: int = Field(default=3, description="Number of results to skip (for pagination)"),
+    limit: int = Field(default=3, description="Number of additional results to return"),
+    min_score: float = Field(default=0.7, description="Minimum similarity score (0-1)"),
+    project: Optional[str] = Field(default=None, description="Search specific project only")
+) -> str:
+    """Get additional search results after an initial search (pagination support)."""
+    # Note: Since Qdrant doesn't support true offset in our current implementation,
+    # we'll fetch offset+limit results and slice
+    total_limit = offset + limit
+    
+    # Get the larger result set
+    result = await reflect_on_past(
+        ctx=ctx,
+        query=query,
+        limit=total_limit,
+        min_score=min_score,
+        project=project,
+        response_format="xml",
+        brief=False,
+        include_raw=False
+    )
+    
+    # Parse and extract only the additional results
+    import re
+    
+    # Find all result blocks
+    result_pattern = r'<r>.*?</r>'
+    all_results = re.findall(result_pattern, result, re.DOTALL)
+    
+    # Get only the results after offset
+    additional_results = all_results[offset:offset+limit] if len(all_results) > offset else []
+    
+    if not additional_results:
+        return """<more_results>
+<message>No additional results found</message>
+</more_results>"""
+    
+    # Reconstruct response with only additional results
+    response = f"""<more_results>
+<offset>{offset}</offset>
+<count>{len(additional_results)}</count>
+<results>
+{''.join(additional_results)}
+</results>
+</more_results>"""
+    
+    return response
 
 
 # Debug output

@@ -5,6 +5,37 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.5] - 2025-07-29
+
+### Added
+- Performance optimizations achieving 10-40x speed improvement
+  - End-to-end response time reduced from 28.9s-2min to 2-3s
+  - Response size reduced by 40-60% through compression techniques
+- Brief mode parameter for minimal responses (`brief=true`)
+- Progress reporting during search operations (requires client progressToken)
+- Comprehensive timing logs for performance debugging
+- Debug mode with `include_raw=true` for troubleshooting
+- Response format parameter supporting both XML and markdown (`response_format`)
+
+### Changed
+- Default result limit reduced from 5 to 3 for better performance
+- XML tags compressed to single letters for smaller payload
+- Excerpt length reduced from 500 to 250 characters
+- Title and key-finding lengths optimized (80/100 chars)
+- Timezone handling fixed for proper datetime comparisons
+
+### Performance
+- Search latency: 103-620ms (varies by collection count)
+- MCP overhead: 75-85% of total response time
+- Response size reduction: 40% (normal), 60% (brief mode)
+- Streaming works properly when using reflection-specialist sub-agent
+
+### Technical
+- Added detailed timing breakdown in debug logs
+- Fixed "0 tool uses" display issue with sub-agents
+- Improved real-time playback with markdown format
+- Better error handling for timezone-aware datetimes
+
 ## [2.4.4] - 2025-07-29
 
 ### Added
