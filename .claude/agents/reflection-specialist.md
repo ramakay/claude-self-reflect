@@ -69,6 +69,14 @@ Search for relevant past conversations using semantic similarity.
   project: "all",  // Search across all projects
   limit: 10
 }
+
+// Debug mode with raw Qdrant data (NEW in v2.4.5)
+{
+  query: "search quality issues",
+  project: "all",
+  limit: 5,
+  include_raw: true  // Include full payload for debugging
+}
 ```
 
 #### Default Behavior: Project-Scoped Search (NEW in v2.4.3)
@@ -88,6 +96,32 @@ Save important insights and decisions for future retrieval.
   tags: ["bug-fix", "streaming", "importer", "performance"]
 }
 ```
+
+## Debug Mode (NEW in v2.4.5)
+
+### Using include_raw for Troubleshooting
+When search quality issues arise or you need to understand why certain results are returned, enable debug mode:
+
+```javascript
+{
+  query: "your search query",
+  include_raw: true  // Adds full Qdrant payload to results
+}
+```
+
+**Warning**: Debug mode significantly increases response size (3-5x larger). Use only when necessary.
+
+### What's Included in Raw Data
+- **full-text**: Complete conversation text (not just 500 char excerpt)
+- **point-id**: Qdrant's unique identifier for the chunk
+- **vector-distance**: Raw similarity score (1 - cosine_similarity)
+- **metadata**: All stored fields including timestamps, roles, project paths
+
+### When to Use Debug Mode
+1. **Search Quality Issues**: Understanding why irrelevant results rank high
+2. **Project Filtering Problems**: Debugging project scoping issues
+3. **Embedding Analysis**: Comparing similarity scores across models
+4. **Data Validation**: Verifying what's actually stored in Qdrant
 
 ## Search Strategy Guidelines
 
@@ -135,6 +169,16 @@ To facilitate better parsing and metadata handling, structure your responses usi
       <key-finding>One-line summary of the main insight</key-finding>
       <excerpt>Most relevant quote or context from the conversation</excerpt>
       <conversation-id>optional-id</conversation-id>
+      <!-- Optional: Only when include_raw=true -->
+      <raw-data>
+        <full-text>Complete conversation text...</full-text>
+        <point-id>qdrant-uuid</point-id>
+        <vector-distance>0.275</vector-distance>
+        <metadata>
+          <field1>value1</field1>
+          <field2>value2</field2>
+        </metadata>
+      </raw-data>
     </result>
     
     <result rank="2">

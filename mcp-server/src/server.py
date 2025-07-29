@@ -87,6 +87,7 @@ class SearchResult(BaseModel):
     project_name: str
     conversation_id: Optional[str] = None
     collection_name: str
+    raw_payload: Optional[Dict[str, Any]] = None  # Full Qdrant payload when debug mode enabled
 
 
 # Initialize FastMCP instance
@@ -151,7 +152,8 @@ async def reflect_on_past(
     limit: int = Field(default=5, description="Maximum number of results to return"),
     min_score: float = Field(default=0.7, description="Minimum similarity score (0-1)"),
     use_decay: Union[int, str] = Field(default=-1, description="Apply time-based decay: 1=enable, 0=disable, -1=use environment default (accepts int or str)"),
-    project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects.")
+    project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects."),
+    include_raw: bool = Field(default=False, description="Include raw Qdrant payload data for debugging (increases response size)")
 ) -> str:
     """Search for relevant past conversations using semantic search with optional time decay."""
     
@@ -356,7 +358,8 @@ async def reflect_on_past(
                             excerpt=(point.payload.get('text', '')[:500] + '...'),
                             project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
-                            collection_name=collection_name
+                            collection_name=collection_name,
+                            raw_payload=point.payload if include_raw else None
                         ))
                     
                 elif should_use_decay:
@@ -431,7 +434,8 @@ async def reflect_on_past(
                             excerpt=(point.payload.get('text', '')[:500] + '...'),
                             project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
-                            collection_name=collection_name
+                            collection_name=collection_name,
+                            raw_payload=point.payload if include_raw else None
                         ))
                 else:
                     # Standard search without decay
@@ -466,7 +470,8 @@ async def reflect_on_past(
                             excerpt=(point.payload.get('text', '')[:500] + '...'),
                             project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
-                            collection_name=collection_name
+                            collection_name=collection_name,
+                            raw_payload=point.payload if include_raw else None
                         ))
             
             except Exception as e:
