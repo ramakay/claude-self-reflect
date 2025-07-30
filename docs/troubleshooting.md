@@ -8,6 +8,7 @@ This guide helps you resolve common issues with Claude Self-Reflect.
 - [MCP Connection Issues](#mcp-connection-issues)
 - [Search and Reflection Issues](#search-and-reflection-issues)
 - [Performance Issues](#performance-issues)
+- [Memory and Import Issues](#memory-and-import-issues)
 - [Error Messages](#error-messages)
 
 ## Installation Issues
@@ -430,6 +431,57 @@ sudo apt-get install --reinstall python3
 2. Reduce batch size in configuration
 3. Monitor Docker memory limits
 4. Process conversations in smaller chunks
+
+## Memory and Import Issues
+
+### Import watcher getting killed (OOM)
+
+**Symptom**: Import watcher shows "Import failed with code -9" in logs
+
+**Solution**:
+1. Temporarily increase Docker memory to 4GB:
+   - Docker Desktop → Settings → Resources → Memory: 4GB
+2. Let the initial import complete (check logs show "Import completed successfully")
+3. Once state file is built, reduce back to 2GB
+4. Future imports will be incremental and use much less memory
+
+### First import takes too long
+
+**Symptom**: Initial import takes 5-10 minutes and uses high memory
+
+**Explanation**: This is normal for first-time setup:
+- Processing entire conversation history (500-1000 files typical)
+- Building embeddings for 5,000-15,000 conversation chunks
+- Creating initial state tracking file
+
+**Solution**:
+1. Be patient - this is a one-time operation
+2. Monitor progress with: `docker logs -f claude-reflection-watcher`
+3. After completion, subsequent imports take <60 seconds
+
+### Container keeps restarting
+
+**Symptom**: Watcher container restarts repeatedly, never completes import
+
+**Cause**: Insufficient memory causing OOM kills
+
+**Solution**:
+1. Check Docker memory allocation:
+   ```bash
+   docker system info | grep Memory
+   ```
+2. Increase memory limit in docker-compose.yaml:
+   ```yaml
+   watcher:
+     mem_limit: 4g      # Increase from 2g
+     memswap_limit: 4g  # Match mem_limit
+   ```
+3. Restart services:
+   ```bash
+   docker compose down
+   docker compose --profile watch up -d
+   ```
+4. After initial import, revert to 2g
 
 ## Error Messages
 

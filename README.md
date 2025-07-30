@@ -26,6 +26,15 @@ Your conversations become searchable. Your decisions stay remembered. Your conte
 - **Node.js** 16+ (for the setup wizard)
 - **Claude Desktop** app
 
+## System Requirements
+
+### Memory
+- **Docker Memory**: 2GB minimum (4GB recommended for initial setup)
+- **First Import**: May take 2-7 minutes to process all conversations
+- **Subsequent Imports**: <60 seconds (only processes new/changed files)
+
+💡 **First-Time User Note**: The initial import processes your entire conversation history. This is a one-time operation. After that, the system only imports new conversations, making it much faster and using less memory.
+
 ## Install
 
 ### Quick Start (Local Mode - Default)

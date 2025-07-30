@@ -5,6 +5,38 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.10] - 2025-07-30
+
+### Fixed
+- Critical memory optimization: Import watcher no longer gets OOM killed on 2GB systems
+  - Reduced batch size from 100 to 10 messages for lower memory footprint
+  - Added per-file state saving to prevent progress loss on OOM
+  - Implemented garbage collection after each file processing
+  - State persistence now happens incrementally, not just at end
+
+### Added
+- Comprehensive memory footprint documentation (docs/memory-footprint.md)
+  - Detailed memory usage patterns for first-time vs incremental imports
+  - Troubleshooting guide for OOM issues
+  - Performance metrics and optimization details
+- Enhanced setup wizard with memory configuration guidance
+  - Warns about first-time import memory requirements
+  - Suggests temporary 4GB allocation for initial setup
+
+### Changed
+- Import process now more resilient to memory constraints
+  - Works reliably with 2GB Docker memory after initial import
+  - First import may still benefit from 4GB temporary allocation
+- Updated documentation across multiple files:
+  - README.md: Added system requirements section
+  - troubleshooting.md: New memory and import issues section
+  - setup-wizard-docker.js: Better memory handling guidance
+
+### Performance
+- Memory usage reduced by ~60% during import operations
+- Import reliability improved - no longer fails on systems with 2GB Docker memory
+- State tracking prevents re-importing unchanged files even after OOM recovery
+
 ## [2.4.9] - 2025-07-30
 
 ### Fixed

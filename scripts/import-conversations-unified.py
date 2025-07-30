@@ -8,6 +8,7 @@ import sys
 import json
 import glob
 import hashlib
+import gc
 from datetime import datetime
 from typing import List, Dict, Any
 import logging
@@ -29,7 +30,7 @@ from tenacity import (
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 LOGS_DIR = os.getenv("LOGS_DIR", "/logs")
 STATE_FILE = os.getenv("STATE_FILE", "/config/imported-files.json")
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))  # Reduced from 100 to prevent OOM
 PREFER_LOCAL_EMBEDDINGS = os.getenv("PREFER_LOCAL_EMBEDDINGS", "false").lower() == "true"
 VOYAGE_API_KEY = os.getenv("VOYAGE_KEY")
 
@@ -304,6 +305,12 @@ def import_project(project_path: Path, collection_name: str, state: dict) -> int
             
             # Update state for this file
             update_file_state(jsonl_file, state, file_chunks)
+            
+            # Save state after each file to prevent loss on OOM
+            save_state(state)
+            
+            # Force garbage collection to free memory
+            gc.collect()
             
         except Exception as e:
             logger.error(f"Failed to import {jsonl_file}: {e}")
