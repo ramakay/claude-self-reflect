@@ -59,6 +59,7 @@ archived/
 # Internal scripts
 .scripts-internal/
 scripts/import-*.py
+!scripts/import-watcher.py
 scripts/test-*.py
 scripts/*decay*.py
 scripts/simple-importer.py
