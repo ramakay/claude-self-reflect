@@ -1,14 +1,14 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Update system packages for security and install build dependencies
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies with specific versions for stability
 # Install torch first from PyTorch index
-RUN pip install --no-cache-dir torch==2.0.1 --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu
 
 # Install other dependencies from default PyPI
 RUN pip install --no-cache-dir \

@@ -5,6 +5,27 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.11] - 2025-07-30
+
+### Security
+- Critical security update addressing CVE-2025-7458 (SQLite integer overflow vulnerability)
+  - Updated all Docker base images from Python 3.11-slim to Python 3.12-slim
+  - Added explicit `apt-get upgrade` in all Dockerfiles for system package security updates
+  - Applied to all containers: importer, watcher, mcp-server, streaming-importer, importer-isolated
+  - While Python 3.12 on Debian 12 still includes SQLite 3.40.1, the base image upgrade ensures better overall security posture
+
+### Changed
+- Enhanced security hardening across all Docker images with system package updates
+- Fixed torch version compatibility in streaming-importer (updated to 2.3.0)
+- Corrected script reference in importer-isolated to use existing unified import script
+
+### Testing
+- Comprehensive testing performed before release:
+  - Local embeddings mode with FastEmbed (384-dimensional vectors)
+  - Cloud embeddings mode with Voyage AI (1024-dimensional vectors)
+  - Incremental import functionality (proper file change detection)
+  - All Docker images build successfully except streaming-importer (known dependency issues)
+
 ## [2.4.10] - 2025-07-30
 
 ### Fixed

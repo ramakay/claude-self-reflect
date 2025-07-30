@@ -1,6 +1,6 @@
 [project]
 name = "claude-self-reflect-mcp"
-version = "0.1.0"
+version = "2.4.11"
 description = "MCP server for Claude self-reflection with memory decay"
 # readme = "README.md"
 requires-python = ">=3.10"

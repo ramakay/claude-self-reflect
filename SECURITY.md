@@ -82,6 +82,11 @@ For repository administrators:
 
 ## Security Audit History
 
+- **v2.4.11**: Security update to address CVE-2025-7458:
+  - Updated all Docker base images from Python 3.11-slim to Python 3.12-slim
+  - Added explicit `apt-get upgrade` in all Dockerfiles for system package updates
+  - SQLite updated from vulnerable 3.40.1 to 3.50.1
+  - Applied to: importer, watcher, mcp-server, streaming-importer, importer-isolated
 - **v2.3.9**: Added gitleaks configuration to handle false positives and historical secrets
 - **v2.3.7**: Major security cleanup - removed 250+ internal files, secured .env permissions
 - **v2.3.3**: Migrated to local embeddings by default for privacy
