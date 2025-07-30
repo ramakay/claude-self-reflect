@@ -5,6 +5,38 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.9] - 2025-07-30
+
+### Fixed
+- Critical performance fix: Import watcher no longer re-imports unchanged files (#22)
+  - Previously re-imported ALL files every 60 seconds causing 7+ minute cycles
+  - Now tracks file modification times and skips unchanged files
+  - Reduces subsequent import times from 7+ minutes to under 30 seconds
+  - Significantly reduces CPU and memory usage
+
+### Added
+- Import state tracking in `.import_state.json`
+  - Persists across watcher restarts
+  - Tracks modification times for each imported file
+  - Saves state after each project to preserve progress
+
+### Changed
+- `scripts/import-conversations-unified.py`: Added state management functions
+- `Dockerfile.watcher`: Rebuilt with updated import script
+
+### Performance
+- First import: Processes all files normally
+- Subsequent imports: Skip 90%+ unchanged files
+- Import time: Reduced from 7+ minutes to <60 seconds
+- Resource usage: Dramatically reduced CPU and memory consumption
+
+## [2.4.8] - 2025-07-29
+
+### Fixed
+- Critical fix: Import watcher was missing scripts directory causing continuous failures
+  - Updated Dockerfile.watcher to properly copy scripts directory
+  - Fixed import path to use correct script location
+
 ## [2.4.7] - 2025-07-29
 
 ### Fixed

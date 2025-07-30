@@ -37,6 +37,60 @@ VOYAGE_API_KEY = os.getenv("VOYAGE_KEY")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# State management functions
+def load_state():
+    """Load the import state from file."""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r') as f:
+                state = json.load(f)
+                # Ensure the expected structure exists
+                if "imported_files" not in state:
+                    state["imported_files"] = {}
+                return state
+        except Exception as e:
+            logger.warning(f"Failed to load state file: {e}")
+    return {"imported_files": {}}
+
+def save_state(state):
+    """Save the import state to file."""
+    try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        # Write atomically by using a temp file
+        temp_file = STATE_FILE + ".tmp"
+        with open(temp_file, 'w') as f:
+            json.dump(state, f, indent=2)
+        os.replace(temp_file, STATE_FILE)
+        logger.debug(f"Saved state with {len(state['imported_files'])} files")
+    except Exception as e:
+        logger.error(f"Failed to save state file: {e}")
+
+def should_import_file(file_path, state):
+    """Check if a file should be imported based on modification time."""
+    str_path = str(file_path)
+    file_mtime = os.path.getmtime(file_path)
+    
+    if str_path in state["imported_files"]:
+        last_imported = state["imported_files"][str_path].get("last_imported", 0)
+        last_modified = state["imported_files"][str_path].get("last_modified", 0)
+        
+        # Skip if file hasn't been modified since last import
+        if file_mtime <= last_modified and last_imported > 0:
+            logger.info(f"Skipping unchanged file: {file_path.name}")
+            return False
+    
+    return True
+
+def update_file_state(file_path, state, chunks_imported):
+    """Update the state for an imported file."""
+    str_path = str(file_path)
+    state["imported_files"][str_path] = {
+        "last_modified": os.path.getmtime(file_path),
+        "last_imported": datetime.now().timestamp(),
+        "chunks_imported": chunks_imported
+    }
+
 # Initialize embedding provider
 embedding_provider = None
 embedding_dimension = None
@@ -120,7 +174,7 @@ def chunk_conversation(messages: List[Dict[str, Any]], chunk_size: int = 10) -> 
     
     return chunks
 
-def import_project(project_path: Path, collection_name: str) -> int:
+def import_project(project_path: Path, collection_name: str, state: dict) -> int:
     """Import all conversations from a project."""
     jsonl_files = list(project_path.glob("*.jsonl"))
     
@@ -143,6 +197,10 @@ def import_project(project_path: Path, collection_name: str) -> int:
     total_chunks = 0
     
     for jsonl_file in jsonl_files:
+        # Check if file should be imported
+        if not should_import_file(jsonl_file, state):
+            continue
+            
         logger.info(f"Processing file: {jsonl_file.name}")
         try:
             # Read JSONL file and extract messages
@@ -241,7 +299,11 @@ def import_project(project_path: Path, collection_name: str) -> int:
                 
                 total_chunks += len(points)
             
-            logger.info(f"Imported {len(chunks)} chunks from {jsonl_file.name}")
+            file_chunks = len(chunks)
+            logger.info(f"Imported {file_chunks} chunks from {jsonl_file.name}")
+            
+            # Update state for this file
+            update_file_state(jsonl_file, state, file_chunks)
             
         except Exception as e:
             logger.error(f"Failed to import {jsonl_file}: {e}")
@@ -257,6 +319,10 @@ def main():
     if not logs_path.exists():
         logger.error(f"Logs directory not found: {LOGS_DIR}")
         return
+    
+    # Load existing state
+    state = load_state()
+    logger.info(f"Loaded state with {len(state['imported_files'])} previously imported files")
     
     # Find all project directories
     project_dirs = [d for d in logs_path.iterdir() if d.is_dir()]
@@ -274,9 +340,15 @@ def main():
         collection_name = f"conv_{hashlib.md5(project_dir.name.encode()).hexdigest()[:8]}{collection_suffix}"
         
         logger.info(f"Importing project: {project_dir.name} -> {collection_name}")
-        chunks = import_project(project_dir, collection_name)
+        chunks = import_project(project_dir, collection_name, state)
         total_imported += chunks
         logger.info(f"Imported {chunks} chunks from {project_dir.name}")
+        
+        # Save state after each project to avoid losing progress
+        save_state(state)
+    
+    # Final save (redundant but ensures state is saved)
+    save_state(state)
     
     logger.info(f"Import complete! Total chunks imported: {total_imported}")
 
