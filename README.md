@@ -372,4 +372,19 @@ Special thanks to our contributors and security researchers:
 - **[@akamalov](https://github.com/akamalov)** - Highlighted Ubuntu WSL bug and helped educate about filesystem nuances
 - **[@kylesnowschwartz](https://github.com/kylesnowschwartz)** - Comprehensive security review leading to v2.3.3+ security improvements (#6)
 
+## Windows Configuration
+
+### Recommended: Use WSL
+For the best experience on Windows, we recommend using WSL (Windows Subsystem for Linux) which provides native Linux compatibility for Docker operations.
+
+### Alternative: Native Windows
+If using Docker Desktop on native Windows, you need to adjust the CONFIG_PATH in your `.env` file to use Docker-compatible paths:
+
+```bash
+# Replace USERNAME with your Windows username
+CONFIG_PATH=/c/Users/USERNAME/.claude-self-reflect/config
+```
+
+This ensures Docker can properly mount the config directory. The setup wizard creates the directory, but Windows users need to update the path format for Docker compatibility.
+
 MIT License. Built with ❤️ for the Claude community.
