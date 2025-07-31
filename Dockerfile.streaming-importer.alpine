@@ -1,0 +1,24 @@
+FROM python:3.12-alpine
+
+WORKDIR /app
+
+# Install build dependencies and security updates
+RUN apk update && apk upgrade && \
+    apk add --no-cache gcc g++ musl-dev linux-headers curl && \
+    rm -rf /var/cache/apk/*
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    qdrant-client \
+    sentence-transformers \
+    numpy \
+    fastembed \
+    voyageai \
+    python-dotenv \
+    torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu
+
+# Copy scripts
+COPY scripts/import-conversations-voyage-streaming.py /app/
+
+# Run the streaming import script
+CMD ["python", "-u", "import-conversations-voyage-streaming.py"]

@@ -1,0 +1,21 @@
+FROM python:3.12-alpine
+
+# Install build dependencies, security updates and curl
+RUN apk update && apk upgrade && \
+    apk add --no-cache gcc musl-dev linux-headers curl && \
+    rm -rf /var/cache/apk/*
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    qdrant-client \
+    sentence-transformers \
+    numpy
+
+# Copy the import script with proper permissions
+COPY scripts/import-conversations-unified.py /app/import.py
+RUN chmod +x /app/import.py
+
+WORKDIR /app
+
+# Run the import script
+CMD ["python", "import.py"]

@@ -260,6 +260,60 @@ Both embedding options work well. Local mode uses FastEmbed for privacy and offl
 - [Why We Built This](docs/motivation-and-history.md) - The full story
 - [Advanced Usage](docs/advanced-usage.md) - Power user features
 
+## Security
+
+### Container Security Notice
+⚠️ **Known Vulnerabilities**: Our Docker images are continuously monitored by Snyk and may show vulnerabilities in base system libraries. We want to be transparent about this:
+
+- **Why they exist**: We use official Python Docker images based on Debian stable, which prioritizes stability over latest versions
+- **Actual risk is minimal** because:
+  - Most CVEs are in unused system libraries or require local access
+  - Security patches are backported by Debian (version numbers don't reflect patches)
+  - Our containers run as non-root users with minimal permissions
+  - This is a local-only tool with no network exposure
+- **What we're doing**: Regular updates, security monitoring, and evaluating alternative base images
+
+**For production or security-sensitive environments**, consider:
+- Building your own hardened images
+- Running with additional security constraints (see below)
+- Evaluating if the tool meets your security requirements
+
+For maximum security:
+```bash
+# Run containers with read-only root filesystem
+docker run --read-only --tmpfs /tmp claude-self-reflect
+```
+
+### Privacy & Data Security
+- **Local by default**: Your conversations never leave your machine unless you explicitly enable cloud embeddings
+- **No telemetry**: We don't track usage or collect any data
+- **Secure storage**: All data stored in Docker volumes with proper permissions
+- **API keys**: Stored in .env file with 600 permissions (read/write by owner only)
+
+See our [Security Policy](SECURITY.md) for vulnerability reporting and more details.
+
+## ⚠️ Important Disclaimers
+
+### Tool Operation
+- **Resource Usage**: The import process can be CPU and memory intensive, especially during initial import of large conversation histories
+- **Data Processing**: This tool reads and indexes your Claude conversation files. Ensure you have adequate disk space
+- **No Warranty**: This software is provided "AS IS" under the MIT License, without warranty of any kind
+- **Data Responsibility**: You are responsible for your conversation data and any API keys used
+
+### Limitations
+- **Not Official**: This is a community tool, not officially supported by Anthropic
+- **Experimental Features**: Some features like memory decay are experimental and may change
+- **Import Delays**: Large conversation histories may take significant time to import initially
+- **Docker Dependency**: Requires Docker to be running, which uses system resources
+
+### Best Practices
+- **Backup Your Data**: Always maintain backups of important conversations
+- **Monitor Resources**: Check Docker resource usage if you experience system slowdowns
+- **Test First**: Try with a small subset of conversations before full import
+- **Review Logs**: Check import logs if conversations seem missing
+
+By using this tool, you acknowledge these disclaimers and limitations.
+
 ## Problems?
 
 - [Troubleshooting Guide](docs/troubleshooting.md)

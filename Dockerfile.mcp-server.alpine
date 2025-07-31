@@ -1,0 +1,22 @@
+FROM python:3.12-alpine
+
+WORKDIR /app
+
+# Install build dependencies and security updates
+RUN apk update && apk upgrade && \
+    apk add --no-cache gcc musl-dev linux-headers && \
+    rm -rf /var/cache/apk/*
+
+# Copy the MCP server package files
+COPY mcp-server/pyproject.toml ./
+COPY mcp-server/src ./src
+
+# Install the package in development mode
+RUN pip install --no-cache-dir -e .
+
+# Create a non-root user
+RUN adduser -D -u 1000 mcpuser
+USER mcpuser
+
+# Keep the container running and wait for docker exec commands
+CMD ["tail", "-f", "/dev/null"]

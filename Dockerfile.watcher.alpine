@@ -1,0 +1,24 @@
+FROM python:3.12-alpine
+
+WORKDIR /app
+
+# Install build dependencies and security updates
+RUN apk update && apk upgrade && \
+    apk add --no-cache gcc musl-dev linux-headers curl && \
+    rm -rf /var/cache/apk/*
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    qdrant-client \
+    sentence-transformers \
+    numpy \
+    fastembed \
+    voyageai \
+    python-dotenv
+
+# Copy scripts with proper permissions
+COPY scripts/ /app/scripts/
+RUN chmod +x /app/scripts/*.py
+
+# Run the watcher script
+CMD ["python", "-u", "scripts/import-watcher.py"]

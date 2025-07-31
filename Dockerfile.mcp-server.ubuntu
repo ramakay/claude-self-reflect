@@ -1,0 +1,34 @@
+FROM ubuntu:24.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /app
+
+# Install Python 3.12 and security updates
+RUN apt-get update && apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-venv \
+    python3-pip \
+    python3.12-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create virtual environment
+RUN python3.12 -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+
+# Copy the MCP server package files
+COPY mcp-server/pyproject.toml ./
+COPY mcp-server/src ./src
+
+# Install the package in development mode
+RUN pip install --no-cache-dir -e .
+
+# Create a non-root user
+RUN useradd -m -u 1000 mcpuser
+USER mcpuser
+
+# Keep the container running and wait for docker exec commands
+CMD ["tail", "-f", "/dev/null"]
