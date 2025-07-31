@@ -7,6 +7,7 @@ import fs from 'fs/promises';
 import fsSync from 'fs';
 import readline from 'readline';
 import path from 'path';
+import os from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -94,6 +95,40 @@ async function checkDocker() {
 async function configureEnvironment() {
   console.log('\n🔐 Configuring environment...');
   
+  // Setup config directory in user's home directory for global npm installs
+  const userConfigDir = join(os.homedir(), '.claude-self-reflect', 'config');
+  
+  try {
+    await fs.mkdir(userConfigDir, { recursive: true });
+    console.log(`📁 Using config directory: ${userConfigDir}`);
+    
+    // Migrate existing config from project directory if it exists
+    const oldConfigDir = join(projectRoot, 'config');
+    try {
+      await fs.access(oldConfigDir);
+      const files = await fs.readdir(oldConfigDir);
+      if (files.length > 0) {
+        console.log('🔄 Migrating existing config data...');
+        for (const file of files) {
+          const sourcePath = join(oldConfigDir, file);
+          const targetPath = join(userConfigDir, file);
+          try {
+            await fs.copyFile(sourcePath, targetPath);
+          } catch (err) {
+            // Ignore copy errors, file might already exist
+          }
+        }
+        console.log('✅ Config migration completed');
+      }
+    } catch {
+      // No old config directory, nothing to migrate
+    }
+  } catch (error) {
+    console.log(`❌ Could not create config directory: ${error.message}`);
+    console.log('   This may cause Docker mount issues. Please check permissions.');
+    throw error;
+  }
+  
   const envPath = join(projectRoot, '.env');
   let envContent = '';
   let hasValidApiKey = false;
@@ -152,6 +187,9 @@ async function configureEnvironment() {
   }
   if (!envContent.includes('PREFER_LOCAL_EMBEDDINGS=')) {
     envContent += `PREFER_LOCAL_EMBEDDINGS=${localMode ? 'true' : 'false'}\n`;
+  }
+  if (!envContent.includes('CONFIG_PATH=')) {
+    envContent += `CONFIG_PATH=${userConfigDir}\n`;
   }
   
   await fs.writeFile(envPath, envContent.trim() + '\n');
