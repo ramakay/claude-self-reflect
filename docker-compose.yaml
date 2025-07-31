@@ -2,6 +2,14 @@ volumes:
   qdrant_data:
 
 services:
+  # Fix permissions for config directory
+  init-permissions:
+    image: alpine
+    command: chown -R 1000:1000 /config
+    volumes:
+      - ./config:/config
+    profiles: ["watch", "mcp"]
+
   # Qdrant vector database - the heart of semantic search
   qdrant:
     image: qdrant/qdrant:v1.15.1
@@ -51,6 +59,7 @@ services:
       dockerfile: Dockerfile.watcher
     container_name: claude-reflection-watcher
     depends_on:
+      - init-permissions
       - qdrant
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
