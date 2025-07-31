@@ -8,7 +8,7 @@ services:
     command: chown -R 1000:1000 /config
     volumes:
       - ./config:/config
-    profiles: ["watch", "mcp"]
+    profiles: ["watch", "mcp", "import"]
 
   # Qdrant vector database - the heart of semantic search
   qdrant:
@@ -32,6 +32,7 @@ services:
       dockerfile: Dockerfile.importer
     container_name: claude-reflection-importer
     depends_on:
+      - init-permissions
       - qdrant
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
