@@ -5,12 +5,20 @@ WORKDIR /app
 # Update system packages for security
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
-# Install dependencies
-COPY scripts/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install dependencies directly (avoids file path issues with global npm installs)
+RUN pip install --no-cache-dir \
+    qdrant-client==1.15.0 \
+    openai==1.97.1 \
+    mcp-server-qdrant==0.8.0 \
+    backoff==2.2.1 \
+    tqdm==4.67.1 \
+    humanize==4.12.3 \
+    fastembed==0.7.1 \
+    voyageai==0.3.4 \
+    tenacity==9.1.2
 
-# Copy only the unified import script
-COPY scripts/import-conversations-unified.py .
+# Note: The import script is mounted as a volume in docker-compose.yaml
+# This allows the container to work with both local development and global npm installs
 
-# Run the unified importer
-CMD ["python", "import-conversations-unified.py"]
+# Default command (can be overridden by docker-compose)
+CMD ["python", "--version"]
