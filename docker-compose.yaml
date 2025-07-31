@@ -7,7 +7,7 @@ services:
     image: alpine
     command: chown -R 1000:1000 /config
     volumes:
-      - ./config:/config
+      - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
     profiles: ["watch", "mcp", "import"]
 
   # Qdrant vector database - the heart of semantic search
@@ -36,7 +36,7 @@ services:
       - qdrant
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
-      - ./config:/config
+      - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
       - ./scripts:/scripts:ro
     environment:
       - QDRANT_URL=http://qdrant:6333
@@ -64,7 +64,7 @@ services:
       - qdrant
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
-      - ./config:/config
+      - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
       - ./scripts:/scripts:ro
     environment:
       - QDRANT_URL=http://qdrant:6333
