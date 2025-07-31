@@ -885,6 +885,219 @@ async def get_more_results(
     return response
 
 
+@mcp.tool()
+async def search_by_file(
+    ctx: Context,
+    file_path: str = Field(description="The file path to search for in conversations"),
+    limit: int = Field(default=10, description="Maximum number of results to return"),
+    project: Optional[str] = Field(default=None, description="Search specific project only. Use 'all' to search across all projects.")
+) -> str:
+    """Search for conversations that analyzed a specific file."""
+    global client
+    if client is None:
+        client = AsyncQdrantClient(url=QDRANT_URL)
+    
+    # Normalize file path
+    normalized_path = file_path.replace("\\", "/").replace("/Users/", "~/")
+    
+    # Determine which collections to search
+    project_to_search = project or get_current_project()
+    collections = await get_collections_to_search(project_to_search)
+    
+    if not collections:
+        return "<search_by_file>\n<error>No collections found to search</error>\n</search_by_file>"
+    
+    # Prepare results
+    all_results = []
+    
+    for collection_name in collections:
+        try:
+            # Search with file filter
+            results = await client.search(
+                collection_name=collection_name,
+                query_filter=models.Filter(
+                    should=[
+                        models.FieldCondition(
+                            key="files_analyzed",
+                            match=models.MatchAny(any=[normalized_path])
+                        ),
+                        models.FieldCondition(
+                            key="files_edited", 
+                            match=models.MatchAny(any=[normalized_path])
+                        )
+                    ]
+                ),
+                query_vector=[0.0] * embedding_dimension,  # Dummy vector for filter-only search
+                limit=limit,
+                with_payload=True,
+                score_threshold=0.0  # Accept all matches
+            )
+            
+            for point in results:
+                payload = point.payload
+                all_results.append({
+                    'score': 1.0,  # File match is always 1.0
+                    'payload': payload,
+                    'collection': collection_name
+                })
+                
+        except Exception as e:
+            continue
+    
+    # Sort by timestamp (newest first)
+    all_results.sort(key=lambda x: x['payload'].get('timestamp', ''), reverse=True)
+    
+    # Format results
+    if not all_results:
+        return f"""<search_by_file>
+<query>{file_path}</query>
+<normalized_path>{normalized_path}</normalized_path>
+<message>No conversations found that analyzed this file</message>
+</search_by_file>"""
+    
+    results_text = []
+    for i, result in enumerate(all_results[:limit]):
+        payload = result['payload']
+        timestamp = payload.get('timestamp', 'Unknown')
+        conversation_id = payload.get('conversation_id', 'Unknown')
+        project = payload.get('project', 'Unknown')
+        text_preview = payload.get('text', '')[:200] + '...' if len(payload.get('text', '')) > 200 else payload.get('text', '')
+        
+        # Check if file was edited or just read
+        action = "edited" if normalized_path in payload.get('files_edited', []) else "analyzed"
+        
+        # Get related tools used
+        tool_summary = payload.get('tool_summary', {})
+        tools_used = ', '.join(f"{tool}({count})" for tool, count in tool_summary.items())
+        
+        results_text.append(f"""<result rank="{i+1}">
+<conversation_id>{conversation_id}</conversation_id>
+<project>{project}</project>
+<timestamp>{timestamp}</timestamp>
+<action>{action}</action>
+<tools_used>{tools_used}</tools_used>
+<preview>{text_preview}</preview>
+</result>""")
+    
+    return f"""<search_by_file>
+<query>{file_path}</query>
+<normalized_path>{normalized_path}</normalized_path>
+<count>{len(all_results)}</count>
+<results>
+{''.join(results_text)}
+</results>
+</search_by_file>"""
+
+
+@mcp.tool()
+async def search_by_concept(
+    ctx: Context,
+    concept: str = Field(description="The concept to search for (e.g., 'security', 'docker', 'testing')"),
+    include_files: bool = Field(default=True, description="Include file information in results"),
+    limit: int = Field(default=10, description="Maximum number of results to return"),
+    project: Optional[str] = Field(default=None, description="Search specific project only. Use 'all' to search across all projects.")
+) -> str:
+    """Search for conversations about a specific development concept."""
+    global client
+    if client is None:
+        client = AsyncQdrantClient(url=QDRANT_URL)
+    
+    # Generate embedding for the concept
+    embedding = await generate_embedding(concept)
+    
+    # Determine which collections to search
+    project_to_search = project or get_current_project()
+    collections = await get_collections_to_search(project_to_search)
+    
+    if not collections:
+        return "<search_by_concept>\n<error>No collections found to search</error>\n</search_by_concept>"
+    
+    # Search all collections
+    all_results = []
+    
+    for collection_name in collections:
+        try:
+            # Hybrid search: semantic + concept filter
+            results = await client.search(
+                collection_name=collection_name,
+                query_vector=embedding,
+                query_filter=models.Filter(
+                    should=[
+                        models.FieldCondition(
+                            key="concepts",
+                            match=models.MatchAny(any=[concept.lower()])
+                        )
+                    ]
+                ),
+                limit=limit * 2,  # Get more results for better filtering
+                with_payload=True
+            )
+            
+            for point in results:
+                payload = point.payload
+                # Boost score if concept is in the concepts list
+                score_boost = 0.2 if concept.lower() in payload.get('concepts', []) else 0.0
+                all_results.append({
+                    'score': float(point.score) + score_boost,
+                    'payload': payload,
+                    'collection': collection_name
+                })
+                
+        except Exception as e:
+            continue
+    
+    # Sort by score and limit
+    all_results.sort(key=lambda x: x['score'], reverse=True)
+    all_results = all_results[:limit]
+    
+    # Format results
+    if not all_results:
+        return f"""<search_by_concept>
+<concept>{concept}</concept>
+<message>No conversations found about this concept</message>
+</search_by_concept>"""
+    
+    results_text = []
+    for i, result in enumerate(all_results):
+        payload = result['payload']
+        score = result['score']
+        timestamp = payload.get('timestamp', 'Unknown')
+        conversation_id = payload.get('conversation_id', 'Unknown')
+        project = payload.get('project', 'Unknown')
+        concepts = payload.get('concepts', [])
+        
+        # Get text preview
+        text_preview = payload.get('text', '')[:200] + '...' if len(payload.get('text', '')) > 200 else payload.get('text', '')
+        
+        # File information
+        files_info = ""
+        if include_files:
+            files_analyzed = payload.get('files_analyzed', [])[:5]
+            if files_analyzed:
+                files_info = f"\n<files_analyzed>{', '.join(files_analyzed)}</files_analyzed>"
+        
+        # Related concepts
+        related_concepts = [c for c in concepts if c != concept.lower()][:5]
+        
+        results_text.append(f"""<result rank="{i+1}">
+<score>{score:.3f}</score>
+<conversation_id>{conversation_id}</conversation_id>
+<project>{project}</project>
+<timestamp>{timestamp}</timestamp>
+<concepts>{', '.join(concepts)}</concepts>
+<related_concepts>{', '.join(related_concepts)}</related_concepts>{files_info}
+<preview>{text_preview}</preview>
+</result>""")
+    
+    return f"""<search_by_concept>
+<concept>{concept}</concept>
+<count>{len(all_results)}</count>
+<results>
+{''.join(results_text)}
+</results>
+</search_by_concept>"""
+
+
 # Debug output
 print(f"[DEBUG] FastMCP server created with name: {mcp.name}")
 
