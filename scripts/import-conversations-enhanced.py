@@ -32,7 +32,7 @@ from tenacity import (
 # Configuration
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 LOGS_DIR = os.getenv("LOGS_DIR", "/logs")
-STATE_FILE = os.getenv("STATE_FILE", "/config/imported-files-enhanced.json")
+STATE_FILE = os.getenv("STATE_FILE", "./config/imported-files-enhanced.json")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 PREFER_LOCAL_EMBEDDINGS = os.getenv("PREFER_LOCAL_EMBEDDINGS", "false").lower() == "true"
 VOYAGE_API_KEY = os.getenv("VOYAGE_KEY")

@@ -893,16 +893,22 @@ async def search_by_file(
     project: Optional[str] = Field(default=None, description="Search specific project only. Use 'all' to search across all projects.")
 ) -> str:
     """Search for conversations that analyzed a specific file."""
-    global client
-    if client is None:
-        client = AsyncQdrantClient(url=QDRANT_URL)
+    global qdrant_client
     
     # Normalize file path
     normalized_path = file_path.replace("\\", "/").replace("/Users/", "~/")
     
     # Determine which collections to search
-    project_to_search = project or get_current_project()
-    collections = await get_collections_to_search(project_to_search)
+    # If no project specified, search all collections
+    collections = await get_all_collections() if not project else []
+    
+    if project and project != 'all':
+        # Filter collections for specific project
+        project_hash = hashlib.md5(project.encode()).hexdigest()[:8]
+        collection_prefix = f"conv_{project_hash}_"
+        collections = [c for c in await get_all_collections() if c.startswith(collection_prefix)]
+    elif project == 'all':
+        collections = await get_all_collections()
     
     if not collections:
         return "<search_by_file>\n<error>No collections found to search</error>\n</search_by_file>"
@@ -912,34 +918,26 @@ async def search_by_file(
     
     for collection_name in collections:
         try:
-            # Search with file filter
-            results = await client.search(
+            # Use scroll to get all points and filter manually
+            # Qdrant's array filtering can be tricky, so we'll filter in code
+            scroll_result = await qdrant_client.scroll(
                 collection_name=collection_name,
-                query_filter=models.Filter(
-                    should=[
-                        models.FieldCondition(
-                            key="files_analyzed",
-                            match=models.MatchAny(any=[normalized_path])
-                        ),
-                        models.FieldCondition(
-                            key="files_edited", 
-                            match=models.MatchAny(any=[normalized_path])
-                        )
-                    ]
-                ),
-                query_vector=[0.0] * embedding_dimension,  # Dummy vector for filter-only search
-                limit=limit,
-                with_payload=True,
-                score_threshold=0.0  # Accept all matches
+                limit=1000,  # Get a batch
+                with_payload=True
             )
             
-            for point in results:
+            # Filter results that contain the file
+            for point in scroll_result[0]:
                 payload = point.payload
-                all_results.append({
-                    'score': 1.0,  # File match is always 1.0
-                    'payload': payload,
-                    'collection': collection_name
-                })
+                files_analyzed = payload.get('files_analyzed', [])
+                files_edited = payload.get('files_edited', [])
+                
+                if normalized_path in files_analyzed or normalized_path in files_edited:
+                    all_results.append({
+                        'score': 1.0,  # File match is always 1.0
+                        'payload': payload,
+                        'collection': collection_name
+                    })
                 
         except Exception as e:
             continue
@@ -998,16 +996,22 @@ async def search_by_concept(
     project: Optional[str] = Field(default=None, description="Search specific project only. Use 'all' to search across all projects.")
 ) -> str:
     """Search for conversations about a specific development concept."""
-    global client
-    if client is None:
-        client = AsyncQdrantClient(url=QDRANT_URL)
+    global qdrant_client
     
     # Generate embedding for the concept
     embedding = await generate_embedding(concept)
     
     # Determine which collections to search
-    project_to_search = project or get_current_project()
-    collections = await get_collections_to_search(project_to_search)
+    # If no project specified, search all collections
+    collections = await get_all_collections() if not project else []
+    
+    if project and project != 'all':
+        # Filter collections for specific project
+        project_hash = hashlib.md5(project.encode()).hexdigest()[:8]
+        collection_prefix = f"conv_{project_hash}_"
+        collections = [c for c in await get_all_collections() if c.startswith(collection_prefix)]
+    elif project == 'all':
+        collections = await get_all_collections()
     
     if not collections:
         return "<search_by_concept>\n<error>No collections found to search</error>\n</search_by_concept>"
@@ -1018,7 +1022,7 @@ async def search_by_concept(
     for collection_name in collections:
         try:
             # Hybrid search: semantic + concept filter
-            results = await client.search(
+            results = await qdrant_client.search(
                 collection_name=collection_name,
                 query_vector=embedding,
                 query_filter=models.Filter(
