@@ -14,6 +14,10 @@ from typing import List, Dict, Any
 import logging
 from pathlib import Path
 
+# Add the mcp-server/src directory to the Python path
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'mcp-server', 'src'))
+from utils import normalize_project_name
+
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     VectorParams, Distance, PointStruct,
@@ -343,10 +347,11 @@ def main():
     # Import each project
     total_imported = 0
     for project_dir in project_dirs:
-        # Create collection name from project path
-        collection_name = f"conv_{hashlib.md5(project_dir.name.encode()).hexdigest()[:8]}{collection_suffix}"
+        # Create collection name from normalized project name
+        normalized_name = normalize_project_name(project_dir.name)
+        collection_name = f"conv_{hashlib.md5(normalized_name.encode()).hexdigest()[:8]}{collection_suffix}"
         
-        logger.info(f"Importing project: {project_dir.name} -> {collection_name}")
+        logger.info(f"Importing project: {project_dir.name} (normalized: {normalized_name}) -> {collection_name}")
         chunks = import_project(project_dir, collection_name, state)
         total_imported += chunks
         logger.info(f"Imported {chunks} chunks from {project_dir.name}")
