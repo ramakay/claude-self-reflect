@@ -1,0 +1,2934 @@
+{
+  "imported_files": {
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder-langgraph-backend/d3398ad9-360c-4887-895a-31bbeaccc789.jsonl": {
+      "last_modified": 1752902493.2461934,
+      "last_imported": 1753843517.591275,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/bc2ff2b4-1ffb-422c-b42d-2646189db506.jsonl": {
+      "last_modified": 1752939331.965763,
+      "last_imported": 1753843517.677618,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/9197a9ae-1e5c-4659-8aa6-a32b848f3acb.jsonl": {
+      "last_modified": 1752939059.65069,
+      "last_imported": 1753843517.720719,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/9c8f73a4-8e49-4565-9061-a4143ef05d67.jsonl": {
+      "last_modified": 1752606530.5017872,
+      "last_imported": 1753843517.763419,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/756fae03-71d2-4d29-bcfa-b59ee93f3748.jsonl": {
+      "last_modified": 1752531679.2272673,
+      "last_imported": 1753843518.02758,
+      "chunks_imported": 19
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/1ea2244f-dc82-404c-b013-5478679508e4.jsonl": {
+      "last_modified": 1752902525.551273,
+      "last_imported": 1753843518.175736,
+      "chunks_imported": 11
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/d9bb75ce-6dbe-4196-8653-ca25b6acc26a.jsonl": {
+      "last_modified": 1752938787.2570946,
+      "last_imported": 1753843518.19963,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/ee93f6ac-1b21-4e27-af22-10658216bbf1.jsonl": {
+      "last_modified": 1752938700.645982,
+      "last_imported": 1753843518.269717,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/e48095ed-e0a5-4ede-b5d5-a40aea941da1.jsonl": {
+      "last_modified": 1752520777.5246336,
+      "last_imported": 1753843518.4192,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/84c66251-2232-4c6c-b39b-b4f7b66c3673.jsonl": {
+      "last_modified": 1752519662.365543,
+      "last_imported": 1753843518.485716,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/44b80f5d-c890-4c93-906a-387335a7b3fa.jsonl": {
+      "last_modified": 1752939579.2390652,
+      "last_imported": 1753843518.546264,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/8acbd39c-3179-41d7-84f8-44176c614abe.jsonl": {
+      "last_modified": 1752900995.0996966,
+      "last_imported": 1753843518.587945,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/7de173c0-9e4d-4d7c-be74-b44486b29b11.jsonl": {
+      "last_modified": 1752939500.7223399,
+      "last_imported": 1753843518.641425,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis/6e70f3a7-3a29-4746-a677-e982226ce247.jsonl": {
+      "last_modified": 1752452983.659623,
+      "last_imported": 1753843518.70748,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis/2f4fbb36-e961-4ad2-bd4d-b1655e295592.jsonl": {
+      "last_modified": 1752339853.3527079,
+      "last_imported": 1753843518.737873,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/a49d90f8-4c17-41fb-bd6b-fe73959f4bdf.jsonl": {
+      "last_modified": 1752090358.6700027,
+      "last_imported": 1753843518.863928,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/afab7cce-ef14-4f43-85e3-b9f697d89882.jsonl": {
+      "last_modified": 1753307037.8939464,
+      "last_imported": 1753843518.953144,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/b081dd2a-05a7-4cf2-a122-c4f0d6d0bd6b.jsonl": {
+      "last_modified": 1753215429.1340337,
+      "last_imported": 1753843519.299343,
+      "chunks_imported": 30
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/4533f8c8-7d37-499f-bfee-f813cb1783e1.jsonl": {
+      "last_modified": 1753242567.668779,
+      "last_imported": 1753843519.509363,
+      "chunks_imported": 13
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/fedd99e9-8fae-4642-9d0f-7d9274f660d2.jsonl": {
+      "last_modified": 1753549170.0108094,
+      "last_imported": 1753843519.587749,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/b6a57c25-2369-445f-9c44-eadb6aefb95e.jsonl": {
+      "last_modified": 1752097053.6125257,
+      "last_imported": 1753843519.82833,
+      "chunks_imported": 15
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/d70f3689-010d-49de-9578-2a9193e97e05.jsonl": {
+      "last_modified": 1753681064.7215955,
+      "last_imported": 1753843519.981227,
+      "chunks_imported": 12
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/02cd4ddf-8801-42e9-a46a-84365cd1be41.jsonl": {
+      "last_modified": 1753203500.3293073,
+      "last_imported": 1753843520.149569,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/10ba321b-3e4f-4a7e-a020-ccf85fddc6ef.jsonl": {
+      "last_modified": 1752086628.7679536,
+      "last_imported": 1753843520.345168,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/d27609bd-17d5-4505-8ff0-f74752e2fd61.jsonl": {
+      "last_modified": 1753550834.863287,
+      "last_imported": 1753843520.445483,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/5f0252a5-d70d-421b-9d60-285d0be9d77a.jsonl": {
+      "last_modified": 1753277572.7624865,
+      "last_imported": 1753843520.653034,
+      "chunks_imported": 11
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/a16aa4af-6a35-4928-bceb-8b5c6106cde3.jsonl": {
+      "last_modified": 1753203702.3004942,
+      "last_imported": 1753843520.772653,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/abaeb91f-b03b-414d-bb4f-dcbceed352cf.jsonl": {
+      "last_modified": 1752078532.3627832,
+      "last_imported": 1753843520.993052,
+      "chunks_imported": 13
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/86dfa12e-b885-49e0-ac4c-2feb8bc6fb61.jsonl": {
+      "last_modified": 1753222849.7107337,
+      "last_imported": 1753843521.146753,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-procsolve-website/34b65aa3-40e6-415f-b8fe-05b0de027414.jsonl": {
+      "last_modified": 1753881123.5553222,
+      "last_imported": 1753881142.378303,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/740308ec-2f91-48da-ba78-3329c11b9c5e.jsonl": {
+      "last_modified": 1753470535.8472767,
+      "last_imported": 1753845734.69368,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/2bb5f256-bc0a-4a29-8807-f796a463fade.jsonl": {
+      "last_modified": 1753454976.7859507,
+      "last_imported": 1753845735.151185,
+      "chunks_imported": 24
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/5db3661d-37e2-430f-8c5b-ad759497edff.jsonl": {
+      "last_modified": 1753424425.2285562,
+      "last_imported": 1753845735.451442,
+      "chunks_imported": 15
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/6bb35d90-f656-411e-bbd2-20963ac13188.jsonl": {
+      "last_modified": 1753419608.3710406,
+      "last_imported": 1753845736.050193,
+      "chunks_imported": 32
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/4f970df5-e4f8-4637-9894-2a04dbd81ad4.jsonl": {
+      "last_modified": 1753457302.659666,
+      "last_imported": 1753845736.459556,
+      "chunks_imported": 22
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/42cf5906-8041-41d4-bb84-0e5d006350b7.jsonl": {
+      "last_modified": 1753406974.3681035,
+      "last_imported": 1753845736.788889,
+      "chunks_imported": 20
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/12e2403c-fc99-4deb-8a27-a57edfe5e024.jsonl": {
+      "last_modified": 1753458315.0189002,
+      "last_imported": 1753845736.891705,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/f147c5ed-1d58-45e2-b3fc-847a872facf2.jsonl": {
+      "last_modified": 1753451871.1292315,
+      "last_imported": 1753845737.040437,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/2e95f0f0-3cdb-4b49-8e9a-3ff51838c2c0.jsonl": {
+      "last_modified": 1753470783.4756598,
+      "last_imported": 1753845737.206308,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/67264bdb-e3ce-4e88-85cf-0f243079c958.jsonl": {
+      "last_modified": 1753386608.3816657,
+      "last_imported": 1753845737.529595,
+      "chunks_imported": 22
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/7e77666f-bee4-40fd-ad32-02d6cfd01653.jsonl": {
+      "last_modified": 1753407902.5984802,
+      "last_imported": 1753845737.58936,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/4f59c157-d1ea-4d80-a923-6dc179e0c859.jsonl": {
+      "last_modified": 1751304042.6542306,
+      "last_imported": 1753845737.721802,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/a1aa0839-becf-4a16-81ce-dd0c664099bf.jsonl": {
+      "last_modified": 1753469632.3803146,
+      "last_imported": 1753845738.037991,
+      "chunks_imported": 19
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/a2ae66a2-41f5-4b07-ab8b-353b5174af34.jsonl": {
+      "last_modified": 1753460317.5724761,
+      "last_imported": 1753845738.304038,
+      "chunks_imported": 16
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/dfca9276-24c7-4ad3-8b54-df08233d554e.jsonl": {
+      "last_modified": 1751377045.9535146,
+      "last_imported": 1753845738.615313,
+      "chunks_imported": 19
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/da7b64d2-7466-4f0f-901f-3f7f94920458.jsonl": {
+      "last_modified": 1753482317.8836856,
+      "last_imported": 1753845738.772742,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/2144c5bb-eab8-416b-89b9-5fffb2e1a543.jsonl": {
+      "last_modified": 1751868860.0281875,
+      "last_imported": 1753845894.959023,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/23888710-1700-48f5-940c-965b37ab2b80.jsonl": {
+      "last_modified": 1753478817.408664,
+      "last_imported": 1753845895.242479,
+      "chunks_imported": 15
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/fc0bcac9-78dc-4ea2-89dd-d6b6f8648d06.jsonl": {
+      "last_modified": 1751750155.365569,
+      "last_imported": 1753845895.380798,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/19bc6e90-0053-4376-b4cf-a821a31af7f7.jsonl": {
+      "last_modified": 1753473831.6924422,
+      "last_imported": 1753845895.598567,
+      "chunks_imported": 13
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/68ab1cb2-7a18-47f6-b7da-973b5bb41dfd.jsonl": {
+      "last_modified": 1753462883.818526,
+      "last_imported": 1753845895.842169,
+      "chunks_imported": 16
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/c37470fa-28f7-4a2c-9ea6-82e729239eb6.jsonl": {
+      "last_modified": 1753408326.2011583,
+      "last_imported": 1753845895.887269,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/3f28f5d5-035c-4bcd-bbe6-66187b06159f.jsonl": {
+      "last_modified": 1753480535.9306548,
+      "last_imported": 1753845896.284114,
+      "chunks_imported": 25
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/b63d9e70-1fd6-4198-b029-d7c16fe6f080.jsonl": {
+      "last_modified": 1753389618.036597,
+      "last_imported": 1753845896.576818,
+      "chunks_imported": 19
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/9d1f772a-eb4c-4339-a169-292d81f1ad09.jsonl": {
+      "last_modified": 1751317119.4968736,
+      "last_imported": 1753845896.897288,
+      "chunks_imported": 16
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/b4d9bc6f-d27a-40fe-932c-05008ebbb8d2.jsonl": {
+      "last_modified": 1753408374.835471,
+      "last_imported": 1753845896.939735,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/2aa84c92-5958-423f-9b0c-a93e8379d5c7.jsonl": {
+      "last_modified": 1753485439.0894027,
+      "last_imported": 1753845897.007375,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/bc27d492-160e-46de-b6c6-85e7e510e1b2.jsonl": {
+      "last_modified": 1751747623.5267777,
+      "last_imported": 1753845897.087225,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/9e30dcb9-7964-4b3a-b809-83331e47c890.jsonl": {
+      "last_modified": 1753485546.9831243,
+      "last_imported": 1753845897.226493,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/623a36e1-86ad-449c-98fd-746d52e944e4.jsonl": {
+      "last_modified": 1753449993.4798203,
+      "last_imported": 1753845897.355648,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/1ecdf881-367f-4648-bc06-30bad35e7e95.jsonl": {
+      "last_modified": 1753408403.018711,
+      "last_imported": 1753845897.399347,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/462f4de0-d7ef-496e-945d-c8cff74663b9.jsonl": {
+      "last_modified": 1753379796.646243,
+      "last_imported": 1753845897.448609,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/01be8755-7ccb-4c09-a36d-20f8f83b9440.jsonl": {
+      "last_modified": 1751473691.202748,
+      "last_imported": 1753845897.688042,
+      "chunks_imported": 12
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/1e970dbb-f7b7-416c-bca1-89f92a291c19.jsonl": {
+      "last_modified": 1753470225.7725236,
+      "last_imported": 1753845897.828227,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/29c60887-44dd-41ac-9fe2-0744b4b2faa1.jsonl": {
+      "last_modified": 1753496088.1630094,
+      "last_imported": 1753845897.965868,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/17a3739e-0879-404b-8269-5a47ca8b057b.jsonl": {
+      "last_modified": 1751322871.3032718,
+      "last_imported": 1753845898.411136,
+      "chunks_imported": 24
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/bba932a7-4171-46e4-89e4-a81767879648.jsonl": {
+      "last_modified": 1753495608.9827251,
+      "last_imported": 1753845898.637844,
+      "chunks_imported": 14
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/426973e5-f7f1-4c3b-952b-b4fe9f430eff.jsonl": {
+      "last_modified": 1753411208.5953915,
+      "last_imported": 1753845898.68781,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/e014b265-835f-46bb-a740-26f51985845a.jsonl": {
+      "last_modified": 1751301057.498562,
+      "last_imported": 1753845900.079251,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/9f9f3016-5371-4199-8538-24e42a2378f8.jsonl": {
+      "last_modified": 1753396734.0268314,
+      "last_imported": 1753845900.410912,
+      "chunks_imported": 21
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/7528974f-43b9-4e0b-877b-79232e4db100.jsonl": {
+      "last_modified": 1753470982.3147953,
+      "last_imported": 1753845900.568616,
+      "chunks_imported": 10
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/f34cce59-ba80-430c-ad85-43a65e78ba7d.jsonl": {
+      "last_modified": 1751377581.0385537,
+      "last_imported": 1753845900.72794,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/08df2ab7-9fb5-4ec4-87b2-e7891ce28e58.jsonl": {
+      "last_modified": 1753466786.5320375,
+      "last_imported": 1753845901.077207,
+      "chunks_imported": 15
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/71854a2e-7816-429b-acfe-471090e61003.jsonl": {
+      "last_modified": 1751868662.29613,
+      "last_imported": 1753845901.982799,
+      "chunks_imported": 53
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/c8936024-80ce-44ac-add8-30869613985e.jsonl": {
+      "last_modified": 1753407437.476446,
+      "last_imported": 1753845902.049316,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/b1f2a837-6733-4b33-a091-cd4c852029a6.jsonl": {
+      "last_modified": 1751470482.5277588,
+      "last_imported": 1753845902.205317,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/40c86645-1bbf-446b-9b5b-ad31989f3655.jsonl": {
+      "last_modified": 1751917170.882952,
+      "last_imported": 1753845903.830285,
+      "chunks_imported": 10
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/b56848fb-3ca3-4ad0-8b26-e8239166d933.jsonl": {
+      "last_modified": 1751300978.989163,
+      "last_imported": 1753845905.263739,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/473ff6f1-2d3a-48b1-9ae9-589b80e990a1.jsonl": {
+      "last_modified": 1753466934.088372,
+      "last_imported": 1753845905.396459,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack/09383a86-8361-422d-8d1d-b392fcdb2d8e.jsonl": {
+      "last_modified": 1751300529.8086076,
+      "last_imported": 1753845905.864749,
+      "chunks_imported": 29
+    },
+    "/logs/-Users-ramakrishnanannaswamy/1340120c-ea76-406b-9404-317f2c5ab1dc.jsonl": {
+      "last_modified": 1752939232.9953837,
+      "last_imported": 1753845905.970328,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-eval/5cf507fc-ad4d-4cc4-8c2f-375d13ad93bf.jsonl": {
+      "last_modified": 1752526217.8129125,
+      "last_imported": 1753845906.192761,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-eval/e2886975-5e10-4e8a-a479-473383233056.jsonl": {
+      "last_modified": 1752528396.4382155,
+      "last_imported": 1753845906.339003,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-eval/52c44878-3f87-40ec-9b74-971a5cf39c3f.jsonl": {
+      "last_modified": 1752519350.3479612,
+      "last_imported": 1753845906.591025,
+      "chunks_imported": 12
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-eval/55f6eaa8-11d6-4f8e-abc7-cd1aba673193.jsonl": {
+      "last_modified": 1752523747.7897303,
+      "last_imported": 1753845906.692641,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-proc1-Proc1/2913e6f7-0228-4b87-9de8-7438068008a2.jsonl": {
+      "last_modified": 1752816185.9559093,
+      "last_imported": 1753845906.902914,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-proc1-Proc1/ae37bdd1-51ee-49c2-8a3f-5286b4af244f.jsonl": {
+      "last_modified": 1752814309.4049478,
+      "last_imported": 1753845907.00517,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-proc1-Proc1/5f803ad5-7f91-482f-9992-df2f7d63a591.jsonl": {
+      "last_modified": 1752288351.1894088,
+      "last_imported": 1753845907.403304,
+      "chunks_imported": 23
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-proc1-Proc1/0fb8cada-f7b3-4b49-a5b8-7cd6aed0913b.jsonl": {
+      "last_modified": 1752168330.9817677,
+      "last_imported": 1753845907.645884,
+      "chunks_imported": 12
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-zenmcp-zen-mcp-server/aed13d75-c52f-48f2-83c9-6d83bb885a41.jsonl": {
+      "last_modified": 1751745821.064337,
+      "last_imported": 1753845907.762695,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-zenmcp-zen-mcp-server/a734880b-a195-4433-9b71-3f39e26383e1.jsonl": {
+      "last_modified": 1751476813.8642259,
+      "last_imported": 1753845907.832854,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-zenmcp-zen-mcp-server/71f474fc-e3ed-42b5-b5ad-39aa65a07bb9.jsonl": {
+      "last_modified": 1751746131.311917,
+      "last_imported": 1753845907.873245,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-zenmcp-zen-mcp-server/e4b05bba-8edb-45ca-8fe2-4bd9f8a8a29c.jsonl": {
+      "last_modified": 1751476901.2866035,
+      "last_imported": 1753845907.934921,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-zenmcp-zen-mcp-server/da697be0-bf15-4d35-8088-833dbda7bbb4.jsonl": {
+      "last_modified": 1751745854.7352257,
+      "last_imported": 1753845907.982577,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-hooks-test/be4b0eb5-7218-438e-a8e8-3c704e84d09d.jsonl": {
+      "last_modified": 1752591501.6997132,
+      "last_imported": 1753845908.075904,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-hooks-test/f48af423-70a1-4a2a-93cf-4f63a06464ec.jsonl": {
+      "last_modified": 1752596830.5759287,
+      "last_imported": 1753845908.120612,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-hooks-test/f81044a3-90c5-4dc6-ac9b-36af90d96f7f.jsonl": {
+      "last_modified": 1752606687.1373134,
+      "last_imported": 1753845908.174973,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-hooks-test/636cc8b1-e26d-4020-a834-d2fb4e663920.jsonl": {
+      "last_modified": 1752590289.9562068,
+      "last_imported": 1753845908.22477,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-hooks-test/bc92fa22-9b82-49bc-bf0d-65a8771ac560.jsonl": {
+      "last_modified": 1752592687.120362,
+      "last_imported": 1753845908.280825,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-hooks-test/a80f5638-7675-4be2-88c9-6ac7e1d28025.jsonl": {
+      "last_modified": 1752633223.3508074,
+      "last_imported": 1753845908.346667,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-hooks-test/473eaad6-8859-4f49-b69a-3dd64c9dacf1.jsonl": {
+      "last_modified": 1752592766.9486465,
+      "last_imported": 1753845908.379485,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-hooks-test/a005b722-a5d9-42f1-894a-8b475215a1de.jsonl": {
+      "last_modified": 1752607074.7168005,
+      "last_imported": 1753845908.430438,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-hooks-test/41109324-8eea-40b5-9988-0ef9bc62c39c.jsonl": {
+      "last_modified": 1752607153.4307723,
+      "last_imported": 1753845908.479621,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/b8c96ce8-7d1c-4b23-b390-d97bf96812dc.jsonl": {
+      "last_modified": 1751948473.0772538,
+      "last_imported": 1753845908.81603,
+      "chunks_imported": 16
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/4d3d6413-4e6b-4447-ae2c-f11b6d49e2ce.jsonl": {
+      "last_modified": 1751597991.6779,
+      "last_imported": 1753845908.887222,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/cb429b24-8a11-4f20-9352-f90cf1c37e64.jsonl": {
+      "last_modified": 1752452999.8752515,
+      "last_imported": 1753845909.02898,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/127fba6b-c2d3-4c9a-a692-4349094059ff.jsonl": {
+      "last_modified": 1751520246.3867896,
+      "last_imported": 1753845909.208238,
+      "chunks_imported": 10
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/78b86f9d-dd69-4db4-ae2f-55969e389b85.jsonl": {
+      "last_modified": 1752452459.130248,
+      "last_imported": 1753845909.979575,
+      "chunks_imported": 39
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/70d8ea21-24ff-4c9f-b2b4-c7fdc3573ec3.jsonl": {
+      "last_modified": 1751926391.795708,
+      "last_imported": 1753845910.100853,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/8df28f97-ad96-42b2-be65-c4e2a01d9902.jsonl": {
+      "last_modified": 1751499492.1819134,
+      "last_imported": 1753845910.401745,
+      "chunks_imported": 13
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/bca2d07f-24ad-4aea-9c5c-2887be92d18a.jsonl": {
+      "last_modified": 1752093848.3807094,
+      "last_imported": 1753845910.519651,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/9ff6c326-17f6-4357-be60-930208ccba1d.jsonl": {
+      "last_modified": 1751596208.4618385,
+      "last_imported": 1753845910.608667,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/c15de6ac-71c2-4664-a033-38ceb42c03f3.jsonl": {
+      "last_modified": 1751779799.1317725,
+      "last_imported": 1753845910.729866,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/b5845d50-3e35-4498-ae1d-0e4a2aa0030d.jsonl": {
+      "last_modified": 1752342503.2938032,
+      "last_imported": 1753845911.435632,
+      "chunks_imported": 40
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/a91928d3-62d6-4a2c-bde7-10386db163bf.jsonl": {
+      "last_modified": 1752089044.2505782,
+      "last_imported": 1753845911.731716,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/755644be-dc42-4a81-b51c-42fbeed52a98.jsonl": {
+      "last_modified": 1751501069.4124742,
+      "last_imported": 1753845911.887666,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/6cc8b0d9-7348-4e2f-b9df-332aaa00f7dc.jsonl": {
+      "last_modified": 1752170332.9948149,
+      "last_imported": 1753845912.07774,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/d17369fd-7134-4cd7-ade2-d71705d0c368.jsonl": {
+      "last_modified": 1752898535.472379,
+      "last_imported": 1753845912.77355,
+      "chunks_imported": 38
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-n8n-node-explorer/8c1f6ab8-8569-44ba-9536-454790dbc217.jsonl": {
+      "last_modified": 1751475255.0686717,
+      "last_imported": 1753845913.195415,
+      "chunks_imported": 22
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/7ff7356f-b182-4542-893b-01be7550cd64.jsonl": {
+      "last_modified": 1751729678.4587374,
+      "last_imported": 1753845913.506167,
+      "chunks_imported": 17
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/2c0b1db5-cd89-45d9-8d06-032fc7a71657.jsonl": {
+      "last_modified": 1751596202.8545816,
+      "last_imported": 1753845914.25122,
+      "chunks_imported": 42
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/277cffca-38ca-40ec-a9c1-0a9a1ffe4a94.jsonl": {
+      "last_modified": 1751475067.3312795,
+      "last_imported": 1753845915.547112,
+      "chunks_imported": 74
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/4940ce32-a877-470d-8fad-90121182d0da.jsonl": {
+      "last_modified": 1751578338.473123,
+      "last_imported": 1753845915.747658,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/731c0009-e46b-49a8-8e09-1cbab1a073a2.jsonl": {
+      "last_modified": 1751579366.02624,
+      "last_imported": 1753845915.974279,
+      "chunks_imported": 10
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/427fe6fc-e97b-4c4e-85e6-806288f32751.jsonl": {
+      "last_modified": 1751345255.9797065,
+      "last_imported": 1753845916.220074,
+      "chunks_imported": 11
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/13d2bc7f-1750-4608-bc3e-78ace48b5dbb.jsonl": {
+      "last_modified": 1751489056.498726,
+      "last_imported": 1753845916.60252,
+      "chunks_imported": 19
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/cfdbb46f-003f-4b5e-93ea-688d1f4a8ce4.jsonl": {
+      "last_modified": 1751741113.5783226,
+      "last_imported": 1753845917.017927,
+      "chunks_imported": 23
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/29e6e956-c6f8-4a5e-8200-280c581a8cf6.jsonl": {
+      "last_modified": 1751571668.8829584,
+      "last_imported": 1753845917.448724,
+      "chunks_imported": 21
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/c4b8763a-3982-4f97-a24b-ec510f99d051.jsonl": {
+      "last_modified": 1751609189.4835777,
+      "last_imported": 1753845917.727229,
+      "chunks_imported": 17
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/388f79ee-02df-45c9-b10b-c51294c896e2.jsonl": {
+      "last_modified": 1751381196.0887501,
+      "last_imported": 1753845918.185707,
+      "chunks_imported": 24
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/069cff69-0a5b-44d8-9725-58899c262043.jsonl": {
+      "last_modified": 1751407588.954215,
+      "last_imported": 1753845918.7413,
+      "chunks_imported": 34
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/074057a0-b643-487b-b6b0-58234b30f3ed.jsonl": {
+      "last_modified": 1751729650.7438517,
+      "last_imported": 1753845919.03985,
+      "chunks_imported": 17
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/d8f58b76-9b05-4ba5-96d1-c0575e2d6e1c.jsonl": {
+      "last_modified": 1751383266.2309382,
+      "last_imported": 1753845919.184653,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/098e87a7-fee9-4e6e-b578-151e51bcfd90.jsonl": {
+      "last_modified": 1751579892.7560117,
+      "last_imported": 1753845919.405823,
+      "chunks_imported": 12
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/8a6150b2-eba9-4d53-97c5-54b63a711639.jsonl": {
+      "last_modified": 1751725084.501847,
+      "last_imported": 1753845920.589929,
+      "chunks_imported": 63
+    },
+    "/logs/-Users-ramakrishnanannaswamy-vercelship25/e8e59a14-1b57-4783-9f2f-ad5a3d0845e0.jsonl": {
+      "last_modified": 1751578705.3841789,
+      "last_imported": 1753845920.721737,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack-claude-reflect/f104a1fe-f429-40d0-a3e7-9fcf49c95969.jsonl": {
+      "last_modified": 1753473375.1272037,
+      "last_imported": 1753845920.818313,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-test/ec156749-7764-426d-baf0-1c240bdf1212.jsonl": {
+      "last_modified": 1752356507.3085263,
+      "last_imported": 1753845920.938,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-test/81b489ac-3619-4071-a0cf-26b337294391.jsonl": {
+      "last_modified": 1752341695.135598,
+      "last_imported": 1753845920.983435,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-test/0b68adf2-ce11-401c-875d-02bd1ca5cbad.jsonl": {
+      "last_modified": 1752357714.4388134,
+      "last_imported": 1753845921.085689,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-test/bfb90880-b65d-4a89-87b4-57e63c19f7fd.jsonl": {
+      "last_modified": 1752356900.2534273,
+      "last_imported": 1753845921.149913,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-test/b9f761d6-7c13-4b58-9401-2eea544eb86c.jsonl": {
+      "last_modified": 1752358346.8513584,
+      "last_imported": 1753845921.215378,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-test/e0b649be-b60d-4178-9e53-9953903682f8.jsonl": {
+      "last_modified": 1752356675.1444805,
+      "last_imported": 1753845921.27036,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-test/4406c0f3-5cbf-471f-bc85-aa343cc8b277.jsonl": {
+      "last_modified": 1752340750.6427321,
+      "last_imported": 1753845921.326088,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/0bd6a977-83e7-41b6-8f45-766fd83490d7.jsonl": {
+      "last_modified": 1753209226.2679782,
+      "last_imported": 1753845921.83353,
+      "chunks_imported": 23
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/4b55c4ad-5513-4a2e-80e4-fb7212ff9f78.jsonl": {
+      "last_modified": 1752687041.728448,
+      "last_imported": 1753845921.89221,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/4ae62074-115b-49e7-bb7b-3a694492ed79.jsonl": {
+      "last_modified": 1752686945.6596406,
+      "last_imported": 1753845921.935374,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/050f5d70-abb0-4f8e-9191-6ad28cbeaad3.jsonl": {
+      "last_modified": 1752685883.3022583,
+      "last_imported": 1753845921.987106,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/c89d8e13-1354-47c2-b3eb-5bca9a2ce5be.jsonl": {
+      "last_modified": 1752634859.3365223,
+      "last_imported": 1753845922.038491,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/6c283328-6946-4647-9e85-67f116557b63.jsonl": {
+      "last_modified": 1752644861.3031883,
+      "last_imported": 1753845922.358943,
+      "chunks_imported": 17
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/68b06010-11e0-472f-b7ca-39b7686c7a5f.jsonl": {
+      "last_modified": 1752648788.3200684,
+      "last_imported": 1753845922.424662,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/85ccd1cc-e119-4529-a384-ea5e2f825faa.jsonl": {
+      "last_modified": 1753021527.4017296,
+      "last_imported": 1753845922.477098,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/97ba625d-efee-4c76-ad02-ee494d622658.jsonl": {
+      "last_modified": 1752684729.5535967,
+      "last_imported": 1753845922.526321,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/ff1399a0-63a9-467a-885a-02a79b553faf.jsonl": {
+      "last_modified": 1752634596.3310378,
+      "last_imported": 1753845922.582228,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/8f90c853-a580-4482-be10-91f8da8de468.jsonl": {
+      "last_modified": 1752686909.9897578,
+      "last_imported": 1753845922.621981,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/dd419434-b1ea-43be-ad8b-70c3d844d6b4.jsonl": {
+      "last_modified": 1753029556.8381119,
+      "last_imported": 1753845922.673497,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/b6fa8cd7-3549-441c-9338-612d51c11be8.jsonl": {
+      "last_modified": 1752684720.5006342,
+      "last_imported": 1753845922.724591,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/346bdbef-183b-40d8-b3af-ddfff8308854.jsonl": {
+      "last_modified": 1753029567.8824043,
+      "last_imported": 1753845923.059469,
+      "chunks_imported": 20
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/bedb2235-2121-40b9-b1bb-b27faa1a15cb.jsonl": {
+      "last_modified": 1752685872.462822,
+      "last_imported": 1753845923.11027,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/96bb9e57-5d47-47aa-a968-db6d8083ceee.jsonl": {
+      "last_modified": 1752713636.499993,
+      "last_imported": 1753845924.075108,
+      "chunks_imported": 59
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/e961ca75-0839-4ad5-b725-04c91093eb2d.jsonl": {
+      "last_modified": 1752687237.7482119,
+      "last_imported": 1753845924.133844,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/a1ddb727-89df-41d8-8d8f-4a07582bf93e.jsonl": {
+      "last_modified": 1752684796.9861817,
+      "last_imported": 1753845924.179302,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/43a6ade9-07e5-419e-8d60-67a051169f35.jsonl": {
+      "last_modified": 1752685353.7137415,
+      "last_imported": 1753845924.221986,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/55f3f0bc-f03d-4cd6-86c9-1b2291e54fca.jsonl": {
+      "last_modified": 1752687078.040134,
+      "last_imported": 1753845924.280113,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/2589eb7e-1584-4873-aa06-d1a92c422e40.jsonl": {
+      "last_modified": 1752686988.0753653,
+      "last_imported": 1753845924.326629,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/95eb7e29-d5ff-40b6-8e88-1fce9bdf2ec8.jsonl": {
+      "last_modified": 1753050873.7649555,
+      "last_imported": 1753845924.629564,
+      "chunks_imported": 17
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/e5d11cd4-7a23-4509-878f-838ff022c378.jsonl": {
+      "last_modified": 1752685818.5597184,
+      "last_imported": 1753845924.686452,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/e86b54c9-d5f4-4554-9b0d-0d6a5c12f6f0.jsonl": {
+      "last_modified": 1752687127.7575529,
+      "last_imported": 1753845924.74989,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/221587db-d021-478e-878a-984624303e3d.jsonl": {
+      "last_modified": 1752636146.7935255,
+      "last_imported": 1753845924.808531,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/9472f203-5edc-44b0-90e4-c558e427490a.jsonl": {
+      "last_modified": 1752685787.1377158,
+      "last_imported": 1753845924.857636,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/6b7ef095-5aa6-48fa-bc42-e0a673495805.jsonl": {
+      "last_modified": 1752687136.3181636,
+      "last_imported": 1753845924.911186,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/71872e1f-d498-4722-a6de-0cbab7d8394a.jsonl": {
+      "last_modified": 1752685327.3165953,
+      "last_imported": 1753845924.968105,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/b1d662c1-efd2-44de-8ece-47d1d83236d9.jsonl": {
+      "last_modified": 1753021778.3775766,
+      "last_imported": 1753845925.113826,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/c4cbbbbc-4870-47b7-8ad9-14bee728f8b9.jsonl": {
+      "last_modified": 1752686955.5146608,
+      "last_imported": 1753845925.161738,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/fb5b8415-9320-487b-80a5-08537b1ed006.jsonl": {
+      "last_modified": 1752635317.5007455,
+      "last_imported": 1753845925.209218,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/371cd1d6-468b-4def-8702-21011e1b6877.jsonl": {
+      "last_modified": 1753034225.5617082,
+      "last_imported": 1753845925.435118,
+      "chunks_imported": 12
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/8dd09ead-c4ea-4f05-a829-ea236a100da1.jsonl": {
+      "last_modified": 1752635866.8356612,
+      "last_imported": 1753845925.490852,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/277b125d-946f-4481-bda5-9c8b1e508360.jsonl": {
+      "last_modified": 1752687247.3467755,
+      "last_imported": 1753845925.547045,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/6e0ac1eb-ba14-4ef8-b0f0-cec1ccd2c9a4.jsonl": {
+      "last_modified": 1752634897.2960365,
+      "last_imported": 1753845925.60058,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/610972c2-143e-4ea5-852b-2aa2f01c059b.jsonl": {
+      "last_modified": 1752687009.832139,
+      "last_imported": 1753845925.650324,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/0be05ce7-7106-444f-8285-897e1b8bbb9a.jsonl": {
+      "last_modified": 1752685828.0914304,
+      "last_imported": 1753845925.706709,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/e60e6157-af3d-48e4-8a1f-3fd4d6e44d3f.jsonl": {
+      "last_modified": 1752687050.687491,
+      "last_imported": 1753845925.759492,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/00f5f3b0-4826-492c-9214-d954d7492161.jsonl": {
+      "last_modified": 1752636169.058781,
+      "last_imported": 1753845925.806729,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/9dedf2ad-bd9a-4d4c-be26-00ab6dd32132.jsonl": {
+      "last_modified": 1752686918.926283,
+      "last_imported": 1753845925.858241,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/894b4055-812d-4e9f-943a-cf401c882f1a.jsonl": {
+      "last_modified": 1752684772.5494363,
+      "last_imported": 1753845925.897934,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/61edac62-39c4-4d82-b289-ffd953f98853.jsonl": {
+      "last_modified": 1753054495.3733149,
+      "last_imported": 1753845926.018299,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/bf22c259-df89-4044-acc1-4e45d40260ea.jsonl": {
+      "last_modified": 1752687019.464046,
+      "last_imported": 1753845926.07222,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/951f5a0c-88be-4f53-ad33-75dece31a838.jsonl": {
+      "last_modified": 1752685775.4498804,
+      "last_imported": 1753845926.125306,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/c7fb9e7c-f42e-451f-a517-d45e20e6e5b1.jsonl": {
+      "last_modified": 1752684752.727529,
+      "last_imported": 1753845926.177387,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/0282057e-6089-4029-8959-638b17b8ff04.jsonl": {
+      "last_modified": 1752635150.1666126,
+      "last_imported": 1753845926.328793,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/c78741e3-c2d0-48c8-ae0b-f230a7c78b62.jsonl": {
+      "last_modified": 1752684781.527666,
+      "last_imported": 1753845926.389633,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/cbc46ece-d656-4e5d-acb6-e30afecd8d83.jsonl": {
+      "last_modified": 1752675424.1923652,
+      "last_imported": 1753845926.841614,
+      "chunks_imported": 26
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/9f063f16-c8d5-45c8-aa4e-f2dfd68ebfa1.jsonl": {
+      "last_modified": 1752686978.4453006,
+      "last_imported": 1753845926.894649,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-organize/ae74af0a-d6b8-4bcb-b0e4-800080e5cb7e.jsonl": {
+      "last_modified": 1752634644.961532,
+      "last_imported": 1753845926.949098,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/1fdb7477-eae3-4cb4-b32e-1240e3e927c3.jsonl": {
+      "last_modified": 1753452559.5820856,
+      "last_imported": 1753845927.058892,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/839fc11e-e117-4353-b994-0f3464c5e5d0.jsonl": {
+      "last_modified": 1753453828.760244,
+      "last_imported": 1753845927.121192,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/6bda6e84-5ab6-456a-9727-8eb46dde4a86.jsonl": {
+      "last_modified": 1753496638.9386818,
+      "last_imported": 1753845927.227242,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/44b23a40-40c3-4afe-a0d7-d6d27f283504.jsonl": {
+      "last_modified": 1753504405.5849667,
+      "last_imported": 1753845927.284103,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/529ba4e8-2ed7-47b3-b299-7ca1a73d5a81.jsonl": {
+      "last_modified": 1753470926.589748,
+      "last_imported": 1753845927.330745,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/2986140a-2cb5-41e5-8d5b-b2829213581d.jsonl": {
+      "last_modified": 1753480479.3831456,
+      "last_imported": 1753845927.389461,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/b41a58cb-a6e3-4ba5-a1ca-461a839d8c33.jsonl": {
+      "last_modified": 1753470535.5234222,
+      "last_imported": 1753845927.436684,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/5ba45faf-ddba-4357-adeb-5aea469e0327.jsonl": {
+      "last_modified": 1753495109.8624096,
+      "last_imported": 1753845927.49356,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/fa7b2783-64b3-47a4-870a-9d8355fa88d6.jsonl": {
+      "last_modified": 1753491946.1031253,
+      "last_imported": 1753845927.547181,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/87f7f6c3-c95d-4f11-a28f-e8976ed3cc25.jsonl": {
+      "last_modified": 1753504364.5631375,
+      "last_imported": 1753845927.613947,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/cd9610c0-011b-4749-bddf-83b14cd98691.jsonl": {
+      "last_modified": 1753505246.0021365,
+      "last_imported": 1753845927.971807,
+      "chunks_imported": 22
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/ebc600c8-0bdb-436d-957e-5d2871794e60.jsonl": {
+      "last_modified": 1753497336.5660317,
+      "last_imported": 1753845928.136158,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/aa25820b-ec36-4a7e-ab70-d54dff795b05.jsonl": {
+      "last_modified": 1753471809.8874576,
+      "last_imported": 1753845928.185276,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/8cd1ae93-20af-4965-a170-03c10741c46f.jsonl": {
+      "last_modified": 1753502395.5343306,
+      "last_imported": 1753845928.516367,
+      "chunks_imported": 20
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/5e7d0481-5135-429b-8795-be5d2b69994a.jsonl": {
+      "last_modified": 1753504465.590886,
+      "last_imported": 1753845928.569315,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/163976b5-a421-4503-92f7-3e039cb8d747.jsonl": {
+      "last_modified": 1752614572.3203776,
+      "last_imported": 1753845928.676928,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/c759b602-5b26-4303-b9e5-1a53148e5a7a.jsonl": {
+      "last_modified": 1752611105.7877653,
+      "last_imported": 1753845928.728752,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/8014cc93-411f-419b-a01f-5d018e1c97aa.jsonl": {
+      "last_modified": 1752608829.9574242,
+      "last_imported": 1753845928.830503,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/5853304a-df9b-47d6-9b82-65b43bbc724b.jsonl": {
+      "last_modified": 1752610766.7097263,
+      "last_imported": 1753845928.883808,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/61381108-2b0d-4e66-a935-b0aa7e13c039.jsonl": {
+      "last_modified": 1752600218.1084483,
+      "last_imported": 1753845928.938346,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/ca54efde-9bb8-4ee8-969e-03ed77ddf6dd.jsonl": {
+      "last_modified": 1752609547.7702577,
+      "last_imported": 1753845928.998791,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/35b410a2-dc73-4ee3-8b4f-e62d9921edc3.jsonl": {
+      "last_modified": 1752609707.9517891,
+      "last_imported": 1753845929.067079,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/1da4473b-7d16-4315-9774-97aca8d36f6c.jsonl": {
+      "last_modified": 1752600421.3541713,
+      "last_imported": 1753845929.121494,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/c936cf02-07a0-4222-b05d-72a4db725a2c.jsonl": {
+      "last_modified": 1752557217.837273,
+      "last_imported": 1753845929.255455,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/2917dd0b-261a-4e3c-bb30-c28be5046be7.jsonl": {
+      "last_modified": 1752613276.3289506,
+      "last_imported": 1753845929.361064,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/c2538143-68e6-4cae-9e08-57d8884d7eaa.jsonl": {
+      "last_modified": 1752614283.386892,
+      "last_imported": 1753845929.420804,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/f259c822-4d5a-48af-b620-b1be3aa9aceb.jsonl": {
+      "last_modified": 1752612379.779271,
+      "last_imported": 1753845929.477964,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/10f9b8f3-f832-494f-876d-51e8d641696c.jsonl": {
+      "last_modified": 1752608524.0966246,
+      "last_imported": 1753845929.529338,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/9e6192f0-b55b-45b9-975f-bc69978f6948.jsonl": {
+      "last_modified": 1752600157.8708425,
+      "last_imported": 1753845929.580615,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/256043c6-c960-4dd1-a6ba-f712f271e046.jsonl": {
+      "last_modified": 1752609564.7565398,
+      "last_imported": 1753845929.697224,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/ce8c19ab-e8cd-4b12-9b32-d8e6f68e06ac.jsonl": {
+      "last_modified": 1752599348.1101894,
+      "last_imported": 1753845929.751773,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/5ae21b01-8ba9-422c-ae9a-d846c15e67e2.jsonl": {
+      "last_modified": 1752556126.1544964,
+      "last_imported": 1753845929.802036,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/9bae64fb-b00a-4ceb-8ec1-7029b26ccc94.jsonl": {
+      "last_modified": 1752632152.2616217,
+      "last_imported": 1753845929.906547,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/7f153a7e-3d0b-4b57-be06-36262cb6aeec.jsonl": {
+      "last_modified": 1752612866.1415555,
+      "last_imported": 1753845929.957999,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/6618e080-47b7-44a5-a6c8-bdbb4d3d0934.jsonl": {
+      "last_modified": 1752609707.3874645,
+      "last_imported": 1753845930.009781,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/a99a708e-b973-426e-b5d2-9de4e8006405.jsonl": {
+      "last_modified": 1752608119.5552125,
+      "last_imported": 1753845930.408175,
+      "chunks_imported": 19
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/868c8826-7b9d-4a9e-95dd-2db0defcbdd1.jsonl": {
+      "last_modified": 1752609525.2498074,
+      "last_imported": 1753845930.463769,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/b403fdfb-cae9-449e-a92c-28968e468bd5.jsonl": {
+      "last_modified": 1752609521.676987,
+      "last_imported": 1753845930.534835,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/7545a034-61e1-43a8-ad6a-e5e79706d529.jsonl": {
+      "last_modified": 1752612379.5549662,
+      "last_imported": 1753845930.5973,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/834005fe-a38f-416e-bb98-70b00443e01a.jsonl": {
+      "last_modified": 1752608265.86071,
+      "last_imported": 1753845930.655787,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/2fee97dc-25c6-4d7d-8e68-ea992af55757.jsonl": {
+      "last_modified": 1752557034.7293167,
+      "last_imported": 1753845930.737626,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/b2fd8c79-16bc-4e9b-9acc-5bfef874718b.jsonl": {
+      "last_modified": 1752600042.4518132,
+      "last_imported": 1753845930.781739,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/002d1b5a-eb41-4138-a9d7-fb6148a83dac.jsonl": {
+      "last_modified": 1752609934.8783844,
+      "last_imported": 1753845930.824292,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/2efa56cb-c9ad-4dfe-845c-585b90206c4b.jsonl": {
+      "last_modified": 1753019140.3467548,
+      "last_imported": 1753845930.871595,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/fa4a151f-0cc7-4216-bf1b-f5bc088169cb.jsonl": {
+      "last_modified": 1752614532.2608075,
+      "last_imported": 1753845930.923054,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/51ab1a92-59ce-4eb3-bf4e-7cba2039b6cc.jsonl": {
+      "last_modified": 1752599617.6089106,
+      "last_imported": 1753845930.98092,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/1e7e581d-e629-43e6-b17b-4b6fcd49e9af.jsonl": {
+      "last_modified": 1752592861.2488165,
+      "last_imported": 1753845931.298543,
+      "chunks_imported": 11
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/69f734ba-9eca-40be-bf33-8c62ff88f84a.jsonl": {
+      "last_modified": 1752556097.3858478,
+      "last_imported": 1753845931.335458,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/a0b25eec-51a4-4dc6-a3d6-3e5737900a52.jsonl": {
+      "last_modified": 1752599672.8632207,
+      "last_imported": 1753845931.396517,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/663d799e-a61e-4490-aaa2-223f0f9f274a.jsonl": {
+      "last_modified": 1752610767.5497792,
+      "last_imported": 1753845931.447067,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/badd09b4-909f-43cb-a060-8bc373c93b98.jsonl": {
+      "last_modified": 1752611560.4084527,
+      "last_imported": 1753845931.499745,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/5fe28f77-9810-48d3-a6a3-1f3089ef9df0.jsonl": {
+      "last_modified": 1752609992.17004,
+      "last_imported": 1753845931.545228,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/c02b594a-eed2-4a75-a444-873f45c71b1d.jsonl": {
+      "last_modified": 1752609933.3557858,
+      "last_imported": 1753845931.604497,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/94c8c6d5-ca47-400f-84fc-603f10dd2a33.jsonl": {
+      "last_modified": 1752557096.4604354,
+      "last_imported": 1753845931.714612,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/bfc2bafd-fe13-493c-93fc-1de8381ef405.jsonl": {
+      "last_modified": 1752556214.2573838,
+      "last_imported": 1753845931.777328,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/89aee260-79d6-41c3-bd45-8d2ea6626eeb.jsonl": {
+      "last_modified": 1752611047.7544029,
+      "last_imported": 1753845931.822109,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/643f04fa-c6eb-4fdb-b6fe-f28ecc9d56e6.jsonl": {
+      "last_modified": 1752611047.590986,
+      "last_imported": 1753845931.873621,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/112785f3-4e43-47ea-a96f-4ca8d3b45db2.jsonl": {
+      "last_modified": 1752599299.0756826,
+      "last_imported": 1753845931.933789,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/5eaa3c93-95b3-473f-9a57-65b6c22bf755.jsonl": {
+      "last_modified": 1752609549.2897677,
+      "last_imported": 1753845931.97851,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/d575f87f-e06e-4158-a3eb-08206c4bcb8d.jsonl": {
+      "last_modified": 1752610772.516135,
+      "last_imported": 1753845932.036933,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/ad831b52-e1cf-4c8c-86af-10aae8312c34.jsonl": {
+      "last_modified": 1752610080.8751278,
+      "last_imported": 1753845932.084616,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/c728a06b-2d7e-4dda-8e28-58d85988bf30.jsonl": {
+      "last_modified": 1752614281.7882385,
+      "last_imported": 1753845932.132133,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/4cf6b824-1ea8-45e9-b751-5cc94e1dfd68.jsonl": {
+      "last_modified": 1752614531.6366298,
+      "last_imported": 1753845932.174039,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/ef759422-dbce-4ff3-8370-31e6120b5a89.jsonl": {
+      "last_modified": 1752609715.493511,
+      "last_imported": 1753845932.33077,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/c2370f13-2f6d-4ae0-9b77-9f775e76d9a4.jsonl": {
+      "last_modified": 1752599277.2704782,
+      "last_imported": 1753845932.39189,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/4b19c3a9-9eef-4c35-9bda-ce9d24527447.jsonl": {
+      "last_modified": 1752600068.0307078,
+      "last_imported": 1753845932.448596,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/cf7f884d-ca2b-42bc-9d68-a9bead090969.jsonl": {
+      "last_modified": 1752612397.0817256,
+      "last_imported": 1753845932.5438,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/02c450a4-c0e5-44a9-859a-29896202b17e.jsonl": {
+      "last_modified": 1752600139.7683313,
+      "last_imported": 1753845932.598591,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/e17ca032-9de0-46ec-8208-ed56a933b095.jsonl": {
+      "last_modified": 1752599736.0121665,
+      "last_imported": 1753845932.649309,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/68e29838-1161-4a60-a6ed-c39ee373a20d.jsonl": {
+      "last_modified": 1752633310.052791,
+      "last_imported": 1753845932.786569,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/f7167592-1fef-4307-b0a4-4b2fcf72c0a2.jsonl": {
+      "last_modified": 1752610153.9217079,
+      "last_imported": 1753845932.949382,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/31790b0b-2c95-4523-aa52-79ea61b1d0e8.jsonl": {
+      "last_modified": 1752556056.916342,
+      "last_imported": 1753845933.024279,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/cfdc5af9-bc9e-49dd-af42-d1089079928c.jsonl": {
+      "last_modified": 1752611107.061449,
+      "last_imported": 1753845933.073429,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/af2eeae4-e3d5-40b6-9306-bb7936d115d5.jsonl": {
+      "last_modified": 1752614291.5118515,
+      "last_imported": 1753845933.161543,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/7f43b2e4-1ea6-4d6a-815e-cb4fb246d8d4.jsonl": {
+      "last_modified": 1752608265.3927028,
+      "last_imported": 1753845933.211561,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/11b650d9-6980-41a4-95aa-5fedbb83399c.jsonl": {
+      "last_modified": 1752608523.8205438,
+      "last_imported": 1753845933.261175,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/61f52b68-1602-4c59-956e-fdf21b3c7328.jsonl": {
+      "last_modified": 1752614572.29096,
+      "last_imported": 1753845933.310666,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/a512ef1a-ed97-480d-9cec-704346590bd8.jsonl": {
+      "last_modified": 1752632872.8934307,
+      "last_imported": 1753845933.365633,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/f01a64d5-f846-40a5-bb01-55b7ad0655a1.jsonl": {
+      "last_modified": 1752610082.513615,
+      "last_imported": 1753845933.41678,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/e3c30a01-58c6-4f2e-aa0a-213e1994d23c.jsonl": {
+      "last_modified": 1752610686.4463732,
+      "last_imported": 1753845933.477647,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/8b611024-68b3-4d12-bcd1-fe9664cc98ee.jsonl": {
+      "last_modified": 1752612866.6776257,
+      "last_imported": 1753845933.533741,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/2dd59084-617b-4093-b772-6e7f5cf53b3d.jsonl": {
+      "last_modified": 1752611559.2100172,
+      "last_imported": 1753845933.577035,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/9b188423-65bf-4818-adf3-b19c7a83d5c0.jsonl": {
+      "last_modified": 1752611594.9818726,
+      "last_imported": 1753845933.658191,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/88d65f9b-8145-455d-ad97-4740aa432d95.jsonl": {
+      "last_modified": 1752608585.0721455,
+      "last_imported": 1753845933.77769,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/16211ecb-e206-43aa-9c04-9d64d229215e.jsonl": {
+      "last_modified": 1752614579.258508,
+      "last_imported": 1753845933.904536,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/363d9585-b577-4076-a2c5-d9094b2b2c4a.jsonl": {
+      "last_modified": 1752600680.3556452,
+      "last_imported": 1753845934.433063,
+      "chunks_imported": 25
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/471760c9-33e6-4cc5-9a64-03ce1201d35d.jsonl": {
+      "last_modified": 1752609992.3920226,
+      "last_imported": 1753845934.494982,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/78627971-e047-44d9-9460-9027d86b45c2.jsonl": {
+      "last_modified": 1752632871.9808578,
+      "last_imported": 1753845934.548375,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-code-governance/c52327f2-3702-4fb2-9f72-9279127fdd5b.jsonl": {
+      "last_modified": 1752600093.0085762,
+      "last_imported": 1753845934.588349,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Fuselenses/cca12383-3311-43f8-a040-20c4261987d8.jsonl": {
+      "last_modified": 1752348640.1817274,
+      "last_imported": 1753845934.801438,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-UNSPSC/9cb15e71-4f7b-4204-9beb-13e36dd73699.jsonl": {
+      "last_modified": 1751995212.457942,
+      "last_imported": 1753845934.906231,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-UNSPSC/e56df9a8-1cb5-4df3-bd6d-95811f4892c1.jsonl": {
+      "last_modified": 1751995434.861047,
+      "last_imported": 1753845934.966367,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/61a35bb0-39d4-4a8f-aeee-c114e9cb03ed.jsonl": {
+      "last_modified": 1753727191.738602,
+      "last_imported": 1753845935.061523,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/d1766cb4-cb19-471b-8d05-d847887dc474.jsonl": {
+      "last_modified": 1753557975.5553195,
+      "last_imported": 1753845935.235812,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/fd365a98-0ad4-4bda-88fe-3a12ab8b494a.jsonl": {
+      "last_modified": 1753801070.5717611,
+      "last_imported": 1753845935.397066,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/7bcf301f-dbf8-4e0e-9012-2d8808b0d750.jsonl": {
+      "last_modified": 1753638756.782888,
+      "last_imported": 1753845935.595538,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/137d02a1-3f7f-47b3-9ff8-bd2c7b710376.jsonl": {
+      "last_modified": 1753647339.5441802,
+      "last_imported": 1753845935.750964,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/2823d23f-d366-40b8-8dc6-91f647583108.jsonl": {
+      "last_modified": 1753827036.7716494,
+      "last_imported": 1753845936.072068,
+      "chunks_imported": 16
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/f2a3a95b-86a6-46d0-acd0-09bd0c4a293f.jsonl": {
+      "last_modified": 1753678458.4486926,
+      "last_imported": 1753845936.265826,
+      "chunks_imported": 10
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/0de02bae-e82e-4ebb-8bea-136a0c9f97f0.jsonl": {
+      "last_modified": 1753724179.9311075,
+      "last_imported": 1753845936.600675,
+      "chunks_imported": 18
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/24ead315-a47a-434d-816c-654d8dbb41d4.jsonl": {
+      "last_modified": 1753800518.6788664,
+      "last_imported": 1753845936.734738,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/d125ea47-744e-49e7-bae1-8b33a49b50ce.jsonl": {
+      "last_modified": 1753819599.6530726,
+      "last_imported": 1753845936.892485,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/68bc1bde-c68b-4399-bf92-1cb4de6c5e1d.jsonl": {
+      "last_modified": 1753541916.5444965,
+      "last_imported": 1753845937.057223,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/db322621-595c-479d-98c5-562ccb1fea30.jsonl": {
+      "last_modified": 1753808070.857982,
+      "last_imported": 1753845937.30088,
+      "chunks_imported": 12
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/2818f953-0f46-494a-bf28-035a0f41339d.jsonl": {
+      "last_modified": 1753724437.2537813,
+      "last_imported": 1753845937.398448,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/e051982f-ca5a-431a-850b-eda1a268314f.jsonl": {
+      "last_modified": 1753556159.3671138,
+      "last_imported": 1753845937.446562,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/856c5081-9aaf-4142-9078-5c1529d15794.jsonl": {
+      "last_modified": 1753726246.7129922,
+      "last_imported": 1753845937.62422,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/4d6ac244-638e-4907-89a9-e5deb6de0653.jsonl": {
+      "last_modified": 1753802504.9827564,
+      "last_imported": 1753845937.931705,
+      "chunks_imported": 16
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/74ba1a70-0b84-4bb2-91d0-32de1e4da507.jsonl": {
+      "last_modified": 1753806377.639416,
+      "last_imported": 1753845938.213304,
+      "chunks_imported": 15
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/5072bf39-d6a8-43b9-9220-58dca12464a4.jsonl": {
+      "last_modified": 1753807706.9504368,
+      "last_imported": 1753845938.375908,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/6d792976-d294-49a4-b0ad-b6e91f143441.jsonl": {
+      "last_modified": 1753722520.3613005,
+      "last_imported": 1753845938.432773,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/bdd9d20c-f1bc-486a-a12e-3ef890c51dd5.jsonl": {
+      "last_modified": 1753804423.5016406,
+      "last_imported": 1753845938.545709,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/79c80fac-baf5-4ac2-95f1-0b4a2c7c94a9.jsonl": {
+      "last_modified": 1753547219.437787,
+      "last_imported": 1753845938.598737,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/121fb9ff-7bc5-4924-9607-08581228b490.jsonl": {
+      "last_modified": 1753729639.211666,
+      "last_imported": 1753845938.64573,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/7ab9febc-8257-4e0c-9e8e-566786902b18.jsonl": {
+      "last_modified": 1753722564.9498231,
+      "last_imported": 1753845938.689053,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/c810cc19-19f3-40b5-92bc-657223e31489.jsonl": {
+      "last_modified": 1753648273.3621087,
+      "last_imported": 1753845938.76662,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/941513f3-3cb9-4392-8a3f-2f4a99daaba2.jsonl": {
+      "last_modified": 1753676730.253279,
+      "last_imported": 1753845938.94866,
+      "chunks_imported": 10
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/8c5b3d49-a584-44fa-9e84-b4de99f847d5.jsonl": {
+      "last_modified": 1753637802.072475,
+      "last_imported": 1753845939.269607,
+      "chunks_imported": 13
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/013adfa9-341b-4dff-912a-caf534dcc620.jsonl": {
+      "last_modified": 1753738515.7188637,
+      "last_imported": 1753845939.543706,
+      "chunks_imported": 14
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/65bc5d0a-f7d1-41b5-8066-4f999c988815.jsonl": {
+      "last_modified": 1753547688.9230666,
+      "last_imported": 1753845939.59721,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/9dc8a8f3-c7b8-4f89-bc3c-2602b19bcc5a.jsonl": {
+      "last_modified": 1753542484.3270712,
+      "last_imported": 1753845939.670123,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/96231de4-aa85-404a-8d88-d9b0226bb3d1.jsonl": {
+      "last_modified": 1753682963.2715728,
+      "last_imported": 1753845940.294716,
+      "chunks_imported": 36
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/806e2f11-3fb8-49fe-b774-f23f989d83d0.jsonl": {
+      "last_modified": 1753672376.9701595,
+      "last_imported": 1753845940.368194,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/c2f7e48f-43e5-4fc7-ad6e-0735d65f85f7.jsonl": {
+      "last_modified": 1753664475.910354,
+      "last_imported": 1753845940.599343,
+      "chunks_imported": 12
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/b0dc67d2-9768-4411-9e0e-da5348f64ec0.jsonl": {
+      "last_modified": 1753677538.5013604,
+      "last_imported": 1753845940.859595,
+      "chunks_imported": 14
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/4f2ef1f0-f2ad-4334-8a27-b10c9f43e514.jsonl": {
+      "last_modified": 1753673946.3724184,
+      "last_imported": 1753845941.103198,
+      "chunks_imported": 13
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/f1f58ec6-f0a2-4a4f-8a5e-fcba0eb31b76.jsonl": {
+      "last_modified": 1753739042.88429,
+      "last_imported": 1753845941.41741,
+      "chunks_imported": 16
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/3efdc962-943c-47f3-9e51-9aa07423e9b0.jsonl": {
+      "last_modified": 1753807654.225846,
+      "last_imported": 1753845941.575191,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/a16acb2b-5a2a-4d2c-9653-418ff7582f13.jsonl": {
+      "last_modified": 1753550907.8026948,
+      "last_imported": 1753845941.894908,
+      "chunks_imported": 19
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/f4726a28-3f45-4883-8256-6102516891d2.jsonl": {
+      "last_modified": 1753816207.2393234,
+      "last_imported": 1753845942.196582,
+      "chunks_imported": 14
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/0a06e4d1-c2b4-42a8-b2e0-75a29610da09.jsonl": {
+      "last_modified": 1753800846.5851924,
+      "last_imported": 1753845942.364041,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/56d729d0-1cbf-45c7-82aa-cb08d3ebd59b.jsonl": {
+      "last_modified": 1753726105.287441,
+      "last_imported": 1753845942.517352,
+      "chunks_imported": 10
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/e9d01457-28f6-44af-ac97-7844b1e6cc2c.jsonl": {
+      "last_modified": 1753672453.9226522,
+      "last_imported": 1753845942.556647,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/195d929f-f467-475b-9485-1047fb3b7ce8.jsonl": {
+      "last_modified": 1753550401.6198885,
+      "last_imported": 1753845942.616675,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/efa74170-e691-4b9a-9bcb-82ddbd72e3c9.jsonl": {
+      "last_modified": 1753849162.78504,
+      "last_imported": 1753849203.482595,
+      "chunks_imported": 27
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/0931a04c-5760-4151-8f4c-a459a34c0e60.jsonl": {
+      "last_modified": 1753807471.4269419,
+      "last_imported": 1753845943.067126,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/9067555c-1f83-46bc-b490-5b225e8eadb9.jsonl": {
+      "last_modified": 1753724501.5754693,
+      "last_imported": 1753845943.148286,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/e364be0d-7c10-46b1-bcd8-8e36c8961e57.jsonl": {
+      "last_modified": 1753817931.7144878,
+      "last_imported": 1753845943.53878,
+      "chunks_imported": 22
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/d2e9d5f4-053c-4140-8e08-31387e38bf26.jsonl": {
+      "last_modified": 1753547132.5867548,
+      "last_imported": 1753845943.58817,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/02c76aae-31a9-4f78-86dc-4cde3aec3e95.jsonl": {
+      "last_modified": 1753555860.413195,
+      "last_imported": 1753845943.966046,
+      "chunks_imported": 21
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/bf0045dd-0af6-4282-94d8-fb6e2d8e2f4a.jsonl": {
+      "last_modified": 1753799141.4150898,
+      "last_imported": 1753845944.020906,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/d3a8c860-aa1f-4a75-9631-8f467ee3b582.jsonl": {
+      "last_modified": 1753679614.327908,
+      "last_imported": 1753845944.388544,
+      "chunks_imported": 18
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/5ea2c66a-0b48-48d6-a892-990e85f098ff.jsonl": {
+      "last_modified": 1753807255.9427073,
+      "last_imported": 1753845944.531031,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/c28ccbf8-e097-4683-89cd-14871e64b24f.jsonl": {
+      "last_modified": 1753806689.595962,
+      "last_imported": 1753845944.643692,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/e8bfe4da-65bb-4892-9674-4554d6cf7d0d.jsonl": {
+      "last_modified": 1753801034.8461406,
+      "last_imported": 1753845944.782941,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/7f9e771e-3f8e-4c20-9771-921bb03cf478.jsonl": {
+      "last_modified": 1753842008.8181145,
+      "last_imported": 1753845944.953238,
+      "chunks_imported": 11
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/e77e1c60-cbbb-449d-ad4e-9841e8e2711d.jsonl": {
+      "last_modified": 1753804639.5139802,
+      "last_imported": 1753845945.115744,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/4fc72b46-89b2-40ca-afb4-e35c5a58de70.jsonl": {
+      "last_modified": 1753814419.3435886,
+      "last_imported": 1753845945.553227,
+      "chunks_imported": 27
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/f6a47fcd-3eba-479b-984b-e4342d9d6167.jsonl": {
+      "last_modified": 1753741666.2396078,
+      "last_imported": 1753845945.975209,
+      "chunks_imported": 24
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/32c5ece7-b6da-470c-b521-6a6d83e40ca4.jsonl": {
+      "last_modified": 1753679025.3182757,
+      "last_imported": 1753845946.245042,
+      "chunks_imported": 14
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/5148a807-f62b-455b-8154-c5a07dedda9f.jsonl": {
+      "last_modified": 1753803690.1465497,
+      "last_imported": 1753845946.57272,
+      "chunks_imported": 17
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/7f3044d6-e5db-4a08-b861-05278b47cab9.jsonl": {
+      "last_modified": 1753831140.184924,
+      "last_imported": 1753845946.622421,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/d48c6b7f-9fb4-4b1a-935d-9c43cb031253.jsonl": {
+      "last_modified": 1753542370.407577,
+      "last_imported": 1753845946.687103,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/f055dec3-6161-428e-a44a-b2843c59581e.jsonl": {
+      "last_modified": 1753732755.4527285,
+      "last_imported": 1753845947.367318,
+      "chunks_imported": 36
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/b3ce97ce-7e8b-4248-b6eb-d0754210592c.jsonl": {
+      "last_modified": 1753744159.947915,
+      "last_imported": 1753845947.509871,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/f6611038-2f3f-491d-a98c-2c2c38c10356.jsonl": {
+      "last_modified": 1753544103.1640246,
+      "last_imported": 1753845947.925558,
+      "chunks_imported": 21
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/50b3b1a9-15d4-4c60-93e2-aa276f433912.jsonl": {
+      "last_modified": 1753807719.4197502,
+      "last_imported": 1753845948.090914,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/b606e003-1fc6-4404-9b85-2ed091c5e616.jsonl": {
+      "last_modified": 1752356181.9924753,
+      "last_imported": 1753845948.303719,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/c7af274b-4906-4046-8ebf-e3ad85a39d3c.jsonl": {
+      "last_modified": 1752289379.812258,
+      "last_imported": 1753845948.371198,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/e8084fb3-e05c-48fa-ae74-9004645eb377.jsonl": {
+      "last_modified": 1752297284.9872375,
+      "last_imported": 1753845948.4024,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/41bfcf60-5ecc-4be8-8ff5-fa0d1ca0a325.jsonl": {
+      "last_modified": 1752297452.991676,
+      "last_imported": 1753845948.487698,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/134b3fb4-95f7-4c62-ae50-edc52479d800.jsonl": {
+      "last_modified": 1752336472.1111479,
+      "last_imported": 1753845948.700952,
+      "chunks_imported": 12
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/b3705401-cb42-4405-b860-a060bc4e1484.jsonl": {
+      "last_modified": 1752358730.5586433,
+      "last_imported": 1753845949.007821,
+      "chunks_imported": 16
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/5c986743-314b-4dc8-8681-76c01b101a82.jsonl": {
+      "last_modified": 1752293174.3816884,
+      "last_imported": 1753845949.083332,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/85785224-097d-425a-8def-0a04811fe735.jsonl": {
+      "last_modified": 1752361081.8020415,
+      "last_imported": 1753845949.244759,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/0006c72d-a4b5-4177-9bb5-b4308fee9408.jsonl": {
+      "last_modified": 1752341666.841463,
+      "last_imported": 1753845949.357839,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/57be3b40-f950-4364-a9d2-30f4dfca377e.jsonl": {
+      "last_modified": 1752298229.3710551,
+      "last_imported": 1753845949.513338,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/1cd7a25c-a3a0-4c7a-bdff-5c682f6c9a44.jsonl": {
+      "last_modified": 1752298139.454842,
+      "last_imported": 1753845949.626883,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/fee5cb08-c697-4f1d-a671-fdb2d1f0eaf6.jsonl": {
+      "last_modified": 1752340365.1195362,
+      "last_imported": 1753845949.707218,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/1e46bcb7-3c1b-4550-86f6-e90035bc7a36.jsonl": {
+      "last_modified": 1752358915.7915926,
+      "last_imported": 1753845949.835023,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/10152e9f-d8f5-4dc8-888a-659639659d8b.jsonl": {
+      "last_modified": 1752292989.589515,
+      "last_imported": 1753845950.062242,
+      "chunks_imported": 11
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-mantis-mantis-mcp/1fc419e8-149e-4917-9ced-596149c27633.jsonl": {
+      "last_modified": 1752342606.9015932,
+      "last_imported": 1753845950.238802,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-llmsharedmemory/e4b2d8b0-6f46-49d0-a522-e067907d22ba.jsonl": {
+      "last_modified": 1752872024.89382,
+      "last_imported": 1753845950.534981,
+      "chunks_imported": 11
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-llmsharedmemory/71f2c59f-ab0e-46e0-94b7-c70de5a85a9e.jsonl": {
+      "last_modified": 1752853088.231853,
+      "last_imported": 1753845950.589035,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-llmsharedmemory/4c0cf49c-d345-4483-8ee1-f8ac7519f36f.jsonl": {
+      "last_modified": 1752857326.6200838,
+      "last_imported": 1753845950.680017,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-llmsharedmemory/c8b24e75-97ce-489c-a8d3-f8b482604ce5.jsonl": {
+      "last_modified": 1752853192.8124964,
+      "last_imported": 1753845950.723105,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-ShopifyMCPMockShop/ed146765-e369-4e9b-85b6-ba60c1888558.jsonl": {
+      "last_modified": 1753076974.5629222,
+      "last_imported": 1753845950.94163,
+      "chunks_imported": 10
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-ShopifyMCPMockShop/b717126c-4236-4cd3-9692-314bef313b15.jsonl": {
+      "last_modified": 1753055566.901018,
+      "last_imported": 1753845951.012803,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/108cc1a8-97aa-40af-a089-28afd4bd0f93.jsonl": {
+      "last_modified": 1752541926.0381691,
+      "last_imported": 1753845951.186821,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/e15035bd-d055-4c77-8cf7-466a3596d16c.jsonl": {
+      "last_modified": 1752546518.9547408,
+      "last_imported": 1753845951.359081,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/82a52cfe-88bf-40cf-baa7-33c16da55a76.jsonl": {
+      "last_modified": 1752466787.1632516,
+      "last_imported": 1753845951.443836,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/3c82cbfc-d851-410b-b22b-102132eb185a.jsonl": {
+      "last_modified": 1752470779.8877103,
+      "last_imported": 1753845951.495994,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/23c7847b-ae21-46ff-b5dc-7016fd00d46d.jsonl": {
+      "last_modified": 1752470595.1586792,
+      "last_imported": 1753845951.678496,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/dc9de528-c4ef-4782-90ea-852c00bf3a0d.jsonl": {
+      "last_modified": 1752589992.9912822,
+      "last_imported": 1753845951.736553,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/3286ab66-2a6f-478b-bbb1-fccf42237bc1.jsonl": {
+      "last_modified": 1752466422.8692043,
+      "last_imported": 1753845951.875171,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/5f3cb3b9-1db7-4de9-aef3-b1914925fb39.jsonl": {
+      "last_modified": 1752590204.2464154,
+      "last_imported": 1753845951.92235,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/980776cb-912d-48be-94e1-e43acda65058.jsonl": {
+      "last_modified": 1752555706.9994423,
+      "last_imported": 1753845952.060381,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/cf6b8d4c-2694-4d33-9f6f-94881d11cb20.jsonl": {
+      "last_modified": 1752499399.6362443,
+      "last_imported": 1753845952.092681,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/f9276f4b-88aa-4627-876c-5e750a5556be.jsonl": {
+      "last_modified": 1752542545.9534295,
+      "last_imported": 1753845952.123118,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/56407348-9ffe-45ee-b258-3984d69bf1c2.jsonl": {
+      "last_modified": 1752546823.9599962,
+      "last_imported": 1753845952.168587,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/f66f2368-341f-445d-8385-a1767c1871f1.jsonl": {
+      "last_modified": 1752471540.4374406,
+      "last_imported": 1753845952.24826,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/954dc8ed-aaa0-41bb-861a-6c0c3b438078.jsonl": {
+      "last_modified": 1752470484.5192087,
+      "last_imported": 1753845952.407015,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/d61b833b-ed97-4f9a-8ce0-5db7f4437629.jsonl": {
+      "last_modified": 1752470071.7831383,
+      "last_imported": 1753845952.539978,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/a9018b0d-2b52-461b-82b0-e581d2e7fcbc.jsonl": {
+      "last_modified": 1752469061.7347238,
+      "last_imported": 1753845952.643362,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/409e0878-55a2-4267-a6bf-f11910719249.jsonl": {
+      "last_modified": 1752470903.9679403,
+      "last_imported": 1753845952.705028,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/a7cf2fa4-2776-430f-aed5-e573bae17800.jsonl": {
+      "last_modified": 1752542439.1168008,
+      "last_imported": 1753845952.860265,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/6fee0437-a3b0-40ac-8ba4-ce1e6b9313e6.jsonl": {
+      "last_modified": 1752555742.5907896,
+      "last_imported": 1753845952.906359,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/95c36629-f0bf-4db6-a041-b0ee3cd040de.jsonl": {
+      "last_modified": 1752467533.8126674,
+      "last_imported": 1753845952.999207,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects/f5371703-6597-4b2f-bef5-30a9c9019b19.jsonl": {
+      "last_modified": 1752546860.8324273,
+      "last_imported": 1753845953.027942,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack-claude-self-reflection/8dc498df-c625-4fb1-a0d9-c7b5881dc0ff.jsonl": {
+      "last_modified": 1753382206.3374972,
+      "last_imported": 1753845953.111974,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack-claude-self-reflection/9366c81c-9f84-4a4a-8a6e-3b0c0c12684d.jsonl": {
+      "last_modified": 1753396688.0313904,
+      "last_imported": 1753845953.156291,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-claude-self-reflect-qdrant-mcp-stack/5bf55d7f-268f-4767-bc95-8675fdcfbfc3.jsonl": {
+      "last_modified": 1753506355.0830545,
+      "last_imported": 1753845953.516763,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-claude-self-reflect-qdrant-mcp-stack/d3eef018-cf4b-44f4-9d89-929fa46ede2c.jsonl": {
+      "last_modified": 1753540666.3933537,
+      "last_imported": 1753845953.645062,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-claude-self-reflect-qdrant-mcp-stack/89d46b6f-a9e8-4e96-a046-61490209df96.jsonl": {
+      "last_modified": 1753505134.303744,
+      "last_imported": 1753845953.689663,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-claude-self-reflect-qdrant-mcp-stack/144a5578-cfc7-4dcc-97aa-fc4dd6362fb1.jsonl": {
+      "last_modified": 1753505796.0347288,
+      "last_imported": 1753845953.782736,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/8dc23f73-9c78-4334-a1e8-9b2ba477cf95.jsonl": {
+      "last_modified": 1752687925.6238723,
+      "last_imported": 1753845953.888054,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/5857be23-77aa-4767-8095-231e2e6c4a16.jsonl": {
+      "last_modified": 1752688385.2379339,
+      "last_imported": 1753845953.938952,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/61db11db-9f3e-4ab2-ac57-ac7f027e3e69.jsonl": {
+      "last_modified": 1751902409.4350283,
+      "last_imported": 1753845954.366228,
+      "chunks_imported": 25
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/d687bb06-afef-4ecb-891d-09c374ea175e.jsonl": {
+      "last_modified": 1753129934.702185,
+      "last_imported": 1753845954.412721,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/0351f864-167e-4780-b6d6-c944e06df20d.jsonl": {
+      "last_modified": 1751398310.9645607,
+      "last_imported": 1753845954.459719,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/5c06a0c7-77c2-48f4-84c8-5d116c7e5bd2.jsonl": {
+      "last_modified": 1753025411.5573184,
+      "last_imported": 1753845954.522414,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/2bfede14-ee18-490d-8518-32ec01c58911.jsonl": {
+      "last_modified": 1752687526.5629337,
+      "last_imported": 1753845954.576461,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/d64359bb-b675-4bd2-83ea-68467c3a7582.jsonl": {
+      "last_modified": 1751747760.3574276,
+      "last_imported": 1753845954.749387,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/1074c78f-453f-4c11-84bb-337d48e13d84.jsonl": {
+      "last_modified": 1751599707.3858156,
+      "last_imported": 1753845954.872697,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/c0e3f1e4-4dbc-488d-9f42-881c7f7ead1c.jsonl": {
+      "last_modified": 1752687963.643719,
+      "last_imported": 1753845954.925745,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/3b1b5833-4170-4160-823f-fd55f113f960.jsonl": {
+      "last_modified": 1752679865.905895,
+      "last_imported": 1753845954.982288,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/8e62a82d-215e-41b9-98f9-027eec5bf813.jsonl": {
+      "last_modified": 1752687887.8858662,
+      "last_imported": 1753845955.064151,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/1cf44948-e39e-4189-b927-617cfb23d1c7.jsonl": {
+      "last_modified": 1752687772.3145335,
+      "last_imported": 1753845955.136556,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/44fb6edf-8b86-422a-93aa-618a2f11c467.jsonl": {
+      "last_modified": 1752687667.2985547,
+      "last_imported": 1753845955.182802,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/2f534070-aef9-498b-99fd-a2b12aae3f52.jsonl": {
+      "last_modified": 1752687566.2657764,
+      "last_imported": 1753845955.239574,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/d666d4ae-9387-4c1a-a7c0-e6b300a78694.jsonl": {
+      "last_modified": 1753108859.7229824,
+      "last_imported": 1753845955.288056,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/c24313d0-4983-4950-9cea-5fcc21fe8ae4.jsonl": {
+      "last_modified": 1751383304.0778766,
+      "last_imported": 1753845955.609384,
+      "chunks_imported": 17
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/d354496d-3c63-4d5d-afde-87b59fa96fd8.jsonl": {
+      "last_modified": 1753743401.9375048,
+      "last_imported": 1753845955.683282,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/a6ee483b-7c70-46df-b210-d0da69e6e238.jsonl": {
+      "last_modified": 1753129473.0719004,
+      "last_imported": 1753845955.729976,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/583f8bf3-ecae-4534-94fa-2a8a216b19a9.jsonl": {
+      "last_modified": 1753054614.809024,
+      "last_imported": 1753845955.794461,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/95c5f929-081b-4a1e-9c51-797323e9213d.jsonl": {
+      "last_modified": 1753108871.3190572,
+      "last_imported": 1753845955.858247,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/70a85a84-4a0b-4118-b755-63b1bc18212e.jsonl": {
+      "last_modified": 1751906226.8103638,
+      "last_imported": 1753845955.911705,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/faf8b3bc-df0e-4aae-96f3-e955e37be0b7.jsonl": {
+      "last_modified": 1752687743.4772735,
+      "last_imported": 1753845955.958159,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/0887e718-034c-4fa8-b9b7-3cc0b51b7696.jsonl": {
+      "last_modified": 1751728277.8367276,
+      "last_imported": 1753845957.079765,
+      "chunks_imported": 64
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/dca83821-7562-4cd1-b940-73b59646de64.jsonl": {
+      "last_modified": 1753035522.5783424,
+      "last_imported": 1753845957.200385,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/b919e163-91cb-44f7-ad7b-28012e89e0a6.jsonl": {
+      "last_modified": 1751436152.421403,
+      "last_imported": 1753845957.357289,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/73e9d763-c9f9-40b1-b0c6-5f145bb80a5c.jsonl": {
+      "last_modified": 1753307599.655554,
+      "last_imported": 1753845957.466653,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/e1e15e27-3bc5-4110-8758-08639a7ecf89.jsonl": {
+      "last_modified": 1751569081.7455595,
+      "last_imported": 1753845957.76071,
+      "chunks_imported": 12
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/b366523e-271c-46ee-96bc-fc318e637e5e.jsonl": {
+      "last_modified": 1751756532.2577443,
+      "last_imported": 1753845958.090619,
+      "chunks_imported": 16
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/83959765-58d7-4e73-8e47-81b3a8eddba5.jsonl": {
+      "last_modified": 1752288093.4804754,
+      "last_imported": 1753845958.757365,
+      "chunks_imported": 36
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/b4e02b57-3240-476f-86eb-abbc46403ca0.jsonl": {
+      "last_modified": 1752688193.7509487,
+      "last_imported": 1753845958.818907,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/64e1673d-ab7d-4945-a704-cdac8c5e655e.jsonl": {
+      "last_modified": 1752693520.6824806,
+      "last_imported": 1753845958.873364,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/2b620bb1-a4ca-4733-9987-ee0ce0e40b02.jsonl": {
+      "last_modified": 1753040031.5433974,
+      "last_imported": 1753845959.152957,
+      "chunks_imported": 15
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/7868ce54-c5f0-465c-b720-498d7cdc2fee.jsonl": {
+      "last_modified": 1752687974.3145657,
+      "last_imported": 1753845959.202379,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/0ae6454f-eb16-4b50-aa68-cbe7799d3a6a.jsonl": {
+      "last_modified": 1752901704.715783,
+      "last_imported": 1753845959.256231,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/3d1536ef-8dae-45d5-b255-e48100093cd9.jsonl": {
+      "last_modified": 1753377451.089291,
+      "last_imported": 1753845959.34756,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/5897ebcf-f856-4afb-ae8b-1d1f729c7d98.jsonl": {
+      "last_modified": 1752687486.8184638,
+      "last_imported": 1753845959.407754,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/290750c0-0824-4074-b6d6-458ee16dca06.jsonl": {
+      "last_modified": 1752901871.5496058,
+      "last_imported": 1753845959.751779,
+      "chunks_imported": 20
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/23db87e6-4769-4638-b1ba-69af2ad00498.jsonl": {
+      "last_modified": 1752986599.7204478,
+      "last_imported": 1753845959.847204,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/0a27deb7-a439-4d2f-8ea6-6928783d584f.jsonl": {
+      "last_modified": 1752471228.196735,
+      "last_imported": 1753845959.993829,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/d82afeda-a0f5-47d6-b25b-e9525f2030c6.jsonl": {
+      "last_modified": 1751750418.3780556,
+      "last_imported": 1753845960.325476,
+      "chunks_imported": 14
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/c0efa807-3957-4d1f-8f34-a00c684a0db5.jsonl": {
+      "last_modified": 1753129869.455564,
+      "last_imported": 1753845960.378805,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/2e18e1ad-31f7-4c86-b482-0423062f716c.jsonl": {
+      "last_modified": 1752679597.8889563,
+      "last_imported": 1753845960.432195,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/d3288d3f-d5d4-4880-ba12-1b260c5e88d5.jsonl": {
+      "last_modified": 1753050826.8347118,
+      "last_imported": 1753845960.48116,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/97da35d3-588f-4e15-80eb-5b3ca33af0b8.jsonl": {
+      "last_modified": 1751388823.8169942,
+      "last_imported": 1753845960.671543,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/e5433021-ca09-4f71-9349-91e7c9915655.jsonl": {
+      "last_modified": 1753115630.998668,
+      "last_imported": 1753845960.822965,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/c79f6b9a-ccf4-4d9b-b198-160efb7645d6.jsonl": {
+      "last_modified": 1751377805.3894365,
+      "last_imported": 1753845961.294043,
+      "chunks_imported": 19
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/9477b237-46a4-4463-a898-bbe4d0826460.jsonl": {
+      "last_modified": 1751515806.981721,
+      "last_imported": 1753845961.633937,
+      "chunks_imported": 17
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/42724faa-7e04-4770-a733-a95414fb4ff6.jsonl": {
+      "last_modified": 1753129988.087465,
+      "last_imported": 1753845961.747593,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/e4530012-b1c0-401f-8be6-100f97e6bfc2.jsonl": {
+      "last_modified": 1752901814.0621264,
+      "last_imported": 1753845961.806769,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/308d0137-c070-4412-abff-fa0bb343c5d6.jsonl": {
+      "last_modified": 1752679829.0021195,
+      "last_imported": 1753845961.855327,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/91efa378-c7b7-4c9b-8216-1ba79ecd825d.jsonl": {
+      "last_modified": 1752687615.3958397,
+      "last_imported": 1753845961.917163,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/a8a33846-3c60-4e85-bcb3-a1b592225e96.jsonl": {
+      "last_modified": 1751905907.615485,
+      "last_imported": 1753845962.208554,
+      "chunks_imported": 16
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/d04b99fa-f13c-406e-975a-52fc99caa877.jsonl": {
+      "last_modified": 1752688077.5906346,
+      "last_imported": 1753845962.269877,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/c780f0fc-9ed2-4b6b-a50b-168a9ebd5974.jsonl": {
+      "last_modified": 1752687397.4408367,
+      "last_imported": 1753845962.328651,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/cc72830a-c25b-427c-a8de-ae229ee813e0.jsonl": {
+      "last_modified": 1752688469.4728303,
+      "last_imported": 1753845962.390155,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/6dc70f22-02dd-4f89-bcd0-5211a02a6eee.jsonl": {
+      "last_modified": 1753419008.9591331,
+      "last_imported": 1753845962.437063,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/7903d9b8-7ce7-4816-8b33-18025bd66a1e.jsonl": {
+      "last_modified": 1752687499.0515397,
+      "last_imported": 1753845962.497423,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/f5574539-d0a9-409e-81f7-1bc5b09cb174.jsonl": {
+      "last_modified": 1753076684.4634569,
+      "last_imported": 1753845962.668298,
+      "chunks_imported": 9
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/f1c17423-100a-47f3-81c0-b45b5c822bb9.jsonl": {
+      "last_modified": 1752693559.4795728,
+      "last_imported": 1753845962.723354,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/cc618c1f-8738-4ee6-99dc-d852558e2628.jsonl": {
+      "last_modified": 1751868983.7077377,
+      "last_imported": 1753845962.893203,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/0f3f9859-55ab-486c-9a77-24f951c6a0fb.jsonl": {
+      "last_modified": 1752687822.7345598,
+      "last_imported": 1753845962.964854,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/adbfa6b5-31b8-4b12-afff-26185673d50f.jsonl": {
+      "last_modified": 1753054626.354075,
+      "last_imported": 1753845963.01657,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/3041c383-ac0b-4e7a-83f8-08c007470f12.jsonl": {
+      "last_modified": 1752901802.1783586,
+      "last_imported": 1753845963.064155,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/e958de15-ba24-4f33-b8e2-313b50fa57a9.jsonl": {
+      "last_modified": 1751583858.2181633,
+      "last_imported": 1753845963.200966,
+      "chunks_imported": 7
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/82cf1997-aafc-48e8-af12-6a27708367ad.jsonl": {
+      "last_modified": 1752687537.8022382,
+      "last_imported": 1753845963.256924,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/ad281801-e046-485f-b99e-6b7dbdf0ecf3.jsonl": {
+      "last_modified": 1752688166.956536,
+      "last_imported": 1753845963.313277,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/11bdd029-df36-4e0e-8f65-8a1eacb3afb7.jsonl": {
+      "last_modified": 1753025422.9675004,
+      "last_imported": 1753845963.369342,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/2f800a91-2371-4678-80f9-c45fc3751fcb.jsonl": {
+      "last_modified": 1751392375.6364145,
+      "last_imported": 1753845963.606065,
+      "chunks_imported": 12
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/203ad2a6-a892-479b-9a0b-10fdb551ac4e.jsonl": {
+      "last_modified": 1752373732.7669353,
+      "last_imported": 1753845963.69934,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/45123d92-c752-4bb2-aa28-2118def2655a.jsonl": {
+      "last_modified": 1752687783.4518714,
+      "last_imported": 1753845963.756124,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/049d5c4b-3714-4c13-acbb-4814191c5511.jsonl": {
+      "last_modified": 1751326995.8848603,
+      "last_imported": 1753845964.451113,
+      "chunks_imported": 35
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/f9316f66-04ff-4041-967a-d9e18d5b9e84.jsonl": {
+      "last_modified": 1753109046.548236,
+      "last_imported": 1753845964.511744,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/f5554cb3-0516-4741-b0cd-76f50e123377.jsonl": {
+      "last_modified": 1752687898.6509693,
+      "last_imported": 1753845964.564396,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/8a4fb8d2-e9bb-4db2-8753-a4a2fc11d53a.jsonl": {
+      "last_modified": 1753743863.3081632,
+      "last_imported": 1753845964.669763,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/09a3578e-627d-47c2-9223-e83bb476b58e.jsonl": {
+      "last_modified": 1753109405.4872088,
+      "last_imported": 1753845964.735289,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/01f18693-c845-466b-a56f-c0c459a3ecca.jsonl": {
+      "last_modified": 1751904321.5900557,
+      "last_imported": 1753845965.009215,
+      "chunks_imported": 11
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/e1332943-2232-41b1-b5db-2a5b101c2289.jsonl": {
+      "last_modified": 1753130180.7786598,
+      "last_imported": 1753845965.055577,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/579d1e5c-cc09-4ae8-9369-c51fda5cc04d.jsonl": {
+      "last_modified": 1753109533.099922,
+      "last_imported": 1753845965.105176,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/e3981db8-768d-4882-a674-e237f70eea32.jsonl": {
+      "last_modified": 1753744433.5986745,
+      "last_imported": 1753845965.211647,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/f67d0842-ef7c-475b-a8a2-1265481cbfb6.jsonl": {
+      "last_modified": 1751600830.9450903,
+      "last_imported": 1753845965.423537,
+      "chunks_imported": 11
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/9ebe927d-91b6-44f4-a4d3-b2705db38221.jsonl": {
+      "last_modified": 1752687588.660271,
+      "last_imported": 1753845965.482519,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/b71425c3-679a-4ceb-ba0a-fb691fcf7124.jsonl": {
+      "last_modified": 1752688447.1611798,
+      "last_imported": 1753845965.530312,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/9233b6a8-ad9d-4c40-9d8a-51ac1497eb6a.jsonl": {
+      "last_modified": 1753130082.6129665,
+      "last_imported": 1753845965.57783,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/46da30fe-4238-4cfb-a555-7a35c4d35f7e.jsonl": {
+      "last_modified": 1753024624.7220411,
+      "last_imported": 1753845965.627373,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/7968b791-7d30-4da5-993b-d07352dc71fb.jsonl": {
+      "last_modified": 1753106401.9964144,
+      "last_imported": 1753845965.704919,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/c34597fa-6bce-4c66-8fb5-74195aca1886.jsonl": {
+      "last_modified": 1751475689.324599,
+      "last_imported": 1753845965.826423,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/cf8ba70e-8a39-4607-ad02-664a9562a720.jsonl": {
+      "last_modified": 1752675381.32009,
+      "last_imported": 1753845966.193277,
+      "chunks_imported": 18
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/0a16d77c-ec7d-4bf0-a84d-dca1c4ea98af.jsonl": {
+      "last_modified": 1753108938.8115423,
+      "last_imported": 1753845966.246326,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/5f690af8-357c-4060-86d0-2661f0e76184.jsonl": {
+      "last_modified": 1752647138.1049566,
+      "last_imported": 1753845967.222067,
+      "chunks_imported": 54
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/a16e33ed-1012-420a-939a-ba0d6dbb82b5.jsonl": {
+      "last_modified": 1752688373.875657,
+      "last_imported": 1753845967.274141,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/66740617-b38c-4295-9e91-9b45c0a93f84.jsonl": {
+      "last_modified": 1752688040.235202,
+      "last_imported": 1753845967.328002,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/b7e32fc8-548c-4e00-a679-dfc182f3e22b.jsonl": {
+      "last_modified": 1751856021.5228102,
+      "last_imported": 1753845968.453911,
+      "chunks_imported": 68
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/7ef17388-20fe-49d8-a821-74728154bb29.jsonl": {
+      "last_modified": 1753377492.4606562,
+      "last_imported": 1753845968.490775,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/90c3649e-9d54-4725-8f1e-2a9511853a82.jsonl": {
+      "last_modified": 1752688690.7180502,
+      "last_imported": 1753845968.54469,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/bcc1fc72-fce4-48d8-9eaf-9fc4e65c08a8.jsonl": {
+      "last_modified": 1752687706.929673,
+      "last_imported": 1753845968.616689,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/9b4f62ab-9254-45fb-afe4-ab9bba531f94.jsonl": {
+      "last_modified": 1752688050.8100114,
+      "last_imported": 1753845968.665305,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/298db971-859f-489e-b969-b77a1adeda93.jsonl": {
+      "last_modified": 1753210164.4108095,
+      "last_imported": 1753845968.70219,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/24c04e26-7c03-4771-b6aa-85b20eea8924.jsonl": {
+      "last_modified": 1751480256.8469968,
+      "last_imported": 1753845968.769312,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/4bc7dd9b-eeb2-44df-821b-7f148c4474d4.jsonl": {
+      "last_modified": 1751378467.6037998,
+      "last_imported": 1753845968.870358,
+      "chunks_imported": 4
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/47928b27-4b27-4c4e-be07-9af017704620.jsonl": {
+      "last_modified": 1752688089.0676134,
+      "last_imported": 1753845968.922766,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/877b3159-4c70-4e87-b119-40d685d16c8f.jsonl": {
+      "last_modified": 1752901691.9645512,
+      "last_imported": 1753845968.979437,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/2aeb6406-fb9b-4969-936b-06c5b6339eab.jsonl": {
+      "last_modified": 1751396909.1069582,
+      "last_imported": 1753845969.394721,
+      "chunks_imported": 22
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/9011b5e0-3283-43e1-b26f-02b5cf4fa65f.jsonl": {
+      "last_modified": 1752546535.530792,
+      "last_imported": 1753845970.107838,
+      "chunks_imported": 41
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/0b092fca-bfd0-4d58-b37c-1b299ad7e1d6.jsonl": {
+      "last_modified": 1753107049.9158208,
+      "last_imported": 1753845970.192418,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/a7f2f941-a357-4f47-85eb-0b07acc43095.jsonl": {
+      "last_modified": 1753109159.9679992,
+      "last_imported": 1753845970.255439,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/17a3527e-29cd-4a0f-9ed5-56a0eac1affb.jsonl": {
+      "last_modified": 1751480010.3050702,
+      "last_imported": 1753845970.436576,
+      "chunks_imported": 10
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/933ee423-09b0-45c5-ac53-20dc526b5b12.jsonl": {
+      "last_modified": 1752373940.1372256,
+      "last_imported": 1753845970.517954,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/6ae1e116-a55d-4e51-968d-c83edc3e7587.jsonl": {
+      "last_modified": 1752688014.1654866,
+      "last_imported": 1753845970.580908,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/b0c98aa7-4757-44ed-bf72-e1905d3db369.jsonl": {
+      "last_modified": 1751598559.222132,
+      "last_imported": 1753845970.65491,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/5aa3843b-b5db-433d-b2cf-333ac5df21ed.jsonl": {
+      "last_modified": 1753034927.795544,
+      "last_imported": 1753845971.006844,
+      "chunks_imported": 20
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/7b18cfc8-9e60-4fe1-956d-de64ea6562bc.jsonl": {
+      "last_modified": 1753109272.9061484,
+      "last_imported": 1753845971.056762,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/787ee784-73fe-433b-b81c-65ab880fe493.jsonl": {
+      "last_modified": 1753036885.0642507,
+      "last_imported": 1753845971.190572,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/43648f3b-5614-46f3-a3c8-ac738c3d73e7.jsonl": {
+      "last_modified": 1753109286.5164835,
+      "last_imported": 1753845971.239487,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/9108103e-3028-489a-8801-f6a2b81208af.jsonl": {
+      "last_modified": 1753109142.4178789,
+      "last_imported": 1753845971.296199,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/e5c0e106-8a65-4635-9af0-df577d32ff4d.jsonl": {
+      "last_modified": 1751753282.4931438,
+      "last_imported": 1753845971.695963,
+      "chunks_imported": 21
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/aa0a252e-f18d-4544-b074-e5cb9e969b74.jsonl": {
+      "last_modified": 1752688002.3217716,
+      "last_imported": 1753845971.743636,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/e064ef47-4f92-4d28-a6e4-139d52309065.jsonl": {
+      "last_modified": 1752648515.5621426,
+      "last_imported": 1753845971.908647,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/4e652fb8-16f9-4484-8503-d6cd7df8455b.jsonl": {
+      "last_modified": 1751557357.6012073,
+      "last_imported": 1753845972.377456,
+      "chunks_imported": 26
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/c90fd9c9-a8ee-43b3-b5c8-fa8e16309427.jsonl": {
+      "last_modified": 1753108310.991846,
+      "last_imported": 1753845972.473104,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/e30eec0c-d661-454a-a793-136f46816333.jsonl": {
+      "last_modified": 1753130192.1465673,
+      "last_imported": 1753845972.60883,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/f55a0e1c-2671-468f-b1ec-172bc48beae7.jsonl": {
+      "last_modified": 1752688246.417597,
+      "last_imported": 1753845972.666051,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/9149a7d7-0266-47d7-88e1-1ee79187ed5a.jsonl": {
+      "last_modified": 1751434858.4896622,
+      "last_imported": 1753845973.434511,
+      "chunks_imported": 37
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/a9f536ba-4c05-4f71-a221-e409ee7be42b.jsonl": {
+      "last_modified": 1753024558.9260793,
+      "last_imported": 1753845973.51123,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/49ed6969-7a09-4c02-be75-75de9fa21ffe.jsonl": {
+      "last_modified": 1752688130.643962,
+      "last_imported": 1753845973.574766,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/8ea368a2-4c52-4052-852e-8156f95d15f5.jsonl": {
+      "last_modified": 1753109514.8409114,
+      "last_imported": 1753845973.622854,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/9c3ef46e-b848-4511-979b-54c04a90cc90.jsonl": {
+      "last_modified": 1753130071.1160243,
+      "last_imported": 1753845973.682474,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/5981cb9d-edbd-4ed9-a18b-bc40e5b32a0c.jsonl": {
+      "last_modified": 1753077813.8197231,
+      "last_imported": 1753845973.733527,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/7ae7f7ff-a408-4170-a07d-475a7f3d0de3.jsonl": {
+      "last_modified": 1752422086.8381398,
+      "last_imported": 1753845974.643022,
+      "chunks_imported": 54
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/8d6f84aa-b657-4e0f-9b15-872715de690c.jsonl": {
+      "last_modified": 1752688155.9456089,
+      "last_imported": 1753845974.709885,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/27c16784-81ab-4f7f-9e2d-1e2cfd4d09a9.jsonl": {
+      "last_modified": 1753025250.8211184,
+      "last_imported": 1753845974.759484,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/08425966-91fb-4842-b11a-b4dc57794a3f.jsonl": {
+      "last_modified": 1752687937.3172867,
+      "last_imported": 1753845974.804122,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/a9319c20-6064-45d2-ae7b-5efeebd3d56f.jsonl": {
+      "last_modified": 1751594741.959393,
+      "last_imported": 1753845975.114438,
+      "chunks_imported": 15
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/d5fc2283-d805-4c89-85c3-e400ea3a888d.jsonl": {
+      "last_modified": 1752687695.3220704,
+      "last_imported": 1753845975.193696,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/f450ee8a-c2a7-4c4f-b580-4c80a1839034.jsonl": {
+      "last_modified": 1753109392.945395,
+      "last_imported": 1753845975.247935,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/0dde36a9-7f56-420f-b5af-d3a5af3b7a04.jsonl": {
+      "last_modified": 1752687656.91948,
+      "last_imported": 1753845975.314319,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/b843dd2e-db0d-4529-9917-5e694f699ae9.jsonl": {
+      "last_modified": 1751296235.831048,
+      "last_imported": 1753845977.495007,
+      "chunks_imported": 126
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/45a5b90c-fd46-4f7c-89ef-04e8a059eb7e.jsonl": {
+      "last_modified": 1753107473.9724941,
+      "last_imported": 1753845977.554635,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/0515d994-9688-47d8-8c51-ff0c90b02712.jsonl": {
+      "last_modified": 1752687627.9896348,
+      "last_imported": 1753845977.611413,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/3690997b-2a88-4fd9-bfff-43ff7034e6f1.jsonl": {
+      "last_modified": 1751520168.130902,
+      "last_imported": 1753845977.891398,
+      "chunks_imported": 14
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/92bbadf8-4646-4f64-b74d-712f842d1ee8.jsonl": {
+      "last_modified": 1751867476.328163,
+      "last_imported": 1753845978.148907,
+      "chunks_imported": 13
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/eadbf281-024f-4c36-95f0-edc29c0b8aaa.jsonl": {
+      "last_modified": 1753108955.4446623,
+      "last_imported": 1753845978.197028,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/8b03e229-6b9d-4372-8c5b-b40f14d508d5.jsonl": {
+      "last_modified": 1753079233.615065,
+      "last_imported": 1753845978.302767,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/405dcdd9-15b9-466a-8fc7-8aa48455ed62.jsonl": {
+      "last_modified": 1752471183.6462336,
+      "last_imported": 1753845979.384819,
+      "chunks_imported": 56
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/ec5b7f0b-290b-457b-9400-0e0658a2be6f.jsonl": {
+      "last_modified": 1752770645.5483973,
+      "last_imported": 1753845979.899627,
+      "chunks_imported": 28
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/46fe978c-1220-42cb-8052-6591c5a1b78f.jsonl": {
+      "last_modified": 1752688702.0804188,
+      "last_imported": 1753845979.962321,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/be08b4ae-c5c6-491b-b935-d12558e97d55.jsonl": {
+      "last_modified": 1752688411.1690743,
+      "last_imported": 1753845980.030448,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/7cbd1302-4d86-42a8-9368-1168329ffee5.jsonl": {
+      "last_modified": 1752696171.2718976,
+      "last_imported": 1753845980.093247,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/65d63973-c02c-499e-858d-c7148a3701b4.jsonl": {
+      "last_modified": 1753025961.1409757,
+      "last_imported": 1753845980.15149,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/ac200a60-7aa4-499d-aafd-ecda70c412a4.jsonl": {
+      "last_modified": 1751558882.331066,
+      "last_imported": 1753845980.288695,
+      "chunks_imported": 6
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/984337b1-38f6-4f39-bfbb-47e28a9da9fc.jsonl": {
+      "last_modified": 1752693539.596682,
+      "last_imported": 1753845980.346614,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/06526359-4242-4d94-b3dd-45d56fb4786d.jsonl": {
+      "last_modified": 1752688206.5848026,
+      "last_imported": 1753845980.406369,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/1c776e1f-3f0a-4d88-8bc6-4388c5cba7c8.jsonl": {
+      "last_modified": 1752687408.8942864,
+      "last_imported": 1753845980.466962,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/18e6f4a0-0dd4-4f45-9663-9ab3fbd59f91.jsonl": {
+      "last_modified": 1753077824.9174469,
+      "last_imported": 1753845980.523412,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/d487b3f6-05fa-4120-b134-e7b649ccbf1b.jsonl": {
+      "last_modified": 1751483406.0510697,
+      "last_imported": 1753845980.725905,
+      "chunks_imported": 8
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/9f703c26-99b4-48e2-bd82-a2b672c2d21b.jsonl": {
+      "last_modified": 1752693502.5896206,
+      "last_imported": 1753845980.781823,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/43a32111-4325-464f-ac08-524526bf5d38.jsonl": {
+      "last_modified": 1752688234.4509413,
+      "last_imported": 1753845980.840737,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/4c74e051-47fc-4c8d-9a88-9e0e8dbe9e18.jsonl": {
+      "last_modified": 1753129882.0150337,
+      "last_imported": 1753845980.901183,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/4c08b95d-4276-4653-af20-a305d3d5557e.jsonl": {
+      "last_modified": 1753109612.6137702,
+      "last_imported": 1753845980.959083,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/4d5c4d98-aaaf-4889-b9ee-0ce05ff423f5.jsonl": {
+      "last_modified": 1753129950.5372138,
+      "last_imported": 1753845981.02254,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/dac7505a-c284-450e-85f9-18d5eb806b03.jsonl": {
+      "last_modified": 1752687811.5001936,
+      "last_imported": 1753845981.074221,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/f302c7a5-4d68-4c2e-ba51-440365fcd49b.jsonl": {
+      "last_modified": 1752688435.9251323,
+      "last_imported": 1753845981.136903,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/c6f5191e-c6e4-403e-857e-b23a46b9b80d.jsonl": {
+      "last_modified": 1752696182.3393304,
+      "last_imported": 1753845981.200148,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/f4b4d446-841d-42a5-afa6-34b6d9a7dec3.jsonl": {
+      "last_modified": 1751595895.063049,
+      "last_imported": 1753845981.35479,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/1f8732e3-6803-46e9-8d7e-e9e8ea697bb7.jsonl": {
+      "last_modified": 1751305184.6444137,
+      "last_imported": 1753845981.658553,
+      "chunks_imported": 17
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/8a3f303a-dc11-476e-8625-5ced93e3769c.jsonl": {
+      "last_modified": 1753109626.0407965,
+      "last_imported": 1753845981.724898,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/2b923dfb-b7c2-4f38-87f2-ceb2b793be9e.jsonl": {
+      "last_modified": 1753025264.887706,
+      "last_imported": 1753845981.789806,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/b3ac3586-46a1-4920-8ae1-f5da6fa240d3.jsonl": {
+      "last_modified": 1751474521.956993,
+      "last_imported": 1753845982.514478,
+      "chunks_imported": 41
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/13e5154b-abee-4d70-854b-04e473cc6618.jsonl": {
+      "last_modified": 1751394132.3231213,
+      "last_imported": 1753845982.734018,
+      "chunks_imported": 13
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/f31cf100-397a-4a4e-80a3-dafedb0b67b6.jsonl": {
+      "last_modified": 1753025972.128324,
+      "last_imported": 1753845982.79396,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/fd442c85-aa12-4093-b99f-40ad2585226f.jsonl": {
+      "last_modified": 1752600476.8007436,
+      "last_imported": 1753845983.494275,
+      "chunks_imported": 39
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/331949ce-96e8-48a8-848b-372e95c6ea12.jsonl": {
+      "last_modified": 1752241492.149126,
+      "last_imported": 1753845984.736342,
+      "chunks_imported": 68
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/0427218c-438b-42be-90a7-f9084702f699.jsonl": {
+      "last_modified": 1752687732.3123233,
+      "last_imported": 1753845984.80104,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/ae736332-8fa3-416a-93f3-137c53de2985.jsonl": {
+      "last_modified": 1753130651.658796,
+      "last_imported": 1753845984.857225,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/ce9623ef-b01b-456b-955c-80660fd9f1fa.jsonl": {
+      "last_modified": 1753024612.3986988,
+      "last_imported": 1753845984.90954,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/fd546983-af35-48b7-bdd3-2d5277dfcb52.jsonl": {
+      "last_modified": 1751583069.1623738,
+      "last_imported": 1753845985.312266,
+      "chunks_imported": 19
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/d9f109e7-f0cb-455e-8092-1709730e8ce9.jsonl": {
+      "last_modified": 1753847188.6837811,
+      "last_imported": 1753847233.884962,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/b61b72ad-3269-478b-8a05-85f1993c4ea8.jsonl": {
+      "last_modified": 1753884120.923195,
+      "last_imported": 1753884169.502308,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/38653e42-88b4-484b-abea-3998609ab677.jsonl": {
+      "last_modified": 1753884538.9075804,
+      "last_imported": 1753884548.414487,
+      "chunks_imported": 5
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/ce14b7da-0fc0-4455-989a-0336fb54b737.jsonl": {
+      "last_modified": 1753893200.308041,
+      "last_imported": 1753893202.357576,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/f74cd5f9-60cd-4bef-8a3f-91fc472a4640.jsonl": {
+      "last_modified": 1753895061.6495957,
+      "last_imported": 1753895087.621827,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/86b37406-45d6-44ce-8999-51da0252c9ab.jsonl": {
+      "last_modified": 1753905379.9085567,
+      "last_imported": 1753905380.660848,
+      "chunks_imported": 2
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/ac40d99a-adf0-45d3-aab9-5bb31caacdfb.jsonl": {
+      "last_modified": 1753905447.0131829,
+      "last_imported": 1753905506.521837,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/1c600d5d-39bb-43b3-8062-6fba4321f796.jsonl": {
+      "last_modified": 1753905987.3039417,
+      "last_imported": 1753906010.66095,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/a57b896d-c26a-4d2f-889d-4b08043c52aa.jsonl": {
+      "last_modified": 1753905916.3203838,
+      "last_imported": 1753905947.541013,
+      "chunks_imported": 1
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-Connectiva-App-connectiva-ai/4292d0e3-401a-4bd9-ab92-b06bc4284661.jsonl": {
+      "last_modified": 1753911939.7240777,
+      "last_imported": 1753911992.419015,
+      "chunks_imported": 3
+    },
+    "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/bc9a1e3e-755c-4ddc-a977-e1c899d7fb9a.jsonl": {
+      "last_modified": 1753912036.8109555,
+      "last_imported": 1753912048.48963,
+      "chunks_imported": 5
+    }
+  }
+}
