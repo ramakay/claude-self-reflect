@@ -11,6 +11,7 @@ import hashlib
 import time
 
 from fastmcp import FastMCP, Context
+from .utils import normalize_project_name
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.models import (
@@ -233,8 +234,9 @@ async def reflect_on_past(
         # Filter collections by project if not searching all
         project_collections = []  # Define at this scope for later use
         if target_project != 'all':
-            # Generate the collection name pattern for this project
-            project_hash = hashlib.md5(target_project.encode()).hexdigest()[:8]
+            # Generate the collection name pattern for this project using normalized name
+            normalized_name = normalize_project_name(target_project)
+            project_hash = hashlib.md5(normalized_name.encode()).hexdigest()[:8]
             project_collections = [
                 c for c in all_collections 
                 if c.startswith(f"conv_{project_hash}_")

@@ -49,6 +49,7 @@ coverage/
 htmlcov/
 test-results/
 *.coverage
+tool_usage_sample.json
 
 # Internal documentation
 .internal/

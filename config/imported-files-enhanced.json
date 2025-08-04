@@ -1,0 +1,2538 @@
+{
+  "imported_files": {
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/a49d90f8-4c17-41fb-bd6b-fe73959f4bdf.jsonl": {
+      "last_modified": 1752090358.6700027,
+      "last_imported": 1753975132.098072,
+      "chunks_imported": 4,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "Bash",
+          "exit_plan_mode",
+          "TodoWrite",
+          "Edit",
+          "MultiEdit",
+          "mcp__playwright__browser_navigate",
+          "mcp__playwright__browser_take_screenshot"
+        ],
+        "files_analyzed": 5,
+        "concepts": [
+          "mcp",
+          "search"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/afab7cce-ef14-4f43-85e3-b9f697d89882.jsonl": {
+      "last_modified": 1753307037.8939464,
+      "last_imported": 1753975132.172952,
+      "chunks_imported": 5,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "LS",
+          "Glob",
+          "WebSearch",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Write",
+          "Edit",
+          "Bash"
+        ],
+        "files_analyzed": 13,
+        "concepts": [
+          "search",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/b081dd2a-05a7-4cf2-a122-c4f0d6d0bd6b.jsonl": {
+      "last_modified": 1753215429.1340337,
+      "last_imported": 1753975132.673762,
+      "chunks_imported": 30,
+      "tool_stats": {
+        "tools_used": [
+          "Task",
+          "Glob",
+          "Grep",
+          "Read",
+          "Bash",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Edit",
+          "Write",
+          "MultiEdit",
+          "mcp__playwright__browser_navigate",
+          "mcp__playwright__browser_take_screenshot",
+          "mcp__playwright__browser_click",
+          "mcp__playwright__browser_network_requests",
+          "mcp__playwright__browser_hover",
+          "mcp__playwright__browser_console_messages",
+          "mcp__playwright__browser_close",
+          "mcp__playwright__browser_evaluate",
+          "mcp__playwright__browser_snapshot",
+          "LS"
+        ],
+        "files_analyzed": 20,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/4533f8c8-7d37-499f-bfee-f813cb1783e1.jsonl": {
+      "last_modified": 1753242567.668779,
+      "last_imported": 1753975132.919545,
+      "chunks_imported": 13,
+      "tool_stats": {
+        "tools_used": [
+          "Grep",
+          "Read",
+          "LS",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Edit",
+          "Bash",
+          "Write",
+          "Task",
+          "mcp__playwright__browser_navigate",
+          "mcp__playwright__browser_take_screenshot",
+          "mcp__playwright__browser_resize",
+          "mcp__playwright__browser_evaluate",
+          "Glob"
+        ],
+        "files_analyzed": 20,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/fedd99e9-8fae-4642-9d0f-7d9274f660d2.jsonl": {
+      "last_modified": 1753549170.0108094,
+      "last_imported": 1753975132.969581,
+      "chunks_imported": 3,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "Read",
+          "Write",
+          "Grep"
+        ],
+        "files_analyzed": 12,
+        "concepts": [
+          "search"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/b6a57c25-2369-445f-9c44-eadb6aefb95e.jsonl": {
+      "last_modified": 1752097053.6125257,
+      "last_imported": 1753975133.25428,
+      "chunks_imported": 15,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "Grep",
+          "Read",
+          "Bash",
+          "exit_plan_mode",
+          "MultiEdit",
+          "Edit",
+          "LS",
+          "Write"
+        ],
+        "files_analyzed": 14,
+        "concepts": [
+          "search",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/d70f3689-010d-49de-9578-2a9193e97e05.jsonl": {
+      "last_modified": 1753681064.7215955,
+      "last_imported": 1753975133.422539,
+      "chunks_imported": 12,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "LS",
+          "Grep",
+          "Glob",
+          "ExitPlanMode",
+          "WebFetch",
+          "TodoWrite",
+          "Bash",
+          "Write",
+          "Edit",
+          "MultiEdit",
+          "mcp__playwright__browser_navigate",
+          "mcp__playwright__browser_click",
+          "mcp__playwright__browser_take_screenshot",
+          "mcp__playwright__browser_resize",
+          "mcp__playwright__browser_close",
+          "mcp__playwright__browser_wait_for",
+          "mcp__playwright__browser_evaluate"
+        ],
+        "files_analyzed": 20,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/02cd4ddf-8801-42e9-a46a-84365cd1be41.jsonl": {
+      "last_modified": 1753203500.3293073,
+      "last_imported": 1753975133.51254,
+      "chunks_imported": 7,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "Task",
+          "Read",
+          "ExitPlanMode",
+          "Write",
+          "Edit",
+          "Bash",
+          "mcp__playwright__browser_navigate",
+          "mcp__playwright__browser_evaluate",
+          "mcp__playwright__browser_resize",
+          "mcp__playwright__browser_take_screenshot",
+          "mcp__playwright__browser_network_requests",
+          "LS",
+          "Grep",
+          "mcp__playwright__browser_close"
+        ],
+        "files_analyzed": 10,
+        "concepts": [
+          "mcp",
+          "search"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/10ba321b-3e4f-4a7e-a020-ccf85fddc6ef.jsonl": {
+      "last_modified": 1752086628.7679536,
+      "last_imported": 1753975133.700456,
+      "chunks_imported": 9,
+      "tool_stats": {
+        "tools_used": [
+          "mcp__playwright__browser_navigate",
+          "mcp__playwright__browser_close",
+          "mcp__playwright__browser_take_screenshot",
+          "exit_plan_mode",
+          "TodoWrite",
+          "Edit",
+          "mcp__playwright__browser_resize",
+          "Read",
+          "Grep",
+          "Bash"
+        ],
+        "files_analyzed": 6,
+        "concepts": [
+          "mcp",
+          "search"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/d27609bd-17d5-4505-8ff0-f74752e2fd61.jsonl": {
+      "last_modified": 1753550834.863287,
+      "last_imported": 1753975133.751507,
+      "chunks_imported": 4,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "LS",
+          "Grep",
+          "Glob",
+          "ExitPlanMode",
+          "WebFetch",
+          "TodoWrite",
+          "Bash",
+          "Write"
+        ],
+        "files_analyzed": 12,
+        "concepts": [
+          "search"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/5f0252a5-d70d-421b-9d60-285d0be9d77a.jsonl": {
+      "last_modified": 1753277572.7624865,
+      "last_imported": 1753975133.920808,
+      "chunks_imported": 11,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "Read",
+          "Edit",
+          "Bash",
+          "mcp__playwright__browser_navigate",
+          "mcp__playwright__browser_take_screenshot",
+          "Write",
+          "mcp__playwright__browser_click",
+          "mcp__playwright__browser_snapshot",
+          "mcp__playwright__browser_wait_for",
+          "mcp__playwright__browser_resize"
+        ],
+        "files_analyzed": 7,
+        "concepts": [
+          "mcp",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/a16aa4af-6a35-4928-bceb-8b5c6106cde3.jsonl": {
+      "last_modified": 1753203702.3004942,
+      "last_imported": 1753975134.016688,
+      "chunks_imported": 8,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "Task",
+          "Read",
+          "ExitPlanMode",
+          "Write",
+          "Edit",
+          "Bash",
+          "mcp__playwright__browser_navigate",
+          "mcp__playwright__browser_evaluate",
+          "mcp__playwright__browser_resize",
+          "mcp__playwright__browser_take_screenshot",
+          "mcp__playwright__browser_network_requests",
+          "LS",
+          "Grep",
+          "mcp__playwright__browser_close"
+        ],
+        "files_analyzed": 10,
+        "concepts": [
+          "mcp",
+          "search",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/abaeb91f-b03b-414d-bb4f-dcbceed352cf.jsonl": {
+      "last_modified": 1752078532.3627832,
+      "last_imported": 1753975134.246905,
+      "chunks_imported": 13,
+      "tool_stats": {
+        "tools_used": [
+          "Task",
+          "Read",
+          "Glob",
+          "LS",
+          "Write",
+          "TodoWrite",
+          "Bash",
+          "exit_plan_mode",
+          "Edit",
+          "Grep",
+          "mcp__playwright__browser_navigate",
+          "mcp__playwright__browser_close",
+          "mcp__playwright__browser_take_screenshot",
+          "mcp__playwright__browser_resize"
+        ],
+        "files_analyzed": 17,
+        "concepts": [
+          "mcp",
+          "search"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/86dfa12e-b885-49e0-ac4c-2feb8bc6fb61.jsonl": {
+      "last_modified": 1753222849.7107337,
+      "last_imported": 1753975134.313194,
+      "chunks_imported": 5,
+      "tool_stats": {
+        "tools_used": [
+          "Grep",
+          "Read",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Edit",
+          "Bash",
+          "mcp__playwright__browser_navigate",
+          "mcp__playwright__browser_click",
+          "mcp__playwright__browser_wait_for",
+          "mcp__playwright__browser_snapshot",
+          "mcp__playwright__browser_take_screenshot"
+        ],
+        "files_analyzed": 7,
+        "concepts": [
+          "mcp",
+          "search",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-procsolve-website/34b65aa3-40e6-415f-b8fe-05b0de027414.jsonl": {
+      "last_modified": 1753931632.713176,
+      "last_imported": 1753975134.765105,
+      "chunks_imported": 28,
+      "tool_stats": {
+        "tools_used": [
+          "Bash",
+          "TodoWrite",
+          "WebFetch",
+          "Read",
+          "ExitPlanMode",
+          "LS",
+          "Edit",
+          "Write",
+          "MultiEdit",
+          "mcp__playwright__browser_navigate",
+          "mcp__playwright__browser_take_screenshot",
+          "mcp__playwright__browser_wait_for",
+          "mcp__playwright__browser_evaluate",
+          "mcp__playwright__browser_close",
+          "Grep",
+          "mcp__context7__resolve-library-id",
+          "mcp__context7__get-library-docs",
+          "WebSearch",
+          "mcp__playwright__browser_console_messages",
+          "mcp__playwright__browser_click"
+        ],
+        "files_analyzed": 20,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/740308ec-2f91-48da-ba78-3329c11b9c5e.jsonl": {
+      "last_modified": 1753470535.8472767,
+      "last_imported": 1753975134.86153,
+      "chunks_imported": 8,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "ListMcpResourcesTool",
+          "Glob",
+          "ExitPlanMode",
+          "Bash",
+          "TodoWrite",
+          "mcp__claude-reflect__reflect_on_past",
+          "mcp__claude-reflect__store_reflection",
+          "Task",
+          "Edit"
+        ],
+        "files_analyzed": 11,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/2bb5f256-bc0a-4a29-8807-f796a463fade.jsonl": {
+      "last_modified": 1753454976.7859507,
+      "last_imported": 1753975135.150924,
+      "chunks_imported": 24,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "mcp__memento__get_decayed_graph",
+          "TodoWrite",
+          "ExitPlanMode",
+          "Task",
+          "mcp__grep__searchGitHub",
+          "mcp__context7__resolve-library-id",
+          "mcp__context7__get-library-docs",
+          "Edit",
+          "Write",
+          "LS",
+          "Bash",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "Glob"
+        ],
+        "files_analyzed": 20,
+        "concepts": [
+          "docker",
+          "mcp",
+          "testing",
+          "search",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/5db3661d-37e2-430f-8c5b-ad759497edff.jsonl": {
+      "last_modified": 1753424425.2285562,
+      "last_imported": 1753975135.346912,
+      "chunks_imported": 15,
+      "tool_stats": {
+        "tools_used": [
+          "mcp__claude-self-reflection__reflect_on_past",
+          "Bash",
+          "Task",
+          "Read",
+          "Glob",
+          "TodoWrite",
+          "MultiEdit",
+          "Grep",
+          "Edit",
+          "ExitPlanMode",
+          "WebSearch",
+          "WebFetch",
+          "Write"
+        ],
+        "files_analyzed": 13,
+        "concepts": [
+          "docker",
+          "mcp",
+          "testing",
+          "search",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/6bb35d90-f656-411e-bbd2-20963ac13188.jsonl": {
+      "last_modified": 1753419608.3710406,
+      "last_imported": 1753975135.839501,
+      "chunks_imported": 32,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "LS",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Task",
+          "Write",
+          "Edit",
+          "Bash",
+          "MultiEdit",
+          "Grep",
+          "mcp__grep__searchGitHub",
+          "WebSearch",
+          "mcp__memento__search_nodes",
+          "mcp__claude-self-reflection__reflect_on_past"
+        ],
+        "files_analyzed": 20,
+        "concepts": [
+          "docker",
+          "mcp",
+          "testing",
+          "search",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/4f970df5-e4f8-4637-9894-2a04dbd81ad4.jsonl": {
+      "last_modified": 1753457302.659666,
+      "last_imported": 1753975136.113564,
+      "chunks_imported": 22,
+      "tool_stats": {
+        "tools_used": [
+          "Write",
+          "Read",
+          "Edit",
+          "LS",
+          "TodoWrite",
+          "Bash",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "Task",
+          "Grep",
+          "ExitPlanMode",
+          "mcp__self-reflection__reflect_on_past"
+        ],
+        "files_analyzed": 13,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/42cf5906-8041-41d4-bb84-0e5d006350b7.jsonl": {
+      "last_modified": 1753406974.3681035,
+      "last_imported": 1753975136.348076,
+      "chunks_imported": 20,
+      "tool_stats": {
+        "tools_used": [
+          "Bash",
+          "Write",
+          "Read",
+          "TodoWrite",
+          "Edit",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "Glob",
+          "ExitPlanMode",
+          "Grep",
+          "LS",
+          "Task"
+        ],
+        "files_analyzed": 20,
+        "concepts": [
+          "docker",
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/12e2403c-fc99-4deb-8a27-a57edfe5e024.jsonl": {
+      "last_modified": 1753458315.0189002,
+      "last_imported": 1753975136.416315,
+      "chunks_imported": 6,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "LS",
+          "Glob",
+          "Grep",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Bash",
+          "Edit",
+          "Write",
+          "mcp__claude-self-reflection__reflect_on_past"
+        ],
+        "files_analyzed": 12,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/f147c5ed-1d58-45e2-b3fc-847a872facf2.jsonl": {
+      "last_modified": 1753451871.1292315,
+      "last_imported": 1753975136.522321,
+      "chunks_imported": 9,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "mcp__memento__get_decayed_graph",
+          "TodoWrite",
+          "ExitPlanMode",
+          "Task",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "Glob",
+          "mcp__grep__searchGitHub",
+          "Bash",
+          "mcp__context7__resolve-library-id",
+          "mcp__context7__get-library-docs"
+        ],
+        "files_analyzed": 7,
+        "concepts": [
+          "mcp",
+          "search"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/2e95f0f0-3cdb-4b49-8e9a-3ff51838c2c0.jsonl": {
+      "last_modified": 1753470783.4756598,
+      "last_imported": 1753975136.627113,
+      "chunks_imported": 9,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "ListMcpResourcesTool",
+          "Glob",
+          "ExitPlanMode",
+          "Bash",
+          "TodoWrite",
+          "mcp__claude-reflect__reflect_on_past",
+          "mcp__claude-reflect__store_reflection",
+          "Task",
+          "Edit"
+        ],
+        "files_analyzed": 12,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/67264bdb-e3ce-4e88-85cf-0f243079c958.jsonl": {
+      "last_modified": 1753386608.3816657,
+      "last_imported": 1753975136.891539,
+      "chunks_imported": 22,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "LS",
+          "Read",
+          "ExitPlanMode",
+          "Grep",
+          "mcp__grep__searchGitHub",
+          "Bash",
+          "Write",
+          "Edit",
+          "MultiEdit",
+          "Task",
+          "mcp__claude-self-reflection__reflect_on_past"
+        ],
+        "files_analyzed": 19,
+        "concepts": [
+          "docker",
+          "mcp",
+          "testing",
+          "search",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/7e77666f-bee4-40fd-ad32-02d6cfd01653.jsonl": {
+      "last_modified": 1753407902.5984802,
+      "last_imported": 1753975136.923683,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/a1aa0839-becf-4a16-81ce-dd0c664099bf.jsonl": {
+      "last_modified": 1753469632.3803146,
+      "last_imported": 1753975137.186964,
+      "chunks_imported": 19,
+      "tool_stats": {
+        "tools_used": [
+          "Bash",
+          "Read",
+          "Grep",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Write",
+          "Edit",
+          "mcp__claude-reflect__reflect_on_past",
+          "ListMcpResourcesTool",
+          "mcp__zen__thinkdeep",
+          "mcp__zen__chat",
+          "mcp__context7__resolve-library-id",
+          "mcp__context7__get-library-docs",
+          "reflect_on_past",
+          "Glob",
+          "LS",
+          "Task",
+          "MultiEdit"
+        ],
+        "files_analyzed": 12,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/a2ae66a2-41f5-4b07-ab8b-353b5174af34.jsonl": {
+      "last_modified": 1753460317.5724761,
+      "last_imported": 1753975137.344894,
+      "chunks_imported": 16,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Bash",
+          "Grep",
+          "TodoWrite",
+          "Edit",
+          "Write",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "MultiEdit",
+          "mcp__claude-self-reflection__store_reflection"
+        ],
+        "files_analyzed": 13,
+        "concepts": [
+          "docker",
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/da7b64d2-7466-4f0f-901f-3f7f94920458.jsonl": {
+      "last_modified": 1753482317.8836856,
+      "last_imported": 1753975137.435033,
+      "chunks_imported": 7,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "Glob",
+          "mcp__context7__get-library-docs",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Bash",
+          "Edit",
+          "Write"
+        ],
+        "files_analyzed": 8,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/2144c5bb-eab8-416b-89b9-5fffb2e1a543.jsonl": {
+      "last_modified": 1751868860.0281875,
+      "last_imported": 1753975140.050406,
+      "chunks_imported": 6,
+      "tool_stats": {
+        "tools_used": [
+          "Write",
+          "Bash",
+          "exit_plan_mode",
+          "TodoWrite",
+          "Edit",
+          "mcp__zen__chat",
+          "Task",
+          "mcp__memento__search_nodes",
+          "mcp__memento__semantic_search",
+          "mcp__memento__read_graph"
+        ],
+        "files_analyzed": 1,
+        "concepts": [
+          "docker",
+          "mcp"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/23888710-1700-48f5-940c-965b37ab2b80.jsonl": {
+      "last_modified": 1753478817.408664,
+      "last_imported": 1753975140.231358,
+      "chunks_imported": 15,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "ListMcpResourcesTool",
+          "Glob",
+          "ExitPlanMode",
+          "Bash",
+          "TodoWrite",
+          "mcp__claude-reflect__reflect_on_past",
+          "mcp__claude-reflect__store_reflection",
+          "Task",
+          "Edit"
+        ],
+        "files_analyzed": 14,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/fc0bcac9-78dc-4ea2-89dd-d6b6f8648d06.jsonl": {
+      "last_modified": 1751750155.365569,
+      "last_imported": 1753975140.326606,
+      "chunks_imported": 9,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "Bash",
+          "Grep",
+          "Write",
+          "mcp__memento__read_graph",
+          "Read",
+          "Edit",
+          "mcp__memento__search_nodes",
+          "mcp__memento__create_entities",
+          "mcp__memento__semantic_search"
+        ],
+        "files_analyzed": 2,
+        "concepts": [
+          "docker",
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/19bc6e90-0053-4376-b4cf-a821a31af7f7.jsonl": {
+      "last_modified": 1753473831.6924422,
+      "last_imported": 1753975140.477779,
+      "chunks_imported": 13,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "ListMcpResourcesTool",
+          "Glob",
+          "ExitPlanMode",
+          "Bash",
+          "TodoWrite",
+          "mcp__claude-reflect__reflect_on_past",
+          "mcp__claude-reflect__store_reflection",
+          "Task",
+          "Edit"
+        ],
+        "files_analyzed": 14,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/68ab1cb2-7a18-47f6-b7da-973b5bb41dfd.jsonl": {
+      "last_modified": 1753462883.818526,
+      "last_imported": 1753975140.732293,
+      "chunks_imported": 16,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Glob",
+          "LS",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Bash",
+          "Edit",
+          "mcp__zen__thinkdeep",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "Grep",
+          "mcp__self-reflection__reflect_on_past",
+          "mcp__zen__chat"
+        ],
+        "files_analyzed": 8,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/c37470fa-28f7-4a2c-9ea6-82e729239eb6.jsonl": {
+      "last_modified": 1753408326.2011583,
+      "last_imported": 1753975140.761452,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/3f28f5d5-035c-4bcd-bbe6-66187b06159f.jsonl": {
+      "last_modified": 1753480535.9306548,
+      "last_imported": 1753975141.081749,
+      "chunks_imported": 25,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "ListMcpResourcesTool",
+          "Glob",
+          "ExitPlanMode",
+          "Bash",
+          "TodoWrite",
+          "mcp__claude-reflect__reflect_on_past",
+          "mcp__claude-reflect__store_reflection",
+          "Task",
+          "Edit",
+          "mcp__context7__resolve-library-id",
+          "mcp__context7__get-library-docs",
+          "Write"
+        ],
+        "files_analyzed": 17,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/b63d9e70-1fd6-4198-b029-d7c16fe6f080.jsonl": {
+      "last_modified": 1753389618.036597,
+      "last_imported": 1753975141.3045,
+      "chunks_imported": 19,
+      "tool_stats": {
+        "tools_used": [
+          "Write",
+          "TodoWrite",
+          "ExitPlanMode",
+          "MultiEdit",
+          "Read",
+          "Bash",
+          "LS",
+          "Task",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "Grep",
+          "mcp__context7__resolve-library-id",
+          "mcp__context7__get-library-docs",
+          "WebSearch",
+          "Edit"
+        ],
+        "files_analyzed": 17,
+        "concepts": [
+          "docker",
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/b4d9bc6f-d27a-40fe-932c-05008ebbb8d2.jsonl": {
+      "last_modified": 1753408374.835471,
+      "last_imported": 1753975141.334256,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/2aa84c92-5958-423f-9b0c-a93e8379d5c7.jsonl": {
+      "last_modified": 1753485439.0894027,
+      "last_imported": 1753975141.363034,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/bc27d492-160e-46de-b6c6-85e7e510e1b2.jsonl": {
+      "last_modified": 1751747623.5267777,
+      "last_imported": 1753975141.404115,
+      "chunks_imported": 3,
+      "tool_stats": {
+        "tools_used": [
+          "Task",
+          "mcp__zen__thinkdeep",
+          "mcp__zen__listmodels",
+          "Read",
+          "Grep",
+          "exit_plan_mode",
+          "TodoWrite",
+          "Edit",
+          "Write",
+          "Bash"
+        ],
+        "files_analyzed": 6,
+        "concepts": [
+          "mcp",
+          "search"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/9e30dcb9-7964-4b3a-b809-83331e47c890.jsonl": {
+      "last_modified": 1753485546.9831243,
+      "last_imported": 1753975141.477694,
+      "chunks_imported": 6,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Glob",
+          "LS",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Edit",
+          "mcp__context7__resolve-library-id",
+          "mcp__context7__get-library-docs",
+          "Grep",
+          "WebSearch",
+          "mcp__grep__searchGitHub"
+        ],
+        "files_analyzed": 10,
+        "concepts": [
+          "mcp",
+          "search"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/623a36e1-86ad-449c-98fd-746d52e944e4.jsonl": {
+      "last_modified": 1753449993.4798203,
+      "last_imported": 1753975141.553779,
+      "chunks_imported": 6,
+      "tool_stats": {
+        "tools_used": [
+          "Bash",
+          "Glob",
+          "Read",
+          "TodoWrite",
+          "LS",
+          "Edit",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "mcp__claude-self-reflection__store_reflection",
+          "ExitPlanMode",
+          "Write",
+          "MultiEdit"
+        ],
+        "files_analyzed": 6,
+        "concepts": [
+          "mcp",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/1ecdf881-367f-4648-bc06-30bad35e7e95.jsonl": {
+      "last_modified": 1753408403.018711,
+      "last_imported": 1753975141.586163,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/462f4de0-d7ef-496e-945d-c8cff74663b9.jsonl": {
+      "last_modified": 1753379796.646243,
+      "last_imported": 1753975141.617574,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/01be8755-7ccb-4c09-a36d-20f8f83b9440.jsonl": {
+      "last_modified": 1751473691.202748,
+      "last_imported": 1753975141.769045,
+      "chunks_imported": 12,
+      "tool_stats": {
+        "tools_used": [
+          "Bash",
+          "Read",
+          "Write",
+          "Edit",
+          "TodoWrite",
+          "Task",
+          "exit_plan_mode",
+          "mcp__zen__consensus",
+          "Grep",
+          "mcp__memento__semantic_search",
+          "LS",
+          "mcp_memento_semantic_search",
+          "mcp_memento_search_nodes",
+          "semantic_search",
+          "search_nodes"
+        ],
+        "files_analyzed": 11,
+        "concepts": [
+          "docker",
+          "mcp",
+          "testing",
+          "search",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/1e970dbb-f7b7-416c-bca1-89f92a291c19.jsonl": {
+      "last_modified": 1753470225.7725236,
+      "last_imported": 1753975141.833202,
+      "chunks_imported": 5,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "ListMcpResourcesTool",
+          "Glob",
+          "ExitPlanMode",
+          "Bash",
+          "TodoWrite"
+        ],
+        "files_analyzed": 8,
+        "concepts": [
+          "search"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/29c60887-44dd-41ac-9fe2-0744b4b2faa1.jsonl": {
+      "last_modified": 1753496088.1630094,
+      "last_imported": 1753975141.906113,
+      "chunks_imported": 7,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Bash",
+          "LS",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "mcp__claude-self-reflection__store_reflection",
+          "TodoWrite",
+          "Glob",
+          "mcp__claude-reflect__reflect_on_past",
+          "mcp__claude_reflect__reflect_on_past"
+        ],
+        "files_analyzed": 8,
+        "concepts": [
+          "mcp"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/bba932a7-4171-46e4-89e4-a81767879648.jsonl": {
+      "last_modified": 1753495608.9827251,
+      "last_imported": 1753975142.072939,
+      "chunks_imported": 14,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "Read",
+          "mcp__context7__resolve-library-id",
+          "mcp__context7__get-library-docs",
+          "mcp__grep__searchGitHub",
+          "WebSearch",
+          "ExitPlanMode",
+          "Write",
+          "Edit",
+          "Grep",
+          "Bash",
+          "MultiEdit",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "mcp__memento__search_nodes",
+          "mcp__memento__semantic_search",
+          "LS",
+          "mcp__claude-self-reflection__store_reflection"
+        ],
+        "files_analyzed": 14,
+        "concepts": [
+          "docker",
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/426973e5-f7f1-4c3b-952b-b4fe9f430eff.jsonl": {
+      "last_modified": 1753411208.5953915,
+      "last_imported": 1753975142.104848,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/9f9f3016-5371-4199-8538-24e42a2378f8.jsonl": {
+      "last_modified": 1753396734.0268314,
+      "last_imported": 1753975142.367049,
+      "chunks_imported": 21,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "WebSearch",
+          "mcp__zen__thinkdeep",
+          "Grep",
+          "ExitPlanMode",
+          "TodoWrite",
+          "LS",
+          "Write",
+          "Edit",
+          "Bash",
+          "mcp__claude-self-reflection__reflect_on_past"
+        ],
+        "files_analyzed": 19,
+        "concepts": [
+          "docker",
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/7528974f-43b9-4e0b-877b-79232e4db100.jsonl": {
+      "last_modified": 1753470982.3147953,
+      "last_imported": 1753975142.479843,
+      "chunks_imported": 10,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "ListMcpResourcesTool",
+          "Glob",
+          "ExitPlanMode",
+          "Bash",
+          "TodoWrite",
+          "mcp__claude-reflect__reflect_on_past",
+          "mcp__claude-reflect__store_reflection",
+          "Task",
+          "Edit"
+        ],
+        "files_analyzed": 12,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/08df2ab7-9fb5-4ec4-87b2-e7891ce28e58.jsonl": {
+      "last_modified": 1753466786.5320375,
+      "last_imported": 1753975142.727094,
+      "chunks_imported": 15,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Grep",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Edit",
+          "Bash",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "Write",
+          "mcp__claude-reflect__reflect_on_past"
+        ],
+        "files_analyzed": 11,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/71854a2e-7816-429b-acfe-471090e61003.jsonl": {
+      "last_modified": 1751868662.29613,
+      "last_imported": 1753975143.439444,
+      "chunks_imported": 53,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "Bash",
+          "Grep",
+          "Write",
+          "mcp__memento__read_graph",
+          "Read",
+          "Edit",
+          "mcp__memento__search_nodes",
+          "mcp__memento__create_entities",
+          "mcp__memento__semantic_search",
+          "mcp__memento__open_nodes",
+          "mcp__memento__get_entity_history",
+          "exit_plan_mode",
+          "WebSearch",
+          "Task",
+          "mcp__zen__chat"
+        ],
+        "files_analyzed": 16,
+        "concepts": [
+          "docker",
+          "mcp",
+          "testing",
+          "search",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/c8936024-80ce-44ac-add8-30869613985e.jsonl": {
+      "last_modified": 1753407437.476446,
+      "last_imported": 1753975143.487364,
+      "chunks_imported": 2,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "LS",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Bash",
+          "Write",
+          "Edit"
+        ],
+        "files_analyzed": 4,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/b1f2a837-6733-4b33-a091-cd4c852029a6.jsonl": {
+      "last_modified": 1751470482.5277588,
+      "last_imported": 1753975143.602247,
+      "chunks_imported": 9,
+      "tool_stats": {
+        "tools_used": [
+          "Bash",
+          "Read",
+          "Write",
+          "Edit",
+          "TodoWrite",
+          "Task",
+          "exit_plan_mode",
+          "mcp__zen__consensus",
+          "Grep"
+        ],
+        "files_analyzed": 11,
+        "concepts": [
+          "docker",
+          "mcp",
+          "testing",
+          "search",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/40c86645-1bbf-446b-9b5b-ad31989f3655.jsonl": {
+      "last_modified": 1751917170.882952,
+      "last_imported": 1753975146.163616,
+      "chunks_imported": 10,
+      "tool_stats": {
+        "tools_used": [
+          "Write",
+          "Bash",
+          "exit_plan_mode",
+          "TodoWrite",
+          "Edit",
+          "mcp__zen__chat",
+          "Task",
+          "mcp__memento__search_nodes",
+          "mcp__memento__semantic_search",
+          "mcp__memento__read_graph",
+          "mcp__memento__open_nodes",
+          "mcp__memento__get_entity_embedding"
+        ],
+        "files_analyzed": 2,
+        "concepts": [
+          "docker",
+          "mcp",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack/473ff6f1-2d3a-48b1-9ae9-589b80e990a1.jsonl": {
+      "last_modified": 1753466934.088372,
+      "last_imported": 1753975146.235458,
+      "chunks_imported": 6,
+      "tool_stats": {
+        "tools_used": [
+          "Bash",
+          "Read",
+          "Grep",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Write",
+          "Edit",
+          "mcp__claude-reflect__reflect_on_past"
+        ],
+        "files_analyzed": 6,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack-claude-reflect/f104a1fe-f429-40d0-a3e7-9fcf49c95969.jsonl": {
+      "last_modified": 1753473375.1272037,
+      "last_imported": 1753975146.266616,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "Read",
+          "LS",
+          "Bash"
+        ],
+        "files_analyzed": 2,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/0bd6a977-83e7-41b6-8f45-766fd83490d7.jsonl": {
+      "last_modified": 1753209226.2679782,
+      "last_imported": 1753975146.665737,
+      "chunks_imported": 23,
+      "tool_stats": {
+        "tools_used": [
+          "Bash",
+          "TodoWrite",
+          "Read",
+          "Edit",
+          "Task",
+          "exit_plan_mode",
+          "Write",
+          "WebSearch"
+        ],
+        "files_analyzed": 9,
+        "concepts": [
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/4b55c4ad-5513-4a2e-80e4-fb7212ff9f78.jsonl": {
+      "last_modified": 1752687041.728448,
+      "last_imported": 1753975146.694499,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/4ae62074-115b-49e7-bb7b-3a694492ed79.jsonl": {
+      "last_modified": 1752686945.6596406,
+      "last_imported": 1753975146.725295,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/050f5d70-abb0-4f8e-9191-6ad28cbeaad3.jsonl": {
+      "last_modified": 1752685883.3022583,
+      "last_imported": 1753975146.755424,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/c89d8e13-1354-47c2-b3eb-5bca9a2ce5be.jsonl": {
+      "last_modified": 1752634859.3365223,
+      "last_imported": 1753975146.785377,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/4e755f67-c4f5-40b6-b490-78f5a2c1f05b.jsonl": {
+      "last_modified": 1753974754.847871,
+      "last_imported": 1753975146.811738,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/6c283328-6946-4647-9e85-67f116557b63.jsonl": {
+      "last_modified": 1752644861.3031883,
+      "last_imported": 1753975147.061382,
+      "chunks_imported": 17,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Task",
+          "TodoWrite",
+          "Edit",
+          "Bash",
+          "Grep",
+          "Write",
+          "LS",
+          "mcp__zen__thinkdeep",
+          "mcp__zen__listmodels",
+          "Glob"
+        ],
+        "files_analyzed": 20,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/f4645243-6c5a-4024-8264-6486686f1746.jsonl": {
+      "last_modified": 1753970852.3251965,
+      "last_imported": 1753975147.167934,
+      "chunks_imported": 8,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Write",
+          "Bash",
+          "mcp__claude-self-reflect__reflect_on_past",
+          "Task",
+          "Edit"
+        ],
+        "files_analyzed": 7,
+        "concepts": [
+          "mcp",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/68b06010-11e0-472f-b7ca-39b7686c7a5f.jsonl": {
+      "last_modified": 1752648788.3200684,
+      "last_imported": 1753975147.198081,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/85ccd1cc-e119-4529-a384-ea5e2f825faa.jsonl": {
+      "last_modified": 1753021527.4017296,
+      "last_imported": 1753975147.226767,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/97ba625d-efee-4c76-ad02-ee494d622658.jsonl": {
+      "last_modified": 1752684729.5535967,
+      "last_imported": 1753975147.254932,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/54bc8119-be8b-4fc3-a744-cac15a962ea1.jsonl": {
+      "last_modified": 1753973863.1707287,
+      "last_imported": 1753975147.280538,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/ff1399a0-63a9-467a-885a-02a79b553faf.jsonl": {
+      "last_modified": 1752634596.3310378,
+      "last_imported": 1753975147.306709,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/8f90c853-a580-4482-be10-91f8da8de468.jsonl": {
+      "last_modified": 1752686909.9897578,
+      "last_imported": 1753975147.334602,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/dd419434-b1ea-43be-ad8b-70c3d844d6b4.jsonl": {
+      "last_modified": 1753029556.8381119,
+      "last_imported": 1753975147.364954,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/b6fa8cd7-3549-441c-9338-612d51c11be8.jsonl": {
+      "last_modified": 1752684720.5006342,
+      "last_imported": 1753975147.394963,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/346bdbef-183b-40d8-b3af-ddfff8308854.jsonl": {
+      "last_modified": 1753029567.8824043,
+      "last_imported": 1753975147.671522,
+      "chunks_imported": 20,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "TodoWrite",
+          "Bash",
+          "Write",
+          "Edit",
+          "exit_plan_mode",
+          "WebSearch"
+        ],
+        "files_analyzed": 20,
+        "concepts": [
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/bedb2235-2121-40b9-b1bb-b27faa1a15cb.jsonl": {
+      "last_modified": 1752685872.462822,
+      "last_imported": 1753975147.703315,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/96bb9e57-5d47-47aa-a968-db6d8083ceee.jsonl": {
+      "last_modified": 1752713636.499993,
+      "last_imported": 1753975148.721025,
+      "chunks_imported": 59,
+      "tool_stats": {
+        "tools_used": [
+          "Bash",
+          "Read",
+          "Write",
+          "Edit",
+          "exit_plan_mode",
+          "TodoWrite",
+          "Grep",
+          "MultiEdit",
+          "WebFetch",
+          "mcp__zen__thinkdeep",
+          "mcp__zen__chat",
+          "Task",
+          "Glob",
+          "LS",
+          "WebSearch"
+        ],
+        "files_analyzed": 20,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/e961ca75-0839-4ad5-b725-04c91093eb2d.jsonl": {
+      "last_modified": 1752687237.7482119,
+      "last_imported": 1753975148.752855,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/dc14a4ba-185c-4ae0-b151-d2ee0be232f8.jsonl": {
+      "last_modified": 1753973490.9238613,
+      "last_imported": 1753975148.975125,
+      "chunks_imported": 16,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Write",
+          "Bash",
+          "mcp__claude-self-reflect__reflect_on_past",
+          "Task",
+          "Edit",
+          "mcp__claude-self-reflect__store_reflection"
+        ],
+        "files_analyzed": 7,
+        "concepts": [
+          "mcp",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/2ca47e26-c4b4-426b-8085-c94bc4c07755.jsonl": {
+      "last_modified": 1753972884.39776,
+      "last_imported": 1753975149.185095,
+      "chunks_imported": 15,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Write",
+          "Bash",
+          "mcp__claude-self-reflect__reflect_on_past",
+          "Task",
+          "Edit",
+          "mcp__claude-self-reflect__store_reflection"
+        ],
+        "files_analyzed": 7,
+        "concepts": [
+          "mcp",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/c4cc66ab-58c0-4840-aef4-b085975d805f.jsonl": {
+      "last_modified": 1753969909.3825758,
+      "last_imported": 1753975149.245398,
+      "chunks_imported": 4,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Write",
+          "Bash",
+          "mcp__claude-self-reflect__reflect_on_past",
+          "Task"
+        ],
+        "files_analyzed": 3,
+        "concepts": [
+          "mcp",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/a1ddb727-89df-41d8-8d8f-4a07582bf93e.jsonl": {
+      "last_modified": 1752684796.9861817,
+      "last_imported": 1753975149.275428,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/43a6ade9-07e5-419e-8d60-67a051169f35.jsonl": {
+      "last_modified": 1752685353.7137415,
+      "last_imported": 1753975149.302449,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/55f3f0bc-f03d-4cd6-86c9-1b2291e54fca.jsonl": {
+      "last_modified": 1752687078.040134,
+      "last_imported": 1753975149.329986,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "mcp__zen__chat"
+        ],
+        "files_analyzed": 1,
+        "concepts": [
+          "mcp"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/2589eb7e-1584-4873-aa06-d1a92c422e40.jsonl": {
+      "last_modified": 1752686988.0753653,
+      "last_imported": 1753975149.356946,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/95eb7e29-d5ff-40b6-8e88-1fce9bdf2ec8.jsonl": {
+      "last_modified": 1753050873.7649555,
+      "last_imported": 1753975149.613293,
+      "chunks_imported": 17,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "TodoWrite",
+          "Bash",
+          "Write",
+          "Edit",
+          "exit_plan_mode",
+          "WebSearch",
+          "Task",
+          "LS"
+        ],
+        "files_analyzed": 20,
+        "concepts": [
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/e5d11cd4-7a23-4509-878f-838ff022c378.jsonl": {
+      "last_modified": 1752685818.5597184,
+      "last_imported": 1753975149.643171,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/ec8cd8c2-01b9-447c-aacf-04d5bb240328.jsonl": {
+      "last_modified": 1753968207.3962414,
+      "last_imported": 1753975149.671278,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/e86b54c9-d5f4-4554-9b0d-0d6a5c12f6f0.jsonl": {
+      "last_modified": 1752687127.7575529,
+      "last_imported": 1753975149.697571,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/221587db-d021-478e-878a-984624303e3d.jsonl": {
+      "last_modified": 1752636146.7935255,
+      "last_imported": 1753975149.72372,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/b4bc69bd-03c7-4475-88b4-84eeb12706b8.jsonl": {
+      "last_modified": 1753968328.8186734,
+      "last_imported": 1753975149.753334,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/df784be9-fca7-4b42-a229-6ce5f1fb2e52.jsonl": {
+      "last_modified": 1753970344.9792356,
+      "last_imported": 1753975149.834096,
+      "chunks_imported": 6,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Write",
+          "Bash",
+          "mcp__claude-self-reflect__reflect_on_past",
+          "Task"
+        ],
+        "files_analyzed": 4,
+        "concepts": [
+          "mcp",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/9472f203-5edc-44b0-90e4-c558e427490a.jsonl": {
+      "last_modified": 1752685787.1377158,
+      "last_imported": 1753975149.862809,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/6d38c4a0-84af-4279-96b2-a7e906cf8bc5.jsonl": {
+      "last_modified": 1753968547.2829912,
+      "last_imported": 1753975149.901366,
+      "chunks_imported": 2,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Write",
+          "Bash"
+        ],
+        "files_analyzed": 3,
+        "concepts": [
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/6b7ef095-5aa6-48fa-bc42-e0a673495805.jsonl": {
+      "last_modified": 1752687136.3181636,
+      "last_imported": 1753975149.932408,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/71872e1f-d498-4722-a6de-0cbab7d8394a.jsonl": {
+      "last_modified": 1752685327.3165953,
+      "last_imported": 1753975149.96017,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/b1d662c1-efd2-44de-8ece-47d1d83236d9.jsonl": {
+      "last_modified": 1753021778.3775766,
+      "last_imported": 1753975150.061262,
+      "chunks_imported": 8,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "TodoWrite",
+          "Bash",
+          "Write",
+          "Edit",
+          "exit_plan_mode",
+          "WebSearch"
+        ],
+        "files_analyzed": 15,
+        "concepts": [
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/c4cbbbbc-4870-47b7-8ad9-14bee728f8b9.jsonl": {
+      "last_modified": 1752686955.5146608,
+      "last_imported": 1753975150.090737,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/fb5b8415-9320-487b-80a5-08537b1ed006.jsonl": {
+      "last_modified": 1752635317.5007455,
+      "last_imported": 1753975150.117532,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/371cd1d6-468b-4def-8702-21011e1b6877.jsonl": {
+      "last_modified": 1753034225.5617082,
+      "last_imported": 1753975150.282114,
+      "chunks_imported": 12,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "TodoWrite",
+          "Bash",
+          "Write",
+          "Edit",
+          "exit_plan_mode",
+          "WebSearch"
+        ],
+        "files_analyzed": 20,
+        "concepts": [
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/9f7f4e66-ffeb-4fb5-af32-f7a713fc339e.jsonl": {
+      "last_modified": 1753969430.405155,
+      "last_imported": 1753975150.328473,
+      "chunks_imported": 3,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Write",
+          "Bash"
+        ],
+        "files_analyzed": 3,
+        "concepts": [
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/8dd09ead-c4ea-4f05-a829-ea236a100da1.jsonl": {
+      "last_modified": 1752635866.8356612,
+      "last_imported": 1753975150.356561,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/277b125d-946f-4481-bda5-9c8b1e508360.jsonl": {
+      "last_modified": 1752687247.3467755,
+      "last_imported": 1753975150.384258,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/6e0ac1eb-ba14-4ef8-b0f0-cec1ccd2c9a4.jsonl": {
+      "last_modified": 1752634897.2960365,
+      "last_imported": 1753975150.41175,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/610972c2-143e-4ea5-852b-2aa2f01c059b.jsonl": {
+      "last_modified": 1752687009.832139,
+      "last_imported": 1753975150.440586,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/0be05ce7-7106-444f-8285-897e1b8bbb9a.jsonl": {
+      "last_modified": 1752685828.0914304,
+      "last_imported": 1753975150.469905,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/e60e6157-af3d-48e4-8a1f-3fd4d6e44d3f.jsonl": {
+      "last_modified": 1752687050.687491,
+      "last_imported": 1753975150.497577,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/00f5f3b0-4826-492c-9214-d954d7492161.jsonl": {
+      "last_modified": 1752636169.058781,
+      "last_imported": 1753975150.525584,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/9dedf2ad-bd9a-4d4c-be26-00ab6dd32132.jsonl": {
+      "last_modified": 1752686918.926283,
+      "last_imported": 1753975150.552104,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/894b4055-812d-4e9f-943a-cf401c882f1a.jsonl": {
+      "last_modified": 1752684772.5494363,
+      "last_imported": 1753975150.581295,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/548b6caa-792c-499e-bd39-9f3fe43f9534.jsonl": {
+      "last_modified": 1753971831.8321555,
+      "last_imported": 1753975150.751068,
+      "chunks_imported": 13,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Write",
+          "Bash",
+          "mcp__claude-self-reflect__reflect_on_past",
+          "Task",
+          "Edit",
+          "mcp__claude-self-reflect__store_reflection"
+        ],
+        "files_analyzed": 7,
+        "concepts": [
+          "mcp",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/61edac62-39c4-4d82-b289-ffd953f98853.jsonl": {
+      "last_modified": 1753054495.3733149,
+      "last_imported": 1753975150.814239,
+      "chunks_imported": 4,
+      "tool_stats": {
+        "tools_used": [
+          "Bash",
+          "TodoWrite",
+          "Read",
+          "Edit",
+          "Task"
+        ],
+        "files_analyzed": 6,
+        "concepts": [
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/bf22c259-df89-4044-acc1-4e45d40260ea.jsonl": {
+      "last_modified": 1752687019.464046,
+      "last_imported": 1753975150.847489,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/951f5a0c-88be-4f53-ad33-75dece31a838.jsonl": {
+      "last_modified": 1752685775.4498804,
+      "last_imported": 1753975150.876327,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/499fd211-1d1a-46eb-9c97-2f98cb1fa2f5.jsonl": {
+      "last_modified": 1753970108.4942892,
+      "last_imported": 1753975150.95376,
+      "chunks_imported": 5,
+      "tool_stats": {
+        "tools_used": [
+          "Glob",
+          "Read",
+          "ExitPlanMode",
+          "TodoWrite",
+          "Write",
+          "Bash",
+          "mcp__claude-self-reflect__reflect_on_past",
+          "Task"
+        ],
+        "files_analyzed": 4,
+        "concepts": [
+          "mcp",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/c7fb9e7c-f42e-451f-a517-d45e20e6e5b1.jsonl": {
+      "last_modified": 1752684752.727529,
+      "last_imported": 1753975150.989947,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/0282057e-6089-4029-8959-638b17b8ff04.jsonl": {
+      "last_modified": 1752635150.1666126,
+      "last_imported": 1753975151.073929,
+      "chunks_imported": 5,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Task",
+          "Glob",
+          "TodoWrite",
+          "Edit",
+          "Bash",
+          "exit_plan_mode",
+          "Grep",
+          "Write",
+          "LS"
+        ],
+        "files_analyzed": 7,
+        "concepts": [
+          "search",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/c78741e3-c2d0-48c8-ae0b-f230a7c78b62.jsonl": {
+      "last_modified": 1752684781.527666,
+      "last_imported": 1753975151.102948,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/cbc46ece-d656-4e5d-acb6-e30afecd8d83.jsonl": {
+      "last_modified": 1752675424.1923652,
+      "last_imported": 1753975151.437569,
+      "chunks_imported": 26,
+      "tool_stats": {
+        "tools_used": [
+          "Bash",
+          "Read",
+          "TodoWrite",
+          "Write",
+          "Edit",
+          "Grep",
+          "exit_plan_mode"
+        ],
+        "files_analyzed": 17,
+        "concepts": [
+          "search",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/9f063f16-c8d5-45c8-aa4e-f2dfd68ebfa1.jsonl": {
+      "last_modified": 1752686978.4453006,
+      "last_imported": 1753975151.467213,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-organize/ae74af0a-d6b8-4bcb-b0e4-800080e5cb7e.jsonl": {
+      "last_modified": 1752634644.961532,
+      "last_imported": 1753975151.493855,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/1fdb7477-eae3-4cb4-b32e-1240e3e927c3.jsonl": {
+      "last_modified": 1753452559.5820856,
+      "last_imported": 1753975151.526916,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/839fc11e-e117-4353-b994-0f3464c5e5d0.jsonl": {
+      "last_modified": 1753453828.760244,
+      "last_imported": 1753975151.558896,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/6bda6e84-5ab6-456a-9727-8eb46dde4a86.jsonl": {
+      "last_modified": 1753496638.9386818,
+      "last_imported": 1753975151.611239,
+      "chunks_imported": 4,
+      "tool_stats": {
+        "tools_used": [
+          "Read",
+          "Bash",
+          "TodoWrite",
+          "Edit",
+          "Grep",
+          "Write"
+        ],
+        "files_analyzed": 5,
+        "concepts": [
+          "search"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/44b23a40-40c3-4afe-a0d7-d6d27f283504.jsonl": {
+      "last_modified": 1753504405.5849667,
+      "last_imported": 1753975151.642318,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/529ba4e8-2ed7-47b3-b299-7ca1a73d5a81.jsonl": {
+      "last_modified": 1753470926.589748,
+      "last_imported": 1753975151.669145,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [
+          "Read"
+        ],
+        "files_analyzed": 1,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/2986140a-2cb5-41e5-8d5b-b2829213581d.jsonl": {
+      "last_modified": 1753480479.3831456,
+      "last_imported": 1753975151.697812,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/b41a58cb-a6e3-4ba5-a1ca-461a839d8c33.jsonl": {
+      "last_modified": 1753470535.5234222,
+      "last_imported": 1753975151.723663,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [
+          "Read"
+        ],
+        "files_analyzed": 1,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/5ba45faf-ddba-4357-adeb-5aea469e0327.jsonl": {
+      "last_modified": 1753495109.8624096,
+      "last_imported": 1753975151.751714,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/fa7b2783-64b3-47a4-870a-9d8355fa88d6.jsonl": {
+      "last_modified": 1753491946.1031253,
+      "last_imported": 1753975151.778839,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/87f7f6c3-c95d-4f11-a28f-e8976ed3cc25.jsonl": {
+      "last_modified": 1753504364.5631375,
+      "last_imported": 1753975151.810344,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/cd9610c0-011b-4749-bddf-83b14cd98691.jsonl": {
+      "last_modified": 1753505246.0021365,
+      "last_imported": 1753975152.087011,
+      "chunks_imported": 22,
+      "tool_stats": {
+        "tools_used": [
+          "Edit",
+          "Read",
+          "Grep",
+          "TodoWrite",
+          "Bash",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "mcp__claude-self-reflection__store_reflection",
+          "LS",
+          "ExitPlanMode",
+          "Write"
+        ],
+        "files_analyzed": 8,
+        "concepts": [
+          "docker",
+          "mcp",
+          "search",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/ebc600c8-0bdb-436d-957e-5d2871794e60.jsonl": {
+      "last_modified": 1753497336.5660317,
+      "last_imported": 1753975152.175013,
+      "chunks_imported": 8,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "Bash",
+          "LS",
+          "Read",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "ListMcpResourcesTool",
+          "mcp__claude-reflect__reflect_on_past",
+          "mcp__claude-self-reflection__searchConversations",
+          "reflect_on_past"
+        ],
+        "files_analyzed": 4,
+        "concepts": [
+          "mcp",
+          "testing"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/aa25820b-ec36-4a7e-ab70-d54dff795b05.jsonl": {
+      "last_modified": 1753471809.8874576,
+      "last_imported": 1753975152.208395,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "Bash",
+          "Read"
+        ],
+        "files_analyzed": 1,
+        "concepts": []
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/8cd1ae93-20af-4965-a170-03c10741c46f.jsonl": {
+      "last_modified": 1753502395.5343306,
+      "last_imported": 1753975152.448744,
+      "chunks_imported": 20,
+      "tool_stats": {
+        "tools_used": [
+          "TodoWrite",
+          "Bash",
+          "LS",
+          "Read",
+          "mcp__claude-self-reflection__reflect_on_past",
+          "ListMcpResourcesTool",
+          "mcp__claude-reflect__reflect_on_past",
+          "mcp__claude-self-reflection__searchConversations",
+          "reflect_on_past",
+          "Write",
+          "Grep",
+          "Edit",
+          "ExitPlanMode",
+          "MultiEdit",
+          "Task",
+          "mcp__claude-self-reflection__store_reflection"
+        ],
+        "files_analyzed": 19,
+        "concepts": [
+          "mcp",
+          "search",
+          "testing",
+          "git"
+        ]
+      }
+    },
+    "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack/5e7d0481-5135-429b-8795-be5d2b69994a.jsonl": {
+      "last_modified": 1753504465.590886,
+      "last_imported": 1753975152.480486,
+      "chunks_imported": 1,
+      "tool_stats": {
+        "tools_used": [],
+        "files_analyzed": 0,
+        "concepts": []
+      }
+    }
+  }
+}

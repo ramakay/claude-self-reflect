@@ -203,6 +203,10 @@ Recent conversations matter more. Old ones fade. Like your brain, but reliable.
 
 Works perfectly out of the box. [Configure if you're particular](docs/memory-decay.md).
 
+## Theoretical Foundation
+
+Claude Self-Reflect addresses the "reality gap" in AI memory systems - the distance between perfect recall expectations and practical utility. Our approach aligns with the SPAR Framework (Sense, Plan, Act, Reflect) for agentic AI systems. [Learn more about our design philosophy](docs/architecture/SPAR-alignment.md).
+
 ## For the Skeptics
 
 **"Just use grep"** - Sure, enjoy your 10,000 matches for "database"  

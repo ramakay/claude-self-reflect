@@ -14,6 +14,10 @@ from typing import List, Dict, Any
 import logging
 from pathlib import Path
 
+# Add the mcp-server/src directory to the Python path
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'mcp-server', 'src'))
+from utils import normalize_project_name
+
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     VectorParams, Distance, PointStruct,
@@ -29,7 +33,9 @@ from tenacity import (
 # Configuration
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 LOGS_DIR = os.getenv("LOGS_DIR", "/logs")
-STATE_FILE = os.getenv("STATE_FILE", "/config/imported-files.json")
+# Default to project config directory for state file
+default_state_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "imported-files.json")
+STATE_FILE = os.getenv("STATE_FILE", default_state_file)
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))  # Reduced from 100 to prevent OOM
 PREFER_LOCAL_EMBEDDINGS = os.getenv("PREFER_LOCAL_EMBEDDINGS", "false").lower() == "true"
 VOYAGE_API_KEY = os.getenv("VOYAGE_KEY")
@@ -343,10 +349,11 @@ def main():
     # Import each project
     total_imported = 0
     for project_dir in project_dirs:
-        # Create collection name from project path
-        collection_name = f"conv_{hashlib.md5(project_dir.name.encode()).hexdigest()[:8]}{collection_suffix}"
+        # Create collection name from normalized project name
+        normalized_name = normalize_project_name(project_dir.name)
+        collection_name = f"conv_{hashlib.md5(normalized_name.encode()).hexdigest()[:8]}{collection_suffix}"
         
-        logger.info(f"Importing project: {project_dir.name} -> {collection_name}")
+        logger.info(f"Importing project: {project_dir.name} (normalized: {normalized_name}) -> {collection_name}")
         chunks = import_project(project_dir, collection_name, state)
         total_imported += chunks
         logger.info(f"Imported {chunks} chunks from {project_dir.name}")

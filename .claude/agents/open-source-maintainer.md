@@ -175,20 +175,76 @@ safety check -r mcp-server/requirements.txt
 # For Node: npm test
 ```
 
-#### 5. Release Creation
+#### 4.5. Create Professional Release Notes
 ```bash
+# Create release notes file
+VERSION=$(node -p "require('./package.json').version")
+cat > docs/RELEASE_NOTES_v${VERSION}.md << 'EOF'
+# Release Notes - v${VERSION}
+
+## Summary
+Brief description of what this release addresses and why it matters.
+
+## Changes
+
+### Bug Fixes
+- Fixed global npm installation failing due to Docker build context issues (#13)
+  - Modified Dockerfile.importer to embed Python dependencies directly
+  - Removed dependency on external requirements.txt file during build
+  - Ensures compatibility with both local development and global npm installations
+
+### Technical Details
+- Files modified:
+  - `Dockerfile.importer`: Embedded Python dependencies inline
+  - Removed COPY instruction for scripts that are volume-mounted at runtime
+
+### Verification
+- Docker builds tested successfully in isolation
+- Import process verified to skip already imported files
+- Both local and global npm installation paths validated
+
+## Installation
+```bash
+npm install -g claude-self-reflect@${VERSION}
+```
+
+## Contributors
+Thank you to everyone who reported issues and helped test this release:
+- @mattias012 - Reported npm global installation issue
+- @vbp1 - Confirmed Docker setup problems
+
+## Related Issues
+- Resolves #13: Global npm installation Docker build failures
+EOF
+```
+
+#### 5. Version Bump & Release Creation
+```bash
+# Update package.json version BEFORE creating tag
+# Determine version bump type based on changes:
+# - patch: bug fixes, minor updates (2.4.10 -> 2.4.11)
+# - minor: new features, non-breaking changes (2.4.10 -> 2.5.0)
+# - major: breaking changes (2.4.10 -> 3.0.0)
+npm version patch --no-git-tag-version  # Updates package.json and package-lock.json
+
+# Commit version bump
+VERSION=$(node -p "require('./package.json').version")
+git add package.json package-lock.json
+git commit -m "chore: bump version to ${VERSION} for release"
+git push origin main
+
 # Create and push tag
-git tag -a vX.Y.Z -m "Release vX.Y.Z - Brief description"
-git push origin vX.Y.Z
+git tag -a v${VERSION} -m "Release v${VERSION} - Brief description"
+git push origin v${VERSION}
 
 # Create GitHub release
-gh release create vX.Y.Z \
-  --title "vX.Y.Z - Release Title" \
-  --notes-file docs/RELEASE_NOTES_vX.Y.Z.md \
+gh release create v${VERSION} \
+  --title "v${VERSION} - Release Title" \
+  --notes-file docs/RELEASE_NOTES_v${VERSION}.md \
   --target main
 
 # Monitor the release workflow
-echo "🚀 Release created! Monitoring automated publishing..."
+echo "Release created! Monitoring automated publishing..."
 gh run list --workflow "CI/CD Pipeline" --limit 1
 gh run watch
 ```
@@ -207,7 +263,7 @@ echo "⏳ Waiting for automated npm publish..."
 # Monitor the release workflow until npm publish completes
 ```
 
-#### 7. Post-Release Verification
+#### 7. Post-Release Verification & Issue Management
 ```bash
 # Verify GitHub release
 gh release view vX.Y.Z
@@ -217,6 +273,36 @@ npm view claude-self-reflect version
 
 # Check that related PRs are closed
 gh pr list --state closed --limit 10
+
+# Handle related issues professionally
+# For each issue addressed in this release:
+ISSUE_NUMBER=13  # Example
+VERSION=$(node -p "require('./package.json').version")
+
+# Determine if issue should be closed or kept open
+# Close if: bug fixed, feature implemented, question answered
+# Keep open if: partial fix, needs more work, ongoing discussion
+
+# Professional comment template (no emojis, clear references)
+gh issue comment $ISSUE_NUMBER --body "Thank you for reporting this issue. The global npm installation problem has been addressed in release v${VERSION}.
+
+The fix involved modifying the Docker build process to embed dependencies directly:
+- Modified: Dockerfile.importer - Embedded Python dependencies to avoid file path issues
+- Verified: Docker builds work correctly without requiring scripts directory in build context
+- Tested: Import process correctly skips already imported files
+
+You can update to the latest version with:
+\`\`\`bash
+npm install -g claude-self-reflect@${VERSION}
+\`\`\`
+
+Please let us know if you encounter any issues with the new version."
+
+# Close the issue if fully resolved
+gh issue close $ISSUE_NUMBER --comment "Closing as resolved in v${VERSION}. Feel free to reopen if you encounter any related issues."
+
+# Or keep open with status update if partially resolved
+# gh issue comment $ISSUE_NUMBER --body "Partial fix implemented in v${VERSION}. Keeping this issue open to track remaining work on [specific aspect]."
 ```
 
 #### 8. Rollback Procedures

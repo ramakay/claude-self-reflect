@@ -7,7 +7,7 @@ services:
     image: alpine
     command: chown -R 1000:1000 /config
     volumes:
-      - ./config:/config
+      - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
     profiles: ["watch", "mcp", "import"]
 
   # Qdrant vector database - the heart of semantic search
@@ -22,8 +22,8 @@ services:
       - QDRANT__LOG_LEVEL=INFO
       - QDRANT__SERVICE__HTTP_PORT=6333
     restart: unless-stopped
-    mem_limit: ${QDRANT_MEMORY:-1g}
-    memswap_limit: ${QDRANT_MEMORY:-1g}
+    mem_limit: ${QDRANT_MEMORY:-2g}
+    memswap_limit: ${QDRANT_MEMORY:-2g}
 
   # One-time import service (runs once then exits)
   importer:
@@ -36,7 +36,7 @@ services:
       - qdrant
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
-      - ./config:/config
+      - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
       - ./scripts:/scripts:ro
     environment:
       - QDRANT_URL=http://qdrant:6333
@@ -64,8 +64,9 @@ services:
       - qdrant
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
-      - ./config:/config
+      - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
       - ./scripts:/scripts:ro
+      - /tmp:/tmp
     environment:
       - QDRANT_URL=http://qdrant:6333
       - STATE_FILE=/config/imported-files.json
@@ -78,8 +79,8 @@ services:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
     profiles: ["watch"]
-    mem_limit: 2g
-    memswap_limit: 2g
+    mem_limit: 1g
+    memswap_limit: 1g
 
   # MCP server for Claude integration
   mcp-server:
