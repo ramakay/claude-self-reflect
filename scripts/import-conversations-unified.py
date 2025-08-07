@@ -79,13 +79,22 @@ def should_import_file(file_path, state):
     file_mtime = os.path.getmtime(file_path)
     
     if str_path in state["imported_files"]:
-        last_imported = state["imported_files"][str_path].get("last_imported", 0)
-        last_modified = state["imported_files"][str_path].get("last_modified", 0)
+        file_state = state["imported_files"][str_path]
         
-        # Skip if file hasn't been modified since last import
-        if file_mtime <= last_modified and last_imported > 0:
-            logger.info(f"Skipping unchanged file: {file_path.name}")
-            return False
+        # Handle both old string format and new dict format
+        if isinstance(file_state, str):
+            # Old format (just timestamp string) - treat as needs reimport
+            logger.info(f"Found old format state for {file_path.name}, will reimport")
+            return True
+        else:
+            # New format with dictionary
+            last_imported = file_state.get("last_imported", 0)
+            last_modified = file_state.get("last_modified", 0)
+            
+            # Skip if file hasn't been modified since last import
+            if file_mtime <= last_modified and last_imported > 0:
+                logger.info(f"Skipping unchanged file: {file_path.name}")
+                return False
     
     return True
 

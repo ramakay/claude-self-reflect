@@ -108,9 +108,16 @@ async def get_all_collections() -> List[str]:
     return [c.name for c in collections.collections 
             if c.name.endswith('_voyage') or c.name.endswith('_local') or c.name.startswith('reflections')]
 
-async def generate_embedding(text: str) -> List[float]:
-    """Generate embedding using configured provider."""
-    if PREFER_LOCAL_EMBEDDINGS or not voyage_client:
+async def generate_embedding(text: str, force_type: Optional[str] = None) -> List[float]:
+    """Generate embedding using configured provider or forced type.
+    
+    Args:
+        text: Text to embed
+        force_type: Force specific embedding type ('local' or 'voyage')
+    """
+    use_local = force_type == 'local' if force_type else (PREFER_LOCAL_EMBEDDINGS or not voyage_client)
+    
+    if use_local:
         # Use local embeddings
         if not local_embedding_model:
             raise ValueError("Local embedding model not initialized")
@@ -123,6 +130,8 @@ async def generate_embedding(text: str) -> List[float]:
         return embeddings[0].tolist()
     else:
         # Use Voyage AI
+        if not voyage_client:
+            raise ValueError("Voyage client not initialized")
         result = voyage_client.embed(
             texts=[text],
             model="voyage-3-large",
@@ -218,10 +227,10 @@ async def reflect_on_past(
     await ctx.debug(f"DECAY_WEIGHT: {DECAY_WEIGHT}, DECAY_SCALE_DAYS: {DECAY_SCALE_DAYS}")
     
     try:
-        # Generate embedding
-        timing_info['embedding_start'] = time.time()
-        query_embedding = await generate_embedding(query)
-        timing_info['embedding_end'] = time.time()
+        # We'll generate embeddings on-demand per collection type
+        timing_info['embedding_prep_start'] = time.time()
+        query_embeddings = {}  # Cache embeddings by type
+        timing_info['embedding_prep_end'] = time.time()
         
         # Get all collections
         timing_info['get_collections_start'] = time.time()
@@ -237,6 +246,7 @@ async def reflect_on_past(
             # Generate the collection name pattern for this project using normalized name
             normalized_name = normalize_project_name(target_project)
             project_hash = hashlib.md5(normalized_name.encode()).hexdigest()[:8]
+            # Search BOTH local and voyage collections for this project
             project_collections = [
                 c for c in all_collections 
                 if c.startswith(f"conv_{project_hash}_")
@@ -276,6 +286,18 @@ async def reflect_on_past(
             )
             
             try:
+                # Determine embedding type for this collection
+                embedding_type_for_collection = 'voyage' if collection_name.endswith('_voyage') else 'local'
+                
+                # Generate or retrieve cached embedding for this type
+                if embedding_type_for_collection not in query_embeddings:
+                    try:
+                        query_embeddings[embedding_type_for_collection] = await generate_embedding(query, force_type=embedding_type_for_collection)
+                    except Exception as e:
+                        await ctx.debug(f"Failed to generate {embedding_type_for_collection} embedding: {e}")
+                        continue
+                
+                query_embedding = query_embeddings[embedding_type_for_collection]
                 if should_use_decay and USE_NATIVE_DECAY and NATIVE_DECAY_AVAILABLE:
                     # Use native Qdrant decay with newer API
                     await ctx.debug(f"Using NATIVE Qdrant decay (new API) for {collection_name}")

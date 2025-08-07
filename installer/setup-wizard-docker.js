@@ -340,12 +340,32 @@ function showManualConfig(mcpScript) {
 }
 
 async function importConversations() {
-  console.log('\n📚 Importing conversations...');
+  console.log('\n📚 Checking conversation baseline...');
   
-  const answer = await question('Would you like to import your existing Claude conversations? (y/n): ');
+  // Check if baseline exists by looking for imported files state
+  const stateFile = path.join(configDir, 'imported-files.json');
+  let hasBaseline = false;
+  
+  try {
+    if (fs.existsSync(stateFile)) {
+      const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+      hasBaseline = state.imported_files && Object.keys(state.imported_files).length > 0;
+    }
+  } catch (e) {
+    // State file doesn't exist or is invalid
+  }
+  
+  if (!hasBaseline) {
+    console.log('\n⚠️  No baseline detected. Initial import STRONGLY recommended.');
+    console.log('   Without this, historical conversations won\'t be searchable.');
+    console.log('   The watcher only handles NEW conversations going forward.');
+  }
+  
+  const answer = await question('\nImport existing Claude conversations? (y/n) [recommended: y]: ');
   
   if (answer.toLowerCase() === 'y') {
-    console.log('🔄 Starting import process...');
+    console.log('🔄 Starting baseline import...');
+    console.log('   This ensures ALL your conversations are searchable');
     console.log('   This may take a few minutes depending on your conversation history');
     
     try {
@@ -353,12 +373,17 @@ async function importConversations() {
         cwd: projectRoot,
         stdio: 'inherit'
       });
-      console.log('\n✅ Import completed!');
+      console.log('\n✅ Baseline import completed!');
+      console.log('   Historical conversations are now searchable');
     } catch {
       console.log('\n⚠️  Import had some issues, but you can continue');
     }
   } else {
-    console.log('📝 Skipping import. You can import later with:');
+    console.log('\n❌ WARNING: Skipping baseline import means:');
+    console.log('   • Historical conversations will NOT be searchable');
+    console.log('   • Only NEW conversations from now on will be indexed');
+    console.log('   • You may see "BASELINE_NEEDED" warnings in logs');
+    console.log('\n📝 You can run baseline import later with:');
     console.log('   docker compose run --rm importer');
   }
 }

@@ -30,9 +30,7 @@ def monitor_progress(timeout=30):
         if COMPLETE_FILE.exists():
             sys.stdout.write("\r✅ Import completed successfully!" + " " * 50 + "\n")
             sys.stdout.flush()
-            # TEMPORARILY DISABLED: cleanup_files()
-            print(f"DEBUG: Signal file exists: {TRIGGER_FILE.exists()}")
-            print(f"DEBUG: Complete file exists: {COMPLETE_FILE.exists()}")
+            cleanup_files()
             return True
         
         # Check progress file for updates
@@ -57,10 +55,8 @@ def monitor_progress(timeout=30):
     # Timeout
     sys.stdout.write("\r⚠️  Import timeout after 30s - proceeding anyway" + " " * 30 + "\n")
     sys.stdout.flush()
-    # TEMPORARILY DISABLED: cleanup_files()
-    # TEMPORARILY DISABLED: TRIGGER_FILE.unlink(missing_ok=True)
-    print(f"DEBUG: Signal file exists: {TRIGGER_FILE.exists()}")
-    print(f"DEBUG: Complete file exists: {COMPLETE_FILE.exists()}")
+    cleanup_files()
+    TRIGGER_FILE.unlink(missing_ok=True)
     return False
 
 def main():

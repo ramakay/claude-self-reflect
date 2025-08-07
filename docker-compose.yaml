@@ -111,6 +111,7 @@ services:
       - PYTHONUNBUFFERED=1
       - LOGS_DIR=/logs
       - FASTEMBED_CACHE_PATH=/root/.cache/fastembed
+      - CURRENT_PROJECT_PATH=${PWD}  # Pass current project path for prioritization
     restart: unless-stopped
     profiles: ["watch"]
     mem_limit: 1g
