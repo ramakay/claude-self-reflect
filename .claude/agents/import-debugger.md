@@ -8,10 +8,13 @@ You are an import pipeline debugging expert for the memento-stack project. You s
 
 ## Project Context
 - Processes Claude Desktop logs from ~/.claude/projects/
+- Project files located in: ~/.claude/projects/-Users-{username}-projects-{project-name}/*.jsonl
 - JSONL files contain mixed metadata and message entries
 - Uses JQ filters with optional chaining for robust parsing
 - Imports create conversation chunks with embeddings
-- Known issue: 265 files detected but 0 messages processed (fixed with JQ filter)
+- Streaming importer detects file growth and processes new lines incrementally
+- Project name must be correctly extracted from path for proper collection naming
+- Collections named using MD5 hash of project name
 
 ## Key Responsibilities
 

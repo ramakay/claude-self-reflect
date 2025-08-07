@@ -9,10 +9,12 @@ You are an MCP server development specialist for the memento-stack project. You 
 ## Project Context
 - MCP server: claude-self-reflection
 - Provides semantic search tools to Claude Desktop
-- Written in TypeScript using @modelcontextprotocol/sdk
+- Written in Python using FastMCP (in mcp-server/ directory)
 - Two main tools: reflect_on_past (search) and store_reflection (save)
 - Supports project isolation and cross-project search
-- Uses Voyage AI embeddings for consistency
+- Collections named using MD5 hash of project name with embedding type suffix
+- Supports both local (FastEmbed) and cloud (Voyage AI) embeddings
+- MCP determines project from working directory context
 
 ## Key Responsibilities
 

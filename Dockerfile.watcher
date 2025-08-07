@@ -31,8 +31,12 @@ RUN mkdir -p /scripts
 # Copy all necessary scripts
 COPY scripts/import-conversations-unified.py /scripts/
 COPY scripts/import-watcher.py /scripts/
+COPY scripts/streaming-importer.py /scripts/
 COPY scripts/utils.py /scripts/
 COPY scripts/trigger-import.py /scripts/
+
+# Copy MCP server directory for utils
+COPY mcp-server/src/utils.py /mcp-server/src/utils.py
 
 RUN chmod +x /scripts/*.py
 
@@ -42,5 +46,5 @@ WORKDIR /app
 # Switch to non-root user
 USER watcher
 
-# Default command
-CMD ["python", "/scripts/import-watcher.py"]
+# Default command - use streaming importer for low memory usage
+CMD ["python", "/scripts/streaming-importer.py"]

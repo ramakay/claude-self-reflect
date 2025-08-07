@@ -18,12 +18,13 @@ services:
       - "${QDRANT_PORT:-6333}:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+      - ./config/qdrant-config.yaml:/qdrant/config/config.yaml:ro
     environment:
       - QDRANT__LOG_LEVEL=INFO
       - QDRANT__SERVICE__HTTP_PORT=6333
     restart: unless-stopped
-    mem_limit: ${QDRANT_MEMORY:-2g}
-    memswap_limit: ${QDRANT_MEMORY:-2g}
+    mem_limit: ${QDRANT_MEMORY:-4g}
+    memswap_limit: ${QDRANT_MEMORY:-4g}
 
   # One-time import service (runs once then exits)
   importer:
@@ -53,7 +54,7 @@ services:
     profiles: ["import"]
     command: python /scripts/import-conversations-unified.py
 
-  # Continuous watcher service (optional)
+  # Continuous watcher service (optional) - DEPRECATED, use streaming-importer
   watcher:
     build:
       context: .
@@ -73,10 +74,43 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
       - VOYAGE_KEY=${VOYAGE_KEY:-}
-      - PREFER_LOCAL_EMBEDDINGS=${PREFER_LOCAL_EMBEDDINGS:-false}
+      - PREFER_LOCAL_EMBEDDINGS=${PREFER_LOCAL_EMBEDDINGS:-true}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-voyage-3}
-      - WATCH_INTERVAL=${WATCH_INTERVAL:-60}
+      - WATCH_INTERVAL=${WATCH_INTERVAL:-5}
+      - MAX_MEMORY_MB=${MAX_MEMORY_MB:-250}
+      - CHUNK_SIZE=${CHUNK_SIZE:-5}
       - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    profiles: ["watch-old"]
+    mem_limit: 500m
+    memswap_limit: 500m
+
+  # Streaming importer service - Low memory continuous import
+  streaming-importer:
+    build:
+      context: .
+      dockerfile: Dockerfile.streaming-importer
+    container_name: claude-reflection-streaming
+    depends_on:
+      - init-permissions
+      - qdrant
+    volumes:
+      - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
+      - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
+      - ./scripts:/scripts:ro
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - STATE_FILE=/config/imported-files.json
+      - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
+      - VOYAGE_KEY=${VOYAGE_KEY:-}
+      - PREFER_LOCAL_EMBEDDINGS=${PREFER_LOCAL_EMBEDDINGS:-true}
+      - WATCH_INTERVAL=${WATCH_INTERVAL:-5}  # Testing with 5 second interval
+      - MAX_MEMORY_MB=${MAX_MEMORY_MB:-350}  # Total memory including model
+      - OPERATIONAL_MEMORY_MB=${OPERATIONAL_MEMORY_MB:-100}  # Memory for operations (increased for large file handling)
+      - CHUNK_SIZE=${CHUNK_SIZE:-5}
+      - PYTHONUNBUFFERED=1
+      - LOGS_DIR=/logs
+      - FASTEMBED_CACHE_PATH=/root/.cache/fastembed
     restart: unless-stopped
     profiles: ["watch"]
     mem_limit: 1g

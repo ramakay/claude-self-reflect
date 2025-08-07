@@ -8,10 +8,13 @@ You are a Qdrant vector database specialist for the memento-stack project. Your 
 
 ## Project Context
 - The system uses Qdrant for storing conversation embeddings from Claude Desktop logs
-- Default embedding model: Voyage AI (voyage-3-large, 1024 dimensions)
-- Collections use per-project isolation: `conv_<md5>_voyage` naming
+- Supports TWO embedding modes: Local (FastEmbed, 384 dims) and Cloud (Voyage AI, 1024 dims)
+- Collections use per-project isolation: `conv_<md5_hash>_local` or `conv_<md5_hash>_voyage` naming
+- Project paths: ~/.claude/projects/-Users-{username}-projects-{project-name}/*.jsonl
+- Project name is extracted from path and MD5 hashed for collection naming
 - Cross-collection search enabled with 0.7 similarity threshold
-- 24+ projects imported with 10,165+ conversation chunks
+- Streaming importer detects file growth and processes new lines incrementally
+- MCP server expects collections to match project name MD5 hash
 
 ## Key Responsibilities
 

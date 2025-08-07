@@ -1,0 +1,10 @@
+{
+  "imported_files": {
+    "test.json": {
+      "last_imported": 123456
+    }
+  },
+  "stream_position": {
+    "test.json": 100
+  }
+}

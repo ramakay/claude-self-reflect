@@ -1,52 +1,72 @@
-"""Utility functions for Claude Self-Reflect."""
+"""Shared utilities for claude-self-reflect MCP server and scripts."""
 
-import hashlib
-import re
 from pathlib import Path
 
 
-def normalize_project_name(path: str) -> str:
+def normalize_project_name(project_path: str) -> str:
     """
-    Normalize project name from path for consistent collection naming.
+    Normalize project name for consistent hashing across import/search.
+    
+    Handles various path formats:
+    - Claude logs format: -Users-kyle-Code-claude-self-reflect -> claude-self-reflect
+    - File paths in Claude logs: /path/to/-Users-kyle-Code-claude-self-reflect/file.jsonl -> claude-self-reflect  
+    - Regular file paths: /path/to/project/file.txt -> project
+    - Regular paths: /path/to/project -> project
+    - Already normalized: project -> project
     
     Args:
-        path: File path or project path
+        project_path: Project path or name in any format
         
     Returns:
-        Normalized project name
+        Normalized project name suitable for consistent hashing
     """
-    # Extract project name from path
-    path_obj = Path(path)
+    if not project_path:
+        return ""
     
-    # Look for common project indicators
-    parts = path_obj.parts
+    # Remove trailing slashes
+    project_path = project_path.rstrip('/')
     
-    # Find the project root (usually after 'projects' or similar)
-    project_name = None
-    for i, part in enumerate(parts):
-        if part in ['projects', 'repos', 'code', 'src']:
-            if i + 1 < len(parts):
-                project_name = parts[i + 1]
-                break
+    # Handle Claude logs format (starts with dash)
+    if project_path.startswith('-'):
+        # For paths like -Users-kyle-Code-claude-self-reflect
+        # We want to extract the actual project name which may contain dashes
+        # Strategy: Find common parent directories and extract what comes after
+        
+        # Remove leading dash and convert back to path-like format
+        path_str = project_path[1:].replace('-', '/')
+        path_parts = Path(path_str).parts
+        
+        # Look for common project parent directories
+        project_parents = {'projects', 'code', 'Code', 'repos', 'repositories', 
+                          'dev', 'Development', 'work', 'src', 'github'}
+        
+        # Find the project name after a known parent directory
+        for i, part in enumerate(path_parts):
+            if part.lower() in project_parents and i + 1 < len(path_parts):
+                # Everything after the parent directory is the project name
+                # Join remaining parts with dash if project name has multiple components
+                remaining = path_parts[i + 1:]
+                return '-'.join(remaining)
+        
+        # Fallback: just use the last component
+        return path_parts[-1] if path_parts else project_path
     
-    # If no project indicator found, use the last meaningful directory
-    if not project_name:
-        for part in reversed(parts):
-            if part and not part.startswith('.') and part not in ['home', 'Users', 'var', 'tmp']:
-                project_name = part
-                break
+    # Check if this is a file path that contains a Claude logs directory
+    # Pattern: /path/to/-Users-...-projects-..../filename
+    path_obj = Path(project_path)
     
-    # Fallback to 'default' if nothing found
-    if not project_name:
-        project_name = 'default'
+    # Look for a parent directory that starts with dash (Claude logs format)
+    for parent in path_obj.parents:
+        parent_name = parent.name
+        if parent_name.startswith("-"):
+            # Found a Claude logs directory, process it
+            return normalize_project_name(parent_name)
     
-    # Normalize the name (lowercase, replace special chars)
-    normalized = re.sub(r'[^a-z0-9]+', '_', project_name.lower())
-    normalized = normalized.strip('_')
-    
-    return normalized or 'default'
-
-
-def get_project_hash(project_name: str) -> str:
-    """Get MD5 hash of project name for collection naming."""
-    return hashlib.md5(project_name.encode()).hexdigest()[:8]
+    # Handle regular paths - if it's a file, get the parent directory
+    # Otherwise use the directory/project name itself
+    if path_obj.suffix:  # It's a file (has an extension)
+        # Use the parent directory name
+        return path_obj.parent.name
+    else:
+        # Use the directory name itself
+        return path_obj.name

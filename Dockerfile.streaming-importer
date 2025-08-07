@@ -4,27 +4,40 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Upgrade pip and install setuptools first
+RUN pip install --upgrade pip setuptools wheel
+
 # Install Python dependencies with specific versions for stability
-# Install torch first from PyTorch index
+# Install PyTorch CPU version for smaller size
 RUN pip install --no-cache-dir torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu
 
-# Install other dependencies from default PyPI
+# Install other dependencies
 RUN pip install --no-cache-dir \
     qdrant-client==1.15.0 \
-    sentence-transformers==2.2.2 \
-    numpy==1.24.3 \
-    psutil==5.9.5
+    fastembed==0.2.7 \
+    numpy==1.26.0 \
+    psutil==7.0.0 \
+    tenacity==8.2.3 \
+    python-dotenv==1.0.0 \
+    voyageai==0.2.3
 
-# Create non-root user
+# Pre-download and cache the FastEmbed model to reduce startup time
+# Set cache directory to a writable location
+ENV FASTEMBED_CACHE_PATH=/root/.cache/fastembed
+RUN mkdir -p /root/.cache/fastembed && \
+    python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='sentence-transformers/all-MiniLM-L6-v2')"
+
+# Create non-root user (but don't switch to it yet due to cache issues)
 RUN useradd -m -u 1000 importer
 
 # Set working directory
 WORKDIR /app
 
-# Switch to non-root user
-USER importer
+# Note: Running as root for now due to fastembed cache permissions
+# TODO: Fix cache permissions to run as non-root user
 
 # Default command
 CMD ["python", "/scripts/streaming-importer.py"]

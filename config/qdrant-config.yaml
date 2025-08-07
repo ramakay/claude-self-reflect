@@ -1,0 +1,59 @@
+log_level: INFO
+
+storage:
+  # Where to store all the data
+  storage_path: ./storage
+  
+  # Where to store snapshots
+  snapshots_path: ./snapshots
+  
+  # CRITICAL: Store payloads on disk to save memory
+  on_disk_payload: true
+
+  performance:
+    # Reduce number of search threads to save memory
+    max_search_threads: 2
+    
+    # Conservative CPU budget for optimization
+    optimizer_cpu_budget: 1
+
+  optimizers:
+    # Memory-optimized settings
+    deleted_threshold: 0.2
+    vacuum_min_vector_number: 1000
+    default_segment_number: 1
+    # Reduce max segment size to prevent memory spikes
+    max_segment_size_kb: 50000  # 50MB max
+    # Lower indexing threshold to use disk sooner
+    indexing_threshold_kb: 1000  # 1MB
+    flush_interval_sec: 5
+    max_optimization_threads: 1
+
+  # CRITICAL: Store HNSW indexes on disk
+  hnsw_index:
+    m: 16
+    ef_construct: 100
+    full_scan_threshold_kb: 1000
+    max_indexing_threads: 2
+    # Store HNSW index on disk - CRITICAL for memory savings
+    on_disk: true
+
+  collection:
+    # Default vectors storage on disk
+    vectors:
+      on_disk: true
+    
+    # Single replica to save memory
+    replication_factor: 1
+    write_consistency_factor: 1
+
+service:
+  max_request_size_mb: 32
+  max_workers: 2
+  host: 0.0.0.0
+  http_port: 6333
+  grpc_port: 6334
+  enable_cors: true
+
+# Disable telemetry
+telemetry_disabled: true

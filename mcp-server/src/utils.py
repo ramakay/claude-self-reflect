@@ -9,6 +9,8 @@ def normalize_project_name(project_path: str) -> str:
     
     Handles various path formats:
     - Claude logs format: -Users-kyle-Code-claude-self-reflect -> claude-self-reflect
+    - File paths in Claude logs: /path/to/-Users-kyle-Code-claude-self-reflect/file.jsonl -> claude-self-reflect  
+    - Regular file paths: /path/to/project/file.txt -> project
     - Regular paths: /path/to/project -> project
     - Already normalized: project -> project
     
@@ -49,5 +51,22 @@ def normalize_project_name(project_path: str) -> str:
         # Fallback: just use the last component
         return path_parts[-1] if path_parts else project_path
     
-    # Handle regular paths - use basename
-    return Path(project_path).name
+    # Check if this is a file path that contains a Claude logs directory
+    # Pattern: /path/to/-Users-...-projects-..../filename
+    path_obj = Path(project_path)
+    
+    # Look for a parent directory that starts with dash (Claude logs format)
+    for parent in path_obj.parents:
+        parent_name = parent.name
+        if parent_name.startswith("-"):
+            # Found a Claude logs directory, process it
+            return normalize_project_name(parent_name)
+    
+    # Handle regular paths - if it's a file, get the parent directory
+    # Otherwise use the directory/project name itself
+    if path_obj.suffix:  # It's a file (has an extension)
+        # Use the parent directory name
+        return path_obj.parent.name
+    else:
+        # Use the directory name itself
+        return path_obj.name

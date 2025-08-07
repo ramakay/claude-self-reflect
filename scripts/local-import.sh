@@ -52,10 +52,12 @@ fi
 
 # Run the import
 if [ $# -eq 0 ]; then
-    echo -e "${GREEN}Starting full import of all Claude projects...${NC}"
+    echo -e "${GREEN}Starting streaming import of all Claude projects...${NC}"
+    echo -e "${YELLOW}Using low-memory streaming mode (50MB limit)${NC}"
     python "$SCRIPT_DIR/streaming-importer.py"
 else
     echo -e "${GREEN}Importing specific project: $1${NC}"
+    echo -e "${YELLOW}Using low-memory streaming mode (50MB limit)${NC}"
     python "$SCRIPT_DIR/streaming-importer.py" "$1"
 fi
 
