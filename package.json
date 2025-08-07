@@ -1,6 +1,6 @@
 {
   "name": "claude-self-reflect",
-  "version": "2.5.2",
+  "version": "2.5.3",
   "description": "Give Claude perfect memory of all your conversations - Installation wizard for Python MCP server",
   "keywords": [
     "claude",
