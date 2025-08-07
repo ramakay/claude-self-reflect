@@ -93,49 +93,7 @@ Technical details exist. You don't need them to start.
 
 Here's how your conversations get imported and prioritized:
 
-```mermaid
-flowchart TB
-    subgraph "Real-Time Import System"
-        NewFile([New/Modified<br/>Conversation]) --> Watcher{Streaming<br/>Watcher}
-        
-        Watcher -->|Every 60s| Check[Check Files]
-        Check --> Priority{File Age?}
-        
-        Priority -->|< 5 min| Hot[🔥 HOT<br/>2-sec mode]
-        Priority -->|< 24 hr| Warm[🌡️ WARM<br/>Normal]
-        Priority -->|> 24 hr| Cold[❄️ COLD<br/>Batch-5]
-        
-        Hot --> FastMode[Fast Mode<br/>2-sec intervals<br/>Can interrupt]
-        Warm --> NormalMode[Normal Mode<br/>60-sec intervals]
-        Cold --> BatchMode[Batch Mode<br/>Max 5 files]
-        
-        FastMode --> Import{Import<br/>Strategy}
-        NormalMode --> Import
-        BatchMode --> Import
-        
-        Import -->|Never seen| Full[Baseline Import<br/>From start]
-        Import -->|Gap > 100 lines| Catchup[Catch-up Import<br/>From position]
-        Import -->|Small changes| Stream[Stream Import<br/>Continue]
-        
-        Full --> Process[Process<br/>& Embed]
-        Catchup --> Process
-        Stream --> Process
-        
-        Process --> Memory{Memory<br/>< 50MB?}
-        Memory -->|Yes| Store[(Qdrant<br/>Vector DB)]
-        Memory -->|No| GC[Garbage<br/>Collect]
-        
-        GC --> Store
-        Store --> State[Update State]
-        State --> Wait[Wait for<br/>next cycle]
-        Wait --> Watcher
-        
-        style Hot fill:#ff6b6b
-        style Warm fill:#ffd93d
-        style Cold fill:#6bcf7f
-        style FastMode stroke:#ff6b6b,stroke-width:3px
-    end
-```
+![Import Architecture](docs/diagrams/import-architecture.png)
 
 **The system intelligently prioritizes your conversations:**
 - **🔥 HOT** (< 5 minutes): Switches to 2-second intervals for near real-time import
@@ -192,10 +150,10 @@ Recent conversations matter more. Old ones fade. Like your brain, but reliable.
 
 ## What's New
 
+- **v2.5.3** - Streamlined README & import architecture diagram
 - **v2.5.2** - State file compatibility fix
 - **v2.4.5** - 10-40x performance boost
 - **v2.4.3** - Project-scoped search
-- **v2.3.7** - Local embeddings by default
 
 [Full changelog](docs/release-history.md)
 

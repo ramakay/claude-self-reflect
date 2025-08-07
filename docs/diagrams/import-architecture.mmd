@@ -1,41 +1,64 @@
-flowchart TB
-    subgraph "Real-Time Import System"
+flowchart LR
+    subgraph System["Import Architecture: Real-Time Streaming + Baseline Gap Filling"]
         NewFile([New/Modified<br/>Conversation]) --> Watcher{Streaming<br/>Watcher}
         
-        Watcher -->|Every 60s| Check[Check Files]
-        Check --> Priority{File Age?}
+        Watcher --> Priority{File Age?}
         
-        Priority -->|< 5 min| Hot[🔥 HOT<br/>2-sec mode]
-        Priority -->|< 24 hr| Warm[🌡️ WARM<br/>Normal]
-        Priority -->|> 24 hr| Cold[❄️ COLD<br/>Batch-5]
+        Priority -->|Less than 5 min| Hot[🔥 HOT<br/>2-sec mode]
+        Priority -->|Less than 24 hr| Warm[🌡️ WARM<br/>Normal]
+        Priority -->|More than 24 hr| Cold[❄️ COLD<br/>Batch-5]
         
-        Hot --> FastMode[Fast Mode<br/>2-sec intervals<br/>Can interrupt]
-        Warm --> NormalMode[Normal Mode<br/>60-sec intervals]
-        Cold --> BatchMode[Batch Mode<br/>Max 5 files]
+        Hot --> Fast[Fast Mode<br/>2-sec intervals<br/>Can interrupt]
+        Warm --> Normal[Normal Mode<br/>60-sec intervals]
+        Cold --> Batch[Batch Mode<br/>Max 5 files]
         
-        FastMode --> Import{Import<br/>Strategy}
-        NormalMode --> Import
-        BatchMode --> Import
+        Fast --> Gap{Gap Detection}
+        Normal --> Gap
+        Batch --> Gap
         
-        Import -->|Never seen| Full[Baseline Import<br/>From start]
-        Import -->|Gap > 100 lines| Catchup[Catch-up Import<br/>From position]
-        Import -->|Small changes| Stream[Stream Import<br/>Continue]
+        Gap -->|Never imported| Base[BASELINE<br/>Full import]
+        Gap -->|Gap detected| Catch[CATCH-UP<br/>Resume from position]
+        Gap -->|Up to date| Str[STREAM<br/>Continue]
         
-        Full --> Process[Process<br/>& Embed]
-        Catchup --> Process
-        Stream --> Process
+        Base --> Proc[Process<br/>Chunks]
+        Catch --> Proc
+        Str --> Proc
         
-        Process --> Memory{Memory<br/>< 50MB?}
-        Memory -->|Yes| Store[(Qdrant<br/>Vector DB)]
-        Memory -->|No| GC[Garbage<br/>Collect]
+        Proc --> Mem{Memory Check}
+        Mem -->|Under 50MB| Emb[Generate<br/>Embeddings]
+        Mem -->|Over 50MB| GC[Garbage<br/>Collection]
+        GC --> Emb
         
-        GC --> Store
-        Store --> State[Update State]
-        State --> Wait[Wait for<br/>next cycle]
-        Wait --> Watcher
+        Emb --> Type{Embedding<br/>Mode}
+        Type -->|Local| Loc[FastEmbed<br/>384 dims<br/>Private]
+        Type -->|Cloud| Cld[Voyage AI<br/>1024 dims<br/>Accurate]
         
-        style Hot fill:#ff6b6b
-        style Warm fill:#ffd93d
-        style Cold fill:#6bcf7f
-        style FastMode stroke:#ff6b6b,stroke-width:3px
+        Loc --> DB[(Qdrant<br/>Vector DB)]
+        Cld --> DB
+        
+        DB --> State[Update State<br/>imported-files.json]
+        State --> Ready[Search Ready]
+        Ready -->|60s cycle| Watcher
+        
+        classDef hotStyle fill:#ff6b6b,stroke:#333,stroke-width:3px,color:#fff
+        classDef warmStyle fill:#FFD700,stroke:#333,stroke-width:2px,color:#333
+        classDef coldStyle fill:#6bcf7f,stroke:#333,stroke-width:2px,color:#fff
+        classDef processStyle fill:#1e3a5f,stroke:#333,stroke-width:2px,color:#fff
+        classDef importStyle fill:#D2691E,stroke:#333,stroke-width:2px,color:#fff
+        classDef storageStyle fill:#8B4513,stroke:#333,stroke-width:2px,color:#fff
+        classDef baselineStyle fill:#9370DB,stroke:#333,stroke-width:3px,color:#fff
+        classDef embedStyle fill:#4682B4,stroke:#333,stroke-width:2px,color:#fff
+        
+        class Hot,Fast hotStyle
+        class Warm,Normal warmStyle
+        class Cold,Batch coldStyle
+        class Base baselineStyle
+        class Catch,Str importStyle
+        class Proc,Mem,GC processStyle
+        class Loc,Cld,Emb,Type embedStyle
+        class DB,State storageStyle
+        class Watcher,Priority,Gap processStyle
+        class NewFile,Ready warmStyle
+        
+        style System fill:#f9f9f9,stroke:#333,stroke-width:3px
     end
