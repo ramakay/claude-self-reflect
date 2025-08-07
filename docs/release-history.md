@@ -1,5 +1,34 @@
 # Release History
 
+## v2.5.4 - Documentation & Bug Fixes
+**Released:** 2025-08-07
+
+### Bug Fixes
+- Fixed critical import path bug: streaming-importer.py now correctly uses `~/.claude/projects/` instead of `~/.claude/conversations/`
+- Fixed state file compatibility to handle both old string format and new dictionary format
+- Improved import visibility for recent conversations (HOT path optimization)
+
+### Documentation
+- Comprehensive documentation update across all 77 markdown files
+- Added streaming import architecture details
+- Updated performance metrics to reflect 10-40x improvements
+- Clarified project-scoped search behavior
+- Fixed outdated directory paths throughout docs
+
+## v2.5.3 - Streamlined Documentation
+**Released:** 2025-08-06
+
+### Documentation Improvements
+- Reduced README.md size by 44% (394 → 221 lines)
+- Created comprehensive import architecture diagram
+- Moved detailed content to organized docs/ subdirectories
+- Added horizontal flow diagram with HOT/WARM/COLD paths
+- Improved visual clarity with PNG diagrams
+
+### Performance
+- Optimized file organization with intelligent content-based sorting
+- Enhanced import prioritization for better real-time visibility
+
 ## v2.4.5 - Performance Revolution
 **Released:** 2025-07-29
 

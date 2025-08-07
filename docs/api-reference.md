@@ -19,6 +19,10 @@ Search for relevant past conversations using semantic search with optional time-
 | `query` | string | required | The search query to find semantically similar conversations |
 | `limit` | integer | 5 | Maximum number of results to return |
 | `min_score` | float | 0.7 | Minimum similarity score (0-1) |
+| `project` | string/null | null | Search specific project only. If not provided, searches current project. Use 'all' to search across all projects |
+| `brief` | boolean | false | Brief mode: returns minimal information for faster response |
+| `include_raw` | boolean | false | Include raw Qdrant payload data for debugging |
+| `response_format` | string | 'xml' | Response format: 'xml' or 'markdown' |
 | `use_decay` | integer/string | -1 | Apply time-based decay: 1=enable, 0=disable, -1=use environment default |
 
 #### Usage Examples
@@ -45,6 +49,18 @@ mcp__claude-self-reflect__reflect_on_past({
 mcp__claude-self-reflect__reflect_on_past({
   query: "recent bugs",
   use_decay: 1
+})
+
+// Search across all projects
+mcp__claude-self-reflect__reflect_on_past({
+  query: "Docker configurations",
+  project: "all"
+})
+
+// Brief mode for faster response
+mcp__claude-self-reflect__reflect_on_past({
+  query: "authentication setup",
+  brief: true
 })
 
 // Disable memory decay for historical search

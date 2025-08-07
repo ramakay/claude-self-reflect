@@ -31,7 +31,7 @@ Each conversation chunk is stored as:
 ```json
 {
   "id": "uuid",
-  "vector": [1024 dimensions],
+  "vector": [384 or 1024 dimensions],
   "payload": {
     "content": "conversation text",
     "project": "project-name",

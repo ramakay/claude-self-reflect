@@ -15,24 +15,22 @@ This guide walks you through installing Claude Self-Reflect, a memory system tha
 
 Before installing Claude Self-Reflect, ensure you have:
 
-1. **Claude Code** (Claude Desktop App)
+1. **Docker Desktop** (Primary Requirement)
+   - Required for running Qdrant vector database and containerized services
+   - Download from [docker.com](https://docker.com)
+   - **Important**: Docker daemon must be running before setup
+   - The setup wizard runs everything in Docker - no Python issues!
+
+2. **Claude Code** (Claude Desktop App)
    - Download from [Claude.ai](https://claude.ai)
    - Must be version that supports MCP (Model Context Protocol)
 
-2. **Python 3.10 or higher**
-   - Check version: `python3 --version`
-   - Download from [python.org](https://python.org) if needed
-
-3. **Docker Desktop**
-   - Required for running Qdrant vector database
-   - Download from [docker.com](https://docker.com)
-   - **Important**: Docker daemon must be running
-
-4. **Node.js 18+ and npm**
+3. **Node.js 16+ and npm**
+   - Required for the setup wizard
    - Check version: `node --version`
    - Download from [nodejs.org](https://nodejs.org) if needed
 
-5. **Voyage AI API Key** (Only needed for Cloud mode)
+4. **Voyage AI API Key** (Optional - Only for Cloud mode)
    - Sign up at [voyageai.com](https://www.voyageai.com/)
    - 200M free tokens per month
    - **Not required**: Local mode works without any API keys

@@ -52,12 +52,16 @@ Python-based service using FastMCP framework. Provides two simple tools:
 
 ### 3. Import Pipeline
 Python service that processes conversation logs:
-- Reads JSONL files from Claude conversation logs (`~/.claude/`)
+- Reads JSONL files from Claude conversation logs (`~/.claude/projects/*/conversations/`)
 - Creates conversation chunks for context (500 tokens each)
 - Generates embeddings using:
   - **Local (Default)**: FastEmbed with all-MiniLM-L6-v2 (384 dimensions)
   - **Cloud (Optional)**: Voyage AI voyage-3-large (1024 dimensions)
 - Stores directly in Qdrant with metadata
+- **Streaming Mode**: Real-time import with intelligent prioritization:
+  - 🔥 HOT (< 5 min): 2-second intervals for immediate visibility
+  - 🌡️ WARM (< 24 hr): Normal priority, 60-second intervals
+  - ❄️ COLD (> 24 hr): Batch processing, max 5 per cycle
 
 ### 4. Qdrant Vector Database
 - Stores conversation embeddings with metadata
@@ -184,11 +188,14 @@ claude-self-reflect/
 - **Naming**: 
   - Local: `conv_<md5_hash>_local`
   - Cloud: `conv_<md5_hash>_voyage`
+  - Hash: MD5 of project directory path for unique identification
 
 ### Performance
-- **Search latency**: ~100ms for cross-collection search
-- **Import speed**: ~1000 conversations/minute
-- **Memory overhead**: ~1GB per 100k conversations
+- **Search latency**: 200-350ms end-to-end (10-40x faster than v2.4.4)
+- **Import speed**: 
+  - HOT: 2-second response for new conversations
+  - Batch: ~1000 conversations/minute
+- **Memory overhead**: 50MB operational target with smart chunking
 
 ## Security & Privacy
 

@@ -105,6 +105,28 @@ sudo apt-get install --reinstall python3
 
 ## Import Problems
 
+### Streaming importer not finding conversations
+
+**Symptom**: "No conversations found" or imports showing 0 messages
+
+**Solution**:
+1. Verify conversations exist: `ls ~/.claude/projects/*/conversations/*.jsonl`
+2. Check the importer is using correct path (should be `~/.claude/projects/`, NOT `~/.claude/conversations/`)
+3. Run manual import: `python scripts/import-conversations-unified.py`
+4. Check Docker logs: `docker logs claude-self-reflect-watcher-1`
+
+### Recent conversations not searchable immediately
+
+**Symptom**: Just had a conversation but can't search for it
+
+**Solution**:
+- The streaming importer prioritizes recent files:
+  - Files < 5 minutes old: Imported within 2 seconds (HOT path)
+  - Files < 24 hours old: Imported within 60 seconds (WARM path)  
+  - Older files: Batch processed (COLD path)
+- Check import status: `python scripts/check-collections.py`
+- Force immediate import: `python scripts/streaming-importer.py --limit 1`
+
 ### Local Embedding Issues
 
 **Symptom**: Import fails with FastEmbed errors
@@ -433,6 +455,16 @@ sudo apt-get install --reinstall python3
 4. Process conversations in smaller chunks
 
 ## Memory and Import Issues
+
+### State file compatibility errors
+
+**Symptom**: `AttributeError: 'str' object has no attribute 'get'`
+
+**Solution**:
+- This occurs when upgrading from older versions
+- The system now handles both old (string) and new (dictionary) state formats
+- Run: `rm data/.import_state.json` to reset state
+- Re-run import: `python scripts/import-conversations-unified.py`
 
 ### Import watcher getting killed (OOM)
 
