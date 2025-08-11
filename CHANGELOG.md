@@ -5,6 +5,13 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.7] - 2025-08-11
+
+### Changed
+- **Dependencies**: Removed unused `openai` package from requirements.txt
+  - Package was listed but never imported or used in the codebase
+  - Kept `tqdm`, `humanize`, and `backoff` for potential future use in setup wizard and rate limiting
+
 ## [2.5.6] - 2025-08-11
 
 ### Added
