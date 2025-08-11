@@ -1,5 +1,14 @@
 {
   "hooks": {
-    "PreCompact": "echo '🔄 PreCompact hook triggered! Importing conversation to Qdrant...' && touch /tmp/claude-self-reflect-import-current"
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '🔄 PreCompact hook triggered! Importing conversation to Qdrant...' && touch /tmp/claude-self-reflect-import-current"
+          }
+        ]
+      }
+    ]
   }
 }

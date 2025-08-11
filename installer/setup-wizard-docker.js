@@ -343,13 +343,25 @@ async function importConversations() {
   console.log('\n📚 Checking conversation baseline...');
   
   // Check if baseline exists by looking for imported files state
+  const configDir = path.join(os.homedir(), '.claude-self-reflect', 'config');
   const stateFile = path.join(configDir, 'imported-files.json');
   let hasBaseline = false;
+  let needsMetadataMigration = false;
   
   try {
-    if (fs.existsSync(stateFile)) {
-      const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    if (fsSync.existsSync(stateFile)) {
+      const state = JSON.parse(fsSync.readFileSync(stateFile, 'utf8'));
       hasBaseline = state.imported_files && Object.keys(state.imported_files).length > 0;
+      
+      // Check if any imported files are in old format (string timestamp vs object)
+      if (hasBaseline) {
+        for (const [file, data] of Object.entries(state.imported_files)) {
+          if (typeof data === 'string') {
+            needsMetadataMigration = true;
+            break;
+          }
+        }
+      }
     }
   } catch (e) {
     // State file doesn't exist or is invalid
@@ -359,13 +371,18 @@ async function importConversations() {
     console.log('\n⚠️  No baseline detected. Initial import STRONGLY recommended.');
     console.log('   Without this, historical conversations won\'t be searchable.');
     console.log('   The watcher only handles NEW conversations going forward.');
+  } else if (needsMetadataMigration) {
+    console.log('\n🔄 Detected old import format. Metadata enhancement available!');
+    console.log('   Re-importing will add file analysis, tool usage, and concept tracking.');
+    console.log('   This enables advanced search features like search_by_file and search_by_concept.');
   }
   
   const answer = await question('\nImport existing Claude conversations? (y/n) [recommended: y]: ');
   
   if (answer.toLowerCase() === 'y') {
-    console.log('🔄 Starting baseline import...');
+    console.log('🔄 Starting baseline import with metadata extraction...');
     console.log('   This ensures ALL your conversations are searchable');
+    console.log('   Enhanced with tool usage tracking and file analysis');
     console.log('   This may take a few minutes depending on your conversation history');
     
     try {
@@ -373,8 +390,9 @@ async function importConversations() {
         cwd: projectRoot,
         stdio: 'inherit'
       });
-      console.log('\n✅ Baseline import completed!');
+      console.log('\n✅ Baseline import completed with metadata!');
       console.log('   Historical conversations are now searchable');
+      console.log('   Tool usage and file analysis metadata extracted');
     } catch {
       console.log('\n⚠️  Import had some issues, but you can continue');
     }

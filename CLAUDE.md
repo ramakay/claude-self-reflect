@@ -1,5 +1,17 @@
 # Claude Self Reflect - Conversation Memory for Claude
 
+## Documentation Style Guidelines
+
+### Release Announcements
+When creating release announcements or formal documentation:
+- Use professional, technical language similar to enterprise SDK releases (e.g., Meta XR SDK style)
+- Avoid excessive emojis - limit to section headers if necessary
+- Structure with clear sections: Version, Release Notes, Documentation, Key Features, Technical Specifications
+- Include formal headers like "Updated: [Date] | Version: [X.X.X]"
+- Use bullet points for feature lists with bold feature names
+- Provide code examples in properly formatted blocks
+- End with Support/Forums/Documentation links
+
 ## Overview
 Claude Self Reflect provides semantic search across all Claude conversations with built-in memory decay capabilities, using a vector database for efficient similarity matching.
 
@@ -251,3 +263,4 @@ claude mcp add claude-self-reflect "/path/to/mcp-server/run-mcp.sh" -e QDRANT_UR
 3. **Check .env settings** - new variables may be added
 4. **Test with small imports first** using --limit flag
 5. **Monitor Docker logs** if using containerized setup
+- all claude related conversations are in ~/.claude/projects not in conversations folder - this is NOT a claude desktop project.

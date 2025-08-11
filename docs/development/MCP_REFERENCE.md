@@ -74,6 +74,11 @@ claude mcp add claude-self-reflect "/Users/ramakrishnanannaswamy/projects/claude
 ### Available Tools:
 - `mcp__claude-self-reflect__reflect_on_past` - Search past conversations
 - `mcp__claude-self-reflect__store_reflection` - Store insights
+- `mcp__claude-self-reflect__search_by_file` - Search conversations by file path (v2.5.6+)
+- `mcp__claude-self-reflect__search_by_concept` - Search conversations by concept (v2.5.6+)
+- `mcp__claude-self-reflect__quick_search` - Quick search with minimal results
+- `mcp__claude-self-reflect__search_summary` - Get aggregated insights without details
+- `mcp__claude-self-reflect__get_more_results` - Pagination for search results
 
 ### Required Environment Variables:
 - `VOYAGE_KEY`: API key for Voyage AI embeddings (required)
@@ -113,6 +118,37 @@ mcp__claude-self-reflect__store_reflection({
   content: "Important insight or solution",
   tags: ["tag1", "tag2", "tag3"]
 })
+```
+
+**Search by file path** (v2.5.6+):
+```javascript
+mcp__claude-self-reflect__search_by_file({
+  file_path: "src/utils.py",
+  limit: 10,
+  project: "claude-self-reflect"  // Optional: filter by project
+})
+// Finds conversations that analyzed, edited, or mentioned this file in git outputs
+```
+
+**Search by concept** (v2.5.6+):
+```javascript
+mcp__claude-self-reflect__search_by_concept({
+  concept: "docker",  // Searches for docker-related conversations
+  limit: 10,
+  include_files: true,  // Include file information
+  project: "all"  // Search across all projects
+})
+// Returns conversations tagged with this concept
+```
+
+**Quick search for overview**:
+```javascript
+mcp__claude-self-reflect__quick_search({
+  query: "authentication bug",
+  minScore: 0.7,
+  project: null  // Uses current project
+})
+// Returns count and top result only
 ```
 
 ## 📊 Memory Decay Feature

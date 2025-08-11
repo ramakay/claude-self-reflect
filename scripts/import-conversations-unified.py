@@ -9,8 +9,9 @@ import json
 import glob
 import hashlib
 import gc
+import re
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 import logging
 from pathlib import Path
 
@@ -39,10 +40,251 @@ STATE_FILE = os.getenv("STATE_FILE", default_state_file)
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))  # Reduced from 100 to prevent OOM
 PREFER_LOCAL_EMBEDDINGS = os.getenv("PREFER_LOCAL_EMBEDDINGS", "false").lower() == "true"
 VOYAGE_API_KEY = os.getenv("VOYAGE_KEY")
+CURRENT_METADATA_VERSION = 2  # Version 2: Added tool output extraction
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# ============= Metadata Extraction Functions =============
+
+def normalize_path_for_metadata(path: str) -> str:
+    """Normalize file paths for consistency in metadata."""
+    if not path:
+        return ""
+    
+    # Remove common prefixes
+    path = path.replace("/Users/", "~/")
+    path = path.replace("\\Users\\", "~\\")
+    
+    # Convert to forward slashes
+    path = path.replace("\\", "/")
+    
+    # Remove duplicate slashes
+    path = re.sub(r'/+', '/', path)
+    
+    return path
+
+def extract_concepts(text: str, tool_usage: Dict[str, Any]) -> Set[str]:
+    """Extract high-level concepts from conversation and tool usage."""
+    concepts = set()
+    
+    # Common development concepts with patterns
+    concept_patterns = {
+        'security': r'(security|vulnerability|CVE|injection|sanitize|escape|auth|token|JWT)',
+        'performance': r'(performance|optimization|speed|memory|efficient|benchmark|latency)',
+        'testing': r'(test|pytest|unittest|coverage|TDD|spec|assert)',
+        'docker': r'(docker|container|compose|dockerfile|kubernetes|k8s)',
+        'api': r'(API|REST|GraphQL|endpoint|webhook|http|request)',
+        'database': r'(database|SQL|query|migration|schema|postgres|mysql|mongodb|qdrant)',
+        'authentication': r'(auth|login|token|JWT|session|oauth|permission)',
+        'debugging': r'(debug|error|exception|traceback|log|stack|trace)',
+        'refactoring': r'(refactor|cleanup|improve|restructure|optimize|technical debt)',
+        'deployment': r'(deploy|CI/CD|release|production|staging|rollout)',
+        'git': r'(git|commit|branch|merge|pull request|PR|rebase)',
+        'architecture': r'(architecture|design|pattern|structure|component|module)',
+        'mcp': r'(MCP|claude-self-reflect|tool|agent|claude code)',
+        'embeddings': r'(embedding|vector|semantic|similarity|fastembed|voyage)',
+        'search': r'(search|query|find|filter|match|relevance)'
+    }
+    
+    # Check text content (limit to first 10000 chars for performance)
+    combined_text = text[:10000].lower() if text else ""
+    for concept, pattern in concept_patterns.items():
+        if re.search(pattern, combined_text, re.IGNORECASE):
+            concepts.add(concept)
+    
+    # Check tool usage patterns
+    if tool_usage.get('grep_searches'):
+        concepts.add('search')
+    if tool_usage.get('files_edited') or tool_usage.get('files_created'):
+        concepts.add('development')
+    if any('test' in str(f).lower() for f in tool_usage.get('files_read', [])):
+        concepts.add('testing')
+    if any('docker' in str(cmd).lower() for cmd in tool_usage.get('bash_commands', [])):
+        concepts.add('docker')
+    
+    return concepts
+
+def extract_files_from_git_output(output_text: str) -> List[str]:
+    """Extract file paths from git command outputs (diff, show, status, etc)."""
+    files = set()
+    
+    # Patterns for different git output formats
+    patterns = [
+        r'diff --git a/(.*?) b/',  # git diff format
+        r'^\+\+\+ b/(.+)$',  # diff new file
+        r'^--- a/(.+)$',  # diff old file
+        r'^modified:\s+(.+)$',  # git status
+        r'^deleted:\s+(.+)$',  # git status
+        r'^new file:\s+(.+)$',  # git status
+        r'^renamed:\s+(.+) -> (.+)$',  # git status (captures both)
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, output_text, re.MULTILINE)
+        for match in matches:
+            if isinstance(match, tuple):
+                # Handle renamed files (captures both old and new)
+                for f in match:
+                    if f:
+                        files.add(normalize_path_for_metadata(f))
+            else:
+                files.add(normalize_path_for_metadata(match))
+    
+    return list(files)[:20]  # Limit to 20 files
+
+def extract_tool_data_from_message(tool_use: Dict[str, Any], usage_dict: Dict[str, Any], tool_output: str = None):
+    """Extract tool usage data from a tool_use object in a message, including outputs."""
+    tool_name = tool_use.get('name', '')
+    inputs = tool_use.get('input', {})
+    
+    # Track tool in summary
+    usage_dict['tools_summary'][tool_name] = usage_dict['tools_summary'].get(tool_name, 0) + 1
+    
+    # Handle Read tool
+    if tool_name == 'Read':
+        file_path = inputs.get('file_path')
+        if file_path:
+            normalized = normalize_path_for_metadata(file_path)
+            if normalized not in usage_dict['files_read']:
+                usage_dict['files_read'].append(normalized)
+    
+    # Handle Edit and MultiEdit tools
+    elif tool_name in ['Edit', 'MultiEdit']:
+        path = inputs.get('file_path')
+        if path:
+            normalized = normalize_path_for_metadata(path)
+            if normalized not in usage_dict['files_edited']:
+                usage_dict['files_edited'].append(normalized)
+    
+    # Handle Write tool
+    elif tool_name == 'Write':
+        path = inputs.get('file_path')
+        if path:
+            normalized = normalize_path_for_metadata(path)
+            if normalized not in usage_dict['files_created']:
+                usage_dict['files_created'].append(normalized)
+    
+    # Handle Grep tool
+    elif tool_name == 'Grep':
+        pattern = inputs.get('pattern')
+        if pattern and len(usage_dict['grep_searches']) < 10:  # Limit
+            usage_dict['grep_searches'].append(pattern[:100])  # Truncate long patterns
+    
+    # Handle Bash tool - Extract both command and output
+    elif tool_name == 'Bash':
+        command = inputs.get('command')
+        if command and len(usage_dict['bash_commands']) < 10:
+            usage_dict['bash_commands'].append(command[:200])  # Truncate
+            
+            # Process tool output for git commands
+            if tool_output and any(cmd in command for cmd in ['git diff', 'git show', 'git status']):
+                git_files = extract_files_from_git_output(tool_output)
+                for file_path in git_files:
+                    if file_path not in usage_dict['git_file_changes']:
+                        usage_dict['git_file_changes'].append(file_path)
+    
+    # Store tool output preview (for any tool)
+    if tool_output and len(usage_dict['tool_outputs']) < 15:
+        usage_dict['tool_outputs'].append({
+            'tool': tool_name,
+            'command': inputs.get('command', inputs.get('pattern', ''))[:100],
+            'output_preview': tool_output[:500],  # First 500 chars
+            'output_length': len(tool_output)
+        })
+
+def extract_metadata_from_jsonl(file_path: str) -> Dict[str, Any]:
+    """Extract metadata from a JSONL conversation file."""
+    tool_usage = {
+        "files_read": [],
+        "files_edited": [],
+        "files_created": [],
+        "grep_searches": [],
+        "bash_commands": [],
+        "tools_summary": {},
+        "git_file_changes": [],  # NEW: Files from git outputs
+        "tool_outputs": []  # NEW: Tool output previews
+    }
+    
+    conversation_text = ""
+    tool_outputs = {}  # Map tool_use_id to output text
+    
+    try:
+        # First pass: collect tool outputs
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        data = json.loads(line)
+                        if 'message' in data and data['message']:
+                            msg = data['message']
+                            if msg.get('content') and isinstance(msg['content'], list):
+                                for item in msg['content']:
+                                    if isinstance(item, dict) and item.get('type') == 'tool_result':
+                                        # Capture tool output
+                                        tool_id = item.get('tool_use_id')
+                                        output_content = item.get('content', '')
+                                        if tool_id and output_content:
+                                            tool_outputs[tool_id] = output_content
+                        # Also check for toolUseResult in data
+                        if 'toolUseResult' in data:
+                            result = data['toolUseResult']
+                            if isinstance(result, dict):
+                                tool_outputs['last_result'] = json.dumps(result)[:1000]
+                    except:
+                        continue
+        
+        # Second pass: extract tool uses and text with outputs available
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        data = json.loads(line)
+                        if 'message' in data and data['message']:
+                            msg = data['message']
+                            # Extract text
+                            if msg.get('content'):
+                                if isinstance(msg['content'], str):
+                                    conversation_text += msg['content'] + "\n"
+                                elif isinstance(msg['content'], list):
+                                    for item in msg['content']:
+                                        if isinstance(item, dict):
+                                            if item.get('type') == 'text' and item.get('text'):
+                                                conversation_text += item['text'] + "\n"
+                                            elif item.get('type') == 'tool_use':
+                                                # Process tool use with output now available
+                                                tool_id = item.get('id', '')
+                                                output = tool_outputs.get(tool_id, '')
+                                                extract_tool_data_from_message(item, tool_usage, output)
+                    except:
+                        continue
+    except Exception as e:
+        logger.warning(f"Error extracting metadata from {file_path}: {e}")
+    
+    # Extract concepts from text
+    concepts = extract_concepts(conversation_text, tool_usage)
+    
+    # Build metadata
+    metadata = {
+        "files_analyzed": tool_usage['files_read'][:20],  # Limit to 20
+        "files_edited": tool_usage['files_edited'][:10],  # Limit to 10
+        "files_created": tool_usage['files_created'][:10],
+        "tools_used": list(tool_usage['tools_summary'].keys())[:20],
+        "tool_summary": dict(list(tool_usage['tools_summary'].items())[:10]),
+        "concepts": list(concepts)[:15],  # Limit to 15
+        "search_patterns": tool_usage['grep_searches'][:10],
+        "git_file_changes": tool_usage['git_file_changes'][:20],  # NEW: Git file changes
+        "tool_outputs": tool_usage['tool_outputs'][:15],  # NEW: Tool output previews
+        "analysis_only": len(tool_usage['files_edited']) == 0 and len(tool_usage['files_created']) == 0,
+        "has_file_metadata": True,
+        "metadata_version": CURRENT_METADATA_VERSION,
+        "metadata_extracted_at": datetime.now().isoformat()
+    }
+    
+    return metadata
+
+# ============= End Metadata Extraction Functions =============
 
 # State management functions
 def load_state():
@@ -273,6 +515,9 @@ def import_project(project_path: Path, collection_name: str, state: dict) -> int
                 created_at = datetime.now().isoformat()
             conversation_id = jsonl_file.stem
             
+            # Extract tool usage metadata from the file
+            metadata = extract_metadata_from_jsonl(str(jsonl_file))
+            
             # Chunk the conversation
             chunks = chunk_conversation(messages)
             
@@ -294,17 +539,22 @@ def import_project(project_path: Path, collection_name: str, state: dict) -> int
                         f"{conversation_id}_{chunk['chunk_index']}".encode()
                     ).hexdigest()[:16]
                     
+                    # Combine basic payload with metadata
+                    payload = {
+                        "text": chunk["text"],
+                        "conversation_id": conversation_id,
+                        "chunk_index": chunk["chunk_index"],
+                        "timestamp": created_at,
+                        "project": project_path.name,
+                        "start_role": chunk["start_role"]
+                    }
+                    # Add metadata fields
+                    payload.update(metadata)
+                    
                     points.append(PointStruct(
                         id=int(point_id, 16) % (2**63),  # Convert to valid integer ID
                         vector=embedding,
-                        payload={
-                            "text": chunk["text"],
-                            "conversation_id": conversation_id,
-                            "chunk_index": chunk["chunk_index"],
-                            "timestamp": created_at,
-                            "project": project_path.name,
-                            "start_role": chunk["start_role"]
-                        }
+                        payload=payload
                     ))
                 
                 # Upload to Qdrant

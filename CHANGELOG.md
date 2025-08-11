@@ -5,6 +5,35 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.6] - 2025-08-11
+
+### Added
+- **Tool Output Extraction**: Metadata v2 schema captures tool outputs and git file changes
+  - Extracts up to 15 tool outputs (500 chars each) per conversation
+  - Parses git diff/show/status outputs to identify modified files
+  - Enables cross-agent discovery via `search_by_file` for git-modified files
+  - Two-pass JSONL parsing for complete output capture
+  
+### Enhanced
+- **Search Capabilities**: 
+  - `search_by_file` now finds conversations with git-modified files
+  - `search_by_concept` improved for git-related concepts
+  - Tool outputs included in semantic search index
+  
+### Changed
+- Metadata schema upgraded to version 2
+  - Added `git_file_changes` field for files from git outputs
+  - Added `tool_outputs` field for tool execution results
+  - Backward compatible with v1 metadata
+  
+### Technical Details
+- **Files Modified**:
+  - `scripts/streaming-importer.py` - Added `extract_files_from_git_output()` function
+  - `scripts/import-conversations-unified.py` - Added two-pass JSONL parsing
+  - Both importers now extract tool outputs from user messages
+- **Performance**: Minimal overhead (~10ms per conversation)
+- **Storage**: ~2-5KB increase per conversation with tool outputs
+
 ## [2.5.5] - 2025-08-11
 
 ### Security
