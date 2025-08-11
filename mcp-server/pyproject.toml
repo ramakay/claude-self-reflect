@@ -1,6 +1,6 @@
 [project]
 name = "claude-self-reflect-mcp"
-version = "2.5.1"
+version = "2.5.5"
 description = "MCP server for Claude self-reflection with memory decay"
 # readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ dependencies = [
     "qdrant-client>=1.7.0,<2.0.0",
     "voyageai>=0.1.0,<1.0.0",
     "python-dotenv>=1.0.0,<2.0.0",
-    "pydantic>=2.9.2,<3.0.0",  # Pin to avoid CVE-2024-3772
+    "pydantic>=2.11.7,<3.0.0",  # Updated for fastmcp 2.10.6 compatibility
     "pydantic-settings>=2.0.0,<3.0.0",
     "fastembed>=0.4.0,<1.0.0",
 ]

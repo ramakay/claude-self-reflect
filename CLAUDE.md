@@ -64,7 +64,7 @@ claude mcp add claude-self-reflect     # MISSING required commandOrUrl argument
 #### Important Notes:
 - The `claude mcp add` command REQUIRES both a name AND a commandOrUrl
 - Environment variables must be passed with `-e` flag
-- After adding MCP, you may need to restart Claude Code for tools to be available
+- **CRITICAL**: After modifying MCP server code, you MUST restart Claude Code entirely for changes to take effect
 - Check `.env` file for VOYAGE_KEY if not set
 
 ### Search & Reflection
@@ -90,6 +90,37 @@ python scripts/import-conversations-voyage-streaming.py --limit 5  # Limit to 5 
 # Check collections
 python scripts/check-collections.py
 ```
+
+### Delta Metadata Update (NEW)
+**Purpose**: Update existing Qdrant points with tool usage metadata without re-importing vectors
+
+```bash
+# Activate virtual environment first
+source venv/bin/activate
+
+# Test with limited files first
+LIMIT=5 python scripts/delta-metadata-update.py
+
+# Dry run to see what would be updated
+DRY_RUN=true python scripts/delta-metadata-update.py
+
+# Update past week's conversations (default)
+python scripts/delta-metadata-update.py
+
+# Update specific time range
+DAYS_TO_UPDATE=14 python scripts/delta-metadata-update.py
+
+# Force local embeddings
+PREFER_LOCAL_EMBEDDINGS=true python scripts/delta-metadata-update.py
+```
+
+**What it does**:
+- Extracts tool usage (files_analyzed, files_edited, tools_used, concepts)
+- Updates existing Qdrant points using `set_payload` (preserves vectors)
+- Enables `search_by_file` and `search_by_concept` functionality
+- Tracks state in `config/delta-update-state.json`
+
+**Note**: The streaming importer (`streaming-importer.py`) does NOT extract metadata. Use delta update after streaming import to add metadata.
 
 ## Specialized Sub-Agents for Claude Self Reflect
 

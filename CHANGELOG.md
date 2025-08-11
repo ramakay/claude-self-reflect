@@ -5,6 +5,36 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.5] - 2025-08-11
+
+### Security
+- **CRITICAL**: Fixed pydantic version conflict preventing MCP server startup
+  - Updated pydantic from >=2.9.2 to >=2.11.7 for fastmcp 2.10.6 compatibility
+  - Ensures runtime stability and prevents dependency resolution failures
+
+### Fixed
+- **Streaming Importer**: Enhanced file validation to prevent queue blocking
+  - Added detection and automatic skipping of empty files (0 bytes)
+  - Added detection and automatic skipping of summary-only files without conversation data
+  - Implemented state tracking for skipped files to avoid re-processing
+  - Prevents import pipeline from stalling on non-importable files
+  - Files are re-validated if they grow in size or change modification time
+
+### Changed
+- Repository organization: Archived old release notes to docs/archive/releases/
+- Cleaned up test artifacts from root directory
+- Updated dependencies:
+  - openai: 1.97.1 → 1.98.0
+  - qdrant-client: 1.15.0 → 1.15.1
+
+### Technical Details
+- **Files Modified**: 
+  - `scripts/streaming-importer.py` - Added comprehensive file validation functions
+  - `mcp-server/pyproject.toml` - Fixed pydantic version constraint
+- **State Management**: Enhanced imported-files.json to track skipped files
+- **Docker**: Rebuilt streaming-importer image with validation logic
+- **Impact**: Improved reliability for continuous import operations
+
 ## [2.5.1] - 2025-08-06
 
 ### Fixed

@@ -956,7 +956,14 @@ async def search_by_file(
                 files_analyzed = payload.get('files_analyzed', [])
                 files_edited = payload.get('files_edited', [])
                 
-                if normalized_path in files_analyzed or normalized_path in files_edited:
+                # Check for exact match or if any file ends with the normalized path
+                file_match = False
+                for file in files_analyzed + files_edited:
+                    if file == normalized_path or file.endswith('/' + normalized_path) or file.endswith('\\' + normalized_path):
+                        file_match = True
+                        break
+                
+                if file_match:
                     all_results.append({
                         'score': 1.0,  # File match is always 1.0
                         'payload': payload,
