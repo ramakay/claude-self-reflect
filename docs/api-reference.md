@@ -128,6 +128,117 @@ Returns a confirmation message:
 "Reflection stored successfully with tags: authentication, security, jwt"
 ```
 
+### `search_by_file` (New in v2.5.6)
+
+Find conversations that analyzed, modified, or referenced specific files. This tool is particularly useful for finding conversations where git operations were performed on specific files.
+
+#### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `file_path` | string | required | The file path to search for in conversations |
+| `limit` | integer | 10 | Maximum number of results to return |
+| `project` | string/null | null | Search specific project only. Use 'all' to search across all projects |
+
+#### Usage Examples
+
+```javascript
+// Find conversations about a specific file
+mcp__claude-self-reflect__search_by_file({
+  file_path: "src/components/Header.tsx"
+})
+
+// Search for discussions about a config file
+mcp__claude-self-reflect__search_by_file({
+  file_path: "package.json",
+  limit: 5
+})
+
+// Find git operations on a specific file across all projects
+mcp__claude-self-reflect__search_by_file({
+  file_path: "README.md",
+  project: "all"
+})
+```
+
+#### Return Value
+
+Returns XML with structured results showing conversations that mentioned the file:
+
+```xml
+<search_by_file>
+  <query>src/components/Header.tsx</query>
+  <normalized_path>src/components/header.tsx</normalized_path>
+  <count>3</count>
+  <results>
+    <result>
+      <timestamp>2024-01-15T14:30:00Z</timestamp>
+      <project>my-app</project>
+      <action>Modified Header component styling</action>
+      <tools_used>Edit, Read</tools_used>
+      <preview>Updated the Header component to fix responsive...</preview>
+    </result>
+  </results>
+</search_by_file>
+```
+
+### `search_by_concept` (New in v2.5.6)
+
+Search conversations by conceptual themes, topics, or technologies. Uses semantic analysis of tool outputs and conversation content.
+
+#### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `concept` | string | required | The concept to search for (e.g., 'security', 'docker', 'testing') |
+| `include_files` | boolean | true | Include file information in results |
+| `limit` | integer | 10 | Maximum number of results to return |
+| `project` | string/null | null | Search specific project only. Use 'all' to search across all projects |
+
+#### Usage Examples
+
+```javascript
+// Find security-related conversations
+mcp__claude-self-reflect__search_by_concept({
+  concept: "security"
+})
+
+// Search for Docker discussions without file details
+mcp__claude-self-reflect__search_by_concept({
+  concept: "docker",
+  include_files: false
+})
+
+// Find testing conversations across all projects
+mcp__claude-self-reflect__search_by_concept({
+  concept: "testing",
+  project: "all",
+  limit: 15
+})
+```
+
+#### Return Value
+
+Returns XML with concept-based search results:
+
+```xml
+<search_by_concept>
+  <concept>security</concept>
+  <count>5</count>
+  <results>
+    <result>
+      <score>0.89</score>
+      <timestamp>2024-01-15T10:00:00Z</timestamp>
+      <project>auth-service</project>
+      <concepts>security, authentication, jwt</concepts>
+      <related_concepts>authorization, tokens, middleware</related_concepts>
+      <files>src/auth/middleware.ts, config/security.json</files>
+      <preview>Implemented JWT authentication middleware with...</preview>
+    </result>
+  </results>
+</search_by_concept>
+```
+
 ## Configuration
 
 The behavior of these tools can be configured through environment variables:
@@ -266,19 +377,21 @@ Future possibilities (not yet implemented):
 
 ## Limitations
 
-1. **Search Scope**: Currently searches all projects (no project filtering)
-2. **Storage**: `store_reflection` not yet persistent
-3. **Performance**: Large conversation histories may be slow
-4. **Context**: Limited to conversation text (no code analysis)
+1. **Storage**: `store_reflection` not yet persistent
+2. **Performance**: Large conversation histories may be slow
+3. **Context**: Limited to conversation text content and tool outputs
+4. **File Search**: Only finds files mentioned in tool outputs (git operations, edits, reads)
 
 ## Future Enhancements
 
 Planned improvements:
-- Project-specific search filtering
-- Persistent reflection storage
-- Code snippet extraction
-- Conversation threading
+- ✅ ~~Project-specific search filtering~~ (Available since v2.4.3)
+- ✅ ~~File-based search~~ (Available since v2.5.6)
+- ✅ ~~Concept-based search~~ (Available since v2.5.6)
+- Persistent reflection storage (in development)
+- Code snippet extraction with syntax highlighting
+- Conversation threading and follow-ups
 - Multi-modal search (images, code)
-- Export capabilities
+- Export capabilities (CSV, JSON)
 
 For the latest updates, see the [GitHub repository](https://github.com/ramakay/claude-self-reflect).

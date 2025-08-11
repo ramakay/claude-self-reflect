@@ -150,6 +150,9 @@ Recent conversations matter more. Old ones fade. Like your brain, but reliable.
 
 ## What's New
 
+- **v2.5.6** - Tool Output Extraction - Captures git changes & tool outputs for cross-agent discovery
+- **v2.5.5** - Critical dependency fix & streaming importer enhancements
+- **v2.5.4** - Documentation & bug fixes (import path & state file compatibility)
 - **v2.5.3** - Streamlined README & import architecture diagram
 - **v2.5.2** - State file compatibility fix
 - **v2.4.5** - 10-40x performance boost

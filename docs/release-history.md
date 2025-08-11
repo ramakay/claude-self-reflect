@@ -1,5 +1,44 @@
 # Release History
 
+## v2.5.6 - Tool Output Extraction 
+**Released:** 2025-08-11
+
+### 🚀 Major Feature: Tool Output Extraction
+- **Metadata v2 Schema**: Captures tool outputs and git file changes for enhanced cross-agent discovery
+- **Tool Output Capture**: Extracts up to 15 tool outputs (500 chars each) per conversation
+- **Git File Tracking**: Parses git diff/show/status outputs to identify modified files
+- **Two-Pass JSONL Parsing**: Complete output capture during imports
+
+### New Search Capabilities
+- **`search_by_file`**: Find conversations with git-modified files
+- **`search_by_concept`**: Improved for git-related concepts
+- **Enhanced Semantic Search**: Tool outputs included in search index
+
+### Technical Improvements
+- **Performance**: Minimal overhead (~10ms per conversation)
+- **Storage**: ~2-5KB increase per conversation with tool outputs
+- **Backward Compatible**: Works with existing v1 metadata
+- **Files Modified**: `streaming-importer.py`, `import-conversations-unified.py`
+
+## v2.5.5 - Critical Fixes & Enhancements
+**Released:** 2025-08-11
+
+### 🔒 Critical Security Fix
+- **CRITICAL**: Fixed pydantic version conflict preventing MCP server startup
+- **Dependency Update**: pydantic >=2.11.7 for fastmcp 2.10.6 compatibility
+- **Runtime Stability**: Prevents dependency resolution failures
+
+### Streaming Importer Enhancements
+- **File Validation**: Enhanced detection of empty files (0 bytes)
+- **Summary Detection**: Automatic skipping of summary-only files without conversation data
+- **State Tracking**: Improved handling of skipped files to prevent queue blocking
+- **Re-validation Logic**: Files re-checked if they grow or change
+
+### Repository Cleanup
+- **Archive Organization**: Old release notes moved to `docs/archive/releases/`
+- **Dependencies Updated**: openai 1.97.1→1.98.0, qdrant-client 1.15.0→1.15.1
+- **Test Cleanup**: Removed test artifacts from root directory
+
 ## v2.5.4 - Documentation & Bug Fixes
 **Released:** 2025-08-07
 

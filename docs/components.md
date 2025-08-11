@@ -38,7 +38,16 @@ Each conversation chunk is stored as:
     "timestamp": "2024-01-26T10:30:00Z",
     "file_path": "path/to/conversation.jsonl",
     "chunk_index": 0,
-    "total_chunks": 5
+    "total_chunks": 5,
+    
+    // Metadata v2 Schema (Added in v2.5.6)
+    "metadata_version": "2",
+    "files_analyzed": ["src/components/Header.tsx", "package.json"],
+    "files_edited": ["README.md", "docs/api.md"],
+    "tools_used": ["Edit", "Read", "Grep"],
+    "concepts": ["react", "typescript", "documentation"],
+    "git_file_changes": ["src/auth/middleware.ts", "config/security.json"],
+    "tool_outputs": ["git status output", "test results", "build logs"]
   }
 }
 ```

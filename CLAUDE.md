@@ -46,7 +46,7 @@ Currently using client-side decay calculation (v1.3.1):
 
 ## Key Commands
 
-**📖 IMPORTANT**: For comprehensive MCP usage, see [MCP_REFERENCE.md](./MCP_REFERENCE.md)
+**📖 IMPORTANT**: For comprehensive MCP usage, see [MCP_REFERENCE.md](./docs/development/MCP_REFERENCE.md)
 
 ### MCP Management in Claude Code
 
@@ -209,7 +209,7 @@ claude-self-reflect/
 - Never commit without running tests first
 - Memory decay is opt-in (disabled by default)
 - Test files belong in organized directories, not root
-- **CRITICAL**: All agents MUST follow [MCP_REFERENCE.md](./MCP_REFERENCE.md) for MCP operations
+- **CRITICAL**: All agents MUST follow [MCP_REFERENCE.md](./docs/development/MCP_REFERENCE.md) for MCP operations
 
 ## File Organization
 - Claude automatically organizes .md files based on content (see parent project's CLAUDE.md)
