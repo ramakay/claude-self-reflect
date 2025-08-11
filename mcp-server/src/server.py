@@ -193,8 +193,10 @@ async def reflect_on_past(
     # Determine project scope
     target_project = project
     if project is None:
-        # Try to detect current project from working directory
-        cwd = os.getcwd()
+        # Use MCP_CLIENT_CWD environment variable set by run-mcp.sh
+        # This contains the actual working directory where Claude Code is running
+        cwd = os.environ.get('MCP_CLIENT_CWD', os.getcwd())
+        
         # Extract project name from path (e.g., /Users/.../projects/project-name)
         path_parts = Path(cwd).parts
         if 'projects' in path_parts:
@@ -220,6 +222,7 @@ async def reflect_on_past(
         pass  # We'll handle this differently in the filtering logic
     
     await ctx.debug(f"Searching for: {query}")
+    await ctx.debug(f"Client working directory: {cwd}")
     await ctx.debug(f"Project scope: {target_project if target_project != 'all' else 'all projects'}")
     await ctx.debug(f"Decay enabled: {should_use_decay}")
     await ctx.debug(f"Native decay mode: {USE_NATIVE_DECAY}")

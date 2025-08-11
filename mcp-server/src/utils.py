@@ -3,6 +3,30 @@
 from pathlib import Path
 
 
+def path_to_dash_encoded(path: str) -> str:
+    """
+    Convert a file path to dash-encoded format used in Claude logs.
+    
+    Examples:
+    - /Users/kyle/projects/my-app -> -Users-kyle-projects-my-app
+    - /home/user/Code/project -> -home-user-Code-project
+    
+    Args:
+        path: File system path
+        
+    Returns:
+        Dash-encoded path string
+    """
+    # Convert to Path object and get parts
+    path_obj = Path(path)
+    
+    # Remove empty parts and join with dashes
+    parts = [p for p in path_obj.parts if p and p != '/']
+    
+    # Join with dashes and add leading dash
+    return '-' + '-'.join(parts)
+
+
 def normalize_project_name(project_path: str) -> str:
     """
     Normalize project name for consistent hashing across import/search.
@@ -65,8 +89,17 @@ def normalize_project_name(project_path: str) -> str:
     # Handle regular paths - if it's a file, get the parent directory
     # Otherwise use the directory/project name itself
     if path_obj.suffix:  # It's a file (has an extension)
-        # Use the parent directory name
+        # Check if .claude is anywhere in the parent path
+        for parent in path_obj.parents:
+            if parent.name == '.claude' and parent.parent:
+                return parent.parent.name
+        # No .claude found, use immediate parent
         return path_obj.parent.name
     else:
+        # Check if any parent in the path is .claude
+        for parent in [path_obj] + list(path_obj.parents):
+            if parent.name == '.claude' and parent.parent:
+                # Return the parent of .claude (the project directory)
+                return parent.parent.name
         # Use the directory name itself
         return path_obj.name

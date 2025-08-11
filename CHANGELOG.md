@@ -5,6 +5,20 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.8] - 2025-08-11
+
+### Fixed
+- **CRITICAL: Project-Scoped Search Now Works Correctly**
+  - **Root Cause**: MCP server was always searching claude-self-reflect conversations regardless of which project you were actually in
+  - **Issue**: The server runs from `mcp-server/` directory, so `os.getcwd()` always returned the server's directory, not Claude Code's working directory
+  - **Solution**: Modified `run-mcp.sh` to capture original `$PWD` as `MCP_CLIENT_CWD` environment variable
+  - **Impact**: Project-scoped search now correctly isolates conversations per project, eliminating cross-project contamination
+  - **Files Modified**:
+    - `run-mcp.sh`: Added `export MCP_CLIENT_CWD="$PWD"` to capture client working directory
+    - `server.py`: Updated project detection logic to use `MCP_CLIENT_CWD` instead of `os.getcwd()`
+    - `utils.py`: Enhanced project name normalization functions
+  - **User Action**: None required - fix is automatic upon MCP server restart
+
 ## [2.5.7] - 2025-08-11
 
 ### Changed
