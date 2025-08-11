@@ -5,6 +5,26 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.10] - 2025-08-11
+
+### Fixed
+- **CRITICAL: MCP Server Startup Failure** - Emergency hotfix for IndentationError
+  - **Root Cause**: Version 2.5.9 shipped with unreachable dead code after return statements in three MCP tool functions
+  - **Issue**: Server failed to start with IndentationError due to dead code after return statements in:
+    - `quick_search()` - 32 lines of parsing/formatting code after return statement
+    - `search_summary()` - 57 lines of result analysis code after return statement  
+    - `get_more_results()` - 26 lines of pagination logic after return statement
+  - **Solution**: Removed all dead code after return statements while preserving error messages about MCP architectural limitations
+  - **Impact**: MCP server can now start properly, reflection tools are accessible again
+  - **Files Modified**: `mcp-server/src/server.py` - Removed 115+ lines of unreachable code
+  - **User Action**: Update to v2.5.10 immediately to restore server functionality
+
+### Technical Details
+- **What Happened**: Functions had code after return statements that Python interpreter couldn't parse
+- **Why It Happened**: Incomplete removal of old functionality when implementing MCP architectural limitation messages
+- **The Fix**: Clean removal of all code after return statements in the three affected functions
+- **No Functionality Lost**: The removed code was unreachable and non-functional due to return statements
+
 ## [2.5.9] - 2025-08-11
 
 ### Fixed
