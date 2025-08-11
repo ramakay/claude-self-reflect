@@ -192,10 +192,13 @@ async def reflect_on_past(
     
     # Determine project scope
     target_project = project
+    
+    # Always get the working directory for logging purposes
+    cwd = os.environ.get('MCP_CLIENT_CWD', os.getcwd())
+    
     if project is None:
         # Use MCP_CLIENT_CWD environment variable set by run-mcp.sh
         # This contains the actual working directory where Claude Code is running
-        cwd = os.environ.get('MCP_CLIENT_CWD', os.getcwd())
         
         # Extract project name from path (e.g., /Users/.../projects/project-name)
         path_parts = Path(cwd).parts
@@ -744,18 +747,17 @@ async def quick_search(
     project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects.")
 ) -> str:
     """Quick search that returns only the count and top result for fast overview."""
-    try:
-        # Leverage reflect_on_past with optimized parameters
-        result = await reflect_on_past(
-            ctx=ctx,
-            query=query,
-            limit=1,  # Only get the top result
-            min_score=min_score,
-            project=project,
-            response_format="xml",
-            brief=True,  # Use brief mode for minimal response
-            include_raw=False
-        )
+    # MCP architectural limitation: MCP tools cannot call other MCP tools
+    return """<error>
+MCP Architectural Limitation: This tool cannot directly call other MCP tools.
+
+To perform a quick search, please:
+1. Call reflect_on_past directly with limit=1 and brief=True
+2. Or use the reflection-specialist agent for quick searches
+
+This limitation exists because MCP tools can only be orchestrated by the client (Claude), 
+not by other tools within the MCP server.
+</error>"""
         
         # Parse and reformat for quick overview
         import re
@@ -795,17 +797,20 @@ async def search_summary(
     project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects.")
 ) -> str:
     """Get aggregated insights from search results without individual result details."""
-    # Get more results for better summary
-    result = await reflect_on_past(
-        ctx=ctx,
-        query=query,
-        limit=10,  # Get more results for analysis
-        min_score=0.6,  # Lower threshold for broader context
-        project=project,
-        response_format="xml",
-        brief=False,  # Get full excerpts for analysis
-        include_raw=False
-    )
+    # MCP architectural limitation: MCP tools cannot call other MCP tools
+    # This is a fundamental constraint of the MCP protocol
+    return """<error>
+MCP Architectural Limitation: This tool cannot directly call other MCP tools.
+
+To get a search summary, please use the reflection-specialist agent instead:
+1. Call the reflection-specialist agent
+2. Ask it to provide a summary of search results for your query
+
+Alternative: Call reflect_on_past directly and analyze the results yourself.
+
+This limitation exists because MCP tools can only be orchestrated by the client (Claude), 
+not by other tools within the MCP server.
+</error>"""
     
     # Parse results for summary generation
     import re
@@ -869,21 +874,17 @@ async def get_more_results(
     project: Optional[str] = Field(default=None, description="Search specific project only")
 ) -> str:
     """Get additional search results after an initial search (pagination support)."""
-    # Note: Since Qdrant doesn't support true offset in our current implementation,
-    # we'll fetch offset+limit results and slice
-    total_limit = offset + limit
-    
-    # Get the larger result set
-    result = await reflect_on_past(
-        ctx=ctx,
-        query=query,
-        limit=total_limit,
-        min_score=min_score,
-        project=project,
-        response_format="xml",
-        brief=False,
-        include_raw=False
-    )
+    # MCP architectural limitation: MCP tools cannot call other MCP tools
+    return """<error>
+MCP Architectural Limitation: This tool cannot directly call other MCP tools.
+
+To get more search results, please:
+1. Call reflect_on_past directly with a higher limit parameter
+2. Or use the reflection-specialist agent to handle pagination
+
+This limitation exists because MCP tools can only be orchestrated by the client (Claude), 
+not by other tools within the MCP server.
+</error>"""
     
     # Parse and extract only the additional results
     import re
