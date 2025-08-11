@@ -5,6 +5,25 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.9] - 2025-08-11
+
+### Fixed
+- **MCP Tool Interoperability**: Fixed tools attempting to call other MCP tools internally
+  - **Root Cause**: MCP architecture doesn't allow tools to call other tools - only the client (Claude) can orchestrate tool calls
+  - **Issue**: `quick_search`, `search_summary`, and `get_more_results` were trying to call `reflect_on_past` internally
+  - **Previous Error**: "FunctionTool object is not callable" - cryptic and unhelpful
+  - **Solution**: Replaced internal tool calls with graceful error messages explaining MCP architectural limitation
+  - **User Guidance**: Clear alternatives provided (use reflection-specialist agent or call tools directly)
+  - **Files Modified**: `mcp-server/src/server.py` - Updated 3 specialized search tools
+- **Variable Scope Bug**: Fixed `cwd` variable not initialized when `project="all"` specified
+  - Moved `cwd` initialization outside conditional block to ensure it's always set
+
+### Impact
+- Graceful error handling instead of cryptic "FunctionTool object is not callable" messages
+- Clear guidance for users when MCP architectural limitations prevent certain operations
+- Better developer experience with informative error messages
+- No functional regressions - all tools work as intended within MCP constraints
+
 ## [2.5.8] - 2025-08-11
 
 ### Fixed
