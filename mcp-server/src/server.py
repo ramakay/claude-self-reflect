@@ -758,36 +758,6 @@ To perform a quick search, please:
 This limitation exists because MCP tools can only be orchestrated by the client (Claude), 
 not by other tools within the MCP server.
 </error>"""
-        
-        # Parse and reformat for quick overview
-        import re
-        
-        # Extract count from metadata
-        count_match = re.search(r'<tc>(\d+)</tc>', result)
-        total_count = count_match.group(1) if count_match else "0"
-        
-        # Extract top result
-        score_match = re.search(r'<s>([\d.]+)</s>', result)
-        project_match = re.search(r'<p>([^<]+)</p>', result)
-        title_match = re.search(r'<t>([^<]+)</t>', result)
-        
-        if score_match and project_match and title_match:
-            return f"""<quick_search>
-<total_matches>{total_count}</total_matches>
-<top_result>
-<score>{score_match.group(1)}</score>
-<project>{project_match.group(1)}</project>
-<title>{title_match.group(1)}</title>
-</top_result>
-</quick_search>"""
-        else:
-            return f"""<quick_search>
-<total_matches>{total_count}</total_matches>
-<message>No relevant matches found</message>
-</quick_search>"""
-    except Exception as e:
-        await ctx.error(f"Quick search failed: {str(e)}")
-        return f"<quick_search><error>{str(e)}</error></quick_search>"
 
 
 @mcp.tool()
@@ -811,57 +781,6 @@ Alternative: Call reflect_on_past directly and analyze the results yourself.
 This limitation exists because MCP tools can only be orchestrated by the client (Claude), 
 not by other tools within the MCP server.
 </error>"""
-    
-    # Parse results for summary generation
-    import re
-    from collections import Counter
-    
-    # Extract all projects
-    projects = re.findall(r'<p>([^<]+)</p>', result)
-    project_counts = Counter(projects)
-    
-    # Extract scores for statistics
-    scores = [float(s) for s in re.findall(r'<s>([\d.]+)</s>', result)]
-    avg_score = sum(scores) / len(scores) if scores else 0
-    
-    # Extract themes from titles and excerpts
-    titles = re.findall(r'<t>([^<]+)</t>', result)
-    excerpts = re.findall(r'<e>([^<]+)</e>', result)
-    
-    # Extract metadata
-    count_match = re.search(r'<tc>(\d+)</tc>', result)
-    total_count = count_match.group(1) if count_match else "0"
-    
-    # Generate summary
-    summary = f"""<search_summary>
-<total_matches>{total_count}</total_matches>
-<searched_projects>{len(project_counts)}</searched_projects>
-<average_relevance>{avg_score:.2f}</average_relevance>
-<project_distribution>"""
-    
-    for proj, count in project_counts.most_common(3):
-        summary += f"\n  <project name='{proj}' matches='{count}'/>"
-    
-    summary += f"""
-</project_distribution>
-<common_themes>"""
-    
-    # Simple theme extraction from titles
-    theme_words = []
-    for title in titles[:5]:  # Top 5 results
-        words = [w.lower() for w in title.split() if len(w) > 4]
-        theme_words.extend(words)
-    
-    theme_counts = Counter(theme_words)
-    for theme, count in theme_counts.most_common(5):
-        if count > 1:  # Only show repeated themes
-            summary += f"\n  <theme>{theme}</theme>"
-    
-    summary += """
-</common_themes>
-</search_summary>"""
-    
-    return summary
 
 
 @mcp.tool()
@@ -885,32 +804,6 @@ To get more search results, please:
 This limitation exists because MCP tools can only be orchestrated by the client (Claude), 
 not by other tools within the MCP server.
 </error>"""
-    
-    # Parse and extract only the additional results
-    import re
-    
-    # Find all result blocks
-    result_pattern = r'<r>.*?</r>'
-    all_results = re.findall(result_pattern, result, re.DOTALL)
-    
-    # Get only the results after offset
-    additional_results = all_results[offset:offset+limit] if len(all_results) > offset else []
-    
-    if not additional_results:
-        return """<more_results>
-<message>No additional results found</message>
-</more_results>"""
-    
-    # Reconstruct response with only additional results
-    response = f"""<more_results>
-<offset>{offset}</offset>
-<count>{len(additional_results)}</count>
-<results>
-{''.join(additional_results)}
-</results>
-</more_results>"""
-    
-    return response
 
 
 @mcp.tool()
