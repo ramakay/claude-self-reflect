@@ -36,37 +36,48 @@ except ImportError:
 import voyageai
 from dotenv import load_dotenv
 
-# Load environment variables
+# Load environment variables from .env file (fallback only)
 env_path = Path(__file__).parent.parent.parent / '.env'
-load_dotenv(env_path)
+load_dotenv(env_path, override=False)  # Don't override process environment
 
-# Configuration
+# Configuration - prioritize process environment variables over .env file
 QDRANT_URL = os.getenv('QDRANT_URL', 'http://localhost:6333')
-VOYAGE_API_KEY = os.getenv('VOYAGE_KEY') or os.getenv('VOYAGE_KEY-2')
+VOYAGE_API_KEY = os.getenv('VOYAGE_KEY') or os.getenv('VOYAGE_KEY-2') or os.getenv('VOYAGE_KEY_2')
 ENABLE_MEMORY_DECAY = os.getenv('ENABLE_MEMORY_DECAY', 'false').lower() == 'true'
 DECAY_WEIGHT = float(os.getenv('DECAY_WEIGHT', '0.3'))
 DECAY_SCALE_DAYS = float(os.getenv('DECAY_SCALE_DAYS', '90'))
 USE_NATIVE_DECAY = os.getenv('USE_NATIVE_DECAY', 'false').lower() == 'true'
 
-# Embedding configuration
-PREFER_LOCAL_EMBEDDINGS = os.getenv('PREFER_LOCAL_EMBEDDINGS', 'false').lower() == 'true'
+# Embedding configuration - now using lazy initialization
+# CRITICAL: Default changed to 'true' for local embeddings for privacy
+PREFER_LOCAL_EMBEDDINGS = os.getenv('PREFER_LOCAL_EMBEDDINGS', 'true').lower() == 'true'
 EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2')
 
-# Initialize Voyage AI client (only if not using local embeddings)
-voyage_client = None
-if not PREFER_LOCAL_EMBEDDINGS and VOYAGE_API_KEY:
-    voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY)
+# Import the robust embedding manager
+from .embedding_manager import get_embedding_manager
 
-# Initialize local embedding model if needed
-local_embedding_model = None
-if PREFER_LOCAL_EMBEDDINGS or not VOYAGE_API_KEY:
+# Lazy initialization - models will be loaded on first use
+embedding_manager = None
+voyage_client = None  # Keep for backward compatibility
+local_embedding_model = None  # Keep for backward compatibility
+
+def initialize_embeddings():
+    """Initialize embedding models with robust fallback."""
+    global embedding_manager, voyage_client, local_embedding_model
     try:
-        from fastembed import TextEmbedding
-        local_embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL)
-        print(f"[DEBUG] Initialized local embedding model: {EMBEDDING_MODEL}")
-    except ImportError:
-        print("[ERROR] FastEmbed not available. Install with: pip install fastembed")
-        raise
+        embedding_manager = get_embedding_manager()
+        print(f"[INFO] Embedding manager initialized: {embedding_manager.get_model_info()}")
+        
+        # Set backward compatibility references
+        if embedding_manager.model_type == 'voyage':
+            voyage_client = embedding_manager.voyage_client
+        elif embedding_manager.model_type == 'local':
+            local_embedding_model = embedding_manager.model
+        
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize embeddings: {e}")
+        return False
 
 # Debug environment loading
 print(f"[DEBUG] Environment variables loaded:")
@@ -88,6 +99,7 @@ class SearchResult(BaseModel):
     excerpt: str
     project_name: str
     conversation_id: Optional[str] = None
+    base_conversation_id: Optional[str] = None
     collection_name: str
     raw_payload: Optional[Dict[str, Any]] = None  # Full Qdrant payload when debug mode enabled
 
@@ -100,6 +112,99 @@ mcp = FastMCP(
 
 # Create Qdrant client
 qdrant_client = AsyncQdrantClient(url=QDRANT_URL)
+
+# Track indexing status (updated periodically)
+indexing_status = {
+    "last_check": 0,
+    "indexed_conversations": 0,
+    "total_conversations": 0,
+    "percentage": 100.0,
+    "backlog_count": 0,
+    "is_checking": False
+}
+
+async def update_indexing_status():
+    """Update indexing status by checking JSONL files vs Qdrant collections.
+    This is a lightweight check that compares file counts, not full content."""
+    global indexing_status
+    
+    # Don't run concurrent checks
+    if indexing_status["is_checking"]:
+        return
+    
+    # Only check every 5 minutes to avoid overhead
+    current_time = time.time()
+    if current_time - indexing_status["last_check"] < 300:  # 5 minutes
+        return
+    
+    indexing_status["is_checking"] = True
+    
+    try:
+        # Count total JSONL files
+        projects_dir = Path.home() / ".claude" / "projects"
+        total_files = 0
+        indexed_files = 0
+        
+        if projects_dir.exists():
+            # Get all JSONL files
+            jsonl_files = list(projects_dir.glob("**/*.jsonl"))
+            total_files = len(jsonl_files)
+            
+            # Check imported-files.json to see what's been imported
+            # The streaming importer uses imported-files.json with nested structure
+            # Try multiple possible locations for the config file
+            possible_paths = [
+                Path.home() / ".claude-self-reflect" / "config" / "imported-files.json",
+                Path(__file__).parent.parent.parent / "config" / "imported-files.json",
+                Path("/config/imported-files.json")  # Docker path if running in container
+            ]
+            
+            imported_files_path = None
+            for path in possible_paths:
+                if path.exists():
+                    imported_files_path = path
+                    break
+            
+            if imported_files_path and imported_files_path.exists():
+                with open(imported_files_path, 'r') as f:
+                    imported_data = json.load(f)
+                    # The file has nested structure: {stream_position: {file: position}, imported_files: {file: lines}}
+                    # Handle new nested structure
+                    stream_position = imported_data.get("stream_position", {})
+                    imported_files_list = stream_position.get("imported_files", [])
+                    file_metadata = stream_position.get("file_metadata", {})
+                    
+                    # Count files that have been imported
+                    for file_path in jsonl_files:
+                        # Try multiple path formats to match Docker's state file
+                        file_str = str(file_path).replace(str(Path.home()), "/logs").replace("\\", "/")
+                        # Also try without .claude/projects prefix (Docker mounts directly)
+                        file_str_alt = file_str.replace("/.claude/projects", "")
+                        
+                        # Check if file is in imported_files list (fully imported)
+                        if file_str in imported_files_list or file_str_alt in imported_files_list:
+                            indexed_files += 1
+                        # Or if it has metadata with position > 0 (partially imported)
+                        elif file_str in file_metadata and file_metadata[file_str].get("position", 0) > 0:
+                            indexed_files += 1
+                        elif file_str_alt in file_metadata and file_metadata[file_str_alt].get("position", 0) > 0:
+                            indexed_files += 1
+        
+        # Update status
+        indexing_status["last_check"] = current_time
+        indexing_status["total_conversations"] = total_files
+        indexing_status["indexed_conversations"] = indexed_files
+        indexing_status["backlog_count"] = total_files - indexed_files
+        
+        if total_files > 0:
+            indexing_status["percentage"] = (indexed_files / total_files) * 100
+        else:
+            indexing_status["percentage"] = 100.0
+            
+    except Exception as e:
+        print(f"[WARNING] Failed to update indexing status: {e}")
+    finally:
+        indexing_status["is_checking"] = False
     
 async def get_all_collections() -> List[str]:
     """Get all collections (both Voyage and local)."""
@@ -115,12 +220,23 @@ async def generate_embedding(text: str, force_type: Optional[str] = None) -> Lis
         text: Text to embed
         force_type: Force specific embedding type ('local' or 'voyage')
     """
-    use_local = force_type == 'local' if force_type else (PREFER_LOCAL_EMBEDDINGS or not voyage_client)
+    global embedding_manager, voyage_client, local_embedding_model
+    
+    # Initialize on first use
+    if embedding_manager is None:
+        if not initialize_embeddings():
+            raise RuntimeError("Failed to initialize any embedding model. Check logs for details.")
+    
+    # Determine which type to use
+    if force_type:
+        use_local = force_type == 'local'
+    else:
+        use_local = embedding_manager.model_type == 'local'
     
     if use_local:
         # Use local embeddings
         if not local_embedding_model:
-            raise ValueError("Local embedding model not initialized")
+            raise ValueError("Local embedding model not available")
         
         # Run in executor since fastembed is synchronous
         loop = asyncio.get_event_loop()
@@ -131,7 +247,7 @@ async def generate_embedding(text: str, force_type: Optional[str] = None) -> Lis
     else:
         # Use Voyage AI
         if not voyage_client:
-            raise ValueError("Voyage client not initialized")
+            raise ValueError("Voyage client not available")
         result = voyage_client.embed(
             texts=[text],
             model="voyage-3-large",
@@ -417,6 +533,7 @@ async def reflect_on_past(
                             excerpt=(point.payload.get('text', '')[:350] + '...' if len(point.payload.get('text', '')) > 350 else point.payload.get('text', '')),
                             project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
+                            base_conversation_id=point.payload.get('base_conversation_id'),
                             collection_name=collection_name,
                             raw_payload=point.payload if include_raw else None
                         ))
@@ -496,6 +613,7 @@ async def reflect_on_past(
                             excerpt=(point.payload.get('text', '')[:350] + '...' if len(point.payload.get('text', '')) > 350 else point.payload.get('text', '')),
                             project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
+                            base_conversation_id=point.payload.get('base_conversation_id'),
                             collection_name=collection_name,
                             raw_payload=point.payload if include_raw else None
                         ))
@@ -532,6 +650,7 @@ async def reflect_on_past(
                             excerpt=(point.payload.get('text', '')[:350] + '...' if len(point.payload.get('text', '')) > 350 else point.payload.get('text', '')),
                             project_name=point_project,
                             conversation_id=point.payload.get('conversation_id'),
+                            base_conversation_id=point.payload.get('base_conversation_id'),
                             collection_name=collection_name,
                             raw_payload=point.payload if include_raw else None
                         ))
@@ -552,6 +671,30 @@ async def reflect_on_past(
             message="Search complete, processing results"
         )
         
+        # Apply base_conversation_id boosting before sorting
+        timing_info['boost_start'] = time.time()
+        
+        # Group results by base_conversation_id to identify related chunks
+        base_conversation_groups = {}
+        for result in all_results:
+            base_id = result.base_conversation_id
+            if base_id:
+                if base_id not in base_conversation_groups:
+                    base_conversation_groups[base_id] = []
+                base_conversation_groups[base_id].append(result)
+        
+        # Apply boost to results from base conversations with multiple high-scoring chunks
+        base_conversation_boost = 0.1  # Boost factor for base conversation matching
+        for base_id, group_results in base_conversation_groups.items():
+            if len(group_results) > 1:  # Multiple chunks from same base conversation
+                avg_score = sum(r.score for r in group_results) / len(group_results)
+                if avg_score > 0.8:  # Only boost high-quality base conversations
+                    for result in group_results:
+                        result.score += base_conversation_boost
+                        await ctx.debug(f"Boosted result from base_conversation_id {base_id}: {result.score:.3f}")
+        
+        timing_info['boost_end'] = time.time()
+        
         # Sort by score and limit
         timing_info['sort_start'] = time.time()
         all_results.sort(key=lambda x: x.score, reverse=True)
@@ -561,12 +704,89 @@ async def reflect_on_past(
         if not all_results:
             return f"No conversations found matching '{query}'. Try different keywords or check if conversations have been imported."
         
+        # Update indexing status before returning results
+        await update_indexing_status()
+        
         # Format results based on response_format
         timing_info['format_start'] = time.time()
         
         if response_format == "xml":
+            # Add upfront summary for immediate visibility (before collapsible XML)
+            upfront_summary = ""
+            
+            # Show indexing status prominently
+            if indexing_status["percentage"] < 95.0:
+                upfront_summary += f"📊 INDEXING: {indexing_status['indexed_conversations']}/{indexing_status['total_conversations']} conversations ({indexing_status['percentage']:.1f}% complete, {indexing_status['backlog_count']} pending)\n"
+            
+            # Show result summary
+            if all_results:
+                score_info = "high" if all_results[0].score >= 0.85 else "good" if all_results[0].score >= 0.75 else "partial"
+                upfront_summary += f"🎯 RESULTS: {len(all_results)} matches ({score_info} relevance, top score: {all_results[0].score:.3f})\n"
+                
+                # Show performance
+                total_time = time.time() - start_time
+                upfront_summary += f"⚡ PERFORMANCE: {int(total_time * 1000)}ms total ({len(collections_to_search)} collections searched)\n"
+            else:
+                upfront_summary += f"❌ NO RESULTS: No conversations found matching '{query}'\n"
+            
             # XML format (compact tags for performance)
-            result_text = "<search>\n"
+            result_text = upfront_summary + "\n<search>\n"
+            
+            # Add indexing status if not fully baselined - put key stats in opening tag for immediate visibility
+            if indexing_status["percentage"] < 95.0:
+                result_text += f'  <info status="indexing" progress="{indexing_status["percentage"]:.1f}%" backlog="{indexing_status["backlog_count"]}">\n'
+                result_text += f'    <message>📊 Indexing: {indexing_status["indexed_conversations"]}/{indexing_status["total_conversations"]} conversations ({indexing_status["percentage"]:.1f}% complete, {indexing_status["backlog_count"]} pending)</message>\n'
+                result_text += f"  </info>\n"
+            
+            # Add high-level result summary
+            if all_results:
+                # Count today's results
+                now = datetime.now(timezone.utc)
+                today_count = 0
+                yesterday_count = 0
+                week_count = 0
+                
+                for result in all_results:
+                    timestamp_clean = result.timestamp.replace('Z', '+00:00') if result.timestamp.endswith('Z') else result.timestamp
+                    timestamp_dt = datetime.fromisoformat(timestamp_clean)
+                    if timestamp_dt.tzinfo is None:
+                        timestamp_dt = timestamp_dt.replace(tzinfo=timezone.utc)
+                    
+                    days_ago = (now - timestamp_dt).days
+                    if days_ago == 0:
+                        today_count += 1
+                    elif days_ago == 1:
+                        yesterday_count += 1
+                    if days_ago <= 7:
+                        week_count += 1
+                
+                # Compact summary with key info in opening tag
+                time_info = ""
+                if today_count > 0:
+                    time_info = f"{today_count} today"
+                elif yesterday_count > 0:
+                    time_info = f"{yesterday_count} yesterday"
+                elif week_count > 0:
+                    time_info = f"{week_count} this week"
+                else:
+                    time_info = "older results"
+                
+                score_info = "high" if all_results[0].score >= 0.85 else "good" if all_results[0].score >= 0.75 else "partial"
+                
+                result_text += f'  <summary count="{len(all_results)}" relevance="{score_info}" recency="{time_info}" top-score="{all_results[0].score:.3f}">\n'
+                
+                # Short preview of top result
+                top_excerpt = all_results[0].excerpt[:100].strip()
+                if '...' not in top_excerpt:
+                    top_excerpt += "..."
+                result_text += f'    <preview>{top_excerpt}</preview>\n'
+                result_text += f"  </summary>\n"
+            else:
+                result_text += f"  <result-summary>\n"
+                result_text += f"    <headline>No matches found</headline>\n"
+                result_text += f"    <relevance>No conversations matched your query</relevance>\n"
+                result_text += f"  </result-summary>\n"
+            
             result_text += f"  <meta>\n"
             result_text += f"    <q>{query}</q>\n"
             result_text += f"    <scope>{target_project if target_project != 'all' else 'all'}</scope>\n"

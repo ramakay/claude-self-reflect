@@ -150,13 +150,14 @@ Recent conversations matter more. Old ones fade. Like your brain, but reliable.
 
 ## What's New
 
+- **v2.5.11** - Critical cloud mode fix - Environment variables now properly passed to MCP server
+- **v2.5.10** - Emergency hotfix for MCP server startup failure (dead code removal)
 - **v2.5.6** - Tool Output Extraction - Captures git changes & tool outputs for cross-agent discovery
 - **v2.5.5** - Critical dependency fix & streaming importer enhancements
 - **v2.5.4** - Documentation & bug fixes (import path & state file compatibility)
 - **v2.5.3** - Streamlined README & import architecture diagram
 - **v2.5.2** - State file compatibility fix
 - **v2.4.5** - 10-40x performance boost
-- **v2.4.3** - Project-scoped search
 
 [Full changelog](docs/release-history.md)
 
