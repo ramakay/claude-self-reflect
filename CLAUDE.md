@@ -55,8 +55,11 @@ Currently using client-side decay calculation (v1.3.1):
 # List all MCPs and their connection status
 claude mcp list
 
-# Add the MCP with required environment variables (name, then command, then env vars)
-claude mcp add claude-self-reflect "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e VOYAGE_KEY="your-voyage-api-key" -e QDRANT_URL="http://localhost:6333"
+# Add the MCP as user-scoped (PREFERRED - persists across projects)
+claude mcp add claude-self-reflect "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333" -s user
+
+# For local project-only setup (alternative)
+claude mcp add claude-self-reflect "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333"
 
 # Remove an MCP (useful when needing to restart)
 claude mcp remove claude-self-reflect
@@ -64,6 +67,11 @@ claude mcp remove claude-self-reflect
 # Restart MCP (remove then re-add with env vars)
 claude mcp restart claude-self-reflect
 ```
+
+#### MCP Configuration Preferences:
+- **PREFERRED**: Use `-s user` flag for user-scoped configuration (available across all projects)
+- **Alternative**: Local project configuration (only available in this project)
+- **Environment**: QDRANT_URL is required, VOYAGE_KEY is optional (defaults to local FastEmbed)
 
 #### INCORRECT Commands (Never Use):
 ```bash
@@ -210,6 +218,7 @@ claude-self-reflect/
 - Memory decay is opt-in (disabled by default)
 - Test files belong in organized directories, not root
 - **CRITICAL**: All agents MUST follow [MCP_REFERENCE.md](./docs/development/MCP_REFERENCE.md) for MCP operations
+- **Task Parallelization**: Use multiple Task invocations in a SINGLE message for parallel operations to maximize performance
 
 ## File Organization
 - Claude automatically organizes .md files based on content (see parent project's CLAUDE.md)

@@ -10,8 +10,21 @@ def main():
         "--transport",
         choices=["stdio", "sse"],
         default="stdio",
+        help="Transport protocol for MCP server (default: stdio)"
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Get indexing status as JSON with overall and per-project breakdown"
     )
     args = parser.parse_args()
+    
+    # Handle status request with early exit (avoid loading heavy MCP dependencies)
+    if args.status:
+        from .status import get_status
+        import json
+        print(json.dumps(get_status()))
+        return
     
     # Import is done here to make sure environment variables are loaded
     from .server import mcp

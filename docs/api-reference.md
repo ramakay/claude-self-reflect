@@ -375,6 +375,111 @@ Future possibilities (not yet implemented):
 - Weekly summaries of key decisions
 - Project knowledge extraction
 
+## CLI Status Interface
+
+Claude Self-Reflect provides a command-line status interface for monitoring indexing progress and integration with external tools, status bars, and automation scripts.
+
+### Command
+
+```bash
+claude-self-reflect status
+```
+
+Returns indexing status as JSON with overall statistics and per-project breakdown.
+
+### Output Format
+
+```json
+{
+  "overall": {
+    "percentage": 15.4,
+    "indexed": 111,
+    "total": 719,
+    "backlog": 608
+  },
+  "projects": {
+    "claude-self-reflect": {
+      "percentage": 22.4,
+      "indexed": 50,
+      "total": 223
+    },
+    "procsolve-website": {
+      "percentage": 41.1,
+      "indexed": 23,
+      "total": 56
+    }
+  }
+}
+```
+
+### Integration Examples
+
+#### Status Bar Integration
+```bash
+# Simple percentage: "15.4%"
+claude-self-reflect status | jq -r '.overall.percentage'
+
+# Status bar format: "15.4% (111/719)"
+claude-self-reflect status | jq -r '.overall | "\(.percentage)% (\(.indexed)/\(.total))"'
+```
+
+#### Current Project Status
+```bash
+# Get current working directory project status
+CURRENT_PROJECT=$(basename "$(pwd)")
+STATUS=$(claude-self-reflect status | jq -r --arg proj "$CURRENT_PROJECT" '.projects[$proj] // null')
+
+if [ "$STATUS" != "null" ]; then
+    PERCENT=$(echo "$STATUS" | jq -r '.percentage')
+    echo "Current project: ${PERCENT}%"
+else
+    echo "Current project: Not indexed"
+fi
+```
+
+#### Monitor Specific Projects
+```bash
+# Check specific project
+PROJECT="procsolve-website"
+PERCENT=$(claude-self-reflect status | jq -r --arg proj "$PROJECT" '.projects[$proj].percentage // "Not found"')
+echo "$PROJECT: ${PERCENT}%"
+```
+
+#### Find Projects Needing Attention
+```bash
+# Projects < 50% complete with 10+ files
+claude-self-reflect status | jq -r '
+  .projects | 
+  to_entries[] | 
+  select(.value.percentage < 50 and .value.total >= 10) | 
+  "\(.key): \(.value.percentage)%"
+'
+```
+
+### Error Handling
+
+```bash
+# Check command availability
+if ! command -v claude-self-reflect &> /dev/null; then
+    echo "❌ claude-self-reflect not installed"
+    exit 1
+fi
+
+# Timeout protection
+STATUS=$(timeout 10s claude-self-reflect status 2>/dev/null)
+if [ $? -eq 124 ]; then
+    echo "⏱️ Status check timed out"
+elif [ $? -ne 0 ]; then
+    echo "❌ Status check failed"
+fi
+```
+
+### Performance
+
+- **Execution time**: ~185ms (suitable for periodic monitoring)
+- **Dependencies**: Requires `jq` for JSON parsing
+- **Resource usage**: Minimal CPU/memory impact
+
 ## Limitations
 
 1. **Storage**: `store_reflection` not yet persistent

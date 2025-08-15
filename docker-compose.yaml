@@ -8,7 +8,7 @@ services:
     command: chown -R 1000:1000 /config
     volumes:
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-    profiles: ["watch", "mcp", "import"]
+    profiles: ["watch", "mcp", "import", "async"]
 
   # Qdrant vector database - the heart of semantic search
   qdrant:
@@ -104,18 +104,59 @@ services:
       - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
       - VOYAGE_KEY=${VOYAGE_KEY:-}
       - PREFER_LOCAL_EMBEDDINGS=${PREFER_LOCAL_EMBEDDINGS:-true}
-      - WATCH_INTERVAL=${WATCH_INTERVAL:-5}  # Testing with 5 second interval
-      - MAX_MEMORY_MB=${MAX_MEMORY_MB:-350}  # Total memory including model
-      - OPERATIONAL_MEMORY_MB=${OPERATIONAL_MEMORY_MB:-100}  # Memory for operations (increased for large file handling)
-      - CHUNK_SIZE=${CHUNK_SIZE:-5}
+      - WATCH_INTERVAL=${WATCH_INTERVAL:-1}  # Aggressive: 5x faster detection (minimum 1 second)
+      - MAX_MEMORY_MB=${MAX_MEMORY_MB:-2000}  # Ultra conservative to prevent memory leak
+      - OPERATIONAL_MEMORY_MB=${OPERATIONAL_MEMORY_MB:-1500}  # 1.5GB operational (25% of 8GB)
+      - CHUNK_SIZE=${CHUNK_SIZE:-5}  # Minimal batch size 
+      - HOT_WINDOW_MINUTES=${HOT_WINDOW_MINUTES:-15}  # Keep files HOT longer
+      - MAX_COLD_FILES_PER_CYCLE=${MAX_COLD_FILES_PER_CYCLE:-5}  # Single file processing
+      - PARALLEL_WORKERS=${PARALLEL_WORKERS:-8}  # Enable parallel embedding workers
       - PYTHONUNBUFFERED=1
       - LOGS_DIR=/logs
       - FASTEMBED_CACHE_PATH=/root/.cache/fastembed
       - CURRENT_PROJECT_PATH=${PWD}  # Pass current project path for prioritization
+      - MALLOC_ARENA_MAX=2  # MEMORY LEAK FIX: Limit glibc malloc arenas
+      - THREAD_POOL_WORKERS=${THREAD_POOL_WORKERS:-2}  # AsyncEmbedder thread pool size (speed vs stability)
+      - THREAD_POOL_RECYCLE_FILES=${THREAD_POOL_RECYCLE_FILES:-50}  # Files before recycling thread pool
     restart: unless-stopped
     profiles: ["watch"]
-    mem_limit: 1g
-    memswap_limit: 1g
+    mem_limit: 8g
+    memswap_limit: 8g
+
+  # Async streaming importer - Ground-up async rewrite
+  async-importer:
+    build:
+      context: .
+      dockerfile: Dockerfile.async-importer
+    container_name: claude-reflection-async
+    depends_on:
+      - qdrant
+    volumes:
+      - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
+      - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
+      - ./scripts:/scripts:ro
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - STATE_FILE=/config/imported-files.json
+      - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
+      - VOYAGE_KEY=${VOYAGE_KEY:-}
+      - PREFER_LOCAL_EMBEDDINGS=${PREFER_LOCAL_EMBEDDINGS:-true}
+      - WATCH_INTERVAL=${WATCH_INTERVAL:-5}
+      - MAX_MEMORY_MB=${MAX_MEMORY_MB:-2000}
+      - OPERATIONAL_MEMORY_MB=${OPERATIONAL_MEMORY_MB:-1500}
+      - CHUNK_SIZE=${CHUNK_SIZE:-5}
+      - HOT_WINDOW_MINUTES=${HOT_WINDOW_MINUTES:-15}
+      - MAX_COLD_FILES_PER_CYCLE=${MAX_COLD_FILES_PER_CYCLE:-5}
+      - THREAD_POOL_WORKERS=${THREAD_POOL_WORKERS:-2}
+      - PYTHONUNBUFFERED=1
+      - LOGS_DIR=/logs
+      - FASTEMBED_CACHE_PATH=/root/.cache/fastembed
+      - CURRENT_PROJECT_PATH=${PWD}
+      - MALLOC_ARENA_MAX=2
+    restart: unless-stopped
+    profiles: ["async"]
+    mem_limit: 4g
+    memswap_limit: 4g
 
   # MCP server for Claude integration
   mcp-server:

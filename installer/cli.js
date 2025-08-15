@@ -10,6 +10,7 @@ const __dirname = dirname(__filename);
 
 const commands = {
   setup: 'Run the setup wizard to configure Claude Self-Reflect',
+  status: 'Get indexing status as JSON (overall + per-project breakdown)',
   doctor: 'Check your installation and diagnose issues',
   help: 'Show this help message'
 };
@@ -25,6 +26,53 @@ async function setup() {
   child.on('exit', (code) => {
     process.exit(code || 0);
   });
+}
+
+async function status() {
+  // Call the Python MCP server's --status command
+  const mcpServerPath = join(__dirname, '..', 'mcp-server');
+  const venvPython = join(mcpServerPath, 'venv', 'bin', 'python');
+  const mcpModule = join(mcpServerPath, 'src');
+  
+  try {
+    const child = spawn(venvPython, ['-m', 'src', '--status'], {
+      cwd: mcpServerPath,
+      stdio: ['inherit', 'pipe', 'pipe']
+    });
+    
+    let stdout = '';
+    let stderr = '';
+    
+    child.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+    
+    child.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+    
+    child.on('exit', (code) => {
+      if (code === 0) {
+        // Output the JSON directly for other tools to parse
+        process.stdout.write(stdout);
+        process.exit(0);
+      } else {
+        console.error('Error getting status:', stderr || 'Unknown error');
+        process.exit(1);
+      }
+    });
+    
+    // Handle timeout
+    setTimeout(() => {
+      child.kill('SIGTERM');
+      console.error('Status check timed out');
+      process.exit(1);
+    }, 10000); // 10 second timeout
+    
+  } catch (error) {
+    console.error('Failed to execute status command:', error.message);
+    process.exit(1);
+  }
 }
 
 async function doctor() {
@@ -124,8 +172,11 @@ function help() {
   console.log('  claude-self-reflect setup --voyage-key=pa-1234567890');
   console.log('  claude-self-reflect setup --local');
   console.log('  claude-self-reflect setup --debug  # For troubleshooting');
+  console.log('  claude-self-reflect status          # Get indexing status as JSON');
   
-  console.log('\nFor more information: https://github.com/ramakay/claude-self-reflect');
+  console.log('\nFor more information:');
+  console.log('  Documentation: https://github.com/ramakay/claude-self-reflect');
+  console.log('  Status API: See docs/api-reference.md#cli-status-interface');
 }
 
 // Main
@@ -134,6 +185,9 @@ const command = process.argv[2] || 'help';
 switch (command) {
   case 'setup':
     setup();
+    break;
+  case 'status':
+    status();
     break;
   case 'doctor':
     doctor();
