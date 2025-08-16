@@ -168,11 +168,13 @@ async def update_indexing_status():
             if imported_files_path and imported_files_path.exists():
                 with open(imported_files_path, 'r') as f:
                     imported_data = json.load(f)
-                    # The file has nested structure: {stream_position: {file: position}, imported_files: {file: lines}}
-                    # Handle new nested structure
-                    stream_position = imported_data.get("stream_position", {})
-                    imported_files_list = stream_position.get("imported_files", [])
-                    file_metadata = stream_position.get("file_metadata", {})
+                    # The actual structure has imported_files and file_metadata at the top level
+                    # NOT nested under stream_position as previously assumed
+                    imported_files_dict = imported_data.get("imported_files", {})
+                    file_metadata = imported_data.get("file_metadata", {})
+                    
+                    # Convert dict keys to list for compatibility with existing logic
+                    imported_files_list = list(imported_files_dict.keys())
                     
                     # Count files that have been imported
                     for file_path in jsonl_files:
@@ -714,18 +716,15 @@ async def reflect_on_past(
             # Add upfront summary for immediate visibility (before collapsible XML)
             upfront_summary = ""
             
-            # Show indexing status prominently
-            if indexing_status["percentage"] < 95.0:
-                upfront_summary += f"📊 INDEXING: {indexing_status['indexed_conversations']}/{indexing_status['total_conversations']} conversations ({indexing_status['percentage']:.1f}% complete, {indexing_status['backlog_count']} pending)\n"
-            
             # Show result summary
             if all_results:
                 score_info = "high" if all_results[0].score >= 0.85 else "good" if all_results[0].score >= 0.75 else "partial"
                 upfront_summary += f"🎯 RESULTS: {len(all_results)} matches ({score_info} relevance, top score: {all_results[0].score:.3f})\n"
                 
-                # Show performance
+                # Show performance with indexing status inline
                 total_time = time.time() - start_time
-                upfront_summary += f"⚡ PERFORMANCE: {int(total_time * 1000)}ms total ({len(collections_to_search)} collections searched)\n"
+                indexing_info = f" | 📊 {indexing_status['indexed_conversations']}/{indexing_status['total_conversations']} indexed" if indexing_status["percentage"] < 100.0 else ""
+                upfront_summary += f"⚡ PERFORMANCE: {int(total_time * 1000)}ms ({len(collections_to_search)} collections searched{indexing_info})\n"
             else:
                 upfront_summary += f"❌ NO RESULTS: No conversations found matching '{query}'\n"
             
