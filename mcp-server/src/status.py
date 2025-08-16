@@ -39,6 +39,20 @@ def extract_project_name_from_path(file_path: str) -> str:
     return dir_name.lstrip('-')
 
 
+def normalize_file_path(file_path: str) -> str:
+    """Normalize file paths to handle Docker vs local path differences.
+    
+    Converts:
+    - /logs/PROJECT_DIR/file.jsonl -> ~/.claude/projects/PROJECT_DIR/file.jsonl
+    - Already normalized paths remain unchanged
+    """
+    if file_path.startswith("/logs/"):
+        # Convert Docker path to local path
+        projects_dir = str(Path.home() / ".claude" / "projects")
+        return file_path.replace("/logs/", projects_dir + "/", 1)
+    return file_path
+
+
 def get_status() -> dict:
     """Get indexing status with overall stats and per-project breakdown.
     
@@ -48,11 +62,16 @@ def get_status() -> dict:
     projects_dir = Path.home() / ".claude" / "projects"
     project_stats = defaultdict(lambda: {"indexed": 0, "total": 0})
     
+    # Build a mapping of normalized file paths to project names
+    file_to_project = {}
+    
     # Count total JSONL files per project
     if projects_dir.exists():
         for jsonl_file in projects_dir.glob("**/*.jsonl"):
-            project_name = extract_project_name_from_path(str(jsonl_file))
+            file_str = str(jsonl_file)
+            project_name = extract_project_name_from_path(file_str)
             project_stats[project_name]["total"] += 1
+            file_to_project[file_str] = project_name
     
     # Read imported-files.json to count indexed files per project
     config_paths = [
@@ -72,33 +91,42 @@ def get_status() -> dict:
             with open(imported_files_path, 'r') as f:
                 data = json.load(f)
                 
-                # Handle both old and new config file formats
-                if "stream_position" in data:
-                    # New format with stream_position
-                    stream_pos = data.get("stream_position", {})
-                    imported_files = stream_pos.get("imported_files", [])
-                    file_metadata = stream_pos.get("file_metadata", {})
-                    
-                    # Count fully imported files
-                    for file_path in imported_files:
-                        project_name = extract_project_name_from_path(file_path)
+                # The actual structure has imported_files at the top level
+                imported_files = data.get("imported_files", {})
+                
+                # Count all files in imported_files object (they are all fully imported)
+                for file_path in imported_files.keys():
+                    normalized_path = normalize_file_path(file_path)
+                    if normalized_path in file_to_project:
+                        project_name = file_to_project[normalized_path]
                         project_stats[project_name]["indexed"] += 1
-                    
-                    # Count partially imported files (files with position > 0)
-                    for file_path, metadata in file_metadata.items():
-                        if isinstance(metadata, dict) and metadata.get("position", 0) > 0:
-                            # Only count if not already in imported_files
-                            if file_path not in imported_files:
-                                project_name = extract_project_name_from_path(file_path)
+                
+                # Also check file_metadata for partially imported files
+                file_metadata = data.get("file_metadata", {})
+                for file_path, metadata in file_metadata.items():
+                    if isinstance(metadata, dict) and metadata.get("position", 0) > 0:
+                        # Only count if not already in imported_files
+                        if file_path not in imported_files:
+                            normalized_path = normalize_file_path(file_path)
+                            if normalized_path in file_to_project:
+                                project_name = file_to_project[normalized_path]
                                 project_stats[project_name]["indexed"] += 1
-                else:
-                    # Legacy format with imported_files as top-level object
-                    imported_files = data.get("imported_files", {})
-                    
-                    # Count all files in imported_files object (they are all fully imported)
-                    for file_path in imported_files.keys():
-                        project_name = extract_project_name_from_path(file_path)
-                        project_stats[project_name]["indexed"] += 1
+                
+                # Also check stream_position if it contains file paths
+                stream_position = data.get("stream_position", {})
+                if isinstance(stream_position, dict):
+                    for file_path in stream_position.keys():
+                        # Skip non-file entries
+                        if file_path in ["imported_files", "file_metadata"]:
+                            continue
+                        # Only count if not already counted
+                        if file_path not in imported_files:
+                            normalized_path = normalize_file_path(file_path)
+                            if normalized_path in file_to_project:
+                                project_name = file_to_project[normalized_path]
+                                # Only increment if not already counted
+                                if project_stats[project_name]["indexed"] < project_stats[project_name]["total"]:
+                                    project_stats[project_name]["indexed"] += 1
         except (json.JSONDecodeError, KeyError, OSError):
             # If config file is corrupted or unreadable, continue with zero indexed counts
             pass
