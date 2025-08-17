@@ -18,10 +18,10 @@ Claude forgets everything. This fixes that.
 - [Using It](#using-it)
 - [Key Features](#key-features)
 - [Performance](#performance)
-- [V2.5.16 Critical Updates](#v2516-critical-updates)
+- [V2.5.17 Critical Updates](#v2517-critical-updates)
 - [Configuration](#configuration)
 - [Technical Stack](#the-technical-stack)
-- [Problems?](#problems)
+- [Problems](#problems)
 - [What's New](#whats-new)
 - [Advanced Topics](#advanced-topics)
 - [Contributors](#contributors)
@@ -30,12 +30,12 @@ Claude forgets everything. This fixes that.
 
 Ask Claude about past conversations. Get actual answers. **100% local by default** - your conversations never leave your machine. Cloud-enhanced search available when you need it.
 
-**✅ Proven at Scale**: Successfully indexed 682 conversation files with 100% reliability. No data loss, no corruption, just seamless conversation memory that works.
+**Proven at Scale**: Successfully indexed 682 conversation files with 100% reliability. No data loss, no corruption, just seamless conversation memory that works.
 
 **Before**: "I don't have access to previous conversations"  
 **After**: 
 ```
-⏺ reflection-specialist(Search FastEmbed vs cloud embedding decision)
+reflection-specialist(Search FastEmbed vs cloud embedding decision)
   ⎿ Done (3 tool uses · 8.2k tokens · 12.4s)
 
 "Found it! Yesterday we decided on FastEmbed for local mode - better privacy, 
@@ -122,7 +122,7 @@ Here's how your conversations get imported and prioritized:
 ![Import Architecture](docs/diagrams/import-architecture.png)
 
 **The system intelligently prioritizes your conversations:**
-- **🔥 HOT** (< 5 minutes): Switches to 2-second intervals for near real-time import
+- **HOT** (< 5 minutes): Switches to 2-second intervals for near real-time import
 - **🌡️ WARM** (< 24 hours): Normal priority, processed every 60 seconds
 - **❄️ COLD** (> 24 hours): Batch processed, max 5 per cycle to prevent blocking
 
@@ -138,7 +138,7 @@ The reflection specialist automatically activates. No special commands needed.
 
 ## Key Features
 
-### 🎯 Project-Scoped Search
+### Project-Scoped Search
 Searches are **project-aware by default**. Claude automatically searches within your current project:
 
 ```
@@ -162,27 +162,27 @@ Recent conversations matter more. Old ones fade. Like your brain, but reliable.
 - **Scale**: 100% indexing success rate across all conversation types
 - **V2 Migration**: 100% complete - all conversations use token-aware chunking
 
-## V2.5.16 Critical Updates
+## V2.5.17 Critical Updates
 
-### 🚨 CPU Performance Fix - RESOLVED
+### CPU Performance Fix - RESOLVED
 **Issue**: Streaming importer was consuming **1437% CPU** causing system overload  
 **Solution**: Complete rewrite with production-grade throttling and monitoring  
 **Result**: CPU usage reduced to **<1%** (99.93% improvement)
 
-### ✅ Production-Ready Streaming Importer
+### Production-Ready Streaming Importer
 - **Non-blocking CPU monitoring** with cgroup awareness
 - **Queue overflow protection** - data deferred, never dropped
 - **Atomic state persistence** with fsync for crash recovery
 - **Memory management** with 15% GC buffer and automatic cleanup
 - **Proper async signal handling** for clean shutdowns
 
-### 🎯 100% V2 Token-Aware Chunking
+### 100% V2 Token-Aware Chunking
 - **Complete Migration**: All collections now use optimized chunking
 - **Configuration**: 400 tokens/1600 chars with 75 token/300 char overlap
 - **Search Quality**: Improved semantic boundaries and context preservation
 - **Memory Efficiency**: Streaming processing prevents OOM during imports
 
-### 📊 Performance Metrics (v2.5.16)
+### Performance Metrics (v2.5.17)
 | Metric | Before | After | Improvement |
 |--------|--------|-------|-------------|
 | CPU Usage | 1437% | <1% | 99.93% ↓ |
@@ -206,7 +206,7 @@ Fixed broken `--status` command in MCP server - now returns:
 - **MCP Server**: Python + FastMCP
 - **Search**: Semantic similarity with time decay
 
-## Problems?
+## Problems
 
 - [Troubleshooting Guide](docs/troubleshooting.md)
 - [GitHub Issues](https://github.com/ramakay/claude-self-reflect/issues)
@@ -345,6 +345,4 @@ Special thanks to our contributors:
 
 ---
 
-Stop reading. Start installing. Your future self will thank you.
-
-MIT License. Built with ❤️ for the Claude community.
+Built with ❤️ by [ramakay](https://github.com/ramakay) for the Claude community.
