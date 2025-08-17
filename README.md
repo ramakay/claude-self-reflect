@@ -6,10 +6,7 @@ Claude forgets everything. This fixes that.
 
 - [What You Get](#what-you-get)
 - [Requirements](#requirements)
-- [Quick Install](#quick-install)
-  - [Local Mode (Default)](#local-mode-default---your-data-stays-private)
-  - [Cloud Mode](#cloud-mode-better-search-accuracy)
-- [Uninstall Instructions](#uninstall-instructions)
+- [Quick Install/Uninstall](#quick-installuninstall)
 - [The Magic](#the-magic)
 - [Before & After](#before--after)
 - [Real Examples](#real-examples-that-made-us-build-this)
@@ -18,7 +15,6 @@ Claude forgets everything. This fixes that.
 - [Using It](#using-it)
 - [Key Features](#key-features)
 - [Performance](#performance)
-- [V2.5.17 Critical Updates](#v2517-critical-updates)
 - [Configuration](#configuration)
 - [Technical Stack](#the-technical-stack)
 - [Problems](#problems)
@@ -52,9 +48,11 @@ Your conversations become searchable. Your decisions stay remembered. Your conte
 - **Node.js** 16+ (for the setup wizard)
 - **Claude Desktop** app
 
-## Quick Install
+## Quick Install/Uninstall
 
-### Local Mode (Default - Your Data Stays Private)
+### Install
+
+#### Local Mode (Default - Your Data Stays Private)
 ```bash
 # Install and run automatic setup
 npm install -g claude-self-reflect
@@ -69,7 +67,7 @@ claude-self-reflect setup
 # 🔒 Keep all data local - no API keys needed
 ```
 
-### Cloud Mode (Better Search Accuracy)
+#### Cloud Mode (Better Search Accuracy)
 ```bash
 # Step 1: Get your free Voyage AI key
 # Sign up at https://www.voyageai.com/ - it takes 30 seconds
@@ -162,40 +160,6 @@ Recent conversations matter more. Old ones fade. Like your brain, but reliable.
 - **Scale**: 100% indexing success rate across all conversation types
 - **V2 Migration**: 100% complete - all conversations use token-aware chunking
 
-## V2.5.17 Critical Updates
-
-### CPU Performance Fix - RESOLVED
-**Issue**: Streaming importer was consuming **1437% CPU** causing system overload  
-**Solution**: Complete rewrite with production-grade throttling and monitoring  
-**Result**: CPU usage reduced to **<1%** (99.93% improvement)
-
-### Production-Ready Streaming Importer
-- **Non-blocking CPU monitoring** with cgroup awareness
-- **Queue overflow protection** - data deferred, never dropped
-- **Atomic state persistence** with fsync for crash recovery
-- **Memory management** with 15% GC buffer and automatic cleanup
-- **Proper async signal handling** for clean shutdowns
-
-### 100% V2 Token-Aware Chunking
-- **Complete Migration**: All collections now use optimized chunking
-- **Configuration**: 400 tokens/1600 chars with 75 token/300 char overlap
-- **Search Quality**: Improved semantic boundaries and context preservation
-- **Memory Efficiency**: Streaming processing prevents OOM during imports
-
-### Performance Metrics (v2.5.17)
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| CPU Usage | 1437% | <1% | 99.93% ↓ |
-| Memory | 8GB peak | 302MB | 96.2% ↓ |
-| Search Latency | Variable | 3.16ms avg | Consistent |
-| Test Success | Unstable | 21/25 passing | Reliable |
-
-### 🔧 CLI Status Command Fix
-Fixed broken `--status` command in MCP server - now returns:
-- Collection counts and health
-- Real-time CPU and memory usage
-- Search performance metrics
-- Import processing status
 
 ## The Technical Stack
 
@@ -214,7 +178,8 @@ Fixed broken `--status` command in MCP server - now returns:
 
 ## What's New
 
-- **v2.5.16** - **CRITICAL PERFORMANCE UPDATE** - Fixed 1437% CPU overload, 100% V2 migration complete, production streaming importer
+- **v2.5.17** - Critical CPU fix and memory limit adjustment. [Full release notes](docs/releases/v2.5.17-release-notes.md)
+- **v2.5.16** - (Pre-release only) Initial streaming importer with CPU throttling
 - **v2.5.15** - Critical bug fixes and collection creation improvements
 - **v2.5.14** - Async importer collection fix - All conversations now searchable
 - **v2.5.11** - Critical cloud mode fix - Environment variables now properly passed to MCP server
@@ -231,109 +196,20 @@ Fixed broken `--status` command in MCP server - now returns:
 - [Architecture details](docs/architecture-details.md)
 - [Contributing](CONTRIBUTING.md)
 
-## Uninstall Instructions
+### Uninstall
 
-### Complete Uninstall Guide
+For complete uninstall instructions, see [docs/UNINSTALL.md](docs/UNINSTALL.md).
 
-#### 1. Remove MCP Server from Claude Code
+Quick uninstall:
 ```bash
-# Remove the MCP server configuration
+# Remove MCP server
 claude mcp remove claude-self-reflect
 
-# Verify removal
-claude mcp list
-```
-
-#### 2. Stop and Remove Docker Containers
-```bash
-# Stop all containers
+# Stop Docker containers
 docker-compose down
 
-# Remove containers and volumes
-docker-compose down -v
-
-# Remove Docker images (optional)
-docker rmi claude-self-reflect-streaming-importer
-docker rmi claude-self-reflect-mcp-server
-```
-
-#### 3. Remove npm Package
-```bash
-# Global uninstall
+# Uninstall npm package
 npm uninstall -g claude-self-reflect
-
-# Verify removal
-npm list -g claude-self-reflect
-```
-
-#### 4. Remove Qdrant Data (Optional - This Deletes All Conversations!)
-```bash
-# WARNING: This permanently deletes all indexed conversations
-docker stop qdrant
-docker rm qdrant
-docker volume rm claude-self-reflect_qdrant_storage
-
-# Or if using local Qdrant
-rm -rf ./data/qdrant_storage
-```
-
-#### 5. Remove Project Files
-```bash
-# Remove the entire project directory
-rm -rf ~/projects/claude-self-reflect
-
-# Remove configuration files
-rm -rf ~/.claude/agents/claude-self-reflect-*
-rm -f ~/.env.claude-self-reflect
-```
-
-#### 6. Remove Python Virtual Environment
-```bash
-# If you created a dedicated venv
-rm -rf ~/claude-self-reflect-venv
-```
-
-#### 7. Clean Claude Code Agent Cache
-```bash
-# Remove specialized sub-agents
-rm -f ~/.claude/agents/qdrant-specialist.md
-rm -f ~/.claude/agents/import-debugger.md
-rm -f ~/.claude/agents/docker-orchestrator.md
-rm -f ~/.claude/agents/mcp-integration.md
-rm -f ~/.claude/agents/search-optimizer.md
-rm -f ~/.claude/agents/reflection-specialist.md
-```
-
-### Partial Uninstall (Keep Data)
-
-If you want to uninstall but preserve your indexed conversations:
-
-```bash
-# 1. Stop services but keep data
-docker-compose stop
-
-# 2. Remove MCP server
-claude mcp remove claude-self-reflect
-
-# 3. Uninstall npm package
-npm uninstall -g claude-self-reflect
-
-# Your data remains in Docker volumes and can be restored later
-```
-
-### Reinstall After Uninstall
-
-To reinstall after a complete uninstall:
-```bash
-npm install -g claude-self-reflect
-claude-self-reflect setup
-```
-
-To restore after a partial uninstall:
-```bash
-npm install -g claude-self-reflect
-docker-compose up -d
-claude mcp add claude-self-reflect "path/to/run-mcp.sh" -e QDRANT_URL="http://localhost:6333"
 ```
 
 ## Contributors
@@ -345,4 +221,4 @@ Special thanks to our contributors:
 
 ---
 
-Built with ❤️ by [ramakay](https://github.com/ramakay) for the Claude community.
+Built with ❤️  by [ramakay](https://github.com/ramakay) for the Claude community.

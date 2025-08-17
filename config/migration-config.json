@@ -1,0 +1,26 @@
+{
+  "chunking": {
+    "version": "v2",
+    "chunk_size_tokens": 400,
+    "chunk_overlap_tokens": 75,
+    "chunk_size_chars_fallback": 1600,
+    "preserve_message_boundaries": true,
+    "separators": ["\n\n", "\n", ". ", " ", ""]
+  },
+  "migration": {
+    "repair_rate_per_minute": 10,
+    "boost_v2_chunks": 1.2,
+    "pause_hours": [9, 10, 11, 14, 15, 16],
+    "priority_projects": ["anukruti", "claude-self-reflect"],
+    "enable_background_repair": true
+  },
+  "search": {
+    "boost_v2_results": true,
+    "v2_boost_factor": 1.2,
+    "min_score_threshold": 0.7
+  },
+  "monitoring": {
+    "log_migration_stats": true,
+    "stats_interval_minutes": 30
+  }
+}

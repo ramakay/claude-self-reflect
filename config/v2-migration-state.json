@@ -1,0 +1,149 @@
+{
+  "version": "2.5.16",
+  "started_at": "2025-08-17T09:27:24.693947",
+  "completed_at": "2025-08-17T11:18:20.920279",
+  "projects_migrated": {
+    "conv_90b68432_local": {
+      "migrated_at": "2025-08-17T09:28:23.388932",
+      "v1_chunks": 1,
+      "v2_chunks_created": 6
+    },
+    "conv_20e31d2b_local": {
+      "migrated_at": "2025-08-17T11:17:55.495434",
+      "v1_chunks": 6,
+      "v2_chunks_created": 0
+    },
+    "conv_3ce27839_local": {
+      "migrated_at": "2025-08-17T11:17:57.266877",
+      "v1_chunks": 5,
+      "v2_chunks_created": 0
+    },
+    "conv_ffe14b6c_local": {
+      "migrated_at": "2025-08-17T11:17:58.936040",
+      "v1_chunks": 5,
+      "v2_chunks_created": 0
+    },
+    "conv_1b0f5912_voyage": {
+      "migrated_at": "2025-08-17T10:10:25.805274",
+      "v1_chunks": 14,
+      "v2_chunks_created": 0
+    },
+    "conv_c31ca916_local": {
+      "migrated_at": "2025-08-17T09:29:37.416062",
+      "v1_chunks": 1,
+      "v2_chunks_created": 1
+    },
+    "conv_e2b70c15_local": {
+      "migrated_at": "2025-08-17T11:18:00.663227",
+      "v1_chunks": 3,
+      "v2_chunks_created": 0
+    },
+    "conv_64fe5a3b_local": {
+      "migrated_at": "2025-08-17T10:10:33.373783",
+      "v1_chunks": 39,
+      "v2_chunks_created": 422
+    },
+    "conv_f13e03e9_local": {
+      "migrated_at": "2025-08-17T11:18:02.337790",
+      "v1_chunks": 3,
+      "v2_chunks_created": 0
+    },
+    "conv_168a485f_local": {
+      "migrated_at": "2025-08-17T09:37:38.015448",
+      "v1_chunks": 1,
+      "v2_chunks_created": 9
+    },
+    "conv_3dce28e9_local": {
+      "migrated_at": "2025-08-17T09:37:41.470333",
+      "v1_chunks": 267,
+      "v2_chunks_created": 204
+    },
+    "conv_88cfc96a_local": {
+      "migrated_at": "2025-08-17T09:37:43.169818",
+      "v1_chunks": 4,
+      "v2_chunks_created": 1
+    },
+    "conv_fa66b70f_local": {
+      "migrated_at": "2025-08-17T11:18:05.916437",
+      "v1_chunks": 36,
+      "v2_chunks_created": 0
+    },
+    "conv_d1469ac0_local": {
+      "migrated_at": "2025-08-17T11:18:07.592445",
+      "v1_chunks": 1,
+      "v2_chunks_created": 0
+    },
+    "conv_ee2ad4da_local": {
+      "migrated_at": "2025-08-17T11:18:09.238309",
+      "v1_chunks": 2,
+      "v2_chunks_created": 0
+    },
+    "conv_bb8f8088_local": {
+      "migrated_at": "2025-08-17T11:18:10.945343",
+      "v1_chunks": 2,
+      "v2_chunks_created": 0
+    },
+    "conv_01ad4fa6_local": {
+      "migrated_at": "2025-08-17T10:10:49.611652",
+      "v1_chunks": 1,
+      "v2_chunks_created": 4
+    },
+    "conv_22f17df6_local": {
+      "migrated_at": "2025-08-17T11:18:13.237900",
+      "v1_chunks": 8,
+      "v2_chunks_created": 45
+    },
+    "conv_6c4b74d9_local": {
+      "migrated_at": "2025-08-17T10:10:58.582319",
+      "v1_chunks": 71,
+      "v2_chunks_created": 14
+    },
+    "conv_228ca34a_local": {
+      "migrated_at": "2025-08-17T10:11:00.267237",
+      "v1_chunks": 1,
+      "v2_chunks_created": 0
+    },
+    "conv_a5ed5c5a_local": {
+      "migrated_at": "2025-08-17T11:18:14.887164",
+      "v1_chunks": 2,
+      "v2_chunks_created": 0
+    },
+    "conv_b07de732_local": {
+      "migrated_at": "2025-08-17T10:11:04.467989",
+      "v1_chunks": 99,
+      "v2_chunks_created": 35
+    },
+    "conv_51435d8d_local": {
+      "migrated_at": "2025-08-17T10:11:06.157273",
+      "v1_chunks": 5,
+      "v2_chunks_created": 2
+    },
+    "conv_7f6df0fc_local": {
+      "migrated_at": "2025-08-17T11:18:16.559349",
+      "v1_chunks": 1,
+      "v2_chunks_created": 0
+    },
+    "conv_79348fed_local": {
+      "migrated_at": "2025-08-17T11:18:18.235615",
+      "v1_chunks": 1,
+      "v2_chunks_created": 0
+    },
+    "conv_17dd5d6a_local": {
+      "migrated_at": "2025-08-17T10:11:11.996332",
+      "v1_chunks": 108,
+      "v2_chunks_created": 54
+    },
+    "conv_42b8c052_local": {
+      "migrated_at": "2025-08-17T11:18:19.919460",
+      "v1_chunks": 59,
+      "v2_chunks_created": 0
+    },
+    "conv_a3c13968_local": {
+      "migrated_at": "2025-08-17T11:18:04.234869",
+      "v1_chunks": 3,
+      "v2_chunks_created": 17
+    }
+  },
+  "total_chunks_migrated": 62,
+  "status": "completed"
+}
