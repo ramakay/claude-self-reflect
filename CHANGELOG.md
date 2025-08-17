@@ -5,6 +5,15 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.18] - 2025-08-17
+
+### Security
+- **Updated Dependencies**: Security patch for Docker streaming-importer
+  - Updated `fastembed` from 0.2.7 to 0.4.0 (latest stable)
+  - Updated `numpy` from 1.26.0 to 1.26.4 (latest compatible with fastembed constraints)
+  - No critical or high severity vulnerabilities found in GitHub security scanning
+  - All services tested and running correctly after updates
+
 ## [2.5.16] - 2025-08-17
 
 ### 🚨 Critical Performance & Stability Release

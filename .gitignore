@@ -17,6 +17,7 @@ build/
 .env.local
 .env.*.local
 .env.template
+.env.backup*
 
 # IDE files
 .vscode/

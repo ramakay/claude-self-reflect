@@ -14,11 +14,12 @@ RUN pip install --upgrade pip setuptools wheel
 # Install PyTorch CPU version for smaller size
 RUN pip install --no-cache-dir torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu
 
-# Install other dependencies
+# Install other dependencies with updated versions for security
+# Note: fastembed 0.4.0 requires numpy<2, so using compatible version
 RUN pip install --no-cache-dir \
     qdrant-client==1.15.0 \
-    fastembed==0.2.7 \
-    numpy==1.26.0 \
+    fastembed==0.4.0 \
+    numpy==1.26.4 \
     psutil==7.0.0 \
     tenacity==8.2.3 \
     python-dotenv==1.0.0 \
