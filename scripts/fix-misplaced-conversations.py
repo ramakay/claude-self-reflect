@@ -15,6 +15,11 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Any
 import json
+import sys
+
+# Add parent directory to path to import utils
+sys.path.insert(0, str(Path(__file__).parent))
+from utils import normalize_project_name
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import PointStruct, VectorParams, Distance
@@ -31,7 +36,9 @@ class CollectionFixer:
     
     def get_expected_collection(self, project_path: str) -> str:
         """Calculate expected collection name for a project."""
-        hash_val = hashlib.md5(project_path.encode()).hexdigest()[:8]
+        # Normalize the project name first (like MCP server does)
+        normalized = normalize_project_name(project_path)
+        hash_val = hashlib.md5(normalized.encode()).hexdigest()[:8]
         return f"conv_{hash_val}_local"
     
     async def ensure_collection_exists(self, collection_name: str):

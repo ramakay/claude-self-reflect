@@ -545,7 +545,7 @@ def import_project(project_path: Path, collection_name: str, state: dict) -> int
                         "conversation_id": conversation_id,
                         "chunk_index": chunk["chunk_index"],
                         "timestamp": created_at,
-                        "project": project_path.name,
+                        "project": normalize_project_name(project_path.name),
                         "start_role": chunk["start_role"]
                     }
                     # Add metadata fields
