@@ -110,7 +110,7 @@ services:
       - MAX_CONCURRENT_QDRANT=2  # Limit concurrent Qdrant operations
       - IMPORT_FREQUENCY=15  # Check every 15 seconds instead of 1
       - BATCH_SIZE=3  # Process only 3 files at a time
-      - MEMORY_LIMIT_MB=400  # Tight memory limit
+      - MEMORY_LIMIT_MB=600  # Memory limit (increased from 400MB for stability)
       - MAX_QUEUE_SIZE=100  # Limit queue size
       - MAX_BACKLOG_HOURS=24  # Alert if backlog > 24 hours
       - QDRANT_TIMEOUT=10  # 10 second timeout for Qdrant ops

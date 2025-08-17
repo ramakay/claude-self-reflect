@@ -63,7 +63,7 @@ class Config:
     # Production throttling controls
     import_frequency: int = field(default_factory=lambda: int(os.getenv("IMPORT_FREQUENCY", "10")))  # Check every 10s
     batch_size: int = field(default_factory=lambda: int(os.getenv("BATCH_SIZE", "5")))
-    memory_limit_mb: int = field(default_factory=lambda: int(os.getenv("MEMORY_LIMIT_MB", "400")))
+    memory_limit_mb: int = field(default_factory=lambda: int(os.getenv("MEMORY_LIMIT_MB", "600")))
     
     # CPU management - properly scaled for multi-core
     max_cpu_percent_per_core: float = field(default_factory=lambda: float(os.getenv("MAX_CPU_PERCENT_PER_CORE", "50")))
