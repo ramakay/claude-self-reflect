@@ -273,3 +273,21 @@ claude mcp add claude-self-reflect "/path/to/mcp-server/run-mcp.sh" -e QDRANT_UR
 4. **Test with small imports first** using --limit flag
 5. **Monitor Docker logs** if using containerized setup
 - all claude related conversations are in ~/.claude/projects not in conversations folder - this is NOT a claude desktop project.
+
+## Lessons Learned from v2.5.17 Release Crisis
+
+### Critical Testing Rules
+1. **NEVER skip tests** - even under pressure (v2.5.16 disaster: streaming importer didn't work)
+2. **Test with real data** - not just synthetic tests (`.json` vs `.jsonl` issue)
+3. **Memory limits matter** - too conservative = nothing works (400MB blocked all processing)
+4. **Pre-releases are valuable** - saved us from breaking production
+5. **Multiple AI reviews catch different issues** - GPT-5 found queue risks, Opus 4.1 found race conditions
+6. **Version consistency is critical** - automated systems kept reverting versions
+7. **CPU calculations need container awareness** - 1437% was actually 90% of cgroup limit
+8. **Follow the workflow religiously** - implementation → review → test → docs → release
+9. **Track test completion explicitly** - "completed" means executed and passing, not just written
+10. **Resource monitoring must account for baseline** - 400MB limit + 400MB baseline = 0MB available
+11. **Document actual vs expected behavior** - "0 files processed" revealed the failure
+12. **Rollback strategies must be immediate** - convert to pre-release, don't push through
+13. **State persistence without progress is a red flag** - activity ≠ productivity
+14. **Default configs should be generous** - start high (1GB), optimize down, not vice versa

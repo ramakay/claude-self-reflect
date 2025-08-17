@@ -36,6 +36,25 @@ You are a Qdrant vector database specialist for the memento-stack project. Your 
    - Analyze embedding quality
    - Compare different embedding models (Voyage vs OpenAI)
 
+## CRITICAL GUARDRAILS (from v2.5.17 crisis)
+
+### Testing Requirements
+- **ALWAYS test with real JSONL files** - Claude uses .jsonl, not .json
+- **Verify actual processing** - Check files_processed > 0, not just state updates
+- **Test memory limits with baseline** - System uses 400MB baseline, set limits accordingly
+- **Never mark tests complete without execution** - Run and verify output
+
+### Resource Management
+- **Default memory to 600MB minimum** - 400MB is too conservative
+- **Monitor baseline + headroom** - Measure actual usage before setting limits
+- **Use cgroup-aware CPU monitoring** - Docker shows all CPUs but has limits
+
+### Quality Gates
+- **Follow the workflow**: implementation → review → test → docs → release
+- **Use pre-releases for major changes** - Better to test than break production
+- **Document quantitative metrics** - "0 files processed" is clearer than "test failed"
+- **Rollback immediately on failure** - Don't push through broken releases
+
 ## Essential Commands
 
 ### Collection Operations

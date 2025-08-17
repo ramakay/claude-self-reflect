@@ -1,0 +1,284 @@
+{
+  "timestamp": "2025-08-17T11:30:50.540059",
+  "passed": 0,
+  "failed": 25,
+  "errors": [
+    {
+      "test": "Signal Handler",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "CPU Monitor Init",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Queue Overflow",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "State Persistence",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Cgroup CPU",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Memory Buffer",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Atomic Writes",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Embedding Retry",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Qdrant Timeout",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Missing Logs",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Chunking",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "High Water Mark",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Concurrency",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Cache TTL",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Backlog Alert",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "CPU Throttle",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Memory Cleanup",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Tool Extraction",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Concepts",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Shutdown",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Platform Replace",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Regex Limit",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Executor Cleanup",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Cached Time",
+      "error": "No module named 'streaming_importer_final'"
+    },
+    {
+      "test": "Integration",
+      "error": "No module named 'streaming_importer_final'"
+    }
+  ],
+  "test_details": [
+    {
+      "name": "Signal Handler",
+      "description": "Verify no race condition in signal handling",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 9.202957153320312e-05
+    },
+    {
+      "name": "CPU Monitor Init",
+      "description": "Verify CPU monitoring doesn't return 0%",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 4.100799560546875e-05
+    },
+    {
+      "name": "Queue Overflow",
+      "description": "Verify queue overflow handling",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 5.078315734863281e-05
+    },
+    {
+      "name": "State Persistence",
+      "description": "Verify state survives container restart",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.981590270996094e-05
+    },
+    {
+      "name": "Cgroup CPU",
+      "description": "Verify Docker CPU limits are respected",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 4.291534423828125e-05
+    },
+    {
+      "name": "Memory Buffer",
+      "description": "Verify 15% GC buffer in memory checks",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 9.584426879882812e-05
+    },
+    {
+      "name": "Atomic Writes",
+      "description": "Verify atomic state file updates",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 5.817413330078125e-05
+    },
+    {
+      "name": "Embedding Retry",
+      "description": "Verify embeddings retry on failure",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 4.982948303222656e-05
+    },
+    {
+      "name": "Qdrant Timeout",
+      "description": "Verify proper task cancellation",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.981590270996094e-05
+    },
+    {
+      "name": "Missing Logs",
+      "description": "Verify graceful handling of missing dir",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 4.00543212890625e-05
+    },
+    {
+      "name": "Chunking",
+      "description": "Verify natural boundary detection",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 4.792213439941406e-05
+    },
+    {
+      "name": "High Water Mark",
+      "description": "Verify efficient file scanning",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.719329833984375e-05
+    },
+    {
+      "name": "Concurrency",
+      "description": "Verify semaphore limits",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.910064697265625e-05
+    },
+    {
+      "name": "Cache TTL",
+      "description": "Verify collection cache expiry",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.600120544433594e-05
+    },
+    {
+      "name": "Backlog Alert",
+      "description": "Verify old file warnings",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.409385681152344e-05
+    },
+    {
+      "name": "CPU Throttle",
+      "description": "Verify throttling triggers correctly",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.62396240234375e-05
+    },
+    {
+      "name": "Memory Cleanup",
+      "description": "Verify GC and malloc_trim",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.0040740966796875e-05
+    },
+    {
+      "name": "Tool Extraction",
+      "description": "Verify tool usage metadata",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.1948089599609375e-05
+    },
+    {
+      "name": "Concepts",
+      "description": "Verify concept detection",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.0994415283203125e-05
+    },
+    {
+      "name": "Shutdown",
+      "description": "Verify clean shutdown",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.504753112792969e-05
+    },
+    {
+      "name": "Platform Replace",
+      "description": "Verify Windows/POSIX handling",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.4809112548828125e-05
+    },
+    {
+      "name": "Regex Limit",
+      "description": "Verify regex performance limits",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.719329833984375e-05
+    },
+    {
+      "name": "Executor Cleanup",
+      "description": "Verify clean thread shutdown",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.0040740966796875e-05
+    },
+    {
+      "name": "Cached Time",
+      "description": "Verify timestamp caching",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 2.8133392333984375e-05
+    },
+    {
+      "name": "Integration",
+      "description": "Full processing pipeline",
+      "passed": false,
+      "error": "No module named 'streaming_importer_final'",
+      "duration": 3.0994415283203125e-05
+    }
+  ]
+}

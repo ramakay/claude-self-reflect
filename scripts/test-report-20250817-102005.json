@@ -1,0 +1,267 @@
+{
+  "timestamp": "2025-08-17T10:19:51.413784",
+  "version": "2.5.16",
+  "tests": {
+    "JSONL Format Compatibility": {
+      "name": "JSONL Format Compatibility",
+      "status": "passed",
+      "details": {
+        "standard": 0,
+        "nested": 0,
+        "anukruti": 0,
+        "total_chunks": 20,
+        "v1_chunks": 0,
+        "v2_chunks": 20
+      },
+      "message": "Multiple formats detected, 100.0% v2 chunks"
+    },
+    "Age-Based Search Patterns": {
+      "name": "Age-Based Search Patterns",
+      "status": "passed",
+      "details": {
+        "today": 61,
+        "this_week": 0,
+        "this_month": 0,
+        "older": 0
+      },
+      "message": "Found 61 chunks across all age groups"
+    },
+    "Conversation Size Handling": {
+      "name": "Conversation Size Handling",
+      "status": "passed",
+      "details": {
+        "small": {
+          "count": 7,
+          "v2_count": 7,
+          "avg_size": 729.1428571428571
+        },
+        "medium": {
+          "count": 24,
+          "v2_count": 24,
+          "avg_size": 1489.5416666666667
+        }
+      },
+      "message": "V2 chunking working for larger conversations"
+    },
+    "Chunk Boundary Cases": {
+      "name": "Chunk Boundary Cases",
+      "status": "passed",
+      "details": {
+        "truncated_v1": 0,
+        "truncated_markers": 0,
+        "empty_chunks": 0,
+        "overlapping_v2": 41,
+        "proper_v2": 41
+      },
+      "message": "V2 chunking reducing boundary issues (41 good v2 chunks)"
+    },
+    "Technical Term Searches": {
+      "name": "Technical Term Searches",
+      "status": "warning",
+      "details": {
+        "TensorZero API ML model infere": {
+          "max_score": 0.43109602,
+          "avg_score": 0.313105435,
+          "found_v2": true
+        },
+        "Sanskrit philosophical discuss": {
+          "max_score": 0.09287633,
+          "avg_score": 0.07729640666666666,
+          "found_v2": true
+        },
+        "Observable A/B testing framewo": {
+          "max_score": 0.14304967,
+          "avg_score": 0.112874798,
+          "found_v2": true
+        }
+      },
+      "message": "Low scores for technical terms (avg: 0.222)"
+    },
+    "Project Isolation": {
+      "name": "Project Isolation",
+      "status": "passed",
+      "details": {
+        "projects_found": [
+          "-Users-ramakrishnanannaswamy-projects-mantis-mantis-test",
+          "-Users-ramakrishnanannaswamy-projects-llmsharedmemory",
+          "-Users-ramakrishnanannaswamy-projects-Fuselenses",
+          "/logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect",
+          "/logs/-Users-ramakrishnanannaswamy-projects",
+          "/logs/-Users-ramakrishnanannaswamy-memento-stack",
+          "cloud-test-1755038399",
+          "cc-statusline",
+          "/logs/-Users-ramakrishnanannaswamy-memento-stack-qdrant-mcp-stack",
+          "/logs/-Users-ramakrishnanannaswamy-projects-llmsharedmemory"
+        ],
+        "total_projects": 64,
+        "project_sample": {
+          "-Users-ramakrishnanannaswamy-projects-mantis-mantis-test": {
+            "collections": [
+              "conv_ebb63232_local"
+            ],
+            "total_chunks": 11,
+            "v2_chunks": 0
+          },
+          "-Users-ramakrishnanannaswamy-projects-llmsharedmemory": {
+            "collections": [
+              "conv_2b4b4b1f_local"
+            ],
+            "total_chunks": 98,
+            "v2_chunks": 0
+          },
+          "-Users-ramakrishnanannaswamy-projects-Fuselenses": {
+            "collections": [
+              "conv_ec59a1bb_local"
+            ],
+            "total_chunks": 39,
+            "v2_chunks": 0
+          }
+        }
+      },
+      "message": "Found 64 isolated projects"
+    },
+    "Score Threshold Testing": {
+      "name": "Score Threshold Testing",
+      "status": "passed",
+      "details": {
+        "threshold_0.2": {
+          "matches": 2,
+          "v2_matches": 2
+        },
+        "threshold_0.3": {
+          "matches": 0,
+          "v2_matches": 0
+        },
+        "threshold_0.5": {
+          "matches": 0,
+          "v2_matches": 0
+        },
+        "threshold_0.7": {
+          "matches": 0,
+          "v2_matches": 0
+        }
+      },
+      "message": "Score thresholds working correctly"
+    },
+    "V1/V2 Coexistence & Boosting": {
+      "name": "V1/V2 Coexistence & Boosting",
+      "status": "passed",
+      "details": {
+        "v1_only_collections": 0,
+        "v2_only_collections": 4,
+        "mixed_collections": 1,
+        "v2_boost_evidence": [
+          {
+            "version": "v2",
+            "score": 0.039143234
+          },
+          {
+            "version": "v2",
+            "score": 0.02714818
+          },
+          {
+            "version": "v2",
+            "score": 0.02380345
+          },
+          {
+            "version": "v2",
+            "score": 0.022906536
+          },
+          {
+            "version": "v2",
+            "score": 0.022906536
+          },
+          {
+            "version": "v2",
+            "score": -0.010614489
+          },
+          {
+            "version": "v2",
+            "score": -0.057682954
+          },
+          {
+            "version": "v2",
+            "score": -0.061399024
+          },
+          {
+            "version": "v2",
+            "score": -0.061545398
+          },
+          {
+            "version": "v2",
+            "score": -0.08717741
+          },
+          {
+            "version": "v2",
+            "score": 0.2473408
+          },
+          {
+            "version": "v2",
+            "score": 0.1685103
+          },
+          {
+            "version": "v2",
+            "score": 0.13755585
+          },
+          {
+            "version": "v2",
+            "score": 0.13679335
+          },
+          {
+            "version": "v2",
+            "score": 0.13361368
+          },
+          {
+            "version": "v2",
+            "score": 0.132927
+          },
+          {
+            "version": "v2",
+            "score": 0.119538344
+          },
+          {
+            "version": "v2",
+            "score": 0.11952485
+          },
+          {
+            "version": "v2",
+            "score": 0.11168523
+          },
+          {
+            "version": "v2",
+            "score": 0.11136452
+          }
+        ]
+      },
+      "message": "V1/V2 coexisting in 1 collections"
+    },
+    "Critical Content Recovery": {
+      "name": "Critical Content Recovery",
+      "status": "failed",
+      "details": {
+        "TensorZero": {
+          "found": false,
+          "max_score": 0,
+          "found_in_v2": false
+        },
+        "Sanskrit": {
+          "found": false,
+          "max_score": 0,
+          "found_in_v2": false
+        },
+        "Observable": {
+          "found": false,
+          "max_score": 0,
+          "found_in_v2": false
+        }
+      },
+      "message": "Critical content still not searchable!"
+    }
+  },
+  "summary": {
+    "total": 9,
+    "passed": 7,
+    "failed": 1,
+    "warnings": 1
+  }
+}

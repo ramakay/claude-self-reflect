@@ -13,6 +13,26 @@ You are a Docker orchestration specialist for the memento-stack project. You man
 - Services run on host network for local development
 - Production uses Railway deployment
 
+## CRITICAL GUARDRAILS (from v2.5.17 crisis)
+
+### Resource Limit Guidelines
+⚠️ **Memory limits must include baseline usage**
+- Measure baseline: `docker stats --no-stream`
+- Add 200MB+ headroom above baseline
+- Default: 600MB minimum (not 400MB)
+
+⚠️ **CPU monitoring in containers**
+- Containers see all host CPUs but have cgroup limits
+- 1437% CPU = ~90% of actual allocation
+- Use cgroup-aware monitoring: `/sys/fs/cgroup/cpu/cpu.cfs_quota_us`
+
+### Pre-Deployment Checklist
+✅ Test with production data volumes (600+ files)
+✅ Verify STATE_FILE paths match between config and container
+✅ Check volume mounts are writable
+✅ Confirm memory/CPU limits are realistic
+✅ Test graceful shutdown handling
+
 ## Key Responsibilities
 
 1. **Service Management**
