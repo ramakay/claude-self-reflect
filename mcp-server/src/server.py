@@ -624,8 +624,8 @@ async def reflect_on_past(
                     results = await qdrant_client.search(
                         collection_name=collection_name,
                         query_vector=query_embedding,
-                        limit=limit,
-                        score_threshold=min_score,
+                        limit=limit * 2,  # Get more results to account for filtering
+                        score_threshold=min_score * 0.9,  # Slightly lower threshold to catch v1 chunks
                         with_payload=True
                     )
                     
@@ -643,10 +643,25 @@ async def reflect_on_past(
                             # We want to match just "ShopifyMCPMockShop"
                             if not point_project.endswith(f"-{target_project}") and point_project != target_project:
                                 continue  # Skip results from other projects
+                        
+                        # BOOST V2 CHUNKS: Apply score boost for v2 chunks (better quality)
+                        original_score = point.score
+                        final_score = original_score
+                        chunking_version = point.payload.get('chunking_version', 'v1')
+                        
+                        if chunking_version == 'v2':
+                            # Boost v2 chunks by 20% (configurable)
+                            boost_factor = 1.2  # From migration config
+                            final_score = min(1.0, original_score * boost_factor)
+                            await ctx.debug(f"Boosted v2 chunk: {original_score:.3f} -> {final_score:.3f}")
+                        
+                        # Apply minimum score threshold after boosting
+                        if final_score < min_score:
+                            continue
                             
                         all_results.append(SearchResult(
                             id=str(point.id),
-                            score=point.score,
+                            score=final_score,
                             timestamp=clean_timestamp,
                             role=point.payload.get('start_role', point.payload.get('role', 'unknown')),
                             excerpt=(point.payload.get('text', '')[:350] + '...' if len(point.payload.get('text', '')) > 350 else point.payload.get('text', '')),
@@ -1254,4 +1269,25 @@ print(f"[DEBUG] FastMCP server created with name: {mcp.name}")
 
 # Run the server
 if __name__ == "__main__":
+    import sys
+    
+    # Handle --status command
+    if len(sys.argv) > 1 and sys.argv[1] == "--status":
+        import asyncio
+        
+        async def print_status():
+            await update_indexing_status()
+            # Convert timestamp to string for JSON serialization
+            status_copy = indexing_status.copy()
+            if status_copy["last_check"]:
+                from datetime import datetime
+                status_copy["last_check"] = datetime.fromtimestamp(status_copy["last_check"]).isoformat()
+            else:
+                status_copy["last_check"] = None
+            print(json.dumps(status_copy, indent=2))
+        
+        asyncio.run(print_status())
+        sys.exit(0)
+    
+    # Normal MCP server operation
     mcp.run()

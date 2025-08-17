@@ -22,7 +22,8 @@ RUN pip install --no-cache-dir \
     psutil==7.0.0 \
     tenacity==8.2.3 \
     python-dotenv==1.0.0 \
-    voyageai==0.2.3
+    voyageai==0.2.3 \
+    langchain-text-splitters==0.3.9
 
 # Pre-download and cache the FastEmbed model to reduce startup time
 # Set cache directory to a writable location
