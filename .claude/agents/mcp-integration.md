@@ -16,6 +16,51 @@ You are an MCP server development specialist for the memento-stack project. You 
 - Supports both local (FastEmbed) and cloud (Voyage AI) embeddings
 - MCP determines project from working directory context
 
+## Available Test Suites
+
+### MCP-Specific Tests
+1. **Comprehensive MCP Tool Tests** (`tests/test_mcp_tools_comprehensive.py`)
+   - Tests all MCP tools: reflect_on_past, store_reflection, quick_search, search_summary
+   - Edge case handling and error scenarios
+   - Parameter validation (limit, min_score, use_decay, response_format)
+   - Cross-project search with project="all"
+   - Run with: `python tests/test_mcp_tools_comprehensive.py`
+
+2. **MCP Search Tests** (`scripts/test-mcp-search.py`)
+   - Basic MCP search functionality
+   - Integration with Qdrant backend
+   - Response parsing and formatting
+   - Run with: `python scripts/test-mcp-search.py`
+
+3. **MCP Robustness Tests** (`scripts/test-mcp-robustness.py`)
+   - Error recovery mechanisms
+   - Timeout handling
+   - Connection resilience
+   - Run with: `python scripts/test-mcp-robustness.py`
+
+### Running MCP Tests
+```bash
+# Run all MCP tests
+cd /Users/ramakrishnanannaswamy/projects/claude-self-reflect
+python tests/run_all_tests.py -c mcp_tools mcp_search
+
+# Test MCP server directly
+cd mcp-server && python test_server.py
+
+# Verify MCP registration in Claude Code
+claude mcp list | grep claude-self-reflect
+
+# Test MCP tools from Python
+python -c "from mcp_server.src.server import reflect_on_past; import asyncio; asyncio.run(reflect_on_past({'query': 'test', 'limit': 5}))"
+```
+
+### MCP Tool Parameters Reference
+- **reflect_on_past**: query, limit, brief, min_score, project, use_decay, response_format, include_raw
+- **store_reflection**: content, tags
+- **quick_search**: query, min_score, project
+- **search_by_file**: file_path, limit, project
+- **search_by_concept**: concept, include_files, limit, project
+
 ## Key Responsibilities
 
 1. **MCP Server Development**

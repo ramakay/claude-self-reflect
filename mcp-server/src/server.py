@@ -1169,7 +1169,8 @@ async def search_by_concept(
     
     if project and project != 'all':
         # Filter collections for specific project
-        project_hash = hashlib.md5(project.encode()).hexdigest()[:8]
+        normalized_project = normalize_project_name(project)
+        project_hash = hashlib.md5(normalized_project.encode()).hexdigest()[:8]
         collection_prefix = f"conv_{project_hash}_"
         collections = [c for c in await get_all_collections() if c.startswith(collection_prefix)]
     elif project == 'all':
@@ -1178,39 +1179,89 @@ async def search_by_concept(
     if not collections:
         return "<search_by_concept>\n<error>No collections found to search</error>\n</search_by_concept>"
     
+    # First, check metadata health
+    metadata_found = False
+    total_points_checked = 0
+    
+    for collection_name in collections[:3]:  # Sample first 3 collections
+        try:
+            sample_points, _ = await qdrant_client.scroll(
+                collection_name=collection_name,
+                limit=10,
+                with_payload=True
+            )
+            total_points_checked += len(sample_points)
+            for point in sample_points:
+                if 'concepts' in point.payload and point.payload['concepts']:
+                    metadata_found = True
+                    break
+            if metadata_found:
+                break
+        except:
+            continue
+    
     # Search all collections
     all_results = []
     
-    for collection_name in collections:
-        try:
-            # Hybrid search: semantic + concept filter
-            results = await qdrant_client.search(
-                collection_name=collection_name,
-                query_vector=embedding,
-                query_filter=models.Filter(
-                    should=[
-                        models.FieldCondition(
-                            key="concepts",
-                            match=models.MatchAny(any=[concept.lower()])
-                        )
-                    ]
-                ),
-                limit=limit * 2,  # Get more results for better filtering
-                with_payload=True
-            )
-            
-            for point in results:
-                payload = point.payload
-                # Boost score if concept is in the concepts list
-                score_boost = 0.2 if concept.lower() in payload.get('concepts', []) else 0.0
-                all_results.append({
-                    'score': float(point.score) + score_boost,
-                    'payload': payload,
-                    'collection': collection_name
-                })
+    # If metadata exists, try metadata-based search first
+    if metadata_found:
+        for collection_name in collections:
+            try:
+                # Hybrid search: semantic + concept filter
+                results = await qdrant_client.search(
+                    collection_name=collection_name,
+                    query_vector=embedding,
+                    query_filter=models.Filter(
+                        should=[
+                            models.FieldCondition(
+                                key="concepts",
+                                match=models.MatchAny(any=[concept.lower()])
+                            )
+                        ]
+                    ),
+                    limit=limit * 2,  # Get more results for better filtering
+                    with_payload=True
+                )
                 
-        except Exception as e:
-            continue
+                for point in results:
+                    payload = point.payload
+                    # Boost score if concept is in the concepts list
+                    score_boost = 0.2 if concept.lower() in payload.get('concepts', []) else 0.0
+                    all_results.append({
+                        'score': float(point.score) + score_boost,
+                        'payload': payload,
+                        'collection': collection_name,
+                        'search_type': 'metadata'
+                    })
+                    
+            except Exception as e:
+                continue
+    
+    # If no results from metadata search OR no metadata exists, fall back to semantic search
+    if not all_results:
+        await ctx.debug(f"Falling back to semantic search for concept: {concept}")
+        
+        for collection_name in collections:
+            try:
+                # Pure semantic search without filters
+                results = await qdrant_client.search(
+                    collection_name=collection_name,
+                    query_vector=embedding,
+                    limit=limit,
+                    score_threshold=0.5,  # Lower threshold for broader results
+                    with_payload=True
+                )
+                
+                for point in results:
+                    all_results.append({
+                        'score': float(point.score),
+                        'payload': point.payload,
+                        'collection': collection_name,
+                        'search_type': 'semantic'
+                    })
+                    
+            except Exception as e:
+                continue
     
     # Sort by score and limit
     all_results.sort(key=lambda x: x['score'], reverse=True)
@@ -1218,9 +1269,11 @@ async def search_by_concept(
     
     # Format results
     if not all_results:
+        metadata_status = "with metadata" if metadata_found else "NO METADATA FOUND"
         return f"""<search_by_concept>
 <concept>{concept}</concept>
-<message>No conversations found about this concept</message>
+<metadata_health>{metadata_status} (checked {total_points_checked} points)</metadata_health>
+<message>No conversations found about this concept. {'Try running: python scripts/delta-metadata-update.py' if not metadata_found else 'Try different search terms.'}</message>
 </search_by_concept>"""
     
     results_text = []
@@ -1255,8 +1308,14 @@ async def search_by_concept(
 <preview>{text_preview}</preview>
 </result>""")
     
+    # Determine if this was a fallback search
+    used_fallback = any(r.get('search_type') == 'semantic' for r in all_results)
+    metadata_status = "with metadata" if metadata_found else "NO METADATA FOUND"
+    
     return f"""<search_by_concept>
 <concept>{concept}</concept>
+<metadata_health>{metadata_status} (checked {total_points_checked} points)</metadata_health>
+<search_type>{'fallback_semantic' if used_fallback else 'metadata_based'}</search_type>
 <count>{len(all_results)}</count>
 <results>
 {''.join(results_text)}

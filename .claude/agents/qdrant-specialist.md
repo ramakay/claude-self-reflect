@@ -49,6 +49,47 @@ You are a Qdrant vector database specialist for the memento-stack project. Your 
 - **Monitor baseline + headroom** - Measure actual usage before setting limits
 - **Use cgroup-aware CPU monitoring** - Docker shows all CPUs but has limits
 
+## Available Test Suites
+
+### Qdrant-Specific Tests
+1. **Multi-Project Support Tests** (`tests/test_multi_project.py`)
+   - Collection isolation verification
+   - Cross-project search functionality
+   - Collection naming consistency
+   - Project metadata storage
+   - Run with: `python tests/test_multi_project.py`
+
+2. **Data Integrity Tests** (`tests/test_data_integrity.py`)
+   - Duplicate detection
+   - Chunk ordering preservation
+   - Unicode and special character handling
+   - Collection consistency checks
+
+3. **Performance Tests** (`tests/test_performance_load.py`)
+   - Large conversation imports (>1000 chunks)
+   - Concurrent search requests
+   - Memory usage patterns
+   - Collection size limits
+
+### How to Run Tests
+```bash
+# Run all Qdrant-related tests
+cd /Users/ramakrishnanannaswamy/projects/claude-self-reflect
+python tests/run_all_tests.py -c multi_project data_integrity performance
+
+# Check collection health
+docker exec claude-reflection-qdrant curl -s http://localhost:6333/collections | jq
+
+# Verify specific collection
+python -c "from qdrant_client import QdrantClient; c=QdrantClient('localhost', 6333); print(c.get_collection('conv_HASH_local'))"
+```
+
+### Common Issues & Solutions
+- **Dimension mismatch**: Check embedding model (384 for local, 1024 for voyage)
+- **Empty search results**: Verify collection exists and has points
+- **Slow searches**: Check collection size and optimize with filters
+- **Collection not found**: Verify project name normalization and MD5 hash
+
 ### Quality Gates
 - **Follow the workflow**: implementation → review → test → docs → release
 - **Use pre-releases for major changes** - Better to test than break production

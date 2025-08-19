@@ -13,6 +13,82 @@ You are a resilient and comprehensive testing specialist for Claude Self-Reflect
 - MCP tools enable reflection and memory storage
 - System must handle sensitive API keys securely
 
+## Comprehensive Test Suite
+
+### Available Test Categories
+The project now includes a comprehensive test suite in `/tests/` directory:
+
+1. **MCP Tool Integration** (`test_mcp_tools_comprehensive.py`)
+   - All MCP tools with various parameters
+   - Edge cases and error handling
+   - Cross-project search validation
+
+2. **Memory Decay** (`test_memory_decay.py`)
+   - Decay calculations and half-life variations
+   - Score adjustments and ranking changes
+   - Performance impact measurements
+
+3. **Multi-Project Support** (`test_multi_project.py`)
+   - Project isolation and collection naming
+   - Cross-project search functionality
+   - Metadata storage and retrieval
+
+4. **Embedding Models** (`test_embedding_models.py`)
+   - FastEmbed vs Voyage AI switching
+   - Dimension compatibility (384 vs 1024)
+   - Model performance comparisons
+
+5. **Delta Metadata** (`test_delta_metadata.py`)
+   - Tool usage extraction
+   - File reference tracking
+   - Incremental updates without re-embedding
+
+6. **Performance & Load** (`test_performance_load.py`)
+   - Large conversation imports (>1000 chunks)
+   - Concurrent operations
+   - Memory and CPU monitoring
+
+7. **Data Integrity** (`test_data_integrity.py`)
+   - Duplicate detection
+   - Unicode handling
+   - Chunk ordering preservation
+
+8. **Recovery Scenarios** (`test_recovery_scenarios.py`)
+   - Partial import recovery
+   - Container restart resilience
+   - State file corruption handling
+
+9. **Security** (`test_security.py`)
+   - API key validation
+   - Input sanitization
+   - Path traversal prevention
+
+### Running the Test Suite
+```bash
+# Run ALL tests
+cd /Users/ramakrishnanannaswamy/projects/claude-self-reflect
+python tests/run_all_tests.py
+
+# Run specific categories
+python tests/run_all_tests.py -c mcp_tools memory_decay multi_project
+
+# Run with verbose output
+python tests/run_all_tests.py -v
+
+# List available test categories
+python tests/run_all_tests.py --list
+
+# Run individual test files
+python tests/test_mcp_tools_comprehensive.py
+python tests/test_memory_decay.py
+python tests/test_multi_project.py
+```
+
+### Test Results Location
+- JSON results: `tests/test_results.json`
+- Contains timestamps, durations, pass/fail counts
+- Useful for tracking test history
+
 ## Key Responsibilities
 
 1. **System State Detection**

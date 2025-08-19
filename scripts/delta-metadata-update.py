@@ -21,7 +21,7 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 # Configuration
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-LOGS_DIR = os.getenv("LOGS_DIR", "/Users/ramakrishnanannaswamy/.claude/projects")
+LOGS_DIR = os.getenv("LOGS_DIR", os.path.expanduser("~/.claude/projects"))
 STATE_FILE = os.getenv("STATE_FILE", "./config/delta-update-state.json")
 PREFER_LOCAL_EMBEDDINGS = os.getenv("PREFER_LOCAL_EMBEDDINGS", "true").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"

@@ -176,8 +176,33 @@ Recent conversations matter more. Old ones fade. Like your brain, but reliable.
 - [GitHub Issues](https://github.com/ramakay/claude-self-reflect/issues)
 - [Discussions](https://github.com/ramakay/claude-self-reflect/discussions)
 
+## Upgrading to v2.5.19
+
+### 🆕 New Feature: Metadata Enrichment
+v2.5.19 adds searchable metadata to your conversations - concepts, files, and tools!
+
+#### For Existing Users
+```bash
+# Update to latest version
+npm update -g claude-self-reflect
+
+# Run setup - it will detect your existing installation
+claude-self-reflect setup
+# Choose "yes" when asked about metadata enrichment
+
+# Or manually enrich metadata anytime:
+docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.py
+```
+
+#### What You Get
+- `search_by_concept("docker")` - Find conversations by topic
+- `search_by_file("server.py")` - Find conversations that touched specific files
+- Better search accuracy with metadata-based filtering
+
 ## What's New
 
+- **v2.5.19** - Metadata Enrichment! Search by concepts, files, and tools. [Full release notes](docs/releases/v2.5.19-RELEASE-NOTES.md)
+- **v2.5.18** - Security dependency updates
 - **v2.5.17** - Critical CPU fix and memory limit adjustment. [Full release notes](docs/releases/v2.5.17-release-notes.md)
 - **v2.5.16** - (Pre-release only) Initial streaming importer with CPU throttling
 - **v2.5.15** - Critical bug fixes and collection creation improvements

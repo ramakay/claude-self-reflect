@@ -406,6 +406,54 @@ async function importConversations() {
   }
 }
 
+async function enrichMetadata() {
+  console.log('\n🔍 Metadata Enrichment (NEW in v2.5.19!)...');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('This feature enhances your conversations with searchable metadata:');
+  console.log('   • Concepts: High-level topics (docker, security, testing, etc.)');
+  console.log('   • Files: Track which files were analyzed or edited');
+  console.log('   • Tools: Record which Claude tools were used');
+  console.log('\nEnables powerful searches like:');
+  console.log('   • search_by_concept("docker")');
+  console.log('   • search_by_file("server.py")');
+  
+  const enrichChoice = await question('\nEnrich past conversations with metadata? (recommended) (y/n): ');
+  
+  if (enrichChoice.toLowerCase() === 'y') {
+    console.log('\n⏳ Starting metadata enrichment (safe mode)...');
+    console.log('   • Processing last 30 days of conversations');
+    console.log('   • Using conservative rate limiting');
+    console.log('   • This may take 5-10 minutes\n');
+    
+    try {
+      // Run the safe delta update script
+      safeExec('docker', [
+        'compose', 'run', '--rm',
+        '-e', 'DAYS_TO_UPDATE=30',
+        '-e', 'BATCH_SIZE=2',
+        '-e', 'RATE_LIMIT_DELAY=0.5',
+        '-e', 'MAX_CONCURRENT_UPDATES=2',
+        'importer',
+        'python', '/app/scripts/delta-metadata-update-safe.py'
+      ], {
+        cwd: projectRoot,
+        stdio: 'inherit'
+      });
+      
+      console.log('\n✅ Metadata enrichment completed successfully!');
+      console.log('   Your conversations now have searchable concepts and file tracking.');
+    } catch (error) {
+      console.log('\n⚠️  Metadata enrichment had some issues but continuing setup');
+      console.log('   You can retry later with:');
+      console.log('   docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.py');
+    }
+  } else {
+    console.log('\n📝 Skipping metadata enrichment.');
+    console.log('   You can run it later with:');
+    console.log('   docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.py');
+  }
+}
+
 async function showFinalInstructions() {
   console.log('\n✅ Setup complete!');
   
@@ -419,6 +467,7 @@ async function showFinalInstructions() {
   console.log('   • Check status: docker compose ps');
   console.log('   • View logs: docker compose logs -f');
   console.log('   • Import conversations: docker compose run --rm importer');
+  console.log('   • Enrich metadata: docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.py');
   console.log('   • Start watcher: docker compose --profile watch up -d');
   console.log('   • Stop all: docker compose down');
   
@@ -450,13 +499,25 @@ async function checkExistingInstallation() {
         console.log('   • 🔍 Mode: ' + (localMode ? 'Local embeddings (privacy mode)' : 'Cloud embeddings (Voyage AI)'));
         console.log('   • ⚡ Memory decay: Enabled (90-day half-life)');
         
+        // Offer metadata enrichment for v2.5.19
+        console.log('\n🆕 NEW in v2.5.19: Metadata Enrichment!');
+        console.log('   Enhance your conversations with searchable concepts and file tracking.');
+        
+        const upgradeChoice = await question('\nWould you like to enrich your conversations with metadata? (y/n): ');
+        
+        if (upgradeChoice.toLowerCase() === 'y') {
+          await enrichMetadata();
+          console.log('\n✅ Upgrade complete! Your conversations now have enhanced search capabilities.');
+        }
+        
         console.log('\n📋 Quick Commands:');
         console.log('   • View status: docker compose ps');
         console.log('   • View logs: docker compose logs -f');
+        console.log('   • Enrich metadata: docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.py');
         console.log('   • Restart: docker compose restart');
         console.log('   • Stop: docker compose down');
         
-        console.log('\n💡 To re-run setup, first stop services with: docker compose down');
+        console.log('\n💡 To re-run full setup, first stop services with: docker compose down');
         return true;
       }
     }
@@ -503,6 +564,9 @@ async function main() {
   
   // Import conversations
   await importConversations();
+  
+  // Enrich metadata (new in v2.5.19)
+  await enrichMetadata();
   
   // Show final instructions
   await showFinalInstructions();
