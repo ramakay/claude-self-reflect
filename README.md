@@ -4,30 +4,17 @@
 
 [![npm version](https://badge.fury.io/js/claude-self-reflect.svg)](https://www.npmjs.com/package/claude-self-reflect)
 [![npm downloads](https://img.shields.io/npm/dm/claude-self-reflect.svg)](https://www.npmjs.com/package/claude-self-reflect)
-[![npm downloads total](https://img.shields.io/npm/dt/claude-self-reflect.svg)](https://www.npmjs.com/package/claude-self-reflect)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![GitHub CI](https://github.com/ramakay/claude-self-reflect/actions/workflows/ci.yml/badge.svg)](https://github.com/ramakay/claude-self-reflect/actions/workflows/ci.yml)
 
-[![GitHub stars](https://img.shields.io/github/stars/ramakay/claude-self-reflect.svg?style=social)](https://github.com/ramakay/claude-self-reflect/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/ramakay/claude-self-reflect.svg?style=social)](https://github.com/ramakay/claude-self-reflect/network)
-[![GitHub issues](https://img.shields.io/github/issues/ramakay/claude-self-reflect.svg)](https://github.com/ramakay/claude-self-reflect/issues)
-[![GitHub pull requests](https://img.shields.io/github/issues-pr/ramakay/claude-self-reflect.svg)](https://github.com/ramakay/claude-self-reflect/pulls)
-[![GitHub last commit](https://img.shields.io/github/last-commit/ramakay/claude-self-reflect.svg)](https://github.com/ramakay/claude-self-reflect/commits/main)
-
-[![Docker](https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
-[![Qdrant](https://img.shields.io/badge/Qdrant-Vector_DB-FF5A00?logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTEyIDJDNi40NzcgMiAyIDYuNDc3IDIgMTJDMiAxNy41MjMgNi40NzcgMjIgMTIgMjJDMTcuNTIzIDIyIDIyIDE3LjUyMyAyMiAxMkMyMiA2LjQ3NyAxNy41MjMgMiAxMiAyWiIgZmlsbD0id2hpdGUiLz4KPC9zdmc+)](https://qdrant.tech/)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-Compatible-6B4FBB)](https://github.com/anthropics/claude-code)
-[![MCP](https://img.shields.io/badge/MCP-Protocol-FF6B6B)](https://modelcontextprotocol.io/)
+[![MCP Protocol](https://img.shields.io/badge/MCP-Enabled-FF6B6B)](https://modelcontextprotocol.io/)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![Local First](https://img.shields.io/badge/Local%20First-Privacy-4A90E2)](https://github.com/ramakay/claude-self-reflect)
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Node](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
-[![FastEmbed](https://img.shields.io/badge/FastEmbed-Local-4A90E2)](https://github.com/qdrant/fastembed)
-[![Voyage AI](https://img.shields.io/badge/Voyage%20AI-Optional-9B59B6)](https://www.voyageai.com/)
-
+[![GitHub stars](https://img.shields.io/github/stars/ramakay/claude-self-reflect.svg?style=social)](https://github.com/ramakay/claude-self-reflect/stargazers)
+[![GitHub issues](https://img.shields.io/github/issues/ramakay/claude-self-reflect.svg)](https://github.com/ramakay/claude-self-reflect/issues)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/ramakay/claude-self-reflect/pulls)
-[![Contributors](https://img.shields.io/github/contributors/ramakay/claude-self-reflect.svg)](https://github.com/ramakay/claude-self-reflect/graphs/contributors)
-[![Code Size](https://img.shields.io/github/languages/code-size/ramakay/claude-self-reflect.svg)](https://github.com/ramakay/claude-self-reflect)
-[![Repo Size](https://img.shields.io/github/repo-size/ramakay/claude-self-reflect.svg)](https://github.com/ramakay/claude-self-reflect)
 
 </div>
 
