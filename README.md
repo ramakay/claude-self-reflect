@@ -1,5 +1,10 @@
 # Claude Self-Reflect
 
+[![npm version](https://badge.fury.io/js/claude-self-reflect.svg)](https://www.npmjs.com/package/claude-self-reflect)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Docker](https://img.shields.io/badge/Docker-Required-blue.svg)](https://www.docker.com/)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-Compatible-green.svg)](https://github.com/anthropics/claude-code)
+
 Claude forgets everything. This fixes that.
 
 ## Table of Contents

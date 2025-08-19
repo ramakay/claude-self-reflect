@@ -13,6 +13,12 @@
     "ai-memory",
     "claude-code"
   ],
+  "badges": {
+    "npm": "https://badge.fury.io/js/claude-self-reflect.svg",
+    "license": "https://img.shields.io/badge/License-MIT-yellow.svg",
+    "docker": "https://img.shields.io/badge/Docker-Required-blue.svg",
+    "claude": "https://img.shields.io/badge/Claude%20Code-Compatible-green.svg"
+  },
   "homepage": "https://github.com/ramakay/claude-self-reflect#readme",
   "bugs": {
     "url": "https://github.com/ramakay/claude-self-reflect/issues"
