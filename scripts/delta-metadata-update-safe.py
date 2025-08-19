@@ -40,8 +40,53 @@ logger = logging.getLogger(__name__)
 client = QdrantClient(url=QDRANT_URL, timeout=30)  # Increased timeout
 
 def get_collection_suffix():
-    """Get the collection suffix based on embedding type."""
+    """Get the collection suffix based on embedding type (for new collections only)."""
     return "_local" if PREFER_LOCAL_EMBEDDINGS else "_voyage"
+
+def get_existing_collection_suffix(project_hash: str, max_retries: int = 3) -> str:
+    """Detect which collection type actually exists for this project.
+    
+    This function checks for existing collections and returns the actual suffix found.
+    Only falls back to preference when creating new collections.
+    Includes retry logic for resilience against temporary Qdrant unavailability.
+    
+    Args:
+        project_hash: The MD5 hash of the normalized project name
+        max_retries: Maximum number of retry attempts for collection detection
+        
+    Returns:
+        "_voyage" if voyage collection exists, "_local" if local exists,
+        or preference-based suffix if neither exists yet
+    """
+    for attempt in range(max_retries):
+        try:
+            collections = client.get_collections().collections
+            collection_names = [c.name for c in collections]
+            
+            # Check for both possible collection names
+            voyage_name = f"conv_{project_hash}_voyage"
+            local_name = f"conv_{project_hash}_local"
+            
+            # Return the actual collection type that exists
+            if voyage_name in collection_names:
+                logger.debug(f"Found existing Voyage collection: {voyage_name}")
+                return "_voyage"
+            elif local_name in collection_names:
+                logger.debug(f"Found existing Local collection: {local_name}")
+                return "_local"
+            else:
+                # No existing collection - use preference for new ones
+                suffix = get_collection_suffix()
+                logger.debug(f"No existing collection for hash {project_hash}, using preference: {suffix}")
+                return suffix
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 0.5 * (attempt + 1)  # Exponential backoff
+                logger.debug(f"Error checking collections (attempt {attempt + 1}/{max_retries}): {e}, retrying in {wait_time}s")
+                time.sleep(wait_time)
+                continue
+            logger.warning(f"Error checking collections after {max_retries} attempts: {e}, falling back to preference")
+            return get_collection_suffix()
 
 def normalize_project_name(project_name: str) -> str:
     """Normalize project name by removing path-like prefixes."""
@@ -260,7 +305,7 @@ async def process_conversation_async(jsonl_file: Path, state: Dict[str, Any]) ->
                                 if isinstance(msg['content'], str):
                                     conversation_text += msg['content'][:500] + "\n"
                     except Exception as e:
-                        logger.debug(f"Parse error in {jsonl_path}: {e}")
+                        logger.debug(f"Parse error in {jsonl_file}: {e}")
                         continue
         
         # Extract concepts
@@ -278,7 +323,9 @@ async def process_conversation_async(jsonl_file: Path, state: Dict[str, Any]) ->
         
         # Determine collection
         project_hash = hashlib.md5(normalize_project_name(project_name).encode()).hexdigest()[:8]
-        collection_name = f"conv_{project_hash}{get_collection_suffix()}"
+        # Use smart detection to find the actual collection type
+        collection_suffix = get_existing_collection_suffix(project_hash)
+        collection_name = f"conv_{project_hash}{collection_suffix}"
         
         # Check if collection exists
         try:
