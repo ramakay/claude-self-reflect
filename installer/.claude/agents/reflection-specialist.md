@@ -220,7 +220,7 @@ The streaming importer efficiently processes large conversation files without me
 
 ```bash
 # Activate virtual environment (REQUIRED in managed environment)
-cd /Users/ramakrishnanannaswamy/claude-self-reflect
+cd ~/claude-self-reflect
 source .venv/bin/activate
 
 # Import latest conversations (streaming)

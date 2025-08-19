@@ -45,7 +45,6 @@ def extract_concepts(text: str) -> Set[str]:
     concepts = set()
     
     concept_patterns = {
-        'freightwise': r'(freightwise|freight\s*wise)',
         'security': r'(security|vulnerability|CVE|injection|auth)',
         'docker': r'(docker|container|compose|kubernetes)',
         'testing': r'(test|pytest|unittest|coverage)',
@@ -278,9 +277,7 @@ async def main():
     
     for collection in collections:
         name = collection.name
-        if 'freightwise' in name.lower() or 'metafora' in name.lower() or '51e51d47' in name:
-            priority_collections.append(name)
-        elif name.startswith('conv_'):
+        if name.startswith('conv_'):
             other_collections.append(name)
     
     logger.info(f"Found {len(priority_collections)} priority collections")

@@ -74,7 +74,7 @@ You are a Qdrant vector database specialist for the memento-stack project. Your 
 ### How to Run Tests
 ```bash
 # Run all Qdrant-related tests
-cd /Users/ramakrishnanannaswamy/projects/claude-self-reflect
+cd ~/projects/claude-self-reflect
 python tests/run_all_tests.py -c multi_project data_integrity performance
 
 # Check collection health

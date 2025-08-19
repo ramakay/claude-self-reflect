@@ -66,7 +66,7 @@ The project now includes a comprehensive test suite in `/tests/` directory:
 ### Running the Test Suite
 ```bash
 # Run ALL tests
-cd /Users/ramakrishnanannaswamy/projects/claude-self-reflect
+cd ~/projects/claude-self-reflect
 python tests/run_all_tests.py
 
 # Run specific categories

@@ -204,7 +204,7 @@ docker compose up -d qdrant
 
 **Import errors:**
 ```bash
-cd /Users/ramakrishnanannaswamy/projects/claude-self-reflect
+cd ~/projects/claude-self-reflect
 source venv/bin/activate
 pip install -r requirements.txt
 ```

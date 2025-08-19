@@ -13,8 +13,8 @@ def extract_project_name_from_path(file_path: str) -> str:
     """Extract project name from JSONL file path.
     
     Handles paths like:
-    - ~/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/file.jsonl
-    - /logs/-Users-ramakrishnanannaswamy-projects-n8n-builder/file.jsonl
+    - ~/.claude/projects/-Users-username-projects-claude-self-reflect/file.jsonl
+    - /logs/-Users-username-projects-n8n-builder/file.jsonl
     """
     # Get the directory name containing the JSONL file
     path_obj = Path(file_path)

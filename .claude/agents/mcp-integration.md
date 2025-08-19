@@ -41,7 +41,7 @@ You are an MCP server development specialist for the memento-stack project. You 
 ### Running MCP Tests
 ```bash
 # Run all MCP tests
-cd /Users/ramakrishnanannaswamy/projects/claude-self-reflect
+cd ~/projects/claude-self-reflect
 python tests/run_all_tests.py -c mcp_tools mcp_search
 
 # Test MCP server directly

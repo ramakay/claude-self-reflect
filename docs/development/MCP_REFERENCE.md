@@ -44,7 +44,7 @@ claude mcp add <name>        # ❌ MISSING required commandOrUrl
 
 **CORRECT full command**:
 ```bash
-claude mcp add claude-self-reflect "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e VOYAGE_KEY="<actual-key>" -e QDRANT_URL="http://localhost:6333"
+claude mcp add claude-self-reflect "~/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e VOYAGE_KEY="<actual-key>" -e QDRANT_URL="http://localhost:6333"
 ```
 
 **Common mistakes to AVOID**:
@@ -237,12 +237,12 @@ Before working with MCPs, ALWAYS:
 docker ps | grep qdrant
 
 # Start Qdrant if not running
-cd /Users/ramakrishnanannaswamy/projects/claude-self-reflect
+cd ~/projects/claude-self-reflect
 docker-compose up -d qdrant
 
 # Remove and re-add claude-self-reflect (update VOYAGE_KEY)
 claude mcp remove claude-self-reflect
-claude mcp add claude-self-reflect "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e VOYAGE_KEY="your-actual-key" -e QDRANT_URL="http://localhost:6333"
+claude mcp add claude-self-reflect "~/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e VOYAGE_KEY="your-actual-key" -e QDRANT_URL="http://localhost:6333"
 claude mcp list
 
 # Test MCP tools (after restart if needed)
@@ -251,7 +251,7 @@ claude mcp list
 
 ## 📚 Additional Resources
 
-- **Project README**: `/Users/ramakrishnanannaswamy/projects/claude-self-reflect/README.md`
+- **Project README**: `~/projects/claude-self-reflect/README.md`
 - **CLAUDE.md**: Project-specific rules and guidelines
 - **Agents Directory**: `.claude/agents/` (NOT `/agents/`)
 - **Test Scripts**: `scripts/test/` directory

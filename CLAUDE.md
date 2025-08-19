@@ -56,10 +56,10 @@ Currently using client-side decay calculation (v1.3.1):
 claude mcp list
 
 # Add the MCP as user-scoped (PREFERRED - persists across projects)
-claude mcp add claude-self-reflect "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333" -s user
+claude mcp add claude-self-reflect "~/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333" -s user
 
 # For local project-only setup (alternative)
-claude mcp add claude-self-reflect "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333"
+claude mcp add claude-self-reflect "~/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333"
 
 # Remove an MCP (useful when needing to restart)
 claude mcp remove claude-self-reflect

@@ -522,7 +522,7 @@ async def reflect_on_past(
                         
                         # Handle project matching - check if the target project name appears at the end of the stored project path
                         if target_project != 'all' and not project_collections:
-                            # The stored project name is like "-Users-ramakrishnanannaswamy-projects-ShopifyMCPMockShop"
+                            # The stored project name is like "-Users-username-projects-ShopifyMCPMockShop"
                             # We want to match just "ShopifyMCPMockShop"
                             if not point_project.endswith(f"-{target_project}") and point_project != target_project:
                                 continue  # Skip results from other projects
@@ -602,7 +602,7 @@ async def reflect_on_past(
                         
                         # Handle project matching - check if the target project name appears at the end of the stored project path
                         if target_project != 'all' and not project_collections:
-                            # The stored project name is like "-Users-ramakrishnanannaswamy-projects-ShopifyMCPMockShop"
+                            # The stored project name is like "-Users-username-projects-ShopifyMCPMockShop"
                             # We want to match just "ShopifyMCPMockShop"
                             if not point_project.endswith(f"-{target_project}") and point_project != target_project:
                                 continue  # Skip results from other projects
@@ -639,7 +639,7 @@ async def reflect_on_past(
                         
                         # Handle project matching - check if the target project name appears at the end of the stored project path
                         if target_project != 'all' and not project_collections:
-                            # The stored project name is like "-Users-ramakrishnanannaswamy-projects-ShopifyMCPMockShop"
+                            # The stored project name is like "-Users-username-projects-ShopifyMCPMockShop"
                             # We want to match just "ShopifyMCPMockShop"
                             if not point_project.endswith(f"-{target_project}") and point_project != target_project:
                                 continue  # Skip results from other projects
