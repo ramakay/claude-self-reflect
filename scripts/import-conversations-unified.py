@@ -42,6 +42,20 @@ PREFER_LOCAL_EMBEDDINGS = os.getenv("PREFER_LOCAL_EMBEDDINGS", "false").lower() 
 VOYAGE_API_KEY = os.getenv("VOYAGE_KEY")
 CURRENT_METADATA_VERSION = 2  # Version 2: Added tool output extraction
 
+# Token limit configuration for Voyage AI
+MAX_TOKENS_PER_BATCH = int(os.getenv("MAX_TOKENS_PER_BATCH", "100000"))  # Safe limit (120k - 20k buffer)
+if MAX_TOKENS_PER_BATCH > 120000 or MAX_TOKENS_PER_BATCH < 1000:
+    logger.warning(f"MAX_TOKENS_PER_BATCH={MAX_TOKENS_PER_BATCH} outside safe range [1000, 120000], using 100000")
+    MAX_TOKENS_PER_BATCH = 100000
+
+TOKEN_ESTIMATION_RATIO = int(os.getenv("TOKEN_ESTIMATION_RATIO", "3"))  # chars per token estimate
+if TOKEN_ESTIMATION_RATIO < 2 or TOKEN_ESTIMATION_RATIO > 10:
+    logger.warning(f"TOKEN_ESTIMATION_RATIO={TOKEN_ESTIMATION_RATIO} outside normal range [2, 10], using 3")
+    TOKEN_ESTIMATION_RATIO = 3
+
+USE_TOKEN_AWARE_BATCHING = os.getenv("USE_TOKEN_AWARE_BATCHING", "true").lower() == "true"
+MAX_RECURSION_DEPTH = 10  # Maximum depth for recursive chunk splitting
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -381,6 +395,38 @@ def log_retry_state(retry_state):
 def embed_with_backoff(**kwargs):
     return voyage_client.embed(**kwargs)
 
+def estimate_tokens(text: str) -> int:
+    """Estimate token count for text with content-aware heuristics.
+    Base estimate uses TOKEN_ESTIMATION_RATIO, adjusted for content type.
+    """
+    # Base estimate
+    base_tokens = len(text) // TOKEN_ESTIMATION_RATIO
+    
+    # Adjust for code/JSON content (typically more tokens per char)
+    # Count indicators of structured content
+    structure_indicators = text.count('{') + text.count('[') + text.count('```')
+    if structure_indicators > 10:  # Likely JSON/code
+        base_tokens = int(base_tokens * 1.3)
+    
+    # Add 10% safety margin
+    return int(base_tokens * 1.1)
+
+def extract_message_content(msg: Dict[str, Any]) -> str:
+    """Extract text content from a message."""
+    content = msg.get("content", "")
+    
+    if isinstance(content, list):
+        # Handle structured content
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+            elif isinstance(item, str):
+                text_parts.append(item)
+        content = " ".join(text_parts)
+    
+    return content
+
 def generate_embeddings(texts: List[str]) -> List[List[float]]:
     """Generate embeddings for a list of texts."""
     if PREFER_LOCAL_EMBEDDINGS or not VOYAGE_API_KEY:
@@ -431,6 +477,125 @@ def chunk_conversation(messages: List[Dict[str, Any]], chunk_size: int = 10) -> 
             })
     
     return chunks
+
+def split_large_chunk(chunk: Dict[str, Any], max_tokens: int, depth: int = 0) -> List[Dict[str, Any]]:
+    """Split a large chunk into smaller pieces that fit token limit."""
+    # Check recursion depth to prevent stack overflow
+    if depth >= MAX_RECURSION_DEPTH:
+        logger.error(f"Max recursion depth {MAX_RECURSION_DEPTH} reached while splitting chunk")
+        # Force truncate as last resort
+        max_chars = max_tokens * TOKEN_ESTIMATION_RATIO
+        chunk["text"] = chunk["text"][:max_chars] + "\n[TRUNCATED - MAX DEPTH REACHED]"
+        chunk["was_truncated"] = True
+        return [chunk]
+    
+    text = chunk["text"]
+    messages = chunk["messages"]
+    
+    # First, check if we can split by messages
+    if len(messages) > 1:
+        # Try splitting messages into smaller groups
+        mid = len(messages) // 2
+        chunk1_messages = messages[:mid]
+        chunk2_messages = messages[mid:]
+        
+        # Recreate text for each split
+        texts1 = []
+        texts2 = []
+        
+        for msg in chunk1_messages:
+            role = msg.get("role", "unknown")
+            content = extract_message_content(msg)
+            if content:
+                texts1.append(f"{role.upper()}: {content}")
+        
+        for msg in chunk2_messages:
+            role = msg.get("role", "unknown")
+            content = extract_message_content(msg)
+            if content:
+                texts2.append(f"{role.upper()}: {content}")
+        
+        split_chunks = []
+        if texts1:
+            split_chunks.append({
+                "text": "\n".join(texts1),
+                "messages": chunk1_messages,
+                "chunk_index": f"{chunk['chunk_index']}_a",
+                "start_role": chunk["start_role"]
+            })
+        if texts2:
+            split_chunks.append({
+                "text": "\n".join(texts2),
+                "messages": chunk2_messages,
+                "chunk_index": f"{chunk['chunk_index']}_b",
+                "start_role": chunk2_messages[0].get("role", "unknown") if chunk2_messages else "unknown"
+            })
+        
+        # Recursively split if still too large
+        result = []
+        for split_chunk in split_chunks:
+            if estimate_tokens(split_chunk["text"]) > max_tokens:
+                result.extend(split_large_chunk(split_chunk, max_tokens, depth + 1))
+            else:
+                result.append(split_chunk)
+        return result
+    else:
+        # Single message too large - truncate with warning
+        max_chars = max_tokens * TOKEN_ESTIMATION_RATIO
+        if len(text) > max_chars:
+            truncated_size = len(text) - max_chars
+            logger.warning(f"Single message exceeds token limit, truncating {truncated_size} chars from {len(text)} total")
+            chunk["text"] = text[:max_chars] + f"\n[TRUNCATED {truncated_size} CHARS]"
+            chunk["was_truncated"] = True
+            chunk["original_size"] = len(text)
+        return [chunk]
+
+def create_token_aware_batches(chunks: List[Dict[str, Any]], max_tokens: int = MAX_TOKENS_PER_BATCH) -> List[List[Dict[str, Any]]]:
+    """Create batches that respect token limits."""
+    if not USE_TOKEN_AWARE_BATCHING:
+        # Fall back to old batching method
+        batches = []
+        for i in range(0, len(chunks), BATCH_SIZE):
+            batches.append(chunks[i:i + BATCH_SIZE])
+        return batches
+    
+    batches = []
+    current_batch = []
+    current_tokens = 0
+    
+    for chunk in chunks:
+        chunk_tokens = estimate_tokens(chunk["text"])
+        
+        # If single chunk exceeds limit, split it
+        if chunk_tokens > max_tokens:
+            logger.warning(f"Chunk with {chunk_tokens} estimated tokens exceeds limit of {max_tokens}, splitting...")
+            split_chunks = split_large_chunk(chunk, max_tokens)
+            for split_chunk in split_chunks:
+                split_tokens = estimate_tokens(split_chunk["text"])
+                if split_tokens > max_tokens:
+                    logger.error(f"Split chunk still exceeds limit: {split_tokens} tokens")
+                batches.append([split_chunk])
+        # If adding chunk would exceed limit, start new batch
+        elif current_tokens + chunk_tokens > max_tokens:
+            if current_batch:
+                batches.append(current_batch)
+            current_batch = [chunk]
+            current_tokens = chunk_tokens
+        else:
+            current_batch.append(chunk)
+            current_tokens += chunk_tokens
+    
+    if current_batch:
+        batches.append(current_batch)
+    
+    # Log batch statistics
+    if batches:
+        batch_sizes = [len(batch) for batch in batches]
+        batch_tokens = [sum(estimate_tokens(chunk["text"]) for chunk in batch) for batch in batches]
+        logger.debug(f"Created {len(batches)} batches, chunk counts: min={min(batch_sizes)}, max={max(batch_sizes)}, "
+                    f"estimated tokens: min={min(batch_tokens)}, max={max(batch_tokens)}, avg={sum(batch_tokens)//len(batches)}")
+    
+    return batches
 
 def import_project(project_path: Path, collection_name: str, state: dict) -> int:
     """Import all conversations from a project."""
@@ -524,10 +689,16 @@ def import_project(project_path: Path, collection_name: str, state: dict) -> int
             if not chunks:
                 continue
             
-            # Process in batches
-            for batch_start in range(0, len(chunks), BATCH_SIZE):
-                batch = chunks[batch_start:batch_start + BATCH_SIZE]
+            # Process in batches (token-aware if enabled)
+            token_aware_batches = create_token_aware_batches(chunks)
+            
+            for batch_idx, batch in enumerate(token_aware_batches):
                 texts = [chunk["text"] for chunk in batch]
+                
+                # Log batch info for debugging
+                if USE_TOKEN_AWARE_BATCHING:
+                    total_tokens = sum(estimate_tokens(text) for text in texts)
+                    logger.debug(f"Batch {batch_idx + 1}/{len(token_aware_batches)}: {len(texts)} chunks, ~{total_tokens} estimated tokens")
                 
                 # Generate embeddings
                 embeddings = generate_embeddings(texts)
