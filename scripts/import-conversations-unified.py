@@ -44,8 +44,17 @@ CURRENT_METADATA_VERSION = 2  # Version 2: Added tool output extraction
 
 # Token limit configuration for Voyage AI
 MAX_TOKENS_PER_BATCH = int(os.getenv("MAX_TOKENS_PER_BATCH", "100000"))  # Safe limit (120k - 20k buffer)
+if MAX_TOKENS_PER_BATCH > 120000 or MAX_TOKENS_PER_BATCH < 1000:
+    logger.warning(f"MAX_TOKENS_PER_BATCH={MAX_TOKENS_PER_BATCH} outside safe range [1000, 120000], using 100000")
+    MAX_TOKENS_PER_BATCH = 100000
+
 TOKEN_ESTIMATION_RATIO = int(os.getenv("TOKEN_ESTIMATION_RATIO", "3"))  # chars per token estimate
+if TOKEN_ESTIMATION_RATIO < 2 or TOKEN_ESTIMATION_RATIO > 10:
+    logger.warning(f"TOKEN_ESTIMATION_RATIO={TOKEN_ESTIMATION_RATIO} outside normal range [2, 10], using 3")
+    TOKEN_ESTIMATION_RATIO = 3
+
 USE_TOKEN_AWARE_BATCHING = os.getenv("USE_TOKEN_AWARE_BATCHING", "true").lower() == "true"
+MAX_RECURSION_DEPTH = 10  # Maximum depth for recursive chunk splitting
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -387,11 +396,20 @@ def embed_with_backoff(**kwargs):
     return voyage_client.embed(**kwargs)
 
 def estimate_tokens(text: str) -> int:
-    """Estimate token count for text.
-    Conservative estimate: ~3 characters per token for English/code content.
-    This gives us a safety buffer for the 120k token limit.
+    """Estimate token count for text with content-aware heuristics.
+    Base estimate uses TOKEN_ESTIMATION_RATIO, adjusted for content type.
     """
-    return len(text) // TOKEN_ESTIMATION_RATIO
+    # Base estimate
+    base_tokens = len(text) // TOKEN_ESTIMATION_RATIO
+    
+    # Adjust for code/JSON content (typically more tokens per char)
+    # Count indicators of structured content
+    structure_indicators = text.count('{') + text.count('[') + text.count('```')
+    if structure_indicators > 10:  # Likely JSON/code
+        base_tokens = int(base_tokens * 1.3)
+    
+    # Add 10% safety margin
+    return int(base_tokens * 1.1)
 
 def extract_message_content(msg: Dict[str, Any]) -> str:
     """Extract text content from a message."""
@@ -460,8 +478,17 @@ def chunk_conversation(messages: List[Dict[str, Any]], chunk_size: int = 10) -> 
     
     return chunks
 
-def split_large_chunk(chunk: Dict[str, Any], max_tokens: int) -> List[Dict[str, Any]]:
+def split_large_chunk(chunk: Dict[str, Any], max_tokens: int, depth: int = 0) -> List[Dict[str, Any]]:
     """Split a large chunk into smaller pieces that fit token limit."""
+    # Check recursion depth to prevent stack overflow
+    if depth >= MAX_RECURSION_DEPTH:
+        logger.error(f"Max recursion depth {MAX_RECURSION_DEPTH} reached while splitting chunk")
+        # Force truncate as last resort
+        max_chars = max_tokens * TOKEN_ESTIMATION_RATIO
+        chunk["text"] = chunk["text"][:max_chars] + "\n[TRUNCATED - MAX DEPTH REACHED]"
+        chunk["was_truncated"] = True
+        return [chunk]
+    
     text = chunk["text"]
     messages = chunk["messages"]
     
@@ -508,7 +535,7 @@ def split_large_chunk(chunk: Dict[str, Any], max_tokens: int) -> List[Dict[str, 
         result = []
         for split_chunk in split_chunks:
             if estimate_tokens(split_chunk["text"]) > max_tokens:
-                result.extend(split_large_chunk(split_chunk, max_tokens))
+                result.extend(split_large_chunk(split_chunk, max_tokens, depth + 1))
             else:
                 result.append(split_chunk)
         return result
@@ -516,8 +543,11 @@ def split_large_chunk(chunk: Dict[str, Any], max_tokens: int) -> List[Dict[str, 
         # Single message too large - truncate with warning
         max_chars = max_tokens * TOKEN_ESTIMATION_RATIO
         if len(text) > max_chars:
-            logger.warning(f"Single message exceeds token limit, truncating from {len(text)} to {max_chars} chars")
-            chunk["text"] = text[:max_chars] + "\n[TRUNCATED DUE TO SIZE]"
+            truncated_size = len(text) - max_chars
+            logger.warning(f"Single message exceeds token limit, truncating {truncated_size} chars from {len(text)} total")
+            chunk["text"] = text[:max_chars] + f"\n[TRUNCATED {truncated_size} CHARS]"
+            chunk["was_truncated"] = True
+            chunk["original_size"] = len(text)
         return [chunk]
 
 def create_token_aware_batches(chunks: List[Dict[str, Any]], max_tokens: int = MAX_TOKENS_PER_BATCH) -> List[List[Dict[str, Any]]]:
@@ -562,7 +592,8 @@ def create_token_aware_batches(chunks: List[Dict[str, Any]], max_tokens: int = M
     if batches:
         batch_sizes = [len(batch) for batch in batches]
         batch_tokens = [sum(estimate_tokens(chunk["text"]) for chunk in batch) for batch in batches]
-        logger.debug(f"Created {len(batches)} batches, sizes: {batch_sizes}, estimated tokens: {batch_tokens}")
+        logger.debug(f"Created {len(batches)} batches, chunk counts: min={min(batch_sizes)}, max={max(batch_sizes)}, "
+                    f"estimated tokens: min={min(batch_tokens)}, max={max(batch_tokens)}, avg={sum(batch_tokens)//len(batches)}")
     
     return batches
 
