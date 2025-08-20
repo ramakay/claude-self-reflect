@@ -5,6 +5,66 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2025-08-20
+
+### Fixed
+- **CRITICAL: Voyage AI Token Limit Exceeded** - Resolves import failures for large conversations (#38)
+  - **Root Cause**: Batch size based on message count (100 messages) could exceed Voyage AI's 120,000 token limit
+  - **Impact**: Some conversations with extensive code content couldn't be imported, causing data loss
+  - **Solution**: Implemented intelligent token-aware batching with content analysis
+  - **Files Modified**: `scripts/import-conversations-unified.py`, added architecture documentation
+
+### Added
+- **Token-Aware Batching System** for reliable Voyage AI imports:
+  - Content-aware token estimation with 30% adjustment for code/JSON content
+  - Dynamic batch sizing that respects 120k token limits with 20k safety buffer
+  - Automatic chunk splitting for oversized conversations (max 10 recursion levels)
+  - Graceful degradation with truncation warnings for single oversized messages
+  - Debug logging for batch statistics and performance monitoring
+- **Enhanced Configuration Options**:
+  - `MAX_TOKENS_PER_BATCH` (default: 100,000) with validation bounds [1,000-120,000]
+  - `TOKEN_ESTIMATION_RATIO` (default: 3 chars/token) with bounds [2-10]
+  - `USE_TOKEN_AWARE_BATCHING` (default: true) for backward compatibility
+  - Automatic fallback to original batching if disabled
+
+### Changed
+- **Import Reliability Improvements**:
+  - Conversation chunks now analyzed for content type before batching
+  - Code and JSON content detected and adjusted for higher token density
+  - 10% safety margin added to all token estimates
+  - Recursive chunk splitting preserves message context when possible
+- **Error Handling Enhancements**:
+  - Clear warnings for chunk splitting operations
+  - Detailed logging of truncation events with size information
+  - Graceful handling of extreme cases (stack overflow protection)
+
+### Technical Details
+- **Performance**: Minimal overhead (~1-2ms per chunk for token estimation)
+- **Compatibility**: Fully backward compatible with existing installations
+- **Safety**: Maximum recursion depth of 10 prevents infinite loops
+- **Monitoring**: Debug logs show batch counts, sizes, and token estimates
+- **Fallback**: Feature flag allows reverting to original behavior if needed
+
+### Validation
+- **Test Scenarios**: Large conversations with code blocks, JSON data, mixed content
+- **Token Limits**: Verified batches stay under 100k tokens (20k buffer from 120k limit)
+- **Chunk Splitting**: Tested recursive splitting preserves message boundaries
+- **Error Recovery**: Confirmed graceful handling of edge cases and oversized content
+
+### Migration Guide
+No user action required - fix is automatic upon upgrade:
+1. Update package: `npm install -g claude-self-reflect@2.6.0`
+2. Restart import process: imports will use new token-aware batching
+3. Monitor logs for any split/truncation warnings during first import
+
+### Environment Variables
+```bash
+# Token limit configuration (optional)
+MAX_TOKENS_PER_BATCH=100000         # Safe limit with 20k buffer
+TOKEN_ESTIMATION_RATIO=3            # Conservative chars-per-token estimate
+USE_TOKEN_AWARE_BATCHING=true       # Enable intelligent batching (recommended)
+```
+
 ## [2.5.18] - 2025-08-17
 
 ### Security
