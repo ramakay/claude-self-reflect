@@ -385,6 +385,78 @@ sudo apt-get install --reinstall python3
 
 ## Search and Reflection Issues
 
+### Conversations imported but not searchable (Issue #40)
+
+**Symptom**: After successful import showing hundreds of points in Qdrant, MCP queries (`reflect_on_past`, `quick_search`) return "No conversations found"
+
+**Common Causes**:
+
+1. **NPM Global Install Python Environment Issue**
+   - When installed globally via npm, the Python virtual environment may not be properly initialized
+   - The MCP server may not have access to required Python packages
+
+2. **Collection Naming Mismatch**
+   - Import creates collections with pattern `conv_<hash>_local` or `conv_<hash>_voyage`
+   - MCP server might be searching wrong collection names
+
+3. **Project Name Resolution**
+   - Import uses file paths to determine project names
+   - MCP server uses current working directory
+   - Mismatch causes searches in wrong collections
+
+**Solutions**:
+
+1. **Verify Python Environment**:
+   ```bash
+   # Check if venv exists and is properly set up
+   cd $(npm root -g)/claude-self-reflect
+   ls -la venv/  # Should show Python virtual environment
+   
+   # If missing, recreate:
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+2. **Check Collection Names**:
+   ```bash
+   # List all collections in Qdrant
+   curl http://localhost:6333/collections | jq
+   
+   # Verify collections have points
+   curl http://localhost:6333/collections/<collection_name> | jq
+   ```
+
+3. **Test with Docker** (Recommended):
+   ```bash
+   # Use Docker for consistent environment
+   docker-compose --profile import up
+   docker-compose --profile mcp up
+   ```
+
+4. **Debug MCP Server**:
+   ```bash
+   # Set debug environment variable
+   export DEBUG=true
+   export QDRANT_URL=http://localhost:6333
+   
+   # Run MCP server manually to see logs
+   cd $(npm root -g)/claude-self-reflect
+   ./mcp-server/run-mcp.sh
+   ```
+
+5. **Validate Setup**:
+   ```bash
+   # Run validation script
+   cd $(npm root -g)/claude-self-reflect
+   python scripts/validate-setup.py
+   ```
+
+**Prevention**:
+- Use Docker installation for production environments
+- Run setup wizard after npm install: `claude-self-reflect setup`
+- Always verify with test search after import
+
 ### Search returns no results
 
 **Symptom**: Asking about past conversations yields nothing

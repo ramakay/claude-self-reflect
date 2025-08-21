@@ -12,6 +12,7 @@ import time
 
 from fastmcp import FastMCP, Context
 from .utils import normalize_project_name
+from .project_resolver import ProjectResolver
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.models import (
@@ -367,19 +368,22 @@ async def reflect_on_past(
         # Filter collections by project if not searching all
         project_collections = []  # Define at this scope for later use
         if target_project != 'all':
-            # Generate the collection name pattern for this project using normalized name
-            normalized_name = normalize_project_name(target_project)
-            project_hash = hashlib.md5(normalized_name.encode()).hexdigest()[:8]
-            # Search BOTH local and voyage collections for this project
-            project_collections = [
-                c for c in all_collections 
-                if c.startswith(f"conv_{project_hash}_")
-            ]
+            # Use ProjectResolver to find collections for this project
+            resolver = ProjectResolver(qdrant_client)
+            project_collections = resolver.find_collections_for_project(target_project)
             
             if not project_collections:
-                # Try to find collections with project metadata
+                # Fall back to old method for backward compatibility
+                normalized_name = normalize_project_name(target_project)
+                project_hash = hashlib.md5(normalized_name.encode()).hexdigest()[:8]
+                project_collections = [
+                    c for c in all_collections 
+                    if c.startswith(f"conv_{project_hash}_")
+                ]
+            
+            if not project_collections:
                 # Fall back to searching all collections but filtering by project metadata
-                await ctx.debug(f"No collections found for project hash {project_hash}, will filter by metadata")
+                await ctx.debug(f"No collections found for project {target_project}, will filter by metadata")
                 collections_to_search = all_collections
             else:
                 await ctx.debug(f"Found {len(project_collections)} collections for project {target_project}")

@@ -47,6 +47,10 @@ def normalize_project_name(project_path: str) -> str:
     if not project_path:
         return ""
     
+    # Project discovery markers - common parent directories that indicate project roots
+    PROJECT_MARKERS = {'projects', 'code', 'Code', 'repos', 'repositories', 
+                       'dev', 'Development', 'work', 'src', 'github'}
+    
     # Remove trailing slashes
     project_path = project_path.rstrip('/')
     
@@ -61,15 +65,28 @@ def normalize_project_name(project_path: str) -> str:
         path_parts = Path(path_str).parts
         
         # Look for common project parent directories
-        project_parents = {'projects', 'code', 'Code', 'repos', 'repositories', 
-                          'dev', 'Development', 'work', 'src', 'github'}
+        project_parents = PROJECT_MARKERS
         
         # Find the project name after a known parent directory
         for i, part in enumerate(path_parts):
             if part.lower() in project_parents and i + 1 < len(path_parts):
                 # Everything after the parent directory is the project name
-                # Join remaining parts with dash if project name has multiple components
                 remaining = path_parts[i + 1:]
+                
+                # Use segment-based approach for complex paths
+                # Return the most likely project name from remaining segments
+                if remaining:
+                    # If it's a single segment, return it
+                    if len(remaining) == 1:
+                        return remaining[0]
+                    # For multiple segments, look for project-like patterns
+                    for r in remaining:
+                        r_lower = r.lower()
+                        # Prioritize segments with project indicators
+                        if any(ind in r_lower for ind in ['app', 'service', 'project', 'api', 'client']):
+                            return r
+                
+                # Join remaining parts with dash if project name has multiple components
                 return '-'.join(remaining)
         
         # Fallback: just use the last component

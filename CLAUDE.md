@@ -291,3 +291,4 @@ claude mcp add claude-self-reflect "/path/to/mcp-server/run-mcp.sh" -e QDRANT_UR
 12. **Rollback strategies must be immediate** - convert to pre-release, don't push through
 13. **State persistence without progress is a red flag** - activity ≠ productivity
 14. **Default configs should be generous** - start high (1GB), optimize down, not vice versa
+- This is a open source project, Don't leak personal project names into the internet

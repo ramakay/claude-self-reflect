@@ -8,7 +8,7 @@ services:
     command: chown -R 1000:1000 /config
     volumes:
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-    profiles: ["watch", "mcp", "import", "async"]
+    profiles: ["watch", "mcp", "import", "async", "safe-watch"]
 
   # Qdrant vector database - the heart of semantic search
   qdrant:
@@ -108,10 +108,10 @@ services:
       - MAX_CPU_PERCENT_PER_CORE=25  # 25% per core = 400% total on 16 cores
       - MAX_CONCURRENT_EMBEDDINGS=1  # Limit concurrent embeddings
       - MAX_CONCURRENT_QDRANT=2  # Limit concurrent Qdrant operations
-      - IMPORT_FREQUENCY=15  # Check every 15 seconds instead of 1
-      - BATCH_SIZE=3  # Process only 3 files at a time
-      - MEMORY_LIMIT_MB=600  # Memory limit (increased from 400MB for stability)
-      - MAX_QUEUE_SIZE=100  # Limit queue size
+      - IMPORT_FREQUENCY=5  # Check every 5 seconds for faster processing
+      - BATCH_SIZE=20  # Process 20 files at a time (increased from 3)
+      - MEMORY_LIMIT_MB=1500  # Memory limit (increased to 1.5GB)
+      - MAX_QUEUE_SIZE=500  # Increased queue size to handle backlog
       - MAX_BACKLOG_HOURS=24  # Alert if backlog > 24 hours
       - QDRANT_TIMEOUT=10  # 10 second timeout for Qdrant ops
       - MAX_RETRIES=3  # Retry failed operations
@@ -120,11 +120,11 @@ services:
       - LOGS_DIR=/logs
       - FASTEMBED_CACHE_PATH=/root/.cache/fastembed
       - MALLOC_ARENA_MAX=2  # MEMORY LEAK FIX: Limit glibc malloc arenas
-    restart: unless-stopped
-    profiles: ["watch"]
-    mem_limit: 500m
-    memswap_limit: 500m
-    cpus: 4.0  # Hard CPU limit: 4 cores max
+    restart: "no"  # DISABLED - causes system overload
+    profiles: ["watch-disabled"]  # Changed from "watch" to disable auto-start
+    mem_limit: 2g  # Increased from 500m to 2GB
+    memswap_limit: 2g
+    cpus: 8.0  # Increased CPU limit to 8 cores for faster processing
 
   # Async streaming importer - Ground-up async rewrite
   async-importer:
@@ -160,6 +160,38 @@ services:
     profiles: ["async"]
     mem_limit: 4g
     memswap_limit: 4g
+
+  # Safe watcher with hot/warm/cold priority
+  safe-watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.safe-watcher
+    container_name: claude-reflection-safe-watcher
+    depends_on:
+      - init-permissions
+      - qdrant
+    volumes:
+      - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
+      - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
+      - ./scripts:/scripts:ro
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - STATE_FILE=/config/watcher-state.json
+      - VOYAGE_KEY=${VOYAGE_KEY:-}
+      - PREFER_LOCAL_EMBEDDINGS=${PREFER_LOCAL_EMBEDDINGS:-true}
+      - HOT_WINDOW_MINUTES=${HOT_WINDOW_MINUTES:-15}
+      - MAX_COLD_FILES_PER_CYCLE=${MAX_COLD_FILES_PER_CYCLE:-3}
+      - MAX_MEMORY_MB=${MAX_MEMORY_MB:-300}
+      - WATCH_INTERVAL_SECONDS=${WATCH_INTERVAL_SECONDS:-30}
+      - MAX_FILES_PER_CYCLE=${MAX_FILES_PER_CYCLE:-10}
+      - MAX_CHUNK_SIZE=${MAX_CHUNK_SIZE:-50}  # Messages per chunk for streaming
+      - PYTHONUNBUFFERED=1
+      - MALLOC_ARENA_MAX=2
+    restart: "no"  # Manual start only - prevent system overload
+    profiles: ["safe-watch"]  # Requires explicit profile to run
+    mem_limit: 600m  # Increased from 400m to handle large files safely
+    memswap_limit: 600m
+    cpus: 1.0  # Single CPU core limit
 
   # MCP server for Claude integration
   mcp-server:

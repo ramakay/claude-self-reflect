@@ -1,0 +1,44 @@
+FROM python:3.12-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip and install setuptools
+RUN pip install --upgrade pip setuptools wheel
+
+# Install Python dependencies (matching importer)
+RUN pip install --no-cache-dir \
+    qdrant-client==1.15.0 \
+    fastembed==0.7.1 \
+    numpy==1.26.4 \
+    psutil==7.0.0 \
+    python-dotenv==1.0.0 \
+    voyageai==0.3.4 \
+    tenacity==9.1.2 \
+    humanize==4.12.3 \
+    tqdm==4.67.1
+
+# Pre-download and cache the FastEmbed model
+ENV FASTEMBED_CACHE_PATH=/root/.cache/fastembed
+RUN mkdir -p /root/.cache/fastembed && \
+    python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='sentence-transformers/all-MiniLM-L6-v2')"
+
+# Set working directory
+WORKDIR /app
+
+# Copy scripts
+COPY scripts/ /scripts/
+
+# Create config directory
+RUN mkdir -p /config
+
+# Set environment variables for memory management
+ENV PYTHONUNBUFFERED=1
+ENV MALLOC_ARENA_MAX=2
+
+# Run the watcher loop
+CMD ["/scripts/watcher-loop.sh"]
