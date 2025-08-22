@@ -1,6 +1,6 @@
 # Claude Self-Reflect
 <div align="center">
-![Alt](https://repobeats.axiom.co/api/embed/e45aa7276c6b2d1fbc46a9a3324e2231718787bb.svg "Repobeats analytics image")
+<img src="https://repobeats.axiom.co/api/embed/e45aa7276c6b2d1fbc46a9a3324e2231718787bb.svg" alt="Repobeats analytics image" />
 </div>
 <div align="center">
 
