@@ -31,7 +31,7 @@
   "author": "Claude-Self-Reflect Contributors",
   "type": "module",
   "bin": {
-    "claude-self-reflect": "./installer/cli.js"
+    "claude-self-reflect": "installer/cli.js"
   },
   "files": [
     "installer/*.js",
