@@ -1,5 +1,7 @@
 # Claude Self-Reflect
-
+<div align="center">
+![Alt](https://repobeats.axiom.co/api/embed/e45aa7276c6b2d1fbc46a9a3324e2231718787bb.svg "Repobeats analytics image")
+</div>
 <div align="center">
 
 [![npm version](https://badge.fury.io/js/claude-self-reflect.svg)](https://www.npmjs.com/package/claude-self-reflect)

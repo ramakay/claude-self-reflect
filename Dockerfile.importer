@@ -17,8 +17,12 @@ RUN pip install --no-cache-dir \
     voyageai==0.3.4 \
     tenacity==9.1.2
 
-# Note: The import script is mounted as a volume in docker-compose.yaml
-# This allows the container to work with both local development and global npm installs
+# Copy scripts into the image for npm package compatibility
+# This ensures scripts are available even without volume mounts
+COPY scripts/ /app/scripts/
+
+# Note: Volume mounts in docker-compose.yaml will override these files in local development
+# This provides compatibility for both local development and global npm installs
 
 # Default command (can be overridden by docker-compose)
 CMD ["python", "--version"]

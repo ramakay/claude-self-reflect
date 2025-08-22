@@ -1,0 +1,76 @@
+version: '3.8'
+
+# Test configuration for isolated testing without affecting production services
+# Uses different ports and container names to avoid conflicts
+
+services:
+  # Test Qdrant database on different port
+  test-qdrant:
+    image: qdrant/qdrant:v1.15.0
+    container_name: test-claude-qdrant
+    ports:
+      - "6334:6333"  # Different external port
+    volumes:
+      - test_qdrant_data:/qdrant/storage
+      - ./config/qdrant-config.yaml:/qdrant/config/config.yaml:ro
+    environment:
+      - QDRANT__LOG_LEVEL=INFO
+      - QDRANT__SERVICE__HTTP_PORT=6333
+    restart: "no"
+    mem_limit: 1g
+
+  # Test importer with isolated configuration
+  test-importer:
+    build:
+      context: .
+      dockerfile: Dockerfile.importer
+    container_name: test-claude-importer
+    depends_on:
+      - test-qdrant
+    volumes:
+      # Use test data directory
+      - /tmp/test-claude-logs:/logs:ro
+      - /tmp/test-claude-config:/config
+      # Test both with and without volume mount
+      # Comment out next line to test npm package scenario
+      - ./scripts:/scripts:ro
+    environment:
+      - QDRANT_URL=http://test-qdrant:6333
+      - STATE_FILE=/config/test-imported-files.json
+      - PREFER_LOCAL_EMBEDDINGS=true
+      - EMBEDDING_MODEL=all-MiniLM-L6-v2
+      - BATCH_SIZE=10
+      - CHUNK_SIZE=5
+      - PYTHONUNBUFFERED=1
+      - TEST_MODE=true
+    restart: "no"
+    command: python /app/scripts/delta-metadata-update-safe.py
+
+  # Test script verification container
+  test-script-check:
+    build:
+      context: .
+      dockerfile: Dockerfile.importer
+    container_name: test-script-checker
+    command: |
+      sh -c "
+        echo '=== Testing Script Availability ===' &&
+        echo 'Checking /app/scripts/:' &&
+        ls -la /app/scripts/ 2>/dev/null || echo 'Directory not found' &&
+        echo '' &&
+        echo 'Checking /scripts/:' &&
+        ls -la /scripts/ 2>/dev/null || echo 'Directory not found' &&
+        echo '' &&
+        echo 'Testing script execution:' &&
+        python /app/scripts/delta-metadata-update-safe.py --help 2>&1 | head -5 || echo 'Script execution failed' &&
+        echo '=== Test Complete ==='
+      "
+    restart: "no"
+
+volumes:
+  test_qdrant_data:
+    name: test-claude-qdrant-data
+
+networks:
+  default:
+    name: test-claude-network
