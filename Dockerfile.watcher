@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 # Update system packages for security and install build dependencies for psutil
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
