@@ -381,13 +381,19 @@ async def reflect_on_past(
                     if c.startswith(f"conv_{project_hash}_")
                 ]
             
+            # Always include reflections collections when searching a specific project
+            reflections_collections = [c for c in all_collections if c.startswith('reflections')]
+            
             if not project_collections:
                 # Fall back to searching all collections but filtering by project metadata
                 await ctx.debug(f"No collections found for project {target_project}, will filter by metadata")
                 collections_to_search = all_collections
             else:
                 await ctx.debug(f"Found {len(project_collections)} collections for project {target_project}")
-                collections_to_search = project_collections
+                # Include both project collections and reflections
+                collections_to_search = project_collections + reflections_collections
+                # Remove duplicates
+                collections_to_search = list(set(collections_to_search))
         else:
             collections_to_search = all_collections
         
@@ -524,12 +530,26 @@ async def reflect_on_past(
                         # Check project filter if we're searching all collections but want specific project
                         point_project = point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', ''))
                         
+                        # Special handling for reflections - they're global by default but can have project context
+                        is_reflection_collection = collection_name.startswith('reflections')
+                        
                         # Handle project matching - check if the target project name appears at the end of the stored project path
-                        if target_project != 'all' and not project_collections:
+                        if target_project != 'all' and not project_collections and not is_reflection_collection:
                             # The stored project name is like "-Users-username-projects-ShopifyMCPMockShop"
                             # We want to match just "ShopifyMCPMockShop"
                             if not point_project.endswith(f"-{target_project}") and point_project != target_project:
                                 continue  # Skip results from other projects
+                        
+                        # For reflections with project context, optionally filter by project
+                        if is_reflection_collection and target_project != 'all' and 'project' in point.payload:
+                            # Only filter if the reflection has project metadata
+                            reflection_project = point.payload.get('project', '')
+                            if reflection_project and not (
+                                reflection_project == target_project or 
+                                reflection_project.endswith(f"/{target_project}") or
+                                reflection_project.endswith(f"-{target_project}")
+                            ):
+                                continue  # Skip reflections from other projects
                             
                         all_results.append(SearchResult(
                             id=str(point.id),
@@ -604,12 +624,26 @@ async def reflect_on_past(
                         # Check project filter if we're searching all collections but want specific project
                         point_project = point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', ''))
                         
+                        # Special handling for reflections - they're global by default but can have project context
+                        is_reflection_collection = collection_name.startswith('reflections')
+                        
                         # Handle project matching - check if the target project name appears at the end of the stored project path
-                        if target_project != 'all' and not project_collections:
+                        if target_project != 'all' and not project_collections and not is_reflection_collection:
                             # The stored project name is like "-Users-username-projects-ShopifyMCPMockShop"
                             # We want to match just "ShopifyMCPMockShop"
                             if not point_project.endswith(f"-{target_project}") and point_project != target_project:
                                 continue  # Skip results from other projects
+                        
+                        # For reflections with project context, optionally filter by project
+                        if is_reflection_collection and target_project != 'all' and 'project' in point.payload:
+                            # Only filter if the reflection has project metadata
+                            reflection_project = point.payload.get('project', '')
+                            if reflection_project and not (
+                                reflection_project == target_project or 
+                                reflection_project.endswith(f"/{target_project}") or
+                                reflection_project.endswith(f"-{target_project}")
+                            ):
+                                continue  # Skip reflections from other projects
                             
                         all_results.append(SearchResult(
                             id=str(point.id),
@@ -641,12 +675,26 @@ async def reflect_on_past(
                         # Check project filter if we're searching all collections but want specific project
                         point_project = point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', ''))
                         
+                        # Special handling for reflections - they're global by default but can have project context
+                        is_reflection_collection = collection_name.startswith('reflections')
+                        
                         # Handle project matching - check if the target project name appears at the end of the stored project path
-                        if target_project != 'all' and not project_collections:
+                        if target_project != 'all' and not project_collections and not is_reflection_collection:
                             # The stored project name is like "-Users-username-projects-ShopifyMCPMockShop"
                             # We want to match just "ShopifyMCPMockShop"
                             if not point_project.endswith(f"-{target_project}") and point_project != target_project:
                                 continue  # Skip results from other projects
+                        
+                        # For reflections with project context, optionally filter by project
+                        if is_reflection_collection and target_project != 'all' and 'project' in point.payload:
+                            # Only filter if the reflection has project metadata
+                            reflection_project = point.payload.get('project', '')
+                            if reflection_project and not (
+                                reflection_project == target_project or 
+                                reflection_project.endswith(f"/{target_project}") or
+                                reflection_project.endswith(f"-{target_project}")
+                            ):
+                                continue  # Skip reflections from other projects
                         
                         # BOOST V2 CHUNKS: Apply score boost for v2 chunks (better quality)
                         original_score = point.score
@@ -932,6 +980,25 @@ async def store_reflection(
         # Create reflections collection name
         collection_name = f"reflections{get_collection_suffix()}"
         
+        # Get current project context
+        cwd = os.environ.get('MCP_CLIENT_CWD', os.getcwd())
+        project_path = Path(cwd)
+        
+        # Extract project name from path
+        project_name = None
+        path_parts = project_path.parts
+        if 'projects' in path_parts:
+            idx = path_parts.index('projects')
+            if idx + 1 < len(path_parts):
+                # Get all parts after 'projects' to form the project name
+                # This handles cases like projects/Connectiva-App/connectiva-ai
+                project_parts = path_parts[idx + 1:]
+                project_name = '/'.join(project_parts)
+        
+        # If no project detected, use the last directory name
+        if not project_name:
+            project_name = project_path.name
+        
         # Ensure collection exists
         try:
             collection_info = await qdrant_client.get_collection(collection_name)
@@ -949,7 +1016,7 @@ async def store_reflection(
         # Generate embedding for the reflection
         embedding = await generate_embedding(content)
         
-        # Create point with metadata
+        # Create point with metadata including project context
         point_id = datetime.now().timestamp()
         point = PointStruct(
             id=int(point_id),
@@ -959,7 +1026,9 @@ async def store_reflection(
                 "tags": tags,
                 "timestamp": datetime.now().isoformat(),
                 "type": "reflection",
-                "role": "user_reflection"
+                "role": "user_reflection",
+                "project": project_name,  # Add project context
+                "project_path": str(project_path)  # Add full path for reference
             }
         )
         

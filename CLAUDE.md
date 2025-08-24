@@ -1,5 +1,10 @@
 # Claude Self Reflect - Conversation Memory for Claude
 
+## Important: Conversation Storage Location
+- Claude conversations are stored in `~/.claude/projects/` (NOT in a `/conversations` subdirectory)
+- Each project folder contains `.jsonl` files directly in the project directory
+- Project folders are named with sanitized paths like `-Users-username-projects-projectname`
+
 ## Documentation Style Guidelines
 
 ### Release Announcements
