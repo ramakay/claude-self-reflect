@@ -5,6 +5,36 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.1] - 2025-08-24
+
+### Fixed
+- **CRITICAL: Reflections Not Searchable from Project Context** - Cross-agent reflection sharing now works properly
+  - **Root Cause**: Reflections stored by one agent weren't searchable by the next agent when working in project context
+  - **Issue**: Project-scoped searches excluded the global reflections collection, making stored insights invisible
+  - **Solution**: Modified search logic to always include reflections collection when searching from specific projects
+  - **Impact**: Agents can now build upon each other's stored insights and maintain conversation continuity
+  - **Files Modified**:
+    - `mcp-server/src/server.py`: Enhanced project-scoped search to include reflections collection
+    - `mcp-server/src/server.py`: Added project metadata to newly stored reflections for better organization
+    - `CLAUDE.md`: Updated documentation with reflection storage improvements
+  - **Backward Compatibility**: Old reflections without project metadata remain fully searchable
+
+### Added
+- **Project Metadata for Reflections**: Newly stored reflections now include project context for better organization
+- **Enhanced Search Logic**: Project-specific searches now automatically include global reflections for comprehensive results
+- **Improved Cross-Agent Continuity**: Agents can now discover and build upon insights from previous interactions
+
+### Technical Details
+- **Search Behavior**: When searching from a specific project, the system now queries both the project collection and the global reflections collection
+- **Metadata Schema**: New reflections include project name and context for future filtering capabilities
+- **Performance**: No performance impact - reflections collection is lightweight and adds minimal overhead
+- **Migration**: Automatic - no user action required, existing reflections remain accessible
+
+### Validation
+- **Cross-Agent Testing**: Verified that insights stored by one agent are discoverable by subsequent agents
+- **Project Isolation**: Confirmed that project-scoped searches still work correctly while including relevant reflections
+- **Backward Compatibility**: Tested that old reflections without project metadata continue to function properly
+
 ## [2.7.0] - 2025-08-21
 
 ### Added
