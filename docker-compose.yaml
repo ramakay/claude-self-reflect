@@ -42,6 +42,7 @@ services:
     environment:
       - QDRANT_URL=http://qdrant:6333
       - STATE_FILE=/config/imported-files.json
+      - LOGS_DIR=/logs
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
       - VOYAGE_KEY=${VOYAGE_KEY:-}
