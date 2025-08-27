@@ -24,7 +24,8 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue
 # Configuration
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 LOGS_DIR = os.getenv("LOGS_DIR", os.path.expanduser("~/.claude/projects"))
-STATE_FILE = os.getenv("STATE_FILE", "./config/delta-update-state.json")
+# Use /config path if running in Docker, otherwise use ./config
+STATE_FILE = os.getenv("STATE_FILE", "/config/delta-update-state.json" if os.path.exists("/config") else "./config/delta-update-state.json")
 PREFER_LOCAL_EMBEDDINGS = os.getenv("PREFER_LOCAL_EMBEDDINGS", "true").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 DAYS_TO_UPDATE = int(os.getenv("DAYS_TO_UPDATE", "7"))
@@ -432,7 +433,7 @@ async def main_async():
     logger.info("=== Delta Update Complete ===")
     logger.info(f"Successfully updated: {success_count} conversations")
     logger.info(f"Failed: {failed_count} conversations")
-    logger.info(f"Total conversations in state: {len(state['updated_conversations'])}")
+    logger.info(f"Total conversations in state: {len(state.get('updated_conversations', {}))}")
 
 def main():
     """Entry point."""

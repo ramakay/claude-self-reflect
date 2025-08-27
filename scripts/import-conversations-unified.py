@@ -57,7 +57,9 @@ else:
 
 def normalize_project_name(project_name: str) -> str:
     """Normalize project name for consistency."""
-    return project_name.replace("-Users-ramakrishnanannaswamy-projects-", "").replace("-", "_").lower()
+    # For compatibility with delta-metadata-update, just use the project name as-is
+    # This ensures collection names match between import and delta update scripts
+    return project_name
 
 def get_collection_name(project_path: Path) -> str:
     """Generate collection name from project path."""
