@@ -81,6 +81,7 @@ config/imported-files.json
 config/imported-files-old.json
 config/delta-update-state.json
 config/*-state.json
+config/test/
 
 # Temporary files
 *.tmp
