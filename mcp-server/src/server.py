@@ -9,6 +9,7 @@ import json
 import numpy as np
 import hashlib
 import time
+import logging
 
 from fastmcp import FastMCP, Context
 from .utils import normalize_project_name
@@ -124,18 +125,48 @@ indexing_status = {
     "is_checking": False
 }
 
-async def update_indexing_status():
+# Cache for indexing status (5-second TTL)
+_indexing_cache = {"result": None, "timestamp": 0}
+
+# Setup logger
+logger = logging.getLogger(__name__)
+
+def normalize_path(path_str: str) -> str:
+    """Normalize path for consistent comparison across platforms.
+    
+    Args:
+        path_str: Path string to normalize
+        
+    Returns:
+        Normalized path string with consistent separators
+    """
+    if not path_str:
+        return path_str
+    p = Path(path_str).expanduser().resolve()
+    return str(p).replace('\\', '/')  # Consistent separators for all platforms
+
+async def update_indexing_status(cache_ttl: int = 5):
     """Update indexing status by checking JSONL files vs Qdrant collections.
-    This is a lightweight check that compares file counts, not full content."""
-    global indexing_status
+    This is a lightweight check that compares file counts, not full content.
+    
+    Args:
+        cache_ttl: Cache time-to-live in seconds (default: 5)
+    """
+    global indexing_status, _indexing_cache
+    
+    # Check cache first (5-second TTL to prevent performance issues)
+    current_time = time.time()
+    if _indexing_cache["result"] and current_time - _indexing_cache["timestamp"] < cache_ttl:
+        # Use cached result
+        indexing_status = _indexing_cache["result"].copy()
+        return
     
     # Don't run concurrent checks
     if indexing_status["is_checking"]:
         return
     
-    # Only check every 5 minutes to avoid overhead
-    current_time = time.time()
-    if current_time - indexing_status["last_check"] < 300:  # 5 minutes
+    # Check immediately on first call, then every 60 seconds to avoid overhead
+    if indexing_status["last_check"] > 0 and current_time - indexing_status["last_check"] < 60:  # 1 minute
         return
     
     indexing_status["is_checking"] = True
@@ -151,46 +182,107 @@ async def update_indexing_status():
             jsonl_files = list(projects_dir.glob("**/*.jsonl"))
             total_files = len(jsonl_files)
             
-            # Check imported-files.json to see what's been imported
-            # The streaming importer uses imported-files.json with nested structure
-            # Try multiple possible locations for the config file
+            # Check imported-files.json AND watcher state files to see what's been imported
+            # The system uses multiple state files that need to be merged
+            all_imported_files = set()  # Use set to avoid duplicates
+            file_metadata = {}
+            
+            # 1. Check imported-files.json (batch importer)
             possible_paths = [
                 Path.home() / ".claude-self-reflect" / "config" / "imported-files.json",
                 Path(__file__).parent.parent.parent / "config" / "imported-files.json",
                 Path("/config/imported-files.json")  # Docker path if running in container
             ]
             
-            imported_files_path = None
             for path in possible_paths:
                 if path.exists():
-                    imported_files_path = path
-                    break
+                    try:
+                        with open(path, 'r') as f:
+                            imported_data = json.load(f)
+                            imported_files_dict = imported_data.get("imported_files", {})
+                            file_metadata.update(imported_data.get("file_metadata", {}))
+                            # Normalize paths before adding to set
+                            normalized_files = {normalize_path(k) for k in imported_files_dict.keys()}
+                            all_imported_files.update(normalized_files)
+                    except (json.JSONDecodeError, IOError) as e:
+                        logger.debug(f"Failed to read state file {path}: {e}")
+                        pass  # Continue if file is corrupted
             
-            if imported_files_path and imported_files_path.exists():
-                with open(imported_files_path, 'r') as f:
-                    imported_data = json.load(f)
-                    # The actual structure has imported_files and file_metadata at the top level
-                    # NOT nested under stream_position as previously assumed
-                    imported_files_dict = imported_data.get("imported_files", {})
-                    file_metadata = imported_data.get("file_metadata", {})
-                    
-                    # Convert dict keys to list for compatibility with existing logic
-                    imported_files_list = list(imported_files_dict.keys())
+            # 2. Check csr-watcher.json (streaming watcher - local mode)
+            watcher_paths = [
+                Path.home() / ".claude-self-reflect" / "config" / "csr-watcher.json",
+                Path("/config/csr-watcher.json")  # Docker path
+            ]
+            
+            for path in watcher_paths:
+                if path.exists():
+                    try:
+                        with open(path, 'r') as f:
+                            watcher_data = json.load(f)
+                            watcher_files = watcher_data.get("imported_files", {})
+                            # Normalize paths before adding to set
+                            normalized_files = {normalize_path(k) for k in watcher_files.keys()}
+                            all_imported_files.update(normalized_files)
+                            # Add to metadata with normalized paths
+                            for file_path, info in watcher_files.items():
+                                normalized = normalize_path(file_path)
+                                if normalized not in file_metadata:
+                                    file_metadata[normalized] = {
+                                        "position": 1,
+                                        "chunks": info.get("chunks", 0)
+                                    }
+                    except (json.JSONDecodeError, IOError) as e:
+                        logger.debug(f"Failed to read watcher state file {path}: {e}")
+                        pass  # Continue if file is corrupted
+            
+            # 3. Check csr-watcher-cloud.json (streaming watcher - cloud mode)
+            cloud_watcher_path = Path.home() / ".claude-self-reflect" / "config" / "csr-watcher-cloud.json"
+            if cloud_watcher_path.exists():
+                try:
+                    with open(cloud_watcher_path, 'r') as f:
+                        cloud_data = json.load(f)
+                        cloud_files = cloud_data.get("imported_files", {})
+                        # Normalize paths before adding to set
+                        normalized_files = {normalize_path(k) for k in cloud_files.keys()}
+                        all_imported_files.update(normalized_files)
+                        # Add to metadata with normalized paths
+                        for file_path, info in cloud_files.items():
+                            normalized = normalize_path(file_path)
+                            if normalized not in file_metadata:
+                                file_metadata[normalized] = {
+                                    "position": 1,
+                                    "chunks": info.get("chunks", 0)
+                                }
+                except (json.JSONDecodeError, IOError) as e:
+                    logger.debug(f"Failed to read cloud watcher state file {cloud_watcher_path}: {e}")
+                    pass  # Continue if file is corrupted
+            
+            # Convert set to list for compatibility
+            imported_files_list = list(all_imported_files)
                     
                     # Count files that have been imported
                     for file_path in jsonl_files:
+                        # Normalize the current file path for consistent comparison
+                        normalized_file = normalize_path(str(file_path))
+                        
                         # Try multiple path formats to match Docker's state file
                         file_str = str(file_path).replace(str(Path.home()), "/logs").replace("\\", "/")
                         # Also try without .claude/projects prefix (Docker mounts directly)
                         file_str_alt = file_str.replace("/.claude/projects", "")
                         
+                        # Normalize alternative paths as well
+                        normalized_alt = normalize_path(file_str)
+                        normalized_alt2 = normalize_path(file_str_alt)
+                        
                         # Check if file is in imported_files list (fully imported)
-                        if file_str in imported_files_list or file_str_alt in imported_files_list:
+                        if normalized_file in imported_files_list or normalized_alt in imported_files_list or normalized_alt2 in imported_files_list:
                             indexed_files += 1
                         # Or if it has metadata with position > 0 (partially imported)
-                        elif file_str in file_metadata and file_metadata[file_str].get("position", 0) > 0:
+                        elif normalized_file in file_metadata and file_metadata[normalized_file].get("position", 0) > 0:
                             indexed_files += 1
-                        elif file_str_alt in file_metadata and file_metadata[file_str_alt].get("position", 0) > 0:
+                        elif normalized_alt in file_metadata and file_metadata[normalized_alt].get("position", 0) > 0:
+                            indexed_files += 1
+                        elif normalized_alt2 in file_metadata and file_metadata[normalized_alt2].get("position", 0) > 0:
                             indexed_files += 1
         
         # Update status
@@ -203,9 +295,14 @@ async def update_indexing_status():
             indexing_status["percentage"] = (indexed_files / total_files) * 100
         else:
             indexing_status["percentage"] = 100.0
+        
+        # Update cache
+        _indexing_cache["result"] = indexing_status.copy()
+        _indexing_cache["timestamp"] = current_time
             
     except Exception as e:
         print(f"[WARNING] Failed to update indexing status: {e}")
+        logger.error(f"Failed to update indexing status: {e}", exc_info=True)
     finally:
         indexing_status["is_checking"] = False
     

@@ -1,0 +1,87 @@
+{
+  "timestamp": "2024-12-29",
+  "production_ready": true,
+  "analysis": {
+    "file_size": 50682,
+    "line_count": 1220,
+    "features": {
+      "voyage_provider": true,
+      "fastembed_provider": true,
+      "memory_monitor": true,
+      "cpu_monitor": true,
+      "queue_manager": true,
+      "retry_logic": true,
+      "state_persistence": true,
+      "collection_naming": true,
+      "docker_detection": true,
+      "memory_cleanup": true,
+      "cpu_throttling": true,
+      "no_messages_fix": true,
+      "atomic_save": true,
+      "cgroup_detection": true
+    },
+    "issues": [],
+    "strengths": [
+      "async_context: 5 instances",
+      "logging: 66 instances",
+      "type_hints: 1 instances",
+      "docstrings: 47 instances",
+      "constants: 2 instances",
+      "config_dataclass: 1 instances",
+      "Critical feature: exponential_backoff",
+      "Critical feature: memory_threshold",
+      "Critical feature: queue_overflow",
+      "Critical feature: chunk_memory_check",
+      "Critical feature: graceful_shutdown",
+      "Version identified: 3.0.0",
+      "Configuration completeness: 100.0%"
+    ],
+    "version": "3.0.0",
+    "config_completeness": 100.0,
+    "scores": {
+      "features": 100.0,
+      "quality": 60,
+      "critical": 100,
+      "overall": 88.0
+    }
+  },
+  "scenarios": [
+    {
+      "name": "Local FastEmbed Mode",
+      "env": {
+        "PREFER_LOCAL_EMBEDDINGS": "true",
+        "MEMORY_LIMIT_MB": "1024",
+        "LOGS_DIR": "~/.claude/projects"
+      },
+      "expected": {
+        "prefer_local": true,
+        "state_file_contains": "csr-watcher.json",
+        "collection_suffix": "_local"
+      }
+    },
+    {
+      "name": "Cloud Voyage Mode",
+      "env": {
+        "PREFER_LOCAL_EMBEDDINGS": "false",
+        "VOYAGE_API_KEY": "test-key",
+        "MEMORY_LIMIT_MB": "1024"
+      },
+      "expected": {
+        "prefer_local": false,
+        "state_file_contains": "cloud",
+        "collection_suffix": "_voyage"
+      }
+    },
+    {
+      "name": "Docker Container Mode",
+      "env": {
+        "LOGS_DIR": "/logs",
+        "DOCKERENV": "/.dockerenv"
+      },
+      "expected": {
+        "state_file_contains": "/config/",
+        "logs_dir": "/logs"
+      }
+    }
+  ]
+}

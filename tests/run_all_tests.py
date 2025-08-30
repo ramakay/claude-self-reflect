@@ -82,6 +82,11 @@ TEST_SUITES = {
         "file": "../scripts/test-streaming-importer-e2e.py",
         "description": "Streaming importer E2E test",
         "async": True
+    },
+    "streaming_watcher": {
+        "file": "test_streaming_watcher.py",
+        "description": "Streaming watcher comprehensive tests",
+        "async": True
     }
 }
 
