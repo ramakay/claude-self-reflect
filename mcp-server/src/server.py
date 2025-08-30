@@ -259,31 +259,31 @@ async def update_indexing_status(cache_ttl: int = 5):
             
             # Convert set to list for compatibility
             imported_files_list = list(all_imported_files)
-                    
-                    # Count files that have been imported
-                    for file_path in jsonl_files:
-                        # Normalize the current file path for consistent comparison
-                        normalized_file = normalize_path(str(file_path))
-                        
-                        # Try multiple path formats to match Docker's state file
-                        file_str = str(file_path).replace(str(Path.home()), "/logs").replace("\\", "/")
-                        # Also try without .claude/projects prefix (Docker mounts directly)
-                        file_str_alt = file_str.replace("/.claude/projects", "")
-                        
-                        # Normalize alternative paths as well
-                        normalized_alt = normalize_path(file_str)
-                        normalized_alt2 = normalize_path(file_str_alt)
-                        
-                        # Check if file is in imported_files list (fully imported)
-                        if normalized_file in imported_files_list or normalized_alt in imported_files_list or normalized_alt2 in imported_files_list:
-                            indexed_files += 1
-                        # Or if it has metadata with position > 0 (partially imported)
-                        elif normalized_file in file_metadata and file_metadata[normalized_file].get("position", 0) > 0:
-                            indexed_files += 1
-                        elif normalized_alt in file_metadata and file_metadata[normalized_alt].get("position", 0) > 0:
-                            indexed_files += 1
-                        elif normalized_alt2 in file_metadata and file_metadata[normalized_alt2].get("position", 0) > 0:
-                            indexed_files += 1
+            
+            # Count files that have been imported
+            for file_path in jsonl_files:
+                # Normalize the current file path for consistent comparison
+                normalized_file = normalize_path(str(file_path))
+                
+                # Try multiple path formats to match Docker's state file
+                file_str = str(file_path).replace(str(Path.home()), "/logs").replace("\\", "/")
+                # Also try without .claude/projects prefix (Docker mounts directly)
+                file_str_alt = file_str.replace("/.claude/projects", "")
+                
+                # Normalize alternative paths as well
+                normalized_alt = normalize_path(file_str)
+                normalized_alt2 = normalize_path(file_str_alt)
+                
+                # Check if file is in imported_files list (fully imported)
+                if normalized_file in imported_files_list or normalized_alt in imported_files_list or normalized_alt2 in imported_files_list:
+                    indexed_files += 1
+                # Or if it has metadata with position > 0 (partially imported)
+                elif normalized_file in file_metadata and file_metadata[normalized_file].get("position", 0) > 0:
+                    indexed_files += 1
+                elif normalized_alt in file_metadata and file_metadata[normalized_alt].get("position", 0) > 0:
+                    indexed_files += 1
+                elif normalized_alt2 in file_metadata and file_metadata[normalized_alt2].get("position", 0) > 0:
+                    indexed_files += 1
         
         # Update status
         indexing_status["last_check"] = current_time
