@@ -1,0 +1,148 @@
+{
+  "timestamp": "2025-08-29T20:21:21.828513",
+  "duration": 8.468336820602417,
+  "categories": [
+    "mcp_tools",
+    "memory_decay",
+    "multi_project",
+    "embedding_models",
+    "delta_metadata",
+    "performance",
+    "data_integrity",
+    "recovery",
+    "security",
+    "e2e_import",
+    "mcp_search",
+    "search_functionality",
+    "streaming_importer",
+    "streaming_watcher"
+  ],
+  "results": {
+    "mcp_tools": {
+      "name": "mcp_tools",
+      "status": "FAIL",
+      "duration": 0.08987998962402344,
+      "counts": {
+        "passed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "total": 0
+      },
+      "output": ""
+    },
+    "memory_decay": {
+      "name": "memory_decay",
+      "status": "PASS",
+      "duration": 0.06545615196228027,
+      "counts": {
+        "passed": 26,
+        "failed": 0,
+        "skipped": 0,
+        "total": 26
+      },
+      "output": null
+    },
+    "multi_project": {
+      "name": "multi_project",
+      "status": "PASS",
+      "duration": 1.2706749439239502,
+      "counts": {
+        "passed": 17,
+        "failed": 0,
+        "skipped": 0,
+        "total": 17
+      },
+      "output": null
+    },
+    "embedding_models": {
+      "name": "embedding_models",
+      "status": "SKIP",
+      "error": "Test file not found: /Users/ramakrishnanannaswamy/projects/claude-self-reflect/tests/test_embedding_models.py",
+      "duration": 0
+    },
+    "delta_metadata": {
+      "name": "delta_metadata",
+      "status": "SKIP",
+      "error": "Test file not found: /Users/ramakrishnanannaswamy/projects/claude-self-reflect/tests/test_delta_metadata.py",
+      "duration": 0
+    },
+    "performance": {
+      "name": "performance",
+      "status": "SKIP",
+      "error": "Test file not found: /Users/ramakrishnanannaswamy/projects/claude-self-reflect/tests/test_performance_load.py",
+      "duration": 0
+    },
+    "data_integrity": {
+      "name": "data_integrity",
+      "status": "SKIP",
+      "error": "Test file not found: /Users/ramakrishnanannaswamy/projects/claude-self-reflect/tests/test_data_integrity.py",
+      "duration": 0
+    },
+    "recovery": {
+      "name": "recovery",
+      "status": "SKIP",
+      "error": "Test file not found: /Users/ramakrishnanannaswamy/projects/claude-self-reflect/tests/test_recovery_scenarios.py",
+      "duration": 0
+    },
+    "security": {
+      "name": "security",
+      "status": "SKIP",
+      "error": "Test file not found: /Users/ramakrishnanannaswamy/projects/claude-self-reflect/tests/test_security.py",
+      "duration": 0
+    },
+    "e2e_import": {
+      "name": "e2e_import",
+      "status": "FAIL",
+      "duration": 0.7712969779968262,
+      "counts": {
+        "passed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "total": 0
+      },
+      "output": ""
+    },
+    "mcp_search": {
+      "name": "mcp_search",
+      "status": "FAIL",
+      "duration": 1.027359962463379,
+      "counts": {
+        "passed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "total": 0
+      },
+      "output": "\ud83e\uddea Testing MCP Search Functionality\n\n"
+    },
+    "search_functionality": {
+      "name": "search_functionality",
+      "status": "FAIL",
+      "duration": 0.9939479827880859,
+      "counts": {
+        "passed": 5,
+        "failed": 2,
+        "skipped": 0,
+        "total": 7
+      },
+      "output": "\n================================================================================\nCLAUDE SELF-REFLECT SEARCH FUNCTIONALITY TEST SUITE\n================================================================================\nStarting tests at 2025-08-29T20:21:18.698617\nTotal tests to run: 7\n\n[1/7] Running: Procsolve AI Product Page...\n  Project: procsolve-website\n  Query: AI product realization usecases\n  Result: \u2705 PASSED\n  Found: 1 results, Top score: 1.000\n  Time: 0.05s\n\n[2/7] Running: Procsolve Spline Integration...\n  Project: procsolve-website\n  Query: spline mcp server 3D visualization\n  Result: \u2705 PASSED\n  Found: 98 results, Top score: 1.000\n  Time: 0.04s\n\n[3/7] Running: Self-Reflect Migration Fix...\n  Project: claude-self-reflect\n  Query: fix misplaced conversations normalize project\n  Result: \u2705 PASSED\n  Found: 1 results, Top score: 1.000\n  Time: 0.01s\n\n[4/7] Running: ZenMCP Model Tools...\n  Project: zenmcp-zen-mcp-server\n  Query: opus gemini flash model comparison\n  Result: \u2705 PASSED\n  Found: 82 results, Top score: 1.000\n  Time: 0.01s\n\n[5/7] Running: Anukruti Wedding Project...\n  Project: anukruti\n  Query: wedding invitation RSVP form backend\n  Result: \u274c FAILED\n  Found: 0 results, Top score: 0.000\n  Time: 0.03s\n\n[6/7] Running: Cross-Project Docker Search...\n  Project: all\n  Query: docker compose container orchestration\n  Result: \u274c FAILED\n  Found: 0 results, Top score: 0.000\n  Time: 0.01s\n\n[7/7] Running: Self-Reflect Qdrant Management...\n  Project: claude-self-reflect\n  Query: qdrant collection vector embeddings FastEmbed\n  Result: \u2705 PASSED\n  Found: 19 results, Top score: 1.000\n  Time: 0.01s\n\n================================================================================\nTEST SUMMARY\n================================================================================\nTotal: 7 tests\nPassed: 5 \u2705\nFailed: 2 \u274c\nSuccess Rate: 71.4%\n\nFailed Tests:\n  - Anukruti Wedding Project: anukruti\n    Query: 'wedding invitation RSVP form backend'\n    Expected: 'wedding'\n    Got: 0 results, score: 0.000\n  - Cross-Project Docker Search: all\n    Query: 'docker compose container orchestration'\n    Expected: 'docker'\n    Got: 0 results, score: 0.000\n\nPerformance:\n  Average search time: 0.02s\n  Fastest: 0.01s\n  Slowest: 0.05s\n\n================================================================================\nCOLLECTION VERIFICATION\n================================================================================\n  procsolve-website: conv_9f2f312b_local (2707 points)\n  procsolve-website: conv_9f2f312b_voyage (507 points)\n  claude-self-reflect: conv_07400017_local (251 points)\n  anukruti: conv_b2a02c80_local (0 points)\n  zenmcp-zen-mcp-server: conv_66d0bf97_local (36 points)\n\n================================================================================\nTest suite completed at 2025-08-29T20:21:18.866308\n================================================================================\n\n\u26a0\ufe0f Some tests failed. Please review the results above.\nConsider investigating failed tests before proceeding with release.\n"
+    },
+    "streaming_importer": {
+      "name": "streaming_importer",
+      "status": "SKIP",
+      "error": "Test file not found: /Users/ramakrishnanannaswamy/projects/claude-self-reflect/tests/../scripts/test-streaming-importer-e2e.py",
+      "duration": 0
+    },
+    "streaming_watcher": {
+      "name": "streaming_watcher",
+      "status": "FAIL",
+      "duration": 2.858036994934082,
+      "counts": {
+        "passed": 3,
+        "failed": 13,
+        "skipped": 0,
+        "total": 16
+      },
+      "output": "================================================================================\nClaude Self-Reflect Streaming Watcher Comprehensive Test Suite\n================================================================================\n\n\ud83e\uddea Running synchronous unit tests...\n\n\ud83d\udd04 Running asynchronous tests...\n\n=== Running TestVoyageProvider ===\n  Running test_api_failure_retry... PASS\n  Running test_rate_limiting_retry... FAIL: Failed to get embeddings after 2 attempts\n  Running test_session_cleanup... PASS\n  Running test_successful_embedding... FAIL: Failed to get embeddings after 2 attempts\n\n=== Running TestFastEmbedProvider ===\n  Running test_concurrent_limit... FAIL: Model test-model is not supported in TextEmbedding. Please check the supported models using `TextEmbedding.list_supported_models()`\n  Running test_embedding_generation... PASS\n\n=== Running TestCollectionNaming ===\n  Running test_cloud_collection_naming... FAIL: No module named 'streaming_watcher'\n  Running test_consistent_naming... FAIL: No module named 'streaming_watcher'\n  Running test_local_collection_naming... FAIL: No module named 'streaming_watcher'\n\n=== Running TestStatePersistence ===\n  Running test_state_file_separation... FAIL: No module named 'streaming_watcher'\n  Running test_state_migration... FAIL: No module named 'streaming_watcher'\n\n=== Running TestNoMessagesHandling ===\n  Running test_empty_file_handling... FAIL: No module named 'streaming_watcher'\n  Running test_no_messages_file_handling... FAIL: No module named 'streaming_watcher'\n  Running test_valid_file_processing... FAIL: No module named 'streaming_watcher'\n\n=== Running TestProductionReadiness ===\n  Running test_error_recovery... FAIL: No module named 'streaming_watcher'\n  Running test_graceful_shutdown... FAIL: No module named 'streaming_watcher'\n\n================================================================================\n\ud83d\udcca TEST SUMMARY\n================================================================================\nTotal Tests: 16\n\u2705 Passed: 3\n\u274c Failed: 13\n\u23f1\ufe0f  Duration: 2.06s\n\n\u26a0\ufe0f  13 tests failed. Review issues before production deployment.\n"
+    }
+  }
+}

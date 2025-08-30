@@ -79,9 +79,11 @@ mcp-server/test-fresh-install/
 # User-specific config
 config/imported-files.json
 config/imported-files-old.json
+config/imported-files-enhanced.json.backup
 config/delta-update-state.json
 config/*-state.json
 config/test/
+config/csr-watcher.json
 
 # Temporary files
 *.tmp

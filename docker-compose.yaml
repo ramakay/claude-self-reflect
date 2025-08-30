@@ -177,21 +177,29 @@ services:
       - ./scripts:/scripts:ro
     environment:
       - QDRANT_URL=http://qdrant:6333
-      - STATE_FILE=/config/watcher-state.json
+      - STATE_FILE=/config/csr-watcher.json
+      - LOGS_DIR=/logs  # Fixed: Point to mounted volume
       - VOYAGE_KEY=${VOYAGE_KEY:-}
       - PREFER_LOCAL_EMBEDDINGS=${PREFER_LOCAL_EMBEDDINGS:-true}
-      - HOT_WINDOW_MINUTES=${HOT_WINDOW_MINUTES:-15}
-      - MAX_COLD_FILES_PER_CYCLE=${MAX_COLD_FILES_PER_CYCLE:-3}
-      - MAX_MEMORY_MB=${MAX_MEMORY_MB:-300}
-      - WATCH_INTERVAL_SECONDS=${WATCH_INTERVAL_SECONDS:-30}
-      - MAX_FILES_PER_CYCLE=${MAX_FILES_PER_CYCLE:-10}
+      - ENABLE_MEMORY_DECAY=${ENABLE_MEMORY_DECAY:-false}
+      - DECAY_WEIGHT=${DECAY_WEIGHT:-0.3}
+      - DECAY_SCALE_DAYS=${DECAY_SCALE_DAYS:-90}
+      - CHECK_INTERVAL_S=${CHECK_INTERVAL_S:-60}
+      - HOT_CHECK_INTERVAL_S=${HOT_CHECK_INTERVAL_S:-2}
+      - HOT_WINDOW_MINUTES=${HOT_WINDOW_MINUTES:-5}
+      - WARM_WINDOW_HOURS=${WARM_WINDOW_HOURS:-24}
+      - MAX_COLD_FILES=${MAX_COLD_FILES:-5}
+      - MAX_WARM_WAIT_MINUTES=${MAX_WARM_WAIT_MINUTES:-30}
+      - MAX_MESSAGES_PER_CHUNK=${MAX_MESSAGES_PER_CHUNK:-10}
       - MAX_CHUNK_SIZE=${MAX_CHUNK_SIZE:-50}  # Messages per chunk for streaming
+      - MEMORY_LIMIT_MB=${MEMORY_LIMIT_MB:-1000}
+      - MEMORY_WARNING_MB=${MEMORY_WARNING_MB:-500}
       - PYTHONUNBUFFERED=1
       - MALLOC_ARENA_MAX=2
-    restart: "no"  # Manual start only - prevent system overload
-    profiles: ["safe-watch"]  # Requires explicit profile to run
-    mem_limit: 600m  # Increased from 400m to handle large files safely
-    memswap_limit: 600m
+    restart: unless-stopped
+    profiles: ["safe-watch", "watch"]  # Requires explicit profile to run
+    mem_limit: 1g  # Increased to 1GB to match MEMORY_LIMIT_MB
+    memswap_limit: 1g
     cpus: 1.0  # Single CPU core limit
 
   # MCP server for Claude integration

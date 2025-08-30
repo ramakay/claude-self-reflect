@@ -5,6 +5,7 @@ Designed for <20ms execution time to support status bars and shell scripts.
 """
 
 import json
+import time
 from pathlib import Path
 from collections import defaultdict
 
@@ -53,11 +54,36 @@ def normalize_file_path(file_path: str) -> str:
     return file_path
 
 
+def get_watcher_status() -> dict:
+    """Get streaming watcher status if available."""
+    watcher_state_file = Path.home() / "config" / "csr-watcher.json"
+    
+    if not watcher_state_file.exists():
+        return {"running": False, "status": "not configured"}
+    
+    try:
+        with open(watcher_state_file) as f:
+            state = json.load(f)
+            
+        # Check if watcher is active (modified recently)
+        file_age = time.time() - watcher_state_file.stat().st_mtime
+        is_active = file_age < 120  # Active if updated in last 2 minutes
+        
+        return {
+            "running": is_active,
+            "files_processed": len(state.get("imported_files", {})),
+            "last_update_seconds": int(file_age),
+            "status": "🟢 active" if is_active else "🔴 inactive"
+        }
+    except:
+        return {"running": False, "status": "error reading state"}
+
+
 def get_status() -> dict:
     """Get indexing status with overall stats and per-project breakdown.
     
     Returns:
-        dict: JSON structure with overall and per-project indexing status
+        dict: JSON structure with overall and per-project indexing status, plus watcher status
     """
     projects_dir = Path.home() / ".claude" / "projects"
     project_stats = defaultdict(lambda: {"indexed": 0, "total": 0})
@@ -153,6 +179,9 @@ def get_status() -> dict:
             "indexed": stats["indexed"],
             "total": stats["total"]
         }
+    
+    # Add watcher status
+    result["watcher"] = get_watcher_status()
     
     return result
 

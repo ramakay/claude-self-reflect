@@ -43,11 +43,29 @@ Currently using client-side decay calculation (v1.3.1):
 - **Performance**: Minimal overhead (~9ms for 1000 points)
 
 ## Current Status
-- **Projects Imported**: 24
-- **Conversation Chunks**: 10,165+
-- **Collections**: Per-project isolation with `conv_<md5>_local` (FastEmbed) or `conv_<md5>_voyage` (Voyage AI) naming
-- **Search Accuracy**: 66.1% with cross-collection overhead ~100ms
-- **Default**: Local embeddings for privacy (v2.3.7+)
+
+### CRITICAL: Understanding Import Status (Updated 2025-08-29)
+**⚠️ ALWAYS use `python mcp-server/src/status.py` to check the REAL import status.**
+
+**Actual Import Status:**
+- **Overall**: 72.3% (352 of 487 JSONL files imported)
+- **claude-self-reflect**: 84.0% (173 of 206 files imported)
+- **Total Chunks in Qdrant**: 83,203+ points across 150+ collections
+- **Projects with Data**: 22 projects have imported conversations
+
+### Import System Components
+Different components track different state:
+1. **MCP's imported-files.json**: Source of truth for imports (used by status.py)
+2. **Streaming watcher's csr-watcher.json**: Tracks watcher's own processing
+3. **Qdrant collections**: Actual vector data storage
+
+**Important Architecture Notes:**
+- **import-conversations-unified.py**: Main batch import script
+- **streaming-watcher.py**: Delta watcher for NEW conversations only
+- **Delta behavior**: Watcher should process NEWEST files first (sort by age descending)
+- If watcher shows "672 hour backlog" = wrong sort order, re-importing old files
+
+**Common Mistake**: Don't trust csr-watcher.json counts - it only tracks what streaming-watcher has processed, not the total system imports. The MCP's imported-files.json (via status.py) shows the real import status.
 
 ## Key Commands
 

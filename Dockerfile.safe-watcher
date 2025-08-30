@@ -30,8 +30,11 @@ RUN mkdir -p /root/.cache/fastembed && \
 # Set working directory
 WORKDIR /app
 
-# Copy scripts
-COPY scripts/ /scripts/
+# Copy application scripts
+COPY scripts/ /app/scripts/
+
+# Make watcher-loop.sh executable
+RUN chmod +x /app/scripts/watcher-loop.sh
 
 # Create config directory
 RUN mkdir -p /config
@@ -41,4 +44,4 @@ ENV PYTHONUNBUFFERED=1
 ENV MALLOC_ARENA_MAX=2
 
 # Run the watcher loop
-CMD ["/scripts/watcher-loop.sh"]
+CMD ["/app/scripts/watcher-loop.sh"]

@@ -24,17 +24,43 @@ sys.path.insert(0, str(scripts_dir))
 
 # Import the streaming watcher
 try:
+    # Try importing with underscore (module name)
     from streaming_watcher import (
         Config, StreamingWatcher, VoyageProvider, FastEmbedProvider,
         MemoryMonitor, CPUMonitor, QueueManager, IndexingProgress,
         QdrantService, TokenAwareChunker, get_effective_cpus,
         extract_tool_usage_from_conversation, extract_concepts
     )
-except ImportError as e:
-    print(f"Failed to import streaming_watcher: {e}")
-    print(f"Scripts directory: {scripts_dir}")
-    print(f"Scripts directory exists: {scripts_dir.exists()}")
-    sys.exit(1)
+except ImportError:
+    try:
+        # Try importing with hyphen (file name)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "streaming_watcher", 
+            scripts_dir / "streaming-watcher.py"
+        )
+        streaming_watcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(streaming_watcher)
+        
+        # Extract the classes and functions
+        Config = streaming_watcher.Config
+        StreamingWatcher = streaming_watcher.StreamingWatcher
+        VoyageProvider = streaming_watcher.VoyageProvider
+        FastEmbedProvider = streaming_watcher.FastEmbedProvider
+        MemoryMonitor = streaming_watcher.MemoryMonitor
+        CPUMonitor = streaming_watcher.CPUMonitor
+        QueueManager = streaming_watcher.QueueManager
+        IndexingProgress = streaming_watcher.IndexingProgress
+        QdrantService = streaming_watcher.QdrantService
+        TokenAwareChunker = streaming_watcher.TokenAwareChunker
+        get_effective_cpus = streaming_watcher.get_effective_cpus
+        extract_tool_usage_from_conversation = streaming_watcher.extract_tool_usage_from_conversation
+        extract_concepts = streaming_watcher.extract_concepts
+    except ImportError as e:
+        print(f"Failed to import streaming_watcher: {e}")
+        print(f"Scripts directory: {scripts_dir}")
+        print(f"Scripts directory exists: {scripts_dir.exists()}")
+        sys.exit(1)
 
 class MockVoyageAPI:
     """Mock Voyage API for testing without actual API calls."""
@@ -160,7 +186,10 @@ class TestVoyageProvider(unittest.TestCase):
             ]
         }
         
-        mock_session.post.return_value.__aenter__.return_value = mock_response
+        # Create proper async context manager mock
+        ctx_manager = AsyncMock()
+        ctx_manager.__aenter__.return_value = mock_response
+        mock_session.post.return_value = ctx_manager
         
         texts = ["hello world", "test document"]
         embeddings = await self.provider.embed_documents(texts)
@@ -186,10 +215,13 @@ class TestVoyageProvider(unittest.TestCase):
             "data": [{"embedding": [0.1] * 1024}]
         }
         
-        mock_session.post.return_value.__aenter__.side_effect = [
-            rate_limit_response,
-            success_response
-        ]
+        # Create proper async context manager mocks
+        first_ctx = AsyncMock()
+        first_ctx.__aenter__.return_value = rate_limit_response
+        second_ctx = AsyncMock()
+        second_ctx.__aenter__.return_value = success_response
+        
+        mock_session.post.side_effect = [first_ctx, second_ctx]
         
         with patch('asyncio.sleep') as mock_sleep:
             embeddings = await self.provider.embed_documents(["test"])
@@ -208,7 +240,10 @@ class TestVoyageProvider(unittest.TestCase):
         error_response.status = 500
         error_response.text.return_value = "Server Error"
         
-        mock_session.post.return_value.__aenter__.return_value = error_response
+        # Create proper async context manager mock for error
+        error_ctx = AsyncMock()
+        error_ctx.__aenter__.return_value = error_response
+        mock_session.post.return_value = error_ctx
         
         with self.assertRaises(Exception) as cm:
             await self.provider.embed_documents(["test"])
@@ -236,7 +271,8 @@ class TestFastEmbedProvider(unittest.TestCase):
             Mock(tolist=lambda: [0.2] * 384)
         ]
         
-        with patch('streaming_watcher.TextEmbedding', return_value=self.mock_model):
+        # Use the actual imported TextEmbedding class for patching
+        with patch.object(streaming_watcher, 'TextEmbedding', return_value=self.mock_model):
             self.provider = FastEmbedProvider("test-model")
     
     async def test_embedding_generation(self):

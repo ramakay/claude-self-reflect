@@ -454,6 +454,26 @@ async function enrichMetadata() {
   }
 }
 
+async function startWatcher() {
+  console.log('\n🔄 Starting the streaming watcher...');
+  console.log('   • HOT files (<5 min): 2-second processing');
+  console.log('   • WARM files (<24 hrs): Normal priority');
+  console.log('   • COLD files (>24 hrs): Batch processing');
+  
+  try {
+    safeExec('docker', ['compose', '--profile', 'watch', 'up', '-d', 'safe-watcher'], {
+      cwd: projectRoot,
+      stdio: 'inherit'
+    });
+    console.log('✅ Watcher started successfully!');
+    return true;
+  } catch (error) {
+    console.log('⚠️  Could not start watcher automatically');
+    console.log('   You can start it manually with: docker compose --profile watch up -d');
+    return false;
+  }
+}
+
 async function showFinalInstructions() {
   console.log('\n✅ Setup complete!');
   
@@ -461,7 +481,7 @@ async function showFinalInstructions() {
   console.log('   • 🌐 Qdrant Dashboard: http://localhost:6333/dashboard/');
   console.log('   • 📊 Status: All services running');
   console.log('   • 🔍 Search: Semantic search with memory decay enabled');
-  console.log('   • 🚀 Import: Watcher checking every 60 seconds');
+  console.log('   • 🚀 Watcher: HOT/WARM/COLD prioritization active');
   
   console.log('\n📋 Quick Reference Commands:');
   console.log('   • Check status: docker compose ps');
@@ -567,6 +587,9 @@ async function main() {
   
   // Enrich metadata (new in v2.5.19)
   await enrichMetadata();
+  
+  // Start the watcher
+  await startWatcher();
   
   // Show final instructions
   await showFinalInstructions();

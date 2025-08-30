@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Any, Set, Tuple, Generator
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from enum import Enum
 import logging
 from collections import deque
 
@@ -62,10 +63,10 @@ class Config:
         # Docker/cloud mode: use /config volume
         Path("/config/csr-watcher.json") if os.path.exists("/.dockerenv") 
         # Local mode with cloud flag: separate state file
-        else Path("~/config/csr-watcher-cloud.json").expanduser() 
+        else Path("~/.claude-self-reflect/config/csr-watcher-cloud.json").expanduser() 
         if os.getenv("PREFER_LOCAL_EMBEDDINGS", "true").lower() == "false" and os.getenv("VOYAGE_API_KEY")
         # Default local mode
-        else Path("~/config/csr-watcher.json").expanduser()
+        else Path("~/.claude-self-reflect/config/csr-watcher.json").expanduser()
         if os.getenv("STATE_FILE") is None
         # User override
         else Path(os.getenv("STATE_FILE")).expanduser()
@@ -75,10 +76,17 @@ class Config:
     vector_size: int = 384  # FastEmbed all-MiniLM-L6-v2
     
     # Production throttling controls (optimized for stability)
-    import_frequency: int = field(default_factory=lambda: int(os.getenv("IMPORT_FREQUENCY", "10")))
+    import_frequency: int = field(default_factory=lambda: int(os.getenv("IMPORT_FREQUENCY", "60")))  # Normal cycle
+    hot_check_interval_s: int = field(default_factory=lambda: int(os.getenv("HOT_CHECK_INTERVAL_S", "2")))  # HOT file check
     batch_size: int = field(default_factory=lambda: int(os.getenv("BATCH_SIZE", "10")))
     memory_limit_mb: int = field(default_factory=lambda: int(os.getenv("MEMORY_LIMIT_MB", "1024")))  # 1GB default
     memory_warning_mb: int = field(default_factory=lambda: int(os.getenv("MEMORY_WARNING_MB", "500")))  # 500MB warning
+    
+    # HOT/WARM/COLD configuration
+    hot_window_minutes: int = field(default_factory=lambda: int(os.getenv("HOT_WINDOW_MINUTES", "5")))  # Files < 5 min are HOT
+    warm_window_hours: int = field(default_factory=lambda: int(os.getenv("WARM_WINDOW_HOURS", "24")))  # Files < 24 hrs are WARM
+    max_cold_files: int = field(default_factory=lambda: int(os.getenv("MAX_COLD_FILES", "5")))  # Max COLD files per cycle
+    max_warm_wait_minutes: int = field(default_factory=lambda: int(os.getenv("MAX_WARM_WAIT_MINUTES", "30")))  # Starvation prevention
     
     # CPU management
     max_cpu_percent_per_core: float = field(default_factory=lambda: float(os.getenv("MAX_CPU_PERCENT_PER_CORE", "50")))
@@ -246,6 +254,14 @@ def extract_concepts(text: str, tool_usage: Dict[str, Any]) -> List[str]:
     return list(concepts)[:15]
 
 
+class FreshnessLevel(Enum):
+    """File freshness categorization for prioritization."""
+    HOT = "HOT"           # < 5 minutes old - near real-time processing
+    WARM = "WARM"         # 5 minutes - 24 hours - normal processing
+    COLD = "COLD"         # > 24 hours - batch processing
+    URGENT_WARM = "URGENT_WARM"  # WARM files waiting > 30 minutes (starvation prevention)
+
+
 class MemoryMonitor:
     """Enhanced memory monitoring with psutil."""
     
@@ -365,6 +381,8 @@ class FastEmbedProvider(EmbeddingProvider):
         self.model = TextEmbedding(model_name)
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.vector_size = 384  # all-MiniLM-L6-v2 dimensions
+        self.provider_type = 'local'
     
     async def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings with concurrency control."""
@@ -390,6 +408,7 @@ class VoyageProvider(EmbeddingProvider):
     def __init__(self, api_key: str, model_name: str = "voyage-3", max_concurrent: int = 2):
         self.api_key = api_key
         self.model_name = model_name
+        self.vector_size = 1024  # voyage-3 dimension
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.base_url = "https://api.voyageai.com/v1/embeddings"
         self.session = None
@@ -625,26 +644,41 @@ class CPUMonitor:
 
 
 class QueueManager:
-    """Manage file processing queue with limits."""
+    """Manage file processing queue with priority support and deduplication."""
     
     def __init__(self, max_size: int, max_age_hours: int):
         self.max_size = max_size
         self.max_age = timedelta(hours=max_age_hours)
-        self.queue: deque = deque(maxlen=max_size)
+        # Queue stores (path, mod_time, freshness_level, priority_score)
+        self.queue: deque = deque()
+        self._queued: Set[str] = set()  # Track queued files to prevent duplicates
         self.processed_count = 0
         self.deferred_count = 0
     
-    def add_files(self, files: List[Tuple[Path, datetime]]) -> int:
-        """Add files to queue, return number added."""
+    def add_categorized(self, items: List[Tuple[Path, datetime, FreshnessLevel, int]]) -> int:
+        """Add categorized files with priority handling."""
         added = 0
         overflow = []
         
-        for file_path, mod_time in files:
+        for file_path, mod_time, level, priority in items:
+            key = str(file_path)
+            
+            # Skip if already queued
+            if key in self._queued:
+                continue
+                
             if len(self.queue) >= self.max_size:
                 overflow.append((file_path, mod_time))
+                continue
+            
+            # HOT and URGENT_WARM go to front of queue
+            if level in (FreshnessLevel.HOT, FreshnessLevel.URGENT_WARM):
+                self.queue.appendleft((file_path, mod_time, level, priority))
             else:
-                self.queue.append((file_path, mod_time))
-                added += 1
+                self.queue.append((file_path, mod_time, level, priority))
+            
+            self._queued.add(key)
+            added += 1
         
         if overflow:
             self.deferred_count += len(overflow)
@@ -654,8 +688,8 @@ class QueueManager:
         
         return added
     
-    def get_batch(self, batch_size: int) -> List[Path]:
-        """Get next batch of files."""
+    def get_batch(self, batch_size: int) -> List[Tuple[Path, FreshnessLevel]]:
+        """Get next batch of files with their freshness levels."""
         batch = []
         now = datetime.now()
         
@@ -666,11 +700,17 @@ class QueueManager:
         
         for _ in range(min(batch_size, len(self.queue))):
             if self.queue:
-                file_path, _ = self.queue.popleft()
-                batch.append(file_path)
+                file_path, _, level, _ = self.queue.popleft()
+                self._queued.discard(str(file_path))
+                batch.append((file_path, level))
                 self.processed_count += 1
         
         return batch
+    
+    def has_hot_or_urgent(self) -> bool:
+        """Check if queue contains HOT or URGENT_WARM files."""
+        return any(level in (FreshnessLevel.HOT, FreshnessLevel.URGENT_WARM) 
+                  for _, _, level, _ in self.queue)
     
     def get_metrics(self) -> Dict[str, Any]:
         """Get queue metrics."""
@@ -752,11 +792,76 @@ class StreamingWatcher:
             "start_time": time.time()
         }
         
+        # Track file wait times for starvation prevention
+        self.file_first_seen: Dict[str, float] = {}
+        self.current_project: Optional[str] = self._detect_current_project()
+        self.last_mode: Optional[str] = None  # Track mode changes for logging
+        
         self.shutdown_event = asyncio.Event()
         
-        logger.info(f"Streaming Watcher v3.0.0 initialized")
+        logger.info(f"Streaming Watcher v3.0.0 with HOT/WARM/COLD prioritization")
         logger.info(f"State file: {self.config.state_file}")
         logger.info(f"Memory limits: {config.memory_warning_mb}MB warning, {config.memory_limit_mb}MB limit")
+        logger.info(f"HOT window: {config.hot_window_minutes} min, WARM window: {config.warm_window_hours} hrs")
+    
+    def _detect_current_project(self) -> Optional[str]:
+        """Detect current project from working directory."""
+        try:
+            cwd = Path.cwd()
+            # Check if we're in a claude project directory
+            if "/.claude/projects/" in str(cwd):
+                # Extract project name from path
+                parts = str(cwd).split("/.claude/projects/")
+                if len(parts) > 1:
+                    project = parts[1].split("/")[0]
+                    logger.info(f"Detected current project: {project}")
+                    return project
+        except Exception as e:
+            logger.debug(f"Could not detect current project: {e}")
+        return None
+    
+    def categorize_freshness(self, file_path: Path) -> Tuple[FreshnessLevel, int]:
+        """
+        Categorize file freshness for prioritization.
+        Returns (FreshnessLevel, priority_score) where lower scores = higher priority.
+        """
+        now = time.time()
+        file_key = str(file_path)
+        
+        # Track first seen time atomically
+        if file_key not in self.file_first_seen:
+            self.file_first_seen[file_key] = now
+        first_seen_time = self.file_first_seen[file_key]
+        
+        file_age_minutes = (now - file_path.stat().st_mtime) / 60
+        
+        # Check if file is from current project
+        is_current_project = False
+        if self.current_project:
+            file_project = normalize_project_name(str(file_path.parent))
+            is_current_project = (file_project == self.current_project)
+        
+        # Determine base freshness level
+        if file_age_minutes < self.config.hot_window_minutes:
+            level = FreshnessLevel.HOT
+            base_priority = 0  # Highest priority
+        elif file_age_minutes < (self.config.warm_window_hours * 60):
+            # Check for starvation (WARM files waiting too long)
+            wait_minutes = (now - first_seen_time) / 60
+            if wait_minutes > self.config.max_warm_wait_minutes:
+                level = FreshnessLevel.URGENT_WARM
+                base_priority = 1  # Second highest priority
+            else:
+                level = FreshnessLevel.WARM
+                base_priority = 2 if is_current_project else 3
+        else:
+            level = FreshnessLevel.COLD
+            base_priority = 4  # Lowest priority
+        
+        # Adjust priority score based on exact age for tie-breaking
+        priority_score = base_priority * 10000 + min(file_age_minutes, 9999)
+        
+        return level, int(priority_score)
     
     def _create_embedding_provider(self) -> EmbeddingProvider:
         """Create embedding provider based on configuration."""
@@ -894,8 +999,13 @@ class StreamingWatcher:
                     if line.strip():
                         try:
                             data = json.loads(line)
-                            if 'message' in data and data['message']:
+                            # Handle 'messages' array (standard format)
+                            if 'messages' in data and data['messages']:
+                                all_messages.extend(data['messages'])
+                            # Handle single 'message' object
+                            elif 'message' in data and data['message']:
                                 all_messages.append(data['message'])
+                            # Handle direct role/content format
                             elif 'role' in data and 'content' in data:
                                 all_messages.append(data)
                         except json.JSONDecodeError:
@@ -1023,15 +1133,16 @@ class StreamingWatcher:
             self.stats["failures"] += 1
             return False
     
-    async def find_new_files(self) -> List[Tuple[Path, datetime]]:
-        """Find new files to process."""
+    async def find_new_files(self) -> List[Tuple[Path, FreshnessLevel, int]]:
+        """Find new files to process with freshness categorization."""
         if not self.config.logs_dir.exists():
             logger.warning(f"Logs dir not found: {self.config.logs_dir}")
             return []
         
-        new_files = []
+        categorized_files = []
         high_water_mark = self.state.get("high_water_mark", 0)
         new_high_water = high_water_mark
+        now = time.time()
         
         try:
             for project_dir in self.config.logs_dir.iterdir():
@@ -1056,7 +1167,10 @@ class StreamingWatcher:
                                 if file_mtime <= import_time:
                                     continue
                         
-                        new_files.append((jsonl_file, datetime.fromtimestamp(file_mtime)))
+                        # Categorize file freshness (handles first_seen tracking internally)
+                        freshness_level, priority_score = self.categorize_freshness(jsonl_file)
+                        
+                        categorized_files.append((jsonl_file, freshness_level, priority_score))
                 except Exception as e:
                     logger.error(f"Error scanning project dir {project_dir}: {e}")
                     
@@ -1065,10 +1179,25 @@ class StreamingWatcher:
         
         self.state["high_water_mark"] = new_high_water
         
-        # Sort by age (oldest first)
-        new_files.sort(key=lambda x: x[1])
+        # Sort by priority score (lower = higher priority)
+        categorized_files.sort(key=lambda x: x[2])
         
-        return new_files
+        # Log categorization summary
+        if categorized_files:
+            hot_count = sum(1 for _, level, _ in categorized_files if level == FreshnessLevel.HOT)
+            urgent_count = sum(1 for _, level, _ in categorized_files if level == FreshnessLevel.URGENT_WARM)
+            warm_count = sum(1 for _, level, _ in categorized_files if level == FreshnessLevel.WARM)
+            cold_count = sum(1 for _, level, _ in categorized_files if level == FreshnessLevel.COLD)
+            
+            status_parts = []
+            if hot_count: status_parts.append(f"{hot_count} 🔥HOT")
+            if urgent_count: status_parts.append(f"{urgent_count} ⚠️URGENT")
+            if warm_count: status_parts.append(f"{warm_count} 🌡️WARM")
+            if cold_count: status_parts.append(f"{cold_count} ❄️COLD")
+            
+            logger.info(f"Found {len(categorized_files)} new files: {', '.join(status_parts)}")
+        
+        return categorized_files
     
     async def run_continuous(self) -> None:
         """Main loop with comprehensive monitoring."""
@@ -1097,23 +1226,62 @@ class StreamingWatcher:
                 try:
                     cycle_count += 1
                     
-                    # Find new files
-                    new_files = await self.find_new_files()
+                    # Find new files with categorization
+                    categorized_files = await self.find_new_files()
                     
-                    if new_files:
-                        added = self.queue_manager.add_files(new_files)
-                        logger.info(f"Cycle {cycle_count}: Added {added} files to queue")
+                    # Determine if we have HOT files (in new files or existing queue)
+                    has_hot_files = (any(level == FreshnessLevel.HOT for _, level, _ in categorized_files) 
+                                   or self.queue_manager.has_hot_or_urgent())
+                    
+                    # Process files by temperature with proper priority
+                    files_to_process = []
+                    cold_count = 0
+                    
+                    for file_path, level, priority in categorized_files:
+                        # Limit COLD files per cycle
+                        if level == FreshnessLevel.COLD:
+                            if cold_count >= self.config.max_cold_files:
+                                logger.debug(f"Skipping COLD file {file_path.name} (limit reached)")
+                                continue
+                            cold_count += 1
+                        
+                        mod_time = datetime.fromtimestamp(file_path.stat().st_mtime)
+                        files_to_process.append((file_path, mod_time, level, priority))
+                    
+                    if files_to_process:
+                        added = self.queue_manager.add_categorized(files_to_process)
+                        if added > 0:
+                            logger.info(f"Cycle {cycle_count}: Added {added} files to queue")
                     
                     # Process batch
                     batch = self.queue_manager.get_batch(self.config.batch_size)
                     
-                    for file_path in batch:
+                    for file_path, level in batch:
                         if self.shutdown_event.is_set():
                             break
+                        
+                        # Double-check if already imported (defensive)
+                        file_key = str(file_path)
+                        try:
+                            file_mtime = file_path.stat().st_mtime
+                        except FileNotFoundError:
+                            logger.warning(f"File disappeared: {file_path}")
+                            continue
+                        
+                        imported = self.state["imported_files"].get(file_key)
+                        if imported:
+                            parsed_time = imported.get("_parsed_time")
+                            if not parsed_time and "imported_at" in imported:
+                                parsed_time = datetime.fromisoformat(imported["imported_at"]).timestamp()
+                            if parsed_time and file_mtime <= parsed_time:
+                                logger.debug(f"Skipping already imported: {file_path.name}")
+                                continue
                         
                         success = await self.process_file(file_path)
                         
                         if success:
+                            # Clean up first_seen tracking to prevent memory leak
+                            self.file_first_seen.pop(file_key, None)
                             await self.save_state()
                             self.progress.update(len(self.state["imported_files"]))
                     
@@ -1155,8 +1323,26 @@ class StreamingWatcher:
                                 f"{queue_metrics['oldest_age_hours']:.1f} hours old"
                             )
                     
-                    # Wait before next cycle
-                    await asyncio.sleep(self.config.import_frequency)
+                    # Dynamic interval based on file temperature
+                    current_mode = "HOT" if has_hot_files else "NORMAL"
+                    
+                    if current_mode != self.last_mode:
+                        if has_hot_files:
+                            logger.info(f"🔥 HOT files detected - switching to {self.config.hot_check_interval_s}s interval")
+                        else:
+                            logger.info(f"Returning to normal {self.config.import_frequency}s interval")
+                        self.last_mode = current_mode
+                    
+                    wait_time = self.config.hot_check_interval_s if has_hot_files else self.config.import_frequency
+                    
+                    # Wait with interrupt capability for HOT files
+                    try:
+                        await asyncio.wait_for(
+                            self.shutdown_event.wait(),
+                            timeout=wait_time
+                        )
+                    except asyncio.TimeoutError:
+                        pass  # Normal timeout, continue loop
                     
                 except Exception as e:
                     logger.error(f"Error in main loop: {e}")

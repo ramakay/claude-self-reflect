@@ -149,10 +149,17 @@ Here's how your conversations get imported and prioritized:
 
 ![Import Architecture](docs/diagrams/import-architecture.png)
 
-**The system intelligently prioritizes your conversations:**
-- **HOT** (< 5 minutes): Switches to 2-second intervals for near real-time import
-- **🌡️ WARM** (< 24 hours): Normal priority, processed every 60 seconds
-- **❄️ COLD** (> 24 hours): Batch processed, max 5 per cycle to prevent blocking
+**The system intelligently processes your conversations:**
+- Runs every 60 seconds checking for new conversations
+- Processes newest conversations first (delta import pattern)
+- Maintains low memory usage (<50MB) through streaming
+- Handles up to 5 files per cycle to prevent blocking
+
+**HOT/WARM/COLD Intelligent Prioritization:**
+- **🔥 HOT** (< 5 minutes): Switches to 2-second intervals for near real-time import
+- **🌡️ WARM** (< 24 hours): Normal priority with starvation prevention (urgent after 30 min wait)
+- **❄️ COLD** (> 24 hours): Batch processed, max 5 per cycle to prevent blocking new content
+- Files are categorized by age and processed with priority queuing to ensure newest content gets imported quickly while preventing older files from being starved
 
 ## Using It
 
