@@ -24,9 +24,9 @@
 
 Give Claude perfect memory of all your conversations. Search past discussions instantly. Never lose context again.
 
-🔒 **100% Local by Default** • ⚡ **Blazing Fast Search** • 🚀 **Zero Configuration** • 🏭 **Production Ready**
+<img src="docs/icons/shield-check.svg" width="16" height="16" style="vertical-align: middle;"> **100% Local by Default** • <img src="docs/icons/zap.svg" width="16" height="16" style="vertical-align: middle;"> **Blazing Fast Search** • <img src="docs/icons/rocket.svg" width="16" height="16" style="vertical-align: middle;"> **Zero Configuration** • <img src="docs/icons/building-2.svg" width="16" height="16" style="vertical-align: middle;"> **Production Ready**
 
-## 🚀 Quick Install
+## <img src="docs/icons/rocket.svg" width="20" height="20" style="vertical-align: middle;"> Quick Install
 
 ```bash
 # Install and run automatic setup (5 minutes, everything automatic)
@@ -42,7 +42,7 @@ claude-self-reflect setup
 ```
 
 <details>
-<summary>📡 Cloud Mode (Better Search Accuracy)</summary>
+<summary>Cloud Mode (Better Search Accuracy)</summary>
 
 ```bash
 # Step 1: Get your free Voyage AI key
@@ -56,15 +56,15 @@ claude-self-reflect setup --voyage-key=YOUR_ACTUAL_KEY_HERE
 
 </details>
 
-## ✨ The Magic
+## <img src="docs/icons/sparkles.svg" width="20" height="20" style="vertical-align: middle;"> The Magic
 
 ![Self Reflection vs The Grind](docs/images/red-reflection.webp)
 
-## 📊 Before & After
+## <img src="docs/icons/gauge.svg" width="20" height="20" style="vertical-align: middle;"> Before & After
 
 ![Before and After Claude Self-Reflect](docs/diagrams/before-after-combined.webp)
 
-## 💬 Real Examples
+## <img src="docs/icons/message-circle.svg" width="20" height="20" style="vertical-align: middle;"> Real Examples
 
 ```
 You: "What was that PostgreSQL optimization we figured out?"
@@ -83,7 +83,7 @@ Claude: "3 conversations found:
         - Nov 20: Added rate limiting per authenticated connection"
 ```
 
-## 🎯 Key Features
+## <img src="docs/icons/target.svg" width="20" height="20" style="vertical-align: middle;"> Key Features
 
 ### Project-Scoped Search
 Searches are **project-aware by default**. Claude automatically searches within your current project:
@@ -98,37 +98,37 @@ You: "Search all projects for WebSocket implementations"
 Claude: [Searches across ALL your projects]
 ```
 
-### ⏱️ Memory Decay
+### <img src="docs/icons/clock.svg" width="16" height="16" style="vertical-align: middle;"> Memory Decay
 Recent conversations matter more. Old ones fade. Like your brain, but reliable.
 
-### 🚀 Performance at Scale
+### <img src="docs/icons/zap.svg" width="16" height="16" style="vertical-align: middle;"> Performance at Scale
 - **Search**: <3ms average response time
 - **Scale**: 600+ conversations across 24 projects
 - **Reliability**: 100% indexing success rate
 - **Memory**: 96% reduction from v2.5.15
 
-## 🏗️ Architecture
+## <img src="docs/icons/cpu.svg" width="20" height="20" style="vertical-align: middle;"> Architecture
 
 ![Import Architecture](docs/diagrams/import-architecture.png)
 
 <details>
 <summary>HOT/WARM/COLD Intelligent Prioritization</summary>
 
-- **🔥 HOT** (< 5 minutes): 2-second intervals for near real-time import
-- **🌡️ WARM** (< 24 hours): Normal priority with starvation prevention
-- **❄️ COLD** (> 24 hours): Batch processed to prevent blocking
+- **HOT** (< 5 minutes): 2-second intervals for near real-time import
+- **WARM** (< 24 hours): Normal priority with starvation prevention
+- **COLD** (> 24 hours): Batch processed to prevent blocking
 
 Files are categorized by age and processed with priority queuing to ensure newest content gets imported quickly while preventing older files from being starved.
 
 </details>
 
-## 🛠️ Requirements
+## <img src="docs/icons/wrench.svg" width="20" height="20" style="vertical-align: middle;"> Requirements
 
 - **Docker Desktop** (macOS/Windows) or **Docker Engine** (Linux)
 - **Node.js** 16+ (for the setup wizard)
 - **Claude Desktop** app
 
-## 📖 Documentation
+## <img src="docs/icons/book-open.svg" width="20" height="20" style="vertical-align: middle;"> Documentation
 
 <details>
 <summary>Technical Stack</summary>
@@ -181,14 +181,14 @@ npm uninstall -g claude-self-reflect
 
 </details>
 
-## 🆕 What's New
+## <img src="docs/icons/package.svg" width="20" height="20" style="vertical-align: middle;"> What's New
 
 <details>
 <summary>v2.8.0 - Latest Release</summary>
 
-- **🔧 Fixed MCP Indexing**: Now correctly shows 97.1% progress (was showing 0%)
-- **🔥 HOT/WARM/COLD**: Intelligent file prioritization for near real-time imports
-- **📊 Enhanced Monitoring**: Real-time status with visual indicators
+- **Fixed MCP Indexing**: Now correctly shows 97.1% progress (was showing 0%)
+- **HOT/WARM/COLD**: Intelligent file prioritization for near real-time imports
+- **Enhanced Monitoring**: Real-time status with visual indicators
 
 </details>
 
@@ -231,7 +231,7 @@ docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.
 
 </details>
 
-## 👥 Contributors
+## <img src="docs/icons/users.svg" width="20" height="20" style="vertical-align: middle;"> Contributors
 
 Special thanks to our contributors:
 - **[@TheGordon](https://github.com/TheGordon)** - Fixed timestamp parsing (#10)
