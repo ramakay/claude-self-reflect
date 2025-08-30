@@ -81,15 +81,23 @@ def initialize_embeddings():
         print(f"[ERROR] Failed to initialize embeddings: {e}")
         return False
 
-# Debug environment loading
-print(f"[DEBUG] Environment variables loaded:")
-print(f"[DEBUG] ENABLE_MEMORY_DECAY: {ENABLE_MEMORY_DECAY}")
-print(f"[DEBUG] USE_NATIVE_DECAY: {USE_NATIVE_DECAY}")
-print(f"[DEBUG] DECAY_WEIGHT: {DECAY_WEIGHT}")
-print(f"[DEBUG] DECAY_SCALE_DAYS: {DECAY_SCALE_DAYS}")
-print(f"[DEBUG] PREFER_LOCAL_EMBEDDINGS: {PREFER_LOCAL_EMBEDDINGS}")
-print(f"[DEBUG] EMBEDDING_MODEL: {EMBEDDING_MODEL}")
-print(f"[DEBUG] env_path: {env_path}")
+# Debug environment loading and startup
+import sys
+import datetime as dt
+startup_time = dt.datetime.now().isoformat()
+print(f"[STARTUP] MCP Server starting at {startup_time}", file=sys.stderr)
+print(f"[STARTUP] Python: {sys.version}", file=sys.stderr)
+print(f"[STARTUP] Working directory: {os.getcwd()}", file=sys.stderr)
+print(f"[STARTUP] Script location: {__file__}", file=sys.stderr)
+print(f"[DEBUG] Environment variables loaded:", file=sys.stderr)
+print(f"[DEBUG] QDRANT_URL: {QDRANT_URL}", file=sys.stderr)
+print(f"[DEBUG] ENABLE_MEMORY_DECAY: {ENABLE_MEMORY_DECAY}", file=sys.stderr)
+print(f"[DEBUG] USE_NATIVE_DECAY: {USE_NATIVE_DECAY}", file=sys.stderr)
+print(f"[DEBUG] DECAY_WEIGHT: {DECAY_WEIGHT}", file=sys.stderr)
+print(f"[DEBUG] DECAY_SCALE_DAYS: {DECAY_SCALE_DAYS}", file=sys.stderr)
+print(f"[DEBUG] PREFER_LOCAL_EMBEDDINGS: {PREFER_LOCAL_EMBEDDINGS}", file=sys.stderr)
+print(f"[DEBUG] EMBEDDING_MODEL: {EMBEDDING_MODEL}", file=sys.stderr)
+print(f"[DEBUG] env_path: {env_path}", file=sys.stderr)
 
 
 class SearchResult(BaseModel):
@@ -1519,4 +1527,8 @@ if __name__ == "__main__":
         sys.exit(0)
     
     # Normal MCP server operation
+    print(f"[STARTUP] Starting FastMCP server in stdio mode...", file=sys.stderr)
+    print(f"[STARTUP] Server name: {mcp.name}", file=sys.stderr)
+    print(f"[STARTUP] Calling mcp.run()...", file=sys.stderr)
     mcp.run()
+    print(f"[STARTUP] Server exited normally", file=sys.stderr)

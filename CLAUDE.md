@@ -74,15 +74,23 @@ Different components track different state:
 ### MCP Management in Claude Code
 
 #### CORRECT Commands (Use These):
+
+> ⚠️ **CRITICAL**: Always use full absolute paths when configuring MCP servers!
+> The tilde (`~`) is NOT expanded by Claude Code. Use `/Users/username/...` instead of `~/...`
+
 ```bash
 # List all MCPs and their connection status
 claude mcp list
 
 # Add the MCP as user-scoped (PREFERRED - persists across projects)
-claude mcp add claude-self-reflect "~/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333" -s user
+# ✅ CORRECT: Use full absolute path
+claude mcp add claude-self-reflect "/Users/YOUR_USERNAME/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333" -s user
+
+# ❌ WRONG: Do NOT use tilde (~) - it won't work!
+# claude mcp add claude-self-reflect "~/projects/claude-self-reflect/mcp-server/run-mcp.sh" ...
 
 # For local project-only setup (alternative)
-claude mcp add claude-self-reflect "~/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333"
+claude mcp add claude-self-reflect "/Users/YOUR_USERNAME/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333"
 
 # Remove an MCP (useful when needing to restart)
 claude mcp remove claude-self-reflect
@@ -106,6 +114,7 @@ claude mcp add claude-self-reflect     # MISSING required commandOrUrl argument
 
 #### Important Notes:
 - The `claude mcp add` command REQUIRES both a name AND a commandOrUrl
+- **PATH EXPANSION**: Claude Code does NOT expand `~` - always use full absolute paths like `/Users/username/...`
 - Environment variables must be passed with `-e` flag
 - **CRITICAL**: After modifying MCP server code, you MUST restart Claude Code entirely for changes to take effect
 - Check `.env` file for VOYAGE_KEY if not set
@@ -249,6 +258,13 @@ claude-self-reflect/
   - This log tracks where files have been moved by the auto-organization system
   - It's in .gitignore so won't appear in git status
   - Future agents should consult this log when files seem to be missing
+
+## Common MCP Configuration Issues
+
+### Path Expansion Problem
+**Issue**: `spawn ~/path ENOENT` error when connecting  
+**Solution**: Use full absolute paths (`/Users/username/...`) instead of tilde (`~`)  
+**Example**: `/Users/YOUR_USERNAME/projects/claude-self-reflect/mcp-server/run-mcp.sh`
 
 ## Upgrade Guide for Existing Users
 

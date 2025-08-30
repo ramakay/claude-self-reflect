@@ -48,6 +48,7 @@ qdrant_storage/
 coverage/
 .coverage
 htmlcov/
+tests/test_results.json
 test-results/
 *.coverage
 tool_usage_sample.json

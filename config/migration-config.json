@@ -11,7 +11,7 @@
     "repair_rate_per_minute": 10,
     "boost_v2_chunks": 1.2,
     "pause_hours": [9, 10, 11, 14, 15, 16],
-    "priority_projects": ["anukruti", "claude-self-reflect"],
+    "priority_projects": ["claude-self-reflect"],
     "enable_background_repair": true
   },
   "search": {

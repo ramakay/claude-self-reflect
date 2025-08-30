@@ -54,7 +54,7 @@ class ProjectResolver:
         4. Fuzzy matching on collection names
         
         Args:
-            user_project_name: User-provided project name (e.g., "anukruti", "Anukruti", full path)
+            user_project_name: User-provided project name (e.g., "example-project", "Example-Project", full path)
             
         Returns:
             List of collection names that match the project
@@ -362,7 +362,7 @@ class ProjectResolver:
         
         Examples:
         - -Users-name-projects-my-app-src -> ['my', 'app', 'src']
-        - -Users-name-Code-freightwise-documents -> ['freightwise', 'documents']
+        - -Users-name-Code-example-project -> ['example', 'project']
         
         Args:
             path: Path in any format
