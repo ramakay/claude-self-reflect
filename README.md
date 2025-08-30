@@ -41,7 +41,7 @@ claude-self-reflect setup
 # 🔒 Keep all data local - no API keys needed
 ```
 
-<details>
+<details open>
 <summary>Cloud Mode (Better Search Accuracy)</summary>
 
 ```bash
