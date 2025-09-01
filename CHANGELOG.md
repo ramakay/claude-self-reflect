@@ -5,6 +5,29 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.2] - 2025-09-01
+
+### Fixed
+- **CRITICAL: MCP Server Startup Issue** - Resolved IndentationError preventing server initialization
+  - **Root Cause**: Incorrect indentation in `update_indexing_status` function introduced during path normalization
+  - **Impact**: MCP server failed to start, preventing all reflection functionality from working
+  - **Solution**: Fixed function indentation while preserving path normalization improvements
+  - **Files Modified**: `mcp-server/src/server.py` - Corrected lines 263-286 indentation
+  - **User Action**: Update to v2.8.2 and restart Claude Code for immediate resolution
+
+### Changed
+- **Documentation Improvements**: Enhanced clarity around installation and path handling
+  - Updated setup instructions with clearer Docker volume mounting guidance
+  - Improved troubleshooting documentation for common installation issues
+  - Better explanations of system requirements and dependencies
+  - Enhanced error messaging and diagnostic information
+
+### Technical Details
+- **Validation**: MCP server startup verified, all Claude Self-Reflect tools now accessible
+- **Compatibility**: Fully backward compatible, no configuration changes required
+- **Performance**: No performance impact, purely a stability fix
+- **Migration**: Automatic - no user action needed beyond updating package version
+
 ## [2.7.1] - 2025-08-24
 
 ### Fixed
