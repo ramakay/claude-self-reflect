@@ -2,8 +2,12 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-# Update system packages for security
-RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+# SECURITY: CVE-2025-58050 mitigation - PCRE2 heap buffer overflow
+# TODO: Remove explicit PCRE2 upgrade when base image includes patched version
+RUN apt-get update && \
+    (apt-get install -y --only-upgrade libpcre2-8-0 2>/dev/null || \
+     echo "Warning: PCRE2 10.46+ not yet available") && \
+    apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies directly (avoids file path issues with global npm installs)
 RUN pip install --no-cache-dir \

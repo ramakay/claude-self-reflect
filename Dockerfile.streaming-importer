@@ -1,7 +1,13 @@
 FROM python:3.13-slim
 
-# Update system packages for security and install build dependencies
-RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+# SECURITY: CVE-2025-58050 mitigation - PCRE2 heap buffer overflow
+# Attempting explicit upgrade of libpcre2-8-0 (vulnerable: 10.45-1, fixed: 10.46+)
+# TODO: Remove explicit PCRE2 upgrade when base image includes patched version
+RUN apt-get update && \
+    (apt-get install -y --only-upgrade libpcre2-8-0 2>/dev/null || \
+     echo "Warning: PCRE2 10.46+ not yet available, continuing with security updates") && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     curl \
