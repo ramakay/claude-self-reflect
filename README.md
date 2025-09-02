@@ -86,9 +86,9 @@ Claude: "3 conversations found:
 ## 🎯 Key Features
 
 ### 📊 Statusline Integration
-See your indexing progress right in your terminal! When configured with a statusline wrapper:
-- **🔍 98.3%** - Real-time indexing percentage
-- **Color-coded** progress indicators
+See your indexing progress right in your terminal! Works with [Claude Code Statusline](https://github.com/sirmalloc/ccstatusline):
+- **Progress Bar** - Visual indicator `[████████ ] 91%`
+- **Indexing Lag** - Shows backlog `• 7h behind`
 - **Auto-updates** every 60 seconds
 - **Zero overhead** with intelligent caching
 

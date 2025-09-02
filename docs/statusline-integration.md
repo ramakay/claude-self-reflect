@@ -216,11 +216,20 @@ claude-self-reflect status --refresh
 
 ## Integration Examples
 
-### With cc-statusline
-The statusline automatically detects and displays CSR status when available, showing:
+### With Claude Code Statusline Plugin
+Install the [Claude Code Statusline plugin](https://github.com/sirmalloc/ccstatusline) to automatically display CSR indexing status in your terminal.
+
+The statusline plugin detects and displays CSR status when available, showing:
 - Progress bar visualization: `[███████ ]`
 - Exact percentage: `91%`
 - Indexing lag indicator: `• 5m behind` (when applicable)
+
+```bash
+# Install the statusline plugin
+npm install -g ccstatusline
+
+# The plugin will automatically detect claude-self-reflect
+```
 
 ### With Oh My Zsh
 Add to your theme:
