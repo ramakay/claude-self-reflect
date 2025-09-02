@@ -338,7 +338,19 @@ def main():
     logger.info(f"Loaded state with {len(state.get('imported_files', {}))} previously imported files")
     
     # Find all projects
-    logs_dir = Path(os.getenv("LOGS_DIR", "/logs"))
+    # Use LOGS_DIR env var, or fall back to Claude projects directory, then /logs for Docker
+    logs_dir_env = os.getenv("LOGS_DIR")
+    if logs_dir_env:
+        logs_dir = Path(logs_dir_env)
+    elif (Path.home() / ".claude" / "projects").exists():
+        logs_dir = Path.home() / ".claude" / "projects"
+    else:
+        logs_dir = Path("/logs")  # Docker fallback
+    
+    if not logs_dir.exists():
+        logger.error(f"Projects directory not found: {logs_dir}")
+        sys.exit(1)
+    
     project_dirs = [d for d in logs_dir.iterdir() if d.is_dir()]
     logger.info(f"Found {len(project_dirs)} projects to import")
     

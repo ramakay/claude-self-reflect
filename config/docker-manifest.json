@@ -1,0 +1,64 @@
+{
+  "description": "Claude Self Reflect Docker Services Manifest",
+  "version": "1.0.0",
+  "paths": {
+    "docker_compose": "docker-compose.yaml",
+    "logs_mount": {
+      "host": "~/.claude/projects",
+      "container": "/logs"
+    },
+    "config_mount": {
+      "host": "~/.claude-self-reflect/config",
+      "container": "/config"
+    }
+  },
+  "services": {
+    "database": {
+      "name": "qdrant",
+      "container_name": "claude-reflection-qdrant",
+      "type": "database",
+      "always_running": true,
+      "health_check": {
+        "endpoint": "http://localhost:6333",
+        "method": "GET"
+      }
+    },
+    "watcher": {
+      "name": "safe-watcher",
+      "container_name": "claude-reflection-safe-watcher",
+      "type": "importer",
+      "profile": "watch",
+      "description": "Primary watcher for continuous imports",
+      "command": "python /scripts/streaming-watcher.py",
+      "environment": {
+        "LOGS_DIR": "/logs",
+        "STATE_FILE": "/config/csr-watcher.json",
+        "MEMORY_LIMIT_MB": "1000"
+      }
+    },
+    "one_time_import": {
+      "name": "importer",
+      "container_name": "claude-reflection-importer",
+      "type": "importer",
+      "profile": "import",
+      "description": "One-time batch import",
+      "command": "python /scripts/import-conversations-unified.py"
+    }
+  },
+  "import_strategy": {
+    "batch_size_threshold": 10,
+    "use_watcher_when": "files > batch_size_threshold",
+    "use_direct_import_when": "files <= batch_size_threshold",
+    "watcher_check_interval": 60,
+    "watcher_state_file": "csr-watcher.json"
+  },
+  "session_hook": {
+    "enabled": true,
+    "quiet_mode_default": true,
+    "actions": {
+      "check_status": "always",
+      "start_watcher": "if_missing_files_and_not_running",
+      "direct_import": "disabled_use_docker_only"
+    }
+  }
+}

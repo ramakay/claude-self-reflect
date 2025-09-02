@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import fs from 'fs/promises';
@@ -76,71 +76,76 @@ async function status() {
 }
 
 async function doctor() {
-  console.log('🔍 Checking Claude Self-Reflect installation...\n');
+  console.log('🔍 Running comprehensive diagnostics...\n');
   
-  const checks = [
-    {
-      name: 'Python 3.10+',
-      check: async () => {
-        try {
-          const { execSync } = await import('child_process');
-          const version = execSync('python3 --version').toString().trim();
-          return { passed: true, message: version };
-        } catch {
-          return { passed: false, message: 'Python 3.10+ not found' };
-        }
-      }
-    },
-    {
-      name: 'Qdrant',
-      check: async () => {
-        try {
-          const response = await fetch('http://localhost:6333');
-          const data = await response.json();
-          if (data.title && data.title.includes('qdrant')) {
-            return { passed: true, message: `Qdrant ${data.version} is running on port 6333` };
-          }
-        } catch {}
-        return { passed: false, message: 'Qdrant not accessible on localhost:6333' };
-      }
-    },
-    {
-      name: 'MCP Server',
-      check: async () => {
-        const mcpPath = join(__dirname, '..', 'mcp-server', 'pyproject.toml');
-        try {
-          await fs.access(mcpPath);
-          return { passed: true, message: 'MCP server files found' };
-        } catch {
-          return { passed: false, message: 'MCP server files not found' };
-        }
-      }
-    },
-    {
-      name: 'Environment Variables',
-      check: async () => {
-        const envPath = join(__dirname, '..', '.env');
-        try {
-          const content = await fs.readFile(envPath, 'utf-8');
-          const hasVoyageKey = content.includes('VOYAGE_KEY=') && !content.includes('VOYAGE_KEY=your-');
-          if (hasVoyageKey) {
-            return { passed: true, message: '.env file configured with VOYAGE_KEY' };
-          }
-          return { passed: false, message: '.env file missing VOYAGE_KEY' };
-        } catch {
-          return { passed: false, message: '.env file not found' };
-        }
-      }
+  // Use the new Python doctor script for comprehensive checks
+  const doctorScript = join(__dirname, '..', 'scripts', 'doctor.py');
+  
+  try {
+    // Check if Python is available
+    try {
+      execSync('python3 --version', { stdio: 'ignore' });
+    } catch {
+      console.log('❌ Python 3 is required but not found');
+      console.log('   Please install Python 3.10 or later');
+      process.exit(1);
     }
-  ];
-  
-  for (const check of checks) {
-    const result = await check.check();
-    const icon = result.passed ? '✅' : '❌';
-    console.log(`${icon} ${check.name}: ${result.message}`);
+    
+    // Run the doctor script
+    const child = spawn('python3', [doctorScript], { 
+      stdio: 'inherit',
+      cwd: join(__dirname, '..')
+    });
+    
+    child.on('exit', (code) => {
+      if (code === 0) {
+        console.log('\n✅ All checks passed!');
+      } else if (code === 2) {
+        console.log('\n⚠️  Some issues found - see recommendations above');
+      } else {
+        console.log('\n❌ Critical issues found - please address them first');
+      }
+      process.exit(code || 0);
+    });
+  } catch (error) {
+    // Fallback to basic checks if doctor script fails
+    console.log('⚠️  Could not run comprehensive diagnostics, using basic checks...\n');
+    
+    const checks = [
+      {
+        name: 'Docker',
+        check: async () => {
+          try {
+            execSync('docker info', { stdio: 'ignore' });
+            return { passed: true, message: 'Docker is running' };
+          } catch {
+            return { passed: false, message: 'Docker not running or not installed' };
+          }
+        }
+      },
+      {
+        name: 'Qdrant',
+        check: async () => {
+          try {
+            const response = await fetch('http://localhost:6333');
+            const data = await response.json();
+            if (data.title && data.title.includes('qdrant')) {
+              return { passed: true, message: `Qdrant ${data.version} is running` };
+            }
+          } catch {}
+          return { passed: false, message: 'Qdrant not accessible on localhost:6333' };
+        }
+      }
+    ];
+    
+    for (const check of checks) {
+      const result = await check.check();
+      const icon = result.passed ? '✅' : '❌';
+      console.log(`${icon} ${check.name}: ${result.message}`);
+    }
+    
+    console.log('\n💡 Run "claude-self-reflect setup" to fix any issues');
   }
-  
-  console.log('\n💡 Run "claude-self-reflect setup" to fix any issues');
 }
 
 const ASCII_ART = `

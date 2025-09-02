@@ -191,6 +191,12 @@ async function configureEnvironment() {
   if (!envContent.includes('CONFIG_PATH=')) {
     envContent += `CONFIG_PATH=${userConfigDir}\n`;
   }
+  // CRITICAL: Set CLAUDE_LOGS_PATH with expanded home directory
+  // Docker doesn't expand ~ in volume mounts
+  if (!envContent.includes('CLAUDE_LOGS_PATH=')) {
+    const claudeLogsPath = path.join(os.homedir(), '.claude', 'projects');
+    envContent += `CLAUDE_LOGS_PATH=${claudeLogsPath}\n`;
+  }
   
   await fs.writeFile(envPath, envContent.trim() + '\n');
   console.log('✅ Environment configured');
@@ -294,30 +300,36 @@ async function startDockerServices() {
 }
 
 async function configureClaude() {
-  console.log('\n🤖 Configuring Claude Desktop...');
+  console.log('\n🤖 Configuring Claude Code...');
   
-  const mcpScript = join(projectRoot, 'mcp-server', 'run-mcp-docker.sh');
+  // Use the clean wrapper if running locally, Docker script for Docker mode
+  const isDockerMode = process.env.USE_DOCKER_MCP === 'true';
+  const mcpScript = isDockerMode 
+    ? join(projectRoot, 'mcp-server', 'run-mcp-docker.sh')
+    : join(projectRoot, 'mcp-server', 'run-mcp-clean.sh');
   
-  // Create a script that runs the MCP server in Docker
-  const scriptContent = `#!/bin/bash
+  if (isDockerMode) {
+    // Create a script that runs the MCP server in Docker
+    const scriptContent = `#!/bin/bash
 # Run the MCP server in the Docker container with stdin attached
 # Using python -u for unbuffered output
 # Using the main module which properly supports local embeddings
 docker exec -i claude-reflection-mcp python -u -m src
 `;
-  
-  await fs.writeFile(mcpScript, scriptContent, { mode: 0o755 });
+    
+    await fs.writeFile(mcpScript, scriptContent, { mode: 0o755 });
+  }
   
   // Check if Claude CLI is available
   try {
     safeExec('which', ['claude'], { stdio: 'ignore' });
     
-    console.log('🔧 Adding MCP to Claude Desktop...');
+    console.log('🔧 Adding MCP to Claude Code...');
     try {
       const mcpArgs = ['mcp', 'add', 'claude-self-reflect', mcpScript];
       safeExec('claude', mcpArgs, { stdio: 'inherit' });
       console.log('✅ MCP added successfully!');
-      console.log('\n⚠️  Please restart Claude Desktop for changes to take effect.');
+      console.log('\n⚠️  Please restart Claude Code for changes to take effect.');
     } catch {
       console.log('⚠️  Could not add MCP automatically');
       showManualConfig(mcpScript);
@@ -329,7 +341,7 @@ docker exec -i claude-reflection-mcp python -u -m src
 }
 
 function showManualConfig(mcpScript) {
-  console.log('\nAdd this to your Claude Desktop config manually:');
+  console.log('\nAdd this to your Claude Code config manually:');
   console.log('```json');
   console.log(JSON.stringify({
     "claude-self-reflect": {
@@ -341,6 +353,42 @@ function showManualConfig(mcpScript) {
 
 async function importConversations() {
   console.log('\n📚 Checking conversation baseline...');
+  
+  // First check if Claude projects directory exists and has JSONL files
+  const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+  let totalJsonlFiles = 0;
+  let projectCount = 0;
+  
+  try {
+    if (fsSync.existsSync(claudeProjectsDir)) {
+      const projects = fsSync.readdirSync(claudeProjectsDir);
+      for (const project of projects) {
+        const projectPath = path.join(claudeProjectsDir, project);
+        if (fsSync.statSync(projectPath).isDirectory()) {
+          const jsonlFiles = fsSync.readdirSync(projectPath).filter(f => f.endsWith('.jsonl'));
+          if (jsonlFiles.length > 0) {
+            projectCount++;
+            totalJsonlFiles += jsonlFiles.length;
+          }
+        }
+      }
+    }
+    
+    if (totalJsonlFiles === 0) {
+      console.log('\n⚠️  No Claude conversation files found!');
+      console.log(`   Checked: ${claudeProjectsDir}`);
+      console.log('\n   This could mean:');
+      console.log('   • You haven\'t used Claude Code yet');
+      console.log('   • Claude stores conversations in a different location');
+      console.log('   • Permissions issue accessing the directory');
+      console.log('\n   The watcher will monitor for new conversations.');
+      return;
+    }
+    
+    console.log(`✅ Found ${totalJsonlFiles} conversation files across ${projectCount} projects`);
+  } catch (e) {
+    console.log(`⚠️  Could not access Claude projects directory: ${e.message}`);
+  }
   
   // Check if baseline exists by looking for imported files state
   const configDir = path.join(os.homedir(), '.claude-self-reflect', 'config');
@@ -492,7 +540,7 @@ async function showFinalInstructions() {
   console.log('   • Stop all: docker compose down');
   
   console.log('\n🎯 Next Steps:');
-  console.log('1. Restart Claude Desktop');
+  console.log('1. Restart Claude Code');
   console.log('2. Look for "claude-self-reflect" in the MCP tools');
   console.log('3. Try: "Search my past conversations about Python"');
   
