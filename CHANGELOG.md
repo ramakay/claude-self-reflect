@@ -5,6 +5,42 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.5] - 2025-09-02
+
+### Security
+- **CVE-2025-58050 Mitigation**: PCRE2 heap buffer overflow in libpcre2-8-0 10.45-1
+  - Added explicit PCRE2 upgrade attempts to all Debian-based Dockerfiles
+  - Created CI workflow to monitor vulnerability status daily
+  - Added vulnerability checking scripts for operational monitoring
+  - Low risk for this project (no user-controlled PCRE2 patterns)
+
+### Changed
+- **Python 3.13 Upgrade**: Updated all Docker base images from Python 3.12 to 3.13
+  - Merged Dependabot PR #30 for Python Alpine updates
+  - Improved security and performance with latest Python version
+  - All dependencies validated for Python 3.13 compatibility
+
+### Added
+- `.github/workflows/security-pcre2-check.yml` - Automated vulnerability monitoring
+- `scripts/check-pcre2-vulnerability.sh` - Manual vulnerability checking
+- `scripts/mitigate-pcre2-vuln.sh` - Mitigation application script
+
+### Notes
+- PCRE2 patch (10.46+) not yet available in Debian stable repositories
+- Alpine-based images are not affected by CVE-2025-58050
+- Monitoring will continue until upstream fix is available
+
+## [2.8.4] - 2025-09-02
+
+### Added
+- **Claude Code Statusline Support**: Configure your Claude Code statusline with reflection metrics
+- **Enhanced Documentation**: Added comprehensive statusline configuration guide
+- **Visual Status Indicators**: Real-time MCP connection status in statusline
+
+### Improved
+- **User Experience**: Better visibility of reflection system status
+- **Documentation**: Added screenshots and examples for statusline setup
+
 ## [2.8.3] - 2025-09-02
 
 ### Added
