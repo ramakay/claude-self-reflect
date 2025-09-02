@@ -4,10 +4,22 @@
 
 Claude Self-Reflect integrates with the Claude Code statusline to display real-time indexing status. This provides visual feedback about your conversation memory indexing progress directly in your terminal.
 
+## Visual Examples
+
+### Full Indexing (100%)
+![Statusline at 100% indexed](./images/statusbar-1.png)
+*Shows: Progress bar at 100% with no indexing lag*
+
+### Partial Indexing (50%)
+![Statusline at 50% indexed](./images/statusbar-2.png)
+*Shows: Progress bar at 50% with "7h behind" indicating indexing backlog*
+
 ## What You'll See
 
 When properly configured, your statusline will display:
-- **🔍 96.9%** - Current indexing percentage for your active project
+- **Progress Bar**: `[███████ ]` - Visual representation of indexing percentage
+- **Percentage**: `91%` - Exact indexing percentage for your project
+- **Indexing Lag**: `• 5m behind` or `• 7h behind` - How far behind the indexer is
 - **Color Coding**:
   - 🔴 Red: < 25% indexed
   - 🟡 Yellow: 25-50% indexed  
@@ -48,7 +60,9 @@ export CSR_INDEXING_STATUS="96.9"
 If you have a statusline wrapper like `cc-statusline`, it will automatically:
 - Read the `CSR_INDEXING_STATUS` environment variable
 - Call `claude-self-reflect status` for real-time updates
-- Display the percentage with appropriate color coding
+- Display a progress bar visualization (e.g., `[███████ ]`)
+- Show exact percentage (e.g., `91%`)
+- Display indexing lag when behind (e.g., `• 5m behind`)
 - Update every 60 seconds (cached for performance)
 
 ## Setup Instructions
@@ -111,22 +125,28 @@ def get_csr_status():
         pass
     return 0
 
-def format_status(percentage):
-    """Format status with color coding."""
+def format_status(percentage, behind_time=None):
+    """Format status with progress bar and lag indicator."""
+    # Create progress bar
+    filled = int(percentage / 10)  # 10 segments for 100%
+    bar = "█" * filled + " " * (10 - filled)
+    
+    # Determine color based on percentage
     if percentage < 25:
         color = "red"
-        emoji = "🔴"
     elif percentage < 50:
         color = "yellow"
-        emoji = "🟡"
     elif percentage < 75:
         color = "cyan"
-        emoji = "🔵"
     else:
         color = "green"
-        emoji = "🟢"
     
-    return f"{emoji} {percentage:.1f}%"
+    # Format output with optional lag indicator
+    status = f"[{bar}] {percentage:.0f}%"
+    if behind_time:
+        status += f" • {behind_time} behind"
+    
+    return status
 ```
 
 ## Performance Considerations
@@ -138,10 +158,15 @@ def format_status(percentage):
 
 ## Troubleshooting
 
-### Status Not Showing
+### Status Not Showing or Shows Wrong Format
 1. Verify Claude Self-Reflect is installed:
    ```bash
    claude-self-reflect status
+   ```
+
+2. Check the watcher status for indexing lag:
+   ```bash
+   claude-self-reflect status | jq '.watcher'
    ```
 
 2. Check environment variable:
@@ -192,7 +217,10 @@ claude-self-reflect status --refresh
 ## Integration Examples
 
 ### With cc-statusline
-The statusline automatically detects and displays CSR status when available.
+The statusline automatically detects and displays CSR status when available, showing:
+- Progress bar visualization: `[███████ ]`
+- Exact percentage: `91%`
+- Indexing lag indicator: `• 5m behind` (when applicable)
 
 ### With Oh My Zsh
 Add to your theme:
@@ -217,6 +245,21 @@ style = "cyan"
 - [Session Startup Hook](./session-startup-hook.md) - Auto-indexing on session start
 - [API Reference](./api-reference.md) - Complete CLI documentation
 - [Setup Guide](../README.md#setup) - Initial installation
+
+## Understanding the Display
+
+### Progress Bar Segments
+- Each `█` represents 10% of indexing completion
+- Empty spaces show remaining work
+- Full bar `[██████████]` = 100% indexed
+
+### Indexing Lag Indicator
+The "behind" indicator shows how long ago the last unindexed conversation was created:
+- `• 5m behind` - 5 minutes of conversations to index
+- `• 7h behind` - 7 hours of backlog
+- No indicator - Fully up to date
+
+This helps you understand if the indexer is keeping up with your conversation rate.
 
 ---
 *Note: Statusline integration requires Claude Self-Reflect v2.5.11 or higher*
