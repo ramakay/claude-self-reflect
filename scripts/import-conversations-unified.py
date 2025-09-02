@@ -30,7 +30,33 @@ logger = logging.getLogger(__name__)
 
 # Environment variables
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-STATE_FILE = os.getenv("STATE_FILE", os.path.expanduser("~/.claude-self-reflect/config/imported-files.json"))
+
+# Robust cross-platform state file resolution
+def get_default_state_file():
+    """Determine the default state file location with cross-platform support."""
+    from pathlib import Path
+    
+    # Check if we're in Docker (more reliable than just checking /config)
+    docker_indicators = [
+        Path("/.dockerenv").exists(),  # Docker creates this file
+        os.path.exists("/config") and os.access("/config", os.W_OK)  # Mounted config dir with write access
+    ]
+    
+    if any(docker_indicators):
+        return "/config/imported-files.json"
+    
+    # Use pathlib for cross-platform home directory path
+    home_state = Path.home() / ".claude-self-reflect" / "config" / "imported-files.json"
+    return str(home_state)
+
+# Get state file path with env override support
+env_state = os.getenv("STATE_FILE")
+if env_state:
+    # Normalize any user-provided path to absolute
+    from pathlib import Path
+    STATE_FILE = str(Path(env_state).expanduser().resolve())
+else:
+    STATE_FILE = get_default_state_file()
 PREFER_LOCAL_EMBEDDINGS = os.getenv("PREFER_LOCAL_EMBEDDINGS", "true").lower() == "true"
 VOYAGE_API_KEY = os.getenv("VOYAGE_KEY")
 MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", "50"))  # Messages per chunk
