@@ -83,6 +83,18 @@ Claude: "3 conversations found:
         - Nov 20: Added rate limiting per authenticated connection"
 ```
 
+## 🆕 NEW: Real-time Indexing Status in Your Terminal!
+
+See your conversation indexing progress directly in your statusline:
+
+### Fully Indexed (100%)
+![Statusline showing 100% indexed](docs/images/statusbar-1.png)
+
+### Active Indexing (50% with backlog)
+![Statusline showing 50% indexed with 7h backlog](docs/images/statusbar-2.png)
+
+Works with [Claude Code Statusline](https://github.com/sirmalloc/ccstatusline) - shows progress bars, percentages, and indexing lag in real-time!
+
 ## 🎯 Key Features
 
 ### 📊 Statusline Integration
