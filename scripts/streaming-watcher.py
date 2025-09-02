@@ -547,14 +547,15 @@ class QdrantService:
         for attempt in range(self.config.max_retries):
             try:
                 async with self.request_semaphore:
-                    task = asyncio.create_task(
+                    # Directly await with timeout to avoid orphaned tasks
+                    await asyncio.wait_for(
                         self.client.upsert(
                             collection_name=collection_name,
                             points=points,
                             wait=True
-                        )
+                        ),
+                        timeout=self.config.qdrant_timeout_s
                     )
-                    await asyncio.wait_for(task, timeout=self.config.qdrant_timeout_s)
                     logger.debug(f"Stored {len(points)} points in {collection_name}")
                     return True
                     
@@ -573,6 +574,10 @@ class QdrantService:
     async def close(self):
         """Close client connection."""
         self._collection_cache.clear()
+        try:
+            await self.client.close()  # Close AsyncQdrantClient connections
+        except AttributeError:
+            pass  # Older versions might not have close()
 
 
 class TokenAwareChunker:
@@ -990,9 +995,7 @@ class StreamingWatcher:
             
             logger.info(f"Processing: {file_path.name} (memory: {mem_metrics['current_mb']:.1f}MB)")
             
-            await self.qdrant_service.ensure_collection(collection_name)
-            
-            # Read messages
+            # Read messages (defer collection creation until we know we have content)
             all_messages = []
             with open(file_path, 'r') as f:
                 for line in f:
@@ -1012,7 +1015,16 @@ class StreamingWatcher:
                             continue
             
             if not all_messages:
-                logger.warning(f"No messages in {file_path}")
+                logger.warning(f"No messages in {file_path}, marking as processed")
+                # Mark file as processed with 0 chunks
+                self.state["imported_files"][str(file_path)] = {
+                    "imported_at": datetime.now().isoformat(),
+                    "_parsed_time": datetime.now().timestamp(),
+                    "chunks": 0,
+                    "collection": collection_name,
+                    "empty_file": True
+                }
+                self.stats["files_processed"] += 1
                 return True
             
             # Extract metadata
@@ -1029,9 +1041,22 @@ class StreamingWatcher:
             
             combined_text = "\n\n".join(text_parts)
             if not combined_text.strip():
+                logger.warning(f"No textual content in {file_path}, marking as processed")
+                # Mark file as processed with 0 chunks (has messages but no extractable text)
+                self.state["imported_files"][str(file_path)] = {
+                    "imported_at": datetime.now().isoformat(),
+                    "_parsed_time": datetime.now().timestamp(),
+                    "chunks": 0,
+                    "collection": collection_name,
+                    "no_text_content": True
+                }
+                self.stats["files_processed"] += 1
                 return True
             
             concepts = extract_concepts(combined_text, tool_usage)
+            
+            # Now we know we have content, ensure collection exists
+            await self.qdrant_service.ensure_collection(collection_name)
             
             # Process chunks
             chunks_processed = 0
@@ -1052,9 +1077,10 @@ class StreamingWatcher:
                         embeddings = await self.embedding_provider.embed_documents([chunk_text])
                         # Validate embedding dimensions
                         if embeddings and len(embeddings[0]) != self.embedding_provider.vector_size:
-                            logger.error(f"Embedding dimension mismatch: got {len(embeddings[0])}, expected {self.embedding_provider.vector_size}")
+                            logger.error(f"Embedding dimension mismatch: got {len(embeddings[0])}, expected {self.embedding_provider.vector_size} for provider {self.embedding_provider.__class__.__name__}")
                             self.stats["failures"] += 1
                             embeddings = None  # Force retry
+                            continue  # Continue retrying, not break
                         break
                     except Exception as e:
                         logger.warning(f"Embed failed (attempt {attempt+1}): {e}")

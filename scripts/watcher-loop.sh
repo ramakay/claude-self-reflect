@@ -2,7 +2,7 @@
 # Watcher loop for Docker container
 # Runs the streaming-watcher.py with HOT/WARM/COLD prioritization
 
-set -e
+# Don't use set -e in retry loops - it can cause premature exits
 
 echo "Starting Claude Self-Reflect Streaming Watcher v3.0.0"
 echo "HOT/WARM/COLD prioritization enabled"
@@ -23,12 +23,14 @@ while true; do
     echo "[$(date)] Starting watcher (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
     
     # Run the streaming watcher
-    if python /app/scripts/streaming-watcher.py; then
+    python /app/scripts/streaming-watcher.py
+    EXIT_CODE=$?
+    
+    if [ $EXIT_CODE -eq 0 ]; then
         echo "[$(date)] Watcher exited cleanly"
         RETRY_COUNT=0
         BACKOFF_SECONDS=5
     else
-        EXIT_CODE=$?
         echo "[$(date)] Watcher exited with code $EXIT_CODE"
         
         RETRY_COUNT=$((RETRY_COUNT + 1))
@@ -37,8 +39,13 @@ while true; do
             exit 1
         fi
         
-        echo "[$(date)] Restarting in $BACKOFF_SECONDS seconds..."
-        sleep $BACKOFF_SECONDS
+        # Add jitter to prevent thundering herd (±20% of backoff)
+        JITTER=$(( (RANDOM % (BACKOFF_SECONDS / 5 + 1)) - (BACKOFF_SECONDS / 10) ))
+        SLEEP_TIME=$((BACKOFF_SECONDS + JITTER))
+        [ $SLEEP_TIME -lt 1 ] && SLEEP_TIME=1
+        
+        echo "[$(date)] Restarting in $SLEEP_TIME seconds (base: $BACKOFF_SECONDS, jitter: $JITTER)..."
+        sleep $SLEEP_TIME
         
         # Exponential backoff (max 300 seconds)
         BACKOFF_SECONDS=$((BACKOFF_SECONDS * 2))
