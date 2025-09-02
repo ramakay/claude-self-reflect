@@ -26,6 +26,21 @@ Give Claude perfect memory of all your conversations. Search past discussions in
 
 **🔒 100% Local by Default** • **⚡ Blazing Fast Search** • **🚀 Zero Configuration** • **🏭 Production Ready**
 
+## 📑 Table of Contents
+
+- [🚀 Quick Install](#-quick-install)
+- [✨ The Magic](#-the-magic)
+- [📊 Before & After](#-before--after)
+- [💬 Real Examples](#-real-examples)
+- [🆕 NEW: Real-time Indexing Status](#-new-real-time-indexing-status-in-your-terminal)
+- [🎯 Key Features](#-key-features)
+- [🏗️ Architecture](#️-architecture)
+- [🛠️ Requirements](#️-requirements)
+- [📖 Documentation](#-documentation)
+- [📦 What's New](#-whats-new)
+- [🔧 Troubleshooting](#-troubleshooting)
+- [👥 Contributors](#-contributors)
+
 ## 🚀 Quick Install
 
 ```bash
@@ -97,7 +112,9 @@ Works with [Claude Code Statusline](https://github.com/sirmalloc/ccstatusline) -
 
 ## 🎯 Key Features
 
-### 📊 Statusline Integration
+<details>
+<summary><b>📊 Statusline Integration</b></summary>
+
 See your indexing progress right in your terminal! Works with [Claude Code Statusline](https://github.com/sirmalloc/ccstatusline):
 - **Progress Bar** - Visual indicator `[████████ ] 91%`
 - **Indexing Lag** - Shows backlog `• 7h behind`
@@ -106,7 +123,11 @@ See your indexing progress right in your terminal! Works with [Claude Code Statu
 
 [Learn more about statusline integration →](docs/statusline-integration.md)
 
-### Project-Scoped Search
+</details>
+
+<details>
+<summary><b>🔍 Project-Scoped Search</b></summary>
+
 Searches are **project-aware by default**. Claude automatically searches within your current project:
 
 ```
@@ -119,21 +140,37 @@ You: "Search all projects for WebSocket implementations"
 Claude: [Searches across ALL your projects]
 ```
 
-### ⏱️ Memory Decay
-Recent conversations matter more. Old ones fade. Like your brain, but reliable.
+</details>
 
-### ⚡ Performance at Scale
+<details>
+<summary><b>⏱️ Memory Decay</b></summary>
+
+Recent conversations matter more. Old ones fade. Like your brain, but reliable.
+- **90-day half-life**: Recent memories stay strong
+- **Graceful aging**: Old information fades naturally
+- **Configurable**: Adjust decay rate to your needs
+
+</details>
+
+<details>
+<summary><b>⚡ Performance at Scale</b></summary>
+
 - **Search**: <3ms average response time
 - **Scale**: 600+ conversations across 24 projects
 - **Reliability**: 100% indexing success rate
 - **Memory**: 96% reduction from v2.5.15
+- **Real-time**: HOT/WARM/COLD intelligent prioritization
+
+</details>
 
 ## 🏗️ Architecture
 
+<details>
+<summary><b>View Architecture Diagram & Details</b></summary>
+
 ![Import Architecture](docs/diagrams/import-architecture.png)
 
-<details>
-<summary>🔥 HOT/WARM/COLD Intelligent Prioritization</summary>
+### 🔥 HOT/WARM/COLD Intelligent Prioritization
 
 - **🔥 HOT** (< 5 minutes): 2-second intervals for near real-time import
 - **🌡️ WARM** (< 24 hours): Normal priority with starvation prevention
@@ -141,13 +178,37 @@ Recent conversations matter more. Old ones fade. Like your brain, but reliable.
 
 Files are categorized by age and processed with priority queuing to ensure newest content gets imported quickly while preventing older files from being starved.
 
+### Components
+- **Vector Database**: Qdrant for semantic search
+- **MCP Server**: Python-based using FastMCP
+- **Embeddings**: Local (FastEmbed) or Cloud (Voyage AI)
+- **Import Pipeline**: Docker-based with automatic monitoring
+
 </details>
 
 ## 🛠️ Requirements
 
+<details>
+<summary><b>System Requirements</b></summary>
+
+### Minimum Requirements
 - **Docker Desktop** (macOS/Windows) or **Docker Engine** (Linux)
 - **Node.js** 16+ (for the setup wizard)
 - **Claude Code** CLI
+- **4GB RAM** available for Docker
+- **2GB disk space** for vector database
+
+### Recommended
+- **8GB RAM** for optimal performance
+- **SSD storage** for faster indexing
+- **Docker Desktop 4.0+** for best compatibility
+
+### Operating Systems
+- ✅ macOS 11+ (Intel & Apple Silicon)
+- ✅ Windows 10/11 with WSL2
+- ✅ Linux (Ubuntu 20.04+, Debian 11+)
+
+</details>
 
 ## 📖 Documentation
 
@@ -254,9 +315,10 @@ docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.
 
 ## 🔧 Troubleshooting
 
-### Common Issues and Solutions
+<details>
+<summary><b>Common Issues and Solutions</b></summary>
 
-#### 1. "No collections created" after import
+### 1. "No collections created" after import
 **Symptom**: Import runs but Qdrant shows no collections  
 **Cause**: Docker can't access Claude projects directory  
 **Solution**:
@@ -272,12 +334,12 @@ cat .env | grep CLAUDE_LOGS_PATH
 # Should show: CLAUDE_LOGS_PATH=/Users/YOUR_NAME/.claude/projects
 ```
 
-#### 2. MCP server shows "ERROR" but it's actually INFO
+### 2. MCP server shows "ERROR" but it's actually INFO
 **Symptom**: `[ERROR] MCP server "claude-self-reflect" Server stderr: INFO Starting MCP server`  
 **Cause**: Claude Code displays all stderr output as errors  
 **Solution**: This is not an actual error - the MCP is working correctly. The INFO message confirms successful startup.
 
-#### 3. "No JSONL files found"
+### 3. "No JSONL files found"
 **Symptom**: Setup can't find any conversation files  
 **Cause**: Claude Code hasn't been used yet or stores files elsewhere  
 **Solution**:
@@ -289,7 +351,7 @@ ls ~/.claude/projects/
 # The watcher will import them automatically
 ```
 
-#### 4. Docker volume mount issues
+### 4. Docker volume mount issues
 **Symptom**: Import fails with permission errors  
 **Cause**: Docker can't access home directory  
 **Solution**:
@@ -303,7 +365,7 @@ docker compose down
 claude-self-reflect setup
 ```
 
-#### 5. Qdrant not accessible
+### 5. Qdrant not accessible
 **Symptom**: Can't connect to localhost:6333  
 **Solution**:
 ```bash
@@ -317,9 +379,12 @@ docker compose ps
 docker compose logs qdrant
 ```
 
-### Diagnostic Tools
+</details>
 
-Run comprehensive diagnostics:
+<details>
+<summary><b>Diagnostic Tools</b></summary>
+
+### Run Comprehensive Diagnostics
 ```bash
 claude-self-reflect doctor
 ```
@@ -331,18 +396,41 @@ This checks:
 - Import status and collections
 - Service health
 
-### Still Having Issues?
+### Check Logs
+```bash
+# View all service logs
+docker compose logs -f
 
-1. Check the logs:
-   ```bash
-   docker compose logs -f
-   ```
+# View specific service
+docker compose logs qdrant
+docker compose logs watcher
+```
 
-2. Report issues with diagnostic output:
-   ```bash
-   claude-self-reflect doctor > diagnostic.txt
-   ```
-   Then include diagnostic.txt when [reporting issues](https://github.com/ramakay/claude-self-reflect/issues)
+### Generate Diagnostic Report
+```bash
+# Create diagnostic file for issue reporting
+claude-self-reflect doctor > diagnostic.txt
+```
+
+</details>
+
+<details>
+<summary><b>Getting Help</b></summary>
+
+1. **Check Documentation**
+   - [Troubleshooting Guide](docs/troubleshooting.md)
+   - [FAQ](docs/faq.md)
+   - [Windows Setup](docs/windows-setup.md)
+
+2. **Community Support**
+   - [GitHub Discussions](https://github.com/ramakay/claude-self-reflect/discussions)
+   - [Discord Community](https://discord.gg/claude-self-reflect)
+
+3. **Report Issues**
+   - [GitHub Issues](https://github.com/ramakay/claude-self-reflect/issues)
+   - Include diagnostic output when reporting
+
+</details>
 
 ## 👥 Contributors
 
