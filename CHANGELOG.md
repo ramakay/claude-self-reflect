@@ -5,6 +5,26 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.3] - 2025-09-02
+
+### Added
+- **Production Health Monitoring**: HTTP endpoints (/health, /ready, /metrics) for Docker/Kubernetes integration
+- **Session Startup Hooks**: Auto-indexing new conversations on Claude session start
+- **Diagnostic Tool**: Comprehensive doctor.py for troubleshooting installations
+- **Docker Orchestration**: Enhanced Docker manifest for better service management
+
+### Fixed
+- **Critical Watcher Reliability**: Memory leak fixes, proper async cleanup, retry logic improvements
+- **Path Expansion Issues**: Fixed tilde (~) expansion problems in Docker volumes (GitHub #116)
+- **Embedding Retry Logic**: Fixed premature exit on dimension mismatches
+- **Connection Leaks**: Added proper AsyncQdrantClient cleanup
+
+### Improved
+- **Setup Wizard**: Pre-flight validation and better error messages
+- **Bash Watchdog**: Added jittered exponential backoff for stability
+- **Documentation**: Enhanced troubleshooting guides and setup instructions
+- **Indexing Coverage**: System now achieves 98.3% indexing rate
+
 ## [2.8.2] - 2025-09-01
 
 ### Fixed

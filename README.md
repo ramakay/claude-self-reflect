@@ -126,7 +126,7 @@ Files are categorized by age and processed with priority queuing to ensure newes
 
 - **Docker Desktop** (macOS/Windows) or **Docker Engine** (Linux)
 - **Node.js** 16+ (for the setup wizard)
-- **Claude Desktop** app
+- **Claude Code** CLI
 
 ## 📖 Documentation
 
@@ -230,6 +230,98 @@ docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.
 [Full changelog](docs/release-history.md)
 
 </details>
+
+## 🔧 Troubleshooting
+
+### Common Issues and Solutions
+
+#### 1. "No collections created" after import
+**Symptom**: Import runs but Qdrant shows no collections  
+**Cause**: Docker can't access Claude projects directory  
+**Solution**:
+```bash
+# Run diagnostics to identify the issue
+claude-self-reflect doctor
+
+# Fix: Re-run setup to set correct paths
+claude-self-reflect setup
+
+# Verify .env has full paths (no ~):
+cat .env | grep CLAUDE_LOGS_PATH
+# Should show: CLAUDE_LOGS_PATH=/Users/YOUR_NAME/.claude/projects
+```
+
+#### 2. MCP server shows "ERROR" but it's actually INFO
+**Symptom**: `[ERROR] MCP server "claude-self-reflect" Server stderr: INFO Starting MCP server`  
+**Cause**: Claude Code displays all stderr output as errors  
+**Solution**: This is not an actual error - the MCP is working correctly. The INFO message confirms successful startup.
+
+#### 3. "No JSONL files found"
+**Symptom**: Setup can't find any conversation files  
+**Cause**: Claude Code hasn't been used yet or stores files elsewhere  
+**Solution**:
+```bash
+# Check if files exist
+ls ~/.claude/projects/
+
+# If empty, use Claude Code to create some conversations first
+# The watcher will import them automatically
+```
+
+#### 4. Docker volume mount issues
+**Symptom**: Import fails with permission errors  
+**Cause**: Docker can't access home directory  
+**Solution**:
+```bash
+# Ensure Docker has file sharing permissions
+# macOS: Docker Desktop → Settings → Resources → File Sharing
+# Add: /Users/YOUR_USERNAME/.claude
+
+# Restart Docker and re-run setup
+docker compose down
+claude-self-reflect setup
+```
+
+#### 5. Qdrant not accessible
+**Symptom**: Can't connect to localhost:6333  
+**Solution**:
+```bash
+# Start services
+docker compose --profile mcp up -d
+
+# Check if running
+docker compose ps
+
+# View logs for errors
+docker compose logs qdrant
+```
+
+### Diagnostic Tools
+
+Run comprehensive diagnostics:
+```bash
+claude-self-reflect doctor
+```
+
+This checks:
+- Docker installation and configuration
+- Environment variables and paths
+- Claude projects and JSONL files
+- Import status and collections
+- Service health
+
+### Still Having Issues?
+
+1. Check the logs:
+   ```bash
+   docker compose logs -f
+   ```
+
+2. Report issues with diagnostic output:
+   ```bash
+   claude-self-reflect doctor > diagnostic.txt
+   ```
+   Then include diagnostic.txt when [reporting issues](https://github.com/ramakay/claude-self-reflect/issues)
 
 ## 👥 Contributors
 
