@@ -44,14 +44,21 @@ Currently using client-side decay calculation (v1.3.1):
 
 ## Current Status
 
-### CRITICAL: Understanding Import Status (Updated 2025-08-29)
-**⚠️ ALWAYS use `python mcp-server/src/status.py` to check the REAL import status.**
+### CRITICAL: Understanding Import Status (Updated 2025-09-02)
+**✅ ALWAYS use `python mcp-server/src/status.py` to check the REAL import status.**
+**✅ Health monitoring: `python mcp-server/src/health.py` for comprehensive system health**
 
 **Actual Import Status:**
-- **Overall**: 72.3% (352 of 487 JSONL files imported)
-- **claude-self-reflect**: 84.0% (173 of 206 files imported)
-- **Total Chunks in Qdrant**: 83,203+ points across 150+ collections
+- **Overall**: 99.8% (469 of 470 JSONL files imported)
+- **claude-self-reflect**: 100% (209 of 209 files imported)
+- **Total Collections in Qdrant**: 179 active collections
 - **Projects with Data**: 22 projects have imported conversations
+
+### ⚠️ CRITICAL STATE VALIDATION RULES
+1. **NEVER** assume 0% imports without checking Qdrant directly
+2. **ALWAYS** test MCP search - if it returns results, imports exist
+3. **DO NOT** create new state managers without understanding existing system
+4. The state files (imported-files.json, csr-watcher.json) are CORRECT 99% of the time
 
 ### Import System Components
 Different components track different state:
@@ -60,10 +67,20 @@ Different components track different state:
 3. **Qdrant collections**: Actual vector data storage
 
 **Important Architecture Notes:**
-- **import-conversations-unified.py**: Main batch import script
+- **import-conversations-unified.py**: Main batch import script (uses ~/.claude-self-reflect/config/imported-files.json)
 - **streaming-watcher.py**: Delta watcher for NEW conversations only
+- **mcp-server/src/status.py**: Real-time status calculation - SOURCE OF TRUTH
+- **mcp-server/src/health.py**: System health monitoring endpoint
 - **Delta behavior**: Watcher should process NEWEST files first (sort by age descending)
 - If watcher shows "672 hour backlog" = wrong sort order, re-importing old files
+
+### Critical Files and Their Purposes
+| File | Location | Purpose | Trust Level |
+|------|----------|---------|-------------|
+| status.py | mcp-server/src/ | Real-time import status | PRIMARY TRUTH |
+| health.py | mcp-server/src/ | System health check | MONITORING |
+| imported-files.json | ~/.claude-self-reflect/config/ | Batch import tracking | ACCURATE |
+| csr-watcher.json | ~/.claude-self-reflect/config/ | Watcher state only | SECONDARY |
 
 **Common Mistake**: Don't trust csr-watcher.json counts - it only tracks what streaming-watcher has processed, not the total system imports. The MCP's imported-files.json (via status.py) shows the real import status.
 
@@ -312,6 +329,26 @@ claude mcp add claude-self-reflect "/path/to/mcp-server/run-mcp.sh" -e QDRANT_UR
 4. **Test with small imports first** using --limit flag
 5. **Monitor Docker logs** if using containerized setup
 - all claude related conversations are in ~/.claude/projects not in conversations folder - this is NOT a claude desktop project.
+
+## Docker Container Management
+
+### Critical Containers
+| Container | Name | Purpose | Recovery |
+|-----------|------|---------|----------|
+| Qdrant | qdrant | Vector database | `docker compose up -d qdrant` |
+| Watcher | claude-reflection-safe-watcher | Auto-import new conversations | `docker start claude-reflection-safe-watcher` |
+
+### Container Health Checks
+```bash
+# Check all containers
+docker ps -a | grep -E "qdrant|watcher"
+
+# Check watcher logs
+docker logs claude-reflection-safe-watcher --tail 50
+
+# Restart if needed
+docker restart claude-reflection-safe-watcher
+```
 
 ## Lessons Learned from v2.5.17 Release Crisis
 

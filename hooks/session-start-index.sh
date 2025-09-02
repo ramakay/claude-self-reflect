@@ -2,6 +2,7 @@
 
 # Claude Self Reflect - Session Start Hook
 # Automatically brings current project to 100% indexing on session start
+# Also ensures watcher container is running for real-time updates
 # This hook is triggered when a Claude session starts
 
 set -e
@@ -26,6 +27,46 @@ log() {
 }
 
 log "Session start hook triggered for project: $PROJECT_NAME"
+
+# Function to check and restart watcher container
+check_and_restart_watcher() {
+    local WATCHER_NAME="claude-reflection-safe-watcher"
+    
+    # Check if Docker is available
+    if ! command -v docker &> /dev/null; then
+        log "Docker not found, skipping container check"
+        return 0
+    fi
+    
+    # Check container status
+    local CONTAINER_STATUS=$(docker ps -a --filter "name=$WATCHER_NAME" --format "{{.Status}}" 2>/dev/null || echo "")
+    
+    if [[ -z "$CONTAINER_STATUS" ]]; then
+        log "Watcher container not found"
+        return 0
+    fi
+    
+    # Check if container is running
+    if [[ "$CONTAINER_STATUS" == *"Up"* ]]; then
+        log "Watcher container is running: $CONTAINER_STATUS"
+        return 0
+    fi
+    
+    # Container exists but is not running - restart it
+    log "Watcher container is not running (Status: $CONTAINER_STATUS)"
+    log "Attempting to restart watcher container..."
+    
+    if docker start "$WATCHER_NAME" 2>&1; then
+        log "✅ Watcher container restarted successfully"
+        # Give it a moment to start processing
+        sleep 2
+    else
+        log "⚠️ Failed to restart watcher container"
+    fi
+}
+
+# Check and restart watcher container if needed
+check_and_restart_watcher
 
 # Check if we're in a Claude-tracked project
 if [ ! -d "$HOME/.claude/projects" ]; then

@@ -761,14 +761,17 @@ class IndexingProgress:
     
     def get_progress(self) -> Dict[str, Any]:
         """Get progress metrics."""
-        percent = (self.indexed_files / self.total_files * 100) if self.total_files > 0 else 0
+        # Cap percentage at 100% to handle stale state entries
+        percent = min(100.0, (self.indexed_files / self.total_files * 100)) if self.total_files > 0 else 0
         elapsed = time.time() - self.start_time
         rate = self.indexed_files / elapsed if elapsed > 0 else 0
-        eta = (self.total_files - self.indexed_files) / rate if rate > 0 else 0
+        # For ETA calculation, use remaining files (but min with 0 to avoid negative)
+        remaining = max(0, self.total_files - self.indexed_files)
+        eta = remaining / rate if rate > 0 else 0
         
         return {
             'total_files': self.total_files,
-            'indexed_files': self.indexed_files,
+            'indexed_files': min(self.indexed_files, self.total_files),  # Cap at total
             'percent': percent,
             'rate_per_hour': rate * 3600,
             'eta_hours': eta / 3600,
@@ -1005,9 +1008,11 @@ class StreamingWatcher:
                             # Handle 'messages' array (standard format)
                             if 'messages' in data and data['messages']:
                                 all_messages.extend(data['messages'])
-                            # Handle single 'message' object
+                            # Handle single 'message' object (must be dict, not string)
                             elif 'message' in data and data['message']:
-                                all_messages.append(data['message'])
+                                if isinstance(data['message'], dict):
+                                    all_messages.append(data['message'])
+                                # Skip string messages (like status messages)
                             # Handle direct role/content format
                             elif 'role' in data and 'content' in data:
                                 all_messages.append(data)

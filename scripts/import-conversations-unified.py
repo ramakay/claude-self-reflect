@@ -30,13 +30,16 @@ logger = logging.getLogger(__name__)
 
 # Environment variables
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-STATE_FILE = os.getenv("STATE_FILE", "/config/imported-files.json")
+STATE_FILE = os.getenv("STATE_FILE", os.path.expanduser("~/.claude-self-reflect/config/imported-files.json"))
 PREFER_LOCAL_EMBEDDINGS = os.getenv("PREFER_LOCAL_EMBEDDINGS", "true").lower() == "true"
 VOYAGE_API_KEY = os.getenv("VOYAGE_KEY")
 MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", "50"))  # Messages per chunk
 
-# Initialize Qdrant client
-client = QdrantClient(url=QDRANT_URL)
+# Initialize Qdrant client with timeout
+client = QdrantClient(
+    url=QDRANT_URL,
+    timeout=30  # 30 second timeout for network operations
+)
 
 # Initialize embedding provider
 embedding_provider = None
@@ -138,11 +141,11 @@ def process_and_upload_chunk(messages: List[Dict[str, Any]], chunk_index: int,
             payload=payload
         )
         
-        # Upload immediately
+        # Upload immediately (no wait for better throughput)
         client.upsert(
             collection_name=collection_name,
             points=[point],
-            wait=True
+            wait=False  # Don't wait for indexing to complete
         )
         
         return 1

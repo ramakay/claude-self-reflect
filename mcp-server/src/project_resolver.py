@@ -76,31 +76,64 @@ class ProjectResolver:
             return []
         
         # Strategy 1: Direct hash of input (handles full paths)
-        direct_hash = hashlib.sha256(user_project_name.encode()).hexdigest()[:16]
+        # Try both MD5 (used by streaming-watcher) and SHA256 (legacy)
+        direct_hash_md5 = hashlib.md5(user_project_name.encode()).hexdigest()[:8]
+        direct_hash_sha256 = hashlib.sha256(user_project_name.encode()).hexdigest()[:16]
+        
         # Match exact hash segment between underscores, not substring
         direct_matches = [c for c in collection_names 
-                         if f"_{direct_hash}_" in c or c.endswith(f"_{direct_hash}")]
+                         if f"_{direct_hash_md5}_" in c or c.endswith(f"_{direct_hash_md5}") or
+                            f"_{direct_hash_sha256}_" in c or c.endswith(f"_{direct_hash_sha256}")]
         matching_collections.update(direct_matches)
         
         # Strategy 2: Try normalized version
         normalized = self._normalize_project_name(user_project_name)
         if normalized != user_project_name:
-            norm_hash = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+            norm_hash_md5 = hashlib.md5(normalized.encode()).hexdigest()[:8]
+            norm_hash_sha256 = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+            
             # Match exact hash segment between underscores, not substring
             norm_matches = [c for c in collection_names 
-                           if f"_{norm_hash}_" in c or c.endswith(f"_{norm_hash}")]
+                           if f"_{norm_hash_md5}_" in c or c.endswith(f"_{norm_hash_md5}") or
+                              f"_{norm_hash_sha256}_" in c or c.endswith(f"_{norm_hash_sha256}")]
             matching_collections.update(norm_matches)
         
         # Strategy 3: Case-insensitive normalized version
         lower_normalized = normalized.lower()
         if lower_normalized != normalized:
-            lower_hash = hashlib.sha256(lower_normalized.encode()).hexdigest()[:16]
+            lower_hash_md5 = hashlib.md5(lower_normalized.encode()).hexdigest()[:8]
+            lower_hash_sha256 = hashlib.sha256(lower_normalized.encode()).hexdigest()[:16]
+            
             # Match exact hash segment between underscores, not substring
             lower_matches = [c for c in collection_names 
-                            if f"_{lower_hash}_" in c or c.endswith(f"_{lower_hash}")]
+                            if f"_{lower_hash_md5}_" in c or c.endswith(f"_{lower_hash_md5}") or
+                               f"_{lower_hash_sha256}_" in c or c.endswith(f"_{lower_hash_sha256}")]
             matching_collections.update(lower_matches)
         
-        # Strategy 4: Use segment-based discovery for complex paths
+        # Strategy 4: ALWAYS try mapping project name to full directory path in .claude/projects/
+        # This ensures we find all related collections, not just the first match
+        # This handles the case where streaming-watcher uses full path but MCP uses short name
+        if not user_project_name.startswith('-'):
+            # Check if there's a matching directory in .claude/projects/
+            projects_dir = Path.home() / ".claude" / "projects"
+            if projects_dir.exists():
+                for proj_dir in projects_dir.iterdir():
+                    if proj_dir.is_dir():
+                        # Check if the directory name contains the project name
+                        # This handles both "claude-self-reflect" and "-Users-...-projects-claude-self-reflect"
+                        if (proj_dir.name.endswith(f"-{user_project_name}") or 
+                            f"-{user_project_name}" in proj_dir.name or
+                            proj_dir.name == user_project_name):
+                            # Found a matching directory - hash its name
+                            dir_name = proj_dir.name
+                            dir_hash_md5 = hashlib.md5(dir_name.encode()).hexdigest()[:8]
+                            
+                            # Find collections with this hash
+                            dir_matches = [c for c in collection_names 
+                                          if f"_{dir_hash_md5}_" in c or c.endswith(f"_{dir_hash_md5}")]
+                            matching_collections.update(dir_matches)
+        
+        # Strategy 5: Use segment-based discovery for complex paths
         if not matching_collections:
             # Extract segments from the input
             segments = self._extract_project_segments(user_project_name)
@@ -111,10 +144,13 @@ class ProjectResolver:
                 
                 # Try each candidate
                 for candidate in candidates:
-                    candidate_hash = hashlib.sha256(candidate.encode()).hexdigest()[:16]
+                    candidate_hash_md5 = hashlib.md5(candidate.encode()).hexdigest()[:8]
+                    candidate_hash_sha256 = hashlib.sha256(candidate.encode()).hexdigest()[:16]
+                    
                     # Match exact hash segment between underscores, not substring
                     candidate_matches = [c for c in collection_names 
-                                       if f"_{candidate_hash}_" in c or c.endswith(f"_{candidate_hash}")]
+                                       if f"_{candidate_hash_md5}_" in c or c.endswith(f"_{candidate_hash_md5}") or
+                                          f"_{candidate_hash_sha256}_" in c or c.endswith(f"_{candidate_hash_sha256}")]
                     matching_collections.update(candidate_matches)
                     
                     # Stop if we found matches
