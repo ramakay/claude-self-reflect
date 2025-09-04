@@ -269,6 +269,37 @@ claude-self-reflect/
 - **CRITICAL**: All agents MUST follow [MCP_REFERENCE.md](./docs/development/MCP_REFERENCE.md) for MCP operations
 - **Task Parallelization**: Use multiple Task invocations in a SINGLE message for parallel operations to maximize performance
 
+## AST Tools
+
+### ast-grep
+**Installation**: `brew install ast-grep`
+
+**Purpose**: AST-based code searching and refactoring tool that matches code patterns structurally rather than textually.
+
+**Key Features**:
+- Pattern-based search using actual code syntax
+- Meta-variables ($METAVAR) to match any AST node
+- Interactive refactoring with `--rewrite`
+- Language-aware (use `-l ts` for TypeScript, `-l python` for Python)
+
+**Example Usage**:
+```bash
+# Search for patterns
+ast-grep -p '$PROP && $PROP()' -l ts src/
+
+# Refactor code interactively
+ast-grep -p '$PROP && $PROP()' --rewrite '$PROP?.()' --interactive -l ts src/
+
+# Search Python patterns
+ast-grep -p 'if $VAR.get($KEY): $BODY' -l python scripts/
+```
+
+**Use Cases in This Project**:
+- Finding and extracting code patterns from conversations
+- Refactoring pattern extraction logic
+- Searching for specific AST patterns across the codebase
+- Validating pattern implementations
+
 ## File Organization
 - Claude automatically organizes .md files based on content (see parent project's CLAUDE.md)
 - **Organization Log**: If you can't find a created .md file, check `docs/organization-log.json`

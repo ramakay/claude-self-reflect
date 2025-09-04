@@ -35,17 +35,25 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from fastembed import TextEmbedding
 import psutil
 
-# Import normalize_project_name
-import sys
-sys.path.insert(0, str(Path(__file__).parent))
-from utils import normalize_project_name
-
-# Configure logging
+# Configure logging (moved before optional imports)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Import normalize_project_name
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+from utils import normalize_project_name
+
+# Import AST pattern extractor (optional dependency)
+try:
+    from ast_pattern_extractor import extract_code_patterns_with_fallback
+    AST_EXTRACTION_AVAILABLE = True
+except ImportError:
+    AST_EXTRACTION_AVAILABLE = False
+    logger.warning("AST pattern extraction not available - install ast-grep-py for code pattern analysis")
 
 # Configuration from environment
 @dataclass
@@ -220,6 +228,38 @@ def extract_tool_usage_from_conversation(messages: List[Dict]) -> Dict[str, Any]
     return tool_usage
 
 
+def sanitize_paths(paths: List[str], project_path: str = None) -> List[str]:
+    """Sanitize file paths to remove sensitive information."""
+    sanitized = []
+    for path in paths[:20]:  # Limit to 20 paths
+        if not path:
+            continue
+        
+        try:
+            # Try to make relative to project
+            if project_path:
+                import os
+                rel_path = os.path.relpath(path, start=project_path)
+                # If it goes outside project, use basename
+                if rel_path.startswith('..'):
+                    rel_path = os.path.basename(path)
+            else:
+                # No project path, use basename only
+                import os
+                rel_path = os.path.basename(path)
+            
+            # Normalize slashes
+            rel_path = rel_path.replace('\\', '/')
+            sanitized.append(rel_path)
+        except Exception:
+            # On any error, just use basename
+            import os
+            sanitized.append(os.path.basename(path))
+    
+    # Remove duplicates and sort
+    return sorted(list(set(sanitized)))[:20]
+
+
 def extract_concepts(text: str, tool_usage: Dict[str, Any]) -> List[str]:
     """Extract development concepts from conversation text."""
     concepts = set()
@@ -379,9 +419,10 @@ class FastEmbedProvider(EmbeddingProvider):
     
     def __init__(self, model_name: str, max_concurrent: int = 2):
         self.model = TextEmbedding(model_name)
-        self.executor = ThreadPoolExecutor(max_workers=1)
+        # Align thread pool size with max_concurrent for better throughput
+        self.executor = ThreadPoolExecutor(max_workers=max(1, max_concurrent))
         self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.vector_size = 384  # all-MiniLM-L6-v2 dimensions
+        self.vector_size = None  # Determined dynamically from first embedding
         self.provider_type = 'local'
     
     async def embed_documents(self, texts: List[str]) -> List[List[float]]:
@@ -392,7 +433,14 @@ class FastEmbedProvider(EmbeddingProvider):
                 self.executor,
                 lambda: list(self.model.embed(texts))
             )
-            return [embedding.tolist() for embedding in embeddings]
+            result = [embedding.tolist() for embedding in embeddings]
+            
+            # Determine vector size from first embedding if not yet known
+            if self.vector_size is None and result:
+                self.vector_size = len(result[0])
+                logger.info(f"FastEmbed vector size detected: {self.vector_size}")
+            
+            return result
     
     async def close(self):
         """Shutdown executor properly."""
@@ -488,6 +536,43 @@ class QdrantService:
         self.embedding_provider = embedding_provider
         self._collection_cache: Dict[str, float] = {}
         self.request_semaphore = asyncio.Semaphore(config.max_concurrent_qdrant)
+        # Track in-flight upserts to prevent duplicates on timeout
+        self._inflight_upserts: set = set()
+    
+    async def _create_payload_indexes(self, collection_name: str) -> None:
+        """Create payload indexes for efficient filtering."""
+        try:
+            # Create keyword indexes for exact match fields
+            keyword_fields = ["conversation_id", "project"]
+            for field in keyword_fields:
+                try:
+                    await self.client.create_payload_index(
+                        collection_name=collection_name,
+                        field_name=field,
+                        field_schema=models.PayloadSchemaType.KEYWORD
+                    )
+                    logger.debug(f"Created keyword index for {field}")
+                except Exception as e:
+                    if "already exists" not in str(e):
+                        logger.warning(f"Failed to create index for {field}: {e}")
+            
+            # Create keyword indexes for array fields
+            array_fields = ["concepts", "tools_used", "files_analyzed", "files_edited"]
+            for field in array_fields:
+                try:
+                    await self.client.create_payload_index(
+                        collection_name=collection_name,
+                        field_name=field,
+                        field_schema=models.PayloadSchemaType.KEYWORD
+                    )
+                    logger.debug(f"Created array index for {field}")
+                except Exception as e:
+                    if "already exists" not in str(e):
+                        logger.warning(f"Failed to create index for {field}: {e}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to create payload indexes: {e}")
+            # Non-critical, continue without indexes
     
     async def ensure_collection(self, collection_name: str) -> None:
         """Ensure collection exists with TTL cache."""
@@ -509,6 +594,8 @@ class QdrantService:
                 )
                 self._collection_cache[collection_name] = now
                 logger.debug(f"Collection {collection_name} exists")
+                # Ensure indexes exist even for pre-existing collections
+                await self._create_payload_indexes(collection_name)
             except (UnexpectedResponse, asyncio.TimeoutError):
                 # Create collection with correct vector size based on provider
                 vector_size = self.embedding_provider.vector_size or self.config.vector_size
@@ -529,6 +616,9 @@ class QdrantService:
                     )
                     self._collection_cache[collection_name] = now
                     logger.info(f"Created collection {collection_name}")
+                    
+                    # Create payload indexes for efficient filtering
+                    await self._create_payload_indexes(collection_name)
                 except UnexpectedResponse as e:
                     if "already exists" in str(e):
                         self._collection_cache[collection_name] = now
@@ -544,32 +634,62 @@ class QdrantService:
         if not points:
             return True
         
-        for attempt in range(self.config.max_retries):
-            try:
-                async with self.request_semaphore:
-                    # Directly await with timeout to avoid orphaned tasks
-                    await asyncio.wait_for(
-                        self.client.upsert(
-                            collection_name=collection_name,
-                            points=points,
-                            wait=True
-                        ),
-                        timeout=self.config.qdrant_timeout_s
-                    )
-                    logger.debug(f"Stored {len(points)} points in {collection_name}")
-                    return True
-                    
-            except asyncio.TimeoutError:
-                # Don't cancel - let it complete in background to avoid race condition
-                logger.warning(f"Timeout storing points (attempt {attempt + 1}/{self.config.max_retries})")
-                if attempt < self.config.max_retries - 1:
-                    await asyncio.sleep(self.config.retry_delay_s * (2 ** attempt))
-            except Exception as e:
-                logger.error(f"Error storing points: {e}")
-                if attempt < self.config.max_retries - 1:
-                    await asyncio.sleep(self.config.retry_delay_s)
+        # Create unique key for this batch to prevent duplicates
+        point_ids = tuple(p.id for p in points)
+        batch_key = (collection_name, point_ids)
         
-        return False
+        # Check if this batch is already being processed
+        if batch_key in self._inflight_upserts:
+            logger.warning(f"Skipping duplicate upsert for {len(points)} points in {collection_name}")
+            return False
+        
+        self._inflight_upserts.add(batch_key)
+        try:
+            for attempt in range(self.config.max_retries):
+                try:
+                    async with self.request_semaphore:
+                        # Shield upsert from cancellation to let it complete in background
+                        upsert_task = asyncio.create_task(
+                            self.client.upsert(
+                                collection_name=collection_name,
+                                points=points,
+                                wait=True
+                            )
+                        )
+                        await asyncio.wait_for(
+                            asyncio.shield(upsert_task),
+                            timeout=self.config.qdrant_timeout_s
+                        )
+                        logger.debug(f"Stored {len(points)} points in {collection_name}")
+                        return True
+                        
+                except asyncio.TimeoutError:
+                    # The operation continues in background due to shield
+                    logger.warning(f"Timeout storing points (attempt {attempt + 1}/{self.config.max_retries})")
+                    
+                    # Wait a bit to see if the background operation completes
+                    await asyncio.sleep(2)
+                    
+                    # Check if the task completed in the background
+                    if upsert_task.done():
+                        try:
+                            await upsert_task  # Get result or exception
+                            logger.info("Background upsert completed successfully")
+                            return True
+                        except Exception as e:
+                            logger.warning(f"Background upsert failed: {e}")
+                    
+                    if attempt < self.config.max_retries - 1:
+                        await asyncio.sleep(self.config.retry_delay_s * (2 ** attempt))
+                except Exception as e:
+                    logger.error(f"Error storing points: {e}")
+                    if attempt < self.config.max_retries - 1:
+                        await asyncio.sleep(self.config.retry_delay_s)
+            
+            return False
+        finally:
+            # Remove from inflight set
+            self._inflight_upserts.discard(batch_key)
     
     async def close(self):
         """Close client connection."""
@@ -626,19 +746,17 @@ class CPUMonitor:
         self.max_total_cpu = max_cpu_per_core * effective_cores
         logger.info(f"CPU Monitor: {effective_cores:.1f} effective cores, {self.max_total_cpu:.1f}% limit")
         
-        self.process.cpu_percent(interval=None)
-        time.sleep(0.01)
+        # Non-blocking initial CPU sampling
+        self.process.cpu_percent(interval=0.0)
         self.last_check = time.time()
-        self.last_cpu = self.process.cpu_percent(interval=None)
+        self.last_cpu = 0.0
     
     def get_cpu_nowait(self) -> float:
         """Get CPU without blocking."""
         now = time.time()
         if now - self.last_check > 1.0:
-            val = self.process.cpu_percent(interval=None)
-            if val == 0.0 and self.last_cpu == 0.0:
-                time.sleep(0.01)
-                val = self.process.cpu_percent(interval=None)
+            # Non-blocking CPU sampling
+            val = self.process.cpu_percent(interval=0.0)
             self.last_cpu = val
             self.last_check = now
         return self.last_cpu
@@ -797,7 +915,9 @@ class StreamingWatcher:
             "files_processed": 0,
             "chunks_processed": 0,
             "failures": 0,
-            "start_time": time.time()
+            "start_time": time.time(),
+            "code_patterns_extracted": 0,
+            "pattern_extraction_failures": 0
         }
         
         # Track file wait times for starvation prevention
@@ -1060,90 +1180,241 @@ class StreamingWatcher:
             
             concepts = extract_concepts(combined_text, tool_usage)
             
+            # Extract code patterns if available (AST-based analysis)
+            code_patterns = {}
+            if AST_EXTRACTION_AVAILABLE:
+                try:
+                    # Cap text size for pattern extraction (2MB max)
+                    text_for_patterns = combined_text[:2_000_000]
+                    
+                    # Offload CPU-bound AST extraction to thread executor with timeout
+                    loop = asyncio.get_running_loop()
+                    start_time = time.time()
+                    
+                    pattern_result = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None, 
+                            lambda: extract_code_patterns_with_fallback(text_for_patterns)
+                        ),
+                        timeout=5.0
+                    )
+                    
+                    code_patterns = pattern_result.get("code_patterns", {}) or {}
+                    
+                    # Add extraction metadata and update stats
+                    if code_patterns:
+                        elapsed = time.time() - start_time
+                        logger.debug(f"Extracted code patterns: {list(code_patterns.keys())} "
+                                   f"using {pattern_result.get('extraction_method', 'unknown')} "
+                                   f"in {elapsed:.2f}s")
+                        self.stats["code_patterns_extracted"] += 1
+                        
+                except asyncio.TimeoutError:
+                    logger.warning("Code pattern extraction timed out (5s)")
+                    self.stats["pattern_extraction_failures"] += 1
+                    code_patterns = {}
+                except Exception as e:
+                    logger.warning(f"Code pattern extraction failed: {e}")
+                    self.stats["pattern_extraction_failures"] += 1
+                    code_patterns = {}
+            
             # Now we know we have content, ensure collection exists
             await self.qdrant_service.ensure_collection(collection_name)
             
-            # Process chunks
+            # Process chunks with batching for efficiency
             chunks_processed = 0
             chunk_index = 0
+            had_errors = False  # Track if any batches failed
+            
+            # Batch configuration
+            BATCH_SIZE = max(1, min(self.config.batch_size, 8))  # Ensure at least 1
+            batch_texts = []
+            batch_indices = []
+            batch_points = []
             
             for chunk_text in self.chunker.chunk_text_stream(combined_text):
                 if self.shutdown_event.is_set():
                     return False
                 
-                # CPU throttling
-                if self.cpu_monitor.should_throttle():
-                    await asyncio.sleep(0.5)
-                
-                # Generate embedding
-                embeddings = None
-                for attempt in range(self.config.max_retries):
-                    try:
-                        embeddings = await self.embedding_provider.embed_documents([chunk_text])
-                        # Validate embedding dimensions
-                        if embeddings and len(embeddings[0]) != self.embedding_provider.vector_size:
-                            logger.error(f"Embedding dimension mismatch: got {len(embeddings[0])}, expected {self.embedding_provider.vector_size} for provider {self.embedding_provider.__class__.__name__}")
-                            self.stats["failures"] += 1
-                            embeddings = None  # Force retry
-                            continue  # Continue retrying, not break
-                        break
-                    except Exception as e:
-                        logger.warning(f"Embed failed (attempt {attempt+1}): {e}")
-                        if attempt < self.config.max_retries - 1:
-                            await asyncio.sleep(self.config.retry_delay_s * (2 ** attempt))
-                
-                if not embeddings:
-                    logger.error(f"Failed to embed chunk {chunk_index}")
-                    self.stats["failures"] += 1
-                    continue
-                
-                # Create payload
-                payload = {
-                    "text": chunk_text[:10000],
-                    "conversation_id": conversation_id,
-                    "chunk_index": chunk_index,
-                    "message_count": len(all_messages),
-                    "project": normalize_project_name(project_path),
-                    "timestamp": datetime.now().isoformat(),
-                    "total_length": len(chunk_text),
-                    "chunking_version": "v3",
-                    "concepts": concepts,
-                    "files_analyzed": tool_usage['files_analyzed'],
-                    "files_edited": tool_usage['files_edited'],
-                    "tools_used": tool_usage['tools_used']
-                }
-                
-                # Create point
-                point_id_str = hashlib.md5(
-                    f"{conversation_id}_{chunk_index}".encode()
-                ).hexdigest()[:16]
-                point_id = int(point_id_str, 16) % (2**63)
-                
-                point = models.PointStruct(
-                    id=point_id,
-                    vector=embeddings[0],
-                    payload=payload
-                )
-                
-                # Store
-                success = await self.qdrant_service.store_points_with_retry(
-                    collection_name,
-                    [point]
-                )
-                
-                if not success:
-                    logger.error(f"Failed to store chunk {chunk_index}")
-                    self.stats["failures"] += 1
-                else:
-                    chunks_processed += 1
-                
+                # Add to batch
+                batch_texts.append(chunk_text)
+                batch_indices.append(chunk_index)
                 chunk_index += 1
                 
-                # Memory check mid-file
-                if chunk_index % 10 == 0:
+                # Process batch when full or last chunk
+                should_process = len(batch_texts) >= BATCH_SIZE
+                
+                if should_process:
+                    # CPU throttling
+                    if self.cpu_monitor.should_throttle():
+                        await asyncio.sleep(0.5)
+                    
+                    # Batch embed
+                    embeddings = None
+                    for attempt in range(self.config.max_retries):
+                        try:
+                            embeddings = await self.embedding_provider.embed_documents(batch_texts)
+                            # Validate embedding dimensions
+                            if embeddings:
+                                for emb in embeddings:
+                                    if len(emb) != self.embedding_provider.vector_size:
+                                        logger.error(f"Embedding dimension mismatch: got {len(emb)}, expected {self.embedding_provider.vector_size}")
+                                        embeddings = None
+                                        break
+                            if embeddings:
+                                break
+                        except Exception as e:
+                            logger.warning(f"Batch embed failed (attempt {attempt+1}): {e}")
+                            if attempt < self.config.max_retries - 1:
+                                await asyncio.sleep(self.config.retry_delay_s * (2 ** attempt))
+                    
+                    if not embeddings:
+                        logger.error(f"Failed to embed batch starting at chunk {batch_indices[0]}")
+                        self.stats["failures"] += len(batch_texts)
+                        had_errors = True  # Mark that we had errors
+                        # Clear batch and continue
+                        batch_texts = []
+                        batch_indices = []
+                        continue
+                    
+                    # Create batch points
+                    for i, (text, idx, embedding) in enumerate(zip(batch_texts, batch_indices, embeddings)):
+                        # Sanitize paths for privacy
+                        sanitized_analyzed = sanitize_paths(tool_usage['files_analyzed'], project_path)
+                        sanitized_edited = sanitize_paths(tool_usage['files_edited'], project_path)
+                        
+                        # Create payload
+                        payload = {
+                            "text": text[:10000],
+                            "conversation_id": conversation_id,
+                            "chunk_index": idx,
+                            "message_count": len(all_messages),
+                            "project": normalize_project_name(project_path),
+                            "timestamp": datetime.now().isoformat(),
+                            "total_length": len(text),
+                            "chunking_version": "v3",
+                            "concepts": sorted(list(set(concepts)))[:15],  # Normalize concepts
+                            "files_analyzed": sanitized_analyzed,
+                            "files_edited": sanitized_edited,
+                            "tools_used": sorted(list(set(tool_usage['tools_used'])))[:20],  # Normalize tools
+                            "code_patterns": code_patterns  # AST-extracted patterns
+                        }
+                        
+                        # Create point
+                        point_id_str = hashlib.md5(
+                            f"{conversation_id}_{idx}".encode()
+                        ).hexdigest()[:16]
+                        point_id = int(point_id_str, 16) % (2**63)
+                        
+                        batch_points.append(models.PointStruct(
+                            id=point_id,
+                            vector=embedding,
+                            payload=payload
+                        ))
+                    
+                    # Batch store
+                    success = await self.qdrant_service.store_points_with_retry(
+                        collection_name,
+                        batch_points
+                    )
+                    
+                    if not success:
+                        logger.error(f"Failed to store batch of {len(batch_points)} points")
+                        self.stats["failures"] += len(batch_points)
+                        had_errors = True  # Mark that we had errors
+                    else:
+                        chunks_processed += len(batch_points)
+                    
+                    # Clear batch
+                    batch_texts = []
+                    batch_indices = []
+                    batch_points = []
+                    
+                    # Memory check after batch
                     should_cleanup, _ = self.memory_monitor.check_memory()
                     if should_cleanup:
                         await self.memory_monitor.cleanup()
+            
+            # Process remaining chunks in final batch
+            if batch_texts:
+                # CPU throttling for final batch
+                if self.cpu_monitor.should_throttle():
+                    await asyncio.sleep(0.5)
+                
+                # Process final batch with same logic as above
+                embeddings = None
+                for attempt in range(self.config.max_retries):
+                    try:
+                        embeddings = await self.embedding_provider.embed_documents(batch_texts)
+                        if embeddings:
+                            for emb in embeddings:
+                                if len(emb) != self.embedding_provider.vector_size:
+                                    logger.error(f"Final batch embedding dimension mismatch: got {len(emb)}, expected {self.embedding_provider.vector_size}")
+                                    embeddings = None
+                                    break
+                        if embeddings:
+                            break
+                    except Exception as e:
+                        logger.warning(f"Final batch embed failed: {e}")
+                        if attempt < self.config.max_retries - 1:
+                            await asyncio.sleep(self.config.retry_delay_s * (2 ** attempt))
+                
+                if embeddings:
+                    # Create final batch points
+                    for text, idx, embedding in zip(batch_texts, batch_indices, embeddings):
+                        # Sanitize paths for privacy
+                        sanitized_analyzed = sanitize_paths(tool_usage['files_analyzed'], project_path)
+                        sanitized_edited = sanitize_paths(tool_usage['files_edited'], project_path)
+                        
+                        payload = {
+                            "text": text[:10000],
+                            "conversation_id": conversation_id,
+                            "chunk_index": idx,
+                            "message_count": len(all_messages),
+                            "project": normalize_project_name(project_path),
+                            "timestamp": datetime.now().isoformat(),
+                            "total_length": len(text),
+                            "chunking_version": "v3",
+                            "concepts": sorted(list(set(concepts)))[:15],
+                            "files_analyzed": sanitized_analyzed,
+                            "files_edited": sanitized_edited,
+                            "tools_used": sorted(list(set(tool_usage['tools_used'])))[:20],
+                            "code_patterns": code_patterns
+                        }
+                        
+                        point_id_str = hashlib.md5(f"{conversation_id}_{idx}".encode()).hexdigest()[:16]
+                        point_id = int(point_id_str, 16) % (2**63)
+                        
+                        batch_points.append(models.PointStruct(
+                            id=point_id,
+                            vector=embedding,
+                            payload=payload
+                        ))
+                    
+                    # Store final batch
+                    success = await self.qdrant_service.store_points_with_retry(
+                        collection_name,
+                        batch_points
+                    )
+                    
+                    if success:
+                        chunks_processed += len(batch_points)
+                    else:
+                        logger.error(f"Failed to store final batch of {len(batch_points)} points")
+                        self.stats["failures"] += len(batch_points)
+                        had_errors = True
+                else:
+                    logger.error("Final batch embed failed after retries")
+                    self.stats["failures"] += len(batch_texts)
+                    had_errors = True
+                    should_cleanup, _ = self.memory_monitor.check_memory()
+                    if should_cleanup:
+                        await self.memory_monitor.cleanup()
+            
+            # Only update state if all batches succeeded
+            if had_errors:
+                logger.warning(f"Deferring state update for {file_path} due to batch failures (stored {chunks_processed} chunks)")
+                return False
             
             # Update state - use full path as key
             self.state["imported_files"][str(file_path)] = {
@@ -1396,6 +1667,13 @@ class StreamingWatcher:
             logger.info(f"Files processed: {self.stats['files_processed']}")
             logger.info(f"Chunks processed: {self.stats['chunks_processed']}")
             logger.info(f"Failures: {self.stats['failures']}")
+            
+            # Report code pattern extraction stats if available
+            if AST_EXTRACTION_AVAILABLE:
+                logger.info(f"Code patterns extracted: {self.stats['code_patterns_extracted']}")
+                if self.stats['pattern_extraction_failures'] > 0:
+                    logger.info(f"Pattern extraction failures: {self.stats['pattern_extraction_failures']}")
+            
             logger.info(f"Memory cleanups: {self.memory_monitor.cleanup_count}")
             logger.info(f"Peak memory: {self.memory_monitor.peak_memory:.1f}MB")
             logger.info("=" * 60)

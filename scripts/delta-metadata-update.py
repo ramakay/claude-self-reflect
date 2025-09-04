@@ -2,7 +2,7 @@
 """
 Delta metadata update script for Claude Self-Reflect.
 Updates existing Qdrant points with tool usage metadata without re-importing vectors.
-This allows us to enhance past conversations with file tracking and concept extraction.
+This allows us to enhance past conversations with file tracking, concept extraction, and AST patterns.
 """
 
 import os
@@ -18,6 +18,15 @@ from pathlib import Path
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+# Import AST pattern extractor if available
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from ast_pattern_extractor import extract_code_patterns_with_fallback
+    AST_EXTRACTION_AVAILABLE = True
+except ImportError:
+    AST_EXTRACTION_AVAILABLE = False
+    print("Warning: AST pattern extraction not available")
 
 # Configuration
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -407,6 +416,25 @@ def process_conversation(jsonl_file: Path, state: Dict[str, Any]) -> bool:
         # Extract concepts
         concepts = extract_concepts(conversation_text[:10000], tool_usage)  # Limit text for concept extraction
         
+        # Extract AST patterns if available
+        code_patterns = {}
+        code_metrics = {}
+        if AST_EXTRACTION_AVAILABLE:
+            try:
+                logger.info(f"  Extracting AST patterns...")
+                ast_result = extract_code_patterns_with_fallback(conversation_text)
+                code_patterns = ast_result.get("code_patterns", {})
+                code_metrics = ast_result.get("code_metrics", {})
+                
+                if code_patterns:
+                    logger.info(f"  Found patterns in {len(code_patterns)} categories")
+                if code_metrics and code_metrics.get("total_loc", 0) > 0:
+                    logger.info(f"  Code metrics: {code_metrics.get('total_loc')} LoC, "
+                              f"{code_metrics.get('total_functions')} functions, "
+                              f"{code_metrics.get('total_classes')} classes")
+            except Exception as e:
+                logger.warning(f"  AST extraction failed: {e}")
+        
         # Prepare metadata update
         files_analyzed = list(set([
             item['path'] if isinstance(item, dict) else item
@@ -431,6 +459,14 @@ def process_conversation(jsonl_file: Path, state: Dict[str, Any]) -> bool:
             "has_file_metadata": True,  # Flag to indicate this has been enhanced
             "metadata_updated_at": datetime.now().isoformat()
         }
+        
+        # Add AST patterns and metrics if available and non-empty
+        # Only add code_patterns if there are actual patterns with non-zero counts
+        if code_patterns and any(v for v in code_patterns.values() if v):
+            metadata_update["code_patterns"] = code_patterns
+        # Only add code_metrics if there's actual code (LoC > 0)
+        if code_metrics and code_metrics.get("total_loc", 0) > 0:
+            metadata_update["code_metrics"] = code_metrics
         
         # Determine collection name
         project_hash = hashlib.md5(normalize_project_name(project_name).encode()).hexdigest()[:8]
