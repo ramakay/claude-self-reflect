@@ -306,7 +306,7 @@ async function configureClaude() {
   const isDockerMode = process.env.USE_DOCKER_MCP === 'true';
   const mcpScript = isDockerMode 
     ? join(projectRoot, 'mcp-server', 'run-mcp-docker.sh')
-    : join(projectRoot, 'mcp-server', 'run-mcp-clean.sh');
+    : join(projectRoot, 'mcp-server', 'run-mcp.sh');
   
   if (isDockerMode) {
     // Create a script that runs the MCP server in Docker
