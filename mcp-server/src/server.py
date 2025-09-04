@@ -10,6 +10,7 @@ import numpy as np
 import hashlib
 import time
 import logging
+from xml.sax.saxutils import escape
 
 from fastmcp import FastMCP, Context
 from .utils import normalize_project_name
@@ -47,6 +48,20 @@ QDRANT_URL = os.getenv('QDRANT_URL', 'http://localhost:6333')
 VOYAGE_API_KEY = os.getenv('VOYAGE_KEY') or os.getenv('VOYAGE_KEY-2') or os.getenv('VOYAGE_KEY_2')
 ENABLE_MEMORY_DECAY = os.getenv('ENABLE_MEMORY_DECAY', 'false').lower() == 'true'
 DECAY_WEIGHT = float(os.getenv('DECAY_WEIGHT', '0.3'))
+
+# Setup file logging
+LOG_FILE = Path.home() / '.claude-self-reflect' / 'logs' / 'mcp-server.log'
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+# Configure logging to both file and console
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE, mode='a'),
+        logging.StreamHandler()
+    ]
+)
 DECAY_SCALE_DAYS = float(os.getenv('DECAY_SCALE_DAYS', '90'))
 USE_NATIVE_DECAY = os.getenv('USE_NATIVE_DECAY', 'false').lower() == 'true'
 
@@ -101,7 +116,7 @@ print(f"[DEBUG] env_path: {env_path}", file=sys.stderr)
 
 
 class SearchResult(BaseModel):
-    """A single search result."""
+    """A single search result with pattern intelligence."""
     id: str
     score: float
     timestamp: str
@@ -112,6 +127,11 @@ class SearchResult(BaseModel):
     base_conversation_id: Optional[str] = None
     collection_name: str
     raw_payload: Optional[Dict[str, Any]] = None  # Full Qdrant payload when debug mode enabled
+    # Pattern intelligence fields
+    code_patterns: Optional[Dict[str, List[str]]] = None  # Extracted AST patterns
+    files_analyzed: Optional[List[str]] = None  # Files referenced in conversation
+    tools_used: Optional[List[str]] = None  # Tools/commands used
+    concepts: Optional[List[str]] = None  # Domain concepts discussed
 
 
 # Initialize FastMCP instance
@@ -138,6 +158,8 @@ _indexing_cache = {"result": None, "timestamp": 0}
 
 # Setup logger
 logger = logging.getLogger(__name__)
+logger.info(f"MCP Server starting - Log file: {LOG_FILE}")
+logger.info(f"Configuration: QDRANT_URL={QDRANT_URL}, DECAY={ENABLE_MEMORY_DECAY}, VOYAGE_KEY={'Set' if VOYAGE_API_KEY else 'Not Set'}")
 
 def normalize_path(path_str: str) -> str:
     """Normalize path for consistent comparison across platforms.
@@ -378,6 +400,86 @@ def get_collection_suffix() -> str:
         return "_local"
     else:
         return "_voyage"
+
+def aggregate_pattern_intelligence(results: List[SearchResult]) -> Dict[str, Any]:
+    """Aggregate pattern intelligence across search results."""
+    
+    # Initialize counters
+    all_patterns = {}
+    all_files = set()
+    all_tools = set()
+    all_concepts = set()
+    pattern_by_category = {}
+    
+    for result in results:
+        # Aggregate code patterns
+        if result.code_patterns:
+            for category, patterns in result.code_patterns.items():
+                if category not in pattern_by_category:
+                    pattern_by_category[category] = {}
+                for pattern in patterns:
+                    if pattern not in pattern_by_category[category]:
+                        pattern_by_category[category][pattern] = 0
+                    pattern_by_category[category][pattern] += 1
+                    
+                    # Overall pattern count
+                    if pattern not in all_patterns:
+                        all_patterns[pattern] = 0
+                    all_patterns[pattern] += 1
+        
+        # Aggregate files
+        if result.files_analyzed:
+            all_files.update(result.files_analyzed)
+        
+        # Aggregate tools
+        if result.tools_used:
+            all_tools.update(result.tools_used)
+        
+        # Aggregate concepts
+        if result.concepts:
+            all_concepts.update(result.concepts)
+    
+    # Find most common patterns
+    sorted_patterns = sorted(all_patterns.items(), key=lambda x: x[1], reverse=True)
+    most_common_patterns = sorted_patterns[:10] if sorted_patterns else []
+    
+    # Find pattern categories with most coverage
+    category_coverage = {
+        cat: sum(counts.values()) 
+        for cat, counts in pattern_by_category.items()
+    }
+    
+    # Build intelligence summary
+    intelligence = {
+        "total_unique_patterns": len(all_patterns),
+        "most_common_patterns": most_common_patterns,
+        "pattern_categories": list(pattern_by_category.keys()),
+        "category_coverage": category_coverage,
+        "files_referenced": list(all_files)[:20],  # Limit to top 20
+        "tools_used": list(all_tools),
+        "concepts_discussed": list(all_concepts)[:15],  # Limit to top 15
+        "pattern_by_category": pattern_by_category,
+        "pattern_diversity_score": len(all_patterns) / max(len(results), 1)  # Patterns per result
+    }
+    
+    # Add cross-pattern insights
+    if pattern_by_category:
+        # Check for common pattern combinations
+        async_error_combo = (
+            'async_patterns' in pattern_by_category and 
+            'error_handling' in pattern_by_category
+        )
+        react_state_combo = (
+            'react_hooks' in pattern_by_category and
+            any('useState' in p for p in pattern_by_category.get('react_hooks', {}).keys())
+        )
+        
+        intelligence["pattern_combinations"] = {
+            "async_with_error_handling": async_error_combo,
+            "react_with_state": react_state_combo
+        }
+    
+    return intelligence
     
 # Register tools
 @mcp.tool()
@@ -393,6 +495,8 @@ async def reflect_on_past(
     brief: bool = Field(default=False, description="Brief mode: returns minimal information for faster response")
 ) -> str:
     """Search for relevant past conversations using semantic search with optional time decay."""
+    
+    logger.info(f"=== SEARCH START === Query: '{query}', Project: '{project}', Limit: {limit}")
     
     # Start timing
     start_time = time.time()
@@ -537,6 +641,7 @@ async def reflect_on_past(
                         continue
                 
                 query_embedding = query_embeddings[embedding_type_for_collection]
+                
                 if should_use_decay and USE_NATIVE_DECAY and NATIVE_DECAY_AVAILABLE:
                     # Use native Qdrant decay with newer API
                     await ctx.debug(f"Using NATIVE Qdrant decay (new API) for {collection_name}")
@@ -642,20 +747,37 @@ async def reflect_on_past(
                         if target_project != 'all' and not project_collections and not is_reflection_collection:
                             # The stored project name is like "-Users-username-projects-ShopifyMCPMockShop"
                             # We want to match just "ShopifyMCPMockShop"
-                            if not point_project.endswith(f"-{target_project}") and point_project != target_project:
+                            # Also handle underscore/dash variations (procsolve-website vs procsolve_website)
+                            normalized_target = target_project.replace('-', '_')
+                            normalized_stored = point_project.replace('-', '_')
+                            if not (normalized_stored.endswith(f"_{normalized_target}") or 
+                                    normalized_stored == normalized_target or
+                                    point_project.endswith(f"-{target_project}") or 
+                                    point_project == target_project):
                                 continue  # Skip results from other projects
                         
                         # For reflections with project context, optionally filter by project
                         if is_reflection_collection and target_project != 'all' and 'project' in point.payload:
                             # Only filter if the reflection has project metadata
                             reflection_project = point.payload.get('project', '')
-                            if reflection_project and not (
-                                reflection_project == target_project or 
-                                reflection_project.endswith(f"/{target_project}") or
-                                reflection_project.endswith(f"-{target_project}")
-                            ):
-                                continue  # Skip reflections from other projects
+                            if reflection_project:
+                                # Normalize both for comparison (handle underscore/dash variations)
+                                normalized_target = target_project.replace('-', '_')
+                                normalized_reflection = reflection_project.replace('-', '_')
+                                if not (
+                                    reflection_project == target_project or 
+                                    normalized_reflection == normalized_target or
+                                    reflection_project.endswith(f"/{target_project}") or
+                                    reflection_project.endswith(f"-{target_project}") or
+                                    normalized_reflection.endswith(f"_{normalized_target}") or
+                                    normalized_reflection.endswith(f"/{normalized_target}")
+                                ):
+                                    continue  # Skip reflections from other projects
                             
+                        # Log pattern data
+                        patterns = point.payload.get('code_patterns')
+                        logger.info(f"DEBUG: Creating SearchResult for point {point.id} from {collection_name}: has_patterns={bool(patterns)}, pattern_keys={list(patterns.keys()) if patterns else None}")
+                        
                         all_results.append(SearchResult(
                             id=str(point.id),
                             score=point.score,  # Score already includes decay
@@ -666,7 +788,12 @@ async def reflect_on_past(
                             conversation_id=point.payload.get('conversation_id'),
                             base_conversation_id=point.payload.get('base_conversation_id'),
                             collection_name=collection_name,
-                            raw_payload=point.payload if include_raw else None
+                            raw_payload=point.payload,  # Always include payload for metadata extraction
+                            # Pattern intelligence metadata
+                            code_patterns=point.payload.get('code_patterns'),
+                            files_analyzed=point.payload.get('files_analyzed'),
+                            tools_used=list(point.payload.get('tools_used', [])) if isinstance(point.payload.get('tools_used'), set) else point.payload.get('tools_used'),
+                            concepts=point.payload.get('concepts')
                         ))
                     
                 elif should_use_decay:
@@ -736,19 +863,32 @@ async def reflect_on_past(
                         if target_project != 'all' and not project_collections and not is_reflection_collection:
                             # The stored project name is like "-Users-username-projects-ShopifyMCPMockShop"
                             # We want to match just "ShopifyMCPMockShop"
-                            if not point_project.endswith(f"-{target_project}") and point_project != target_project:
+                            # Also handle underscore/dash variations (procsolve-website vs procsolve_website)
+                            normalized_target = target_project.replace('-', '_')
+                            normalized_stored = point_project.replace('-', '_')
+                            if not (normalized_stored.endswith(f"_{normalized_target}") or 
+                                    normalized_stored == normalized_target or
+                                    point_project.endswith(f"-{target_project}") or 
+                                    point_project == target_project):
                                 continue  # Skip results from other projects
                         
                         # For reflections with project context, optionally filter by project
                         if is_reflection_collection and target_project != 'all' and 'project' in point.payload:
                             # Only filter if the reflection has project metadata
                             reflection_project = point.payload.get('project', '')
-                            if reflection_project and not (
-                                reflection_project == target_project or 
-                                reflection_project.endswith(f"/{target_project}") or
-                                reflection_project.endswith(f"-{target_project}")
-                            ):
-                                continue  # Skip reflections from other projects
+                            if reflection_project:
+                                # Normalize both for comparison (handle underscore/dash variations)
+                                normalized_target = target_project.replace('-', '_')
+                                normalized_reflection = reflection_project.replace('-', '_')
+                                if not (
+                                    reflection_project == target_project or 
+                                    normalized_reflection == normalized_target or
+                                    reflection_project.endswith(f"/{target_project}") or
+                                    reflection_project.endswith(f"-{target_project}") or
+                                    normalized_reflection.endswith(f"_{normalized_target}") or
+                                    normalized_reflection.endswith(f"/{normalized_target}")
+                                ):
+                                    continue  # Skip reflections from other projects
                             
                         all_results.append(SearchResult(
                             id=str(point.id),
@@ -760,7 +900,12 @@ async def reflect_on_past(
                             conversation_id=point.payload.get('conversation_id'),
                             base_conversation_id=point.payload.get('base_conversation_id'),
                             collection_name=collection_name,
-                            raw_payload=point.payload if include_raw else None
+                            raw_payload=point.payload,  # Always include payload for metadata extraction
+                            # Pattern intelligence metadata
+                            code_patterns=point.payload.get('code_patterns'),
+                            files_analyzed=point.payload.get('files_analyzed'),
+                            tools_used=list(point.payload.get('tools_used', [])) if isinstance(point.payload.get('tools_used'), set) else point.payload.get('tools_used'),
+                            concepts=point.payload.get('concepts')
                         ))
                 else:
                     # Standard search without decay
@@ -787,19 +932,32 @@ async def reflect_on_past(
                         if target_project != 'all' and not project_collections and not is_reflection_collection:
                             # The stored project name is like "-Users-username-projects-ShopifyMCPMockShop"
                             # We want to match just "ShopifyMCPMockShop"
-                            if not point_project.endswith(f"-{target_project}") and point_project != target_project:
+                            # Also handle underscore/dash variations (procsolve-website vs procsolve_website)
+                            normalized_target = target_project.replace('-', '_')
+                            normalized_stored = point_project.replace('-', '_')
+                            if not (normalized_stored.endswith(f"_{normalized_target}") or 
+                                    normalized_stored == normalized_target or
+                                    point_project.endswith(f"-{target_project}") or 
+                                    point_project == target_project):
                                 continue  # Skip results from other projects
                         
                         # For reflections with project context, optionally filter by project
                         if is_reflection_collection and target_project != 'all' and 'project' in point.payload:
                             # Only filter if the reflection has project metadata
                             reflection_project = point.payload.get('project', '')
-                            if reflection_project and not (
-                                reflection_project == target_project or 
-                                reflection_project.endswith(f"/{target_project}") or
-                                reflection_project.endswith(f"-{target_project}")
-                            ):
-                                continue  # Skip reflections from other projects
+                            if reflection_project:
+                                # Normalize both for comparison (handle underscore/dash variations)
+                                normalized_target = target_project.replace('-', '_')
+                                normalized_reflection = reflection_project.replace('-', '_')
+                                if not (
+                                    reflection_project == target_project or 
+                                    normalized_reflection == normalized_target or
+                                    reflection_project.endswith(f"/{target_project}") or
+                                    reflection_project.endswith(f"-{target_project}") or
+                                    normalized_reflection.endswith(f"_{normalized_target}") or
+                                    normalized_reflection.endswith(f"/{normalized_target}")
+                                ):
+                                    continue  # Skip reflections from other projects
                         
                         # BOOST V2 CHUNKS: Apply score boost for v2 chunks (better quality)
                         original_score = point.score
@@ -816,7 +974,7 @@ async def reflect_on_past(
                         if final_score < min_score:
                             continue
                             
-                        all_results.append(SearchResult(
+                        search_result = SearchResult(
                             id=str(point.id),
                             score=final_score,
                             timestamp=clean_timestamp,
@@ -826,8 +984,15 @@ async def reflect_on_past(
                             conversation_id=point.payload.get('conversation_id'),
                             base_conversation_id=point.payload.get('base_conversation_id'),
                             collection_name=collection_name,
-                            raw_payload=point.payload if include_raw else None
-                        ))
+                            raw_payload=point.payload,  # Always include payload for metadata extraction
+                            # Pattern intelligence metadata
+                            code_patterns=point.payload.get('code_patterns'),
+                            files_analyzed=point.payload.get('files_analyzed'),
+                            tools_used=list(point.payload.get('tools_used', [])) if isinstance(point.payload.get('tools_used'), set) else point.payload.get('tools_used'),
+                            concepts=point.payload.get('concepts')
+                        )
+                        
+                        all_results.append(search_result)
             
             except Exception as e:
                 await ctx.debug(f"Error searching {collection_name}: {str(e)}")
@@ -875,8 +1040,15 @@ async def reflect_on_past(
         all_results = all_results[:limit]
         timing_info['sort_end'] = time.time()
         
+        logger.info(f"Total results: {len(all_results)}, Returning: {len(all_results[:limit])}")
+        for r in all_results[:3]:  # Log first 3
+            logger.debug(f"Result: id={r.id}, has_patterns={bool(r.code_patterns)}, pattern_keys={list(r.code_patterns.keys()) if r.code_patterns else None}")
+        
         if not all_results:
             return f"No conversations found matching '{query}'. Try different keywords or check if conversations have been imported."
+        
+        # Aggregate pattern intelligence across results
+        pattern_intelligence = aggregate_pattern_intelligence(all_results)
         
         # Update indexing status before returning results
         await update_indexing_status()
@@ -1031,8 +1203,181 @@ async def reflect_on_past(
                     result_text += "        </meta>\n"
                     result_text += "      </raw>\n"
                 
+                # Add patterns if they exist - with detailed logging
+                if result.code_patterns and isinstance(result.code_patterns, dict):
+                    logger.info(f"DEBUG: Point {result.id} has code_patterns dict with keys: {list(result.code_patterns.keys())}")
+                    patterns_to_show = []
+                    for category, patterns in result.code_patterns.items():
+                        if patterns and isinstance(patterns, list) and len(patterns) > 0:
+                            # Take up to 5 patterns from each category
+                            patterns_to_show.append((category, patterns[:5]))
+                            logger.info(f"DEBUG: Added category '{category}' with {len(patterns)} patterns")
+                    
+                    if patterns_to_show:
+                        logger.info(f"DEBUG: Adding patterns XML for point {result.id}")
+                        result_text += "      <patterns>\n"
+                        for category, patterns in patterns_to_show:
+                            # Escape both category name and pattern content for XML safety
+                            safe_patterns = ', '.join(escape(str(p)) for p in patterns)
+                            result_text += f"        <cat name=\"{escape(category)}\">{safe_patterns}</cat>\n"
+                        result_text += "      </patterns>\n"
+                    else:
+                        logger.info(f"DEBUG: Point {result.id} has code_patterns but no valid patterns to show")
+                else:
+                    logger.info(f"DEBUG: Point {result.id} has no patterns. code_patterns={result.code_patterns}, type={type(result.code_patterns)}")
+                
+                if result.files_analyzed and len(result.files_analyzed) > 0:
+                    result_text += f"      <files>{', '.join(result.files_analyzed[:5])}</files>\n"
+                if result.concepts and len(result.concepts) > 0:
+                    result_text += f"      <concepts>{', '.join(result.concepts[:5])}</concepts>\n"
+                
+                # Include structured metadata for agent consumption
+                # This provides clean, parsed fields that agents can easily use
+                if hasattr(result, 'raw_payload') and result.raw_payload:
+                    import json
+                    payload = result.raw_payload
+                    
+                    # Files section - structured for easy agent parsing
+                    files_analyzed = payload.get('files_analyzed', [])
+                    files_edited = payload.get('files_edited', [])
+                    if files_analyzed or files_edited:
+                        result_text += "      <files>\n"
+                        if files_analyzed:
+                            result_text += f"        <analyzed count=\"{len(files_analyzed)}\">"
+                            result_text += ", ".join(files_analyzed[:5])  # First 5 files
+                            if len(files_analyzed) > 5:
+                                result_text += f" ... and {len(files_analyzed)-5} more"
+                            result_text += "</analyzed>\n"
+                        if files_edited:
+                            result_text += f"        <edited count=\"{len(files_edited)}\">"
+                            result_text += ", ".join(files_edited[:5])  # First 5 files
+                            if len(files_edited) > 5:
+                                result_text += f" ... and {len(files_edited)-5} more"
+                            result_text += "</edited>\n"
+                        result_text += "      </files>\n"
+                    
+                    # Concepts section - clean list for agents
+                    concepts = payload.get('concepts', [])
+                    if concepts:
+                        result_text += f"      <concepts>{', '.join(concepts)}</concepts>\n"
+                    
+                    # Tools section - summarized with counts
+                    tools_used = payload.get('tools_used', [])
+                    if tools_used:
+                        # Count tool usage
+                        tool_counts = {}
+                        for tool in tools_used:
+                            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+                        # Sort by frequency
+                        sorted_tools = sorted(tool_counts.items(), key=lambda x: x[1], reverse=True)
+                        tool_summary = ", ".join(f"{tool}({count})" for tool, count in sorted_tools[:5])
+                        if len(sorted_tools) > 5:
+                            tool_summary += f" ... and {len(sorted_tools)-5} more"
+                        result_text += f"      <tools>{tool_summary}</tools>\n"
+                    
+                    # Code patterns section - structured by category
+                    code_patterns = payload.get('code_patterns', {})
+                    if code_patterns:
+                        result_text += "      <code_patterns>\n"
+                        for category, patterns in code_patterns.items():
+                            if patterns:
+                                pattern_list = patterns if isinstance(patterns, list) else [patterns]
+                                # Clean up pattern names
+                                clean_patterns = []
+                                for p in pattern_list[:5]:
+                                    # Remove common prefixes like $FUNC, $VAR
+                                    clean_p = str(p).replace('$FUNC', '').replace('$VAR', '').strip()
+                                    if clean_p:
+                                        clean_patterns.append(clean_p)
+                                if clean_patterns:
+                                    result_text += f"        <{category}>{', '.join(clean_patterns)}</{category}>\n"
+                        result_text += "      </code_patterns>\n"
+                    
+                    # Pattern inheritance info - shows propagation details
+                    pattern_inheritance = payload.get('pattern_inheritance', {})
+                    if pattern_inheritance:
+                        source_chunk = pattern_inheritance.get('source_chunk', '')
+                        confidence = pattern_inheritance.get('confidence', 0)
+                        distance = pattern_inheritance.get('distance', 0)
+                        if source_chunk:
+                            result_text += f"      <pattern_source chunk=\"{source_chunk}\" confidence=\"{confidence:.2f}\" distance=\"{distance}\"/>\n"
+                    
+                    # Message stats for context
+                    msg_count = payload.get('message_count')
+                    total_length = payload.get('total_length')
+                    if msg_count or total_length:
+                        stats_attrs = []
+                        if msg_count:
+                            stats_attrs.append(f'messages="{msg_count}"')
+                        if total_length:
+                            stats_attrs.append(f'length="{total_length}"')
+                        result_text += f"      <stats {' '.join(stats_attrs)}/>\n"
+                    
+                    # Raw metadata dump for backwards compatibility
+                    # Kept minimal - only truly unique fields
+                    remaining_metadata = {}
+                    excluded_keys = {'text', 'conversation_id', 'timestamp', 'role', 'project', 'chunk_index',
+                                   'files_analyzed', 'files_edited', 'concepts', 'tools_used', 
+                                   'code_patterns', 'pattern_inheritance', 'message_count', 'total_length',
+                                   'chunking_version', 'chunk_method', 'chunk_overlap', 'migration_type'}
+                    for key, value in payload.items():
+                        if key not in excluded_keys and value is not None:
+                            if isinstance(value, set):
+                                value = list(value)
+                            remaining_metadata[key] = value
+                    
+                    if remaining_metadata:
+                        try:
+                            # Only include if there's actually extra data
+                            result_text += f"      <metadata_extra><![CDATA[{json.dumps(remaining_metadata, default=str)}]]></metadata_extra>\n"
+                        except:
+                            pass
+                
                 result_text += "    </r>\n"
             result_text += "  </results>\n"
+            
+            # Add aggregated pattern intelligence section
+            if pattern_intelligence and pattern_intelligence.get('total_unique_patterns', 0) > 0:
+                result_text += "  <pattern_intelligence>\n"
+                
+                # Summary statistics
+                result_text += f"    <summary>\n"
+                result_text += f"      <unique_patterns>{pattern_intelligence['total_unique_patterns']}</unique_patterns>\n"
+                result_text += f"      <pattern_diversity>{pattern_intelligence['pattern_diversity_score']:.2f}</pattern_diversity>\n"
+                result_text += f"    </summary>\n"
+                
+                # Most common patterns
+                if pattern_intelligence.get('most_common_patterns'):
+                    result_text += "    <common_patterns>\n"
+                    for pattern, count in pattern_intelligence['most_common_patterns'][:5]:
+                        result_text += f"      <pattern count=\"{count}\">{pattern}</pattern>\n"
+                    result_text += "    </common_patterns>\n"
+                
+                # Pattern categories
+                if pattern_intelligence.get('category_coverage'):
+                    result_text += "    <categories>\n"
+                    for category, count in pattern_intelligence['category_coverage'].items():
+                        result_text += f"      <cat name=\"{category}\" count=\"{count}\"/>\n"
+                    result_text += "    </categories>\n"
+                
+                # Pattern combinations insight
+                if pattern_intelligence.get('pattern_combinations'):
+                    combos = pattern_intelligence['pattern_combinations']
+                    if combos.get('async_with_error_handling'):
+                        result_text += "    <insight>Async patterns combined with error handling detected</insight>\n"
+                    if combos.get('react_with_state'):
+                        result_text += "    <insight>React hooks with state management patterns detected</insight>\n"
+                
+                # Files referenced across results
+                if pattern_intelligence.get('files_referenced') and len(pattern_intelligence['files_referenced']) > 0:
+                    result_text += f"    <files_across_results>{', '.join(pattern_intelligence['files_referenced'][:10])}</files_across_results>\n"
+                
+                # Concepts discussed
+                if pattern_intelligence.get('concepts_discussed') and len(pattern_intelligence['concepts_discussed']) > 0:
+                    result_text += f"    <concepts_discussed>{', '.join(pattern_intelligence['concepts_discussed'][:10])}</concepts_discussed>\n"
+                
+                result_text += "  </pattern_intelligence>\n"
+            
             result_text += "</search>"
             
         else:
@@ -1503,6 +1848,93 @@ async def search_by_concept(
 
 # Debug output
 print(f"[DEBUG] FastMCP server created with name: {mcp.name}")
+
+@mcp.tool()
+async def get_full_conversation(
+    ctx: Context,
+    conversation_id: str = Field(description="The conversation ID from search results (cid)"),
+    project: Optional[str] = Field(default=None, description="Optional project name to help locate the file")
+) -> str:
+    """Get the full JSONL conversation file path for a conversation ID.
+    This allows agents to read complete conversations instead of truncated excerpts."""
+    
+    # Base path for Claude conversations
+    base_path = Path.home() / '.claude/projects'
+    
+    # Build list of directories to search
+    search_dirs = []
+    
+    if project:
+        # Try various project directory name formats
+        sanitized_project = project.replace('/', '-')
+        search_dirs.extend([
+            base_path / project,
+            base_path / sanitized_project,
+            base_path / f"-Users-ramakrishnanannaswamy-projects-{project}",
+            base_path / f"-Users-ramakrishnanannaswamy-projects-{sanitized_project}"
+        ])
+    else:
+        # Search all project directories
+        search_dirs = list(base_path.glob("*"))
+    
+    # Search for the JSONL file
+    jsonl_path = None
+    for search_dir in search_dirs:
+        if not search_dir.is_dir():
+            continue
+            
+        potential_path = search_dir / f"{conversation_id}.jsonl"
+        if potential_path.exists():
+            jsonl_path = potential_path
+            break
+    
+    if not jsonl_path:
+        # Try searching all directories as fallback
+        for proj_dir in base_path.glob("*"):
+            if proj_dir.is_dir():
+                potential_path = proj_dir / f"{conversation_id}.jsonl"
+                if potential_path.exists():
+                    jsonl_path = potential_path
+                    break
+    
+    if not jsonl_path:
+        return f"""<full_conversation>
+<conversation_id>{conversation_id}</conversation_id>
+<status>not_found</status>
+<message>Conversation file not found. Searched {len(search_dirs)} directories.</message>
+<hint>Try using the project parameter or check if the conversation ID is correct.</hint>
+</full_conversation>"""
+    
+    # Get file stats
+    file_stats = jsonl_path.stat()
+    
+    # Count messages
+    try:
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            message_count = sum(1 for _ in f)
+    except:
+        message_count = 0
+    
+    return f"""<full_conversation>
+<conversation_id>{conversation_id}</conversation_id>
+<status>found</status>
+<file_path>{jsonl_path}</file_path>
+<file_size>{file_stats.st_size}</file_size>
+<message_count>{message_count}</message_count>
+<project>{jsonl_path.parent.name}</project>
+<instructions>
+You can now use the Read tool to read the full conversation from:
+{jsonl_path}
+
+Each line in the JSONL file is a separate message with complete content.
+This gives you access to:
+- Complete code blocks (not truncated)
+- Full problem descriptions and solutions
+- Entire debugging sessions
+- Complete architectural decisions and discussions
+</instructions>
+</full_conversation>"""
+
 
 # Run the server
 if __name__ == "__main__":
