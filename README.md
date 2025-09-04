@@ -24,22 +24,22 @@
 
 Give Claude perfect memory of all your conversations. Search past discussions instantly. Never lose context again.
 
-**🔒 100% Local by Default** • **⚡ Blazing Fast Search** • **🚀 Zero Configuration** • **🏭 Production Ready**
+**100% Local by Default** • **Blazing Fast Search** • **Zero Configuration** • **Production Ready**
 
-## 📑 Table of Contents
+## Table of Contents
 
-- [🚀 Quick Install](#-quick-install)
-- [✨ The Magic](#-the-magic)
-- [📊 Before & After](#-before--after)
-- [💬 Real Examples](#-real-examples)
-- [🆕 NEW: Real-time Indexing Status](#-new-real-time-indexing-status-in-your-terminal)
-- [🎯 Key Features](#-key-features)
-- [🏗️ Architecture](#️-architecture)
-- [🛠️ Requirements](#️-requirements)
-- [📖 Documentation](#-documentation)
-- [📦 What's New](#-whats-new)
-- [🔧 Troubleshooting](#-troubleshooting)
-- [👥 Contributors](#-contributors)
+- [Quick Install](#-quick-install)
+- [The Magic](#the-magic)
+- [Before & After](#before--after)
+- [Real Examples](#real-examples)
+- [NEW: Real-time Indexing Status](#new-real-time-indexing-status-in-your-terminal)
+- [Key Features](#key-features)
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Documentation](#documentation)
+- [What's New](#whats-new)
+- [Troubleshooting](#troubleshooting)
+- [Contributors](#contributors)
 
 ## 🚀 Quick Install
 
@@ -71,15 +71,15 @@ claude-self-reflect setup --voyage-key=YOUR_ACTUAL_KEY_HERE
 
 </details>
 
-## ✨ The Magic
+## The Magic
 
 ![Self Reflection vs The Grind](docs/images/red-reflection.webp)
 
-## 📊 Before & After
+## Before & After
 
 ![Before and After Claude Self-Reflect](docs/diagrams/before-after-combined.webp)
 
-## 💬 Real Examples
+## Real Examples
 
 ```
 You: "What was that PostgreSQL optimization we figured out?"
@@ -98,7 +98,7 @@ Claude: "3 conversations found:
         - Nov 20: Added rate limiting per authenticated connection"
 ```
 
-## 🆕 NEW: Real-time Indexing Status in Your Terminal!
+## NEW: Real-time Indexing Status in Your Terminal
 
 See your conversation indexing progress directly in your statusline:
 
@@ -110,10 +110,32 @@ See your conversation indexing progress directly in your statusline:
 
 Works with [Claude Code Statusline](https://github.com/sirmalloc/ccstatusline) - shows progress bars, percentages, and indexing lag in real-time!
 
-## 🎯 Key Features
+## Key Features
 
 <details>
-<summary><b>📊 Statusline Integration</b></summary>
+<summary><b>MCP Tools Available to Claude</b></summary>
+
+**Search & Memory Tools:**
+- `reflect_on_past` - Search past conversations using semantic similarity with time decay
+- `store_reflection` - Store important insights or learnings for future reference
+- `quick_search` - Fast search returning only count and top result
+- `search_summary` - Get aggregated insights without individual details
+- `get_more_results` - Paginate through additional search results
+- `search_by_file` - Find conversations that analyzed specific files
+- `search_by_concept` - Search for conversations about development concepts
+- `get_full_conversation` - Retrieve complete JSONL conversation files (v2.8.8)
+
+**Status & Monitoring Tools:**
+- `get_status` - Real-time import progress and system status
+- `get_health` - Comprehensive system health check
+- `collection_status` - Check Qdrant collection health and stats
+
+All tools are automatically available when the MCP server is connected to Claude Code.
+
+</details>
+
+<details>
+<summary><b>Statusline Integration</b></summary>
 
 See your indexing progress right in your terminal! Works with [Claude Code Statusline](https://github.com/sirmalloc/ccstatusline):
 - **Progress Bar** - Visual indicator `[████████ ] 91%`
@@ -126,7 +148,7 @@ See your indexing progress right in your terminal! Works with [Claude Code Statu
 </details>
 
 <details>
-<summary><b>🔍 Project-Scoped Search</b></summary>
+<summary><b>Project-Scoped Search</b></summary>
 
 Searches are **project-aware by default**. Claude automatically searches within your current project:
 
@@ -143,7 +165,7 @@ Claude: [Searches across ALL your projects]
 </details>
 
 <details>
-<summary><b>⏱️ Memory Decay</b></summary>
+<summary><b>Memory Decay</b></summary>
 
 Recent conversations matter more. Old ones fade. Like your brain, but reliable.
 - **90-day half-life**: Recent memories stay strong
@@ -153,7 +175,7 @@ Recent conversations matter more. Old ones fade. Like your brain, but reliable.
 </details>
 
 <details>
-<summary><b>⚡ Performance at Scale</b></summary>
+<summary><b>Performance at Scale</b></summary>
 
 - **Search**: <3ms average response time
 - **Scale**: 600+ conversations across 24 projects
@@ -163,18 +185,18 @@ Recent conversations matter more. Old ones fade. Like your brain, but reliable.
 
 </details>
 
-## 🏗️ Architecture
+## Architecture
 
 <details>
 <summary><b>View Architecture Diagram & Details</b></summary>
 
 ![Import Architecture](docs/diagrams/import-architecture.png)
 
-### 🔥 HOT/WARM/COLD Intelligent Prioritization
+### HOT/WARM/COLD Intelligent Prioritization
 
-- **🔥 HOT** (< 5 minutes): 2-second intervals for near real-time import
-- **🌡️ WARM** (< 24 hours): Normal priority with starvation prevention
-- **❄️ COLD** (> 24 hours): Batch processed to prevent blocking
+- **HOT** (< 5 minutes): 2-second intervals for near real-time import
+- **WARM** (< 24 hours): Normal priority with starvation prevention
+- **COLD** (> 24 hours): Batch processed to prevent blocking
 
 Files are categorized by age and processed with priority queuing to ensure newest content gets imported quickly while preventing older files from being starved.
 
@@ -186,7 +208,7 @@ Files are categorized by age and processed with priority queuing to ensure newes
 
 </details>
 
-## 🛠️ Requirements
+## Requirements
 
 <details>
 <summary><b>System Requirements</b></summary>
@@ -204,16 +226,16 @@ Files are categorized by age and processed with priority queuing to ensure newes
 - **Docker Desktop 4.0+** for best compatibility
 
 ### Operating Systems
-- ✅ macOS 11+ (Intel & Apple Silicon)
-- ✅ Windows 10/11 with WSL2
-- ✅ Linux (Ubuntu 20.04+, Debian 11+)
+- macOS 11+ (Intel & Apple Silicon)
+- Windows 10/11 with WSL2
+- Linux (Ubuntu 20.04+, Debian 11+)
 
 </details>
 
-## 📖 Documentation
+## Documentation
 
 <details>
-<summary>🔧 Technical Stack</summary>
+<summary>Technical Stack</summary>
 
 - **Vector DB**: Qdrant (local, your data stays yours)
 - **Embeddings**: 
@@ -225,7 +247,7 @@ Files are categorized by age and processed with priority queuing to ensure newes
 </details>
 
 <details>
-<summary>📚 Advanced Topics</summary>
+<summary>Advanced Topics</summary>
 
 - [Performance tuning](docs/performance-guide.md)
 - [Security & privacy](docs/security.md)
@@ -236,7 +258,7 @@ Files are categorized by age and processed with priority queuing to ensure newes
 </details>
 
 <details>
-<summary>🐛 Troubleshooting</summary>
+<summary>Troubleshooting</summary>
 
 - [Troubleshooting Guide](docs/troubleshooting.md)
 - [GitHub Issues](https://github.com/ramakay/claude-self-reflect/issues)
@@ -245,7 +267,7 @@ Files are categorized by age and processed with priority queuing to ensure newes
 </details>
 
 <details>
-<summary>🗑️ Uninstall</summary>
+<summary>Uninstall</summary>
 
 For complete uninstall instructions, see [docs/UNINSTALL.md](docs/UNINSTALL.md).
 
@@ -263,19 +285,19 @@ npm uninstall -g claude-self-reflect
 
 </details>
 
-## 📦 What's New
+## What's New
 
 <details>
-<summary>🎉 v2.8.0 - Latest Release</summary>
+<summary>v2.8.8 - Latest Release</summary>
 
-- **🔧 Fixed MCP Indexing**: Now correctly shows 97.1% progress (was showing 0%)
-- **🔥 HOT/WARM/COLD**: Intelligent file prioritization for near real-time imports
-- **📊 Enhanced Monitoring**: Real-time status with visual indicators
+- **Full Conversation Access**: New `get_full_conversation` tool provides complete JSONL files instead of 200-char excerpts
+- **95% Value Increase**: Agents can now access entire conversations with full implementation details
+- **Direct File Access**: Returns absolute paths for efficient reading with standard tools
 
 </details>
 
 <details>
-<summary>✨ v2.5.19 - Metadata Enrichment</summary>
+<summary>v2.5.19 - Metadata Enrichment</summary>
 
 ### For Existing Users
 ```bash
@@ -298,7 +320,7 @@ docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.
 </details>
 
 <details>
-<summary>📜 Release History</summary>
+<summary>Release History</summary>
 
 - **v2.5.18** - Security dependency updates
 - **v2.5.17** - Critical CPU fix and memory limit adjustment
@@ -313,7 +335,7 @@ docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.
 
 </details>
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
 <details>
 <summary><b>Common Issues and Solutions</b></summary>
@@ -432,7 +454,7 @@ claude-self-reflect doctor > diagnostic.txt
 
 </details>
 
-## 👥 Contributors
+## Contributors
 
 Special thanks to our contributors:
 - **[@TheGordon](https://github.com/TheGordon)** - Fixed timestamp parsing (#10)
@@ -441,4 +463,4 @@ Special thanks to our contributors:
 
 ---
 
-Built with ❤️ by [ramakay](https://github.com/ramakay) for the Claude community.
+Built with care by [ramakay](https://github.com/ramakay) for the Claude community.
