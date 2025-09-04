@@ -159,7 +159,7 @@ _indexing_cache = {"result": None, "timestamp": 0}
 # Setup logger
 logger = logging.getLogger(__name__)
 logger.info(f"MCP Server starting - Log file: {LOG_FILE}")
-logger.info(f"Configuration: QDRANT_URL={QDRANT_URL}, DECAY={ENABLE_MEMORY_DECAY}, VOYAGE_KEY={'Set' if VOYAGE_API_KEY else 'Not Set'}")
+logger.info(f"Configuration: QDRANT_URL={QDRANT_URL}, DECAY={ENABLE_MEMORY_DECAY}, VOYAGE_API_STATUS={'Configured' if VOYAGE_API_KEY else 'Not Configured'}")
 
 def normalize_path(path_str: str) -> str:
     """Normalize path for consistent comparison across platforms.
