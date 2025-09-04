@@ -38,6 +38,7 @@
     "mcp-server/src/**/*.py",
     "mcp-server/pyproject.toml",
     "mcp-server/run-mcp.sh",
+    "mcp-server/run-mcp-clean.sh",
     "mcp-server/run-mcp-docker.sh",
     "scripts/import-*.py",
     "scripts/delta-metadata-update-safe.py",
