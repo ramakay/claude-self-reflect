@@ -21,7 +21,7 @@ RUN pip install --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir \
     qdrant-client==1.15.0 \
     fastembed==0.7.1 \
-    numpy==1.26.4 \
+    numpy>=2.1.0 \
     psutil==7.0.0 \
     python-dotenv==1.0.0 \
     voyageai==0.3.4 \
