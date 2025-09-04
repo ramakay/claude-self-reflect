@@ -1867,11 +1867,15 @@ async def get_full_conversation(
     if project:
         # Try various project directory name formats
         sanitized_project = project.replace('/', '-')
+        
+        # Get the current username dynamically from the home path
+        username = Path.home().name
+        
         search_dirs.extend([
             base_path / project,
             base_path / sanitized_project,
-            base_path / f"-Users-ramakrishnanannaswamy-projects-{project}",
-            base_path / f"-Users-ramakrishnanannaswamy-projects-{sanitized_project}"
+            base_path / f"-Users-{username}-projects-{project}",
+            base_path / f"-Users-{username}-projects-{sanitized_project}"
         ])
     else:
         # Search all project directories
