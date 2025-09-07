@@ -3,31 +3,7 @@
 from pathlib import Path
 
 
-def path_to_dash_encoded(path: str) -> str:
-    """
-    Convert a file path to dash-encoded format used in Claude logs.
-    
-    Examples:
-    - /Users/kyle/projects/my-app -> -Users-kyle-projects-my-app
-    - /home/user/Code/project -> -home-user-Code-project
-    
-    Args:
-        path: File system path
-        
-    Returns:
-        Dash-encoded path string
-    """
-    # Convert to Path object and get parts
-    path_obj = Path(path)
-    
-    # Remove empty parts and join with dashes
-    parts = [p for p in path_obj.parts if p and p != '/']
-    
-    # Join with dashes and add leading dash
-    return '-' + '-'.join(parts)
-
-
-def normalize_project_name(project_path: str) -> str:
+def normalize_project_name(project_path: str, _depth: int = 0) -> str:
     """
     Normalize project name for consistent hashing across import/search.
     
@@ -37,9 +13,11 @@ def normalize_project_name(project_path: str) -> str:
     - Regular file paths: /path/to/project/file.txt -> project
     - Regular paths: /path/to/project -> project
     - Already normalized: project -> project
+    - Docker mount paths: /logs/-Users-name-projects-project -> project
     
     Args:
         project_path: Project path or name in any format
+        _depth: Internal recursion depth counter (do not use)
         
     Returns:
         Normalized project name suitable for consistent hashing
@@ -47,9 +25,9 @@ def normalize_project_name(project_path: str) -> str:
     if not project_path:
         return ""
     
-    # Project discovery markers - common parent directories that indicate project roots
-    PROJECT_MARKERS = {'projects', 'code', 'Code', 'repos', 'repositories', 
-                       'dev', 'Development', 'work', 'src', 'github'}
+    # Prevent infinite recursion on malformed inputs
+    if _depth > 10:
+        return Path(project_path).name
     
     # Remove trailing slashes
     project_path = project_path.rstrip('/')
@@ -65,28 +43,15 @@ def normalize_project_name(project_path: str) -> str:
         path_parts = Path(path_str).parts
         
         # Look for common project parent directories
-        project_parents = PROJECT_MARKERS
+        project_parents = {'projects', 'code', 'Code', 'repos', 'repositories', 
+                          'dev', 'Development', 'work', 'src', 'github'}
         
         # Find the project name after a known parent directory
         for i, part in enumerate(path_parts):
             if part.lower() in project_parents and i + 1 < len(path_parts):
                 # Everything after the parent directory is the project name
-                remaining = path_parts[i + 1:]
-                
-                # Use segment-based approach for complex paths
-                # Return the most likely project name from remaining segments
-                if remaining:
-                    # If it's a single segment, return it
-                    if len(remaining) == 1:
-                        return remaining[0]
-                    # For multiple segments, look for project-like patterns
-                    for r in remaining:
-                        r_lower = r.lower()
-                        # Prioritize segments with project indicators
-                        if any(ind in r_lower for ind in ['app', 'service', 'project', 'api', 'client']):
-                            return r
-                
                 # Join remaining parts with dash if project name has multiple components
+                remaining = path_parts[i + 1:]
                 return '-'.join(remaining)
         
         # Fallback: just use the last component
@@ -96,27 +61,24 @@ def normalize_project_name(project_path: str) -> str:
     # Pattern: /path/to/-Users-...-projects-..../filename
     path_obj = Path(project_path)
     
+    # Check if this is a Docker mount path specifically
+    # e.g., /logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect
+    if str(path_obj).startswith("/logs/") and path_obj.name.startswith("-"):
+        # Process this directory name recursively (Docker case only)
+        return normalize_project_name(path_obj.name, _depth + 1)
+    
     # Look for a parent directory that starts with dash (Claude logs format)
     for parent in path_obj.parents:
         parent_name = parent.name
         if parent_name.startswith("-"):
             # Found a Claude logs directory, process it
-            return normalize_project_name(parent_name)
+            return normalize_project_name(parent_name, _depth + 1)
     
     # Handle regular paths - if it's a file, get the parent directory
     # Otherwise use the directory/project name itself
     if path_obj.suffix:  # It's a file (has an extension)
-        # Check if .claude is anywhere in the parent path
-        for parent in path_obj.parents:
-            if parent.name == '.claude' and parent.parent:
-                return parent.parent.name
-        # No .claude found, use immediate parent
+        # Use the parent directory name
         return path_obj.parent.name
     else:
-        # Check if any parent in the path is .claude
-        for parent in [path_obj] + list(path_obj.parents):
-            if parent.name == '.claude' and parent.parent:
-                # Return the parent of .claude (the project directory)
-                return parent.parent.name
         # Use the directory name itself
         return path_obj.name

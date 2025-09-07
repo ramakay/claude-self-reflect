@@ -3,7 +3,7 @@
 from pathlib import Path
 
 
-def normalize_project_name(project_path: str) -> str:
+def normalize_project_name(project_path: str, _depth: int = 0) -> str:
     """
     Normalize project name for consistent hashing across import/search.
     
@@ -13,15 +13,21 @@ def normalize_project_name(project_path: str) -> str:
     - Regular file paths: /path/to/project/file.txt -> project
     - Regular paths: /path/to/project -> project
     - Already normalized: project -> project
+    - Docker mount paths: /logs/-Users-name-projects-project -> project
     
     Args:
         project_path: Project path or name in any format
+        _depth: Internal recursion depth counter (do not use)
         
     Returns:
         Normalized project name suitable for consistent hashing
     """
     if not project_path:
         return ""
+    
+    # Prevent infinite recursion on malformed inputs
+    if _depth > 10:
+        return Path(project_path).name
     
     # Remove trailing slashes
     project_path = project_path.rstrip('/')
@@ -55,12 +61,18 @@ def normalize_project_name(project_path: str) -> str:
     # Pattern: /path/to/-Users-...-projects-..../filename
     path_obj = Path(project_path)
     
+    # Check if this is a Docker mount path specifically
+    # e.g., /logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect
+    if str(path_obj).startswith("/logs/") and path_obj.name.startswith("-"):
+        # Process this directory name recursively (Docker case only)
+        return normalize_project_name(path_obj.name, _depth + 1)
+    
     # Look for a parent directory that starts with dash (Claude logs format)
     for parent in path_obj.parents:
         parent_name = parent.name
         if parent_name.startswith("-"):
             # Found a Claude logs directory, process it
-            return normalize_project_name(parent_name)
+            return normalize_project_name(parent_name, _depth + 1)
     
     # Handle regular paths - if it's a file, get the parent directory
     # Otherwise use the directory/project name itself
