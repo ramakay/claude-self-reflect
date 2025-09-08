@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo '🔄 PreCompact hook triggered! Importing conversation to Qdrant...' && touch /tmp/claude-self-reflect-import-current"
+            "command": "python3 ~/.claude/hooks/precompact-auto.py 2>/dev/null || true"
           }
         ]
       }

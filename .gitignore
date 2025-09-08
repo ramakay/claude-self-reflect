@@ -107,3 +107,7 @@ docs/fixes/
 # Docker-only setup branch
 work/
 .needs-migration
+
+# FastEmbed cache directory
+.fastembed-cache/
+mcp-server/.fastembed-cache/

@@ -992,7 +992,7 @@ class StreamingWatcher:
                     logger.error(f"Memory critical: {mem_metrics['current_mb']:.1f}MB, skipping {file_path}")
                     return False
             
-            project_path = str(file_path.parent)
+            project_path = file_path.parent.name  # Use just the project directory name, not full path
             collection_name = self.get_collection_name(project_path)
             conversation_id = file_path.stem
             

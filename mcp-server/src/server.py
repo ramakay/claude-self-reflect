@@ -143,6 +143,90 @@ mcp = FastMCP(
 # Create Qdrant client
 qdrant_client = AsyncQdrantClient(url=QDRANT_URL)
 
+# Add MCP Resources for system status
+@mcp.resource("status://import-stats")
+async def get_import_stats():
+    """Current import statistics and progress."""
+    await update_indexing_status()
+    
+    return json.dumps({
+        "indexed_conversations": indexing_status["indexed_conversations"],
+        "total_conversations": indexing_status["total_conversations"],
+        "percentage": indexing_status["percentage"],
+        "backlog_count": indexing_status["backlog_count"],
+        "last_check": datetime.fromtimestamp(indexing_status["last_check"]).isoformat() if indexing_status["last_check"] else None
+    }, indent=2)
+
+@mcp.resource("status://collection-list")
+async def get_collection_list():
+    """List of all Qdrant collections with metadata."""
+    try:
+        collections = await qdrant_client.get_collections()
+        collection_data = []
+        
+        for collection in collections.collections:
+            # Get collection info
+            info = await qdrant_client.get_collection(collection_name=collection.name)
+            collection_data.append({
+                "name": collection.name,
+                "points_count": info.points_count,
+                "indexed_vectors_count": info.indexed_vectors_count,
+                "status": info.status,
+                "config": {
+                    "vector_size": info.config.params.vectors.size if hasattr(info.config.params.vectors, 'size') else 384,
+                    "distance": str(info.config.params.vectors.distance) if hasattr(info.config.params.vectors, 'distance') else "Cosine"
+                }
+            })
+        
+        return json.dumps({
+            "total_collections": len(collection_data),
+            "collections": collection_data
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+@mcp.resource("status://system-health")
+async def get_system_health():
+    """System health and configuration information."""
+    try:
+        # Check Qdrant connectivity
+        qdrant_info = await qdrant_client.get_collections()
+        qdrant_healthy = True
+        qdrant_version = "Connected"
+    except:
+        qdrant_healthy = False
+        qdrant_version = "Disconnected"
+    
+    # Check embedding configuration
+    embedding_info = {}
+    if embedding_manager:
+        embedding_info = {
+            "model_type": embedding_manager.model_type,
+            "model_name": embedding_manager.model_name,
+            "dimension": embedding_manager.dimension
+        }
+    
+    return json.dumps({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "qdrant": {
+            "healthy": qdrant_healthy,
+            "url": QDRANT_URL,
+            "version": qdrant_version
+        },
+        "embeddings": embedding_info,
+        "configuration": {
+            "memory_decay_enabled": ENABLE_MEMORY_DECAY,
+            "decay_weight": DECAY_WEIGHT,
+            "decay_scale_days": DECAY_SCALE_DAYS,
+            "prefer_local_embeddings": PREFER_LOCAL_EMBEDDINGS
+        },
+        "indexing_status": {
+            "indexed": indexing_status["indexed_conversations"],
+            "total": indexing_status["total_conversations"],
+            "percentage": indexing_status["percentage"]
+        }
+    }, indent=2)
+
 # Track indexing status (updated periodically)
 indexing_status = {
     "last_check": 0,

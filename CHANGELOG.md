@@ -5,6 +5,16 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.2] - 2025-09-08
+
+### Fixed
+- Fixed Windows ESM import error (Issue #51) - Added pathToFileURL for dynamic imports
+- Removed .fastembed-cache from source control (25 files, ~90MB)
+- Added .fastembed-cache to .gitignore
+
+### Security
+- Reduced package size by removing cached model files
+
 ## [3.0.1] - 2025-09-08
 
 ### Fixed

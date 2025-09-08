@@ -5,19 +5,17 @@ from pathlib import Path
 
 def normalize_project_name(project_path: str, _depth: int = 0) -> str:
     """
-    Normalize project name for consistent hashing across import/search.
+    Simplified project name normalization for consistent hashing.
     
-    Handles various path formats:
-    - Claude logs format: -Users-kyle-Code-claude-self-reflect -> claude-self-reflect
-    - File paths in Claude logs: /path/to/-Users-kyle-Code-claude-self-reflect/file.jsonl -> claude-self-reflect  
-    - Regular file paths: /path/to/project/file.txt -> project
-    - Regular paths: /path/to/project -> project
-    - Already normalized: project -> project
-    - Docker mount paths: /logs/-Users-name-projects-project -> project
-    
+    Examples:
+        '/Users/name/.claude/projects/-Users-name-projects-myproject' -> 'myproject'
+        '-Users-name-projects-myproject' -> 'myproject'
+        '/path/to/myproject' -> 'myproject'
+        'myproject' -> 'myproject'
+        
     Args:
         project_path: Project path or name in any format
-        _depth: Internal recursion depth counter (do not use)
+        _depth: Internal recursion depth counter (for backwards compatibility)
         
     Returns:
         Normalized project name suitable for consistent hashing
@@ -25,60 +23,17 @@ def normalize_project_name(project_path: str, _depth: int = 0) -> str:
     if not project_path:
         return ""
     
-    # Prevent infinite recursion on malformed inputs
-    if _depth > 10:
-        return Path(project_path).name
+    path = Path(project_path.rstrip('/'))
     
-    # Remove trailing slashes
-    project_path = project_path.rstrip('/')
+    # Extract the final directory name
+    final_component = path.name
     
-    # Handle Claude logs format (starts with dash)
-    if project_path.startswith('-'):
-        # For paths like -Users-kyle-Code-claude-self-reflect
-        # We want to extract the actual project name which may contain dashes
-        # Strategy: Find common parent directories and extract what comes after
-        
-        # Remove leading dash and convert back to path-like format
-        path_str = project_path[1:].replace('-', '/')
-        path_parts = Path(path_str).parts
-        
-        # Look for common project parent directories
-        project_parents = {'projects', 'code', 'Code', 'repos', 'repositories', 
-                          'dev', 'Development', 'work', 'src', 'github'}
-        
-        # Find the project name after a known parent directory
-        for i, part in enumerate(path_parts):
-            if part.lower() in project_parents and i + 1 < len(path_parts):
-                # Everything after the parent directory is the project name
-                # Join remaining parts with dash if project name has multiple components
-                remaining = path_parts[i + 1:]
-                return '-'.join(remaining)
-        
-        # Fallback: just use the last component
-        return path_parts[-1] if path_parts else project_path
+    # If it's Claude's dash-separated format, extract project name
+    if final_component.startswith('-') and 'projects' in final_component:
+        # Find the last occurrence of 'projects-' to handle edge cases
+        idx = final_component.rfind('projects-')
+        if idx != -1:
+            return final_component[idx + len('projects-'):]
     
-    # Check if this is a file path that contains a Claude logs directory
-    # Pattern: /path/to/-Users-...-projects-..../filename
-    path_obj = Path(project_path)
-    
-    # Check if this is a Docker mount path specifically
-    # e.g., /logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect
-    if str(path_obj).startswith("/logs/") and path_obj.name.startswith("-"):
-        # Process this directory name recursively (Docker case only)
-        return normalize_project_name(path_obj.name, _depth + 1)
-    
-    # Look for a parent directory that starts with dash (Claude logs format)
-    for parent in path_obj.parents:
-        parent_name = parent.name
-        if parent_name.startswith("-"):
-            # Found a Claude logs directory, process it
-            return normalize_project_name(parent_name, _depth + 1)
-    
-    # Handle regular paths - if it's a file, get the parent directory
-    # Otherwise use the directory/project name itself
-    if path_obj.suffix:  # It's a file (has an extension)
-        # Use the parent directory name
-        return path_obj.parent.name
-    else:
-        # Use the directory name itself
-        return path_obj.name
+    # For regular paths, just return the directory name
+    return final_component if final_component else path.parent.name

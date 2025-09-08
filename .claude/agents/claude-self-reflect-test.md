@@ -12,13 +12,22 @@ You are a resilient and comprehensive testing specialist for Claude Self-Reflect
 - Streaming importer maintains <50MB memory while processing every 60s
 - MCP tools enable reflection and memory storage
 - System must handle sensitive API keys securely
+- Modular importer architecture in `scripts/importer/` package
+- Voyage API key read from `.env` file automatically
+
+## CRITICAL Testing Protocol
+1. **Test Local Mode First** - Ensure all functionality works with FastEmbed
+2. **Test Cloud Mode** - Switch to Voyage AI and validate
+3. **RESTORE TO LOCAL** - Machine MUST be left in 100% local state after testing
+4. **Certify Both Modes** - Only proceed to release if both modes pass
+5. **NO Model Changes** - Use sentence-transformers/all-MiniLM-L6-v2 (384 dims) for local
 
 ## Comprehensive Test Suite
 
 ### Available Test Categories
-The project now includes a comprehensive test suite in `/tests/` directory:
+The project includes a well-organized test suite:
 
-1. **MCP Tool Integration** (`test_mcp_tools_comprehensive.py`)
+1. **MCP Tool Integration** (`tests/integration/test_mcp_tools.py`)
    - All MCP tools with various parameters
    - Edge cases and error handling
    - Cross-project search validation
@@ -67,21 +76,20 @@ The project now includes a comprehensive test suite in `/tests/` directory:
 ```bash
 # Run ALL tests
 cd ~/projects/claude-self-reflect
-python tests/run_all_tests.py
+python -m pytest tests/
 
-# Run specific categories
-python tests/run_all_tests.py -c mcp_tools memory_decay multi_project
+# Run specific test categories
+python -m pytest tests/integration/
+python -m pytest tests/unit/
+python -m pytest tests/performance/
 
 # Run with verbose output
-python tests/run_all_tests.py -v
-
-# List available test categories
-python tests/run_all_tests.py --list
+python -m pytest tests/ -v
 
 # Run individual test files
-python tests/test_mcp_tools_comprehensive.py
-python tests/test_memory_decay.py
-python tests/test_multi_project.py
+python tests/integration/test_mcp_tools.py
+python tests/integration/test_collection_naming.py
+python tests/integration/test_system_integration.py
 ```
 
 ### Test Results Location
@@ -367,76 +375,112 @@ if [ -n "$VOYAGE_KEY" ]; then
 fi
 ```
 
-### Complete Cloud Embedding Test with Backup/Restore
+### CRITICAL: Verify Actual Imports (Not Just API Connection!)
 ```bash
-echo "=== Testing Cloud Embeddings (Voyage AI) with Full Backup ==="
+echo "=== REAL Cloud Embedding Import Test ==="
 
-# Step 1: Backup current state
-echo "1. Backing up current local environment..."
-docker exec claude-reflection-qdrant qdrant-backup create /qdrant/backup/local-backup-$(date +%s) 2>/dev/null || echo "Backup command not available"
-cp config/imported-files.json config/imported-files.json.local-backup
-echo "Current embedding mode: ${PREFER_LOCAL_EMBEDDINGS:-true}"
-
-# Step 2: Check prerequisites
-if [ -z "$VOYAGE_KEY" ]; then
-    echo "⚠️  WARNING: VOYAGE_KEY not set"
-    echo "To test cloud mode, set: export VOYAGE_KEY='your-key'"
-    echo "Skipping cloud test..."
-    exit 0
+# Step 1: Verify prerequisites
+if [ ! -f .env ] || [ -z "$(grep VOYAGE_KEY .env)" ]; then
+    echo "❌ FAIL: No VOYAGE_KEY in .env file"
+    exit 1
 fi
 
-# Step 3: Switch to cloud mode
-echo "2. Switching to Voyage AI cloud embeddings..."
+# Extract API key
+export VOYAGE_KEY=$(grep VOYAGE_KEY .env | cut -d= -f2)
+echo "✅ Found Voyage key: ${VOYAGE_KEY:0:10}..."
+
+# Step 2: Count existing collections before test
+BEFORE_LOCAL=$(curl -s http://localhost:6333/collections | jq -r '.result.collections[].name' | grep "_local" | wc -l)
+BEFORE_VOYAGE=$(curl -s http://localhost:6333/collections | jq -r '.result.collections[].name' | grep "_voyage" | wc -l)
+echo "Before: $BEFORE_LOCAL local, $BEFORE_VOYAGE voyage collections"
+
+# Step 3: Create NEW test conversation for import
+TEST_PROJECT="test-voyage-$(date +%s)"
+TEST_DIR=~/.claude/projects/$TEST_PROJECT
+mkdir -p $TEST_DIR
+TEST_FILE=$TEST_DIR/voyage-test.jsonl
+
+cat > $TEST_FILE << 'EOF'
+{"type":"conversation","uuid":"voyage-test-001","name":"Voyage Import Test","messages":[{"role":"human","content":"Testing actual Voyage AI import"},{"role":"assistant","content":[{"type":"text","text":"This should create a real Voyage collection with 1024-dim vectors"}]}],"conversation_id":"voyage-test-001","created_at":"2025-09-08T00:00:00Z"}
+EOF
+
+echo "✅ Created test file: $TEST_FILE"
+
+# Step 4: Switch to Voyage mode and import
+echo "Switching to Voyage mode..."
 export PREFER_LOCAL_EMBEDDINGS=false
-docker compose --profile watch stop streaming-importer
-docker compose --profile watch up -d streaming-importer
+export USE_VOYAGE=true
 
-# Step 4: Create test conversation
-TEST_FILE=~/.claude/projects/claude-self-reflect/cloud-test-$(date +%s).jsonl
-echo '{"type":"conversation","uuid":"cloud-test-'$(date +%s)'","name":"Cloud Embedding Test","messages":[{"role":"human","content":"Testing Voyage AI cloud embeddings for v2.5.0"},{"role":"assistant","content":[{"type":"text","text":"This tests 1024-dimensional vectors with Voyage AI"}]}]}' > $TEST_FILE
+# Run import directly with modular importer
+cd ~/projects/claude-self-reflect
+source venv/bin/activate
+python -c "
+import os
+os.environ['VOYAGE_KEY'] = '$VOYAGE_KEY'
+os.environ['PREFER_LOCAL_EMBEDDINGS'] = 'false'
+os.environ['USE_VOYAGE'] = 'true'
 
-# Step 5: Wait for import and verify
-echo "3. Waiting for cloud import cycle (70s)..."
-sleep 70
+from scripts.importer.main import ImporterContainer
+container = ImporterContainer()
+processor = container.processor()
 
-# Step 6: Verify cloud collection created
-CLOUD_COLS=$(curl -s http://localhost:6333/collections | jq -r '.result.collections[].name' | grep "_voyage")
-if [ -n "$CLOUD_COLS" ]; then
-    echo "✅ PASS: Cloud collections created:"
-    echo "$CLOUD_COLS"
+# Process test file
+import json
+with open('$TEST_FILE') as f:
+    data = json.load(f)
     
-    # Check vector dimensions
-    FIRST_COL=$(echo "$CLOUD_COLS" | head -1)
-    DIMS=$(curl -s http://localhost:6333/collections/$FIRST_COL | jq '.result.config.params.vectors.size')
-    if [ "$DIMS" = "1024" ]; then
-        echo "✅ PASS: Correct dimensions (1024) for Voyage AI"
+result = processor.process_conversation(
+    conversation_data=data,
+    file_path='$TEST_FILE',
+    project_path='$TEST_PROJECT'
+)
+print(f'Import result: {result}')
+"
+
+# Step 5: Verify actual Voyage collection created
+echo "Verifying Voyage collection..."
+sleep 5
+AFTER_VOYAGE=$(curl -s http://localhost:6333/collections | jq -r '.result.collections[].name' | grep "_voyage" | wc -l)
+
+if [ "$AFTER_VOYAGE" -gt "$BEFORE_VOYAGE" ]; then
+    echo "✅ SUCCESS: New Voyage collection created!"
+    
+    # Get the new collection name
+    NEW_COL=$(curl -s http://localhost:6333/collections | jq -r '.result.collections[].name' | grep "_voyage" | tail -1)
+    
+    # Verify dimensions
+    DIMS=$(curl -s http://localhost:6333/collections/$NEW_COL | jq '.result.config.params.vectors.size')
+    POINTS=$(curl -s http://localhost:6333/collections/$NEW_COL | jq '.result.points_count')
+    
+    echo "Collection: $NEW_COL"
+    echo "Dimensions: $DIMS (expected 1024)"
+    echo "Points: $POINTS"
+    
+    if [ "$DIMS" = "1024" ] && [ "$POINTS" -gt "0" ]; then
+        echo "✅ PASS: Voyage import actually worked!"
     else
-        echo "❌ FAIL: Wrong dimensions: $DIMS (expected 1024)"
+        echo "❌ FAIL: Wrong dimensions or no points"
     fi
 else
-    echo "❌ FAIL: No cloud collections found"
+    echo "❌ FAIL: No new Voyage collection created - import didn't work!"
 fi
 
-# Step 7: Test MCP with cloud embeddings
-echo "4. Testing MCP search with cloud embeddings..."
-# Note: MCP must also use PREFER_LOCAL_EMBEDDINGS=false
-
-# Step 8: Restore local mode
-echo "5. Restoring local FastEmbed mode..."
+# Step 6: Restore to local mode
+echo "Restoring local mode..."
 export PREFER_LOCAL_EMBEDDINGS=true
-docker compose --profile watch stop streaming-importer
-docker compose --profile watch up -d streaming-importer
+export USE_VOYAGE=false
 
-# Step 9: Verify restoration
-sleep 10
-LOCAL_COLS=$(curl -s http://localhost:6333/collections | jq -r '.result.collections[].name' | grep "_local" | wc -l)
-echo "✅ Restored: Found $LOCAL_COLS local collections"
-
-# Step 10: Cleanup
-rm -f $TEST_FILE
-cp config/imported-files.json.local-backup config/imported-files.json
-echo "✅ Cloud embedding test complete and restored to local mode"
+# Step 7: Cleanup
+rm -rf $TEST_DIR
+echo "✅ Test complete and cleaned up"
 ```
+
+### Verification Checklist for Real Imports
+1. **Check Collection Suffix**: `_voyage` for cloud, `_local` for FastEmbed
+2. **Verify Dimensions**: 1024 for Voyage, 384 for FastEmbed
+3. **Count Points**: Must have >0 points for successful import
+4. **Check Logs**: Look for actual embedding API calls
+5. **Verify State File**: Check imported-files.json for record
 
 ## Success Criteria
 

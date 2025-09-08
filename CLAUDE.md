@@ -17,6 +17,29 @@ When creating release announcements or formal documentation:
 - Provide code examples in properly formatted blocks
 - End with Support/Forums/Documentation links
 
+## File Naming Conventions
+
+### NEVER use these suffixes:
+- `-comprehensive`, `-final`, `-fixed` - Use descriptive names instead
+- `-enhanced`, `-improved`, `-v2` - Use git history for versions
+- `FINAL-`, `OPUS-CRITICAL-` - Avoid shouty prefixes
+
+### Proper Test File Organization:
+```
+tests/
+├── unit/           # Unit tests for individual components
+├── integration/    # Integration tests for system components  
+├── performance/    # Performance and load tests
+└── e2e/           # End-to-end user scenarios
+```
+
+### Test File Naming:
+- ✅ `test_collection_naming.py` - Descriptive and specific
+- ✅ `test_mcp_tools.py` - Clear component focus
+- ✅ `benchmark_import_speed.py` - Performance tests
+- ❌ `test-comprehensive-fixed.py` - Poor naming
+- ❌ `final-test-report.md` - Use dated reports instead
+
 ## Overview
 Claude Self Reflect provides semantic search across all Claude conversations with built-in memory decay capabilities, using a vector database for efficient similarity matching.
 

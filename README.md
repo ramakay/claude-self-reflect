@@ -108,7 +108,7 @@ See your conversation indexing progress directly in your statusline:
 ### Active Indexing (50% with backlog)
 ![Statusline showing 50% indexed with 7h backlog](docs/images/statusbar-2.png)
 
-Works with [Claude Code Statusline](https://github.com/sirmalloc/ccstatusline) - shows progress bars, percentages, and indexing lag in real-time!
+Works with [Claude Code Statusline](https://github.com/sirmalloc/ccstatusline) - shows progress bars, percentages, and indexing lag in real-time! The statusline also displays MCP connection status (✓ Connected) and collection counts (28/29 indexed).
 
 ## Key Features
 
