@@ -115,8 +115,8 @@ jobs:
             exit 1
           fi
           
-          # Check for binary database files
-          if git ls-files | grep -E "qdrant_storage|data/qdrant"; then
+          # Check for binary database files (exclude Python modules)
+          if git ls-files | grep -E "qdrant_storage|data/qdrant" | grep -v "\.py$"; then
             echo "ERROR: Found database files in repository!"
             exit 1
           fi
