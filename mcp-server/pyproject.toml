@@ -15,6 +15,7 @@ dependencies = [
     "pydantic>=2.11.7,<3.0.0",  # Updated for fastmcp 2.10.6 compatibility
     "pydantic-settings>=2.0.0,<3.0.0",
     "fastembed>=0.4.0,<1.0.0",
+    "dependency-injector>=4.0.0,<5.0.0",
 ]
 
 [project.scripts]

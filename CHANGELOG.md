@@ -5,6 +5,19 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.1] - 2025-09-08
+
+### Fixed
+- Added missing `scripts/importer/` directory to npm package files array
+- Added dependency-injector to pyproject.toml requirements
+- Created __main__.py entry point for modular importer
+- Added main() function to importer/main.py for CLI execution
+- Created compatibility wrappers for backward compatibility
+
+### Changed
+- Updated package.json to include `scripts/importer/**/*.py`
+- Bumped version to 3.0.1 for critical hotfix
+
 ## [3.0.0] - 2025-09-08
 
 ### Added
