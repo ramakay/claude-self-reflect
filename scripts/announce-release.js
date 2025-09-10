@@ -37,7 +37,7 @@ async function createDiscussion(repositoryId, categoryId, title, body) {
         repositoryId: "${repositoryId}"
         categoryId: "${categoryId}"
         title: "${title}"
-        body: "${body.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"
+        body: "${body.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"
       }) {
         discussion {
           id
