@@ -287,17 +287,17 @@ class StagedImportProcessor:
                 try:
                     # Acquire exclusive lock
                     # Try to acquire lock with brief retry on contention
-                import time
-                max_attempts = 3
-                for attempt in range(max_attempts):
-                    try:
-                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        if attempt < max_attempts - 1:
-                            time.sleep(0.1)  # Brief wait before retry
-                        else:
-                            raise
+                    import time
+                    max_attempts = 3
+                    for attempt in range(max_attempts):
+                        try:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if attempt < max_attempts - 1:
+                                time.sleep(0.1)  # Brief wait before retry
+                            else:
+                                raise
                     
                     # Load existing state or create new
                     if state_file.exists():

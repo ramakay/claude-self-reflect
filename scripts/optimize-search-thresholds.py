@@ -58,16 +58,16 @@ class ThresholdOptimizer:
                 self.voyage_client = voyageai.Client(api_key=voyage_key)
                 print(" Voyage AI client initialized")
             else:
-                print("  VOYAGE_KEY not found - Voyage optimization will be skipped")
+                print("WARNING: VOYAGE_KEY not found - Voyage optimization will be skipped")
         except ImportError:
-            print("  voyageai not installed - Voyage optimization will be skipped")
+            print("WARNING: voyageai not installed - Voyage optimization will be skipped")
         
         try:
             from fastembed import TextEmbedding
             self.fastembed_model = TextEmbedding(model_name="all-MiniLM-L6-v2")
             print(" FastEmbed client initialized")
         except ImportError:
-            print("  fastembed not installed - Local optimization will be skipped")
+            print("  fastembed not installed - Local optimization will be skipped")
     
     def get_embedding(self, text: str, model_type: str) -> List[float]:
         """Get embedding for text using specified model"""
@@ -148,7 +148,7 @@ class ThresholdOptimizer:
     
     def optimize_model_thresholds(self, model_type: str) -> Dict[str, Any]:
         """Find optimal thresholds for a specific model"""
-        print(f"\n=' Optimizing thresholds for {model_type.upper()} model...")
+        print(f"\n=== Optimizing thresholds for {model_type.upper()} model...")
         
         model_config = OPTIMIZATION_CONFIG["embedding_models"][model_type]
         optimization_results = {
@@ -206,7 +206,7 @@ class ThresholdOptimizer:
     
     def run_optimization(self) -> Dict[str, Any]:
         """Run complete threshold optimization"""
-        print("=€ SEARCH THRESHOLD OPTIMIZATION")
+        print("=== SEARCH THRESHOLD OPTIMIZATION")
         print("=" * 50)
         
         self.setup_embedding_clients()
@@ -222,14 +222,14 @@ class ThresholdOptimizer:
             # Skip if client not available
             if (model_type == "voyage" and not self.voyage_client) or \
                (model_type == "local" and not self.fastembed_model):
-                print(f"  Skipping {model_type} - client not available")
+                print(f"  Skipping {model_type} - client not available")
                 continue
             
             try:
                 model_results = self.optimize_model_thresholds(model_type)
                 results["models"][model_type] = model_results
             except Exception as e:
-                print(f"L Error optimizing {model_type}: {e}")
+                print(f"ERROR optimizing {model_type}: {e}")
                 results["models"][model_type] = {"error": str(e)}
         
         # Generate summary
@@ -272,12 +272,12 @@ class ThresholdOptimizer:
         
         # Summary
         summary = results["summary"]
-        print(f"\n=Ê TESTED MODELS: {', '.join(summary['tested_models'])}")
+        print(f"\n=== TESTED MODELS: {', '.join(summary['tested_models'])}")
         
-        print(f"\n<¯ RECOMMENDATIONS:")
+        print(f"\n=== RECOMMENDATIONS:")
         for model_type, rec in summary["recommendations_by_model"].items():
             if "error" in rec:
-                print(f"   {model_type.upper()}: L {rec['error']}")
+                print(f"   {model_type.upper()}: ERROR {rec['error']}")
             else:
                 threshold = rec["threshold"]
                 limit = rec["limit"]
@@ -292,7 +292,7 @@ class ThresholdOptimizer:
                 print(f"     Avg score: {avg_score}")
                 print(f"     Vs baseline: {vs_baseline}")
         
-        print(f"\n=¡ IMPLEMENTATION:")
+        print(f"\n=== IMPLEMENTATION:")
         print("   Update these settings in your configuration:")
         for model_type, rec in summary["recommendations_by_model"].items():
             if "error" not in rec:
@@ -319,7 +319,7 @@ def main():
         import json
         json.dump(results, f, indent=2)
     
-    print(f"\n=Ä Full results saved to: threshold_optimization_results.json")
+    print(f"\n=== Full results saved to: threshold_optimization_results.json")
 
 
 if __name__ == "__main__":
