@@ -576,11 +576,16 @@ async def reflect_on_past(
     project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects."),
     include_raw: bool = Field(default=False, description="Include raw Qdrant payload data for debugging (increases response size)"),
     response_format: str = Field(default="xml", description="Response format: 'xml' or 'markdown'"),
-    brief: bool = Field(default=False, description="Brief mode: returns minimal information for faster response")
+    brief: bool = Field(default=False, description="Brief mode: returns minimal information for faster response"),
+    mode: str = Field(default="full", description="Search mode: 'full' (all results with details), 'quick' (count + top result only), 'summary' (aggregated insights without individual results)")
 ) -> str:
     """Search for relevant past conversations using semantic search with optional time decay."""
     
     logger.info(f"=== SEARCH START === Query: '{query}', Project: '{project}', Limit: {limit}")
+    
+    # Validate mode parameter
+    if mode not in ['full', 'quick', 'summary']:
+        return f"<error>Invalid mode '{mode}'. Must be 'full', 'quick', or 'summary'</error>"
     
     # Start timing
     start_time = time.time()
@@ -607,6 +612,7 @@ async def reflect_on_past(
     
     # Always get the working directory for logging purposes
     cwd = os.environ.get('MCP_CLIENT_CWD', os.getcwd())
+    await ctx.debug(f"CWD: {cwd}, Project param: {project}")
     
     if project is None:
         # Use MCP_CLIENT_CWD environment variable set by run-mcp.sh
@@ -628,6 +634,8 @@ async def reflect_on_past(
         # If still no project detected, use the last directory name
         if target_project is None:
             target_project = Path(cwd).name
+        
+        await ctx.debug(f"Auto-detected project from path: {target_project}")
     
     # For project matching, we need to handle the dash-encoded format
     # Convert folder name to the format used in stored data
@@ -1121,10 +1129,21 @@ async def reflect_on_past(
         # Sort by score and limit
         timing_info['sort_start'] = time.time()
         all_results.sort(key=lambda x: x.score, reverse=True)
-        all_results = all_results[:limit]
+        
+        # Apply mode-specific limits
+        if mode == "quick":
+            # For quick mode, only keep the top result
+            all_results = all_results[:1]
+        elif mode == "summary":
+            # For summary mode, we'll process all results but not return individual ones
+            pass  # Keep all for aggregation
+        else:
+            # For full mode, apply the normal limit
+            all_results = all_results[:limit]
+        
         timing_info['sort_end'] = time.time()
         
-        logger.info(f"Total results: {len(all_results)}, Returning: {len(all_results[:limit])}")
+        logger.info(f"Total results: {len(all_results)}, Mode: {mode}, Returning: {len(all_results[:limit])}")
         for r in all_results[:3]:  # Log first 3
             logger.debug(f"Result: id={r.id}, has_patterns={bool(r.code_patterns)}, pattern_keys={list(r.code_patterns.keys()) if r.code_patterns else None}")
         
@@ -1137,9 +1156,97 @@ async def reflect_on_past(
         # Update indexing status before returning results
         await update_indexing_status()
         
-        # Format results based on response_format
+        # Format results based on response_format and mode
         timing_info['format_start'] = time.time()
         
+        # Handle mode-specific responses
+        if mode == "quick":
+            # Quick mode: return just count and top result
+            total_count = len(all_results)  # Before we limited to 1
+            if response_format == "xml":
+                result_text = f"<quick_search>\n"
+                result_text += f"  <count>{total_count}</count>\n"
+                if all_results:
+                    top_result = all_results[0]
+                    result_text += f"  <top_result>\n"
+                    result_text += f"    <score>{top_result.score:.3f}</score>\n"
+                    result_text += f"    <excerpt>{escape(top_result.excerpt[:200])}</excerpt>\n"
+                    result_text += f"    <project>{escape(top_result.project_name)}</project>\n"
+                    result_text += f"    <conversation_id>{escape(top_result.conversation_id or '')}</conversation_id>\n"
+                    result_text += f"  </top_result>\n"
+                result_text += f"</quick_search>"
+                return result_text
+            else:
+                # Markdown format for quick mode
+                if all_results:
+                    return f"**Found {total_count} matches**\n\nTop result (score: {all_results[0].score:.3f}):\n{all_results[0].excerpt[:200]}"
+                else:
+                    return f"No matches found for '{query}'"
+        
+        elif mode == "summary":
+            # Summary mode: return aggregated insights without individual results
+            if not all_results:
+                return f"No conversations found to summarize for '{query}'"
+            
+            # Aggregate data
+            total_count = len(all_results)
+            avg_score = sum(r.score for r in all_results) / total_count
+            
+            # Extract common concepts and tools
+            all_concepts = []
+            all_tools = []
+            all_files = []
+            projects = set()
+            
+            for result in all_results:
+                if result.concepts:
+                    all_concepts.extend(result.concepts)
+                if result.tools_used:
+                    all_tools.extend(result.tools_used)
+                if result.files_analyzed:
+                    all_files.extend(result.files_analyzed)
+                projects.add(result.project_name)
+            
+            # Count frequencies
+            from collections import Counter
+            concept_counts = Counter(all_concepts).most_common(5)
+            tool_counts = Counter(all_tools).most_common(5)
+            
+            if response_format == "xml":
+                result_text = f"<search_summary>\n"
+                result_text += f"  <query>{escape(query)}</query>\n"
+                result_text += f"  <total_matches>{total_count}</total_matches>\n"
+                result_text += f"  <average_score>{avg_score:.3f}</average_score>\n"
+                result_text += f"  <projects_involved>{len(projects)}</projects_involved>\n"
+                if concept_counts:
+                    result_text += f"  <common_concepts>\n"
+                    for concept, count in concept_counts:
+                        result_text += f"    <concept count=\"{count}\">{escape(concept)}</concept>\n"
+                    result_text += f"  </common_concepts>\n"
+                if tool_counts:
+                    result_text += f"  <common_tools>\n"
+                    for tool, count in tool_counts:
+                        result_text += f"    <tool count=\"{count}\">{escape(tool)}</tool>\n"
+                    result_text += f"  </common_tools>\n"
+                result_text += f"</search_summary>"
+                return result_text
+            else:
+                # Markdown format for summary
+                result_text = f"## Summary for: {query}\n\n"
+                result_text += f"- **Total matches**: {total_count}\n"
+                result_text += f"- **Average relevance**: {avg_score:.3f}\n"
+                result_text += f"- **Projects involved**: {len(projects)}\n\n"
+                if concept_counts:
+                    result_text += "**Common concepts**:\n"
+                    for concept, count in concept_counts:
+                        result_text += f"- {concept} ({count} occurrences)\n"
+                if tool_counts:
+                    result_text += "\n**Common tools**:\n"
+                    for tool, count in tool_counts:
+                        result_text += f"- {tool} ({count} uses)\n"
+                return result_text
+        
+        # Continue with normal formatting for full mode
         if response_format == "xml":
             # Add upfront summary for immediate visibility (before collapsible XML)
             upfront_summary = ""
@@ -1842,6 +1949,8 @@ async def search_by_concept(
                     })
                     
             except Exception as e:
+                # Log unexpected errors but continue with other collections
+                logger.debug(f"Error searching collection {collection_name}: {e}")
                 continue
     
     # If no results from metadata search OR no metadata exists, fall back to semantic search
@@ -1868,6 +1977,8 @@ async def search_by_concept(
                     })
                     
             except Exception as e:
+                # Log unexpected errors but continue with other collections
+                logger.debug(f"Error searching collection {collection_name}: {e}")
                 continue
     
     # Sort by score and limit
@@ -2018,6 +2129,148 @@ This gives you access to:
 - Complete architectural decisions and discussions
 </instructions>
 </full_conversation>"""
+
+
+@mcp.tool()
+async def get_next_results(
+    ctx: Context,
+    query: str = Field(description="The original search query"),
+    offset: int = Field(default=3, description="Number of results to skip (for pagination)"),
+    limit: int = Field(default=3, description="Number of additional results to return"),
+    min_score: float = Field(default=0.7, description="Minimum similarity score (0-1)"),
+    project: Optional[str] = Field(default=None, description="Search specific project only")
+) -> str:
+    """Get additional search results after an initial search (pagination support)."""
+    global qdrant_client, embedding_manager
+    
+    try:
+        # Generate embedding for the query
+        embedding = await generate_embedding(query)
+        
+        # Determine which collections to search
+        if project == "all" or not project:
+            # Search all collections if project is "all" or not specified
+            collections = await get_all_collections()
+        else:
+            # Search specific project
+            all_collections = await get_all_collections()
+            project_hash = hashlib.md5(project.encode()).hexdigest()[:8]
+            collections = [
+                c for c in all_collections 
+                if c.startswith(f"conv_{project_hash}_")
+            ]
+            if not collections:
+                # Fall back to searching all collections
+                collections = all_collections
+        
+        if not collections:
+            return """<next_results>
+<error>No collections available to search</error>
+</next_results>"""
+        
+        # Collect all results from all collections
+        all_results = []
+        for collection_name in collections:
+            try:
+                # Check if collection exists
+                collection_info = await qdrant_client.get_collection(collection_name)
+                if not collection_info:
+                    continue
+                
+                # Search with reasonable limit to account for offset
+                max_search_limit = 100  # Define a reasonable cap
+                search_limit = min(offset + limit + 10, max_search_limit)
+                results = await qdrant_client.search(
+                    collection_name=collection_name,
+                    query_vector=embedding,
+                    limit=search_limit,
+                    score_threshold=min_score
+                )
+                
+                for point in results:
+                    payload = point.payload
+                    score = float(point.score)
+                    
+                    # Apply time-based decay if enabled
+                    use_decay_bool = ENABLE_MEMORY_DECAY  # Use global default
+                    if use_decay_bool and 'timestamp' in payload:
+                        try:
+                            timestamp = datetime.fromisoformat(payload['timestamp'].replace('Z', '+00:00'))
+                            age_days = (datetime.now(timezone.utc) - timestamp).days
+                            decay_factor = DECAY_WEIGHT + (1 - DECAY_WEIGHT) * math.exp(-age_days / DECAY_SCALE_DAYS)
+                            score = score * decay_factor
+                        except (ValueError, TypeError) as e:
+                            # Log but continue - timestamp format issue shouldn't break search
+                            logger.debug(f"Failed to apply decay for timestamp {payload.get('timestamp')}: {e}")
+                    
+                    all_results.append({
+                        'score': score,
+                        'payload': payload,
+                        'collection': collection_name
+                    })
+                    
+            except Exception as e:
+                # Log unexpected errors but continue with other collections
+                logger.debug(f"Error searching collection {collection_name}: {e}")
+                continue
+        
+        # Sort by score
+        all_results.sort(key=lambda x: x['score'], reverse=True)
+        
+        # Apply pagination
+        paginated_results = all_results[offset:offset + limit]
+        
+        if not paginated_results:
+            return f"""<next_results>
+<query>{query}</query>
+<offset>{offset}</offset>
+<status>no_more_results</status>
+<message>No additional results found beyond offset {offset}</message>
+</next_results>"""
+        
+        # Format results
+        results_text = []
+        for i, result in enumerate(paginated_results, start=offset + 1):
+            payload = result['payload']
+            score = result['score']
+            timestamp = payload.get('timestamp', 'Unknown')
+            conversation_id = payload.get('conversation_id', 'Unknown')
+            project = payload.get('project', 'Unknown')
+            
+            # Get text preview (store text once to avoid multiple calls)
+            text = payload.get('text', '')
+            text_preview = text[:300] + '...' if len(text) > 300 else text
+            
+            results_text.append(f"""
+<result index="{i}">
+  <score>{score:.3f}</score>
+  <timestamp>{timestamp}</timestamp>
+  <project>{project}</project>
+  <conversation_id>{conversation_id}</conversation_id>
+  <preview>{text_preview}</preview>
+</result>""")
+        
+        # Check if there are more results available
+        has_more = len(all_results) > (offset + limit)
+        next_offset = offset + limit if has_more else None
+        
+        return f"""<next_results>
+<query>{query}</query>
+<offset>{offset}</offset>
+<limit>{limit}</limit>
+<count>{len(paginated_results)}</count>
+<total_available>{len(all_results)}</total_available>
+<has_more>{has_more}</has_more>
+{f'<next_offset>{next_offset}</next_offset>' if next_offset else ''}
+<results>{''.join(results_text)}
+</results>
+</next_results>"""
+        
+    except Exception as e:
+        await ctx.error(f"Pagination failed: {str(e)}")
+        return f"""<next_results>
+<error>Failed to get next results: {str(e)}</error>
+</next_results>"""
 
 
 # Run the server

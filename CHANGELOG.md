@@ -5,6 +5,50 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2025-09-09
+
+### Added
+- **Enhanced Search Modes**: Added `mode` parameter to `reflect_on_past` tool with three options:
+  - `full` (default): Returns all results with complete details
+  - `quick`: Returns count and top result only for fast previews  
+  - `summary`: Returns aggregated insights without individual results
+- **Pagination Support**: New `get_next_results` tool for cursor-based pagination
+  - Supports offset/limit parameters for flexible result navigation
+  - Works with both project-specific and cross-project searches
+  - Returns metadata about remaining results for better UX
+
+### Fixed
+- **Documentation Cleanup**: Removed references to non-existent MCP tools from MCP_REFERENCE.md
+  - Removed `quick_search` (use `reflect_on_past` with `mode="quick"`)
+  - Removed `search_summary` (use `reflect_on_past` with `mode="summary"`)  
+  - Removed `get_more_results` (use new `get_next_results` tool)
+- **Performance Bounds**: Search results now capped at maximum 100 to prevent performance issues
+- **Error Handling**: Enhanced exception handling with specific error types and detailed logging
+- **Input Validation**: Added proper validation for mode parameter and search limits
+
+### Changed  
+- **API Enhancement**: `reflect_on_past` now supports flexible search modes while maintaining backward compatibility
+- **Response Optimization**: Improved text preview generation for better performance
+- **Documentation**: Updated all examples to show correct tool usage patterns
+
+### Technical Details
+- Mode parameter validation prevents invalid queries
+- Enhanced logging for debugging failed operations  
+- Optimized response generation reduces latency
+- Comprehensive error handling with graceful degradation
+- All changes are backward compatible with existing code
+
+### Performance
+- Search operations bounded to prevent performance issues
+- Mode-specific optimizations (quick mode for fast previews)
+- Enhanced text processing efficiency
+- Better resource utilization through capped result sets
+
+### Contributors
+- Claude Code for implementation of mode parameter and pagination support
+- Opus 4.1 for comprehensive code review and quality improvements
+- Community for testing and API usability feedback
+
 ## [3.0.2] - 2025-09-08
 
 ### Fixed

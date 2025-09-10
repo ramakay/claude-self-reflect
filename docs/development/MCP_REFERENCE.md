@@ -72,13 +72,18 @@ claude mcp add claude-self-reflect "~/projects/claude-self-reflect/mcp-server/ru
 ## 🎯 Quick Reference for claude-self-reflect
 
 ### Available Tools:
-- `mcp__claude-self-reflect__reflect_on_past` - Search past conversations
+- `mcp__claude-self-reflect__reflect_on_past` - Search past conversations (supports mode parameter in v3.2.0+)
 - `mcp__claude-self-reflect__store_reflection` - Store insights
 - `mcp__claude-self-reflect__search_by_file` - Search conversations by file path (v2.5.6+)
 - `mcp__claude-self-reflect__search_by_concept` - Search conversations by concept (v2.5.6+)
-- `mcp__claude-self-reflect__quick_search` - Quick search with minimal results
-- `mcp__claude-self-reflect__search_summary` - Get aggregated insights without details
-- `mcp__claude-self-reflect__get_more_results` - Pagination for search results
+- `mcp__claude-self-reflect__get_next_results` - Get next page of results for pagination (v3.2.0+)
+- `mcp__claude-self-reflect__get_full_conversation` - Get full JSONL file path for a conversation (v3.1.0+)
+
+### Deprecated/Non-existent Tools (Documentation Error):
+The following tools were documented but never implemented:
+- ~~`quick_search`~~ - Use `reflect_on_past` with `mode: "quick"` instead
+- ~~`search_summary`~~ - Use `reflect_on_past` with `mode: "summary"` instead
+- ~~`get_more_results`~~ - Use `get_next_results` for proper pagination
 
 ### Required Environment Variables:
 - `VOYAGE_KEY`: API key for Voyage AI embeddings (required)
@@ -143,12 +148,25 @@ mcp__claude-self-reflect__search_by_concept({
 
 **Quick search for overview**:
 ```javascript
-mcp__claude-self-reflect__quick_search({
+mcp__claude-self-reflect__reflect_on_past({
   query: "authentication bug",
+  mode: "quick",  // Quick mode returns count and top result only
   minScore: 0.7,
   project: null  // Uses current project
 })
 // Returns count and top result only
+```
+
+**Get more results (pagination)**:
+```javascript
+mcp__claude-self-reflect__get_next_results({
+  query: "original search query",  // Same query as initial search
+  offset: 5,  // Skip the first 5 results
+  limit: 3,   // Get 3 more results
+  minScore: 0.7,
+  project: null
+})
+// Returns results 6-8 from the original search
 ```
 
 ## 📊 Memory Decay Feature
