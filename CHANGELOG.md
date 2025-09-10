@@ -5,6 +5,27 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.3] - 2025-09-10
+
+### Fixed
+- **CLI Status Command**: Resolved broken `claude-self-reflect status` command in global npm installations
+  - **Root Cause**: CLI was incorrectly calling `python -m src --status` which doesn't exist
+  - **Solution**: Now directly calls `status.py` script as intended
+  - **Enhancement**: Added fallback support for both `venv` and `.venv` virtual environment directories
+  - **Impact**: Statusline integration in Claude Code now works correctly again
+  - **Files Modified**: `installer/cli.js` - Fixed status command execution path
+
+### Technical Details
+- **Error Pattern**: Command was attempting to use MCP server module interface for status
+- **Correct Pattern**: Direct execution of dedicated status script
+- **Virtual Environment**: Enhanced compatibility with different venv naming conventions
+- **User Experience**: Status command now returns proper JSON output for external tools
+
+### Validation
+- Status command tested with both `venv/` and `.venv/` directory structures
+- JSON output format validated for statusline integration compatibility
+- Global npm installation verified to work correctly
+
 ## [3.2.0] - 2025-09-09
 
 ### Added

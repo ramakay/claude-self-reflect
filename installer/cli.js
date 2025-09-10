@@ -29,13 +29,21 @@ async function setup() {
 }
 
 async function status() {
-  // Call the Python MCP server's --status command
+  // Call the Python status script directly
   const mcpServerPath = join(__dirname, '..', 'mcp-server');
-  const venvPython = join(mcpServerPath, 'venv', 'bin', 'python');
-  const mcpModule = join(mcpServerPath, 'src');
+  
+  // Check for venv or .venv
+  let venvPython = join(mcpServerPath, 'venv', 'bin', 'python');
+  try {
+    await fs.access(venvPython);
+  } catch {
+    venvPython = join(mcpServerPath, '.venv', 'bin', 'python');
+  }
+  
+  const statusScript = join(mcpServerPath, 'src', 'status.py');
   
   try {
-    const child = spawn(venvPython, ['-m', 'src', '--status'], {
+    const child = spawn(venvPython, [statusScript], {
       cwd: mcpServerPath,
       stdio: ['inherit', 'pipe', 'pipe']
     });
