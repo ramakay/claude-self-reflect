@@ -111,3 +111,15 @@ work/
 # FastEmbed cache directory
 .fastembed-cache/
 mcp-server/.fastembed-cache/
+
+# Articles and drafts (not for public repo)
+docs/articles/
+
+# Backup and temporary files
+qdrant_backup*
+qdrant_cleanup_manifest*
+voyage_test_log.txt
+import_log.txt
+prompt.txt
+backups/
+cache/

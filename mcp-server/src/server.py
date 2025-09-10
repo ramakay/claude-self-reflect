@@ -2065,8 +2065,8 @@ async def get_full_conversation(
         search_dirs.extend([
             base_path / project,
             base_path / sanitized_project,
-            base_path / f"-Users-ramakrishnanannaswamy-projects-{project}",
-            base_path / f"-Users-ramakrishnanannaswamy-projects-{sanitized_project}"
+            base_path / f"-Users-*-projects-{project}",
+            base_path / f"-Users-*-projects-{sanitized_project}"
         ])
     else:
         # Search all project directories

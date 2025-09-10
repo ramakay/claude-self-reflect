@@ -11,6 +11,8 @@ import hashlib
 import gc
 import ast
 import re
+import fcntl
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
@@ -45,6 +47,10 @@ MAX_CONCEPTS = 10
 MAX_AST_ELEMENTS = 30
 MAX_CODE_BLOCKS = 5
 MAX_ELEMENTS_PER_BLOCK = 10
+MAX_FILES_ANALYZED = 20
+MAX_FILES_EDITED = 20
+MAX_TOOLS_USED = 15
+MAX_CONCEPT_MESSAGES = 50
 
 # Robust cross-platform state file resolution
 def get_default_state_file():
@@ -171,7 +177,7 @@ def process_and_upload_chunk(messages: List[Dict[str, Any]], chunk_index: int,
         # Check variance is above threshold
         import statistics
         variance = statistics.variance(embedding)
-        if variance < 1e-6:
+        if variance < 1e-4:  # Less strict threshold for valid embeddings
             logger.warning(f"Low variance embedding detected: {variance}")
         
         # Validate dimension
@@ -194,7 +200,7 @@ def process_and_upload_chunk(messages: List[Dict[str, Any]], chunk_index: int,
             "start_role": messages[0].get("role", "unknown") if messages else "unknown",
             "message_count": len(messages),
             "total_messages": total_messages,
-            "message_index": message_indices[0] if message_indices else 0,
+            "message_index": message_indices[0] if message_indices else None,
             "message_indices": message_indices  # Store all indices in this chunk
         }
         
@@ -205,16 +211,22 @@ def process_and_upload_chunk(messages: List[Dict[str, Any]], chunk_index: int,
         # Create point
         point = PointStruct(
             id=int(point_id, 16) % (2**63),
-            vector=embeddings[0],
+            vector=embedding,  # Use validated embedding variable
             payload=payload
         )
         
-        # Upload immediately (no wait for better throughput)
-        client.upsert(
+        # Upload with wait to ensure persistence (with retries)
+        result = _with_retries(lambda: client.upsert(
             collection_name=collection_name,
             points=[point],
-            wait=False  # Don't wait for indexing to complete
-        )
+            wait=True  # Ensure operation completed before continuing
+        ))
+        
+        # Verify the operation completed successfully (handle enum or string representations)
+        status = getattr(result, 'status', None)
+        if status and 'completed' not in str(status).lower():
+            logger.error(f"Upsert not completed for {conversation_id}:{chunk_index}, status={status}")
+            return 0
         
         return 1
         
@@ -333,15 +345,15 @@ def extract_metadata_single_pass(file_path: str) -> tuple[Dict[str, Any], str, i
                                             if '```' in item.get('text', ''):
                                                 metadata['has_code_blocks'] = True
                                                 # Extract code for AST analysis with bounds checking
-                                                if len(metadata['ast_elements']) < 30:
+                                                if len(metadata['ast_elements']) < MAX_AST_ELEMENTS:
                                                     # Fix: More permissive regex to handle various fence formats
-                                                    code_blocks = re.findall(r'```[^\n]*\n?(.*?)```', item.get('text', ''), re.DOTALL)
-                                                    for code_block in code_blocks[:5]:  # Limit to 5 blocks
-                                                        if len(metadata['ast_elements']) >= 30:
+                                                    code_blocks = re.findall(r'```[^`]*?\n(.*?)```', item.get('text', ''), re.DOTALL)
+                                                    for code_block in code_blocks[:MAX_CODE_BLOCKS]:  # Use defined constant
+                                                        if len(metadata['ast_elements']) >= MAX_AST_ELEMENTS:
                                                             break
                                                         ast_elems = extract_ast_elements(code_block)
-                                                        for elem in list(ast_elems)[:10]:  # Limit elements per block
-                                                            if elem not in metadata['ast_elements'] and len(metadata['ast_elements']) < 30:
+                                                        for elem in list(ast_elems)[:MAX_ELEMENTS_PER_BLOCK]:  # Use defined constant
+                                                            if elem not in metadata['ast_elements'] and len(metadata['ast_elements']) < MAX_AST_ELEMENTS:
                                                                 metadata['ast_elements'].append(elem)
                                         
                                         elif item.get('type') == 'tool_use':
@@ -388,17 +400,17 @@ def extract_metadata_single_pass(file_path: str) -> tuple[Dict[str, Any], str, i
     
     # Extract concepts from collected text
     if all_text:
-        combined_text = ' '.join(all_text[:50])  # Limit to first 50 messages
+        combined_text = ' '.join(all_text[:MAX_CONCEPT_MESSAGES])  # Limit messages for concept extraction
         metadata['concepts'] = extract_concepts(combined_text)
     
     # Set total messages
     metadata['total_messages'] = message_count
     
     # Limit arrays
-    metadata['files_analyzed'] = metadata['files_analyzed'][:20]
-    metadata['files_edited'] = metadata['files_edited'][:20]
-    metadata['tools_used'] = metadata['tools_used'][:15]
-    metadata['ast_elements'] = metadata['ast_elements'][:30]
+    metadata['files_analyzed'] = metadata['files_analyzed'][:MAX_FILES_ANALYZED]
+    metadata['files_edited'] = metadata['files_edited'][:MAX_FILES_EDITED]
+    metadata['tools_used'] = metadata['tools_used'][:MAX_TOOLS_USED]
+    metadata['ast_elements'] = metadata['ast_elements'][:MAX_AST_ELEMENTS]
     
     return metadata, first_timestamp or datetime.now().isoformat(), message_count
 
@@ -406,15 +418,32 @@ def stream_import_file(jsonl_file: Path, collection_name: str, project_path: Pat
     """Stream import a single JSONL file without loading it into memory."""
     logger.info(f"Streaming import of {jsonl_file.name}")
     
+    # Delete existing points for this conversation to prevent stale data
+    conversation_id = jsonl_file.stem
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        client.delete(
+            collection_name=collection_name,
+            points_selector=Filter(
+                must=[FieldCondition(key="conversation_id", match=MatchValue(value=conversation_id))]
+            ),
+            wait=True
+        )
+        logger.info(f"Deleted existing points for conversation {conversation_id}")
+    except Exception as e:
+        logger.warning(f"Could not delete existing points for {conversation_id}: {e}")
+    
     # Extract metadata in first pass (lightweight)
     metadata, created_at, total_messages = extract_metadata_single_pass(str(jsonl_file))
+    
+    # Reset counters for each conversation (critical for correct indexing)
+    current_message_index = 0  # Must be reset before processing each conversation
     
     # Stream messages and process in chunks
     chunk_buffer = []
     chunk_index = 0
     total_chunks = 0
     conversation_id = jsonl_file.stem
-    current_message_index = 0
     
     try:
         with open(jsonl_file, 'r', encoding='utf-8') as f:
@@ -434,13 +463,24 @@ def stream_import_file(jsonl_file: Path, collection_name: str, project_path: Pat
                     if 'message' in data and data['message']:
                         msg = data['message']
                         if msg.get('role') and msg.get('content'):
-                            # Extract content
+                            # Extract content from various message types
                             content = msg['content']
                             if isinstance(content, list):
                                 text_parts = []
                                 for item in content:
-                                    if isinstance(item, dict) and item.get('type') == 'text':
-                                        text_parts.append(item.get('text', ''))
+                                    if isinstance(item, dict):
+                                        item_type = item.get('type', '')
+                                        if item_type == 'text':
+                                            text_parts.append(item.get('text', ''))
+                                        elif item_type == 'tool_use':
+                                            # Include tool use information
+                                            tool_name = item.get('name', 'unknown')
+                                            tool_input = str(item.get('input', ''))[:500]  # Limit size
+                                            text_parts.append(f"[Tool: {tool_name}] {tool_input}")
+                                        elif item_type == 'tool_result':
+                                            # Include tool results
+                                            result_content = str(item.get('content', ''))[:1000]  # Limit size
+                                            text_parts.append(f"[Result] {result_content}")
                                     elif isinstance(item, str):
                                         text_parts.append(item)
                                 content = '\n'.join(text_parts)
@@ -448,8 +488,8 @@ def stream_import_file(jsonl_file: Path, collection_name: str, project_path: Pat
                             if content:
                                 # Track message index for user/assistant messages
                                 if msg['role'] in ['user', 'assistant']:
-                                    current_message_index += 1
                                     message_idx = current_message_index
+                                    current_message_index += 1
                                 else:
                                     message_idx = 0
                                 
@@ -475,6 +515,51 @@ def stream_import_file(jsonl_file: Path, collection_name: str, project_path: Pat
                                     # Log progress
                                     if chunk_index % 10 == 0:
                                         logger.info(f"Processed {chunk_index} chunks from {jsonl_file.name}")
+                
+                    # Handle top-level tool_result/tool_use events (no message wrapper)
+                    entry_type = data.get('type')
+                    if entry_type in ('tool_result', 'tool_use'):
+                        text_parts = []
+                        if entry_type == 'tool_use':
+                            tool_name = data.get('name', 'unknown')
+                            tool_input = str(data.get('input', ''))[:500]
+                            text_parts.append(f"[Tool: {tool_name}] {tool_input}")
+                        elif entry_type == 'tool_result':
+                            # Common structures: either 'content' (list/str) or 'result'
+                            result_content = data.get('content')
+                            if isinstance(result_content, list):
+                                # flatten to text
+                                flat = []
+                                for itm in result_content:
+                                    if isinstance(itm, dict) and itm.get('type') == 'text':
+                                        flat.append(itm.get('text', ''))
+                                    elif isinstance(itm, str):
+                                        flat.append(itm)
+                                result_content = "\n".join(flat)
+                            if not result_content:
+                                result_content = data.get('result', '')  # fallback key used by some tools
+                            text_parts.append(f"[Result] {str(result_content)[:1000]}")
+                        
+                        content = "\n".join([p for p in text_parts if p])
+                        if content:
+                            # Track message index for summary format too
+                            message_idx = current_message_index
+                            current_message_index += 1
+                            
+                            chunk_buffer.append({
+                                'role': entry_type,
+                                'content': content,
+                                'message_index': message_idx
+                            })
+                            if len(chunk_buffer) >= MAX_CHUNK_SIZE:
+                                chunks = process_and_upload_chunk(
+                                    chunk_buffer, chunk_index, conversation_id,
+                                    created_at, metadata, collection_name, project_path, total_messages
+                                )
+                                total_chunks += chunks
+                                chunk_buffer = []
+                                chunk_index += 1
+                                gc.collect()
                                     
                 except json.JSONDecodeError:
                     logger.debug(f"Skipping invalid JSON at line {line_num}")
@@ -496,14 +581,35 @@ def stream_import_file(jsonl_file: Path, collection_name: str, project_path: Pat
         logger.error(f"Failed to import {jsonl_file}: {e}")
         return 0
 
+def _locked_open(path, mode):
+    """Open file with exclusive lock for concurrent safety."""
+    f = open(path, mode)
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    except Exception:
+        f.close()
+        raise
+    return f
+
+def _with_retries(fn, attempts=3, base_sleep=0.5):
+    """Execute function with retries and exponential backoff."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if i == attempts - 1:
+                raise
+            time.sleep(base_sleep * (2 ** i))
+            logger.debug(f"Retrying after error: {e}")
+
 def load_state() -> dict:
-    """Load import state."""
+    """Load import state with file locking."""
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, 'r') as f:
+            with _locked_open(STATE_FILE, 'r') as f:
                 return json.load(f)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to load state: {e}")
     return {"imported_files": {}}
 
 def save_state(state: dict):
@@ -513,10 +619,12 @@ def save_state(state: dict):
     if state_dir:
         os.makedirs(state_dir, exist_ok=True)
     
-    # Use atomic write to prevent corruption during crashes
+    # Use atomic write with locking to prevent corruption
     temp_file = f"{STATE_FILE}.tmp"
-    with open(temp_file, 'w') as f:
+    with _locked_open(temp_file, 'w') as f:
         json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
     
     # Atomic rename (on POSIX systems)
     os.replace(temp_file, STATE_FILE)
@@ -527,9 +635,23 @@ def should_import_file(file_path: Path, state: dict) -> bool:
     if file_str in state.get("imported_files", {}):
         file_info = state["imported_files"][file_str]
         last_modified = file_path.stat().st_mtime
-        if file_info.get("last_modified") == last_modified:
-            logger.info(f"Skipping unchanged file: {file_path.name}")
-            return False
+        
+        # Check if file has been modified
+        if file_info.get("last_modified") != last_modified:
+            logger.info(f"File modified, will re-import: {file_path.name}")
+            return True
+            
+        # Check for suspiciously low chunk counts (likely failed imports)
+        chunks = file_info.get("chunks", 0)
+        file_size_kb = file_path.stat().st_size / 1024
+        
+        # Heuristic: Files > 10KB should have more than 2 chunks
+        if file_size_kb > 10 and chunks <= 2:
+            logger.warning(f"File has suspiciously low chunks ({chunks}) for size {file_size_kb:.1f}KB, will re-import: {file_path.name}")
+            return True
+            
+        logger.info(f"Skipping unchanged file: {file_path.name}")
+        return False
     return True
 
 def update_file_state(file_path: Path, state: dict, chunks: int):
@@ -585,12 +707,37 @@ def main():
             if should_import_file(jsonl_file, state):
                 chunks = stream_import_file(jsonl_file, collection_name, project_dir)
                 if chunks > 0:
-                    update_file_state(jsonl_file, state, chunks)
-                    save_state(state)
-                    total_imported += 1
+                    # Verify data is actually in Qdrant before marking as imported
+                    from qdrant_client.models import Filter, FieldCondition, MatchValue
+                    try:
+                        conversation_id = jsonl_file.stem
+                        count_result = _with_retries(lambda: client.count(
+                            collection_name=collection_name,
+                            count_filter=Filter(
+                                must=[FieldCondition(key="conversation_id", 
+                                                   match=MatchValue(value=conversation_id))]
+                            ),
+                            exact=True  # Ensure exact count, not approximation
+                        ))
+                        actual_count = count_result.count if hasattr(count_result, 'count') else 0
+                        
+                        if actual_count > 0:
+                            logger.info(f"Verified {actual_count} points in Qdrant for {conversation_id}")
+                            update_file_state(jsonl_file, state, chunks)
+                            save_state(state)
+                            total_imported += 1
+                        else:
+                            logger.error(f"No points found in Qdrant for {conversation_id} despite {chunks} chunks processed - not marking as imported")
+                    except Exception as e:
+                        logger.error(f"Failed to verify Qdrant points for {jsonl_file.name}: {e}")
+                        # Don't mark as imported if we can't verify
                     
                     # Force GC after each file
                     gc.collect()
+                else:
+                    # Critical fix: Don't mark files with 0 chunks as imported
+                    # This allows retry on next run
+                    logger.warning(f"File produced 0 chunks, not marking as imported: {jsonl_file.name}")
     
     logger.info(f"Import complete: processed {total_imported} files")
 
