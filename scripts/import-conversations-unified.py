@@ -25,12 +25,20 @@ sys.path.insert(0, str(scripts_dir))
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, Distance, VectorParams
 
-# Import the correct normalize_project_name from utils
+# Import normalize_project_name from shared module
+# Add parent directory to path to import shared module
+sys.path.insert(0, str(Path(__file__).parent.parent))
 try:
-    from utils import normalize_project_name
+    from shared.normalization import normalize_project_name
 except ImportError as e:
-    logging.error(f"Failed to import normalize_project_name from utils: {e}")
-    sys.exit(1)
+    logging.error(f"Failed to import normalize_project_name from shared module: {e}")
+    # Fall back to local utils if shared module not found
+    try:
+        from utils import normalize_project_name
+        logging.warning("Using legacy utils.normalize_project_name - consider updating")
+    except ImportError:
+        logging.error("Could not import normalize_project_name from any source")
+        sys.exit(1)
 
 # Set up logging
 logging.basicConfig(

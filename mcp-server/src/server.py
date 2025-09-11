@@ -10,10 +10,22 @@ import numpy as np
 import hashlib
 import time
 import logging
+import math
 from xml.sax.saxutils import escape
 
 from fastmcp import FastMCP, Context
-from .utils import normalize_project_name
+
+# Import from shared module for consistent normalization
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+try:
+    from shared.normalization import normalize_project_name
+except ImportError:
+    # Fall back to local utils if shared module not found
+    from .utils import normalize_project_name
+    import logging
+    logging.warning("Using legacy utils.normalize_project_name - shared module not found")
+
 from .project_resolver import ProjectResolver
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient, models
@@ -571,7 +583,7 @@ async def reflect_on_past(
     ctx: Context,
     query: str = Field(description="The search query to find semantically similar conversations"),
     limit: int = Field(default=5, description="Maximum number of results to return"),
-    min_score: float = Field(default=0.7, description="Minimum similarity score (0-1)"),
+    min_score: float = Field(default=0.3, description="Minimum similarity score (0-1)"),
     use_decay: Union[int, str] = Field(default=-1, description="Apply time-based decay: 1=enable, 0=disable, -1=use environment default (accepts int or str)"),
     project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects."),
     include_raw: bool = Field(default=False, description="Include raw Qdrant payload data for debugging (increases response size)"),
@@ -669,8 +681,10 @@ async def reflect_on_past(
         # Filter collections by project if not searching all
         project_collections = []  # Define at this scope for later use
         if target_project != 'all':
-            # Use ProjectResolver to find collections for this project
-            resolver = ProjectResolver(qdrant_client)
+            # Use ProjectResolver with sync client (resolver expects sync operations)
+            from qdrant_client import QdrantClient as SyncQdrantClient
+            sync_client = SyncQdrantClient(url=QDRANT_URL)
+            resolver = ProjectResolver(sync_client)
             project_collections = resolver.find_collections_for_project(target_project)
             
             if not project_collections:
@@ -739,33 +753,32 @@ async def reflect_on_past(
                     await ctx.debug(f"Using NATIVE Qdrant decay (new API) for {collection_name}")
                     
                     # Build the query with native Qdrant decay formula using newer API
-                    query_obj = Query(
-                        nearest=query_embedding,
-                        formula=Formula(
+                    # Convert half-life to seconds (Qdrant uses seconds for datetime)
+                    half_life_seconds = DECAY_SCALE_DAYS * 24 * 60 * 60
+                    
+                    # Build query using proper Python models as per Qdrant docs
+                    from qdrant_client import models
+                    
+                    query_obj = models.FormulaQuery(
+                        formula=models.SumExpression(
                             sum=[
-                                # Original similarity score
-                                Expression(variable="score"),
-                                # Decay boost term
-                                Expression(
-                                    mult=MultExpression(
-                                        mult=[
-                                            # Decay weight
-                                            Expression(constant=DECAY_WEIGHT),
-                                            # Exponential decay function
-                                            Expression(
-                                                exp_decay=DecayParamsExpression(
-                                                    # Use timestamp field for decay
-                                                    x=Expression(datetime_key="timestamp"),
-                                                    # Decay from current time (server-side)
-                                                    target=Expression(datetime="now"),
-                                                    # Scale in milliseconds
-                                                    scale=DECAY_SCALE_DAYS * 24 * 60 * 60 * 1000,
-                                                    # Standard exponential decay midpoint
-                                                    midpoint=0.5
-                                                )
+                                "$score",  # Original similarity score
+                                models.MultExpression(
+                                    mult=[
+                                        DECAY_WEIGHT,  # Weight multiplier
+                                        models.ExpDecayExpression(
+                                            exp_decay=models.DecayParamsExpression(
+                                                x=models.DatetimeKeyExpression(
+                                                    datetime_key="timestamp"  # Payload field with datetime
+                                                ),
+                                                target=models.DatetimeExpression(
+                                                    datetime="now"  # Current time on server
+                                                ),
+                                                scale=half_life_seconds,  # Scale in seconds
+                                                midpoint=0.5  # Half-life semantics
                                             )
-                                        ]
-                                    )
+                                        )
+                                    ]
                                 )
                             ]
                         )
@@ -776,36 +789,32 @@ async def reflect_on_past(
                         collection_name=collection_name,
                         query=query_obj,
                         limit=limit,
-                        score_threshold=min_score,
                         with_payload=True
+                        # No score_threshold - let Qdrant's decay formula handle relevance
                     )
                 elif should_use_decay and USE_NATIVE_DECAY and not NATIVE_DECAY_AVAILABLE:
                     # Use native Qdrant decay with older API
                     await ctx.debug(f"Using NATIVE Qdrant decay (legacy API) for {collection_name}")
                     
+                    # Convert half-life to seconds (Qdrant uses seconds for datetime)
+                    half_life_seconds = DECAY_SCALE_DAYS * 24 * 60 * 60
+                    
                     # Build the query with native Qdrant decay formula using older API
+                    # Use the same models but with FormulaQuery
                     query_obj = FormulaQuery(
                         nearest=query_embedding,
                         formula=SumExpression(
                             sum=[
-                                # Original similarity score
-                                'score',  # Variable expression can be a string
-                                # Decay boost term
+                                "$score",  # Original similarity score
                                 {
-                                    'mult': [
-                                        # Decay weight (constant as float)
-                                        DECAY_WEIGHT,
-                                        # Exponential decay function
+                                    "mult": [
+                                        DECAY_WEIGHT,  # Weight multiplier
                                         {
-                                            'exp_decay': DecayParamsExpression(
-                                                # Use timestamp field for decay
-                                                x=DatetimeKeyExpression(datetime_key='timestamp'),
-                                                # Decay from current time (server-side)
-                                                target=DatetimeExpression(datetime='now'),
-                                                # Scale in milliseconds
-                                                scale=DECAY_SCALE_DAYS * 24 * 60 * 60 * 1000,
-                                                # Standard exponential decay midpoint
-                                                midpoint=0.5
+                                            "exp_decay": DecayParamsExpression(
+                                                x=DatetimeKeyExpression(datetime_key="timestamp"),
+                                                target=DatetimeExpression(datetime="now"),
+                                                scale=half_life_seconds,  # Scale in seconds
+                                                midpoint=0.5  # Half-life semantics
                                             )
                                         }
                                     ]
@@ -819,8 +828,8 @@ async def reflect_on_past(
                         collection_name=collection_name,
                         query=query_obj,
                         limit=limit,
-                        score_threshold=min_score,
                         with_payload=True
+                        # No score_threshold - let Qdrant's decay formula handle relevance
                     )
                     
                     # Process results from native decay search
@@ -916,11 +925,14 @@ async def reflect_on_past(
                                     timestamp = timestamp.replace(tzinfo=timezone.utc)
                                 age_ms = (now - timestamp).total_seconds() * 1000
                                 
-                                # Calculate decay factor
-                                decay_factor = np.exp(-age_ms / scale_ms)
+                                # Calculate decay factor using proper half-life formula
+                                # For half-life H: decay = exp(-ln(2) * age / H)
+                                ln2 = math.log(2)
+                                decay_factor = math.exp(-ln2 * age_ms / scale_ms)
                                 
-                                # Apply decay formula
-                                adjusted_score = point.score + (DECAY_WEIGHT * decay_factor)
+                                # Apply multiplicative decay formula to keep scores bounded [0, 1]
+                                # adjusted = score * ((1 - weight) + weight * decay)
+                                adjusted_score = point.score * ((1 - DECAY_WEIGHT) + DECAY_WEIGHT * decay_factor)
                                 
                                 # Debug: show the calculation
                                 age_days = age_ms / (24 * 60 * 60 * 1000)
@@ -1001,12 +1013,13 @@ async def reflect_on_past(
                         ))
                 else:
                     # Standard search without decay
+                    # Let Qdrant handle scoring natively
                     results = await qdrant_client.search(
                         collection_name=collection_name,
                         query_vector=query_embedding,
                         limit=limit * 2,  # Get more results to account for filtering
-                        score_threshold=min_score * 0.9,  # Slightly lower threshold to catch v1 chunks
                         with_payload=True
+                        # No score_threshold - let Qdrant decide what's relevant
                     )
                     
                     for point in results:
@@ -1691,7 +1704,7 @@ async def store_reflection(
 async def quick_search(
     ctx: Context,
     query: str = Field(description="The search query to find semantically similar conversations"),
-    min_score: float = Field(default=0.7, description="Minimum similarity score (0-1)"),
+    min_score: float = Field(default=0.3, description="Minimum similarity score (0-1)"),
     project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects.")
 ) -> str:
     """Quick search that returns only the count and top result for fast overview."""
@@ -1737,7 +1750,7 @@ async def get_more_results(
     query: str = Field(description="The original search query"),
     offset: int = Field(default=3, description="Number of results to skip (for pagination)"),
     limit: int = Field(default=3, description="Number of additional results to return"),
-    min_score: float = Field(default=0.7, description="Minimum similarity score (0-1)"),
+    min_score: float = Field(default=0.3, description="Minimum similarity score (0-1)"),
     project: Optional[str] = Field(default=None, description="Search specific project only")
 ) -> str:
     """Get additional search results after an initial search (pagination support)."""
@@ -1772,8 +1785,9 @@ async def search_by_file(
     collections = await get_all_collections() if not project else []
     
     if project and project != 'all':
-        # Filter collections for specific project
-        project_hash = hashlib.md5(project.encode()).hexdigest()[:8]
+        # Filter collections for specific project - normalize first!
+        normalized_project = normalize_project_name(project)
+        project_hash = hashlib.md5(normalized_project.encode()).hexdigest()[:8]
         collection_prefix = f"conv_{project_hash}_"
         collections = [c for c in await get_all_collections() if c.startswith(collection_prefix)]
     elif project == 'all':
@@ -2137,7 +2151,7 @@ async def get_next_results(
     query: str = Field(description="The original search query"),
     offset: int = Field(default=3, description="Number of results to skip (for pagination)"),
     limit: int = Field(default=3, description="Number of additional results to return"),
-    min_score: float = Field(default=0.7, description="Minimum similarity score (0-1)"),
+    min_score: float = Field(default=0.3, description="Minimum similarity score (0-1)"),
     project: Optional[str] = Field(default=None, description="Search specific project only")
 ) -> str:
     """Get additional search results after an initial search (pagination support)."""
@@ -2152,9 +2166,10 @@ async def get_next_results(
             # Search all collections if project is "all" or not specified
             collections = await get_all_collections()
         else:
-            # Search specific project
+            # Search specific project - normalize first!
             all_collections = await get_all_collections()
-            project_hash = hashlib.md5(project.encode()).hexdigest()[:8]
+            normalized_project = normalize_project_name(project)
+            project_hash = hashlib.md5(normalized_project.encode()).hexdigest()[:8]
             collections = [
                 c for c in all_collections 
                 if c.startswith(f"conv_{project_hash}_")
@@ -2196,9 +2211,12 @@ async def get_next_results(
                     if use_decay_bool and 'timestamp' in payload:
                         try:
                             timestamp = datetime.fromisoformat(payload['timestamp'].replace('Z', '+00:00'))
-                            age_days = (datetime.now(timezone.utc) - timestamp).days
-                            decay_factor = DECAY_WEIGHT + (1 - DECAY_WEIGHT) * math.exp(-age_days / DECAY_SCALE_DAYS)
-                            score = score * decay_factor
+                            age_days = (datetime.now(timezone.utc) - timestamp).total_seconds() / (24 * 60 * 60)
+                            # Use consistent half-life formula: decay = exp(-ln(2) * age / half_life)
+                            ln2 = math.log(2)
+                            decay_factor = math.exp(-ln2 * age_days / DECAY_SCALE_DAYS)
+                            # Apply multiplicative formula: score * ((1 - weight) + weight * decay)
+                            score = score * ((1 - DECAY_WEIGHT) + DECAY_WEIGHT * decay_factor)
                         except (ValueError, TypeError) as e:
                             # Log but continue - timestamp format issue shouldn't break search
                             logger.debug(f"Failed to apply decay for timestamp {payload.get('timestamp')}: {e}")

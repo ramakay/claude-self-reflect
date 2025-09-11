@@ -116,11 +116,9 @@ Works with [Claude Code Statusline](https://github.com/sirmalloc/ccstatusline) -
 <summary><b>MCP Tools Available to Claude</b></summary>
 
 **Search & Memory Tools:**
-- `reflect_on_past` - Search past conversations using semantic similarity with time decay
+- `reflect_on_past` - Search past conversations using semantic similarity with time decay (supports quick/summary modes)
 - `store_reflection` - Store important insights or learnings for future reference
-- `quick_search` - Fast search returning only count and top result
-- `search_summary` - Get aggregated insights without individual details
-- `get_more_results` - Paginate through additional search results
+- `get_next_results` - Paginate through additional search results
 - `search_by_file` - Find conversations that analyzed specific files
 - `search_by_concept` - Search for conversations about development concepts
 - `get_full_conversation` - Retrieve complete JSONL conversation files (v2.8.8)
@@ -288,11 +286,11 @@ npm uninstall -g claude-self-reflect
 ## What's New
 
 <details>
-<summary>v2.8.8 - Latest Release</summary>
+<summary>v3.2.4 - Latest Release</summary>
 
-- **Full Conversation Access**: New `get_full_conversation` tool provides complete JSONL files instead of 200-char excerpts
-- **95% Value Increase**: Agents can now access entire conversations with full implementation details
-- **Direct File Access**: Returns absolute paths for efficient reading with standard tools
+- **CRITICAL: Search Threshold Removal**: Eliminated artificial 0.7+ thresholds that blocked broad searches like "docker", "MCP", "python"
+- **Shared Normalization Module**: Created centralized project name normalization preventing search failures
+- **Memory Decay Fixes**: Corrected mathematical errors in exponential decay calculation
 
 </details>
 

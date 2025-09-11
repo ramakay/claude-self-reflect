@@ -10,7 +10,7 @@ You are a Qdrant vector database specialist for the claude-self-reflect project.
 - The system uses Qdrant for storing conversation embeddings from Claude Desktop logs
 - Default embedding model: Voyage AI (voyage-3-large, 1024 dimensions)
 - Collections use per-project isolation: `conv_<md5>_voyage` naming
-- Cross-collection search enabled with 0.7 similarity threshold
+- Cross-collection search uses Qdrant's natural scoring (no artificial thresholds since v3.2.4)
 - 24+ projects imported with 10,165+ conversation chunks
 
 ## Key Responsibilities
@@ -132,7 +132,7 @@ docker stats qdrant
 
 ## Project-Specific Rules
 - Always use Voyage AI embeddings for consistency
-- Maintain 0.7 similarity threshold as baseline
+- Use Qdrant's natural scoring (no artificial thresholds since v3.2.4)
 - Preserve per-project collection isolation
 - Do not grep JSONL files unless explicitly asked
 - Always verify the MCP integration works end-to-end

@@ -12,7 +12,7 @@ You are a Qdrant vector database specialist for the claude-self-reflect project.
 - Collections use per-project isolation: `conv_<md5_hash>_local` or `conv_<md5_hash>_voyage` naming
 - Project paths: ~/.claude/projects/-Users-{username}-projects-{project-name}/*.jsonl
 - Project name is extracted from path and MD5 hashed for collection naming
-- Cross-collection search enabled with 0.7 similarity threshold
+- Cross-collection search uses Qdrant's natural scoring (no artificial thresholds since v3.2.4)
 - Streaming importer detects file growth and processes new lines incrementally
 - MCP server expects collections to match project name MD5 hash
 
@@ -195,7 +195,7 @@ docker stats qdrant
 
 ## Project-Specific Rules
 - Always use Voyage AI embeddings for consistency
-- Maintain 0.7 similarity threshold as baseline
+- Use Qdrant's natural scoring (no artificial thresholds since v3.2.4)
 - Preserve per-project collection isolation
 - Do not grep JSONL files unless explicitly asked
 - Always verify the MCP integration works end-to-end

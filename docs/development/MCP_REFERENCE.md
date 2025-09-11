@@ -102,7 +102,6 @@ The following tools were documented but never implemented:
 mcp__claude-self-reflect__reflect_on_past({
   query: "your search query",
   limit: 5,
-  minScore: 0.7,
   useDecay: false  // Optional: enable memory decay (default: false)
 })
 ```
@@ -112,7 +111,6 @@ mcp__claude-self-reflect__reflect_on_past({
 mcp__claude-self-reflect__reflect_on_past({
   query: "recent debugging fixes",
   limit: 10,
-  minScore: 0.6,
   useDecay: true  // Prioritize recent conversations
 })
 ```
@@ -151,7 +149,6 @@ mcp__claude-self-reflect__search_by_concept({
 mcp__claude-self-reflect__reflect_on_past({
   query: "authentication bug",
   mode: "quick",  // Quick mode returns count and top result only
-  minScore: 0.7,
   project: null  // Uses current project
 })
 // Returns count and top result only
@@ -163,7 +160,6 @@ mcp__claude-self-reflect__get_next_results({
   query: "original search query",  // Same query as initial search
   offset: 5,  // Skip the first 5 results
   limit: 3,   // Get 3 more results
-  minScore: 0.7,
   project: null
 })
 // Returns results 6-8 from the original search
@@ -235,8 +231,8 @@ mcp__claude-self-reflect__reflect_on_past({
 ### Issue: Search returns no results
 1. Check if collections exist: `python scripts/check-collections.py`
 2. Verify conversations were imported
-3. Try lowering minScore parameter
-4. Check if using correct project name
+3. Check if using correct project name
+4. Ensure query is specific enough (v3.2.4+ removed artificial thresholds)
 
 ## 📋 Agent Checklist
 

@@ -128,7 +128,7 @@ Fast search that returns only the count and top result. Perfect for quick checks
 // Quick overview of matches
 {
   query: "authentication patterns",
-  min_score: 0.5,  // Optional, defaults to 0.7
+  min_score: 0.5,  // Optional (v3.2.4+ ignores this - uses natural scoring)
   project: "all"    // Optional, defaults to current project
 }
 ```
@@ -165,7 +165,7 @@ Pagination support for getting additional results after an initial search.
   query: "original search query",  // Must match original query
   offset: 3,                      // Skip first 3 results
   limit: 3,                       // Get next 3 results
-  min_score: 0.7,                 // Optional
+  min_score: 0.7,                 // Optional (v3.2.4+ ignores this)
   project: "all"                  // Optional
 }
 ```

@@ -5,6 +5,42 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.4] - 2025-09-10
+
+### Fixed
+- **CRITICAL: Search Threshold Removal** - Eliminated artificial 0.7+ score thresholds that blocked broad searches
+  - **Root Cause**: Hardcoded minimum score thresholds prevented searches for common terms like "docker", "MCP", "python"
+  - **Impact**: Searches for broad technical concepts were returning 0 results despite relevant conversations existing
+  - **Solution**: Removed artificial thresholds and let Qdrant handle natural scoring for better search coverage
+  - **Files Modified**: `mcp-server/src/server.py` - Removed minScore filtering in search operations
+  - **User Experience**: Searches now return results for previously blocked queries, dramatically improving search utility
+
+### Added
+- **Shared Normalization Module** - Created centralized project name normalization to prevent search failures
+  - **New Module**: `shared/normalization.py` - Single source of truth for project name normalization
+  - **Purpose**: Ensures consistent collection naming between import scripts and MCP server
+  - **Impact**: Prevents search failures due to mismatched collection names across different components
+  - **Integration**: Used by both import-conversations-unified.py and MCP server for consistent hashing
+
+### Changed
+- **Memory Decay Implementation** - Fixed math errors and implemented native Qdrant decay calculation
+  - **Root Cause**: Previous decay implementation had mathematical errors in exponential calculation
+  - **Solution**: Corrected decay formula with proper imports and native Qdrant model usage
+  - **Files Modified**: `mcp-server/src/server.py` - Fixed decay calculation with proper math.exp import
+  - **Performance**: More accurate time-based relevance scoring with corrected exponential decay
+
+### Technical Details
+- **Search Behavior**: Searches now rely on Qdrant's natural scoring without artificial threshold filtering
+- **Collection Consistency**: Shared normalization prevents import/search mismatches
+- **Memory Decay**: Fixed exponential decay formula provides accurate time-based relevance weighting
+- **Backward Compatibility**: All existing collections and searches remain functional
+
+### Validation
+- Search functionality tested with previously failing queries ("docker", "MCP", "python")
+- Collection normalization verified across different project path formats
+- Memory decay calculation validated with proper mathematical implementation
+- No breaking changes to existing search behavior or stored data
+
 ## [3.2.3] - 2025-09-10
 
 ### Fixed

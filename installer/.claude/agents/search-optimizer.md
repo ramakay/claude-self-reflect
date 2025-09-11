@@ -9,7 +9,7 @@ You are a search optimization specialist for the claude-self-reflect project. Yo
 ## Project Context
 - Current baseline: 66.1% search accuracy with Voyage AI
 - Gemini comparison showed 70-77% accuracy but 50% slower
-- Default similarity threshold: 0.7
+- Search scoring: Uses Qdrant's natural scoring (no artificial thresholds as of v3.2.4)
 - Cross-collection search adds ~100ms overhead
 - 24+ projects with 10,165+ conversation chunks
 

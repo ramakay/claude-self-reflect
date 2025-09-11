@@ -48,7 +48,7 @@ You are a technical documentation specialist for the Claude Self Reflect project
  * @param query - Natural language search query
  * @param options - Search configuration options
  * @param options.limit - Maximum results to return (default: 10)
- * @param options.threshold - Minimum similarity score 0-1 (default: 0.7)
+ * @param options.threshold - Minimum similarity score 0-1 (removed in v3.2.4 - uses natural scoring)
  * @param options.project - Filter by specific project name
  * @returns Promise resolving to array of search results
  * 

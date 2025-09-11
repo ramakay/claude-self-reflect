@@ -2,7 +2,16 @@
 
 import hashlib
 import logging
+import sys
 from pathlib import Path
+
+# Import from shared module for consistent normalization
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+try:
+    from shared.normalization import normalize_project_name as shared_normalize
+except ImportError:
+    shared_normalize = None
+    logging.warning("Could not import shared normalization module")
 
 logger = logging.getLogger(__name__)
 
@@ -20,32 +29,36 @@ class ProjectNormalizer:
         """
         Normalize a project path to a consistent project name.
         
-        CRITICAL: This must match the implementation in utils.py
+        Uses the shared normalization module to ensure consistency
+        across all components.
         
         Examples:
         - "-Users-name-projects-claude-self-reflect" -> "claude-self-reflect"
         - "claude-self-reflect" -> "claude-self-reflect"
         - "/path/to/-Users-name-projects-myapp" -> "myapp"
         """
-        # Get the final component of the path
-        if '/' in project_path:
-            final_component = project_path.split('/')[-1]
-        else:
-            final_component = project_path
+        # Use shared normalization if available
+        if shared_normalize:
+            return shared_normalize(project_path)
+        
+        # Fallback implementation (matches shared module)
+        if not project_path:
+            return ""
+        
+        path = Path(project_path.rstrip('/'))
+        final_component = path.name
         
         # Handle Claude's dash-separated format
         if final_component.startswith('-') and 'projects' in final_component:
-            # Find the last occurrence of 'projects-'
             idx = final_component.rfind('projects-')
             if idx != -1:
-                # Extract everything after 'projects-'
                 project_name = final_component[idx + len('projects-'):]
                 logger.debug(f"Normalized '{project_path}' to '{project_name}'")
                 return project_name
         
         # Already normalized or different format
         logger.debug(f"Project path '{project_path}' already normalized")
-        return final_component
+        return final_component if final_component else path.parent.name
     
     def get_project_name(self, file_path: Path) -> str:
         """

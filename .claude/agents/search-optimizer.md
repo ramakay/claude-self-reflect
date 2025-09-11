@@ -9,7 +9,7 @@ You are a search optimization specialist for the claude-self-reflect project. Yo
 ## Project Context
 - Current baseline: 66.1% search accuracy with Voyage AI
 - Gemini comparison showed 70-77% accuracy but 50% slower
-- Default similarity threshold: 0.7
+- Search scoring: Uses Qdrant's natural scoring (no artificial thresholds as of v3.2.4)
 - Cross-collection search adds ~100ms overhead
 - 24+ projects with 10,165+ conversation chunks
 
@@ -71,9 +71,11 @@ python scripts/analyze-search-quality.py
 ### Threshold Tuning
 ```bash
 # Test different thresholds
-for threshold in 0.5 0.6 0.7 0.8 0.9; do
-  echo "Testing threshold: $threshold"
-  SIMILARITY_THRESHOLD=$threshold npm test
+# Note: As of v3.2.4, artificial thresholds removed
+# Focus on embedding model comparison instead
+for model in voyage openai gemini; do
+  echo "Testing model: $model"
+  EMBEDDING_MODEL=$model npm test
 done
 
 # Find optimal threshold
@@ -237,7 +239,7 @@ def calculate_mrr(queries, results):
 interface ABTestConfig {
   control: {
     model: 'voyage',
-    threshold: 0.7,
+    scoring: 'natural',
     limit: 10
   },
   variant: {
@@ -285,7 +287,7 @@ async function abTestSearch(query: string, userId: string) {
 ### Recommended Settings
 ```env
 # Search Configuration
-SIMILARITY_THRESHOLD=0.7
+# SIMILARITY_THRESHOLD removed in v3.2.4 - uses natural scoring
 SEARCH_LIMIT=10
 CROSS_COLLECTION_LIMIT=5
 
@@ -300,7 +302,7 @@ SAMPLE_RATE=0.1
 ```
 
 ## Project-Specific Rules
-- Maintain 0.7 similarity threshold as baseline
+- Use Qdrant's natural scoring (no artificial thresholds since v3.2.4)
 - Always compare against Voyage AI baseline (66.1%)
 - Consider search latency alongside accuracy
 - Test with real conversation data

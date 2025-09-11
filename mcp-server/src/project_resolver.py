@@ -6,10 +6,20 @@ Handles mapping between user-friendly names and internal collection names.
 import hashlib
 import logging
 import re
+import sys
 from pathlib import Path
 from typing import List, Dict, Optional, Set
 from time import time
 from qdrant_client import QdrantClient
+
+# Import from shared module for consistent normalization
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+try:
+    from shared.normalization import normalize_project_name
+except ImportError:
+    # Fall back to creating local version if shared module not found
+    logging.warning("Could not import shared normalization module")
+    normalize_project_name = None
 
 logger = logging.getLogger(__name__)
 
@@ -244,59 +254,31 @@ class ProjectResolver:
     def _normalize_project_name(self, project_path: str) -> str:
         """
         Normalize project name for consistent hashing.
-        Extracts the actual project name from various path formats.
+        Uses the shared normalization module to ensure consistency
+        with import scripts.
         """
+        # Use the shared normalization function if available
+        if normalize_project_name:
+            return normalize_project_name(project_path)
+        
+        # Fallback implementation - EXACT copy of shared module
         if not project_path:
             return ""
         
-        # Remove trailing slashes
-        project_path = project_path.rstrip('/')
+        path = Path(project_path.rstrip('/'))
         
-        # Handle Claude logs format (starts with dash)
-        if project_path.startswith('-'):
-            # Split on dashes but don't convert to path separators
-            # This preserves project names that contain dashes
-            path_str = project_path[1:]  # Remove leading dash
-            path_parts = path_str.split('-')  # Split on dashes, not path separators
-            
-            # Look for common project parent directories
-            project_parents = {'projects', 'code', 'Code', 'repos', 'repositories', 
-                              'dev', 'Development', 'work', 'src', 'github'}
-            
-            # Find the project name after a known parent directory
-            for i, part in enumerate(path_parts):
-                if part.lower() in project_parents and i + 1 < len(path_parts):
-                    # Return everything after the parent directory
-                    remaining = path_parts[i + 1:]
-                    
-                    # Use segment-based approach for complex paths
-                    # Return the most likely project name from remaining segments
-                    if remaining:
-                        # If it's a single segment, return it
-                        if len(remaining) == 1:
-                            return remaining[0]
-                        # For multiple segments, look for project-like patterns
-                        for r in remaining:
-                            r_lower = r.lower()
-                            # Prioritize segments with project indicators
-                            if any(ind in r_lower for ind in ['app', 'service', 'project', 'api', 'client']):
-                                return r
-                    
-                    # Otherwise join remaining parts
-                    return '-'.join(remaining)
-            
-            # Fallback: use the last component
-            return path_parts[-1] if path_parts else project_path
+        # Extract the final directory name
+        final_component = path.name
         
-        # For regular paths or simple names
-        path_obj = Path(project_path)
+        # If it's Claude's dash-separated format, extract project name
+        if final_component.startswith('-') and 'projects' in final_component:
+            # Find the last occurrence of 'projects-' to handle edge cases
+            idx = final_component.rfind('projects-')
+            if idx != -1:
+                return final_component[idx + len('projects-'):]
         
-        # If it's already a simple name, return it
-        if '/' not in project_path and '\\' not in project_path:
-            return project_path
-            
-        # Otherwise extract from path
-        return path_obj.name
+        # For regular paths, just return the directory name
+        return final_component if final_component else path.parent.name
     
     def _project_matches(self, stored_project: str, target_project: str) -> bool:
         """
