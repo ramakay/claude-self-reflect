@@ -1,84 +1,167 @@
-"""Shared utilities for claude-self-reflect MCP server and scripts."""
+"""Utility functions and ProjectResolver for Claude Self-Reflect MCP server."""
 
+import os
+import hashlib
+import re
 from pathlib import Path
+from typing import Optional, List, Tuple
+from config import logger, CLAUDE_PROJECTS_PATH
 
+class ProjectResolver:
+    """Resolves project names and paths for Claude conversations."""
+    
+    @staticmethod
+    def get_current_project() -> Optional[str]:
+        """Get the current project name from working directory."""
+        cwd = os.getcwd()
+        
+        # Check if we're in a known project directory
+        if '/projects/' in cwd or '/repos/' in cwd or '/code/' in cwd:
+            # Extract project name from path
+            parts = cwd.split('/')
+            for i, part in enumerate(parts):
+                if part in ['projects', 'repos', 'code'] and i + 1 < len(parts):
+                    return parts[i + 1]
+        
+        # Fall back to last directory name
+        return Path(cwd).name
+    
+    @staticmethod
+    def normalize_project_name(project_name: str) -> str:
+        """Normalize project name for consistent matching."""
+        # Remove common prefixes/suffixes
+        name = project_name
+        for prefix in ['/Users/', '/home/', 'projects/', 'repos/', 'code/']:
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+        
+        # Convert path separators to underscores
+        name = name.replace('/', '_').replace('-', '_')
+        
+        # Remove trailing underscores
+        name = name.rstrip('_')
+        
+        return name
+    
+    @staticmethod
+    def get_project_hash(project_name: str) -> str:
+        """Get hash for project name (used in collection naming)."""
+        normalized = ProjectResolver.normalize_project_name(project_name)
+        return hashlib.md5(normalized.encode()).hexdigest()[:8]
+    
+    @staticmethod
+    def find_project_collections(
+        all_collections: List[str], 
+        project_name: str
+    ) -> List[str]:
+        """Find collections belonging to a specific project."""
+        normalized = ProjectResolver.normalize_project_name(project_name)
+        project_hash = ProjectResolver.get_project_hash(project_name)
+        
+        matching = []
+        for collection in all_collections:
+            # Check if collection matches project hash
+            if collection.startswith(f"conv_{project_hash}_"):
+                matching.append(collection)
+            # Also check for project name in collection
+            elif normalized in collection.replace('-', '_'):
+                matching.append(collection)
+        
+        return matching
+    
+    @staticmethod
+    def extract_project_from_collection(collection_name: str) -> str:
+        """Extract project name from collection name."""
+        # Remove conv_ prefix and suffixes
+        name = collection_name
+        if name.startswith('conv_'):
+            name = name[5:]
+        
+        # Remove hash prefix if present
+        if '_' in name and len(name.split('_')[0]) == 8:
+            # Likely a hash, remove it
+            parts = name.split('_', 1)
+            if len(parts) > 1:
+                name = parts[1]
+        
+        # Remove embedding type suffix
+        for suffix in ['_voyage', '_local']:
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+        
+        return name
 
-def normalize_project_name(project_path: str, _depth: int = 0) -> str:
-    """
-    Normalize project name for consistent hashing across import/search.
+def parse_natural_language_time(time_str: str) -> Tuple[Optional[str], Optional[str]]:
+    """Parse natural language time strings into ISO timestamps."""
+    from datetime import datetime, timedelta, timezone
     
-    Handles various path formats:
-    - Claude logs format: -Users-kyle-Code-claude-self-reflect -> claude-self-reflect
-    - File paths in Claude logs: /path/to/-Users-kyle-Code-claude-self-reflect/file.jsonl -> claude-self-reflect  
-    - Regular file paths: /path/to/project/file.txt -> project
-    - Regular paths: /path/to/project -> project
-    - Already normalized: project -> project
-    - Docker mount paths: /logs/-Users-name-projects-project -> project
+    now = datetime.now(timezone.utc)
+    time_str_lower = time_str.lower().strip()
     
-    Args:
-        project_path: Project path or name in any format
-        _depth: Internal recursion depth counter (do not use)
+    # Handle relative times
+    if 'yesterday' in time_str_lower:
+        start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0)
+        end = start + timedelta(days=1)
+        return start.isoformat(), end.isoformat()
+    
+    if 'today' in time_str_lower:
+        start = now.replace(hour=0, minute=0, second=0)
+        return start.isoformat(), now.isoformat()
+    
+    # Parse "last X" patterns
+    last_match = re.match(r'last (\d+) (hour|day|week|month)', time_str_lower)
+    if last_match:
+        amount = int(last_match.group(1))
+        unit = last_match.group(2)
         
-    Returns:
-        Normalized project name suitable for consistent hashing
-    """
-    if not project_path:
-        return ""
-    
-    # Prevent infinite recursion on malformed inputs
-    if _depth > 10:
-        return Path(project_path).name
-    
-    # Remove trailing slashes
-    project_path = project_path.rstrip('/')
-    
-    # Handle Claude logs format (starts with dash)
-    if project_path.startswith('-'):
-        # For paths like -Users-kyle-Code-claude-self-reflect
-        # We want to extract the actual project name which may contain dashes
-        # Strategy: Find common parent directories and extract what comes after
+        if unit == 'hour':
+            delta = timedelta(hours=amount)
+        elif unit == 'day':
+            delta = timedelta(days=amount)
+        elif unit == 'week':
+            delta = timedelta(weeks=amount)
+        elif unit == 'month':
+            delta = timedelta(days=amount * 30)
+        else:
+            delta = timedelta(days=7)
         
-        # Remove leading dash and convert back to path-like format
-        path_str = project_path[1:].replace('-', '/')
-        path_parts = Path(path_str).parts
+        start = now - delta
+        return start.isoformat(), now.isoformat()
+    
+    # Parse "past X" patterns
+    past_match = re.match(r'past (\d+) (hour|day|week|month)', time_str_lower)
+    if past_match:
+        amount = int(past_match.group(1))
+        unit = past_match.group(2)
         
-        # Look for common project parent directories
-        project_parents = {'projects', 'code', 'Code', 'repos', 'repositories', 
-                          'dev', 'Development', 'work', 'src', 'github'}
+        if unit == 'hour':
+            delta = timedelta(hours=amount)
+        elif unit == 'day':
+            delta = timedelta(days=amount)
+        elif unit == 'week':
+            delta = timedelta(weeks=amount)
+        elif unit == 'month':
+            delta = timedelta(days=amount * 30)
+        else:
+            delta = timedelta(days=7)
         
-        # Find the project name after a known parent directory
-        for i, part in enumerate(path_parts):
-            if part.lower() in project_parents and i + 1 < len(path_parts):
-                # Everything after the parent directory is the project name
-                # Join remaining parts with dash if project name has multiple components
-                remaining = path_parts[i + 1:]
-                return '-'.join(remaining)
-        
-        # Fallback: just use the last component
-        return path_parts[-1] if path_parts else project_path
+        start = now - delta
+        return start.isoformat(), now.isoformat()
     
-    # Check if this is a file path that contains a Claude logs directory
-    # Pattern: /path/to/-Users-...-projects-..../filename
-    path_obj = Path(project_path)
+    # Default to last week
+    if 'week' in time_str_lower:
+        start = now - timedelta(days=7)
+        return start.isoformat(), now.isoformat()
     
-    # Check if this is a Docker mount path specifically
-    # e.g., /logs/-Users-ramakrishnanannaswamy-projects-claude-self-reflect
-    if str(path_obj).startswith("/logs/") and path_obj.name.startswith("-"):
-        # Process this directory name recursively (Docker case only)
-        return normalize_project_name(path_obj.name, _depth + 1)
+    # Default to last 24 hours
+    start = now - timedelta(days=1)
+    return start.isoformat(), now.isoformat()
+
+def escape_xml(text: str, attr: bool = False) -> str:
+    """Escape text for XML output."""
+    from xml.sax.saxutils import escape
     
-    # Look for a parent directory that starts with dash (Claude logs format)
-    for parent in path_obj.parents:
-        parent_name = parent.name
-        if parent_name.startswith("-"):
-            # Found a Claude logs directory, process it
-            return normalize_project_name(parent_name, _depth + 1)
-    
-    # Handle regular paths - if it's a file, get the parent directory
-    # Otherwise use the directory/project name itself
-    if path_obj.suffix:  # It's a file (has an extension)
-        # Use the parent directory name
-        return path_obj.parent.name
-    else:
-        # Use the directory name itself
-        return path_obj.name
+    if attr:
+        # For attributes, also escape quotes
+        return escape(text, {'"': '&quot;'})
+    return escape(text)

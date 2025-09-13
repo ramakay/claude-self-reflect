@@ -69,6 +69,11 @@ class ProjectResolver:
         Returns:
             List of collection names that match the project
         """
+        # Special case: 'all' returns all conversation collections
+        if user_project_name == 'all':
+            collection_names = self._get_collection_names()
+            return collection_names  # Return all conv_ collections
+        
         if user_project_name in self._cache:
             # Check if cache entry is still valid
             if time() - self._cache_ttl.get(user_project_name, 0) < self._cache_duration:

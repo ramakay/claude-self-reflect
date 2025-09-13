@@ -13,10 +13,22 @@ import ast
 import re
 import fcntl
 import time
+import argparse
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
 import logging
+
+# Load .env file if it exists
+try:
+    from dotenv import load_dotenv
+    # Load from project root
+    env_path = Path(__file__).parent.parent / '.env'
+    if env_path.exists():
+        load_dotenv(env_path)
+        print(f"Loaded .env from {env_path}")
+except ImportError:
+    pass  # dotenv not available, use system environment
 
 # Add the scripts directory to the Python path for utils import
 scripts_dir = Path(__file__).parent
@@ -133,7 +145,8 @@ def ensure_collection(collection_name: str):
 
 def generate_embeddings(texts: List[str]) -> List[List[float]]:
     """Generate embeddings for texts."""
-    if PREFER_LOCAL_EMBEDDINGS or not VOYAGE_API_KEY:
+    # Use the global embedding_provider which gets updated by command-line args
+    if PREFER_LOCAL_EMBEDDINGS:
         embeddings = list(embedding_provider.passage_embed(texts))
         return [emb.tolist() if hasattr(emb, 'tolist') else emb for emb in embeddings]
     else:
@@ -673,6 +686,32 @@ def update_file_state(file_path: Path, state: dict, chunks: int):
 
 def main():
     """Main import function."""
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Import conversations with unified embeddings support')
+    parser.add_argument('--prefer-voyage', action='store_true', 
+                       help='Use Voyage AI embeddings instead of local FastEmbed')
+    parser.add_argument('--limit', type=int, 
+                       help='Limit number of files to import')
+    parser.add_argument('--max-files-per-cycle', type=int, 
+                       help='Maximum files to process per cycle')
+    args = parser.parse_args()
+    
+    # Override environment variable if --prefer-voyage is specified
+    global PREFER_LOCAL_EMBEDDINGS, embedding_provider, embedding_dimension, collection_suffix
+    if args.prefer_voyage:
+        if not VOYAGE_API_KEY:
+            logger.error("--prefer-voyage specified but VOYAGE_KEY environment variable not set")
+            sys.exit(1)
+        logger.info("Command-line flag --prefer-voyage detected, switching to Voyage AI embeddings")
+        PREFER_LOCAL_EMBEDDINGS = False
+        
+        # Re-initialize embedding provider with Voyage
+        import voyageai
+        embedding_provider = voyageai.Client(api_key=VOYAGE_API_KEY)
+        embedding_dimension = 1024
+        collection_suffix = "voyage"
+        logger.info("Switched to Voyage AI embeddings (dimension: 1024)")
+    
     # Load state
     state = load_state()
     logger.info(f"Loaded state with {len(state.get('imported_files', {}))} previously imported files")
@@ -695,6 +734,7 @@ def main():
     logger.info(f"Found {len(project_dirs)} projects to import")
     
     total_imported = 0
+    files_processed = 0
     
     for project_dir in project_dirs:
         # Get collection name
@@ -707,13 +747,24 @@ def main():
         # Find JSONL files
         jsonl_files = sorted(project_dir.glob("*.jsonl"))
         
+        # Apply limit from command line if specified
+        if args.limit and files_processed >= args.limit:
+            logger.info(f"Reached limit of {args.limit} files, stopping import")
+            break
+            
         # Limit files per cycle if specified
-        max_files = int(os.getenv("MAX_FILES_PER_CYCLE", "1000"))
+        max_files = args.max_files_per_cycle or int(os.getenv("MAX_FILES_PER_CYCLE", "1000"))
         jsonl_files = jsonl_files[:max_files]
         
         for jsonl_file in jsonl_files:
+            # Check limit again per file
+            if args.limit and files_processed >= args.limit:
+                logger.info(f"Reached limit of {args.limit} files, stopping import")
+                break
+                
             if should_import_file(jsonl_file, state):
                 chunks = stream_import_file(jsonl_file, collection_name, project_dir)
+                files_processed += 1
                 if chunks > 0:
                     # Verify data is actually in Qdrant before marking as imported
                     from qdrant_client.models import Filter, FieldCondition, MatchValue

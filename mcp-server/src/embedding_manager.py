@@ -16,16 +16,16 @@ class EmbeddingManager:
     """Manages embedding models with proper cache and lock handling."""
     
     def __init__(self):
-        self.model = None
-        self.model_type = None  # 'local' or 'voyage'
+        self.local_model = None
         self.voyage_client = None
-        
+        self.model_type = None  # Default model type ('local' or 'voyage')
+
         # Configuration
         self.prefer_local = os.getenv('PREFER_LOCAL_EMBEDDINGS', 'true').lower() == 'true'
         self.voyage_key = os.getenv('VOYAGE_KEY') or os.getenv('VOYAGE_KEY-2')
         self.embedding_model = os.getenv('EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2')
         self.download_timeout = int(os.getenv('FASTEMBED_DOWNLOAD_TIMEOUT', '30'))
-        
+
         # Set cache directory to our controlled location
         self.cache_dir = Path(__file__).parent.parent / '.fastembed-cache'
         
@@ -50,27 +50,35 @@ class EmbeddingManager:
                 logger.warning(f"Error cleaning locks: {e}")
         
     def initialize(self) -> bool:
-        """Initialize embedding model based on user preference."""
-        logger.info("Initializing embedding manager...")
-        
+        """Initialize BOTH embedding models to support mixed collections."""
+        logger.info("Initializing embedding manager for dual-mode support...")
+
         # Clean up any stale locks first
         self._clean_stale_locks()
-        
-        if self.prefer_local:
-            # User wants local - try local only, don't fallback to cloud
-            if self._try_initialize_local():
-                return True
-            logger.error("Local embeddings failed and user prefers local - not falling back to cloud")
-            return False
+
+        # Initialize both models for mixed collection support
+        local_success = self._try_initialize_local()
+        voyage_success = False
+
+        if self.voyage_key:
+            voyage_success = self._try_initialize_voyage()
+
+        # Set default model type based on preference and availability
+        if self.prefer_local and local_success:
+            self.model_type = 'local'
+            logger.info("Default model set to LOCAL embeddings")
+        elif voyage_success:
+            self.model_type = 'voyage'
+            logger.info("Default model set to VOYAGE embeddings")
+        elif local_success:
+            self.model_type = 'local'
+            logger.info("Default model set to LOCAL embeddings (fallback)")
         else:
-            # User prefers Voyage AI
-            if self.voyage_key and self._try_initialize_voyage():
-                return True
-            logger.warning("Voyage AI failed, trying local as fallback...")
-            if self._try_initialize_local():
-                return True
-            logger.error("Both Voyage AI and local embeddings failed")
+            logger.error("Failed to initialize any embedding model")
             return False
+
+        logger.info(f"Embedding models available - Local: {local_success}, Voyage: {voyage_success}")
+        return True
     
     def _try_initialize_local(self) -> bool:
         """Try to initialize local FastEmbed model with timeout and optimizations."""
@@ -119,11 +127,10 @@ class EmbeddingManager:
                     from fastembed import TextEmbedding
                     # Initialize with optimized settings
                     # Note: FastEmbed uses these environment variables internally
-                    self.model = TextEmbedding(
+                    self.local_model = TextEmbedding(
                         model_name=self.embedding_model,
                         threads=1  # Single thread per worker to prevent over-subscription
                     )
-                    self.model_type = 'local'
                     success = True
                     logger.info(f"Successfully initialized local model: {self.embedding_model} with single-thread mode")
                 except Exception as e:
@@ -177,39 +184,48 @@ class EmbeddingManager:
             logger.error(f"Failed to initialize Voyage AI: {e}")
             return False
     
-    def embed(self, texts: Union[str, List[str]], input_type: str = "document") -> Optional[List[List[float]]]:
-        """Generate embeddings using the active model."""
-        if not self.model and not self.voyage_client:
-            logger.error("No embedding model initialized")
+    def embed(self, texts: Union[str, List[str]], input_type: str = "document", force_type: str = None) -> Optional[List[List[float]]]:
+        """Generate embeddings using the specified or default model."""
+        # Determine which model to use
+        use_type = force_type if force_type else self.model_type
+        logger.debug(f"Embedding with: force_type={force_type}, self.model_type={self.model_type}, use_type={use_type}")
+
+        if use_type == 'local' and not self.local_model:
+            logger.error("Local model not initialized")
             return None
-        
+        elif use_type == 'voyage' and not self.voyage_client:
+            logger.error("Voyage client not initialized")
+            return None
+
         # Ensure texts is a list
         if isinstance(texts, str):
             texts = [texts]
-        
+
         try:
-            if self.model_type == 'local':
+            if use_type == 'local':
                 # FastEmbed returns a generator, convert to list
-                embeddings = list(self.model.embed(texts))
+                embeddings = list(self.local_model.embed(texts))
                 return [emb.tolist() for emb in embeddings]
-            
-            elif self.model_type == 'voyage':
+
+            elif use_type == 'voyage':
+                # Always use voyage-3 for consistency with collection dimensions (1024)
                 result = self.voyage_client.embed(
                     texts=texts,
-                    model="voyage-3-lite" if input_type == "query" else "voyage-3",
+                    model="voyage-3",
                     input_type=input_type
                 )
                 return result.embeddings
-            
+
         except Exception as e:
-            logger.error(f"Error generating embeddings: {e}")
+            logger.error(f"Error generating embeddings with {use_type}: {e}")
             return None
     
-    def get_vector_dimension(self) -> int:
-        """Get the dimension of embeddings."""
-        if self.model_type == 'local':
+    def get_vector_dimension(self, force_type: str = None) -> int:
+        """Get the dimension of embeddings for a specific type."""
+        use_type = force_type if force_type else self.model_type
+        if use_type == 'local':
             return 384  # all-MiniLM-L6-v2 dimension
-        elif self.model_type == 'voyage':
+        elif use_type == 'voyage':
             return 1024  # voyage-3 dimension
         return 0
     
@@ -222,6 +238,14 @@ class EmbeddingManager:
             'prefer_local': self.prefer_local,
             'has_voyage_key': bool(self.voyage_key)
         }
+    
+    async def generate_embedding(self, text: str, force_type: str = None) -> Optional[List[float]]:
+        """Generate embedding for a single text (async wrapper for compatibility)."""
+        # Use the force_type if specified, otherwise use default
+        result = self.embed(text, input_type="query", force_type=force_type)
+        if result and len(result) > 0:
+            return result[0]
+        return None
 
 
 # Global instance

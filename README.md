@@ -123,6 +123,11 @@ Works with [Claude Code Statusline](https://github.com/sirmalloc/ccstatusline) -
 - `search_by_concept` - Search for conversations about development concepts
 - `get_full_conversation` - Retrieve complete JSONL conversation files (v2.8.8)
 
+**NEW: Temporal Query Tools (v3.3.0):**
+- `get_recent_work` - Answer "What did we work on last?" with session grouping
+- `search_by_recency` - Time-constrained search like "docker issues last week"
+- `get_timeline` - Activity timeline with statistics and patterns
+
 **Status & Monitoring Tools:**
 - `get_status` - Real-time import progress and system status
 - `get_health` - Comprehensive system health check
