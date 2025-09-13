@@ -43,12 +43,18 @@ tests/
 ## Overview
 Claude Self Reflect provides semantic search across all Claude conversations with built-in memory decay capabilities, using a vector database for efficient similarity matching.
 
-## Architecture
+## Architecture (v3.3.0)
 - **Vector Database**: Qdrant with per-project collections
-- **Embeddings**: FastEmbed local embeddings (all-MiniLM-L6-v2, 384 dimensions) by default, Voyage AI optional
-- **Search**: Cross-collection semantic search with time-based decay
-- **Import**: Continuous file watcher for automatic updates
-- **MCP Server**: Python-based using FastMCP (located in `mcp-server/`)
+- **Embeddings**: Dual-mode support
+  - Local: FastEmbed (all-MiniLM-L6-v2, 384 dimensions) - default
+  - Cloud: Voyage AI (1024 dimensions) - optional
+- **MCP Server**: Modularized Python architecture (68% code reduction)
+  - Core: `server.py` (728 lines, down from 2321)
+  - Modules: `search_tools`, `temporal_tools`, `reflection_tools`, `parallel_search`
+  - Rich formatting with performance metrics (🎯, ⚡, 📊)
+- **Search**: Cross-collection parallel search with time-based decay
+- **Import**: Real-time indexing (2s hot files, 60s normal)
+- **Reflections**: Automatic collection naming (`reflections_local` or `reflections_voyage`)
 
 ## Memory Decay Philosophy
 
@@ -65,17 +71,19 @@ Currently using client-side decay calculation (v1.3.1):
 - **Active**: Client-side exponential decay with 90-day half-life
 - **Performance**: Minimal overhead (~9ms for 1000 points)
 
-## Current Status
+## Current Status (v3.3.0)
 
-### CRITICAL: Understanding Import Status (Updated 2025-09-02)
-**✅ ALWAYS use `python mcp-server/src/status.py` to check the REAL import status.**
-**✅ Health monitoring: `python mcp-server/src/health.py` for comprehensive system health**
+### Import Status Commands
+```bash
+python mcp-server/src/status.py  # Real-time import status
+python mcp-server/src/health.py   # System health monitoring
+```
 
-**Actual Import Status:**
-- **Overall**: 99.8% (469 of 470 JSONL files imported)
-- **claude-self-reflect**: 100% (209 of 209 files imported)
-- **Total Collections in Qdrant**: 179 active collections
-- **Projects with Data**: 22 projects have imported conversations
+### Typical Import Metrics
+- **Import Completion**: Usually 99%+ within minutes
+- **Indexing Speed**: ~13ms per chunk, 38 chunks/0.5s
+- **Memory Usage**: ~430MB typical, 1GB limit
+- **Watcher Intervals**: 2s (hot files), 60s (normal)
 
 ### ⚠️ CRITICAL STATE VALIDATION RULES
 1. **NEVER** assume 0% imports without checking Qdrant directly
@@ -98,14 +106,14 @@ Different components track different state:
 - If watcher shows "672 hour backlog" = wrong sort order, re-importing old files
 
 ### Critical Files and Their Purposes
-| File | Location | Purpose | Trust Level |
-|------|----------|---------|-------------|
-| status.py | mcp-server/src/ | Real-time import status | PRIMARY TRUTH |
-| health.py | mcp-server/src/ | System health check | MONITORING |
-| imported-files.json | ~/.claude-self-reflect/config/ | Batch import tracking | ACCURATE |
-| csr-watcher.json | ~/.claude-self-reflect/config/ | Watcher state only | SECONDARY |
+| File | Location | Purpose |
+|------|----------|---------|
+| status.py | mcp-server/src/ | Real-time import status |
+| health.py | mcp-server/src/ | System health check |
+| imported-files.json | ~/.claude-self-reflect/config/ | Batch import tracking |
+| csr-watcher.json | ~/.claude-self-reflect/config/ | Watcher state only |
 
-**Common Mistake**: Don't trust csr-watcher.json counts - it only tracks what streaming-watcher has processed, not the total system imports. The MCP's imported-files.json (via status.py) shows the real import status.
+**Note**: Always use status.py for accurate import counts.
 
 ## Key Commands
 
@@ -159,28 +167,42 @@ claude mcp add claude-self-reflect     # MISSING required commandOrUrl argument
 - **CRITICAL**: After modifying MCP server code, you MUST restart Claude Code entirely for changes to take effect
 - Check `.env` file for VOYAGE_KEY if not set
 
-### Search & Reflection
-```bash
-# Use MCP tools in Claude
-mcp__claude-self-reflect__reflect_on_past
-mcp__claude-self-reflect__store_reflection
-```
+### Available MCP Tools (15+ tools)
+
+#### Core Search Tools
+- `reflect_on_past` - Semantic search with time decay
+- `quick_search` - Fast search returning count and top result
+- `search_summary` - Aggregated insights from search
+- `search_by_concept` - Find conversations about specific concepts
+- `search_by_file` - Find conversations analyzing specific files
+- `get_more_results` / `get_next_results` - Pagination support
+
+#### Temporal Tools (v3.x)
+- `get_recent_work` - Recent conversations grouped by day/session
+- `search_by_recency` - Time-constrained semantic search
+- `get_timeline` - Activity timeline with statistics
+
+#### Reflection Tools
+- `store_reflection` - Store insights (creates reflections_local or reflections_voyage)
+- `get_full_conversation` - Retrieve complete conversation JSONL path
 
 ### Import Commands
 ```bash
 # Always use the virtual environment
 cd claude-self-reflect
-source .venv/bin/activate  # or source venv/bin/activate
+source venv/bin/activate
 
-# Import all projects
-python scripts/import-conversations-voyage.py
+# Main unified import script (handles both local and Voyage)
+python scripts/import-conversations-unified.py
 
-# Import with streaming (recommended for large files)
-export VOYAGE_KEY=your-voyage-api-key  # Required for streaming import
-python scripts/import-conversations-voyage-streaming.py --limit 5  # Limit to 5 files for testing
+# Import with limit for testing
+python scripts/import-conversations-unified.py --limit 5
 
 # Check collections
 python scripts/check-collections.py
+
+# Quick import for recent conversations (precompact hook)
+python scripts/import-latest.py
 ```
 
 ### Delta Metadata Update (NEW)
@@ -308,10 +330,12 @@ claude-self-reflect/
 
 ## Upgrade Guide for Existing Users
 
-### Key Changes in v2.3.7+
-1. **Local Embeddings by Default**: FastEmbed replaces Voyage AI for privacy
-2. **Setup Wizard Improvements**: Better handling of existing installations
-3. **Security Enhancements**: Automated scanning and vulnerability checks
+### Key Changes in v3.3.0
+1. **Modularized Architecture**: Server split into clean modules (68% code reduction)
+2. **Fixed Critical Issues**: CPU spike, store_reflection dimension mismatch resolved
+3. **Dual Embedding Support**: Both local and Voyage collections work seamlessly
+4. **Real-time Indexing**: Hot file detection with 2s intervals
+5. **Rich Formatting**: Performance metrics with emojis restored
 
 ### Common Upgrade Issues & Solutions
 
