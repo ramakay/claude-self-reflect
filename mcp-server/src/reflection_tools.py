@@ -40,23 +40,26 @@ class ReflectionTools:
         tags: List[str] = []
     ) -> str:
         """Store an important insight or reflection for future reference."""
-        
+
         await ctx.debug(f"Storing reflection with {len(tags)} tags")
-        
+
         try:
+            # Determine collection name based on embedding type
+            embedding_manager = self.get_embedding_manager()
+            embedding_type = "local" if embedding_manager.prefer_local else "voyage"
+            collection_name = f"reflections_{embedding_type}"
+
             # Ensure reflections collection exists
-            collection_name = "reflections"
             try:
                 await self.qdrant_client.get_collection(collection_name)
                 await ctx.debug(f"Using existing {collection_name} collection")
             except Exception:
                 # Collection doesn't exist, create it
                 await ctx.debug(f"Creating {collection_name} collection")
-                
+
                 # Determine embedding dimensions
-                embedding_manager = self.get_embedding_manager()
                 embedding_dim = embedding_manager.get_vector_dimension()
-                
+
                 await self.qdrant_client.create_collection(
                     collection_name=collection_name,
                     vectors_config=VectorParams(

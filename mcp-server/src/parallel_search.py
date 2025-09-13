@@ -53,7 +53,7 @@ async def search_single_collection(
         query_embedding = query_embeddings[embedding_type_for_collection]
         
         # Check if this is a reflections collection
-        is_reflection_collection = collection_name == 'reflections'
+        is_reflection_collection = collection_name.startswith('reflections_')
         
         # Import necessary models
         from qdrant_client import models
