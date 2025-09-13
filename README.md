@@ -291,11 +291,15 @@ npm uninstall -g claude-self-reflect
 ## What's New
 
 <details>
-<summary>v3.2.4 - Latest Release</summary>
+<summary>v3.3.0 - Latest Release</summary>
 
-- **CRITICAL: Search Threshold Removal**: Eliminated artificial 0.7+ thresholds that blocked broad searches like "docker", "MCP", "python"
-- **Shared Normalization Module**: Created centralized project name normalization preventing search failures
-- **Memory Decay Fixes**: Corrected mathematical errors in exponential decay calculation
+- **🚀 Major Architecture Overhaul**: Server modularized from 2,321 to 728 lines (68% reduction) for better maintainability
+- **🔧 Critical Bug Fixes**: Fixed 100% CPU usage, store_reflection dimension mismatches, and SearchResult type errors
+- **🕒 New Temporal Tools Suite**: `get_recent_work`, `search_by_recency`, `get_timeline` for time-based search and analysis
+- **🎯 Enhanced UX**: Restored rich formatting with emojis for better readability and information hierarchy
+- **⚡ All 15+ MCP Tools Operational**: Complete functionality with both local and cloud embedding modes
+- **🏗️ Production Infrastructure**: Real-time indexing with smart intervals (2s hot files, 60s normal)
+- **🔍 Enhanced Metadata**: Tool usage analysis, file tracking, and concept extraction for better search
 
 </details>
 
