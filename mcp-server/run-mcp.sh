@@ -11,8 +11,17 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 # Navigate to the mcp-server directory
 cd "$SCRIPT_DIR"
 
-# CRITICAL: Load .env file from project root if it exists
-# This ensures the MCP server uses the same settings as other scripts
+# CRITICAL: Environment variables priority:
+# 1. Command-line args from Claude Code (already in environment)
+# 2. .env file (only for missing values)
+# 3. Defaults (as fallback)
+
+# Store any command-line provided values BEFORE loading .env
+CMDLINE_VOYAGE_KEY="${VOYAGE_KEY:-}"
+CMDLINE_PREFER_LOCAL="${PREFER_LOCAL_EMBEDDINGS:-}"
+CMDLINE_QDRANT_URL="${QDRANT_URL:-}"
+
+# Load .env file for any missing values
 if [ -f "../.env" ]; then
     echo "[DEBUG] Loading .env file from project root" >&2
     set -a  # Export all variables
@@ -22,8 +31,23 @@ else
     echo "[DEBUG] No .env file found, using defaults" >&2
 fi
 
-# Set smart defaults if not already set
-# These match what the CLI setup wizard uses
+# Restore command-line values (they take precedence)
+if [ ! -z "$CMDLINE_VOYAGE_KEY" ]; then
+    export VOYAGE_KEY="$CMDLINE_VOYAGE_KEY"
+    echo "[DEBUG] Using command-line VOYAGE_KEY" >&2
+fi
+
+if [ ! -z "$CMDLINE_PREFER_LOCAL" ]; then
+    export PREFER_LOCAL_EMBEDDINGS="$CMDLINE_PREFER_LOCAL"
+    echo "[DEBUG] Using command-line PREFER_LOCAL_EMBEDDINGS: $PREFER_LOCAL_EMBEDDINGS" >&2
+fi
+
+if [ ! -z "$CMDLINE_QDRANT_URL" ]; then
+    export QDRANT_URL="$CMDLINE_QDRANT_URL"
+    echo "[DEBUG] Using command-line QDRANT_URL: $QDRANT_URL" >&2
+fi
+
+# Set smart defaults ONLY if still not set
 if [ -z "$QDRANT_URL" ]; then
     export QDRANT_URL="http://localhost:6333"
     echo "[DEBUG] Using default QDRANT_URL: $QDRANT_URL" >&2

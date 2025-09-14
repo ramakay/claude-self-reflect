@@ -11,6 +11,7 @@ const __dirname = dirname(__filename);
 const commands = {
   setup: 'Run the setup wizard to configure Claude Self-Reflect',
   status: 'Get indexing status as JSON (overall + per-project breakdown)',
+  statusline: 'Configure Claude Code statusline integration',
   doctor: 'Check your installation and diagnose issues',
   help: 'Show this help message'
 };
@@ -192,6 +193,18 @@ function help() {
   console.log('  Status API: See docs/api-reference.md#cli-status-interface');
 }
 
+async function statusline() {
+  const StatuslineSetup = (await import('./statusline-setup.js')).default;
+  const setup = new StatuslineSetup();
+
+  if (process.argv[3] === '--restore') {
+    console.log('🔄 Restoring original statusline...');
+    setup.restore();
+  } else {
+    await setup.run();
+  }
+}
+
 // Main
 const command = process.argv[2] || 'help';
 
@@ -201,6 +214,9 @@ switch (command) {
     break;
   case 'status':
     status();
+    break;
+  case 'statusline':
+    statusline();
     break;
   case 'doctor':
     doctor();

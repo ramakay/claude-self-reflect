@@ -484,7 +484,20 @@ class QdrantService:
     
     def __init__(self, config: Config, embedding_provider: EmbeddingProvider):
         self.config = config
-        self.client = AsyncQdrantClient(url=config.qdrant_url)
+
+        # Security: Validate Qdrant URL for remote connections
+        from urllib.parse import urlparse
+        parsed = urlparse(config.qdrant_url)
+        host = (parsed.hostname or "").lower()
+
+        if config.require_tls_for_remote and host not in ("localhost", "127.0.0.1", "qdrant") and parsed.scheme != "https":
+            raise ValueError(f"Insecure QDRANT_URL for remote host: {config.qdrant_url} (use https:// or set QDRANT_REQUIRE_TLS_FOR_REMOTE=false)")
+
+        # Initialize with API key if provided
+        self.client = AsyncQdrantClient(
+            url=config.qdrant_url,
+            api_key=config.qdrant_api_key if hasattr(config, 'qdrant_api_key') else None
+        )
         self.embedding_provider = embedding_provider
         self._collection_cache: Dict[str, float] = {}
         self.request_semaphore = asyncio.Semaphore(config.max_concurrent_qdrant)
@@ -979,7 +992,66 @@ class StreamingWatcher:
                         text_parts.append(item.get('text', ''))
             return ' '.join(text_parts)
         return str(content) if content else ''
-    
+
+    def _update_quality_cache(self, pattern_analysis: Dict, avg_score: float, project_name: str = None):
+        """Update quality cache file for statusline display - PER PROJECT."""
+        try:
+            # Determine project name from current context or use provided
+            if not project_name:
+                # Try to infer from analyzed files
+                files = pattern_analysis.get('files', [])
+                if files and len(files) > 0:
+                    # Extract project from first file path
+                    first_file = Path(files[0])
+                    # Walk up to find .git directory or use immediate parent
+                    for parent in first_file.parents:
+                        if (parent / '.git').exists():
+                            project_name = parent.name
+                            break
+                    else:
+                        project_name = 'unknown'
+                else:
+                    project_name = 'unknown'
+
+            # Sanitize project name for filename
+            safe_project_name = project_name.replace('/', '-').replace(' ', '_')
+            cache_dir = Path.home() / ".claude-self-reflect" / "quality_cache"
+            cache_dir.mkdir(exist_ok=True, parents=True)
+            cache_file = cache_dir / f"{safe_project_name}.json"
+
+            # Calculate total issues from pattern analysis
+            total_issues = sum(p.get('count', 0) for p in pattern_analysis.get('issues', []))
+
+            # Determine grade based on score
+            if avg_score >= 0.95:
+                grade = 'A+' if total_issues < 10 else 'A'
+            elif avg_score >= 0.8:
+                grade = 'B'
+            elif avg_score >= 0.6:
+                grade = 'C'
+            else:
+                grade = 'D'
+
+            cache_data = {
+                'status': 'success',
+                'session_id': 'watcher',
+                'timestamp': datetime.now().isoformat(),
+                'summary': {
+                    'files_analyzed': len(pattern_analysis.get('files', [])),
+                    'avg_quality_score': round(avg_score, 3),
+                    'total_issues': total_issues,
+                    'quality_grade': grade
+                }
+            }
+
+            with open(cache_file, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+
+            logger.debug(f"Updated quality cache: {grade}/{total_issues}")
+
+        except Exception as e:
+            logger.debug(f"Failed to update quality cache: {e}")
+
     async def process_file(self, file_path: Path) -> bool:
         """Process a single file."""
         try:
@@ -1034,7 +1106,70 @@ class StreamingWatcher:
             
             # Extract metadata
             tool_usage = extract_tool_usage_from_conversation(all_messages)
-            
+
+            # MANDATORY AST-GREP Analysis for HOT files
+            pattern_analysis = {}
+            avg_quality_score = 0.0
+            freshness_level, _ = self.categorize_freshness(file_path)
+
+            # Analyze code quality for HOT files (current session)
+            if freshness_level == FreshnessLevel.HOT and (tool_usage.get('files_edited') or tool_usage.get('files_analyzed')):
+                try:
+                    # Import analyzer (lazy import to avoid startup overhead)
+                    from ast_grep_final_analyzer import FinalASTGrepAnalyzer
+                    from update_patterns import check_and_update_patterns
+
+                    # Update patterns (24h cache, <100ms)
+                    check_and_update_patterns()
+
+                    # Create analyzer
+                    if not hasattr(self, '_ast_analyzer'):
+                        self._ast_analyzer = FinalASTGrepAnalyzer()
+
+                    # Analyze edited files from this session
+                    files_to_analyze = list(set(
+                        tool_usage.get('files_edited', [])[:5] +
+                        tool_usage.get('files_analyzed', [])[:5]
+                    ))
+
+                    quality_scores = []
+                    for file_ref in files_to_analyze:
+                        if file_ref and any(file_ref.endswith(ext) for ext in ['.py', '.ts', '.js', '.tsx', '.jsx']):
+                            try:
+                                if os.path.exists(file_ref):
+                                    result = self._ast_analyzer.analyze_file(file_ref)
+                                    metrics = result['quality_metrics']
+                                    pattern_analysis[file_ref] = {
+                                        'score': metrics['quality_score'],
+                                        'good_patterns': metrics['good_patterns_found'],
+                                        'bad_patterns': metrics['bad_patterns_found'],
+                                        'issues': metrics['total_issues']
+                                    }
+                                    quality_scores.append(metrics['quality_score'])
+
+                                    # Log quality issues for HOT files
+                                    if metrics['quality_score'] < 0.6:
+                                        logger.warning(f"⚠️ Quality issue in {os.path.basename(file_ref)}: {metrics['quality_score']:.1%} ({metrics['total_issues']} issues)")
+                            except Exception as e:
+                                logger.debug(f"Could not analyze {file_ref}: {e}")
+
+                    if quality_scores:
+                        avg_quality_score = sum(quality_scores) / len(quality_scores)
+                        logger.info(f"📊 Session quality: {avg_quality_score:.1%} for {len(quality_scores)} files")
+
+                        # Update quality cache for statusline - watcher handles this automatically!
+                        # Pass project name from current file being processed
+                        project_name = file_path.parent.name if file_path else None
+                        self._update_quality_cache(pattern_analysis, avg_quality_score, project_name)
+
+                except Exception as e:
+                    logger.debug(f"AST analysis not available: {e}")
+
+            # Add pattern analysis to tool_usage metadata
+            if pattern_analysis:
+                tool_usage['pattern_analysis'] = pattern_analysis
+                tool_usage['avg_quality_score'] = round(avg_quality_score, 3)
+
             # Build text
             text_parts = []
             for msg in all_messages:
@@ -1043,7 +1178,7 @@ class StreamingWatcher:
                 text = self._extract_message_text(content)
                 if text:
                     text_parts.append(f"{role}: {text}")
-            
+
             combined_text = "\n\n".join(text_parts)
             if not combined_text.strip():
                 logger.warning(f"No textual content in {file_path}, marking as processed")
@@ -1057,7 +1192,7 @@ class StreamingWatcher:
                 }
                 self.stats["files_processed"] += 1
                 return True
-            
+
             concepts = extract_concepts(combined_text, tool_usage)
             
             # Now we know we have content, ensure collection exists

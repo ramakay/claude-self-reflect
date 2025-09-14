@@ -1,0 +1,114 @@
+rules:
+  # Good Patterns
+  - id: async-context-manager
+    language: python
+    pattern: |
+      async with $CTX:
+        $$$
+    message: "Good: Using async context manager"
+    severity: info
+    metadata:
+      category: good_pattern
+      weight: 2
+
+  - id: parallel-execution
+    language: python
+    pattern: asyncio.gather($$$)
+    message: "Good: Parallel async execution"
+    severity: info
+    metadata:
+      category: good_pattern
+      weight: 3
+
+  - id: specific-exception
+    language: python
+    pattern: |
+      except $ERROR:
+        $$$
+    constraints:
+      ERROR:
+        not:
+          regex: "^Exception$"
+    message: "Good: Catching specific exception"
+    severity: info
+    metadata:
+      category: good_pattern
+      weight: 2
+
+  - id: type-hints
+    language: python
+    pattern: |
+      def $FUNC($ARGS) -> $RETURN:
+        $$$
+    message: "Good: Function with type hints"
+    severity: info
+    metadata:
+      category: good_pattern
+      weight: 1
+
+  - id: logger-usage
+    language: python
+    pattern: logger.$METHOD($$$)
+    message: "Good: Using logger"
+    severity: info
+    metadata:
+      category: good_pattern
+      weight: 1
+
+  # Bad Patterns
+  - id: print-statement
+    language: python
+    pattern: print($$$)
+    message: "Bad: Using print instead of logger"
+    severity: warning
+    metadata:
+      category: anti_pattern
+      weight: -1
+
+  - id: broad-except
+    language: python
+    patterns:
+      - pattern: |
+          except:
+            $$$
+      - pattern: |
+          except Exception:
+            $$$
+    message: "Bad: Catching all exceptions"
+    severity: warning
+    metadata:
+      category: anti_pattern
+      weight: -2
+
+  - id: sync-in-async
+    language: python
+    patterns:
+      - pattern: time.sleep($$$)
+      - pattern: requests.$METHOD($$$)
+      - pattern: |
+          with open($$$) as $F:
+            $$$
+    message: "Critical: Blocking call in async context"
+    severity: error
+    metadata:
+      category: critical_issue
+      weight: -5
+
+  - id: no-error-handling
+    language: python
+    pattern: |
+      await $ASYNC_CALL($$$)
+    not:
+      inside:
+        any:
+          - pattern: |
+              try:
+                $$$
+          - pattern: |
+              except $ERR:
+                $$$
+    message: "Bad: Async operation without error handling"
+    severity: warning
+    metadata:
+      category: anti_pattern
+      weight: -3

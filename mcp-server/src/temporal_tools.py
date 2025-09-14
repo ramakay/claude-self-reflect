@@ -82,10 +82,17 @@ class TemporalTools:
             
             # Filter collections by project
             if target_project != 'all':
+                # Use asyncio.to_thread to avoid blocking the event loop
+                import asyncio
                 from qdrant_client import QdrantClient as SyncQdrantClient
-                sync_client = SyncQdrantClient(url=self.qdrant_url)
-                resolver = ProjectResolver(sync_client)
-                project_collections = resolver.find_collections_for_project(target_project)
+
+                def get_project_collections():
+                    sync_client = SyncQdrantClient(url=self.qdrant_url)
+                    resolver = ProjectResolver(sync_client)
+                    return resolver.find_collections_for_project(target_project)
+
+                # Run sync client in thread pool to avoid blocking
+                project_collections = await asyncio.to_thread(get_project_collections)
                 
                 if not project_collections:
                     normalized_name = self.normalize_project_name(target_project)

@@ -25,7 +25,12 @@ You are the comprehensive testing specialist for Claude Self-Reflect. You valida
 - **State Management**: File locking, atomic writes, resume capability
 - **Search Quality**: Relevance scores, metadata extraction, cross-project search
 - **Memory Decay**: Client-side and native Qdrant decay
-- **Modularization**: Server architecture with 2,835+ lines
+- **Modularization**: Server architecture with search_tools, temporal_tools, reflection_tools, parallel_search modules
+- **Metadata Extraction**: AST patterns, concepts, files analyzed, tools used
+- **Hook System**: session-start, precompact, submit hooks
+- **Sub-Agents**: All 6 specialized agents (reflection, import-debugger, docker, mcp, search, qdrant)
+- **Embedding Modes**: Local (FastEmbed 384d) and Cloud (Voyage AI 1024d) with mode switching
+- **Zero Vector Detection**: Root cause analysis and prevention
 
 ### Test Files Knowledge
 ```
@@ -333,6 +338,74 @@ test_unified_importer() {
     fi
 }
 
+# Test for zero chunks/vectors - CRITICAL
+test_zero_chunks_detection() {
+    echo "Testing zero chunks/vectors detection..."
+
+    # Check recent imports for zero chunks
+    IMPORT_LOG=$(python scripts/import-conversations-unified.py --limit 5 2>&1)
+
+    # Check for zero chunks warnings
+    if echo "$IMPORT_LOG" | grep -q "Imported 0 chunks"; then
+        echo "❌ CRITICAL: Found imports with 0 chunks!"
+        echo "   Files producing 0 chunks:"
+        echo "$IMPORT_LOG" | grep -B1 "Imported 0 chunks" | grep "import of"
+
+        # Analyze why chunks are zero
+        echo "   Analyzing root cause..."
+
+        # Check for thinking-only content
+        PROBLEM_FILE=$(echo "$IMPORT_LOG" | grep -B1 "Imported 0 chunks" | grep "\.jsonl" | head -1 | awk '{print $NF}')
+        if [ -n "$PROBLEM_FILE" ]; then
+            python -c "
+import json
+file_path = '$PROBLEM_FILE'
+has_thinking = 0
+has_text = 0
+with open(file_path, 'r') as f:
+    for line in f:
+        data = json.loads(line.strip())
+        if 'message' in data and data['message']:
+            content = data['message'].get('content', [])
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get('type') == 'thinking':
+                            has_thinking += 1
+                        elif item.get('type') == 'text':
+                            has_text += 1
+print(f'   Thinking blocks: {has_thinking}')
+print(f'   Text blocks: {has_text}')
+if has_thinking > 0 and has_text == 0:
+    print('   ⚠️ File has only thinking content - import script may need fix')
+"
+        fi
+
+        # DO NOT CERTIFY WITH ZERO CHUNKS
+        echo "   ⛔ CERTIFICATION BLOCKED: Fix zero chunks issue before certifying!"
+        return 1
+    else
+        echo "✅ No zero chunks detected in recent imports"
+    fi
+
+    # Also check Qdrant for empty collections
+    python -c "
+from qdrant_client import QdrantClient
+client = QdrantClient('http://localhost:6333')
+collections = client.get_collections().collections
+empty_collections = []
+for col in collections:
+    count = client.count(collection_name=col.name).count
+    if count == 0:
+        empty_collections.append(col.name)
+if empty_collections:
+    print(f'❌ Found {len(empty_collections)} empty collections: {empty_collections}')
+    print('   ⛔ CERTIFICATION BLOCKED: Empty collections detected!')
+else:
+    print('✅ All collections have vectors')
+" 2>/dev/null || echo "⚠️ Could not check Qdrant collections"
+}
+
 # Test streaming importer
 test_streaming_importer() {
     echo "Testing streaming importer..."
@@ -357,11 +430,262 @@ test_delta_metadata() {
 }
 
 test_unified_importer
+test_zero_chunks_detection  # CRITICAL: Must pass before certification
 test_streaming_importer
 test_delta_metadata
 ```
 
-### 5. MCP Tools Comprehensive Test
+### 5. Hook System Testing
+```bash
+#!/bin/bash
+echo "=== HOOK SYSTEM TESTING ==="
+
+# Test session-start hook
+test_session_start_hook() {
+    echo "Testing session-start hook..."
+    HOOK_PATH="$HOME/.claude/hooks/session-start"
+    if [ -f "$HOOK_PATH" ]; then
+        echo "✅ session-start hook exists"
+        # Check if executable
+        [ -x "$HOOK_PATH" ] && echo "✅ Hook is executable" || echo "❌ Hook not executable"
+    else
+        echo "⚠️ session-start hook not configured"
+    fi
+}
+
+# Test precompact hook
+test_precompact_hook() {
+    echo "Testing precompact hook..."
+    HOOK_PATH="$HOME/.claude/hooks/precompact"
+    if [ -f "$HOOK_PATH" ]; then
+        echo "✅ precompact hook exists"
+        # Test execution
+        timeout 10 "$HOOK_PATH" && echo "✅ Hook executes successfully" || echo "❌ Hook failed"
+    else
+        echo "⚠️ precompact hook not configured"
+    fi
+}
+
+test_session_start_hook
+test_precompact_hook
+```
+
+### 6. Metadata Extraction Testing
+```bash
+#!/bin/bash
+echo "=== METADATA EXTRACTION TESTING ==="
+
+# Test metadata extraction
+test_metadata_extraction() {
+    echo "Testing metadata extraction..."
+    python -c "
+import json
+from pathlib import Path
+
+# Check if metadata is being extracted
+config_dir = Path.home() / '.claude-self-reflect' / 'config'
+delta_state = config_dir / 'delta-update-state.json'
+
+if delta_state.exists():
+    with open(delta_state) as f:
+        state = json.load(f)
+        updated = state.get('updated_points', {})
+        if updated:
+            sample = list(updated.values())[0] if updated else {}
+            print(f'✅ Metadata extracted for {len(updated)} points')
+            if 'files_analyzed' in str(sample):
+                print('✅ files_analyzed metadata present')
+            if 'tools_used' in str(sample):
+                print('✅ tools_used metadata present')
+            if 'concepts' in str(sample):
+                print('✅ concepts metadata present')
+            if 'code_patterns' in str(sample):
+                print('✅ code_patterns (AST) metadata present')
+        else:
+            print('⚠️ No metadata updates found')
+else:
+    print('❌ Delta update state file not found')
+"
+}
+
+# Test AST pattern extraction
+test_ast_patterns() {
+    echo "Testing AST pattern extraction..."
+    TEST_FILE=$(mktemp)
+    cat > "$TEST_FILE" << 'EOF'
+import ast
+text = "def test(): return True"
+tree = ast.parse(text)
+patterns = [node.__class__.__name__ for node in ast.walk(tree)]
+print(f"AST patterns: {patterns}")
+EOF
+    python "$TEST_FILE"
+    rm "$TEST_FILE"
+}
+
+test_metadata_extraction
+test_ast_patterns
+```
+
+### 7. Zero Vector Investigation
+```bash
+#!/bin/bash
+echo "=== ZERO VECTOR INVESTIGATION ==="
+
+test_zero_vectors() {
+    python -c "
+import numpy as np
+from qdrant_client import QdrantClient
+
+# Connect to Qdrant
+client = QdrantClient('http://localhost:6333')
+
+# Check for zero vectors
+collections = client.get_collections().collections
+zero_count = 0
+total_checked = 0
+
+for col in collections[:5]:  # Check first 5 collections
+    try:
+        points = client.scroll(
+            collection_name=col.name,
+            limit=10,
+            with_vectors=True
+        )[0]
+
+        for point in points:
+            total_checked += 1
+            if point.vector:
+                if isinstance(point.vector, list) and all(v == 0 for v in point.vector):
+                    zero_count += 1
+                    print(f'❌ CRITICAL: Zero vector in {col.name}, point {point.id}')
+                elif isinstance(point.vector, dict):
+                    for vec_name, vec in point.vector.items():
+                        if all(v == 0 for v in vec):
+                            zero_count += 1
+                            print(f'❌ CRITICAL: Zero vector in {col.name}, point {point.id}, vector {vec_name}')
+    except Exception as e:
+        print(f'⚠️ Error checking {col.name}: {e}')
+
+if zero_count == 0:
+    print(f'✅ No zero vectors found (checked {total_checked} points)')
+else:
+    print(f'❌ Found {zero_count} zero vectors out of {total_checked} points')
+"
+}
+
+# Test embedding generation
+test_embedding_generation() {
+    echo "Testing embedding generation..."
+    python -c "
+try:
+    from fastembed import TextEmbedding
+    model = TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')
+    texts = ['test', 'hello world', '']
+
+    for text in texts:
+        embedding = list(model.embed([text]))[0]
+        is_zero = all(v == 0 for v in embedding)
+        if is_zero:
+            print(f'❌ CRITICAL: Zero embedding for \'{text}\'')
+        else:
+            import numpy as np
+            print(f'✅ Non-zero embedding for \'{text}\' (mean={np.mean(embedding):.4f})')
+except ImportError:
+    print('❌ FastEmbed not installed')
+"
+}
+
+test_zero_vectors
+test_embedding_generation
+```
+
+### 8. Sub-Agent Testing
+```bash
+#!/bin/bash
+echo "=== SUB-AGENT TESTING ==="
+
+# List all sub-agents
+test_subagent_availability() {
+    echo "Checking sub-agent availability..."
+    AGENTS_DIR="$HOME/projects/claude-self-reflect/.claude/agents"
+
+    EXPECTED_AGENTS=(
+        "claude-self-reflect-test.md"
+        "import-debugger.md"
+        "docker-orchestrator.md"
+        "mcp-integration.md"
+        "search-optimizer.md"
+        "reflection-specialist.md"
+        "qdrant-specialist.md"
+    )
+
+    for agent in "${EXPECTED_AGENTS[@]}"; do
+        if [ -f "$AGENTS_DIR/$agent" ]; then
+            echo "✅ $agent present"
+        else
+            echo "❌ $agent missing"
+        fi
+    done
+}
+
+test_subagent_availability
+```
+
+### 9. Embedding Mode Comprehensive Test
+```bash
+#!/bin/bash
+echo "=== EMBEDDING MODE TESTING ==="
+
+# Test both modes
+test_both_embedding_modes() {
+    echo "Testing local mode (FastEmbed)..."
+    PREFER_LOCAL_EMBEDDINGS=true python -c "
+from mcp_server.src.embedding_manager import get_embedding_manager
+em = get_embedding_manager()
+print(f'Local mode: {em.model_type}, dimension: {em.get_vector_dimension()}')
+"
+
+    if [ -n "$VOYAGE_KEY" ]; then
+        echo "Testing cloud mode (Voyage AI)..."
+        PREFER_LOCAL_EMBEDDINGS=false python -c "
+from mcp_server.src.embedding_manager import get_embedding_manager
+em = get_embedding_manager()
+print(f'Cloud mode: {em.model_type}, dimension: {em.get_vector_dimension()}')
+"
+    else
+        echo "⚠️ VOYAGE_KEY not set, skipping cloud mode test"
+    fi
+}
+
+# Test mode switching
+test_mode_switching() {
+    echo "Testing mode switching..."
+    python -c "
+from pathlib import Path
+env_file = Path('.env')
+if env_file.exists():
+    content = env_file.read_text()
+    if 'PREFER_LOCAL_EMBEDDINGS=false' in content:
+        print('Currently in CLOUD mode')
+    else:
+        print('Currently in LOCAL mode')
+
+    # Test switching
+    print('Testing switch to LOCAL mode...')
+    new_content = content.replace('PREFER_LOCAL_EMBEDDINGS=false', 'PREFER_LOCAL_EMBEDDINGS=true')
+    env_file.write_text(new_content)
+    print('✅ Switched to LOCAL mode')
+else:
+    print('⚠️ .env file not found')
+"
+}
+
+test_both_embedding_modes
+test_mode_switching
+```
+
+### 10. MCP Tools Comprehensive Test
 ```bash
 #!/bin/bash
 echo "=== MCP TOOLS COMPREHENSIVE TEST ==="
@@ -689,16 +1013,96 @@ EOF
 echo "✅ Test report generated: $REPORT_FILE"
 ```
 
+## Pre-Test Validation Protocol
+
+### Agent Self-Review
+Before running any tests, I MUST review myself to ensure comprehensive coverage:
+
+```bash
+#!/bin/bash
+echo "=== PRE-TEST AGENT VALIDATION ==="
+
+# Review this agent file for completeness
+review_agent_completeness() {
+    echo "Reviewing CSR-tester agent for missing features..."
+
+    # Check if agent covers all known features
+    AGENT_FILE="$HOME/projects/claude-self-reflect/.claude/agents/claude-self-reflect-test.md"
+
+    REQUIRED_FEATURES=(
+        "15+ MCP tools"
+        "Temporal tools"
+        "Metadata extraction"
+        "Hook system"
+        "Sub-agents"
+        "Embedding modes"
+        "Zero vectors"
+        "Streaming watcher"
+        "Delta metadata"
+        "Import pipeline"
+        "Docker stack"
+        "CLI tool"
+        "State management"
+        "Memory decay"
+        "Parallel search"
+        "Project scoping"
+        "Collection naming"
+        "Dimension validation"
+        "XML escaping"
+        "Error handling"
+    )
+
+    for feature in "${REQUIRED_FEATURES[@]}"; do
+        if grep -qi "$feature" "$AGENT_FILE"; then
+            echo "✅ $feature: Covered"
+        else
+            echo "❌ $feature: MISSING - Add test coverage!"
+        fi
+    done
+}
+
+# Discover any new features from codebase
+discover_new_features() {
+    echo "Scanning for undocumented features..."
+
+    # Check for new MCP tools
+    NEW_TOOLS=$(grep -h "@mcp.tool()" mcp-server/src/*.py 2>/dev/null | wc -l)
+    echo "MCP tools found: $NEW_TOOLS"
+
+    # Check for new scripts
+    NEW_SCRIPTS=$(ls scripts/*.py 2>/dev/null | wc -l)
+    echo "Python scripts found: $NEW_SCRIPTS"
+
+    # Check for new test files
+    NEW_TESTS=$(find tests -name "*.py" 2>/dev/null | wc -l)
+    echo "Test files found: $NEW_TESTS"
+
+    # Check for new hooks
+    if [ -d "$HOME/.claude/hooks" ]; then
+        HOOKS=$(ls "$HOME/.claude/hooks" 2>/dev/null | wc -l)
+        echo "Hooks configured: $HOOKS"
+    fi
+}
+
+review_agent_completeness
+discover_new_features
+```
+
 ## Test Execution Protocol
 
 ### Run Complete Test Suite
 ```bash
 #!/bin/bash
-# Master test runner
+# Master test runner - CSR-tester is the SOLE executor of all tests
 
 echo "=== CLAUDE SELF-REFLECT COMPLETE TEST SUITE ==="
 echo "Starting at: $(date)"
+echo "Executor: CSR-tester agent (sole test runner)"
 echo ""
+
+# Pre-test validation
+echo "Phase 0: Pre-test Validation..."
+./review_agent_completeness.sh
 
 # Create test results directory
 mkdir -p test-results-$(date +%Y%m%d)
@@ -725,15 +1129,20 @@ echo "Report: test-report-*.md"
 ## Success Criteria
 
 ### Must Pass
-- [ ] All 12 MCP tools functional
+- [ ] All 15+ MCP tools functional
 - [ ] Temporal tools work with proper scoping
 - [ ] Timestamp indexes on all collections
 - [ ] CLI installs and runs globally
 - [ ] Docker containers healthy
-- [ ] No critical bugs (native decay, XML injection)
+- [ ] No critical bugs (native decay, XML injection, dimension mismatch)
 - [ ] Search returns relevant results
 - [ ] Import pipeline processes files
 - [ ] State persists correctly
+- [ ] NO ZERO VECTORS in any collection
+- [ ] Metadata extraction working (files, tools, concepts, AST patterns)
+- [ ] Both embedding modes functional (local 384d, Voyage 1024d)
+- [ ] Hooks execute properly (session-start, precompact)
+- [ ] All 6 sub-agents available
 
 ### Should Pass
 - [ ] Performance within limits
@@ -749,12 +1158,18 @@ echo "Report: test-report-*.md"
 
 ## Final Notes
 
-This agent knows ALL features of Claude Self-Reflect including:
-- New temporal tools
-- Project scoping fixes
-- Timestamp indexing
-- 2,835-line server.py needing modularization
-- GPT-5 review recommendations
+This agent knows ALL features of Claude Self-Reflect v3.3.0 including:
+- 15+ MCP tools with temporal, search, reflection, pagination capabilities
+- Modularized architecture (search_tools.py, temporal_tools.py, reflection_tools.py, parallel_search.py)
+- Metadata extraction (AST patterns, concepts, files analyzed, tools used)
+- Hook system (session-start, precompact, submit hooks)
+- 6 specialized sub-agents for different domains
+- Dual embedding support (FastEmbed 384d, Voyage AI 1024d)
+- Zero vector detection and prevention
+- Streaming watcher and delta metadata updater
+- Project scoping and cross-collection search
+- Memory decay (client-side with 90-day half-life)
+- GPT-5 review recommendations and critical fixes
 - All test scripts and their purposes
 
 The agent will ALWAYS restore the system to local mode after testing and provide comprehensive reports suitable for release decisions.

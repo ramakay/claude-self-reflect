@@ -147,7 +147,15 @@ def generate_embeddings(texts: List[str]) -> List[List[float]]:
     """Generate embeddings for texts."""
     # Use the global embedding_provider which gets updated by command-line args
     if PREFER_LOCAL_EMBEDDINGS:
-        embeddings = list(embedding_provider.passage_embed(texts))
+        # FastEmbed uses 'embed' method, not 'passage_embed'
+        # Try 'embed' first, fall back to 'passage_embed' for compatibility
+        if hasattr(embedding_provider, 'embed'):
+            embeddings = list(embedding_provider.embed(texts))
+        elif hasattr(embedding_provider, 'passage_embed'):
+            # Fallback for older versions (shouldn't exist but kept for safety)
+            embeddings = list(embedding_provider.passage_embed(texts))
+        else:
+            raise AttributeError("FastEmbed provider has neither 'embed' nor 'passage_embed' method")
         return [emb.tolist() if hasattr(emb, 'tolist') else emb for emb in embeddings]
     else:
         response = embedding_provider.embed(texts, model="voyage-3")
@@ -368,7 +376,8 @@ def extract_metadata_single_pass(file_path: str) -> tuple[Dict[str, Any], str, i
                                                 # Extract code for AST analysis with bounds checking
                                                 if len(metadata['ast_elements']) < MAX_AST_ELEMENTS:
                                                     # Fix: More permissive regex to handle various fence formats
-                                                    code_blocks = re.findall(r'```[^`]*?\n(.*?)```', item.get('text', ''), re.DOTALL)
+                                                    # Handles both ```\n and ```python\n cases, with optional newline
+                                                    code_blocks = re.findall(r'```[^`\n]*\n?(.*?)```', item.get('text', ''), re.DOTALL)
                                                     for code_block in code_blocks[:MAX_CODE_BLOCKS]:  # Use defined constant
                                                         if len(metadata['ast_elements']) >= MAX_AST_ELEMENTS:
                                                             break
@@ -376,7 +385,11 @@ def extract_metadata_single_pass(file_path: str) -> tuple[Dict[str, Any], str, i
                                                         for elem in list(ast_elems)[:MAX_ELEMENTS_PER_BLOCK]:  # Use defined constant
                                                             if elem not in metadata['ast_elements'] and len(metadata['ast_elements']) < MAX_AST_ELEMENTS:
                                                                 metadata['ast_elements'].append(elem)
-                                        
+
+                                        elif item.get('type') == 'thinking':
+                                            # Also include thinking content in metadata extraction
+                                            text_content += item.get('thinking', '')
+
                                         elif item.get('type') == 'tool_use':
                                             tool_name = item.get('name', '')
                                             if tool_name and tool_name not in metadata['tools_used']:
@@ -423,39 +436,77 @@ def extract_metadata_single_pass(file_path: str) -> tuple[Dict[str, Any], str, i
     if all_text:
         combined_text = ' '.join(all_text[:MAX_CONCEPT_MESSAGES])  # Limit messages for concept extraction
         metadata['concepts'] = extract_concepts(combined_text)
-    
+
+    # MANDATORY: AST-GREP Pattern Analysis
+    # Analyze code quality for files mentioned in conversation
+    pattern_quality = {}
+    avg_quality_score = 0.0
+
+    try:
+        # Update patterns first (uses 24h cache, <100ms)
+        from update_patterns import check_and_update_patterns
+        check_and_update_patterns()
+
+        # Import analyzer
+        from ast_grep_final_analyzer import FinalASTGrepAnalyzer
+        analyzer = FinalASTGrepAnalyzer()
+
+        # Analyze edited and analyzed files
+        files_to_analyze = list(set(metadata['files_edited'] + metadata['files_analyzed'][:10]))
+        quality_scores = []
+
+        for file_path in files_to_analyze:
+            # Only analyze code files
+            if file_path and any(file_path.endswith(ext) for ext in ['.py', '.ts', '.js', '.tsx', '.jsx']):
+                try:
+                    # Check if file exists and is accessible
+                    if os.path.exists(file_path):
+                        result = analyzer.analyze_file(file_path)
+                        metrics = result['quality_metrics']
+                        pattern_quality[file_path] = {
+                            'score': metrics['quality_score'],
+                            'good_patterns': metrics['good_patterns_found'],
+                            'bad_patterns': metrics['bad_patterns_found'],
+                            'issues': metrics['total_issues']
+                        }
+                        quality_scores.append(metrics['quality_score'])
+                except Exception as e:
+                    logger.debug(f"Could not analyze {file_path}: {e}")
+
+        # Calculate average quality
+        if quality_scores:
+            avg_quality_score = sum(quality_scores) / len(quality_scores)
+
+    except Exception as e:
+        logger.debug(f"AST analysis not available: {e}")
+
+    # Add pattern analysis to metadata
+    metadata['pattern_analysis'] = pattern_quality
+    metadata['avg_quality_score'] = round(avg_quality_score, 3)
+
     # Set total messages
     metadata['total_messages'] = message_count
-    
+
     # Limit arrays
     metadata['files_analyzed'] = metadata['files_analyzed'][:MAX_FILES_ANALYZED]
     metadata['files_edited'] = metadata['files_edited'][:MAX_FILES_EDITED]
     metadata['tools_used'] = metadata['tools_used'][:MAX_TOOLS_USED]
     metadata['ast_elements'] = metadata['ast_elements'][:MAX_AST_ELEMENTS]
-    
+
     return metadata, first_timestamp or datetime.now().isoformat(), message_count
 
 def stream_import_file(jsonl_file: Path, collection_name: str, project_path: Path) -> int:
     """Stream import a single JSONL file without loading it into memory."""
     logger.info(f"Streaming import of {jsonl_file.name}")
-    
-    # Delete existing points for this conversation to prevent stale data
+
+    # Extract conversation ID
     conversation_id = jsonl_file.stem
-    try:
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-        client.delete(
-            collection_name=collection_name,
-            points_selector=Filter(
-                must=[FieldCondition(key="conversation_id", match=MatchValue(value=conversation_id))]
-            ),
-            wait=True
-        )
-        logger.info(f"Deleted existing points for conversation {conversation_id}")
-    except Exception as e:
-        logger.warning(f"Could not delete existing points for {conversation_id}: {e}")
-    
+
     # Extract metadata in first pass (lightweight)
     metadata, created_at, total_messages = extract_metadata_single_pass(str(jsonl_file))
+
+    # Track whether we should delete old points (only after successful import)
+    should_delete_old = False
     
     # Reset counters for each conversation (critical for correct indexing)
     current_message_index = 0  # Must be reset before processing each conversation
@@ -493,6 +544,11 @@ def stream_import_file(jsonl_file: Path, collection_name: str, project_path: Pat
                                         item_type = item.get('type', '')
                                         if item_type == 'text':
                                             text_parts.append(item.get('text', ''))
+                                        elif item_type == 'thinking':
+                                            # Include thinking content (from Claude's thinking blocks)
+                                            thinking_content = item.get('thinking', '')
+                                            if thinking_content:
+                                                text_parts.append(f"[Thinking] {thinking_content[:1000]}")  # Limit size
                                         elif item_type == 'tool_use':
                                             # Include tool use information
                                             tool_name = item.get('name', 'unknown')
@@ -594,10 +650,35 @@ def stream_import_file(jsonl_file: Path, collection_name: str, project_path: Pat
                 created_at, metadata, collection_name, project_path, total_messages
             )
             total_chunks += chunks
-        
+
+        # Only delete old points after successful import verification
+        if total_chunks > 0:
+            try:
+                from qdrant_client.models import Filter, FieldCondition, MatchValue
+                # Count old points before deletion for verification
+                old_count_filter = Filter(
+                    must=[FieldCondition(key="conversation_id", match=MatchValue(value=conversation_id))]
+                )
+                old_points = client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=old_count_filter,
+                    limit=1
+                )[0]
+
+                if len(old_points) > total_chunks + 5:  # Allow some tolerance
+                    # Only delete if we have significantly more old points than new
+                    client.delete(
+                        collection_name=collection_name,
+                        points_selector=old_count_filter,
+                        wait=True
+                    )
+                    logger.info(f"Deleted old points for conversation {conversation_id} after verifying new import")
+            except Exception as e:
+                logger.warning(f"Could not clean up old points for {conversation_id}: {e}")
+
         logger.info(f"Imported {total_chunks} chunks from {jsonl_file.name}")
         return total_chunks
-        
+
     except Exception as e:
         logger.error(f"Failed to import {jsonl_file}: {e}")
         return 0

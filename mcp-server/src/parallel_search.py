@@ -64,84 +64,11 @@ async def search_single_collection(
         DECAY_SCALE_DAYS = constants.get('DECAY_SCALE_DAYS', 90)
         DECAY_WEIGHT = constants.get('DECAY_WEIGHT', 0.3)
         
-        if should_use_decay and USE_NATIVE_DECAY and NATIVE_DECAY_AVAILABLE:
-            # Use native Qdrant decay with newer API
-            await ctx.debug(f"Using NATIVE Qdrant decay (new API) for {collection_name}")
-            
-            half_life_seconds = DECAY_SCALE_DAYS * 24 * 60 * 60
-            
-            # Build query using Qdrant's Fusion and RankFusion
-            fusion_query = models.Fusion(
-                fusion=models.RankFusion.RRF,
-                queries=[
-                    # Semantic similarity query
-                    models.NearestQuery(
-                        nearest=query_embedding,
-                        score_threshold=min_score
-                    ),
-                    # Time decay query using context pair
-                    models.ContextQuery(
-                        context=[
-                            models.ContextPair(
-                                positive=models.DiscoverQuery(
-                                    target=query_embedding,
-                                    context=[
-                                        models.ContextPair(
-                                            positive=models.DatetimeRange(
-                                                gt=datetime.now().isoformat(),
-                                                lt=(datetime.now().timestamp() + half_life_seconds)
-                                            )
-                                        )
-                                    ]
-                                )
-                            )
-                        ]
-                    )
-                ]
-            )
-            
-            # Execute search with native decay
-            search_results = await qdrant_client.query_points(
-                collection_name=collection_name,
-                query=fusion_query,
-                limit=limit,
-                with_payload=True
-            )
-            
-            # Process results
-            for point in search_results.points:
-                # Process each point and add to results
-                raw_timestamp = point.payload.get('timestamp', datetime.now().isoformat())
-                clean_timestamp = raw_timestamp.replace('Z', '+00:00') if raw_timestamp.endswith('Z') else raw_timestamp
-                
-                point_project = point.payload.get('project', collection_name.replace('conv_', '').replace('_voyage', '').replace('_local', ''))
-                
-                # Apply project filtering
-                if target_project != 'all' and not is_reflection_collection:
-                    if point_project != target_project:
-                        normalized_target = target_project.replace('-', '_')
-                        normalized_point = point_project.replace('-', '_')
-                        if not (normalized_point == normalized_target or 
-                                point_project.endswith(f"/{target_project}") or
-                                point_project.endswith(f"-{target_project}") or
-                                normalized_point.endswith(f"_{normalized_target}") or
-                                normalized_point.endswith(f"/{normalized_target}")):
-                            continue
-                
-                # Create SearchResult
-                search_result = {
-                    'id': str(point.id),
-                    'score': point.score,
-                    'timestamp': clean_timestamp,
-                    'role': point.payload.get('start_role', point.payload.get('role', 'unknown')),
-                    'excerpt': (point.payload.get('text', '')[:350] + '...' 
-                               if len(point.payload.get('text', '')) > 350 
-                               else point.payload.get('text', '')),
-                    'project_name': point_project,
-                    'payload': point.payload
-                }
-                results.append(search_result)
-                
+        # NOTE: Native decay API is not available in current Qdrant, fall back to client-side
+        # The Fusion/RankFusion API was experimental and removed, always use client-side decay
+        if should_use_decay and False:  # Disabled until Qdrant provides stable decay API
+            # This code path is intentionally disabled
+            pass
         else:
             # Standard search without native decay or client-side decay
             search_results = await qdrant_client.search(
@@ -220,17 +147,24 @@ async def search_single_collection(
                                 continue
                         logger.debug(f"Keeping point: project '{point_project}' matches target '{target_project}'")
                     
-                    # Create SearchResult
+                    # Create SearchResult with consistent structure
                     search_result = {
                         'id': str(point.id),
                         'score': adjusted_score,
                         'timestamp': clean_timestamp,
                         'role': point.payload.get('start_role', point.payload.get('role', 'unknown')),
-                        'excerpt': (point.payload.get('text', '')[:350] + '...' 
-                                   if len(point.payload.get('text', '')) > 350 
+                        'excerpt': (point.payload.get('text', '')[:350] + '...'
+                                   if len(point.payload.get('text', '')) > 350
                                    else point.payload.get('text', '')),
                         'project_name': point_project,
-                        'payload': point.payload
+                        'conversation_id': point.payload.get('conversation_id'),
+                        'base_conversation_id': point.payload.get('base_conversation_id'),
+                        'collection_name': collection_name,
+                        'raw_payload': point.payload,  # Renamed from 'payload' for consistency
+                        'code_patterns': point.payload.get('code_patterns'),
+                        'files_analyzed': point.payload.get('files_analyzed'),
+                        'tools_used': list(point.payload.get('tools_used', [])) if isinstance(point.payload.get('tools_used'), set) else point.payload.get('tools_used'),
+                        'concepts': point.payload.get('concepts')
                     }
                     results.append(search_result)
             else:

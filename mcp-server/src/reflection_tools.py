@@ -44,9 +44,10 @@ class ReflectionTools:
         await ctx.debug(f"Storing reflection with {len(tags)} tags")
 
         try:
-            # Determine collection name based on embedding type
+            # Determine collection name based on active model type, not prefer_local
             embedding_manager = self.get_embedding_manager()
-            embedding_type = "local" if embedding_manager.prefer_local else "voyage"
+            # Use actual model_type to ensure consistency
+            embedding_type = embedding_manager.model_type or ("voyage" if embedding_manager.voyage_client else "local")
             collection_name = f"reflections_{embedding_type}"
 
             # Ensure reflections collection exists
@@ -57,8 +58,8 @@ class ReflectionTools:
                 # Collection doesn't exist, create it
                 await ctx.debug(f"Creating {collection_name} collection")
 
-                # Determine embedding dimensions
-                embedding_dim = embedding_manager.get_vector_dimension()
+                # Get embedding dimensions for the specific type
+                embedding_dim = embedding_manager.get_vector_dimension(force_type=embedding_type)
 
                 await self.qdrant_client.create_collection(
                     collection_name=collection_name,
@@ -67,10 +68,14 @@ class ReflectionTools:
                         distance=Distance.COSINE
                     )
                 )
-            
-            # Generate embedding for the reflection
-            embedding_manager = self.get_embedding_manager()
-            embedding = await embedding_manager.generate_embedding(content)
+
+            # Generate embedding with the same forced type for consistency
+            embedding = await embedding_manager.generate_embedding(content, force_type=embedding_type)
+
+            # Guard against failed embeddings
+            if not embedding:
+                await ctx.debug("Failed to generate embedding for reflection")
+                return "Failed to store reflection: embedding generation failed"
             
             # Create unique ID
             reflection_id = hashlib.md5(f"{content}{datetime.now().isoformat()}".encode()).hexdigest()

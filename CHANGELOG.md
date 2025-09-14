@@ -5,6 +5,113 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.1] - 2025-09-14
+
+### Bug Fixes & Security Release
+
+This release addresses critical quality tracking bugs and implements comprehensive security improvements identified through GPT-5 code review.
+
+### Fixed
+
+#### Critical Quality Tracking Issues
+- **Global Quality Cache Bug** - Fixed quality cache being global instead of per-project
+  - **Root Cause**: Quality cache was shared across all projects, causing identical metrics display
+  - **Impact**: Statusline showed "100% A/14" for all projects regardless of actual quality
+  - **Solution**: Implemented per-project quality cache isolation with project-specific cache keys
+  - **Files Modified**: `scripts/session_quality_tracker.py` - Added project path normalization for cache isolation
+  - **User Impact**: Each project now shows accurate, independent quality metrics
+
+- **Permanent Hourglass Display** - Fixed statusline showing "[⏳:...]" when no session files exist
+  - **Root Cause**: Quality tracker returned hourglass status for projects without active sessions
+  - **Impact**: Non-coding projects (conversations only) showed confusing permanent loading state
+  - **Solution**: Added conversation-based quality analysis for non-code projects
+  - **Files Modified**: `scripts/conversation-quality-analyzer.py` (new), `scripts/csr-status`
+  - **Enhancement**: Quality metrics now analyze conversation patterns when source code isn't available
+
+- **Confusing Scope Labels** - Removed misleading scope indicators from statusline display
+  - **Root Cause**: Scope labels like "Global:" and "Project:" confused users about quality context
+  - **Solution**: Simplified display to show only essential quality metrics without scope prefixes
+  - **Files Modified**: `scripts/csr-status` - Cleaned up display format
+
+### Security
+
+#### Comprehensive Security Hardening (GPT-5 Review)
+- **Path Sanitization** - Implemented secure whitelist-based approach for project names
+  - Added bounds checking for all user-controlled inputs
+  - Validates project paths against known safe patterns
+  - Prevents directory traversal attacks with "../" sequences
+  - Files Modified: `scripts/session_quality_tracker.py`, `scripts/update-quality-all-projects.py`
+
+- **Command Injection Prevention** - Secured subprocess execution with binary validation
+  - Added whitelist validation for all executable binaries
+  - Implemented safe command construction with proper escaping
+  - Removed shell=True usage where possible for subprocess calls
+  - Added input sanitization for all subprocess arguments
+
+- **Input Validation** - Enhanced bounds checking and data validation
+  - Added maximum limits for file sizes and processing counts
+  - Implemented input sanitization for all user-provided data
+  - Added validation for configuration file formats and values
+  - Enhanced error handling to prevent information disclosure
+
+### Added
+
+#### New Quality Analysis Features
+- **Conversation Quality Analysis** - Quality metrics for non-code projects
+  - Analyzes conversation patterns for quality indicators
+  - Detects bug fixes, testing mentions, documentation updates
+  - Provides quality grades based on development practices discussed
+  - Enables quality tracking for pure conversation-based projects
+
+- **Enhanced Quality Cache** - Improved performance and accuracy
+  - Per-project cache isolation prevents cross-project contamination
+  - Extended cache validity period to 24 hours (was 60 minutes)
+  - Automatic cache invalidation when project files change
+  - Better performance with reduced redundant analysis
+
+- **Automated Quality Updates** - Background quality metric maintenance
+  - New `update-quality-all-projects.py` script for comprehensive updates
+  - Automatic quality metric updates via watcher integration
+  - Scheduled quality refresh for all tracked projects
+  - Maintains accurate metrics without manual intervention
+
+### Technical Details
+
+#### Files Added
+- `scripts/conversation-quality-analyzer.py` - Conversation-based quality analysis
+- `scripts/update-quality-all-projects.py` - Batch quality updates for all projects
+- Enhanced security validation throughout existing scripts
+
+#### Files Modified
+- `scripts/session_quality_tracker.py` - Per-project cache isolation and security hardening
+- `scripts/csr-status` - Improved display format and conversation quality support
+- `scripts/streaming-watcher.py` - Integration with automatic quality updates
+
+#### Security Measures
+- Whitelist-based path validation prevents directory traversal
+- Binary validation ensures only safe executables are called
+- Input bounds checking prevents buffer overflow scenarios
+- Enhanced error handling prevents information disclosure
+- Comprehensive input sanitization across all user-facing interfaces
+
+### Performance
+- Quality analysis cache validity extended to 24 hours for better performance
+- Reduced redundant analysis through improved caching strategies
+- Optimized conversation parsing for faster quality assessment
+- Better memory usage patterns with proper cleanup and validation
+
+### Compatibility
+- Full backward compatibility with existing quality metrics
+- Graceful fallback for projects without conversation data
+- No configuration changes required for existing installations
+- All existing quality grades and history preserved
+
+### Validation
+- Security hardening validated through comprehensive code review
+- Quality tracking tested across multiple project types
+- Cache isolation verified with concurrent project testing
+- Performance improvements measured and validated
+
 ## [3.3.0] - 2025-09-12
 
 ### 🚀 Major Architecture & Performance Release

@@ -4,6 +4,7 @@ import os
 import json
 import logging
 import time
+import html
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 from pathlib import Path
@@ -168,20 +169,23 @@ class SearchTools:
                 if include_raw:
                     output += f"**Raw Payload:**\n```json\n{json.dumps(result.get('payload', {}), indent=2)}\n```\n\n"
         else:
-            # XML format (default)
-            output = f"<search_results>\n<query>{query}</query>\n<count>{len(results)}</count>\n"
+            # XML format (default) with proper escaping
+            def _esc(x): return html.escape(str(x), quote=False)
+
+            output = f"<search_results>\n<query>{_esc(query)}</query>\n<count>{len(results)}</count>\n"
             for i, result in enumerate(results, 1):
                 output += f"<result index=\"{i}\">\n"
                 output += f"  <score>{result['score']:.3f}</score>\n"
-                output += f"  <timestamp>{result.get('timestamp', 'N/A')}</timestamp>\n"
-                output += f"  <conversation_id>{result.get('conversation_id', 'N/A')}</conversation_id>\n"
+                output += f"  <timestamp>{_esc(result.get('timestamp', 'N/A'))}</timestamp>\n"
+                output += f"  <conversation_id>{_esc(result.get('conversation_id', 'N/A'))}</conversation_id>\n"
                 if not brief:
                     # Handle both 'content' and 'excerpt' fields
-                    content = result.get('content', result.get('excerpt', ''))
+                    content = result.get('content', result.get('excerpt', result.get('text', '')))
                     truncated = content[:500] + ('...' if len(content) > 500 else '')
                     output += f"  <content><![CDATA[{truncated}]]></content>\n"
                 if include_raw:
-                    output += f"  <raw_payload>{json.dumps(result.get('payload', {}))}</raw_payload>\n"
+                    # Use CDATA for large JSON payloads
+                    output += f"  <raw_payload><![CDATA[{json.dumps(result.get('payload', {}), ensure_ascii=False)}]]></raw_payload>\n"
                 output += "</result>\n"
             output += "</search_results>"
         
@@ -394,22 +398,29 @@ class SearchTools:
             top_result = max(all_results, key=lambda x: x.get('score', 0)) if all_results else None
             top_score = top_result.get('score', 0) if top_result else 0
             
-            # Format quick search response
+            # Format quick search response with proper XML escaping
+            def _esc(x): return html.escape(str(x), quote=False)
+
             if not top_result:
                 return "<quick_search><count>0</count><message>No matches found</message></quick_search>"
-            
+
+            # Get preview text and ensure we have content fallbacks
+            preview_text = top_result.get('excerpt', top_result.get('content', top_result.get('text', '')))[:200]
+
             return f"""<quick_search>
-<count>{collections_with_matches} collections with matches</count>
+<count>{collections_with_matches}</count>
+<collections_with_matches>{collections_with_matches}</collections_with_matches>
 <top_result>
   <score>{top_result['score']:.3f}</score>
-  <timestamp>{top_result.get('timestamp', 'N/A')}</timestamp>
-  <preview>{top_result.get('excerpt', top_result.get('content', ''))[:200]}...</preview>
+  <timestamp>{_esc(top_result.get('timestamp', 'N/A'))}</timestamp>
+  <preview><![CDATA[{preview_text}...]]></preview>
 </top_result>
 </quick_search>"""
-            
+
         except Exception as e:
             logger.error(f"Quick search failed: {e}", exc_info=True)
-            return f"<quick_search><error>Quick search failed: {str(e)}</error></quick_search>"
+            def _esc(x): return html.escape(str(x), quote=False)
+            return f"<quick_search><error>Quick search failed: {_esc(str(e))}</error></quick_search>"
 
     async def search_summary(
         self,
@@ -606,46 +617,83 @@ class SearchTools:
         project: Optional[str] = None
     ) -> str:
         """Search for conversations that analyzed a specific file."""
-        
+
         await ctx.debug(f"Searching for file: {file_path}, project={project}")
-        
+
         try:
-            # Normalize file path
-            normalized_path = str(Path(file_path).resolve())
-            
+            # Create multiple path variants to match how paths are stored
+            # Import uses normalize_file_path which replaces /Users/ with ~/
+            path_variants = set()
+
+            # Original path
+            path_variants.add(file_path)
+
+            # Basename only
+            path_variants.add(os.path.basename(file_path))
+
+            # Try to resolve if it's a valid path
+            try:
+                resolved_path = str(Path(file_path).resolve())
+                path_variants.add(resolved_path)
+
+                # Convert resolved path to ~/ format (matching how import stores it)
+                home_dir = str(Path.home())
+                if resolved_path.startswith(home_dir):
+                    tilde_path = resolved_path.replace(home_dir, '~', 1)
+                    path_variants.add(tilde_path)
+
+                # Also try with /Users/ replaced by ~/
+                if '/Users/' in resolved_path:
+                    path_variants.add(resolved_path.replace('/Users/', '~/', 1))
+            except:
+                pass
+
+            # If path starts with ~, also try expanded version
+            if file_path.startswith('~'):
+                expanded = os.path.expanduser(file_path)
+                path_variants.add(expanded)
+
+            # Convert all to forward slashes for consistency
+            path_variants = {p.replace('\\', '/') for p in path_variants if p}
+
+            await ctx.debug(f"Searching with path variants: {list(path_variants)}")
+
             # Search for file mentions in metadata
             collections_response = await self.qdrant_client.get_collections()
             collections = collections_response.collections
-            
-            # Define async function to search a single collection
+
+            # Define async function to search a single collection using scroll
             async def search_collection(collection_name: str):
                 try:
-                    # Search by payload filter
-                    search_results = await self.qdrant_client.search(
+                    from qdrant_client import models
+
+                    # Use scroll with proper filter for metadata-only search
+                    results, _ = await self.qdrant_client.scroll(
                         collection_name=collection_name,
-                        query_vector=[0] * 384,  # Dummy vector for metadata search
-                        limit=limit,
-                        query_filter={
-                            "must": [
-                                {
-                                    "key": "files_analyzed",
-                                    "match": {"any": [normalized_path]}
-                                }
+                        scroll_filter=models.Filter(
+                            should=[
+                                models.FieldCondition(
+                                    key="files_analyzed",
+                                    match=models.MatchValue(value=path_variant)
+                                )
+                                for path_variant in path_variants
                             ]
-                        }
+                        ),
+                        limit=limit,
+                        with_payload=True
                     )
-                    
-                    results = []
-                    for result in search_results:
-                        results.append({
-                            'conversation_id': result.payload.get('conversation_id'),
-                            'timestamp': result.payload.get('timestamp'),
-                            'content': result.payload.get('content', ''),
-                            'files_analyzed': result.payload.get('files_analyzed', []),
-                            'score': result.score
+
+                    formatted_results = []
+                    for point in results:
+                        formatted_results.append({
+                            'conversation_id': point.payload.get('conversation_id'),
+                            'timestamp': point.payload.get('timestamp'),
+                            'content': point.payload.get('content', point.payload.get('text', '')),
+                            'files_analyzed': point.payload.get('files_analyzed', []),
+                            'score': 1.0  # No score in scroll, use 1.0 for found items
                         })
-                    return results
-                    
+                    return formatted_results
+
                 except Exception as e:
                     await ctx.debug(f"Error searching {collection_name}: {e}")
                     return []

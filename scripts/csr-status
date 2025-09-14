@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""
+Claude Self-Reflect Status for CC Statusline
+Standalone script that doesn't require venv activation.
+"""
+
+import json
+import time
+from pathlib import Path
+from datetime import datetime, timedelta
+import sys
+
+# Configuration
+CYCLE_FILE = Path.home() / ".claude-self-reflect" / "statusline_cycle.json"
+CYCLE_INTERVAL = 5  # seconds between cycles
+
+
+def get_import_status():
+    """Get current import/indexing status."""
+    state_file = Path.home() / ".claude-self-reflect" / "config" / "imported-files.json"
+
+    if not state_file.exists():
+        return "📚 CSR: Not configured"
+
+    try:
+        with open(state_file, 'r') as f:
+            state = json.load(f)
+
+        imported = len(state.get("imported_files", {}))
+
+        # Count total JSONL files
+        claude_dir = Path.home() / ".claude" / "projects"
+        total = 0
+        if claude_dir.exists():
+            for project_dir in claude_dir.iterdir():
+                if project_dir.is_dir():
+                    total += len(list(project_dir.glob("*.jsonl")))
+
+        if total == 0:
+            return "📚 CSR: No files"
+
+        percent = min(100, (imported / total * 100))
+
+        # Color coding
+        if percent >= 95:
+            emoji = "✅"
+        elif percent >= 50:
+            emoji = "🔄"
+        else:
+            emoji = "⏳"
+
+        return f"{emoji} CSR: {percent:.0f}% indexed"
+
+    except Exception:
+        return "📚 CSR: Error"
+
+
+def get_session_health():
+    """Get cached session health."""
+    cache_file = Path.home() / ".claude-self-reflect" / "session_quality.json"
+
+    if not cache_file.exists():
+        # Fall back to import status if no health data
+        return get_import_status()
+
+    try:
+        # Check cache age
+        mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
+        age = datetime.now() - mtime
+
+        if age > timedelta(minutes=5):
+            # Fall back to import status if stale
+            return get_import_status()
+
+        with open(cache_file, 'r') as f:
+            data = json.load(f)
+
+        if data.get('status') != 'success':
+            # Fall back to import status if no session
+            return get_import_status()
+
+        summary = data['summary']
+        grade = summary['quality_grade']
+        issues = summary['total_issues']
+
+        # Color coding
+        if grade in ['A+', 'A']:
+            emoji = '🟢'
+        elif grade in ['B', 'C']:
+            emoji = '🟡'
+        else:
+            emoji = '🔴'
+
+        if issues > 0:
+            return f"{emoji} Code: {grade} ({issues})"
+        else:
+            return f"{emoji} Code: {grade}"
+
+    except Exception:
+        return get_import_status()
+
+
+def get_current_cycle():
+    """Determine which metric to show based on cycle."""
+    # Read or create cycle state
+    cycle_state = {"last_update": 0, "current": "import"}
+
+    if CYCLE_FILE.exists():
+        try:
+            with open(CYCLE_FILE, 'r') as f:
+                cycle_state = json.load(f)
+        except:
+            pass
+
+    # Check if it's time to cycle
+    now = time.time()
+    if now - cycle_state["last_update"] >= CYCLE_INTERVAL:
+        # Toggle between import and health
+        cycle_state["current"] = "health" if cycle_state["current"] == "import" else "import"
+        cycle_state["last_update"] = now
+
+        # Save state
+        CYCLE_FILE.parent.mkdir(exist_ok=True)
+        with open(CYCLE_FILE, 'w') as f:
+            json.dump(cycle_state, f)
+
+    return cycle_state["current"]
+
+
+def get_compact_status():
+    """Get both import and quality in compact format: [100%][🟢:A+]"""
+    import subprocess
+    import os
+    import re
+    import shutil
+
+    # Get project-specific status using claude-self-reflect status command
+    import_pct = "?"
+    time_behind = ""
+
+    try:
+        # Get current working directory to determine project
+        cwd = os.getcwd()
+        project_name = os.path.basename(cwd)
+
+        # Get status from claude-self-reflect with secure path
+        import shutil
+        csr_binary = shutil.which("claude-self-reflect")
+        if not csr_binary or not os.path.isfile(csr_binary):
+            # Fallback if binary not found
+            import_pct = "?"
+            return f"[{import_pct}]"
+
+        result = subprocess.run(
+            [csr_binary, "status"],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+
+        if result.returncode == 0:
+            status_data = json.loads(result.stdout)
+
+            # Try to find project-specific percentage
+            project_pct = None
+            encoded_path = None
+
+            # Try exact project name FIRST
+            if project_name in status_data.get("projects", {}):
+                project_pct = status_data["projects"][project_name].get("percentage")
+                encoded_path = project_name  # Use project name for file lookup
+
+            # Only try encoded path if exact match not found
+            elif project_pct is None:
+                # Convert path to encoded format
+                encoded_path = cwd.replace("/", "-")
+                if encoded_path.startswith("-"):
+                    encoded_path = encoded_path[1:]  # Remove leading dash
+
+                if encoded_path in status_data.get("projects", {}):
+                    project_pct = status_data["projects"][encoded_path].get("percentage")
+
+            # Use project percentage if found, otherwise use overall
+            if project_pct is not None:
+                pct = int(project_pct)
+            else:
+                pct = int(status_data.get("overall", {}).get("percentage", 0))
+
+            import_pct = f"{pct}%"
+
+            # Only show time behind if NOT at 100%
+            # This indicates how old the unindexed files are
+            if pct < 100:
+                # Check for newest unindexed file
+                state_file = Path.home() / ".claude-self-reflect" / "config" / "imported-files.json"
+                if state_file.exists():
+                    with open(state_file, 'r') as f:
+                        state = json.load(f)
+
+                    # Find project directory
+                    claude_dir = Path.home() / ".claude" / "projects"
+                    if encoded_path:
+                        project_dir = claude_dir / encoded_path
+                        if not project_dir.exists() and not encoded_path.startswith("-"):
+                            project_dir = claude_dir / f"-{encoded_path}"
+
+                        if project_dir.exists():
+                            # Find the newest UNINDEXED file
+                            newest_unindexed_time = None
+                            for jsonl_file in project_dir.glob("*.jsonl"):
+                                file_key = str(jsonl_file)
+                                # Only check unindexed files
+                                if file_key not in state.get("imported_files", {}):
+                                    file_time = datetime.fromtimestamp(jsonl_file.stat().st_mtime)
+                                    if newest_unindexed_time is None or file_time > newest_unindexed_time:
+                                        newest_unindexed_time = file_time
+
+                            # Calculate how behind we are
+                            if newest_unindexed_time:
+                                age = datetime.now() - newest_unindexed_time
+                                if age < timedelta(minutes=5):
+                                    time_behind = " <5m"
+                                elif age < timedelta(hours=1):
+                                    time_behind = f" {int(age.total_seconds() / 60)}m"
+                                elif age < timedelta(days=1):
+                                    time_behind = f" {int(age.total_seconds() / 3600)}h"
+                                else:
+                                    time_behind = f" {int(age.days)}d"
+    except:
+        # Fallback to simple file counting
+        state_file = Path.home() / ".claude-self-reflect" / "config" / "imported-files.json"
+        if state_file.exists():
+            try:
+                with open(state_file, 'r') as f:
+                    state = json.load(f)
+                imported = len(state.get("imported_files", {}))
+
+                claude_dir = Path.home() / ".claude" / "projects"
+                total = 0
+                if claude_dir.exists():
+                    for project_dir in claude_dir.iterdir():
+                        if project_dir.is_dir():
+                            total += len(list(project_dir.glob("*.jsonl")))
+
+                if total > 0:
+                    pct = min(100, int(imported / total * 100))
+                    import_pct = f"{pct}%"
+            except:
+                pass
+
+    # Get quality grade - PER PROJECT cache
+    # BUG FIX: Cache must be per-project, not global!
+    project_name = os.path.basename(os.getcwd())
+    # Secure sanitization with whitelist approach
+    import re
+    safe_project_name = re.sub(r'[^a-zA-Z0-9_-]', '_', project_name)[:100]
+    cache_dir = Path.home() / ".claude-self-reflect" / "quality_cache"
+    cache_file = cache_dir / f"{safe_project_name}.json"
+
+    # Validate cache file path stays within cache directory
+    if cache_file.exists() and not str(cache_file.resolve()).startswith(str(cache_dir.resolve())):
+        # Security issue - return placeholder
+        grade_str = "[...]"
+    else:
+        cache_file.parent.mkdir(exist_ok=True, parents=True)
+    grade_str = ""
+
+    # Try to get quality data (regenerate if too old or missing)
+    quality_valid = False
+
+    if cache_file.exists():
+        try:
+            mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
+            age = datetime.now() - mtime
+
+            # Use quality data up to 24 hours old (more reasonable)
+            if age < timedelta(hours=24):
+                with open(cache_file, 'r') as f:
+                    data = json.load(f)
+
+                if data.get('status') == 'success':
+                    summary = data['summary']
+                    grade = summary['quality_grade']
+                    issues = summary.get('total_issues', 0)
+                    scope = data.get('scope_label', 'Core')  # Get scope label
+
+                    # GPT-5 fix: Remove forced downgrades, trust the analyzer's grade
+                    # Grade should reflect actual quality metrics, not arbitrary thresholds
+
+                    # Pick emoji based on grade
+                    if grade in ['A+', 'A']:
+                        emoji = '🟢'
+                    elif grade in ['B', 'C']:
+                        emoji = '🟡'
+                    else:
+                        emoji = '🔴'
+
+                    # Simple, clear display without confusing scope labels
+                    grade_str = f"[{emoji}:{grade}/{issues}]"
+                    quality_valid = True
+        except:
+            pass
+
+    # If no valid quality data, show last known value or placeholder
+    if not quality_valid and not grade_str:
+        # Try to use last known value from cache even if expired
+        try:
+            if cache_file.exists():
+                with open(cache_file, 'r') as f:
+                    old_data = json.load(f)
+                if old_data.get('status') == 'success':
+                    old_grade = old_data['summary']['quality_grade']
+                    old_issues = old_data['summary'].get('total_issues', 0)
+                    # Show with dimmed indicator that it's old
+                    if old_grade in ['A+', 'A']:
+                        emoji = '🟢'
+                    elif old_grade in ['B', 'C']:
+                        emoji = '🟡'
+                    else:
+                        emoji = '🔴'
+                    grade_str = f"[{emoji}:{old_grade}/{old_issues}]"
+                else:
+                    grade_str = "[...]"
+            else:
+                grade_str = "[...]"
+        except:
+            grade_str = "[...]"
+
+    # Add mini progress bar if not 100%
+    bar_str = ""
+    if import_pct != "?" and import_pct != "100%":
+        pct_num = int(import_pct.rstrip('%'))
+        filled = int(pct_num * 4 / 100)  # 4-char mini bar
+        empty = 4 - filled
+        bar_str = "█" * filled + "░" * empty + " "
+
+    # Return compact format with bar, percentage, time behind, and grade
+    return f"[{bar_str}{import_pct}{time_behind}]{grade_str}"
+
+def main():
+    """Main entry point for CC statusline."""
+    # Check for forced mode
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--import":
+            print(get_import_status())
+        elif sys.argv[1] == "--health":
+            print(get_session_health())
+        elif sys.argv[1] == "--quality-only":
+            # Only show quality, not import (to avoid duplication with MCP status)
+            health = get_session_health()
+            # Only show if it's actual quality data, not fallback to import
+            if "Code:" in health:
+                print(health)
+        elif sys.argv[1] == "--compact":
+            print(get_compact_status())
+        else:
+            # Default to compact mode
+            print(get_compact_status())
+        return
+
+    # Default to compact format (no cycling)
+    print(get_compact_status())
+
+
+if __name__ == "__main__":
+    main()
