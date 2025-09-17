@@ -115,6 +115,14 @@ mcp-server/.fastembed-cache/
 # Articles and drafts (not for public repo)
 docs/articles/
 
+# Security - exclude test files with potential keys
+docs/testing/*verification*.md
+docs/testing/*test-report*.md
+docs/testing/*certification*.md
+**/VOYAGE_KEY*
+**/*api-key*
+**/*API_KEY*
+
 # Backup and temporary files
 qdrant_backup*
 qdrant_cleanup_manifest*

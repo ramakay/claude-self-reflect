@@ -41,7 +41,7 @@ Results: 3 high-relevance matches
 ## 4. Full Conversation Path Retrieval ✅
 ```
 Conversation ID: 9b116392-72fa-4ca5-a5de-0b7c139b6a97
-File path: /Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/9b116392-72fa-4ca5-a5de-0b7c139b6a97.jsonl
+File path: /Users/YOUR_USERNAME/.claude/projects/-Users-YOUR_USERNAME-projects-claude-self-reflect/9b116392-72fa-4ca5-a5de-0b7c139b6a97.jsonl
 File size: 3,838,544 bytes
 Message count: 791
 ```

@@ -61,8 +61,94 @@ def get_import_status():
         return "📚 Import: Error"
 
 
+def categorize_issues(file_reports):
+    """
+    Categorize issues from AST analysis into critical/medium/low.
+    """
+    critical = 0
+    medium = 0
+    low = 0
+
+    for file_path, report in file_reports.items():
+        for rec in report.get('recommendations', []):
+            if 'print statements' in rec or 'console.log' in rec.lower():
+                # Extract count from "Replace N print statements"
+                import re
+                match = re.search(r'(\d+)', rec)
+                if match:
+                    low += int(match.group(1))
+            elif 'anti-patterns' in rec:
+                # Extract count from "Fix N anti-patterns"
+                import re
+                match = re.search(r'Fix (\d+)', rec)
+                if match:
+                    medium += int(match.group(1))
+
+        # Check top_issues for severity classification
+        for issue in report.get('top_issues', []):
+            severity = issue.get('severity', 'medium')
+            count = issue.get('count', 0)
+
+            if severity == 'high':
+                critical += count
+            elif severity == 'medium':
+                if 'print' in issue.get('id', '') or 'console' in issue.get('id', ''):
+                    low += count
+                else:
+                    medium += count
+            else:
+                low += count
+
+    return critical, medium, low
+
+
+def get_quality_icon(critical=0, medium=0, low=0):
+    """
+    Determine quality icon based on issue severity counts.
+    """
+    # Icon selection based on highest severity present
+    if critical > 0:
+        if critical >= 10:
+            return "🔴"  # Red circle - Critical issues need immediate attention
+        else:
+            return "🟠"  # Orange circle - Some critical issues
+    elif medium > 0:
+        if medium >= 50:
+            return "🟡"  # Yellow circle - Many medium issues
+        else:
+            return "🟢"  # Green circle - Few medium issues
+    elif low > 0:
+        if low >= 100:
+            return "⚪"  # White circle - Many minor issues (prints)
+        else:
+            return "✅"  # Check mark - Only minor issues
+    else:
+        return "✨"  # Sparkles - Perfect, no issues
+
+
+def format_statusline_quality(critical=0, medium=0, low=0):
+    """
+    Format statusline with colored dot and labeled numbers.
+    """
+    icon = get_quality_icon(critical, medium, low)
+
+    # Build count display with labels instead of colors for better compatibility
+    counts = []
+    if critical > 0:
+        counts.append(f"C:{critical}")  # C for critical
+    if medium > 0:
+        counts.append(f"M:{medium}")    # M for medium
+    if low > 0:
+        counts.append(f"L:{low}")       # L for low
+
+    if counts:
+        return f"{icon} {' '.join(counts)}"
+    else:
+        return f"{icon}"  # Perfect - no counts needed
+
+
 def get_session_health():
-    """Get cached session health."""
+    """Get cached session health with icon-based quality display."""
     cache_file = Path.home() / ".claude-self-reflect" / "session_quality.json"
 
     if not cache_file.exists():
@@ -82,23 +168,12 @@ def get_session_health():
         if data.get('status') != 'success':
             return "💻 Session: Inactive"
 
-        summary = data['summary']
-        grade = summary['quality_grade']
-        score = summary['avg_quality_score']
-        issues = summary['total_issues']
+        # Extract issue counts by severity
+        file_reports = data.get('file_reports', {})
+        critical, medium, low = categorize_issues(file_reports)
 
-        # Color coding
-        if grade in ['A+', 'A']:
-            emoji = '🟢'
-        elif grade in ['B', 'C']:
-            emoji = '🟡'
-        else:
-            emoji = '🔴'
-
-        if issues > 0:
-            return f"{emoji} Code: {grade} ({issues} issues)"
-        else:
-            return f"{emoji} Code: {grade} Clean"
+        # Use the icon-based display
+        return format_statusline_quality(critical, medium, low)
 
     except Exception:
         return "💻 Session: Error"

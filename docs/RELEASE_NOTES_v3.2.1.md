@@ -37,7 +37,7 @@ The SQLite3 vulnerability (CVE-2025-7709) has been addressed through Docker base
 ### Privacy Pattern Update
 ```python
 # Before (v3.2.0 and earlier):
-base_path / f"-Users-ramakrishnanannaswamy-projects-{project}"
+base_path / f"-Users-YOUR_USERNAME-projects-{project}"
 
 # After (v3.2.1):  
 base_path / f"-Users-*-projects-{project}"

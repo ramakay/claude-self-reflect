@@ -10,9 +10,9 @@ import os
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.server import (
+from src.temporal_tools import (
     get_recent_work,
-    search_by_recency, 
+    search_by_recency,
     get_timeline
 )
 from src.temporal_utils import TemporalParser, SessionDetector

@@ -335,22 +335,27 @@ def extract_metadata_single_pass(file_path: str) -> tuple[Dict[str, Any], str, i
         "concepts": [],
         "ast_elements": [],
         "has_code_blocks": False,
-        "total_messages": 0
+        "total_messages": 0,
+        "project_path": None  # Add project path from cwd
     }
-    
+
     first_timestamp = None
     message_count = 0
     all_text = []
-    
+
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 if not line.strip():
                     continue
-                    
+
                 try:
                     data = json.loads(line)
-                    
+
+                    # Extract cwd (current working directory) as project path
+                    if metadata["project_path"] is None and 'cwd' in data:
+                        metadata["project_path"] = data.get('cwd')
+
                     # Get timestamp from first valid entry
                     if first_timestamp is None and 'timestamp' in data:
                         first_timestamp = data.get('timestamp')

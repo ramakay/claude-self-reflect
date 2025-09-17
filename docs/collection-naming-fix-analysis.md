@@ -23,8 +23,8 @@ project_hash = hashlib.md5(normalized.encode()).hexdigest()[:8]
 ```
 
 ### Evidence
-- Collection `conv_3ce27839_local` contains data for project `-Users-ramakrishnanannaswamy-projects-procsolve-website`
-- Hash `3ce27839` = MD5(`"-Users-ramakrishnanannaswamy-projects-procsolve-website"`)[:8] (direct hash)
+- Collection `conv_3ce27839_local` contains data for project `-Users-YOUR_USERNAME-projects-procsolve-website`
+- Hash `3ce27839` = MD5(`"-Users-YOUR_USERNAME-projects-procsolve-website"`)[:8] (direct hash)
 - Should be `9f2f312b` = MD5(`"procsolve-website"`)[:8] (normalized hash)
 
 ## The Fix

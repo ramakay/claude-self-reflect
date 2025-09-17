@@ -15,7 +15,7 @@ Claude Self-Reflect v3.3.0 successfully passes all critical tests for Voyage AI 
 
 **Environment Variables Tested**:
 ```
-VOYAGE_KEY=pa-JbR-8lzR02embvkQjsuVX2eIrJ9qotqUo5E72zPeQjO
+VOYAGE_KEY=[REDACTED - Use your actual Voyage API key]
 PREFER_LOCAL_EMBEDDINGS=false
 QDRANT_URL=http://localhost:6333
 ```
@@ -24,7 +24,7 @@ QDRANT_URL=http://localhost:6333
 ```bash
 claude mcp add claude-self-reflect "/Users/.../mcp-server/run-mcp.sh" \
   -e QDRANT_URL="http://localhost:6333" \
-  -e VOYAGE_KEY="pa-JbR-8lzR02embvkQjsuVX2eIrJ9qotqUo5E72zPeQjO" \
+  -e VOYAGE_KEY="[REDACTED - Use your actual Voyage API key]" \
   -e PREFER_LOCAL_EMBEDDINGS="false" \
   -s user
 ```

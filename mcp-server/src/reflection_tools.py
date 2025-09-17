@@ -44,10 +44,24 @@ class ReflectionTools:
         await ctx.debug(f"Storing reflection with {len(tags)} tags")
 
         try:
-            # Determine collection name based on active model type, not prefer_local
+            # Check runtime preference from environment
+            import os
+            prefer_local = os.getenv('PREFER_LOCAL_EMBEDDINGS', 'true').lower() == 'true'
+
             embedding_manager = self.get_embedding_manager()
-            # Use actual model_type to ensure consistency
-            embedding_type = embedding_manager.model_type or ("voyage" if embedding_manager.voyage_client else "local")
+
+            # Use embedding_manager's model_type which already respects preferences
+            embedding_type = embedding_manager.model_type
+
+            if embedding_type == "local":
+                await ctx.debug("Using LOCAL mode (FastEmbed, 384 dimensions)")
+            elif embedding_type == "voyage":
+                await ctx.debug("Using VOYAGE mode (Voyage AI, 1024 dimensions)")
+            else:
+                # Shouldn't happen but handle gracefully
+                embedding_type = "local" if embedding_manager.local_model else "voyage"
+                await ctx.debug(f"Using {embedding_type} mode (fallback)")
+
             collection_name = f"reflections_{embedding_type}"
 
             # Ensure reflections collection exists
@@ -104,6 +118,7 @@ class ReflectionTools:
             
             return f"""Reflection stored successfully.
 ID: {reflection_id}
+Collection: {collection_name}
 Tags: {', '.join(tags) if tags else 'none'}
 Timestamp: {metadata['timestamp']}"""
             

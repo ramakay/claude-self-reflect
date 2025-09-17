@@ -21,6 +21,13 @@ CMDLINE_VOYAGE_KEY="${VOYAGE_KEY:-}"
 CMDLINE_PREFER_LOCAL="${PREFER_LOCAL_EMBEDDINGS:-}"
 CMDLINE_QDRANT_URL="${QDRANT_URL:-}"
 
+# CRITICAL: If local mode is explicitly requested, skip VOYAGE_KEY from .env
+if [ "$CMDLINE_PREFER_LOCAL" = "true" ]; then
+    echo "[DEBUG] Local mode explicitly requested - will skip VOYAGE_KEY from .env" >&2
+    # Save current VOYAGE_KEY state
+    SAVED_VOYAGE_KEY="${VOYAGE_KEY:-}"
+fi
+
 # Load .env file for any missing values
 if [ -f "../.env" ]; then
     echo "[DEBUG] Loading .env file from project root" >&2
@@ -31,10 +38,18 @@ else
     echo "[DEBUG] No .env file found, using defaults" >&2
 fi
 
-# Restore command-line values (they take precedence)
-if [ ! -z "$CMDLINE_VOYAGE_KEY" ]; then
+# CRITICAL: Handle local mode by clearing VOYAGE_KEY if local was explicitly requested
+if [ "$CMDLINE_PREFER_LOCAL" = "true" ]; then
+    unset VOYAGE_KEY
+    echo "[DEBUG] Local mode: VOYAGE_KEY cleared to force local embeddings" >&2
+elif [ "${CMDLINE_VOYAGE_KEY+x}" ]; then
+    # Restore command-line VOYAGE_KEY if it was explicitly set
     export VOYAGE_KEY="$CMDLINE_VOYAGE_KEY"
-    echo "[DEBUG] Using command-line VOYAGE_KEY" >&2
+    if [ -z "$VOYAGE_KEY" ]; then
+        echo "[DEBUG] VOYAGE_KEY explicitly set to empty (forcing local mode)" >&2
+    else
+        echo "[DEBUG] Using command-line VOYAGE_KEY" >&2
+    fi
 fi
 
 if [ ! -z "$CMDLINE_PREFER_LOCAL" ]; then
@@ -76,9 +91,8 @@ fi
 # CRITICAL FIX: Pass through environment variables from Claude Code
 # These environment variables are set by `claude mcp add -e KEY=value`
 # Export them so the Python process can access them
-if [ ! -z "$VOYAGE_KEY" ]; then
-    export VOYAGE_KEY="$VOYAGE_KEY"
-fi
+# BUT: Don't export VOYAGE_KEY if we're in local mode
+# Note: VOYAGE_KEY might have been unset earlier for local mode, so skip this entirely
 
 if [ ! -z "$VOYAGE_KEY_2" ]; then
     export VOYAGE_KEY_2="$VOYAGE_KEY_2"

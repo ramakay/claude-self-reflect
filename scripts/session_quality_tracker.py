@@ -106,13 +106,29 @@ class SessionQualityTracker:
 
         return edited_files
 
-    def analyze_session_quality(self, session_file: Optional[Path] = None) -> Dict[str, Any]:
+    def analyze_session_quality(self, session_file: Optional[Path] = None, use_tracker: bool = False) -> Dict[str, Any]:
         """
         Analyze code quality for all files edited in current session.
         Returns quality report with actionable insights.
         """
         # Update patterns (uses cache, <100ms)
         check_and_update_patterns()
+
+        # Check for session edit tracker first (priority mode)
+        if use_tracker or (not session_file):
+            tracker_file = Path.home() / ".claude-self-reflect" / "current_session_edits.json"
+            if tracker_file.exists():
+                try:
+                    with open(tracker_file, 'r') as f:
+                        tracker_data = json.load(f)
+                        edited_files = set(tracker_data.get('edited_files', []))
+                        if edited_files:
+                            logger.info(f"Using session tracker: {len(edited_files)} files edited in session")
+                            self.current_session_id = 'active_session'
+                            # Use Session scope label for tracked edits
+                            return self._analyze_files_with_scope(edited_files, scope_label='Session')
+                except Exception as e:
+                    logger.debug(f"Error reading tracker file: {e}")
 
         # Find active session if not provided
         if not session_file:
@@ -188,7 +204,7 @@ class SessionQualityTracker:
                 'avg_quality_score': round(avg_quality, 3),
                 'total_issues': total_issues,
                 'total_good_patterns': total_good_patterns,
-                'quality_grade': self._get_quality_grade(avg_quality)
+                'quality_grade': self._get_quality_grade(avg_quality, total_issues)
             },
             'file_reports': file_reports,
             'actionable_items': self._generate_actionable_items(file_reports),
@@ -212,20 +228,92 @@ class SessionQualityTracker:
         top_issues.sort(key=lambda x: x['count'], reverse=True)
         return top_issues[:5]  # Top 5 issues
 
-    def _get_quality_grade(self, score: float) -> str:
-        """Convert quality score to letter grade."""
-        if score >= 0.9:
-            return 'A+'
-        elif score >= 0.8:
-            return 'A'
-        elif score >= 0.7:
-            return 'B'
-        elif score >= 0.6:
-            return 'C'
-        elif score >= 0.5:
-            return 'D'
-        else:
+    def _get_quality_grade(self, score: float, total_issues: int = 0) -> str:
+        """
+        Convert quality score to letter grade.
+        Based on consensus: issues should dominate grading.
+
+        Grade boundaries (adjusted for issue count):
+        - A+: score >= 0.97 AND issues <= 5
+        - A:  score >= 0.93 AND issues <= 20
+        - B:  score >= 0.83 AND issues <= 50
+        - C:  score >= 0.73 AND issues <= 100
+        - D:  score >= 0.60
+        - F:  score < 0.60
+        """
+        # Hard caps based on issue count (industry standard)
+        if total_issues > 200:
             return 'F'
+        elif total_issues > 100:
+            # Many issues - max grade is C
+            if score >= 0.77:
+                return 'C+'
+            elif score >= 0.73:
+                return 'C'
+            elif score >= 0.70:
+                return 'C-'
+            elif score >= 0.60:
+                return 'D'
+            else:
+                return 'F'
+        elif total_issues > 50:
+            # Moderate issues - max grade is B
+            if score >= 0.87:
+                return 'B+'
+            elif score >= 0.83:
+                return 'B'
+            elif score >= 0.80:
+                return 'B-'
+            elif score >= 0.73:
+                return 'C'
+            elif score >= 0.60:
+                return 'D'
+            else:
+                return 'F'
+        elif total_issues > 20:
+            # Some issues - max grade is A-
+            if score >= 0.90:
+                return 'A-'
+            elif score >= 0.87:
+                return 'B+'
+            elif score >= 0.83:
+                return 'B'
+            elif score >= 0.73:
+                return 'C'
+            elif score >= 0.60:
+                return 'D'
+            else:
+                return 'F'
+        elif total_issues > 5:
+            # Few issues - max grade is A
+            if score >= 0.93:
+                return 'A'
+            elif score >= 0.90:
+                return 'A-'
+            elif score >= 0.83:
+                return 'B'
+            elif score >= 0.73:
+                return 'C'
+            elif score >= 0.60:
+                return 'D'
+            else:
+                return 'F'
+        else:
+            # Very few issues (0-5) - can achieve A+
+            if score >= 0.97:
+                return 'A+'
+            elif score >= 0.93:
+                return 'A'
+            elif score >= 0.90:
+                return 'A-'
+            elif score >= 0.83:
+                return 'B'
+            elif score >= 0.73:
+                return 'C'
+            elif score >= 0.60:
+                return 'D'
+            else:
+                return 'F'
 
     def _generate_actionable_items(self, file_reports: Dict) -> List[str]:
         """Generate actionable recommendations for the user."""
@@ -263,23 +351,101 @@ class SessionQualityTracker:
 
         return actions
 
+    def _analyze_files_with_scope(self, edited_files: set, scope_label: str = 'Session') -> Dict[str, Any]:
+        """
+        Analyze specific files with a given scope label.
+        Used for both session tracking and fallback modes.
+        """
+        # Analyze each edited file
+        file_reports = {}
+        total_issues = 0
+        total_good_patterns = 0
+        quality_scores = []
+
+        for file_path in edited_files:
+            # Only analyze code files
+            if any(str(file_path).endswith(ext) for ext in ['.py', '.ts', '.js', '.tsx', '.jsx']):
+                try:
+                    result = self.analyzer.analyze_file(file_path)
+                    metrics = result['quality_metrics']
+
+                    file_reports[file_path] = {
+                        'quality_score': metrics['quality_score'],
+                        'good_patterns': metrics['good_patterns_found'],
+                        'issues': metrics['total_issues'],
+                        'recommendations': result.get('recommendations', [])[:3],  # Top 3
+                        'top_issues': self._get_top_issues(result)
+                    }
+
+                    total_issues += metrics['total_issues']
+                    total_good_patterns += metrics['good_patterns_found']
+                    quality_scores.append(metrics['quality_score'])
+
+                    # Track quality history
+                    if file_path not in self.quality_history:
+                        self.quality_history[file_path] = []
+                    self.quality_history[file_path].append({
+                        'timestamp': datetime.now().isoformat(),
+                        'score': metrics['quality_score']
+                    })
+
+                except Exception as e:
+                    logger.error(f"Failed to analyze {file_path}: {e}")
+
+        if not file_reports:
+            return {
+                'status': 'no_code_files',
+                'session_id': self.current_session_id,
+                'scope_label': scope_label,
+                'message': 'No analyzable code files in session'
+            }
+
+        # Calculate session average
+        avg_quality = sum(quality_scores) / len(quality_scores) if quality_scores else 0
+
+        # Generate session report
+        return {
+            'status': 'success',
+            'session_id': self.current_session_id,
+            'scope_label': scope_label,  # Use provided scope label
+            'timestamp': datetime.now().isoformat(),
+            'summary': {
+                'files_analyzed': len(file_reports),
+                'avg_quality_score': round(avg_quality, 3),
+                'total_issues': total_issues,
+                'total_good_patterns': total_good_patterns,
+                'quality_grade': self._get_quality_grade(avg_quality, total_issues)
+            },
+            'file_reports': file_reports,
+            'actionable_items': self._generate_actionable_items(file_reports),
+            'quality_trend': self._calculate_quality_trend()
+        }
+
     def analyze_recent_files(self) -> Dict[str, Any]:
         """Analyze core project files when no session is found."""
-        project_root = Path(__file__).parent.parent
+        # Use current working directory as project root
+        project_root = Path.cwd()
 
-        # Define core project files to analyze (not test files)
-        core_files = [
-            "scripts/session_quality_tracker.py",
-            "scripts/cc-statusline-unified.py",
-            "scripts/pattern_registry_enhanced.py",
-            "scripts/simplified_metadata_extractor.py",
-            "scripts/streaming-watcher.py",
-            "scripts/quality-report.py",
-            "mcp-server/src/server.py",
-            "mcp-server/src/search_tools.py",
-            "mcp-server/src/temporal_tools.py",
-            "mcp-server/src/reflection_tools.py",
-        ]
+        # Find code files in the project dynamically
+        code_extensions = {'.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c',
+                          '.h', '.hpp', '.rs', '.go', '.rb', '.php'}
+
+        core_files = []
+        # Look for code files in the project (limit to avoid too many files)
+        for ext in code_extensions:
+            files = list(project_root.rglob(f'*{ext}'))
+            # Filter out common non-source directories
+            files = [f for f in files if not any(
+                skip in f.parts for skip in ['venv', '.venv', 'node_modules', '.git',
+                                            '__pycache__', '.pytest_cache', 'dist',
+                                            'build', 'target', '.idea', '.vscode']
+            )]
+            core_files.extend(files[:20])  # Take up to 20 files per extension
+            if len(core_files) >= 50:  # Increased limit to 50 files for better coverage
+                break
+
+        # Convert to relative paths
+        core_files = [str(f.relative_to(project_root)) for f in core_files[:50]]
 
         edited_files = set()
         for file_path in core_files:
@@ -289,10 +455,7 @@ class SessionQualityTracker:
 
         # Also check for recently modified files (last 30 minutes) to catch actual work
         try:
-            # Validate project_root is within expected bounds
-            if not str(project_root.resolve()).startswith(str(Path(__file__).parent.parent.resolve())):
-                logger.error("Security: Invalid project root path")
-                return {}
+            # No need to validate project_root - we can analyze any project
 
             # Use pathlib instead of subprocess for safer file discovery
             scripts_dir = project_root / "scripts"
@@ -321,7 +484,7 @@ class SessionQualityTracker:
         total_good_patterns = 0
         quality_scores = []
 
-        for file_path in list(edited_files)[:10]:  # Limit to 10 files for performance
+        for file_path in list(edited_files)[:50]:  # Analyze up to 50 files for better coverage
             try:
                 result = self.analyzer.analyze_file(file_path)
                 metrics = result['quality_metrics']
@@ -367,7 +530,7 @@ class SessionQualityTracker:
                 'avg_quality_score': round(avg_quality, 3),
                 'total_issues': total_issues,
                 'total_good_patterns': total_good_patterns,
-                'quality_grade': self._get_quality_grade(avg_quality)
+                'quality_grade': self._get_quality_grade(avg_quality, total_issues)
             },
             'file_reports': file_reports,
             'actionable_items': self._generate_actionable_items(file_reports),
@@ -441,14 +604,14 @@ class SessionQualityTracker:
         return '\n'.join(report)
 
 
-def main():
+def main(use_tracker=False):
     """Run session quality analysis."""
     tracker = SessionQualityTracker()
 
     logger.info("🔍 Analyzing current session code quality...")
     logger.info("")
 
-    analysis = tracker.analyze_session_quality()
+    analysis = tracker.analyze_session_quality(use_tracker=use_tracker)
     report = tracker.generate_report(analysis)
 
     logger.info(report)
@@ -456,8 +619,8 @@ def main():
     # Save report for watcher integration - PER PROJECT
     # Always save cache, even with fallback analysis
     if analysis.get('status') in ['success', 'fallback']:
-        # Get project name from current directory
-        project_name = os.path.basename(os.getcwd())
+        # Get project name from environment or current directory
+        project_name = os.environ.get('QUALITY_PROJECT_NAME', os.path.basename(os.getcwd()))
         # Secure sanitization with whitelist approach
         import re
         safe_project_name = re.sub(r'[^a-zA-Z0-9_-]', '_', project_name)[:100]
@@ -478,4 +641,21 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description='Analyze code quality for projects')
+    parser.add_argument('--project-path', help='Path to the project to analyze')
+    parser.add_argument('--project-name', help='Name of the project for cache file')
+    parser.add_argument('--use-tracker', action='store_true',
+                        help='Use session edit tracker for analysis')
+    args = parser.parse_args()
+
+    # If external project specified, change to that directory
+    if args.project_path:
+        os.chdir(args.project_path)
+
+    # Override project name if specified
+    if args.project_name:
+        # This will be used in the main() function for cache naming
+        os.environ['QUALITY_PROJECT_NAME'] = args.project_name
+
+    main(use_tracker=args.use_tracker)

@@ -637,6 +637,10 @@ test_subagent_availability
 #!/bin/bash
 echo "=== EMBEDDING MODE TESTING ==="
 
+# CRITICAL: Instructions for switching to cloud mode
+# The system needs new collections with 1024 dimensions for cloud mode
+# This requires MCP restart with VOYAGE_KEY parameter
+
 # Test both modes
 test_both_embedding_modes() {
     echo "Testing local mode (FastEmbed)..."
@@ -658,6 +662,73 @@ print(f'Cloud mode: {em.model_type}, dimension: {em.get_vector_dimension()}')
     fi
 }
 
+# CRITICAL CLOUD MODE SWITCH PROCEDURE
+switch_to_cloud_mode() {
+    echo "=== SWITCHING TO CLOUD MODE (1024 dimensions) ==="
+    echo "This creates NEW collections with _voyage suffix"
+
+    # Step 1: Get VOYAGE_KEY from .env
+    VOYAGE_KEY=$(grep "^VOYAGE_KEY=" .env | cut -d'=' -f2)
+    if [ -z "$VOYAGE_KEY" ]; then
+        echo "❌ VOYAGE_KEY not found in .env file"
+        echo "Please add VOYAGE_KEY=your-key-here to .env file"
+        return 1
+    fi
+
+    # Step 2: Remove existing MCP
+    echo "Removing existing MCP configuration..."
+    claude mcp remove claude-self-reflect
+
+    # Step 3: Re-add with cloud parameters
+    echo "Adding MCP with cloud mode parameters..."
+    claude mcp add claude-self-reflect \
+        "/Users/$(whoami)/projects/claude-self-reflect/mcp-server/run-mcp.sh" \
+        -e PREFER_LOCAL_EMBEDDINGS="false" \
+        -e VOYAGE_KEY="$VOYAGE_KEY" \
+        -e QDRANT_URL="http://localhost:6333" \
+        -s user
+
+    # Step 4: Wait for MCP to initialize
+    echo "Waiting 30 seconds for MCP to initialize..."
+    sleep 30
+
+    # Step 5: Test MCP connection
+    echo "Testing MCP connection..."
+    claude mcp list | grep claude-self-reflect
+
+    echo "✅ Switched to CLOUD mode with 1024-dimensional embeddings"
+    echo "⚠️  New collections will be created with _voyage suffix"
+}
+
+# CRITICAL LOCAL MODE RESTORE PROCEDURE
+switch_to_local_mode() {
+    echo "=== RESTORING LOCAL MODE (384 dimensions) ==="
+    echo "This uses collections with _local suffix"
+
+    # Step 1: Remove existing MCP
+    echo "Removing existing MCP configuration..."
+    claude mcp remove claude-self-reflect
+
+    # Step 2: Re-add with local parameters (default)
+    echo "Adding MCP with local mode parameters..."
+    claude mcp add claude-self-reflect \
+        "/Users/$(whoami)/projects/claude-self-reflect/mcp-server/run-mcp.sh" \
+        -e PREFER_LOCAL_EMBEDDINGS="true" \
+        -e QDRANT_URL="http://localhost:6333" \
+        -s user
+
+    # Step 3: Wait for MCP to initialize
+    echo "Waiting 30 seconds for MCP to initialize..."
+    sleep 30
+
+    # Step 4: Test MCP connection
+    echo "Testing MCP connection..."
+    claude mcp list | grep claude-self-reflect
+
+    echo "✅ Restored to LOCAL mode with 384-dimensional embeddings"
+    echo "Privacy-first mode active"
+}
+
 # Test mode switching
 test_mode_switching() {
     echo "Testing mode switching..."
@@ -667,22 +738,50 @@ env_file = Path('.env')
 if env_file.exists():
     content = env_file.read_text()
     if 'PREFER_LOCAL_EMBEDDINGS=false' in content:
-        print('Currently in CLOUD mode')
+        print('Currently in CLOUD mode (per .env file)')
     else:
-        print('Currently in LOCAL mode')
-
-    # Test switching
-    print('Testing switch to LOCAL mode...')
-    new_content = content.replace('PREFER_LOCAL_EMBEDDINGS=false', 'PREFER_LOCAL_EMBEDDINGS=true')
-    env_file.write_text(new_content)
-    print('✅ Switched to LOCAL mode')
+        print('Currently in LOCAL mode (per .env file)')
 else:
     print('⚠️ .env file not found')
 "
 }
 
+# Full cloud mode test procedure
+full_cloud_mode_test() {
+    echo "=== FULL CLOUD MODE TEST PROCEDURE ==="
+
+    # 1. Switch to cloud mode
+    switch_to_cloud_mode
+
+    # 2. Test cloud embedding generation
+    echo "Testing cloud embedding generation..."
+    # This will create new collections with _voyage suffix
+
+    # 3. Run import with cloud embeddings
+    echo "Running test import with cloud embeddings..."
+    cd /Users/$(whoami)/projects/claude-self-reflect
+    source venv/bin/activate
+    PREFER_LOCAL_EMBEDDINGS=false python scripts/import-conversations-unified.py --limit 5
+
+    # 4. Verify cloud collections created
+    echo "Verifying cloud collections..."
+    curl -s http://localhost:6333/collections | jq '.result.collections[] | select(.name | endswith("_voyage")) | .name'
+
+    # 5. Test search with cloud embeddings
+    echo "Testing search with cloud embeddings..."
+    # Test via MCP tools
+
+    # 6. CRITICAL: Always restore to local mode
+    echo "⚠️  CRITICAL: Restoring to local mode..."
+    switch_to_local_mode
+
+    echo "✅ Cloud mode test complete, system restored to local mode"
+}
+
 test_both_embedding_modes
 test_mode_switching
+# Uncomment to run full cloud test:
+# full_cloud_mode_test
 ```
 
 ### 10. MCP Tools Comprehensive Test

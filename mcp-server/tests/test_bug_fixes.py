@@ -12,11 +12,8 @@ import json
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.server import (
-    reflect_on_past,
-    get_next_results,
-    store_reflection
-)
+from src.search_tools import reflect_on_past, get_next_results
+from src.reflection_tools import store_reflection
 
 
 class TestNativeDecayBugFix:

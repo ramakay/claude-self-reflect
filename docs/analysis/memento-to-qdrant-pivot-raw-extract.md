@@ -88,7 +88,7 @@ Multiple AI reviews: GPT-5 found memory leaks.
   "conversation_id": "295a1824-4395-4038-9123-7b1d473cdd63",
   "chunk_index": 0,
   "message_count": 15,
-  "project": "-Users-ramakrishnanannaswamy-projects-claude-self-reflect",
+  "project": "-Users-YOUR_USERNAME-projects-claude-self-reflect",
   "timestamp": "2025-09-10T13:22:52.122851",
   "total_length": 1107,
   "chunking_version": "v3"
@@ -124,20 +124,20 @@ Multiple AI reviews: GPT-5 found memory leaks.
 
 ```json
 "files_analyzed": [
-  "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/c072a61e-aebb-4c85-960b-c5ffeafa7115.jsonl",
+  "/Users/YOUR_USERNAME/.claude/projects/-Users-YOUR_USERNAME-projects-claude-self-reflect/c072a61e-aebb-4c85-960b-c5ffeafa7115.jsonl",
   "0.737",
-  "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/docs/articles/team-memories-full-article-corrected.md",
+  "/Users/YOUR_USERNAME/projects/claude-self-reflect/docs/articles/team-memories-full-article-corrected.md",
   "0.7",
   "c072a61e-aebb-4c85-960b-c5ffeafa7115.jsonl",
-  "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/scripts/import-conversations-unified.py",
+  "/Users/YOUR_USERNAME/projects/claude-self-reflect/scripts/import-conversations-unified.py",
   "0.5357",
   "v3.1",
-  "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/docs/development/MCP_REFERENCE.md",
-  "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/tests/v3.1.0-certification-report.md",
+  "/Users/YOUR_USERNAME/projects/claude-self-reflect/docs/development/MCP_REFERENCE.md",
+  "/Users/YOUR_USERNAME/projects/claude-self-reflect/tests/v3.1.0-certification-report.md",
   "0.7016",
   "/tmp/code_changes_for_review.py",
   "4.1",
-  "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/src/server.py"
+  "/Users/YOUR_USERNAME/projects/claude-self-reflect/mcp-server/src/server.py"
 ]
 ```
 
@@ -145,11 +145,11 @@ Multiple AI reviews: GPT-5 found memory leaks.
 
 ```json
 "files_edited": [
-  "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/docs/development/v3.2.0-implementation-summary.md",
+  "/Users/YOUR_USERNAME/projects/claude-self-reflect/docs/development/v3.2.0-implementation-summary.md",
   "0.246",
   "v3.1",
   "0.672",
-  "/Users/ramakrishnanannaswamy/.claude",
+  "/Users/YOUR_USERNAME/.claude",
   "0.546",
   "99.8",
   "MCP_REFERENCE.md",
@@ -161,7 +161,7 @@ Multiple AI reviews: GPT-5 found memory leaks.
   "0.959",
   "0.902",
   "4.1",
-  "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/src/server.py",
+  "/Users/YOUR_USERNAME/projects/claude-self-reflect/mcp-server/src/server.py",
   "import-conversations-unified.py",
   "0.685",
   "0.7"
@@ -286,8 +286,8 @@ Analysis of the 85MB ~/.claude.json file reveals project evolution:
 ```json
 {
   "discovered_projects": [
-    "/Users/ramakrishnanannaswamy/memento-stack",
-    "/Users/ramakrishnanannaswamy/memento-stack/qdrant-mcp-stack"
+    "/Users/YOUR_USERNAME/memento-stack",
+    "/Users/YOUR_USERNAME/memento-stack/qdrant-mcp-stack"
   ],
   "memento_stack_history": 100,
   "qdrant_mcp_stack_history": 38,
@@ -303,7 +303,7 @@ Analysis of the 85MB ~/.claude.json file reveals project evolution:
 2. **memento-stack/qdrant-mcp-stack**: 38 history entries (nested project)
 
 #### August 2025 Timeline
-- **August 4, 2025 18:51**: Created `/Users/ramakrishnanannaswamy/claude-self-reflect/qdrant-mcp-stack` directory
+- **August 4, 2025 18:51**: Created `/Users/YOUR_USERNAME/claude-self-reflect/qdrant-mcp-stack` directory
 - **August 9, 2025**: Memento MCP connected (per stored reflections)
 - **August 12, 2025 08:43**: Earliest JSONL file created, project at v2.5.8
 - **August 15, 2025**: Memento declared dead, pivot to Qdrant (per stored reflections)
@@ -377,7 +377,7 @@ The Memento to Qdrant pivot exemplifies this perfectly:
     "type": "reflection",
     "role": "user_reflection",
     "project": "claude-self-reflect",
-    "project_path": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect"
+    "project_path": "/Users/YOUR_USERNAME/projects/claude-self-reflect"
   }
 }
 ```
@@ -389,7 +389,7 @@ The Memento to Qdrant pivot exemplifies this perfectly:
   "parentUuid": "8410f8b2-f694-4713-99d7-684094572466",
   "isSidechain": false,
   "userType": "external",
-  "cwd": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect",
+  "cwd": "/Users/YOUR_USERNAME/projects/claude-self-reflect",
   "sessionId": "295a1824-4395-4038-9123-7b1d473cdd63",
   "version": "1.0.110",
   "gitBranch": "main",

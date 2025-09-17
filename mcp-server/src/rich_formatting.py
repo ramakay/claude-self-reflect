@@ -103,6 +103,109 @@ def format_search_results_rich(
         result_text += f"    <relevance>No conversations matched your query</relevance>\n"
         result_text += f"  </result-summary>\n"
 
+    # Add aggregated insights section (NEW FEATURE)
+    if results and len(results) > 1:
+        result_text += "  <insights>\n"
+        result_text += f"    <!-- Processing {len(results)} results for pattern analysis -->\n"
+
+        # Aggregate file modification patterns
+        file_frequency = {}
+        tool_frequency = {}
+        concept_frequency = {}
+
+        for result in results:
+            # Count file modifications
+            for file in result.get('files_analyzed', []):
+                file_frequency[file] = file_frequency.get(file, 0) + 1
+
+            # Count tool usage
+            for tool in result.get('tools_used', []):
+                tool_frequency[tool] = tool_frequency.get(tool, 0) + 1
+
+            # Count concepts
+            for concept in result.get('concepts', []):
+                concept_frequency[concept] = concept_frequency.get(concept, 0) + 1
+
+        # Show most frequently modified files
+        if file_frequency:
+            top_files = sorted(file_frequency.items(), key=lambda x: x[1], reverse=True)[:3]
+            if top_files:
+                result_text += '    <pattern type="files">\n'
+                result_text += f'      <title>📁 Frequently Modified Files</title>\n'
+                for file, count in top_files:
+                    percentage = (count / len(results)) * 100
+                    result_text += f'      <item count="{count}" pct="{percentage:.0f}%">{file}</item>\n'
+                result_text += '    </pattern>\n'
+
+        # Show common tools used
+        if tool_frequency:
+            top_tools = sorted(tool_frequency.items(), key=lambda x: x[1], reverse=True)[:3]
+            if top_tools:
+                result_text += '    <pattern type="tools">\n'
+                result_text += f'      <title>🔧 Common Tools Used</title>\n'
+                for tool, count in top_tools:
+                    percentage = (count / len(results)) * 100
+                    result_text += f'      <item count="{count}" pct="{percentage:.0f}%">{tool}</item>\n'
+                result_text += '    </pattern>\n'
+
+        # Show related concepts
+        if concept_frequency:
+            top_concepts = sorted(concept_frequency.items(), key=lambda x: x[1], reverse=True)[:3]
+            if top_concepts:
+                result_text += '    <pattern type="concepts">\n'
+                result_text += f'      <title>💡 Related Concepts</title>\n'
+                for concept, count in top_concepts:
+                    percentage = (count / len(results)) * 100
+                    result_text += f'      <item count="{count}" pct="{percentage:.0f}%">{concept}</item>\n'
+                result_text += '    </pattern>\n'
+
+        # Add workflow suggestion based on patterns
+        if file_frequency and tool_frequency:
+            most_common_file = list(file_frequency.keys())[0] if file_frequency else None
+            most_common_tool = list(tool_frequency.keys())[0] if tool_frequency else None
+            if most_common_file and most_common_tool:
+                result_text += '    <suggestion>\n'
+                result_text += f'      <title>💭 Pattern Detection</title>\n'
+                result_text += f'      <text>Similar conversations often involve {most_common_tool} on {most_common_file}</text>\n'
+                result_text += '    </suggestion>\n'
+
+        # Always show a summary even if no clear patterns
+        if not file_frequency and not tool_frequency and not concept_frequency:
+            result_text += '    <summary>\n'
+            result_text += f'      <title>📊 Analysis Summary</title>\n'
+            result_text += f'      <text>Analyzed {len(results)} conversations for patterns</text>\n'
+
+            # Show temporal distribution
+            now = datetime.now(timezone.utc)
+            time_dist = {"today": 0, "week": 0, "month": 0, "older": 0}
+            for result in results:
+                timestamp_str = result.get('timestamp', '')
+                if timestamp_str:
+                    try:
+                        timestamp_clean = timestamp_str.replace('Z', '+00:00') if timestamp_str.endswith('Z') else timestamp_str
+                        timestamp_dt = datetime.fromisoformat(timestamp_clean)
+                        if timestamp_dt.tzinfo is None:
+                            timestamp_dt = timestamp_dt.replace(tzinfo=timezone.utc)
+                        days_ago = (now - timestamp_dt).days
+                        if days_ago == 0:
+                            time_dist["today"] += 1
+                        elif days_ago <= 7:
+                            time_dist["week"] += 1
+                        elif days_ago <= 30:
+                            time_dist["month"] += 1
+                        else:
+                            time_dist["older"] += 1
+                    except:
+                        pass
+
+            if any(time_dist.values()):
+                dist_str = ", ".join([f"{v} {k}" for k, v in time_dist.items() if v > 0])
+                result_text += f'      <temporal>Time distribution: {dist_str}</temporal>\n'
+
+            result_text += '    </summary>\n'
+
+        result_text += "  </insights>\n\n"
+
     # Add metadata
     result_text += f"  <meta>\n"
     result_text += f"    <q>{query}</q>\n"

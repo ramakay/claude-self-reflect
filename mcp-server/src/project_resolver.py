@@ -219,11 +219,27 @@ class ProjectResolver:
                     logger.debug(f"Failed to scroll {coll_name}: {e}")
                     continue
         
+        # Add appropriate reflection collections based on the found conversation collections
+        # If we found _local collections, add reflections_local
+        # If we found _voyage collections, add reflections_voyage
+        reflection_collections = set()
+        for coll in matching_collections:
+            if coll.endswith('_local') and 'reflections_local' in collection_names:
+                reflection_collections.add('reflections_local')
+            elif coll.endswith('_voyage') and 'reflections_voyage' in collection_names:
+                reflection_collections.add('reflections_voyage')
+
+        # Also check for the legacy 'reflections' collection
+        if 'reflections' in collection_names:
+            reflection_collections.add('reflections')
+
+        matching_collections.update(reflection_collections)
+
         # Cache the result with TTL
         result = list(matching_collections)
         self._cache[user_project_name] = matching_collections
         self._cache_ttl[user_project_name] = time()
-        
+
         return result
     
     def _get_collection_names(self, force_refresh: bool = False) -> List[str]:
@@ -244,7 +260,9 @@ class ProjectResolver:
         # Fetch fresh collection list
         try:
             all_collections = self.client.get_collections().collections
-            collection_names = [c.name for c in all_collections if c.name.startswith('conv_')]
+            # Include both conversation collections and reflection collections
+            collection_names = [c.name for c in all_collections
+                              if c.name.startswith('conv_') or c.name.startswith('reflections')]
             
             # Update cache
             self._collections_cache = collection_names

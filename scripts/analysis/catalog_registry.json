@@ -1,0 +1,75 @@
+{
+  "source": "ast-grep-catalog",
+  "version": "1.0.0",
+  "patterns": {
+    "async_patterns": [
+      {
+        "id": "no-await-in-promise-all",
+        "title": "No `await` in `Promise.all` array",
+        "description": "Using `await` inside an inline `Promise.all` array is usually a mistake, as it defeats the purpose of running the promises in parallel.",
+        "severity": "error",
+        "language": "typescript",
+        "has_fix": true,
+        "pattern": "await $A",
+        "inside": {
+          "pattern": "Promise.all($_)",
+          "stopBy": {
+            "not": {
+              "any": [
+                {
+                  "kind": "array"
+                },
+                {
+                  "kind": "arguments"
+                }
+              ]
+            }
+          }
+        },
+        "fix": "$A",
+        "quality": "good",
+        "weight": 6
+      }
+    ],
+    "logging_patterns": [
+      {
+        "id": "no-console-except-error",
+        "title": "No `console` except in `catch` block",
+        "description": "Using `console` methods is usually for debugging purposes and therefore not suitable to ship to the client.",
+        "severity": "warning",
+        "language": "typescript",
+        "has_fix": true,
+        "patterns": [
+          {
+            "pattern": "console.error($$$)",
+            "not": {
+              "inside": {
+                "kind": "catch_clause",
+                "stopBy": "end"
+              }
+            }
+          },
+          {
+            "pattern": "console.$METHOD($$$)"
+          }
+        ],
+        "match_type": "any",
+        "fix": "",
+        "constraints": {
+          "METHOD": {
+            "regex": "log|debug|warn"
+          }
+        },
+        "quality": "good",
+        "weight": 3
+      }
+    ]
+  },
+  "stats": {
+    "total_patterns": 2,
+    "categories": [
+      "async_patterns",
+      "logging_patterns"
+    ]
+  }
+}

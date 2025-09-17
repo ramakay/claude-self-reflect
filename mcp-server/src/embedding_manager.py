@@ -50,38 +50,60 @@ class EmbeddingManager:
                 logger.warning(f"Error cleaning locks: {e}")
         
     def initialize(self) -> bool:
-        """Initialize BOTH embedding models to support mixed collections."""
-        logger.info("Initializing embedding manager for dual-mode support...")
+        """Initialize embedding models based on configuration."""
+        logger.info("Initializing embedding manager...")
 
         # Clean up any stale locks first
         self._clean_stale_locks()
 
-        # Initialize both models for mixed collection support
-        local_success = self._try_initialize_local()
+        local_success = False
         voyage_success = False
 
-        if self.voyage_key:
+        # Only initialize models we actually need
+        if not self.prefer_local and self.voyage_key:
+            # Cloud mode: Skip local initialization to avoid error messages
+            logger.info("Cloud mode requested, skipping local model initialization")
             voyage_success = self._try_initialize_voyage()
-
-        # Set default model type based on preference and availability
-        if self.prefer_local and local_success:
-            self.model_type = 'local'
-            logger.info("Default model set to LOCAL embeddings")
-        elif voyage_success:
-            self.model_type = 'voyage'
-            logger.info("Default model set to VOYAGE embeddings")
-        elif local_success:
-            self.model_type = 'local'
-            logger.info("Default model set to LOCAL embeddings (fallback)")
+            if voyage_success:
+                self.model_type = 'voyage'
+                logger.info("Using VOYAGE embeddings (1024 dimensions)")
+            else:
+                # Fallback to local if voyage fails
+                logger.warning("Voyage initialization failed, falling back to local")
+                local_success = self._try_initialize_local()
+                if local_success:
+                    self.model_type = 'local'
         else:
-            logger.error("Failed to initialize any embedding model")
-            return False
+            # Local mode or mixed mode support
+            local_success = self._try_initialize_local()
+
+            # Only initialize voyage if NOT preferring local
+            if self.voyage_key and not self.prefer_local:
+                voyage_success = self._try_initialize_voyage()
+
+            # Set default model type - prefer_local takes priority
+            if self.prefer_local and local_success:
+                self.model_type = 'local'
+                logger.info("Using LOCAL embeddings (384 dimensions) - preferred")
+            elif voyage_success:
+                self.model_type = 'voyage'
+                logger.info("Using VOYAGE embeddings (1024 dimensions)")
+            elif local_success:
+                self.model_type = 'local'
+                logger.info("Using LOCAL embeddings (fallback)")
+            else:
+                logger.error("Failed to initialize any embedding model")
+                return False
 
         logger.info(f"Embedding models available - Local: {local_success}, Voyage: {voyage_success}")
         return True
     
     def _try_initialize_local(self) -> bool:
         """Try to initialize local FastEmbed model with timeout and optimizations."""
+        return self.try_initialize_local()
+
+    def try_initialize_local(self) -> bool:
+        """Public method to initialize local FastEmbed model with timeout and optimizations."""
         try:
             logger.info(f"Attempting to load local model: {self.embedding_model}")
             
@@ -160,6 +182,10 @@ class EmbeddingManager:
     
     def _try_initialize_voyage(self) -> bool:
         """Try to initialize Voyage AI client."""
+        return self.try_initialize_voyage()
+
+    def try_initialize_voyage(self) -> bool:
+        """Public method to initialize Voyage AI client."""
         try:
             logger.info("Attempting to initialize Voyage AI...")
             import voyageai

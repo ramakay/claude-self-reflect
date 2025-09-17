@@ -1,0 +1,797 @@
+{
+  "file": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/src/server.py",
+  "timestamp": "2025-09-15T06:39:39.961640",
+  "language": "python",
+  "engine": "ast-grep-py + unified registry",
+  "registry_info": {
+    "total_patterns_available": 35,
+    "patterns_matched": 11,
+    "patterns_errored": 1,
+    "categories_found": [
+      "python_async",
+      "python_logging",
+      "python_typing",
+      "python_catalog"
+    ]
+  },
+  "matches_by_category": {
+    "python_async": [
+      {
+        "category": "python_async",
+        "id": "async-function",
+        "description": "Async function definition",
+        "quality": "good",
+        "weight": 2,
+        "count": 5,
+        "locations": [
+          {
+            "line": 256,
+            "column": 0,
+            "text": "async def get_import_stats():\n    \"\"\"Current import statistics and progress.\"\"\"\n"
+          },
+          {
+            "line": 269,
+            "column": 0,
+            "text": "async def get_collection_list():\n    \"\"\"List of all Qdrant collections with meta"
+          },
+          {
+            "line": 297,
+            "column": 0,
+            "text": "async def get_system_health():\n    \"\"\"System health and configuration informatio"
+          },
+          {
+            "line": 542,
+            "column": 0,
+            "text": "async def update_indexing_status(cache_ttl: int = 5):\n    \"\"\"Update indexing sta"
+          },
+          {
+            "line": 773,
+            "column": 8,
+            "text": "async def print_status():\n            await update_indexing_status()\n           "
+          }
+        ]
+      },
+      {
+        "category": "python_async",
+        "id": "async-with",
+        "description": "Async context manager",
+        "quality": "good",
+        "weight": 3,
+        "count": 3,
+        "locations": [
+          {
+            "line": 362,
+            "column": 4,
+            "text": "async with aiofiles.open(path, 'r') as f:\n        content = await f.read()\n     "
+          },
+          {
+            "line": 369,
+            "column": 4,
+            "text": "async with aiofiles.open(path, 'r') as f:\n        content = await f.read()\n     "
+          },
+          {
+            "line": 376,
+            "column": 4,
+            "text": "async with aiofiles.open(path, 'r') as f:\n        content = await f.read()\n     "
+          }
+        ]
+      },
+      {
+        "category": "python_async",
+        "id": "await-call",
+        "description": "Awaited async call",
+        "quality": "neutral",
+        "weight": 1,
+        "count": 15,
+        "locations": [
+          {
+            "line": 258,
+            "column": 4,
+            "text": "await update_indexing_status()"
+          },
+          {
+            "line": 272,
+            "column": 22,
+            "text": "await qdrant_client.get_collections()"
+          },
+          {
+            "line": 277,
+            "column": 19,
+            "text": "await qdrant_client.get_collection(collection_name=collection.name)"
+          },
+          {
+            "line": 301,
+            "column": 22,
+            "text": "await qdrant_client.get_collections()"
+          },
+          {
+            "line": 363,
+            "column": 18,
+            "text": "await f.read()"
+          }
+        ]
+      }
+    ],
+    "python_logging": [
+      {
+        "category": "python_logging",
+        "id": "logger-call",
+        "description": "Logger usage",
+        "quality": "good",
+        "weight": 2,
+        "count": 31,
+        "locations": [
+          {
+            "line": 145,
+            "column": 12,
+            "text": "logger.info(f\"Embedding manager initialized: {self.embedding_manager.get_model_i"
+          },
+          {
+            "line": 156,
+            "column": 12,
+            "text": "logger.error(f\"Failed to initialize embeddings: {e}\")"
+          },
+          {
+            "line": 187,
+            "column": 0,
+            "text": "logger.info(f\"MCP Server starting at {startup_time}\")"
+          },
+          {
+            "line": 188,
+            "column": 0,
+            "text": "logger.info(f\"Python: {sys.version}\")"
+          },
+          {
+            "line": 189,
+            "column": 0,
+            "text": "logger.info(f\"Working directory: {os.getcwd()}\")"
+          }
+        ]
+      }
+    ],
+    "python_typing": [
+      {
+        "category": "python_typing",
+        "id": "typed-function",
+        "description": "Function with return type",
+        "quality": "good",
+        "weight": 3,
+        "count": 14,
+        "locations": [
+          {
+            "line": 345,
+            "column": 0,
+            "text": "def normalize_path(path_str: str) -> str:\n    \"\"\"Normalize path for consistent c"
+          },
+          {
+            "line": 360,
+            "column": 0,
+            "text": "async def read_json_file(path: Path) -> dict:\n    \"\"\"Read JSON file from disk.\"\""
+          },
+          {
+            "line": 367,
+            "column": 0,
+            "text": "async def read_watcher_file(path: Path) -> dict:\n    \"\"\"Read watcher JSON file f"
+          },
+          {
+            "line": 374,
+            "column": 0,
+            "text": "async def read_cloud_file(path: Path) -> dict:\n    \"\"\"Read cloud watcher JSON fi"
+          },
+          {
+            "line": 381,
+            "column": 0,
+            "text": "async def _load_state_files() -> tuple[set[str], dict[str, dict]]:\n    \"\"\"Load a"
+          }
+        ]
+      },
+      {
+        "category": "python_typing",
+        "id": "typed-async",
+        "description": "Async function with return type",
+        "quality": "good",
+        "weight": 4,
+        "count": 7,
+        "locations": [
+          {
+            "line": 360,
+            "column": 0,
+            "text": "async def read_json_file(path: Path) -> dict:\n    \"\"\"Read JSON file from disk.\"\""
+          },
+          {
+            "line": 367,
+            "column": 0,
+            "text": "async def read_watcher_file(path: Path) -> dict:\n    \"\"\"Read watcher JSON file f"
+          },
+          {
+            "line": 374,
+            "column": 0,
+            "text": "async def read_cloud_file(path: Path) -> dict:\n    \"\"\"Read cloud watcher JSON fi"
+          },
+          {
+            "line": 381,
+            "column": 0,
+            "text": "async def _load_state_files() -> tuple[set[str], dict[str, dict]]:\n    \"\"\"Load a"
+          },
+          {
+            "line": 500,
+            "column": 0,
+            "text": "async def _count_indexed_files() -> tuple[int, int]:\n    \"\"\"Count total JSONL fi"
+          }
+        ]
+      },
+      {
+        "category": "python_typing",
+        "id": "type-annotation",
+        "description": "Variable type annotation",
+        "quality": "good",
+        "weight": 2,
+        "count": 7,
+        "locations": [
+          {
+            "line": 210,
+            "column": 4,
+            "text": "conversation_id: Optional[str] = None"
+          },
+          {
+            "line": 211,
+            "column": 4,
+            "text": "base_conversation_id: Optional[str] = None"
+          },
+          {
+            "line": 213,
+            "column": 4,
+            "text": "raw_payload: Optional[Dict[str, Any]] = None"
+          },
+          {
+            "line": 215,
+            "column": 4,
+            "text": "code_patterns: Optional[Dict[str, List[str]]] = None"
+          },
+          {
+            "line": 216,
+            "column": 4,
+            "text": "files_analyzed: Optional[List[str]] = None"
+          }
+        ]
+      }
+    ],
+    "python_catalog": [
+      {
+        "category": "python_catalog",
+        "id": "optional-to-none-union",
+        "description": "[PEP 604](https://peps.python.org/pep-0604/) recommends that `Type | None` is preferred over `Optional[Type]` for Python 3.10+.\n\nThis rule performs such rewriting. Note `Optional[$T]` alone is interpreted as subscripting expression instead of generic type, we need to use [pattern object](/guide/rule-config/atomic-rule.html#pattern-object) to disambiguate it with more context code.\n\n<!-- Use YAML in the example. Delete this section if use pattern. -->",
+        "quality": "good",
+        "weight": 3,
+        "count": 8,
+        "locations": [
+          {
+            "line": 210,
+            "column": 21,
+            "text": "Optional[str]"
+          },
+          {
+            "line": 211,
+            "column": 26,
+            "text": "Optional[str]"
+          },
+          {
+            "line": 213,
+            "column": 17,
+            "text": "Optional[Dict[str, Any]]"
+          },
+          {
+            "line": 215,
+            "column": 19,
+            "text": "Optional[Dict[str, List[str]]]"
+          },
+          {
+            "line": 216,
+            "column": 20,
+            "text": "Optional[List[str]]"
+          }
+        ]
+      },
+      {
+        "category": "python_catalog",
+        "id": "prefer-generator-expressions",
+        "description": "List comprehensions like `[x for x in range(10)]` are a concise way to create lists in Python. However, we can achieve better memory efficiency by using generator expressions like `(x for x in range(10))` instead. List comprehensions create the entire list in memory, while generator expressions generate each element one at a time. We can make the change by replacing the square brackets with parentheses.",
+        "quality": "good",
+        "weight": 3,
+        "count": 4394,
+        "locations": [
+          {
+            "line": 1,
+            "column": 0,
+            "text": "\"\"\"Claude Reflect MCP Server with Memory Decay.\"\"\"\n\nimport os\nimport asyncio\nfro"
+          },
+          {
+            "line": 1,
+            "column": 0,
+            "text": "\"\"\"Claude Reflect MCP Server with Memory Decay.\"\"\""
+          },
+          {
+            "line": 1,
+            "column": 0,
+            "text": "\"\"\"Claude Reflect MCP Server with Memory Decay.\"\"\""
+          },
+          {
+            "line": 1,
+            "column": 0,
+            "text": "\"\"\""
+          },
+          {
+            "line": 1,
+            "column": 3,
+            "text": "Claude Reflect MCP Server with Memory Decay."
+          }
+        ]
+      },
+      {
+        "category": "python_catalog",
+        "id": "remove-async-def",
+        "description": "The `async` keyword in Python is used to define asynchronous functions that can be `await`ed.\n\nIn this example, we want to remove the `async` keyword from a function definition and replace it with a synchronous version of the function. We also need to remove the `await` keyword from the function body.\n\nBy default, ast-grep will not apply overlapping replacements. This means `await` keywords will not be modified because they are inside the async function body.\n\nHowever, we can use the [`rewriter`](https://ast-grep.github.io/reference/yaml/rewriter.html) to apply changes inside the matched function body.",
+        "quality": "good",
+        "weight": 3,
+        "count": 5,
+        "locations": [
+          {
+            "line": 256,
+            "column": 0,
+            "text": "async def get_import_stats():\n    \"\"\"Current import statistics and progress.\"\"\"\n"
+          },
+          {
+            "line": 269,
+            "column": 0,
+            "text": "async def get_collection_list():\n    \"\"\"List of all Qdrant collections with meta"
+          },
+          {
+            "line": 297,
+            "column": 0,
+            "text": "async def get_system_health():\n    \"\"\"System health and configuration informatio"
+          },
+          {
+            "line": 542,
+            "column": 0,
+            "text": "async def update_indexing_status(cache_ttl: int = 5):\n    \"\"\"Update indexing sta"
+          },
+          {
+            "line": 773,
+            "column": 8,
+            "text": "async def print_status():\n            await update_indexing_status()\n           "
+          }
+        ]
+      },
+      {
+        "category": "python_catalog",
+        "id": "use-walrus-operator",
+        "description": "The walrus operator (`:=`) introduced in Python 3.8 allows you to assign values to variables as part of an expression. This rule aims to simplify code by using the walrus operator in `if` statements.\n\nThis first part of the rule identifies cases where a variable is assigned a value and then immediately used in an `if` statement to control flow.",
+        "quality": "good",
+        "weight": 3,
+        "count": 36,
+        "locations": [
+          {
+            "line": 140,
+            "column": 8,
+            "text": "if self._initialized:\n            return True"
+          },
+          {
+            "line": 148,
+            "column": 12,
+            "text": "if self.embedding_manager.model_type == 'voyage':\n                self.voyage_cl"
+          },
+          {
+            "line": 228,
+            "column": 0,
+            "text": "if CONNECTION_POOL_AVAILABLE and ENABLE_PARALLEL_SEARCH:\n    qdrant_pool = Qdran"
+          },
+          {
+            "line": 250,
+            "column": 0,
+            "text": "if DECAY_MANAGER_AVAILABLE:\n    decay_manager = DecayManager()\n    logger.info(\""
+          },
+          {
+            "line": 310,
+            "column": 4,
+            "text": "if embedding_state.embedding_manager:\n        embedding_info = {\n            \"mo"
+          }
+        ]
+      }
+    ]
+  },
+  "all_matches": [
+    {
+      "category": "python_async",
+      "id": "async-function",
+      "description": "Async function definition",
+      "quality": "good",
+      "weight": 2,
+      "count": 5,
+      "locations": [
+        {
+          "line": 256,
+          "column": 0,
+          "text": "async def get_import_stats():\n    \"\"\"Current import statistics and progress.\"\"\"\n"
+        },
+        {
+          "line": 269,
+          "column": 0,
+          "text": "async def get_collection_list():\n    \"\"\"List of all Qdrant collections with meta"
+        },
+        {
+          "line": 297,
+          "column": 0,
+          "text": "async def get_system_health():\n    \"\"\"System health and configuration informatio"
+        },
+        {
+          "line": 542,
+          "column": 0,
+          "text": "async def update_indexing_status(cache_ttl: int = 5):\n    \"\"\"Update indexing sta"
+        },
+        {
+          "line": 773,
+          "column": 8,
+          "text": "async def print_status():\n            await update_indexing_status()\n           "
+        }
+      ]
+    },
+    {
+      "category": "python_async",
+      "id": "async-with",
+      "description": "Async context manager",
+      "quality": "good",
+      "weight": 3,
+      "count": 3,
+      "locations": [
+        {
+          "line": 362,
+          "column": 4,
+          "text": "async with aiofiles.open(path, 'r') as f:\n        content = await f.read()\n     "
+        },
+        {
+          "line": 369,
+          "column": 4,
+          "text": "async with aiofiles.open(path, 'r') as f:\n        content = await f.read()\n     "
+        },
+        {
+          "line": 376,
+          "column": 4,
+          "text": "async with aiofiles.open(path, 'r') as f:\n        content = await f.read()\n     "
+        }
+      ]
+    },
+    {
+      "category": "python_async",
+      "id": "await-call",
+      "description": "Awaited async call",
+      "quality": "neutral",
+      "weight": 1,
+      "count": 15,
+      "locations": [
+        {
+          "line": 258,
+          "column": 4,
+          "text": "await update_indexing_status()"
+        },
+        {
+          "line": 272,
+          "column": 22,
+          "text": "await qdrant_client.get_collections()"
+        },
+        {
+          "line": 277,
+          "column": 19,
+          "text": "await qdrant_client.get_collection(collection_name=collection.name)"
+        },
+        {
+          "line": 301,
+          "column": 22,
+          "text": "await qdrant_client.get_collections()"
+        },
+        {
+          "line": 363,
+          "column": 18,
+          "text": "await f.read()"
+        }
+      ]
+    },
+    {
+      "category": "python_logging",
+      "id": "logger-call",
+      "description": "Logger usage",
+      "quality": "good",
+      "weight": 2,
+      "count": 31,
+      "locations": [
+        {
+          "line": 145,
+          "column": 12,
+          "text": "logger.info(f\"Embedding manager initialized: {self.embedding_manager.get_model_i"
+        },
+        {
+          "line": 156,
+          "column": 12,
+          "text": "logger.error(f\"Failed to initialize embeddings: {e}\")"
+        },
+        {
+          "line": 187,
+          "column": 0,
+          "text": "logger.info(f\"MCP Server starting at {startup_time}\")"
+        },
+        {
+          "line": 188,
+          "column": 0,
+          "text": "logger.info(f\"Python: {sys.version}\")"
+        },
+        {
+          "line": 189,
+          "column": 0,
+          "text": "logger.info(f\"Working directory: {os.getcwd()}\")"
+        }
+      ]
+    },
+    {
+      "category": "python_typing",
+      "id": "typed-function",
+      "description": "Function with return type",
+      "quality": "good",
+      "weight": 3,
+      "count": 14,
+      "locations": [
+        {
+          "line": 345,
+          "column": 0,
+          "text": "def normalize_path(path_str: str) -> str:\n    \"\"\"Normalize path for consistent c"
+        },
+        {
+          "line": 360,
+          "column": 0,
+          "text": "async def read_json_file(path: Path) -> dict:\n    \"\"\"Read JSON file from disk.\"\""
+        },
+        {
+          "line": 367,
+          "column": 0,
+          "text": "async def read_watcher_file(path: Path) -> dict:\n    \"\"\"Read watcher JSON file f"
+        },
+        {
+          "line": 374,
+          "column": 0,
+          "text": "async def read_cloud_file(path: Path) -> dict:\n    \"\"\"Read cloud watcher JSON fi"
+        },
+        {
+          "line": 381,
+          "column": 0,
+          "text": "async def _load_state_files() -> tuple[set[str], dict[str, dict]]:\n    \"\"\"Load a"
+        }
+      ]
+    },
+    {
+      "category": "python_typing",
+      "id": "typed-async",
+      "description": "Async function with return type",
+      "quality": "good",
+      "weight": 4,
+      "count": 7,
+      "locations": [
+        {
+          "line": 360,
+          "column": 0,
+          "text": "async def read_json_file(path: Path) -> dict:\n    \"\"\"Read JSON file from disk.\"\""
+        },
+        {
+          "line": 367,
+          "column": 0,
+          "text": "async def read_watcher_file(path: Path) -> dict:\n    \"\"\"Read watcher JSON file f"
+        },
+        {
+          "line": 374,
+          "column": 0,
+          "text": "async def read_cloud_file(path: Path) -> dict:\n    \"\"\"Read cloud watcher JSON fi"
+        },
+        {
+          "line": 381,
+          "column": 0,
+          "text": "async def _load_state_files() -> tuple[set[str], dict[str, dict]]:\n    \"\"\"Load a"
+        },
+        {
+          "line": 500,
+          "column": 0,
+          "text": "async def _count_indexed_files() -> tuple[int, int]:\n    \"\"\"Count total JSONL fi"
+        }
+      ]
+    },
+    {
+      "category": "python_typing",
+      "id": "type-annotation",
+      "description": "Variable type annotation",
+      "quality": "good",
+      "weight": 2,
+      "count": 7,
+      "locations": [
+        {
+          "line": 210,
+          "column": 4,
+          "text": "conversation_id: Optional[str] = None"
+        },
+        {
+          "line": 211,
+          "column": 4,
+          "text": "base_conversation_id: Optional[str] = None"
+        },
+        {
+          "line": 213,
+          "column": 4,
+          "text": "raw_payload: Optional[Dict[str, Any]] = None"
+        },
+        {
+          "line": 215,
+          "column": 4,
+          "text": "code_patterns: Optional[Dict[str, List[str]]] = None"
+        },
+        {
+          "line": 216,
+          "column": 4,
+          "text": "files_analyzed: Optional[List[str]] = None"
+        }
+      ]
+    },
+    {
+      "category": "python_catalog",
+      "id": "optional-to-none-union",
+      "description": "[PEP 604](https://peps.python.org/pep-0604/) recommends that `Type | None` is preferred over `Optional[Type]` for Python 3.10+.\n\nThis rule performs such rewriting. Note `Optional[$T]` alone is interpreted as subscripting expression instead of generic type, we need to use [pattern object](/guide/rule-config/atomic-rule.html#pattern-object) to disambiguate it with more context code.\n\n<!-- Use YAML in the example. Delete this section if use pattern. -->",
+      "quality": "good",
+      "weight": 3,
+      "count": 8,
+      "locations": [
+        {
+          "line": 210,
+          "column": 21,
+          "text": "Optional[str]"
+        },
+        {
+          "line": 211,
+          "column": 26,
+          "text": "Optional[str]"
+        },
+        {
+          "line": 213,
+          "column": 17,
+          "text": "Optional[Dict[str, Any]]"
+        },
+        {
+          "line": 215,
+          "column": 19,
+          "text": "Optional[Dict[str, List[str]]]"
+        },
+        {
+          "line": 216,
+          "column": 20,
+          "text": "Optional[List[str]]"
+        }
+      ]
+    },
+    {
+      "category": "python_catalog",
+      "id": "prefer-generator-expressions",
+      "description": "List comprehensions like `[x for x in range(10)]` are a concise way to create lists in Python. However, we can achieve better memory efficiency by using generator expressions like `(x for x in range(10))` instead. List comprehensions create the entire list in memory, while generator expressions generate each element one at a time. We can make the change by replacing the square brackets with parentheses.",
+      "quality": "good",
+      "weight": 3,
+      "count": 4394,
+      "locations": [
+        {
+          "line": 1,
+          "column": 0,
+          "text": "\"\"\"Claude Reflect MCP Server with Memory Decay.\"\"\"\n\nimport os\nimport asyncio\nfro"
+        },
+        {
+          "line": 1,
+          "column": 0,
+          "text": "\"\"\"Claude Reflect MCP Server with Memory Decay.\"\"\""
+        },
+        {
+          "line": 1,
+          "column": 0,
+          "text": "\"\"\"Claude Reflect MCP Server with Memory Decay.\"\"\""
+        },
+        {
+          "line": 1,
+          "column": 0,
+          "text": "\"\"\""
+        },
+        {
+          "line": 1,
+          "column": 3,
+          "text": "Claude Reflect MCP Server with Memory Decay."
+        }
+      ]
+    },
+    {
+      "category": "python_catalog",
+      "id": "remove-async-def",
+      "description": "The `async` keyword in Python is used to define asynchronous functions that can be `await`ed.\n\nIn this example, we want to remove the `async` keyword from a function definition and replace it with a synchronous version of the function. We also need to remove the `await` keyword from the function body.\n\nBy default, ast-grep will not apply overlapping replacements. This means `await` keywords will not be modified because they are inside the async function body.\n\nHowever, we can use the [`rewriter`](https://ast-grep.github.io/reference/yaml/rewriter.html) to apply changes inside the matched function body.",
+      "quality": "good",
+      "weight": 3,
+      "count": 5,
+      "locations": [
+        {
+          "line": 256,
+          "column": 0,
+          "text": "async def get_import_stats():\n    \"\"\"Current import statistics and progress.\"\"\"\n"
+        },
+        {
+          "line": 269,
+          "column": 0,
+          "text": "async def get_collection_list():\n    \"\"\"List of all Qdrant collections with meta"
+        },
+        {
+          "line": 297,
+          "column": 0,
+          "text": "async def get_system_health():\n    \"\"\"System health and configuration informatio"
+        },
+        {
+          "line": 542,
+          "column": 0,
+          "text": "async def update_indexing_status(cache_ttl: int = 5):\n    \"\"\"Update indexing sta"
+        },
+        {
+          "line": 773,
+          "column": 8,
+          "text": "async def print_status():\n            await update_indexing_status()\n           "
+        }
+      ]
+    },
+    {
+      "category": "python_catalog",
+      "id": "use-walrus-operator",
+      "description": "The walrus operator (`:=`) introduced in Python 3.8 allows you to assign values to variables as part of an expression. This rule aims to simplify code by using the walrus operator in `if` statements.\n\nThis first part of the rule identifies cases where a variable is assigned a value and then immediately used in an `if` statement to control flow.",
+      "quality": "good",
+      "weight": 3,
+      "count": 36,
+      "locations": [
+        {
+          "line": 140,
+          "column": 8,
+          "text": "if self._initialized:\n            return True"
+        },
+        {
+          "line": 148,
+          "column": 12,
+          "text": "if self.embedding_manager.model_type == 'voyage':\n                self.voyage_cl"
+        },
+        {
+          "line": 228,
+          "column": 0,
+          "text": "if CONNECTION_POOL_AVAILABLE and ENABLE_PARALLEL_SEARCH:\n    qdrant_pool = Qdran"
+        },
+        {
+          "line": 250,
+          "column": 0,
+          "text": "if DECAY_MANAGER_AVAILABLE:\n    decay_manager = DecayManager()\n    logger.info(\""
+        },
+        {
+          "line": 310,
+          "column": 4,
+          "text": "if embedding_state.embedding_manager:\n        embedding_info = {\n            \"mo"
+        }
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "pattern_id": "specific-except",
+      "category": "python_error_handling",
+      "error": "cannot get matcher\n\nCaused by:\n    0: `rule` is not configured correctly.\n    1: Rule contains invalid pattern matcher.\n    2: Multiple AST nodes are detected. Please check the pattern source `except "
+    }
+  ],
+  "quality_metrics": {
+    "quality_score": 1.0,
+    "good_patterns_found": 4510,
+    "bad_patterns_found": 0,
+    "unique_patterns_matched": 11,
+    "total_issues": 0,
+    "total_good_practices": 4510
+  },
+  "recommendations": [
+    "\ud83d\udfe2 Good: Code follows most best practices"
+  ]
+}

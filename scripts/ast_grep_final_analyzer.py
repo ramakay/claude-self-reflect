@@ -50,6 +50,9 @@ class FinalASTGrepAnalyzer:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
+        # Count lines of code for normalization
+        lines_of_code = len(content.splitlines())
+
         # Create SgRoot for the detected language
         sg_language = self._get_sg_language(language)
         root = sg.SgRoot(content, sg_language)
@@ -105,8 +108,8 @@ class FinalASTGrepAnalyzer:
                     'error': str(e)[:200]
                 })
 
-        # Calculate quality score
-        quality_score = self.registry.calculate_quality_score(all_matches)
+        # Calculate quality score with LOC normalization
+        quality_score = self.registry.calculate_quality_score(all_matches, loc=lines_of_code)
 
         # Count good vs bad patterns
         good_matches = [m for m in all_matches if m['quality'] == 'good']

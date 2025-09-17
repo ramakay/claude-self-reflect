@@ -172,7 +172,7 @@ claude mcp add claude-self-reflect "/path/to/run-mcp.sh" -e VOYAGE_KEY="..." -e 
 
 ```bash
 # Environment Setup
-export VOYAGE_KEY="pa-JbR-8lzR02embvkQjsuVX2eIrJ9qotqUo5E72zPeQjO"
+export VOYAGE_KEY="[REDACTED - Use your actual Voyage API key]"
 export PREFER_LOCAL_EMBEDDINGS=false
 
 # Direct Testing

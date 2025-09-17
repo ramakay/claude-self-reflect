@@ -59,6 +59,9 @@ class UnifiedASTGrepRegistry:
         # JavaScript patterns (shared with TS)
         patterns.update(self._load_javascript_patterns())
 
+        # Shell script patterns
+        patterns.update(self._load_shell_patterns())
+
         return patterns
 
     def _load_python_patterns(self) -> Dict[str, List[Dict[str, Any]]]:
@@ -224,6 +227,41 @@ class UnifiedASTGrepRegistry:
                     "quality": "bad",
                     "weight": -4,
                     "language": "python"
+                },
+                {
+                    "id": "sync-voyage-embed",
+                    "pattern": "$CLIENT.embed($$$)",
+                    "description": "Blocking Voyage embed in async context",
+                    "quality": "bad",
+                    "weight": -5,
+                    "language": "python",
+                    "inside": "async def $FUNC($$$): $$$"
+                },
+                {
+                    "id": "thread-join-async",
+                    "pattern": "$THREAD.join($$$)",
+                    "description": "Thread join blocking async context",
+                    "quality": "bad",
+                    "weight": -5,
+                    "language": "python",
+                    "inside": "async def $FUNC($$$): $$$"
+                },
+                {
+                    "id": "invalid-env-var-hyphen",
+                    "pattern": "os.getenv('$VAR')",
+                    "description": "Environment variable with hyphen (invalid in shells)",
+                    "quality": "bad",
+                    "weight": -3,
+                    "language": "python",
+                    "constraint": "$VAR matches .*-.*"
+                },
+                {
+                    "id": "dotenv-override-runtime",
+                    "pattern": "load_dotenv($$$, override=True)",
+                    "description": "Runtime environment mutation in MCP",
+                    "quality": "bad",
+                    "weight": -3,
+                    "language": "python"
                 }
             ],
             "python_qdrant": [
@@ -267,6 +305,50 @@ class UnifiedASTGrepRegistry:
                     "description": "MCP resource definition",
                     "quality": "good",
                     "weight": 5,
+                    "language": "python"
+                },
+                {
+                    "id": "missing-embedding-guard",
+                    "pattern": "query_embedding = await $MGR.generate_embedding($$$)\n$$$\nawait $CLIENT.search($$$, query_vector=query_embedding, $$$)",
+                    "description": "Missing None check after embedding generation",
+                    "quality": "bad",
+                    "weight": -4,
+                    "language": "python"
+                },
+                {
+                    "id": "attr-vs-api",
+                    "pattern": "$MGR.model_name",
+                    "description": "Accessing non-existent attribute instead of API",
+                    "quality": "bad",
+                    "weight": -3,
+                    "language": "python",
+                    "note": "Use get_model_info() instead"
+                },
+                {
+                    "id": "duplicate-import",
+                    "pattern": "import $MODULE\n$$$\ndef $FUNC($$$):\n    $$$\n    import $MODULE",
+                    "description": "Duplicate import inside function",
+                    "quality": "bad",
+                    "weight": -2,
+                    "language": "python"
+                }
+            ],
+            "python_runtime_modification": [
+                {
+                    "id": "singleton-state-change",
+                    "pattern": "$SINGLETON.$ATTR = $VALUE",
+                    "description": "Runtime singleton state modification",
+                    "quality": "neutral",
+                    "weight": 0,
+                    "language": "python",
+                    "note": "Can be good for mode switching, bad if uncontrolled"
+                },
+                {
+                    "id": "public-init-exposure",
+                    "pattern": "def try_initialize_$TYPE(self): $$$",
+                    "description": "Public initialization method for runtime config",
+                    "quality": "neutral",
+                    "weight": 0,
                     "language": "python"
                 }
             ]
@@ -386,6 +468,48 @@ class UnifiedASTGrepRegistry:
             ]
         }
 
+    def _load_shell_patterns(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Shell script patterns."""
+        return {
+            "shell_env_handling": [
+                {
+                    "id": "unused-shell-var",
+                    "pattern": "$VAR=\"$VALUE\"",
+                    "description": "Assigned but never referenced variable",
+                    "quality": "bad",
+                    "weight": -2,
+                    "language": "bash",
+                    "note": "Check if variable is used later"
+                },
+                {
+                    "id": "unsafe-var-check",
+                    "pattern": "[ ! -z \"$VAR\" ]",
+                    "description": "Unsafe variable check (breaks with set -u)",
+                    "quality": "bad",
+                    "weight": -3,
+                    "language": "bash",
+                    "fix": "[ -n \"${VAR:-}\" ]"
+                },
+                {
+                    "id": "redundant-export",
+                    "pattern": "export $VAR=\"$VAR\"",
+                    "description": "Redundant export of same value",
+                    "quality": "bad",
+                    "weight": -2,
+                    "language": "bash"
+                },
+                {
+                    "id": "missing-safety-flags",
+                    "pattern": "#!/bin/bash",
+                    "description": "Missing safety flags",
+                    "quality": "bad",
+                    "weight": -3,
+                    "language": "bash",
+                    "note": "Add 'set -euo pipefail' after shebang"
+                }
+            ]
+        }
+
     def _load_javascript_patterns(self) -> Dict[str, List[Dict[str, Any]]]:
         """JavaScript patterns (subset of TypeScript)."""
         return {
@@ -466,26 +590,56 @@ class UnifiedASTGrepRegistry:
         """Get only bad quality patterns (anti-patterns)."""
         return [p for p in self.get_all_patterns() if p.get('quality') == 'bad']
 
-    def calculate_quality_score(self, matches: List[Dict]) -> float:
+    def calculate_quality_score(self, matches: List[Dict], loc: int = 1000) -> float:
         """
-        Calculate quality score based on pattern matches.
-        Each match includes the pattern and count.
+        Calculate quality score using penalty-based approach.
+        Issues dominate the score; good patterns provide minimal bonus.
+
+        Args:
+            matches: List of pattern matches with weight and count
+            loc: Lines of code (for normalization)
+
+        Returns:
+            Score from 0.0 to 1.0
         """
-        total_weight = 0
-        total_count = 0
+        import math
 
-        for match in matches:
-            weight = match.get('weight', 0)
-            count = match.get('count', 0)
-            total_weight += weight * count
-            total_count += abs(weight) * count
+        # Normalize to KLOC (thousands of lines)
+        kloc = max(1.0, loc / 1000.0)
 
-        if total_count == 0:
-            return 0.5
+        # Separate issues (bad) from good patterns
+        issues = [m for m in matches if m.get('quality') == 'bad']
+        good_patterns = [m for m in matches if m.get('quality') == 'good']
 
-        # Normalize to 0-1 range
-        normalized = (total_weight + 100) / 200
-        return max(0.0, min(1.0, normalized))
+        # Calculate severity-weighted issue density
+        total_issues = 0
+        for issue in issues:
+            severity = abs(issue.get('weight', 1))  # Use weight as severity
+            count = issue.get('count', 0)
+            total_issues += severity * count
+
+        issues_per_kloc = total_issues / kloc
+
+        # Penalty calculation (logarithmic to avoid linear dominance)
+        # Calibrated so 50 issues/KLOC = ~50% penalty
+        penalty = min(0.7, 0.15 * math.log1p(issues_per_kloc))
+
+        # Small bonus for good patterns (capped at 5%)
+        good_score = 0
+        if good_patterns:
+            for pattern in good_patterns:
+                weight = pattern.get('weight', 1)
+                count = pattern.get('count', 0)
+                # Cap contribution per pattern type
+                normalized_count = min(count / kloc, 50)  # Max 50 per KLOC
+                good_score += weight * normalized_count / 1000
+
+        bonus = min(0.05, good_score)  # Cap at 5% bonus
+
+        # Final score: start at 100%, subtract penalty, add small bonus
+        score = max(0.0, min(1.0, 1.0 - penalty + bonus))
+
+        return score
 
     def export_to_json(self, path: str):
         """Export registry to JSON file."""
@@ -545,7 +699,7 @@ if __name__ == "__main__":
         print(f"  - {category}: {count} patterns")
 
     # Export to JSON
-    export_path = "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/scripts/unified_registry.json"
+    export_path = Path(__file__).parent / "unified_registry.json"
     registry.export_to_json(export_path)
     print(f"\n✅ Exported unified registry to {export_path}")
 

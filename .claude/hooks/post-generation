@@ -1,0 +1,68 @@
+#!/bin/bash
+# Post-generation hook for Claude Self-Reflect
+# Tracks edited files and runs quality analysis on session edits only
+
+# Get the directory of this script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+TRACKER_FILE="$HOME/.claude-self-reflect/current_session_edits.json"
+
+# Check if any files were edited in the last minute
+EDITED_FILES=$(find . -type f \( -name "*.py" -o -name "*.ts" -o -name "*.js" -o -name "*.tsx" -o -name "*.jsx" \) -mmin -1 2>/dev/null)
+
+if [ -z "$EDITED_FILES" ]; then
+    exit 0  # No recent edits, nothing to analyze
+fi
+
+# Update session edit tracker
+if [ -n "$EDITED_FILES" ]; then
+    # Create tracker file if it doesn't exist
+    if [ ! -f "$TRACKER_FILE" ]; then
+        echo '{"session_start":"'$(date -u +"%Y-%m-%dT%H:%M:%S")'","edited_files":[],"last_updated":"'$(date -u +"%Y-%m-%dT%H:%M:%S")'","project":"'$(basename "$PWD")'"}' > "$TRACKER_FILE"
+    fi
+
+    # Add edited files to tracker using Python for JSON manipulation
+    python3 -c "
+import json
+import sys
+from pathlib import Path
+import os
+
+tracker_file = '$TRACKER_FILE'
+edited_files = '''$EDITED_FILES'''.strip().split('\n')
+
+# Load existing tracker
+try:
+    with open(tracker_file, 'r') as f:
+        tracker = json.load(f)
+except:
+    tracker = {
+        'session_start': '$(date -u +"%Y-%m-%dT%H:%M:%S")',
+        'edited_files': [],
+        'project': '$(basename "$PWD")'
+    }
+
+# Add new files (convert to absolute paths and dedupe)
+for file in edited_files:
+    if file:
+        abs_path = str(Path(file).resolve())
+        if abs_path not in tracker['edited_files']:
+            tracker['edited_files'].append(abs_path)
+
+# Update timestamp
+tracker['last_updated'] = '$(date -u +"%Y-%m-%dT%H:%M:%S")'
+
+# Save tracker
+with open(tracker_file, 'w') as f:
+    json.dump(tracker, f, indent=2)
+" 2>/dev/null
+fi
+
+# Run quality check on session files only (non-blocking)
+(
+    # Run the session quality tracker with session mode
+    python3 "$PROJECT_ROOT/scripts/session_quality_tracker.py" --use-tracker 2>/dev/null &
+) &
+
+# Don't block Claude's response
+exit 0

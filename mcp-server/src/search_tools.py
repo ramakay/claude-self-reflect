@@ -242,12 +242,14 @@ class SearchTools:
                 ]
                 await ctx.debug(f"Filtered to {len(filtered_collections)} collections from {len(all_collections)} total")
             else:
-                # Use all collections except reflections
+                # Use all collections INCLUDING reflections (with decay)
                 collections_response = await self.qdrant_client.get_collections()
                 collections = collections_response.collections
+                # Include both conversation collections and reflection collections
                 filtered_collections = [
-                    c for c in collections 
-                    if not c.name.startswith('reflections')
+                    c for c in collections
+                    if (c.name.endswith('_local') or c.name.endswith('_voyage') or
+                        c.name.startswith('reflections'))
                 ]
                 await ctx.debug(f"Searching across {len(filtered_collections)} collections")
             
@@ -362,12 +364,14 @@ class SearchTools:
                     if c.name in collection_names
                 ]
             else:
-                # Use all collections except reflections
+                # Use all collections INCLUDING reflections (with decay)
                 collections_response = await self.qdrant_client.get_collections()
                 collections = collections_response.collections
+                # Include both conversation collections and reflection collections
                 filtered_collections = [
-                    c for c in collections 
-                    if not c.name.startswith('reflections')
+                    c for c in collections
+                    if (c.name.endswith('_local') or c.name.endswith('_voyage') or
+                        c.name.startswith('reflections'))
                 ]
             
             # Quick PARALLEL count across collections
@@ -450,12 +454,14 @@ class SearchTools:
                     if c.name in collection_names
                 ]
             else:
-                # Use all collections except reflections
+                # Use all collections INCLUDING reflections (with decay)
                 collections_response = await self.qdrant_client.get_collections()
                 collections = collections_response.collections
+                # Include both conversation collections and reflection collections
                 filtered_collections = [
-                    c for c in collections 
-                    if not c.name.startswith('reflections')
+                    c for c in collections
+                    if (c.name.endswith('_local') or c.name.endswith('_voyage') or
+                        c.name.startswith('reflections'))
                 ]
             
             # Gather results for summary using PARALLEL search
@@ -545,12 +551,14 @@ class SearchTools:
                     if c.name in collection_names
                 ]
             else:
-                # Use all collections except reflections
+                # Use all collections INCLUDING reflections (with decay)
                 collections_response = await self.qdrant_client.get_collections()
                 collections = collections_response.collections
+                # Include both conversation collections and reflection collections
                 filtered_collections = [
-                    c for c in collections 
-                    if not c.name.startswith('reflections')
+                    c for c in collections
+                    if (c.name.endswith('_local') or c.name.endswith('_voyage') or
+                        c.name.startswith('reflections'))
                 ]
             
             # Gather all results using PARALLEL search
@@ -791,7 +799,7 @@ def register_search_tools(
         project_resolver  # Pass the resolver
     )
     
-    @mcp.tool()
+    @mcp.tool(name="csr_reflect_on_past")
     async def reflect_on_past(
         ctx: Context,
         query: str = Field(description="The search query to find semantically similar conversations"),
@@ -804,29 +812,45 @@ def register_search_tools(
         include_raw: bool = Field(default=False, description="Include raw Qdrant payload data for debugging (increases response size)"),
         response_format: str = Field(default="xml", description="Response format: 'xml' or 'markdown'")
     ) -> str:
-        """Search for relevant past conversations using semantic search with optional time decay."""
+        """Search past Claude conversations semantically to find relevant context.
+
+        WHEN TO USE: User asks 'what did we discuss about X?', 'find conversations about Y',
+        mentions 'remember when' or 'last time', debugging issues that may have been solved before,
+        or finding implementation patterns used in the project.
+
+        This is the PRIMARY tool for conversation memory - use it liberally!"""
         return await tools.reflect_on_past(ctx, query, limit, min_score, use_decay, project, mode, brief, include_raw, response_format)
     
-    @mcp.tool()
+    @mcp.tool(name="csr_quick_check")
     async def quick_search(
         ctx: Context,
         query: str = Field(description="The search query to find semantically similar conversations"),
         min_score: float = Field(default=0.3, description="Minimum similarity score (0-1)"),
         project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects.")
     ) -> str:
-        """Quick search that returns only the count and top result for fast overview."""
+        """Quick check if a topic was discussed before (returns count + top match only).
+
+        WHEN TO USE: User asks 'have we discussed X?' or 'is there anything about Y?',
+        need a yes/no answer about topic existence, checking if a problem was encountered before.
+
+        Much faster than full search - use for existence checks!"""
         return await tools.quick_search(ctx, query, min_score, project)
     
-    @mcp.tool()
+    @mcp.tool(name="csr_search_insights")
     async def search_summary(
         ctx: Context,
         query: str = Field(description="The search query to find semantically similar conversations"),
         project: Optional[str] = Field(default=None, description="Search specific project only. If not provided, searches current project based on working directory. Use 'all' to search across all projects.")
     ) -> str:
-        """Get aggregated insights from search results without individual result details."""
+        """Get aggregated insights and patterns from search results.
+
+        WHEN TO USE: User wants patterns or trends, analyzing topic evolution,
+        understanding common themes, getting high-level view without details.
+
+        Provides analysis, not just search results!"""
         return await tools.search_summary(ctx, query, project)
     
-    @mcp.tool()
+    @mcp.tool(name="csr_get_more")
     async def get_more_results(
         ctx: Context,
         query: str = Field(description="The original search query"),
@@ -835,20 +859,30 @@ def register_search_tools(
         min_score: float = Field(default=0.3, description="Minimum similarity score (0-1)"),
         project: Optional[str] = Field(default=None, description="Search specific project only")
     ) -> str:
-        """Get additional search results after an initial search (pagination support)."""
+        """Get additional search results for paginated exploration.
+
+        WHEN TO USE: User says 'show me more' after a search, initial results weren't sufficient,
+        deep diving into a topic, user wants comprehensive coverage.
+
+        Use after initial search when more context is needed!"""
         return await tools.get_more_results(ctx, query, offset, limit, min_score, project)
     
-    @mcp.tool()
+    @mcp.tool(name="csr_search_by_file")
     async def search_by_file(
         ctx: Context,
         file_path: str = Field(description="The file path to search for in conversations"),
         limit: int = Field(default=10, description="Maximum number of results to return"),
         project: Optional[str] = Field(default=None, description="Search specific project only. Use 'all' to search across all projects.")
     ) -> str:
-        """Search for conversations that analyzed a specific file."""
+        """Find all conversations that analyzed or modified a specific file.
+
+        WHEN TO USE: User asks 'when did we modify X file?', investigating file history,
+        understanding why changes were made, finding discussions about specific code files.
+
+        Perfect for code archaeology and understanding file evolution!"""
         return await tools.search_by_file(ctx, file_path, limit, project)
     
-    @mcp.tool()
+    @mcp.tool(name="csr_search_by_concept")
     async def search_by_concept(
         ctx: Context,
         concept: str = Field(description="The concept to search for (e.g., 'security', 'docker', 'testing')"),
@@ -856,7 +890,12 @@ def register_search_tools(
         project: Optional[str] = Field(default=None, description="Search specific project only. Use 'all' to search across all projects."),
         include_files: bool = Field(default=True, description="Include file information in results")
     ) -> str:
-        """Search for conversations about a specific development concept."""
+        """Search for conversations about specific development concepts or themes.
+
+        WHEN TO USE: User asks about broad topics like 'security', 'testing', 'performance',
+        looking for all discussions on a technical theme, gathering knowledge about a concept.
+
+        Ideal for thematic analysis and knowledge gathering!"""
         return await tools.search_by_concept(ctx, concept, limit, project, include_files)
     
     @mcp.tool()

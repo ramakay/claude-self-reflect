@@ -11,6 +11,8 @@ import time
 import logging
 import math
 from xml.sax.saxutils import escape
+from collections import defaultdict, Counter
+import aiofiles
 
 from fastmcp import FastMCP, Context
 
@@ -30,6 +32,8 @@ from .temporal_utils import SessionDetector, TemporalParser, WorkSession, group_
 from .temporal_tools import register_temporal_tools
 from .search_tools import register_search_tools
 from .reflection_tools import register_reflection_tools
+from .mode_switch_tool import register_mode_switch_tool
+from .code_reload_tool import register_code_reload_tool
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.models import (
@@ -77,6 +81,9 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+# Setup logger early to avoid NameError
+logger = logging.getLogger(__name__)
 DECAY_SCALE_DAYS = float(os.getenv('DECAY_SCALE_DAYS', '90'))
 USE_NATIVE_DECAY = os.getenv('USE_NATIVE_DECAY', 'false').lower() == 'true'
 
@@ -122,10 +129,51 @@ except ImportError:
     DECAY_MANAGER_AVAILABLE = False
     logging.warning("Decay manager module not available")
 
-# Lazy initialization - models will be loaded on first use
-embedding_manager = None
-voyage_client = None  # Keep for backward compatibility
-local_embedding_model = None  # Keep for backward compatibility
+class EmbeddingState:
+    """Manages embedding state without global variables."""
+    def __init__(self):
+        self.embedding_manager = None
+        self.voyage_client = None  # Keep for backward compatibility
+        self.local_embedding_model = None  # Keep for backward compatibility
+        self._initialized = False
+
+    def initialize_embeddings(self):
+        """Initialize embedding models with robust fallback."""
+        if self._initialized:
+            return True
+
+        try:
+            self.embedding_manager = get_embedding_manager()
+            logger.info(f"Embedding manager initialized: {self.embedding_manager.get_model_info()}")
+
+            # Set backward compatibility references
+            if self.embedding_manager.model_type == 'voyage':
+                self.voyage_client = self.embedding_manager.voyage_client
+            elif self.embedding_manager.model_type == 'local':
+                self.local_embedding_model = self.embedding_manager.local_model
+
+            self._initialized = True
+            return True
+        except Exception as e:
+            logger.error(f"Failed to initialize embeddings: {e}")
+            return False
+
+class IndexingState:
+    """Manages indexing status without global variables."""
+    def __init__(self):
+        self.status = {
+            "last_check": 0,
+            "indexed_conversations": 0,
+            "total_conversations": 0,
+            "percentage": 100.0,
+            "backlog_count": 0,
+            "is_checking": False
+        }
+        self.cache = {"result": None, "timestamp": 0}
+
+# Initialize state managers
+embedding_state = EmbeddingState()
+indexing_state = IndexingState()
 
 # Initialize connection pool
 qdrant_pool = None
@@ -133,38 +181,24 @@ circuit_breaker = None
 
 def initialize_embeddings():
     """Initialize embedding models with robust fallback."""
-    global embedding_manager, voyage_client, local_embedding_model
-    try:
-        embedding_manager = get_embedding_manager()
-        print(f"[INFO] Embedding manager initialized: {embedding_manager.get_model_info()}")
-        
-        # Set backward compatibility references
-        if embedding_manager.model_type == 'voyage':
-            voyage_client = embedding_manager.voyage_client
-        elif embedding_manager.model_type == 'local':
-            local_embedding_model = embedding_manager.local_model
-        
-        return True
-    except Exception as e:
-        print(f"[ERROR] Failed to initialize embeddings: {e}")
-        return False
+    return embedding_state.initialize_embeddings()
 
 # Debug environment loading and startup
 # Debug environment loading and startup
 startup_time = datetime.now(timezone.utc).isoformat()
-print(f"[STARTUP] MCP Server starting at {startup_time}", file=sys.stderr)
-print(f"[STARTUP] Python: {sys.version}", file=sys.stderr)
-print(f"[STARTUP] Working directory: {os.getcwd()}", file=sys.stderr)
-print(f"[STARTUP] Script location: {__file__}", file=sys.stderr)
-print(f"[DEBUG] Environment variables loaded:", file=sys.stderr)
-print(f"[DEBUG] QDRANT_URL: {QDRANT_URL}", file=sys.stderr)
-print(f"[DEBUG] ENABLE_MEMORY_DECAY: {ENABLE_MEMORY_DECAY}", file=sys.stderr)
-print(f"[DEBUG] USE_NATIVE_DECAY: {USE_NATIVE_DECAY}", file=sys.stderr)
-print(f"[DEBUG] DECAY_WEIGHT: {DECAY_WEIGHT}", file=sys.stderr)
-print(f"[DEBUG] DECAY_SCALE_DAYS: {DECAY_SCALE_DAYS}", file=sys.stderr)
-print(f"[DEBUG] PREFER_LOCAL_EMBEDDINGS: {PREFER_LOCAL_EMBEDDINGS}", file=sys.stderr)
-print(f"[DEBUG] EMBEDDING_MODEL: {EMBEDDING_MODEL}", file=sys.stderr)
-print(f"[DEBUG] env_path: {env_path}", file=sys.stderr)
+logger.info(f"MCP Server starting at {startup_time}")
+logger.info(f"Python: {sys.version}")
+logger.info(f"Working directory: {os.getcwd()}")
+logger.info(f"Script location: {__file__}")
+logger.debug("Environment variables loaded:")
+logger.debug(f"QDRANT_URL: {QDRANT_URL}")
+logger.debug(f"ENABLE_MEMORY_DECAY: {ENABLE_MEMORY_DECAY}")
+logger.debug(f"USE_NATIVE_DECAY: {USE_NATIVE_DECAY}")
+logger.debug(f"DECAY_WEIGHT: {DECAY_WEIGHT}")
+logger.debug(f"DECAY_SCALE_DAYS: {DECAY_SCALE_DAYS}")
+logger.debug(f"PREFER_LOCAL_EMBEDDINGS: {PREFER_LOCAL_EMBEDDINGS}")
+logger.debug(f"EMBEDDING_MODEL: {EMBEDDING_MODEL}")
+logger.debug(f"env_path: {env_path}")
 
 
 class SearchResult(BaseModel):
@@ -205,19 +239,19 @@ if CONNECTION_POOL_AVAILABLE and ENABLE_PARALLEL_SEARCH:
     # Create a wrapper for backward compatibility
     qdrant_client = AsyncQdrantClient(url=QDRANT_URL)
     circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
-    print(f"[INFO] Connection pool initialized with size {POOL_SIZE}", file=sys.stderr)
+    logger.info(f"Connection pool initialized with size {POOL_SIZE}")
 else:
     # Fallback to single client
     qdrant_client = AsyncQdrantClient(url=QDRANT_URL)
     qdrant_pool = None
     circuit_breaker = None
-    print(f"[INFO] Using single Qdrant client (no pooling)", file=sys.stderr)
+    logger.info("Using single Qdrant client (no pooling)")
 
 # Initialize decay manager if available
 decay_manager = None
 if DECAY_MANAGER_AVAILABLE:
     decay_manager = DecayManager()
-    print(f"[INFO] Decay manager initialized", file=sys.stderr)
+    logger.info("Decay manager initialized")
 
 # Add MCP Resources for system status
 @mcp.resource("status://import-stats")
@@ -275,11 +309,11 @@ async def get_system_health():
     
     # Check embedding configuration
     embedding_info = {}
-    if embedding_manager:
+    if embedding_state.embedding_manager:
         embedding_info = {
-            "model_type": embedding_manager.model_type,
-            "model_name": embedding_manager.model_name,
-            "dimension": embedding_manager.dimension
+            "model_type": embedding_state.embedding_manager.model_type,
+            "model_name": embedding_state.embedding_manager.model_name,
+            "dimension": embedding_state.embedding_manager.dimension
         }
     
     return json.dumps({
@@ -303,21 +337,10 @@ async def get_system_health():
         }
     }, indent=2)
 
-# Track indexing status (updated periodically)
-indexing_status = {
-    "last_check": 0,
-    "indexed_conversations": 0,
-    "total_conversations": 0,
-    "percentage": 100.0,
-    "backlog_count": 0,
-    "is_checking": False
-}
+# Legacy support for old variable names
+indexing_status = indexing_state.status
+_indexing_cache = indexing_state.cache
 
-# Cache for indexing status (5-second TTL)
-_indexing_cache = {"result": None, "timestamp": 0}
-
-# Setup logger
-logger = logging.getLogger(__name__)
 logger.info(f"MCP Server starting - Log file: {LOG_FILE}")
 logger.info(f"Configuration: QDRANT_URL={QDRANT_URL}, DECAY={ENABLE_MEMORY_DECAY}, VOYAGE_API_STATUS={'Configured' if VOYAGE_API_KEY else 'Not Configured'}")
 
@@ -335,166 +358,218 @@ def normalize_path(path_str: str) -> str:
     p = Path(path_str).expanduser().resolve()
     return str(p).replace('\\', '/')  # Consistent separators for all platforms
 
+
+async def read_json_file(path: Path) -> dict:
+    """Read JSON file from disk."""
+    async with aiofiles.open(path, 'r') as f:
+        content = await f.read()
+        return json.loads(content)
+
+
+async def read_watcher_file(path: Path) -> dict:
+    """Read watcher JSON file from disk."""
+    async with aiofiles.open(path, 'r') as f:
+        content = await f.read()
+        return json.loads(content)
+
+
+async def read_cloud_file(path: Path) -> dict:
+    """Read cloud watcher JSON file from disk."""
+    async with aiofiles.open(path, 'r') as f:
+        content = await f.read()
+        return json.loads(content)
+
+
+async def _load_state_files() -> tuple[set[str], dict[str, dict]]:
+    """Load and merge all state files to get imported file tracking."""
+    all_imported_files = set()
+    file_metadata = {}
+
+    # 1. Check imported-files.json (batch importer)
+    possible_paths = [
+        Path.home() / ".claude-self-reflect" / "config" / "imported-files.json",
+        Path(__file__).parent.parent.parent / "config" / "imported-files.json",
+        Path("/config/imported-files.json")  # Docker path if running in container
+    ]
+
+    for path in possible_paths:
+        if path.exists():
+            try:
+                imported_data = await read_json_file(path)
+                imported_files_dict = imported_data.get("imported_files", {})
+                file_metadata.update(imported_data.get("file_metadata", {}))
+                # Normalize paths before adding to set
+                normalized_files = {normalize_path(k) for k in imported_files_dict.keys()}
+                all_imported_files.update(normalized_files)
+            except (json.JSONDecodeError, IOError) as e:
+                logger.debug(f"Failed to read state file {path}: {e}")
+                pass  # Continue if file is corrupted
+
+    # 2. Check csr-watcher.json (streaming watcher - local mode)
+    watcher_paths = [
+        Path.home() / ".claude-self-reflect" / "config" / "csr-watcher.json",
+        Path("/config/csr-watcher.json")  # Docker path
+    ]
+
+    for path in watcher_paths:
+        if path.exists():
+            try:
+                watcher_data = await read_watcher_file(path)
+                watcher_files = watcher_data.get("imported_files", {})
+                # Normalize paths before adding to set
+                normalized_files = {normalize_path(k) for k in watcher_files.keys()}
+                all_imported_files.update(normalized_files)
+                # Add to metadata with normalized paths
+                for file_path, info in watcher_files.items():
+                    normalized = normalize_path(file_path)
+                    if normalized not in file_metadata:
+                        file_metadata[normalized] = {
+                            "position": 1,
+                            "chunks": info.get("chunks", 0)
+                        }
+            except (json.JSONDecodeError, IOError) as e:
+                logger.debug(f"Failed to read watcher state file {path}: {e}")
+                pass  # Continue if file is corrupted
+
+    # 3. Check csr-watcher-cloud.json (streaming watcher - cloud mode)
+    cloud_watcher_path = Path.home() / ".claude-self-reflect" / "config" / "csr-watcher-cloud.json"
+    if cloud_watcher_path.exists():
+        try:
+            cloud_data = await read_cloud_file(cloud_watcher_path)
+            cloud_files = cloud_data.get("imported_files", {})
+            # Normalize paths before adding to set
+            normalized_files = {normalize_path(k) for k in cloud_files.keys()}
+            all_imported_files.update(normalized_files)
+            # Add to metadata with normalized paths
+            for file_path, info in cloud_files.items():
+                normalized = normalize_path(file_path)
+                if normalized not in file_metadata:
+                    file_metadata[normalized] = {
+                        "position": 1,
+                        "chunks": info.get("chunks", 0)
+                    }
+        except (json.JSONDecodeError, IOError) as e:
+            logger.debug(f"Failed to read cloud watcher state file {cloud_watcher_path}: {e}")
+            pass  # Continue if file is corrupted
+
+    return all_imported_files, file_metadata
+
+
+def _is_file_imported(file_path: Path, imported_files_list: list[str], file_metadata: dict[str, dict]) -> bool:
+    """Check if a file has been imported using multiple path matching strategies."""
+    # Normalize the current file path for consistent comparison
+    normalized_file = normalize_path(str(file_path))
+
+    # Try multiple path formats to match Docker's state file
+    file_str = str(file_path).replace(str(Path.home()), "/logs").replace("\\", "/")
+    # Also try without .claude/projects prefix (Docker mounts directly)
+    file_str_alt = file_str.replace("/.claude/projects", "")
+
+    # Normalize alternative paths as well
+    normalized_alt = normalize_path(file_str)
+    normalized_alt2 = normalize_path(file_str_alt)
+
+    # Check if file is in imported_files list (fully imported)
+    if any(path in imported_files_list for path in [normalized_file, normalized_alt, normalized_alt2]):
+        return True
+
+    # Or if it has metadata with position > 0 (partially imported)
+    return any(
+        path in file_metadata and file_metadata[path].get("position", 0) > 0
+        for path in [normalized_file, normalized_alt, normalized_alt2]
+    )
+
+
+def _should_skip_indexing_check(cache: dict, status: dict, current_time: float, cache_ttl: int) -> bool:
+    """Check if indexing status update should be skipped due to cache or rate limiting."""
+    # Check cache first (5-second TTL to prevent performance issues)
+    if cache["result"] and current_time - cache["timestamp"] < cache_ttl:
+        # Use cached result
+        status.update(cache["result"])
+        return True
+
+    # Don't run concurrent checks
+    if status["is_checking"]:
+        return True
+
+    # Check immediately on first call, then every 60 seconds to avoid overhead
+    if status["last_check"] > 0 and current_time - status["last_check"] < 60:  # 1 minute
+        return True
+
+    return False
+
+
+async def _count_indexed_files() -> tuple[int, int]:
+    """Count total JSONL files and how many have been indexed."""
+    projects_dir = Path.home() / ".claude" / "projects"
+    total_files = 0
+    indexed_files = 0
+
+    if projects_dir.exists():
+        # Get all JSONL files
+        jsonl_files = list(projects_dir.glob("**/*.jsonl"))
+        total_files = len(jsonl_files)
+
+        # Load state from all tracking files
+        all_imported_files, file_metadata = await _load_state_files()
+        imported_files_list = list(all_imported_files)
+
+        # Count files that have been imported
+        for file_path in jsonl_files:
+            if _is_file_imported(file_path, imported_files_list, file_metadata):
+                indexed_files += 1
+
+    return total_files, indexed_files
+
+
+def _update_status_metrics(status: dict, cache: dict, current_time: float,
+                          total_files: int, indexed_files: int) -> None:
+    """Update the status metrics and cache."""
+    # Update status
+    status["last_check"] = current_time
+    status["total_conversations"] = total_files
+    status["indexed_conversations"] = indexed_files
+    status["backlog_count"] = total_files - indexed_files
+
+    if total_files > 0:
+        status["percentage"] = (indexed_files / total_files) * 100
+    else:
+        status["percentage"] = 100.0
+
+    # Update cache
+    cache["result"] = status.copy()
+    cache["timestamp"] = current_time
+
+
 async def update_indexing_status(cache_ttl: int = 5):
     """Update indexing status by checking JSONL files vs Qdrant collections.
     This is a lightweight check that compares file counts, not full content.
-    
+
     Args:
         cache_ttl: Cache time-to-live in seconds (default: 5)
     """
-    global indexing_status, _indexing_cache
-    
-    # Check cache first (5-second TTL to prevent performance issues)
+    status = indexing_state.status
+    cache = indexing_state.cache
     current_time = time.time()
-    if _indexing_cache["result"] and current_time - _indexing_cache["timestamp"] < cache_ttl:
-        # Use cached result
-        indexing_status = _indexing_cache["result"].copy()
+
+    # Check if we should skip this update
+    if _should_skip_indexing_check(cache, status, current_time, cache_ttl):
         return
-    
-    # Don't run concurrent checks
-    if indexing_status["is_checking"]:
-        return
-    
-    # Check immediately on first call, then every 60 seconds to avoid overhead
-    if indexing_status["last_check"] > 0 and current_time - indexing_status["last_check"] < 60:  # 1 minute
-        return
-    
-    indexing_status["is_checking"] = True
-    
+
+    status["is_checking"] = True
+
     try:
-        # Count total JSONL files
-        projects_dir = Path.home() / ".claude" / "projects"
-        total_files = 0
-        indexed_files = 0
-        
-        if projects_dir.exists():
-            # Get all JSONL files
-            jsonl_files = list(projects_dir.glob("**/*.jsonl"))
-            total_files = len(jsonl_files)
-            
-            # Check imported-files.json AND watcher state files to see what's been imported
-            # The system uses multiple state files that need to be merged
-            all_imported_files = set()  # Use set to avoid duplicates
-            file_metadata = {}
-            
-            # 1. Check imported-files.json (batch importer)
-            possible_paths = [
-                Path.home() / ".claude-self-reflect" / "config" / "imported-files.json",
-                Path(__file__).parent.parent.parent / "config" / "imported-files.json",
-                Path("/config/imported-files.json")  # Docker path if running in container
-            ]
-            
-            for path in possible_paths:
-                if path.exists():
-                    try:
-                        with open(path, 'r') as f:
-                            imported_data = json.load(f)
-                            imported_files_dict = imported_data.get("imported_files", {})
-                            file_metadata.update(imported_data.get("file_metadata", {}))
-                            # Normalize paths before adding to set
-                            normalized_files = {normalize_path(k) for k in imported_files_dict.keys()}
-                            all_imported_files.update(normalized_files)
-                    except (json.JSONDecodeError, IOError) as e:
-                        logger.debug(f"Failed to read state file {path}: {e}")
-                        pass  # Continue if file is corrupted
-            
-            # 2. Check csr-watcher.json (streaming watcher - local mode)
-            watcher_paths = [
-                Path.home() / ".claude-self-reflect" / "config" / "csr-watcher.json",
-                Path("/config/csr-watcher.json")  # Docker path
-            ]
-            
-            for path in watcher_paths:
-                if path.exists():
-                    try:
-                        with open(path, 'r') as f:
-                            watcher_data = json.load(f)
-                            watcher_files = watcher_data.get("imported_files", {})
-                            # Normalize paths before adding to set
-                            normalized_files = {normalize_path(k) for k in watcher_files.keys()}
-                            all_imported_files.update(normalized_files)
-                            # Add to metadata with normalized paths
-                            for file_path, info in watcher_files.items():
-                                normalized = normalize_path(file_path)
-                                if normalized not in file_metadata:
-                                    file_metadata[normalized] = {
-                                        "position": 1,
-                                        "chunks": info.get("chunks", 0)
-                                    }
-                    except (json.JSONDecodeError, IOError) as e:
-                        logger.debug(f"Failed to read watcher state file {path}: {e}")
-                        pass  # Continue if file is corrupted
-            
-            # 3. Check csr-watcher-cloud.json (streaming watcher - cloud mode)
-            cloud_watcher_path = Path.home() / ".claude-self-reflect" / "config" / "csr-watcher-cloud.json"
-            if cloud_watcher_path.exists():
-                try:
-                    with open(cloud_watcher_path, 'r') as f:
-                        cloud_data = json.load(f)
-                        cloud_files = cloud_data.get("imported_files", {})
-                        # Normalize paths before adding to set
-                        normalized_files = {normalize_path(k) for k in cloud_files.keys()}
-                        all_imported_files.update(normalized_files)
-                        # Add to metadata with normalized paths
-                        for file_path, info in cloud_files.items():
-                            normalized = normalize_path(file_path)
-                            if normalized not in file_metadata:
-                                file_metadata[normalized] = {
-                                    "position": 1,
-                                    "chunks": info.get("chunks", 0)
-                                }
-                except (json.JSONDecodeError, IOError) as e:
-                    logger.debug(f"Failed to read cloud watcher state file {cloud_watcher_path}: {e}")
-                    pass  # Continue if file is corrupted
-            
-            # Convert set to list for compatibility
-            imported_files_list = list(all_imported_files)
-            
-            # Count files that have been imported
-            for file_path in jsonl_files:
-                # Normalize the current file path for consistent comparison
-                normalized_file = normalize_path(str(file_path))
-                
-                # Try multiple path formats to match Docker's state file
-                file_str = str(file_path).replace(str(Path.home()), "/logs").replace("\\", "/")
-                # Also try without .claude/projects prefix (Docker mounts directly)
-                file_str_alt = file_str.replace("/.claude/projects", "")
-                
-                # Normalize alternative paths as well
-                normalized_alt = normalize_path(file_str)
-                normalized_alt2 = normalize_path(file_str_alt)
-                
-                # Check if file is in imported_files list (fully imported)
-                if normalized_file in imported_files_list or normalized_alt in imported_files_list or normalized_alt2 in imported_files_list:
-                    indexed_files += 1
-                # Or if it has metadata with position > 0 (partially imported)
-                elif normalized_file in file_metadata and file_metadata[normalized_file].get("position", 0) > 0:
-                    indexed_files += 1
-                elif normalized_alt in file_metadata and file_metadata[normalized_alt].get("position", 0) > 0:
-                    indexed_files += 1
-                elif normalized_alt2 in file_metadata and file_metadata[normalized_alt2].get("position", 0) > 0:
-                    indexed_files += 1
-        
-        # Update status
-        indexing_status["last_check"] = current_time
-        indexing_status["total_conversations"] = total_files
-        indexing_status["indexed_conversations"] = indexed_files
-        indexing_status["backlog_count"] = total_files - indexed_files
-        
-        if total_files > 0:
-            indexing_status["percentage"] = (indexed_files / total_files) * 100
-        else:
-            indexing_status["percentage"] = 100.0
-        
-        # Update cache
-        _indexing_cache["result"] = indexing_status.copy()
-        _indexing_cache["timestamp"] = current_time
-            
+        # Count files and their indexing status
+        total_files, indexed_files = await _count_indexed_files()
+
+        # Update all metrics
+        _update_status_metrics(status, cache, current_time, total_files, indexed_files)
+
     except Exception as e:
-        print(f"[WARNING] Failed to update indexing status: {e}")
+        logger.warning(f"Failed to update indexing status: {e}")
         logger.error(f"Failed to update indexing status: {e}", exc_info=True)
     finally:
-        indexing_status["is_checking"] = False
+        status["is_checking"] = False
     
 async def get_all_collections() -> List[str]:
     """Get all collections (both Voyage and local)."""
@@ -505,40 +580,38 @@ async def get_all_collections() -> List[str]:
 
 async def generate_embedding(text: str, force_type: Optional[str] = None) -> List[float]:
     """Generate embedding using configured provider or forced type.
-    
+
     Args:
         text: Text to embed
         force_type: Force specific embedding type ('local' or 'voyage')
     """
-    global embedding_manager, voyage_client, local_embedding_model
-    
     # Initialize on first use
-    if embedding_manager is None:
-        if not initialize_embeddings():
+    if embedding_state.embedding_manager is None:
+        if not embedding_state.initialize_embeddings():
             raise RuntimeError("Failed to initialize any embedding model. Check logs for details.")
-    
+
     # Determine which type to use
     if force_type:
         use_local = force_type == 'local'
     else:
-        use_local = embedding_manager.model_type == 'local'
-    
+        use_local = embedding_state.embedding_manager.model_type == 'local'
+
     if use_local:
         # Use local embeddings
-        if not local_embedding_model:
+        if not embedding_state.local_embedding_model:
             raise ValueError("Local embedding model not available")
-        
+
         # Run in executor since fastembed is synchronous
         loop = asyncio.get_event_loop()
         embeddings = await loop.run_in_executor(
-            None, lambda: list(local_embedding_model.embed([text]))
+            None, lambda: list(embedding_state.local_embedding_model.embed([text]))
         )
         return embeddings[0].tolist()
     else:
         # Use Voyage AI
-        if not voyage_client:
+        if not embedding_state.voyage_client:
             raise ValueError("Voyage client not available")
-        result = voyage_client.embed(
+        result = embedding_state.voyage_client.embed(
             texts=[text],
             model="voyage-3-large",
             input_type="query"
@@ -547,7 +620,7 @@ async def generate_embedding(text: str, force_type: Optional[str] = None) -> Lis
 
 def get_embedding_dimension() -> int:
     """Get the dimension of embeddings based on the provider."""
-    if PREFER_LOCAL_EMBEDDINGS or not voyage_client:
+    if PREFER_LOCAL_EMBEDDINGS or not embedding_state.voyage_client:
         # all-MiniLM-L6-v2 produces 384-dimensional embeddings
         return 384
     else:
@@ -557,8 +630,8 @@ def get_embedding_dimension() -> int:
 def get_collection_suffix() -> str:
     """Get the collection suffix based on embedding provider."""
     # Use embedding_manager's model type if available
-    if embedding_manager and hasattr(embedding_manager, 'model_type'):
-        if embedding_manager.model_type == 'voyage':
+    if embedding_state.embedding_manager and hasattr(embedding_state.embedding_manager, 'model_type'):
+        if embedding_state.embedding_manager.model_type == 'voyage':
             return "_voyage"
         else:
             return "_local"
@@ -571,28 +644,21 @@ def get_collection_suffix() -> str:
 def aggregate_pattern_intelligence(results: List[SearchResult]) -> Dict[str, Any]:
     """Aggregate pattern intelligence across search results."""
     
-    # Initialize counters
-    all_patterns = {}
+    # Initialize counters using efficient data structures
+    all_patterns = Counter()
     all_files = set()
     all_tools = set()
     all_concepts = set()
-    pattern_by_category = {}
-    
+    pattern_by_category = defaultdict(lambda: defaultdict(int))
+
     for result in results:
-        # Aggregate code patterns
+        # Aggregate code patterns efficiently using Counter operations
         if result.code_patterns:
             for category, patterns in result.code_patterns.items():
-                if category not in pattern_by_category:
-                    pattern_by_category[category] = {}
-                for pattern in patterns:
-                    if pattern not in pattern_by_category[category]:
-                        pattern_by_category[category][pattern] = 0
-                    pattern_by_category[category][pattern] += 1
-                    
-                    # Overall pattern count
-                    if pattern not in all_patterns:
-                        all_patterns[pattern] = 0
-                    all_patterns[pattern] += 1
+                # Use Counter for efficient bulk updates
+                pattern_counter = Counter(patterns)
+                pattern_by_category[category].update(pattern_counter)
+                all_patterns.update(pattern_counter)
         
         # Aggregate files
         if result.files_analyzed:
@@ -625,7 +691,7 @@ def aggregate_pattern_intelligence(results: List[SearchResult]) -> Dict[str, Any
         "files_referenced": list(all_files)[:20],  # Limit to top 20
         "tools_used": list(all_tools),
         "concepts_discussed": list(all_concepts)[:15],  # Limit to top 15
-        "pattern_by_category": pattern_by_category,
+        "pattern_by_category": {k: dict(v) for k, v in pattern_by_category.items()},
         "pattern_diversity_score": len(all_patterns) / max(len(results), 1)  # Patterns per result
     }
     
@@ -660,7 +726,7 @@ register_temporal_tools(
     initialize_embeddings,
     normalize_project_name
 )
-print(f"[INFO] Temporal tools registered", file=sys.stderr)
+logger.info("Temporal tools registered")
 
 # Register search tools
 def get_embedding_manager():
@@ -698,6 +764,18 @@ register_reflection_tools(
     normalize_project_name
 )
 
+# Register mode switching tools
+register_mode_switch_tool(
+    mcp,
+    get_embedding_manager
+)
+
+# Register code reload tools
+register_code_reload_tool(
+    mcp,
+    get_embedding_manager
+)
+
 # Run the server
 if __name__ == "__main__":
     import sys
@@ -715,14 +793,14 @@ if __name__ == "__main__":
                 status_copy["last_check"] = datetime.fromtimestamp(status_copy["last_check"]).isoformat()
             else:
                 status_copy["last_check"] = None
-            print(json.dumps(status_copy, indent=2))
+            logger.info(json.dumps(status_copy, indent=2))
         
         asyncio.run(print_status())
         sys.exit(0)
     
     # Normal MCP server operation
-    print(f"[STARTUP] Starting FastMCP server in stdio mode...", file=sys.stderr)
-    print(f"[STARTUP] Server name: {mcp.name}", file=sys.stderr)
-    print(f"[STARTUP] Calling mcp.run()...", file=sys.stderr)
+    logger.info("Starting FastMCP server in stdio mode...")
+    logger.info(f"Server name: {mcp.name}")
+    logger.info("Calling mcp.run()...")
     mcp.run()
-    print(f"[STARTUP] Server exited normally", file=sys.stderr)
+    logger.info("Server exited normally")

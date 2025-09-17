@@ -125,7 +125,7 @@ from utils import normalize_project_name  # Fixed import
    - Quality scoring for ranking
 
 ## Test Suite Location
-- Comprehensive test: `/Users/ramakrishnanannaswamy/projects/claude-self-reflect/test-comprehensive.py`
+- Comprehensive test: `/Users/YOUR_USERNAME/projects/claude-self-reflect/test-comprehensive.py`
 - Can be run anytime with: `python test-comprehensive.py`
 
 ## Conclusion

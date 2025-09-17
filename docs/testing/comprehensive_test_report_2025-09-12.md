@@ -28,7 +28,7 @@
 
 #### 3. MCP Server Connection
 - **Connection Status**: ✅ Connected and functional
-- **Server Path**: `/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/run-mcp.sh`
+- **Server Path**: `/Users/YOUR_USERNAME/projects/claude-self-reflect/mcp-server/run-mcp.sh`
 - **Environment**: ✅ QDRANT_URL properly configured
 
 #### 4. MCP Tools Functionality (13/14 Tools Tested)

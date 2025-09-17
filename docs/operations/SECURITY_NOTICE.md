@@ -1,6 +1,18 @@
 # Security Notice
 
-## Revoked API Keys in Git History
+## UPDATE: 2025-09-17 - Voyage API Key Rotation Required
+
+### CRITICAL: Immediate Action Required
+A Voyage API key was exposed in local test documentation. While it was never committed to git, it should be rotated immediately:
+1. **Revoke** the exposed key (prefix: `pa-JbR-`)
+2. **Generate** a new Voyage API key
+3. **Update** your `.env` file with the new key
+
+All documentation files have been sanitized and .gitignore updated to prevent future exposure.
+
+---
+
+## Previous: Revoked API Keys in Git History
 
 During a routine security scan, we identified some API keys in historical commits. All identified keys have been **revoked and are no longer active**.
 
@@ -22,4 +34,4 @@ During a routine security scan, we identified some API keys in historical commit
 - Use environment variables or `.env` files (gitignored)
 - Review changes carefully before committing
 
-If you discover any security issues, please report them responsibly to: ramakay@me.com
+If you discover any security issues, please report them responsibly to: user@example.com

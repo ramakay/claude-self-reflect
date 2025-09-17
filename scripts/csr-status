@@ -55,9 +55,120 @@ def get_import_status():
         return "📚 CSR: Error"
 
 
+def categorize_issues(file_reports):
+    """
+    Categorize issues from AST analysis into critical/medium/low.
+    """
+    critical = 0
+    medium = 0
+    low = 0
+
+    for file_path, report in file_reports.items():
+        # Only use top_issues for accurate counting (avoid double-counting from recommendations)
+        for issue in report.get('top_issues', []):
+            severity = issue.get('severity', 'medium')
+            count = issue.get('count', 0)
+            issue_id = issue.get('id', '').lower()
+
+            if severity == 'high' or severity == 'critical':
+                critical += count
+            elif severity == 'medium':
+                # Console.log and print statements are low severity
+                if 'print' in issue_id or 'console' in issue_id:
+                    low += count
+                else:
+                    medium += count
+            else:
+                low += count
+
+    return critical, medium, low
+
+
+def get_quality_icon(critical=0, medium=0, low=0):
+    """
+    Determine quality icon based on issue severity counts.
+    """
+    # Icon selection based on highest severity present
+    if critical > 0:
+        if critical >= 10:
+            return "🔴"  # Red circle - Critical issues need immediate attention
+        else:
+            return "🟠"  # Orange circle - Some critical issues
+    elif medium > 0:
+        if medium >= 50:
+            return "🟡"  # Yellow circle - Many medium issues
+        else:
+            return "🟢"  # Green circle - Few medium issues
+    elif low > 0:
+        if low >= 100:
+            return "⚪"  # White circle - Many minor issues (prints)
+        else:
+            return "✅"  # Check mark - Only minor issues
+    else:
+        return "✨"  # Sparkles - Perfect, no issues
+
+
+def format_statusline_quality(critical=0, medium=0, low=0):
+    """
+    Format statusline with colored dot and labeled numbers.
+    """
+    import os
+    icon = get_quality_icon(critical, medium, low)
+
+    # Check if we should use colors (when in a TTY)
+    use_colors = os.isatty(sys.stdout.fileno()) if hasattr(sys.stdout, 'fileno') else False
+
+    # Build count display with colors if supported
+    counts = []
+    if critical > 0:
+        if use_colors:
+            # Use bright red for critical
+            counts.append(f"\033[1;31mC:{critical}\033[0m")
+        else:
+            counts.append(f"C:{critical}")
+    if medium > 0:
+        if use_colors:
+            # Use bright yellow for medium
+            counts.append(f"\033[1;33mM:{medium}\033[0m")
+        else:
+            counts.append(f"M:{medium}")
+    if low > 0:
+        if use_colors:
+            # Use bright white/gray for low
+            counts.append(f"\033[1;37mL:{low}\033[0m")
+        else:
+            counts.append(f"L:{low}")
+
+    if counts:
+        return f"{icon} {' '.join(counts)}"
+    else:
+        return f"{icon}"  # Perfect - no counts needed
+
+
 def get_session_health():
-    """Get cached session health."""
-    cache_file = Path.home() / ".claude-self-reflect" / "session_quality.json"
+    """Get cached session health with icon-based quality display."""
+    # Check for session edit tracker to show appropriate label
+    tracker_file = Path.home() / ".claude-self-reflect" / "current_session_edits.json"
+
+    # Get quality cache file for current project
+    project_name = Path.cwd().name
+    cache_file = Path.home() / ".claude-self-reflect" / "quality_cache" / f"{project_name}.json"
+
+    # Default label prefix
+    label_prefix = ""
+
+    # Check if we have a session tracker with edited files
+    if tracker_file.exists():
+        try:
+            with open(tracker_file, 'r') as f:
+                tracker_data = json.load(f)
+                edited_files = tracker_data.get('edited_files', [])
+                if edited_files:
+                    # Show session label with file count
+                    file_count = len(edited_files)
+                    label_prefix = f"Session ({file_count} file{'s' if file_count > 1 else ''}): "
+        except:
+            pass
 
     if not cache_file.exists():
         # Fall back to import status if no health data
@@ -79,22 +190,26 @@ def get_session_health():
             # Fall back to import status if no session
             return get_import_status()
 
-        summary = data['summary']
-        grade = summary['quality_grade']
-        issues = summary['total_issues']
+        # Extract issue counts by severity
+        file_reports = data.get('file_reports', {})
+        critical, medium, low = categorize_issues(file_reports)
 
-        # Color coding
-        if grade in ['A+', 'A']:
-            emoji = '🟢'
-        elif grade in ['B', 'C']:
-            emoji = '🟡'
-        else:
-            emoji = '🔴'
+        # Use the icon-based display with optional label
+        quality_display = format_statusline_quality(critical, medium, low)
 
-        if issues > 0:
-            return f"{emoji} Code: {grade} ({issues})"
-        else:
-            return f"{emoji} Code: {grade}"
+        # Add session label if we have one
+        if data.get('scope_label') == 'Session':
+            # For session scope, always show the label with counts
+            if label_prefix:
+                if critical == 0 and medium == 0 and low == 0:
+                    return f"{label_prefix}0 0 0 {quality_display}"
+                else:
+                    return f"{label_prefix}{critical} {medium} {low} {quality_display}"
+            else:
+                # Fallback if no tracker file
+                return f"Session: {critical} {medium} {low} {quality_display}"
+
+        return quality_display
 
     except Exception:
         return get_import_status()
@@ -257,6 +372,14 @@ def get_compact_status():
     cache_dir = Path.home() / ".claude-self-reflect" / "quality_cache"
     cache_file = cache_dir / f"{safe_project_name}.json"
 
+    # If the exact cache file doesn't exist, try to find one that ends with this project name
+    # This handles cases like "metafora-Atlas-gold.json" for project "Atlas-gold"
+    if not cache_file.exists():
+        # Look for files ending with the project name
+        possible_files = list(cache_dir.glob(f"*-{safe_project_name}.json"))
+        if possible_files:
+            cache_file = possible_files[0]  # Use the first match
+
     # Validate cache file path stays within cache directory
     if cache_file.exists() and not str(cache_file.resolve()).startswith(str(cache_dir.resolve())):
         # Security issue - return placeholder
@@ -273,30 +396,38 @@ def get_compact_status():
             mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
             age = datetime.now() - mtime
 
-            # Use quality data up to 24 hours old (more reasonable)
-            if age < timedelta(hours=24):
+            # Use quality data up to 30 minutes old for fresher results
+            if age < timedelta(minutes=30):
                 with open(cache_file, 'r') as f:
                     data = json.load(f)
 
-                if data.get('status') == 'success':
-                    summary = data['summary']
-                    grade = summary['quality_grade']
-                    issues = summary.get('total_issues', 0)
-                    scope = data.get('scope_label', 'Core')  # Get scope label
+                if data.get('status') == 'non-code':
+                    # Non-code project - show documentation indicator
+                    grade_str = "[📚:Docs]"
+                    quality_valid = True
+                elif data.get('status') == 'success':
+                    # Extract issue counts by severity for icon display
+                    file_reports = data.get('file_reports', {})
+                    critical, medium, low = categorize_issues(file_reports)
 
-                    # GPT-5 fix: Remove forced downgrades, trust the analyzer's grade
-                    # Grade should reflect actual quality metrics, not arbitrary thresholds
+                    # Get icon based on severity
+                    icon = get_quality_icon(critical, medium, low)
 
-                    # Pick emoji based on grade
-                    if grade in ['A+', 'A']:
-                        emoji = '🟢'
-                    elif grade in ['B', 'C']:
-                        emoji = '🟡'
+                    # Build compact display with ANSI colors for each severity level
+                    colored_parts = []
+                    if critical > 0:
+                        colored_parts.append(f"\033[31m{critical}\033[0m")  # Standard red for critical
+                    if medium > 0:
+                        colored_parts.append(f"\033[33m{medium}\033[0m")  # Standard yellow for medium
+                    if low > 0:
+                        colored_parts.append(f"\033[37m{low}\033[0m")  # White/light gray for low
+
+                    # Join with middle dot separator
+                    if colored_parts:
+                        grade_str = f"[{icon}:{'·'.join(colored_parts)}]"
                     else:
-                        emoji = '🔴'
+                        grade_str = f"[{icon}]"
 
-                    # Simple, clear display without confusing scope labels
-                    grade_str = f"[{emoji}:{grade}/{issues}]"
                     quality_valid = True
         except:
             pass
@@ -308,17 +439,31 @@ def get_compact_status():
             if cache_file.exists():
                 with open(cache_file, 'r') as f:
                     old_data = json.load(f)
-                if old_data.get('status') == 'success':
-                    old_grade = old_data['summary']['quality_grade']
-                    old_issues = old_data['summary'].get('total_issues', 0)
-                    # Show with dimmed indicator that it's old
-                    if old_grade in ['A+', 'A']:
-                        emoji = '🟢'
-                    elif old_grade in ['B', 'C']:
-                        emoji = '🟡'
+                if old_data.get('status') == 'non-code':
+                    # Non-code project - show documentation indicator
+                    grade_str = "[📚:Docs]"
+                elif old_data.get('status') == 'success':
+                    # Extract issue counts by severity for icon display
+                    file_reports = old_data.get('file_reports', {})
+                    critical, medium, low = categorize_issues(file_reports)
+
+                    # Get icon based on severity
+                    icon = get_quality_icon(critical, medium, low)
+
+                    # Build compact display with ANSI colors for each severity level
+                    colored_parts = []
+                    if critical > 0:
+                        colored_parts.append(f"\033[31m{critical}\033[0m")  # Standard red for critical
+                    if medium > 0:
+                        colored_parts.append(f"\033[33m{medium}\033[0m")  # Standard yellow for medium
+                    if low > 0:
+                        colored_parts.append(f"\033[37m{low}\033[0m")  # White/light gray for low
+
+                    # Join with middle dot separator
+                    if colored_parts:
+                        grade_str = f"[{icon}:{'·'.join(colored_parts)}]"
                     else:
-                        emoji = '🔴'
-                    grade_str = f"[{emoji}:{old_grade}/{old_issues}]"
+                        grade_str = f"[{icon}]"
                 else:
                     grade_str = "[...]"
             else:

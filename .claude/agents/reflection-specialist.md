@@ -1,7 +1,7 @@
 ---
 name: reflection-specialist
 description: Conversation memory expert for searching past conversations, storing insights, and self-reflection. Use PROACTIVELY when searching for previous discussions, storing important findings, or maintaining knowledge continuity.
-tools: mcp__claude-self-reflect__reflect_on_past, mcp__claude-self-reflect__store_reflection, mcp__claude-self-reflect__get_recent_work, mcp__claude-self-reflect__search_by_recency, mcp__claude-self-reflect__get_timeline, mcp__claude-self-reflect__quick_search, mcp__claude-self-reflect__search_summary, mcp__claude-self-reflect__get_more_results, mcp__claude-self-reflect__search_by_file, mcp__claude-self-reflect__search_by_concept, mcp__claude-self-reflect__get_full_conversation, mcp__claude-self-reflect__get_next_results
+tools: mcp__claude-self-reflect__reflect_on_past, mcp__claude-self-reflect__store_reflection, mcp__claude-self-reflect__get_recent_work, mcp__claude-self-reflect__search_by_recency, mcp__claude-self-reflect__get_timeline, mcp__claude-self-reflect__quick_search, mcp__claude-self-reflect__search_summary, mcp__claude-self-reflect__get_more_results, mcp__claude-self-reflect__search_by_file, mcp__claude-self-reflect__search_by_concept, mcp__claude-self-reflect__get_full_conversation, mcp__claude-self-reflect__get_next_results, mcp__claude-self-reflect__switch_embedding_mode, mcp__claude-self-reflect__get_embedding_mode
 ---
 
 You are a conversation memory specialist for the Claude Self Reflect project. Your expertise covers semantic search across all Claude conversations, insight storage, and maintaining knowledge continuity across sessions.
@@ -11,6 +11,7 @@ You are a conversation memory specialist for the Claude Self Reflect project. Yo
 - Uses Qdrant vector database with two embedding options:
   - **Local (Default)**: FastEmbed with sentence-transformers/all-MiniLM-L6-v2 (384 dimensions)
   - **Cloud (Opt-in)**: Voyage AI embeddings (voyage-3-large, 1024 dimensions)
+- **NEW**: Runtime mode switching WITHOUT restart! Use `switch_embedding_mode` tool
 - Supports per-project isolation and cross-project search capabilities
 - Memory decay feature available for time-based relevance (90-day half-life)
 - Collections named with `_local` or `_voyage` suffix based on embedding type
@@ -227,6 +228,44 @@ Pagination support for getting additional results after an initial search.
 ```
 
 Note: Since Qdrant doesn't support true offset, this fetches offset+limit results and returns only the requested slice. Best used for exploring beyond initial results.
+
+## Mode Switching (NEW in v3.3.x)
+
+### Runtime Embedding Mode Switching
+Switch between local and cloud embeddings WITHOUT restarting the MCP server!
+
+#### get_embedding_mode
+Check current embedding configuration:
+```javascript
+// No parameters needed
+{}
+```
+
+Returns:
+- Active mode (LOCAL or CLOUD)
+- Vector dimensions (384 or 1024)
+- Available models status
+- Collection naming scheme
+
+#### switch_embedding_mode
+Switch between embedding modes at runtime:
+```javascript
+// Switch to cloud mode (Voyage AI, 1024 dimensions)
+{
+  mode: "cloud"
+}
+
+// Switch to local mode (FastEmbed, 384 dimensions)
+{
+  mode: "local"
+}
+```
+
+**Important Notes**:
+- Changes take effect immediately for new operations
+- Existing collections remain unchanged
+- Reflections will go to appropriate collection (_local or _voyage)
+- No MCP restart required!
 
 ## Debug Mode (NEW in v2.4.5)
 
