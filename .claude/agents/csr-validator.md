@@ -71,7 +71,19 @@ wc -l ~/.claude-self-reflect/config/unified-state.json
 head -20 ~/.claude-self-reflect/config/unified-state.json
 ```
 
-### 6. Cleanup Transient Files
+### 6. CodeRabbit CLI Analysis
+```bash
+# Run CodeRabbit for code quality check
+echo "=== Running CodeRabbit CLI ==="
+coderabbit --version
+script -q /dev/null coderabbit --prompt-only || echo "CodeRabbit CLI issues detected - terminal mode incompatibility"
+
+# Alternative: Check GitHub PR for CodeRabbit comments
+echo "=== Checking PR CodeRabbit feedback ==="
+gh pr list --state open --limit 1 --json number --jq '.[0].number' | xargs -I {} gh pr view {} --comments | grep -A 5 "coderabbitai" || echo "No open PRs with CodeRabbit feedback"
+```
+
+### 7. Cleanup Transient Files
 ```bash
 # List transient files (DO NOT DELETE YET)
 echo "=== Transient files found ==="
@@ -105,6 +117,11 @@ Performance:
 - Search latency: [Xms]
 - Memory usage: [XMB]
 - Qdrant status: [healthy/unhealthy]
+
+CodeRabbit Analysis: [PASS/FAIL]
+- CLI execution: [✓/✗ - terminal mode issues]
+- PR feedback checked: [✓/✗]
+- Issues found: [none/list]
 
 Critical Issues: [none/list]
 
