@@ -809,7 +809,7 @@ class StreamingWatcher:
 
         self.shutdown_event = asyncio.Event()
 
-        logger.info(f"Streaming Watcher v3.0.0 with HOT/WARM/COLD prioritization")
+        logger.info("Streaming Watcher v3.0.0 with HOT/WARM/COLD prioritization")
         logger.info(f"State file: {self.state_manager.state_file}")
         logger.info(f"Memory limits: {config.memory_warning_mb}MB warning, {config.memory_limit_mb}MB limit")
         logger.info(f"HOT window: {config.hot_window_minutes} min, WARM window: {config.warm_window_hours} hrs")
@@ -1318,7 +1318,7 @@ class StreamingWatcher:
         logger.info("=" * 60)
         logger.info("Claude Self-Reflect Streaming Watcher v3.0.0")
         logger.info("=" * 60)
-        logger.info(f"State manager: UnifiedStateManager")
+        logger.info("State manager: UnifiedStateManager")
         logger.info(f"Memory: {self.config.memory_warning_mb}MB warning, {self.config.memory_limit_mb}MB limit")
         logger.info(f"CPU limit: {self.cpu_monitor.max_total_cpu:.1f}%")
         logger.info(f"Queue size: {self.config.max_queue_size}")

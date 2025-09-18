@@ -52,6 +52,7 @@ tests/test_results.json
 test-results/
 *.coverage
 tool_usage_sample.json
+tests/throwaway/
 
 # Internal documentation
 .internal/
@@ -73,6 +74,7 @@ scripts/performance-*.py
 scripts/validate-decay-impact.py
 scripts/test/
 scripts/test-typescript/
+scripts/tests/
 
 # Test directories
 mcp-server/test-fresh-install/
