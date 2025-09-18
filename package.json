@@ -1,6 +1,6 @@
 {
   "name": "claude-self-reflect",
-  "version": "4.0.1",
+  "version": "4.0.2",
   "description": "Give Claude perfect memory of all your conversations - Installation wizard for Python MCP server",
   "keywords": [
     "claude",
@@ -35,6 +35,9 @@
   },
   "files": [
     "installer/*.js",
+    "scripts/auto-migrate.cjs",
+    "scripts/migrate-to-unified-state.py",
+    "scripts/unified_state_manager.py",
     "scripts/csr-status",
     "scripts/session_quality_tracker.py",
     "scripts/ast_grep_final_analyzer.py",
@@ -68,7 +71,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "postinstall": "node installer/postinstall.js"
+    "postinstall": "node installer/postinstall.js && node scripts/auto-migrate.cjs || true"
   },
   "engines": {
     "node": ">=18.0.0"
