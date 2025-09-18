@@ -83,10 +83,20 @@ class SearchTools:
             # Generate embedding for query
             embedding_manager = self.get_embedding_manager()
             
-            # Determine embedding type based on collection name
-            embedding_type = 'voyage' if collection_name.endswith('_voyage') else 'local'
+            # Determine embedding type based on collection name (v3 and v4 compatible)
+            # v4 format: csr_project_mode_dims (e.g., csr_project_cloud_1024d)
+            # v3 format: project_suffix (e.g., project_voyage)
+            if '_cloud_' in collection_name or collection_name.endswith('_1024d') or collection_name.endswith('_voyage'):
+                embedding_type = 'voyage'
+            else:
+                embedding_type = 'local'
             query_embedding = await embedding_manager.generate_embedding(query, force_type=embedding_type)
-            
+
+            # FIX: Validate embedding before search
+            if query_embedding is None:
+                logger.warning(f"Embedding generation failed for query in {collection_name}")
+                return []
+
             # Search the collection
             search_results = await self.qdrant_client.search(
                 collection_name=collection_name,
@@ -132,9 +142,9 @@ class SearchTools:
                     # Apply exponential decay
                     decay_factor = pow(2, -age / self.decay_scale_days)
                     
-                    # Adjust score
+                    # Adjust score - FIX: Maintain comparable scale
                     original_score = result['score']
-                    result['score'] = original_score * (1 - self.decay_weight) + decay_factor * self.decay_weight
+                    result['score'] = original_score * ((1 - self.decay_weight) + self.decay_weight * decay_factor)
                     result['original_score'] = original_score
                     result['decay_factor'] = decay_factor
                     
@@ -706,17 +716,21 @@ class SearchTools:
                     await ctx.debug(f"Error searching {collection_name}: {e}")
                     return []
             
-            # Use asyncio.gather for PARALLEL search across all collections
+            # SECURITY FIX: Use proper concurrency limiting
             import asyncio
+            from .security_patches import ConcurrencyLimiter
+
             search_tasks = [search_collection(c.name) for c in collections]
-            
-            # Limit concurrent searches to avoid overload
-            batch_size = 20
+
+            # Use semaphore-based limiting instead of batching
             all_results = []
-            for i in range(0, len(search_tasks), batch_size):
-                batch = search_tasks[i:i+batch_size]
-                batch_results = await asyncio.gather(*batch)
-                for results in batch_results:
+            batch_results = await ConcurrencyLimiter.limited_gather(search_tasks, limit=10)
+            for results in batch_results:
+                if isinstance(results, Exception):
+                    logger.error(f"Search task failed: {type(results).__name__}: {results}")
+                    await ctx.debug(f"Search task error: {results}")
+                    continue
+                if results:
                     all_results.extend(results)
             
             # Format results

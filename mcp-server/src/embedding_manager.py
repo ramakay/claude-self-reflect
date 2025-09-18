@@ -159,16 +159,24 @@ class EmbeddingManager:
                     error = e
                     logger.error(f"Failed to initialize local model: {e}")
             
-            # Start initialization in a thread
-            thread = threading.Thread(target=init_model)
-            thread.daemon = True
-            thread.start()
-            thread.join(timeout=self.download_timeout)
-            
-            if thread.is_alive():
+            # SECURITY FIX: Use ThreadPoolExecutor with proper timeout handling
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+            # Create executor and manage lifecycle explicitly to avoid blocking on timeout
+            executor = ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(init_model)
+            try:
+                future.result(timeout=self.download_timeout)
+                executor.shutdown(wait=True)
+            except FuturesTimeoutError:
                 logger.error(f"Model initialization timed out after {self.download_timeout}s")
                 logger.info("Tip: Set FASTEMBED_SKIP_HUGGINGFACE=true to use alternative download sources")
-                # Thread will continue in background but we move on
+                # Don't wait for the hung task
+                executor.shutdown(wait=False)
+                return False
+            except Exception as e:
+                logger.error(f"Model initialization failed: {e}")
+                executor.shutdown(wait=True)
                 return False
             
             return success

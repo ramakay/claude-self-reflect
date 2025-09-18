@@ -225,6 +225,22 @@ Multiple agents can be invoked concurrently:
 - Fallback strategies defined per agent
 - Main instance handles recovery
 
+**Example Error Recovery**:
+```python
+# Search optimization with fallback
+try:
+    result = Task(
+        subagent_type="search-optimizer",
+        prompt="Optimize search for: docker issues"
+    )
+except AgentExecutionError:
+    # Fallback to basic search without optimization
+    result = mcp__claude-self-reflect__reflect_on_past(
+        "docker issues",
+        min_score=0.2  # Lower threshold for wider results
+    )
+```
+
 ## Best Practices
 
 ### 1. Agent Selection

@@ -85,6 +85,13 @@ class CodeReloader:
 
             for module_name in reload_targets:
                 try:
+                    # SECURITY FIX: Validate module is in whitelist
+                    from .security_patches import ModuleWhitelist
+                    if not ModuleWhitelist.is_allowed_module(module_name):
+                        logger.warning(f"Module not in whitelist, skipping: {module_name}")
+                        failed.append((module_name, "Module not in whitelist"))
+                        continue
+
                     if module_name in sys.modules:
                         # Store old module reference for rollback
                         old_module = sys.modules[module_name]

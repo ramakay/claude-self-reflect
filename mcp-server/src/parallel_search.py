@@ -70,11 +70,15 @@ async def search_single_collection(
             # This code path is intentionally disabled
             pass
         else:
+            # SECURITY FIX: Reduce memory multiplier to prevent OOM
+            from .security_patches import MemoryOptimizer
+            safe_limit = MemoryOptimizer.calculate_safe_limit(limit, 1.5) if should_use_decay else limit
+
             # Standard search without native decay or client-side decay
             search_results = await qdrant_client.search(
                 collection_name=collection_name,
                 query_vector=query_embedding,
-                limit=limit * 3 if should_use_decay else limit,  # Get more results for client-side decay
+                limit=safe_limit,  # Use safe limit to prevent memory explosion
                 score_threshold=min_score if not should_use_decay else 0.0,
                 with_payload=True
             )
@@ -292,8 +296,9 @@ async def parallel_search_collections(
     
     for result in search_results:
         if isinstance(result, Exception):
-            # Handle exceptions from gather
-            logger.error(f"Search task failed: {result}")
+            # SECURITY FIX: Proper exception logging with context
+            from .security_patches import ExceptionLogger
+            ExceptionLogger.log_exception(result, "parallel_search_task")
             continue
         
         collection_name, results, timing = result

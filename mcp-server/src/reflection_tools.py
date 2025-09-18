@@ -91,8 +91,9 @@ class ReflectionTools:
                 await ctx.debug("Failed to generate embedding for reflection")
                 return "Failed to store reflection: embedding generation failed"
             
-            # Create unique ID
-            reflection_id = hashlib.md5(f"{content}{datetime.now().isoformat()}".encode()).hexdigest()
+            # SECURITY FIX: Use SHA-256 instead of MD5
+            from .security_patches import SecureHashGenerator
+            reflection_id = SecureHashGenerator.generate_id(f"{content}{datetime.now().isoformat()}")
             
             # Prepare metadata
             metadata = {
@@ -140,17 +141,34 @@ Timestamp: {metadata['timestamp']}"""
         try:
             # Base path for conversations
             base_path = Path.home() / '.claude' / 'projects'
-            
+
+            # SECURITY FIX: Validate paths to prevent traversal
+            from .security_patches import PathValidator
+            if not PathValidator.is_safe_path(base_path):
+                logger.error(f"Unsafe base path detected: {base_path}")
+                return "<conversation_file><error>Security validation failed</error></conversation_file>"
+
             # If project is specified, try to find it in that project
             if project:
                 # Normalize project name for path matching
-                project_normalized = self.normalize_project_name(project)
-                
+                from .security_patches import InputValidator
+                project_normalized = InputValidator.validate_project_name(
+                    self.normalize_project_name(project)
+                )
+
                 # Look for project directories that match
                 for project_dir in base_path.glob('*'):
+                    # Validate each path before accessing
+                    if not PathValidator.is_safe_path(project_dir):
+                        continue
+
                     if project_normalized in project_dir.name.lower():
                         # Look for JSONL files in this project
                         for jsonl_file in project_dir.glob('*.jsonl'):
+                            # Validate file path
+                            if not PathValidator.is_safe_path(jsonl_file):
+                                continue
+
                             # Check if filename matches conversation_id (with or without .jsonl)
                             if conversation_id in jsonl_file.stem or conversation_id == jsonl_file.stem:
                                 await ctx.debug(f"Found conversation by filename in {jsonl_file}")
@@ -163,8 +181,17 @@ Timestamp: {metadata['timestamp']}"""
             
             # If not found in specific project or no project specified, search all
             await ctx.debug("Searching all projects for conversation")
+            from .security_patches import PathValidator
             for project_dir in base_path.glob('*'):
+                # SECURITY FIX: Validate each path before accessing
+                if not PathValidator.is_safe_path(project_dir):
+                    continue
+
                 for jsonl_file in project_dir.glob('*.jsonl'):
+                    # Validate file path
+                    if not PathValidator.is_safe_path(jsonl_file):
+                        continue
+
                     # Check if filename matches conversation_id (with or without .jsonl)
                     if conversation_id in jsonl_file.stem or conversation_id == jsonl_file.stem:
                         await ctx.debug(f"Found conversation by filename in {jsonl_file}")

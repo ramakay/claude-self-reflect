@@ -135,13 +135,15 @@ def get_status() -> dict:
                 # The actual structure has imported_files at the top level
                 imported_files = data.get("imported_files", {})
                 
-                # Count all files in imported_files object (they are all fully imported)
+                # Count all files in imported_files object (only if they still exist on disk)
                 for file_path in imported_files.keys():
                     normalized_path = normalize_file_path(file_path)
                     if normalized_path in file_to_project and normalized_path not in counted_files:
-                        project_name = file_to_project[normalized_path]
-                        project_stats[project_name]["indexed"] += 1
-                        counted_files.add(normalized_path)
+                        # Verify file actually exists before counting it as indexed
+                        if Path(normalized_path).exists():
+                            project_name = file_to_project[normalized_path]
+                            project_stats[project_name]["indexed"] += 1
+                            counted_files.add(normalized_path)
                 
                 # Also check file_metadata for partially imported files
                 file_metadata = data.get("file_metadata", {})
@@ -180,14 +182,17 @@ def get_status() -> dict:
             with open(watcher_state_file, 'r') as f:
                 watcher_data = json.load(f)
                 
-                # Count files imported by the watcher
+                # Count files imported by the watcher (only if they still exist on disk)
                 watcher_imports = watcher_data.get("imported_files", {})
                 for file_path in watcher_imports.keys():
                     normalized_path = normalize_file_path(file_path)
+                    # CRITICAL: Only count if file exists on disk AND is in our project list
                     if normalized_path in file_to_project and normalized_path not in counted_files:
-                        project_name = file_to_project[normalized_path]
-                        project_stats[project_name]["indexed"] += 1
-                        counted_files.add(normalized_path)
+                        # Verify file actually exists before counting it as indexed
+                        if Path(normalized_path).exists():
+                            project_name = file_to_project[normalized_path]
+                            project_stats[project_name]["indexed"] += 1
+                            counted_files.add(normalized_path)
         except (json.JSONDecodeError, KeyError, OSError):
             # If watcher file is corrupted or unreadable, continue
             pass

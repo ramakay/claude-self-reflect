@@ -1,16 +1,19 @@
 {
   "file": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/src/server.py",
-  "timestamp": "2025-09-15T06:39:39.961640",
+  "timestamp": "2025-09-17T21:15:31.484820",
   "language": "python",
   "engine": "ast-grep-py + unified registry",
   "registry_info": {
-    "total_patterns_available": 35,
-    "patterns_matched": 11,
-    "patterns_errored": 1,
+    "total_patterns_available": 39,
+    "patterns_matched": 15,
+    "patterns_errored": 3,
     "categories_found": [
       "python_async",
       "python_logging",
       "python_typing",
+      "python_antipatterns",
+      "python_mcp",
+      "python_runtime_modification",
       "python_catalog"
     ]
   },
@@ -25,27 +28,27 @@
         "count": 5,
         "locations": [
           {
-            "line": 256,
+            "line": 258,
             "column": 0,
             "text": "async def get_import_stats():\n    \"\"\"Current import statistics and progress.\"\"\"\n"
           },
           {
-            "line": 269,
+            "line": 271,
             "column": 0,
             "text": "async def get_collection_list():\n    \"\"\"List of all Qdrant collections with meta"
           },
           {
-            "line": 297,
+            "line": 299,
             "column": 0,
             "text": "async def get_system_health():\n    \"\"\"System health and configuration informatio"
           },
           {
-            "line": 542,
+            "line": 544,
             "column": 0,
             "text": "async def update_indexing_status(cache_ttl: int = 5):\n    \"\"\"Update indexing sta"
           },
           {
-            "line": 773,
+            "line": 787,
             "column": 8,
             "text": "async def print_status():\n            await update_indexing_status()\n           "
           }
@@ -60,17 +63,17 @@
         "count": 3,
         "locations": [
           {
-            "line": 362,
+            "line": 364,
             "column": 4,
             "text": "async with aiofiles.open(path, 'r') as f:\n        content = await f.read()\n     "
           },
           {
-            "line": 369,
+            "line": 371,
             "column": 4,
             "text": "async with aiofiles.open(path, 'r') as f:\n        content = await f.read()\n     "
           },
           {
-            "line": 376,
+            "line": 378,
             "column": 4,
             "text": "async with aiofiles.open(path, 'r') as f:\n        content = await f.read()\n     "
           }
@@ -85,27 +88,27 @@
         "count": 15,
         "locations": [
           {
-            "line": 258,
+            "line": 260,
             "column": 4,
             "text": "await update_indexing_status()"
           },
           {
-            "line": 272,
+            "line": 274,
             "column": 22,
             "text": "await qdrant_client.get_collections()"
           },
           {
-            "line": 277,
+            "line": 279,
             "column": 19,
             "text": "await qdrant_client.get_collection(collection_name=collection.name)"
           },
           {
-            "line": 301,
+            "line": 303,
             "column": 22,
             "text": "await qdrant_client.get_collections()"
           },
           {
-            "line": 363,
+            "line": 365,
             "column": 18,
             "text": "await f.read()"
           }
@@ -122,27 +125,27 @@
         "count": 31,
         "locations": [
           {
-            "line": 145,
+            "line": 147,
             "column": 12,
             "text": "logger.info(f\"Embedding manager initialized: {self.embedding_manager.get_model_i"
           },
           {
-            "line": 156,
+            "line": 158,
             "column": 12,
             "text": "logger.error(f\"Failed to initialize embeddings: {e}\")"
           },
           {
-            "line": 187,
+            "line": 189,
             "column": 0,
             "text": "logger.info(f\"MCP Server starting at {startup_time}\")"
           },
           {
-            "line": 188,
+            "line": 190,
             "column": 0,
             "text": "logger.info(f\"Python: {sys.version}\")"
           },
           {
-            "line": 189,
+            "line": 191,
             "column": 0,
             "text": "logger.info(f\"Working directory: {os.getcwd()}\")"
           }
@@ -159,27 +162,27 @@
         "count": 14,
         "locations": [
           {
-            "line": 345,
+            "line": 347,
             "column": 0,
             "text": "def normalize_path(path_str: str) -> str:\n    \"\"\"Normalize path for consistent c"
           },
           {
-            "line": 360,
+            "line": 362,
             "column": 0,
             "text": "async def read_json_file(path: Path) -> dict:\n    \"\"\"Read JSON file from disk.\"\""
           },
           {
-            "line": 367,
+            "line": 369,
             "column": 0,
             "text": "async def read_watcher_file(path: Path) -> dict:\n    \"\"\"Read watcher JSON file f"
           },
           {
-            "line": 374,
+            "line": 376,
             "column": 0,
             "text": "async def read_cloud_file(path: Path) -> dict:\n    \"\"\"Read cloud watcher JSON fi"
           },
           {
-            "line": 381,
+            "line": 383,
             "column": 0,
             "text": "async def _load_state_files() -> tuple[set[str], dict[str, dict]]:\n    \"\"\"Load a"
           }
@@ -194,27 +197,27 @@
         "count": 7,
         "locations": [
           {
-            "line": 360,
+            "line": 362,
             "column": 0,
             "text": "async def read_json_file(path: Path) -> dict:\n    \"\"\"Read JSON file from disk.\"\""
           },
           {
-            "line": 367,
+            "line": 369,
             "column": 0,
             "text": "async def read_watcher_file(path: Path) -> dict:\n    \"\"\"Read watcher JSON file f"
           },
           {
-            "line": 374,
+            "line": 376,
             "column": 0,
             "text": "async def read_cloud_file(path: Path) -> dict:\n    \"\"\"Read cloud watcher JSON fi"
           },
           {
-            "line": 381,
+            "line": 383,
             "column": 0,
             "text": "async def _load_state_files() -> tuple[set[str], dict[str, dict]]:\n    \"\"\"Load a"
           },
           {
-            "line": 500,
+            "line": 502,
             "column": 0,
             "text": "async def _count_indexed_files() -> tuple[int, int]:\n    \"\"\"Count total JSONL fi"
           }
@@ -229,29 +232,130 @@
         "count": 7,
         "locations": [
           {
-            "line": 210,
+            "line": 212,
             "column": 4,
             "text": "conversation_id: Optional[str] = None"
           },
           {
-            "line": 211,
+            "line": 213,
             "column": 4,
             "text": "base_conversation_id: Optional[str] = None"
           },
           {
-            "line": 213,
+            "line": 215,
             "column": 4,
             "text": "raw_payload: Optional[Dict[str, Any]] = None"
           },
           {
-            "line": 215,
+            "line": 217,
             "column": 4,
             "text": "code_patterns: Optional[Dict[str, List[str]]] = None"
           },
           {
-            "line": 216,
+            "line": 218,
             "column": 4,
             "text": "files_analyzed: Optional[List[str]] = None"
+          }
+        ]
+      }
+    ],
+    "python_antipatterns": [
+      {
+        "category": "python_antipatterns",
+        "id": "sync-voyage-embed",
+        "description": "Blocking Voyage embed in async context",
+        "quality": "bad",
+        "weight": -5,
+        "count": 2,
+        "locations": [
+          {
+            "line": 607,
+            "column": 31,
+            "text": "embedding_state.local_embedding_model.embed([text])"
+          },
+          {
+            "line": 614,
+            "column": 17,
+            "text": "embedding_state.voyage_client.embed(\n            texts=[text],\n            model"
+          }
+        ]
+      },
+      {
+        "category": "python_antipatterns",
+        "id": "invalid-env-var-hyphen",
+        "description": "Environment variable with hyphen (invalid in shells)",
+        "quality": "bad",
+        "weight": -3,
+        "count": 3,
+        "locations": [
+          {
+            "line": 67,
+            "column": 17,
+            "text": "os.getenv('VOYAGE_KEY')"
+          },
+          {
+            "line": 67,
+            "column": 44,
+            "text": "os.getenv('VOYAGE_KEY-2')"
+          },
+          {
+            "line": 67,
+            "column": 73,
+            "text": "os.getenv('VOYAGE_KEY_2')"
+          }
+        ]
+      }
+    ],
+    "python_mcp": [
+      {
+        "category": "python_mcp",
+        "id": "attr-vs-api",
+        "description": "Accessing non-existent attribute instead of API",
+        "quality": "bad",
+        "weight": -3,
+        "count": 1,
+        "locations": [
+          {
+            "line": 315,
+            "column": 26,
+            "text": "embedding_state.embedding_manager.model_name"
+          }
+        ]
+      }
+    ],
+    "python_runtime_modification": [
+      {
+        "category": "python_runtime_modification",
+        "id": "singleton-state-change",
+        "description": "Runtime singleton state modification",
+        "quality": "neutral",
+        "weight": 0,
+        "count": 10,
+        "locations": [
+          {
+            "line": 135,
+            "column": 8,
+            "text": "self.embedding_manager = None"
+          },
+          {
+            "line": 136,
+            "column": 8,
+            "text": "self.voyage_client = None"
+          },
+          {
+            "line": 137,
+            "column": 8,
+            "text": "self.local_embedding_model = None"
+          },
+          {
+            "line": 138,
+            "column": 8,
+            "text": "self._initialized = False"
+          },
+          {
+            "line": 146,
+            "column": 12,
+            "text": "self.embedding_manager = get_embedding_manager()"
           }
         ]
       }
@@ -266,27 +370,27 @@
         "count": 8,
         "locations": [
           {
-            "line": 210,
+            "line": 212,
             "column": 21,
             "text": "Optional[str]"
           },
           {
-            "line": 211,
+            "line": 213,
             "column": 26,
             "text": "Optional[str]"
           },
           {
-            "line": 213,
+            "line": 215,
             "column": 17,
             "text": "Optional[Dict[str, Any]]"
           },
           {
-            "line": 215,
+            "line": 217,
             "column": 19,
             "text": "Optional[Dict[str, List[str]]]"
           },
           {
-            "line": 216,
+            "line": 218,
             "column": 20,
             "text": "Optional[List[str]]"
           }
@@ -298,7 +402,7 @@
         "description": "List comprehensions like `[x for x in range(10)]` are a concise way to create lists in Python. However, we can achieve better memory efficiency by using generator expressions like `(x for x in range(10))` instead. List comprehensions create the entire list in memory, while generator expressions generate each element one at a time. We can make the change by replacing the square brackets with parentheses.",
         "quality": "good",
         "weight": 3,
-        "count": 4394,
+        "count": 4422,
         "locations": [
           {
             "line": 1,
@@ -336,27 +440,27 @@
         "count": 5,
         "locations": [
           {
-            "line": 256,
+            "line": 258,
             "column": 0,
             "text": "async def get_import_stats():\n    \"\"\"Current import statistics and progress.\"\"\"\n"
           },
           {
-            "line": 269,
+            "line": 271,
             "column": 0,
             "text": "async def get_collection_list():\n    \"\"\"List of all Qdrant collections with meta"
           },
           {
-            "line": 297,
+            "line": 299,
             "column": 0,
             "text": "async def get_system_health():\n    \"\"\"System health and configuration informatio"
           },
           {
-            "line": 542,
+            "line": 544,
             "column": 0,
             "text": "async def update_indexing_status(cache_ttl: int = 5):\n    \"\"\"Update indexing sta"
           },
           {
-            "line": 773,
+            "line": 787,
             "column": 8,
             "text": "async def print_status():\n            await update_indexing_status()\n           "
           }
@@ -371,27 +475,27 @@
         "count": 36,
         "locations": [
           {
-            "line": 140,
+            "line": 142,
             "column": 8,
             "text": "if self._initialized:\n            return True"
           },
           {
-            "line": 148,
+            "line": 150,
             "column": 12,
             "text": "if self.embedding_manager.model_type == 'voyage':\n                self.voyage_cl"
           },
           {
-            "line": 228,
+            "line": 230,
             "column": 0,
             "text": "if CONNECTION_POOL_AVAILABLE and ENABLE_PARALLEL_SEARCH:\n    qdrant_pool = Qdran"
           },
           {
-            "line": 250,
+            "line": 252,
             "column": 0,
             "text": "if DECAY_MANAGER_AVAILABLE:\n    decay_manager = DecayManager()\n    logger.info(\""
           },
           {
-            "line": 310,
+            "line": 312,
             "column": 4,
             "text": "if embedding_state.embedding_manager:\n        embedding_info = {\n            \"mo"
           }
@@ -409,27 +513,27 @@
       "count": 5,
       "locations": [
         {
-          "line": 256,
+          "line": 258,
           "column": 0,
           "text": "async def get_import_stats():\n    \"\"\"Current import statistics and progress.\"\"\"\n"
         },
         {
-          "line": 269,
+          "line": 271,
           "column": 0,
           "text": "async def get_collection_list():\n    \"\"\"List of all Qdrant collections with meta"
         },
         {
-          "line": 297,
+          "line": 299,
           "column": 0,
           "text": "async def get_system_health():\n    \"\"\"System health and configuration informatio"
         },
         {
-          "line": 542,
+          "line": 544,
           "column": 0,
           "text": "async def update_indexing_status(cache_ttl: int = 5):\n    \"\"\"Update indexing sta"
         },
         {
-          "line": 773,
+          "line": 787,
           "column": 8,
           "text": "async def print_status():\n            await update_indexing_status()\n           "
         }
@@ -444,17 +548,17 @@
       "count": 3,
       "locations": [
         {
-          "line": 362,
+          "line": 364,
           "column": 4,
           "text": "async with aiofiles.open(path, 'r') as f:\n        content = await f.read()\n     "
         },
         {
-          "line": 369,
+          "line": 371,
           "column": 4,
           "text": "async with aiofiles.open(path, 'r') as f:\n        content = await f.read()\n     "
         },
         {
-          "line": 376,
+          "line": 378,
           "column": 4,
           "text": "async with aiofiles.open(path, 'r') as f:\n        content = await f.read()\n     "
         }
@@ -469,27 +573,27 @@
       "count": 15,
       "locations": [
         {
-          "line": 258,
+          "line": 260,
           "column": 4,
           "text": "await update_indexing_status()"
         },
         {
-          "line": 272,
+          "line": 274,
           "column": 22,
           "text": "await qdrant_client.get_collections()"
         },
         {
-          "line": 277,
+          "line": 279,
           "column": 19,
           "text": "await qdrant_client.get_collection(collection_name=collection.name)"
         },
         {
-          "line": 301,
+          "line": 303,
           "column": 22,
           "text": "await qdrant_client.get_collections()"
         },
         {
-          "line": 363,
+          "line": 365,
           "column": 18,
           "text": "await f.read()"
         }
@@ -504,27 +608,27 @@
       "count": 31,
       "locations": [
         {
-          "line": 145,
+          "line": 147,
           "column": 12,
           "text": "logger.info(f\"Embedding manager initialized: {self.embedding_manager.get_model_i"
         },
         {
-          "line": 156,
+          "line": 158,
           "column": 12,
           "text": "logger.error(f\"Failed to initialize embeddings: {e}\")"
         },
         {
-          "line": 187,
+          "line": 189,
           "column": 0,
           "text": "logger.info(f\"MCP Server starting at {startup_time}\")"
         },
         {
-          "line": 188,
+          "line": 190,
           "column": 0,
           "text": "logger.info(f\"Python: {sys.version}\")"
         },
         {
-          "line": 189,
+          "line": 191,
           "column": 0,
           "text": "logger.info(f\"Working directory: {os.getcwd()}\")"
         }
@@ -539,27 +643,27 @@
       "count": 14,
       "locations": [
         {
-          "line": 345,
+          "line": 347,
           "column": 0,
           "text": "def normalize_path(path_str: str) -> str:\n    \"\"\"Normalize path for consistent c"
         },
         {
-          "line": 360,
+          "line": 362,
           "column": 0,
           "text": "async def read_json_file(path: Path) -> dict:\n    \"\"\"Read JSON file from disk.\"\""
         },
         {
-          "line": 367,
+          "line": 369,
           "column": 0,
           "text": "async def read_watcher_file(path: Path) -> dict:\n    \"\"\"Read watcher JSON file f"
         },
         {
-          "line": 374,
+          "line": 376,
           "column": 0,
           "text": "async def read_cloud_file(path: Path) -> dict:\n    \"\"\"Read cloud watcher JSON fi"
         },
         {
-          "line": 381,
+          "line": 383,
           "column": 0,
           "text": "async def _load_state_files() -> tuple[set[str], dict[str, dict]]:\n    \"\"\"Load a"
         }
@@ -574,27 +678,27 @@
       "count": 7,
       "locations": [
         {
-          "line": 360,
+          "line": 362,
           "column": 0,
           "text": "async def read_json_file(path: Path) -> dict:\n    \"\"\"Read JSON file from disk.\"\""
         },
         {
-          "line": 367,
+          "line": 369,
           "column": 0,
           "text": "async def read_watcher_file(path: Path) -> dict:\n    \"\"\"Read watcher JSON file f"
         },
         {
-          "line": 374,
+          "line": 376,
           "column": 0,
           "text": "async def read_cloud_file(path: Path) -> dict:\n    \"\"\"Read cloud watcher JSON fi"
         },
         {
-          "line": 381,
+          "line": 383,
           "column": 0,
           "text": "async def _load_state_files() -> tuple[set[str], dict[str, dict]]:\n    \"\"\"Load a"
         },
         {
-          "line": 500,
+          "line": 502,
           "column": 0,
           "text": "async def _count_indexed_files() -> tuple[int, int]:\n    \"\"\"Count total JSONL fi"
         }
@@ -609,29 +713,124 @@
       "count": 7,
       "locations": [
         {
-          "line": 210,
+          "line": 212,
           "column": 4,
           "text": "conversation_id: Optional[str] = None"
         },
         {
-          "line": 211,
+          "line": 213,
           "column": 4,
           "text": "base_conversation_id: Optional[str] = None"
         },
         {
-          "line": 213,
+          "line": 215,
           "column": 4,
           "text": "raw_payload: Optional[Dict[str, Any]] = None"
         },
         {
-          "line": 215,
+          "line": 217,
           "column": 4,
           "text": "code_patterns: Optional[Dict[str, List[str]]] = None"
         },
         {
-          "line": 216,
+          "line": 218,
           "column": 4,
           "text": "files_analyzed: Optional[List[str]] = None"
+        }
+      ]
+    },
+    {
+      "category": "python_antipatterns",
+      "id": "sync-voyage-embed",
+      "description": "Blocking Voyage embed in async context",
+      "quality": "bad",
+      "weight": -5,
+      "count": 2,
+      "locations": [
+        {
+          "line": 607,
+          "column": 31,
+          "text": "embedding_state.local_embedding_model.embed([text])"
+        },
+        {
+          "line": 614,
+          "column": 17,
+          "text": "embedding_state.voyage_client.embed(\n            texts=[text],\n            model"
+        }
+      ]
+    },
+    {
+      "category": "python_antipatterns",
+      "id": "invalid-env-var-hyphen",
+      "description": "Environment variable with hyphen (invalid in shells)",
+      "quality": "bad",
+      "weight": -3,
+      "count": 3,
+      "locations": [
+        {
+          "line": 67,
+          "column": 17,
+          "text": "os.getenv('VOYAGE_KEY')"
+        },
+        {
+          "line": 67,
+          "column": 44,
+          "text": "os.getenv('VOYAGE_KEY-2')"
+        },
+        {
+          "line": 67,
+          "column": 73,
+          "text": "os.getenv('VOYAGE_KEY_2')"
+        }
+      ]
+    },
+    {
+      "category": "python_mcp",
+      "id": "attr-vs-api",
+      "description": "Accessing non-existent attribute instead of API",
+      "quality": "bad",
+      "weight": -3,
+      "count": 1,
+      "locations": [
+        {
+          "line": 315,
+          "column": 26,
+          "text": "embedding_state.embedding_manager.model_name"
+        }
+      ]
+    },
+    {
+      "category": "python_runtime_modification",
+      "id": "singleton-state-change",
+      "description": "Runtime singleton state modification",
+      "quality": "neutral",
+      "weight": 0,
+      "count": 10,
+      "locations": [
+        {
+          "line": 135,
+          "column": 8,
+          "text": "self.embedding_manager = None"
+        },
+        {
+          "line": 136,
+          "column": 8,
+          "text": "self.voyage_client = None"
+        },
+        {
+          "line": 137,
+          "column": 8,
+          "text": "self.local_embedding_model = None"
+        },
+        {
+          "line": 138,
+          "column": 8,
+          "text": "self._initialized = False"
+        },
+        {
+          "line": 146,
+          "column": 12,
+          "text": "self.embedding_manager = get_embedding_manager()"
         }
       ]
     },
@@ -644,27 +843,27 @@
       "count": 8,
       "locations": [
         {
-          "line": 210,
+          "line": 212,
           "column": 21,
           "text": "Optional[str]"
         },
         {
-          "line": 211,
+          "line": 213,
           "column": 26,
           "text": "Optional[str]"
         },
         {
-          "line": 213,
+          "line": 215,
           "column": 17,
           "text": "Optional[Dict[str, Any]]"
         },
         {
-          "line": 215,
+          "line": 217,
           "column": 19,
           "text": "Optional[Dict[str, List[str]]]"
         },
         {
-          "line": 216,
+          "line": 218,
           "column": 20,
           "text": "Optional[List[str]]"
         }
@@ -676,7 +875,7 @@
       "description": "List comprehensions like `[x for x in range(10)]` are a concise way to create lists in Python. However, we can achieve better memory efficiency by using generator expressions like `(x for x in range(10))` instead. List comprehensions create the entire list in memory, while generator expressions generate each element one at a time. We can make the change by replacing the square brackets with parentheses.",
       "quality": "good",
       "weight": 3,
-      "count": 4394,
+      "count": 4422,
       "locations": [
         {
           "line": 1,
@@ -714,27 +913,27 @@
       "count": 5,
       "locations": [
         {
-          "line": 256,
+          "line": 258,
           "column": 0,
           "text": "async def get_import_stats():\n    \"\"\"Current import statistics and progress.\"\"\"\n"
         },
         {
-          "line": 269,
+          "line": 271,
           "column": 0,
           "text": "async def get_collection_list():\n    \"\"\"List of all Qdrant collections with meta"
         },
         {
-          "line": 297,
+          "line": 299,
           "column": 0,
           "text": "async def get_system_health():\n    \"\"\"System health and configuration informatio"
         },
         {
-          "line": 542,
+          "line": 544,
           "column": 0,
           "text": "async def update_indexing_status(cache_ttl: int = 5):\n    \"\"\"Update indexing sta"
         },
         {
-          "line": 773,
+          "line": 787,
           "column": 8,
           "text": "async def print_status():\n            await update_indexing_status()\n           "
         }
@@ -749,27 +948,27 @@
       "count": 36,
       "locations": [
         {
-          "line": 140,
+          "line": 142,
           "column": 8,
           "text": "if self._initialized:\n            return True"
         },
         {
-          "line": 148,
+          "line": 150,
           "column": 12,
           "text": "if self.embedding_manager.model_type == 'voyage':\n                self.voyage_cl"
         },
         {
-          "line": 228,
+          "line": 230,
           "column": 0,
           "text": "if CONNECTION_POOL_AVAILABLE and ENABLE_PARALLEL_SEARCH:\n    qdrant_pool = Qdran"
         },
         {
-          "line": 250,
+          "line": 252,
           "column": 0,
           "text": "if DECAY_MANAGER_AVAILABLE:\n    decay_manager = DecayManager()\n    logger.info(\""
         },
         {
-          "line": 310,
+          "line": 312,
           "column": 4,
           "text": "if embedding_state.embedding_manager:\n        embedding_info = {\n            \"mo"
         }
@@ -781,17 +980,28 @@
       "pattern_id": "specific-except",
       "category": "python_error_handling",
       "error": "cannot get matcher\n\nCaused by:\n    0: `rule` is not configured correctly.\n    1: Rule contains invalid pattern matcher.\n    2: Multiple AST nodes are detected. Please check the pattern source `except "
+    },
+    {
+      "pattern_id": "missing-embedding-guard",
+      "category": "python_mcp",
+      "error": "cannot get matcher\n\nCaused by:\n    0: `rule` is not configured correctly.\n    1: Rule contains invalid pattern matcher.\n    2: Multiple AST nodes are detected. Please check the pattern source `query_e"
+    },
+    {
+      "pattern_id": "duplicate-import",
+      "category": "python_mcp",
+      "error": "cannot get matcher\n\nCaused by:\n    0: `rule` is not configured correctly.\n    1: Rule contains invalid pattern matcher.\n    2: Multiple AST nodes are detected. Please check the pattern source `import "
     }
   ],
   "quality_metrics": {
-    "quality_score": 1.0,
-    "good_patterns_found": 4510,
-    "bad_patterns_found": 0,
-    "unique_patterns_matched": 11,
-    "total_issues": 0,
-    "total_good_practices": 4510
+    "quality_score": 0.58,
+    "good_patterns_found": 4538,
+    "bad_patterns_found": 6,
+    "unique_patterns_matched": 15,
+    "total_issues": 6,
+    "total_good_practices": 4538
   },
   "recommendations": [
-    "\ud83d\udfe2 Good: Code follows most best practices"
+    "\ud83d\udfe1 Warning: Several anti-patterns detected",
+    "Fix 5 anti-patterns in python_antipatterns"
   ]
 }
