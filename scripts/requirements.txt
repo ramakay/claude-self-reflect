@@ -4,6 +4,6 @@ backoff==2.2.1
 tqdm==4.67.1
 humanize==4.13.0
 fastembed==0.7.3
-voyageai==0.3.4
+voyageai==0.3.5
 tenacity==9.1.2
 psutil==7.0.0
