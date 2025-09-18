@@ -102,7 +102,8 @@ class SearchTools:
                 collection_name=collection_name,
                 query_vector=query_embedding,
                 limit=limit,
-                score_threshold=min_score
+                score_threshold=min_score,
+                with_payload=True  # Explicitly request payloads from Qdrant
             )
 
             # CRITICAL FIX: Handle None search results (cloud mode issue)

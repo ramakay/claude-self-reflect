@@ -33,12 +33,12 @@
   - Cloud mode: `csr_project_cloud_1024d` (1024 dimensions)
 - **Action**: Run `python scripts/migrate-collections.py`
 
-### Migration Checklist
+### Migration Checklist (v4.x → v5.0 with Unified State)
 - [ ] Backup Qdrant data: `python scripts/backup-qdrant.py`
 - [ ] Run ID migration: `python scripts/migrate-ids.py`
 - [ ] Update collection names: `python scripts/migrate-collections.py`
 - [ ] Add authentication: `python scripts/migrate-auth.py`
-- [ ] Update import tracking: `python scripts/migrate-imports.py`
+- [ ] Migrate to unified state: `python scripts/migrate-unified-state.py --dry-run` then without flag
 - [ ] Test search functionality
 - [ ] Verify all agents working
 
