@@ -83,9 +83,14 @@ async def search_single_collection(
                 with_payload=True
             )
 
+            # CRITICAL FIX: Handle None search results (cloud mode issue)
+            if search_results is None:
+                logger.warning(f"Search returned None for collection {collection_name}")
+                search_results = []
+
             # Debug: Log search results
             logger.debug(f"Search of {collection_name} returned {len(search_results)} results")
-            
+
             if should_use_decay and not USE_NATIVE_DECAY:
                 # Apply client-side decay
                 await ctx.debug(f"Using CLIENT-SIDE decay for {collection_name}")

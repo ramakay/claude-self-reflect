@@ -104,7 +104,12 @@ class SearchTools:
                 limit=limit,
                 score_threshold=min_score
             )
-            
+
+            # CRITICAL FIX: Handle None search results (cloud mode issue)
+            if search_results is None:
+                logger.warning(f"Search returned None for collection {collection_name}")
+                search_results = []
+
             # Convert results to dict format
             results = []
             for result in search_results:

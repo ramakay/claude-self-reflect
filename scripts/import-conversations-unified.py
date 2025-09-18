@@ -15,7 +15,7 @@ import fcntl
 import time
 import argparse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Set
 import logging
 
@@ -33,6 +33,9 @@ except ImportError:
 # Add the scripts directory to the Python path for utils import
 scripts_dir = Path(__file__).parent
 sys.path.insert(0, str(scripts_dir))
+
+# Import UnifiedStateManager
+from unified_state_manager import UnifiedStateManager
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, Distance, VectorParams
@@ -72,32 +75,15 @@ MAX_FILES_EDITED = 20
 MAX_TOOLS_USED = 15
 MAX_CONCEPT_MESSAGES = 50
 
-# Robust cross-platform state file resolution
-def get_default_state_file():
-    """Determine the default state file location with cross-platform support."""
-    from pathlib import Path
-    
-    # Check if we're in Docker (more reliable than just checking /config)
-    docker_indicators = [
-        Path("/.dockerenv").exists(),  # Docker creates this file
-        os.path.exists("/config") and os.access("/config", os.W_OK)  # Mounted config dir with write access
-    ]
-    
-    if any(docker_indicators):
-        return "/config/imported-files.json"
-    
-    # Use pathlib for cross-platform home directory path
-    home_state = Path.home() / ".claude-self-reflect" / "config" / "imported-files.json"
-    return str(home_state)
-
-# Get state file path with env override support
+# Initialize UnifiedStateManager
+# Support legacy STATE_FILE environment variable
 env_state = os.getenv("STATE_FILE")
 if env_state:
-    # Normalize any user-provided path to absolute
     from pathlib import Path
-    STATE_FILE = str(Path(env_state).expanduser().resolve())
+    state_file_path = Path(env_state).expanduser().resolve()
+    state_manager = UnifiedStateManager(state_file_path)
 else:
-    STATE_FILE = get_default_state_file()
+    state_manager = UnifiedStateManager()  # Uses default location
 PREFER_LOCAL_EMBEDDINGS = os.getenv("PREFER_LOCAL_EMBEDDINGS", "true").lower() == "true"
 VOYAGE_API_KEY = os.getenv("VOYAGE_KEY")
 MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", "50"))  # Messages per chunk
@@ -686,17 +672,12 @@ def stream_import_file(jsonl_file: Path, collection_name: str, project_path: Pat
 
     except Exception as e:
         logger.error(f"Failed to import {jsonl_file}: {e}")
+        # Mark file as failed in state manager
+        try:
+            state_manager.mark_file_failed(str(jsonl_file), str(e))
+        except Exception as state_error:
+            logger.warning(f"Could not mark file as failed in state: {state_error}")
         return 0
-
-def _locked_open(path, mode):
-    """Open file with exclusive lock for concurrent safety."""
-    f = open(path, mode)
-    try:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-    except Exception:
-        f.close()
-        raise
-    return f
 
 def _with_retries(fn, attempts=3, base_sleep=0.5):
     """Execute function with retries and exponential backoff."""
@@ -709,66 +690,78 @@ def _with_retries(fn, attempts=3, base_sleep=0.5):
             time.sleep(base_sleep * (2 ** i))
             logger.debug(f"Retrying after error: {e}")
 
-def load_state() -> dict:
-    """Load import state with file locking."""
-    if os.path.exists(STATE_FILE):
-        try:
-            with _locked_open(STATE_FILE, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.warning(f"Failed to load state: {e}")
-    return {"imported_files": {}}
+def should_import_file(file_path: Path) -> bool:
+    """Check if file should be imported using UnifiedStateManager."""
+    try:
+        # Get imported files from state manager
+        imported_files = state_manager.get_imported_files()
 
-def save_state(state: dict):
-    """Save import state with atomic write."""
-    # Fix: Handle case where STATE_FILE has no directory component
-    state_dir = os.path.dirname(STATE_FILE)
-    if state_dir:
-        os.makedirs(state_dir, exist_ok=True)
-    
-    # Use atomic write with locking to prevent corruption
-    temp_file = f"{STATE_FILE}.tmp"
-    with _locked_open(temp_file, 'w') as f:
-        json.dump(state, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    
-    # Atomic rename (on POSIX systems)
-    os.replace(temp_file, STATE_FILE)
+        # Normalize the file path for comparison
+        normalized_path = state_manager.normalize_path(str(file_path))
 
-def should_import_file(file_path: Path, state: dict) -> bool:
-    """Check if file should be imported."""
-    file_str = str(file_path)
-    if file_str in state.get("imported_files", {}):
-        file_info = state["imported_files"][file_str]
-        last_modified = file_path.stat().st_mtime
-        
-        # Check if file has been modified
-        if file_info.get("last_modified") != last_modified:
-            logger.info(f"File modified, will re-import: {file_path.name}")
-            return True
-            
-        # Check for suspiciously low chunk counts (likely failed imports)
-        chunks = file_info.get("chunks", 0)
-        file_size_kb = file_path.stat().st_size / 1024
-        
-        # Heuristic: Files > 10KB should have more than 2 chunks
-        if file_size_kb > 10 and chunks <= 2:
-            logger.warning(f"File has suspiciously low chunks ({chunks}) for size {file_size_kb:.1f}KB, will re-import: {file_path.name}")
-            return True
-            
-        logger.info(f"Skipping unchanged file: {file_path.name}")
-        return False
-    return True
+        if normalized_path in imported_files:
+            file_info = imported_files[normalized_path]
 
-def update_file_state(file_path: Path, state: dict, chunks: int):
-    """Update state for imported file."""
-    file_str = str(file_path)
-    state["imported_files"][file_str] = {
-        "imported_at": datetime.now().isoformat(),
-        "last_modified": file_path.stat().st_mtime,
-        "chunks": chunks
-    }
+            # Skip if file failed and we haven't reached retry limit
+            if file_info.get("status") == "failed" and file_info.get("retry_count", 0) >= 3:
+                logger.info(f"Skipping failed file (max retries reached): {file_path.name}")
+                return False
+
+            # Get file modification time for comparison
+            last_modified = file_path.stat().st_mtime
+            stored_modified = file_info.get("last_modified")
+
+            # Check if file has been modified (convert stored timestamp to float if needed)
+            if stored_modified:
+                try:
+                    # Parse ISO timestamp to float for comparison
+                    stored_time = datetime.fromisoformat(stored_modified.replace("Z", "+00:00")).timestamp()
+                    if abs(last_modified - stored_time) > 1:  # Allow 1 second tolerance
+                        logger.info(f"File modified, will re-import: {file_path.name}")
+                        return True
+                except (ValueError, TypeError):
+                    # If we can't parse the stored time, re-import to be safe
+                    logger.warning(f"Could not parse stored modification time, will re-import: {file_path.name}")
+                    return True
+
+            # Check for suspiciously low chunk counts (likely failed imports)
+            chunks = file_info.get("chunks", 0)
+            file_size_kb = file_path.stat().st_size / 1024
+
+            # Heuristic: Files > 10KB should have more than 2 chunks
+            if file_size_kb > 10 and chunks <= 2 and file_info.get("status") != "failed":
+                logger.warning(f"File has suspiciously low chunks ({chunks}) for size {file_size_kb:.1f}KB, will re-import: {file_path.name}")
+                return True
+
+            # Skip if successfully imported
+            if file_info.get("status") == "completed":
+                logger.info(f"Skipping successfully imported file: {file_path.name}")
+                return False
+
+        return True
+
+    except Exception as e:
+        logger.warning(f"Error checking import status for {file_path}: {e}")
+        return True  # Default to importing if we can't check status
+
+def update_file_state(file_path: Path, chunks: int, collection_name: str):
+    """Update state for imported file using UnifiedStateManager."""
+    try:
+        # Determine embedding mode from collection suffix
+        embedding_mode = "local" if collection_suffix == "local" else "cloud"
+
+        # Add file to state manager
+        state_manager.add_imported_file(
+            file_path=str(file_path),
+            chunks=chunks,
+            importer="streaming",
+            collection=collection_name,
+            embedding_mode=embedding_mode,
+            status="completed"
+        )
+        logger.debug(f"Updated state for {file_path.name}: {chunks} chunks")
+    except Exception as e:
+        logger.error(f"Failed to update state for {file_path}: {e}")
 
 def main():
     """Main import function."""
@@ -798,9 +791,9 @@ def main():
         collection_suffix = "voyage"
         logger.info("Switched to Voyage AI embeddings (dimension: 1024)")
     
-    # Load state
-    state = load_state()
-    logger.info(f"Loaded state with {len(state.get('imported_files', {}))} previously imported files")
+    # Get status from state manager
+    status = state_manager.get_status()
+    logger.info(f"Loaded state with {status['indexed_files']} previously imported files")
     
     # Find all projects
     # Use LOGS_DIR env var, or fall back to Claude projects directory, then /logs for Docker
@@ -848,7 +841,7 @@ def main():
                 logger.info(f"Reached limit of {args.limit} files, stopping import")
                 break
                 
-            if should_import_file(jsonl_file, state):
+            if should_import_file(jsonl_file):
                 chunks = stream_import_file(jsonl_file, collection_name, project_dir)
                 files_processed += 1
                 if chunks > 0:
@@ -868,8 +861,7 @@ def main():
                         
                         if actual_count > 0:
                             logger.info(f"Verified {actual_count} points in Qdrant for {conversation_id}")
-                            update_file_state(jsonl_file, state, chunks)
-                            save_state(state)
+                            update_file_state(jsonl_file, chunks, collection_name)
                             total_imported += 1
                         else:
                             logger.error(f"No points found in Qdrant for {conversation_id} despite {chunks} chunks processed - not marking as imported")
@@ -883,6 +875,11 @@ def main():
                     # Critical fix: Don't mark files with 0 chunks as imported
                     # This allows retry on next run
                     logger.warning(f"File produced 0 chunks, not marking as imported: {jsonl_file.name}")
+                    # Mark as failed so we don't keep retrying indefinitely
+                    try:
+                        state_manager.mark_file_failed(str(jsonl_file), "File produced 0 chunks during import")
+                    except Exception as state_error:
+                        logger.warning(f"Could not mark file as failed in state: {state_error}")
     
     logger.info(f"Import complete: processed {total_imported} files")
 

@@ -35,10 +35,11 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from fastembed import TextEmbedding
 import psutil
 
-# Import normalize_project_name
+# Import normalize_project_name and UnifiedStateManager
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from utils import normalize_project_name
+from unified_state_manager import UnifiedStateManager
 
 # Configure logging
 logging.basicConfig(
@@ -52,25 +53,13 @@ logger = logging.getLogger(__name__)
 class Config:
     """Production configuration with proper defaults."""
     qdrant_url: str = field(default_factory=lambda: os.getenv("QDRANT_URL", "http://localhost:6333"))
+    qdrant_api_key: Optional[str] = field(default_factory=lambda: os.getenv("QDRANT_API_KEY"))
+    require_tls_for_remote: bool = field(default_factory=lambda: os.getenv("QDRANT_REQUIRE_TLS_FOR_REMOTE", "true").lower() == "true")
     voyage_api_key: Optional[str] = field(default_factory=lambda: os.getenv("VOYAGE_API_KEY"))
     prefer_local_embeddings: bool = field(default_factory=lambda: os.getenv("PREFER_LOCAL_EMBEDDINGS", "true").lower() == "true")
     embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"))
     
     logs_dir: Path = field(default_factory=lambda: Path(os.getenv("LOGS_DIR", "~/.claude/projects")).expanduser())
-    
-    # Production state file with proper naming
-    state_file: Path = field(default_factory=lambda: (
-        # Docker/cloud mode: use /config volume
-        Path("/config/csr-watcher.json") if os.path.exists("/.dockerenv") 
-        # Local mode with cloud flag: separate state file
-        else Path("~/.claude-self-reflect/config/csr-watcher-cloud.json").expanduser() 
-        if os.getenv("PREFER_LOCAL_EMBEDDINGS", "true").lower() == "false" and os.getenv("VOYAGE_API_KEY")
-        # Default local mode
-        else Path("~/.claude-self-reflect/config/csr-watcher.json").expanduser()
-        if os.getenv("STATE_FILE") is None
-        # User override
-        else Path(os.getenv("STATE_FILE")).expanduser()
-    ))
     
     collection_prefix: str = "conv"
     vector_size: int = 384  # FastEmbed all-MiniLM-L6-v2
@@ -496,7 +485,7 @@ class QdrantService:
         # Initialize with API key if provided
         self.client = AsyncQdrantClient(
             url=config.qdrant_url,
-            api_key=config.qdrant_api_key if hasattr(config, 'qdrant_api_key') else None
+            api_key=config.qdrant_api_key
         )
         self.embedding_provider = embedding_provider
         self._collection_cache: Dict[str, float] = {}
@@ -797,7 +786,7 @@ class StreamingWatcher:
     
     def __init__(self, config: Config):
         self.config = config
-        self.state: Dict[str, Any] = {}
+        self.state_manager = UnifiedStateManager()
         self.embedding_provider = self._create_embedding_provider()
         self.qdrant_service = QdrantService(config, self.embedding_provider)
         self.chunker = TokenAwareChunker()
@@ -805,23 +794,23 @@ class StreamingWatcher:
         self.memory_monitor = MemoryMonitor(config.memory_limit_mb, config.memory_warning_mb)
         self.queue_manager = QueueManager(config.max_queue_size, config.max_backlog_hours)
         self.progress = IndexingProgress(config.logs_dir)
-        
+
         self.stats = {
             "files_processed": 0,
             "chunks_processed": 0,
             "failures": 0,
             "start_time": time.time()
         }
-        
+
         # Track file wait times for starvation prevention
         self.file_first_seen: Dict[str, float] = {}
         self.current_project: Optional[str] = self._detect_current_project()
         self.last_mode: Optional[str] = None  # Track mode changes for logging
-        
+
         self.shutdown_event = asyncio.Event()
-        
+
         logger.info(f"Streaming Watcher v3.0.0 with HOT/WARM/COLD prioritization")
-        logger.info(f"State file: {self.config.state_file}")
+        logger.info(f"State file: {self.state_manager.state_file}")
         logger.info(f"Memory limits: {config.memory_warning_mb}MB warning, {config.memory_limit_mb}MB limit")
         logger.info(f"HOT window: {config.hot_window_minutes} min, WARM window: {config.warm_window_hours} hrs")
     
@@ -901,75 +890,19 @@ class StreamingWatcher:
             )
     
     async def load_state(self) -> None:
-        """Load persisted state with migration support."""
-        if self.config.state_file.exists():
-            try:
-                with open(self.config.state_file, 'r') as f:
-                    self.state = json.load(f)
-                
-                # Migrate old state format if needed
-                if "imported_files" in self.state:
-                    imported_count = len(self.state["imported_files"])
-                    logger.info(f"Loaded state with {imported_count} files")
-                    
-                    # Ensure all entries have full paths as keys
-                    migrated = {}
-                    for key, value in self.state["imported_files"].items():
-                        # Ensure key is a full path
-                        if not key.startswith('/'):
-                            # Try to reconstruct full path
-                            possible_path = self.config.logs_dir / key
-                            if possible_path.exists():
-                                migrated[str(possible_path)] = value
-                            else:
-                                migrated[key] = value  # Keep as is
-                        else:
-                            migrated[key] = value
-                    
-                    if len(migrated) != len(self.state["imported_files"]):
-                        logger.info(f"Migrated state format: {len(self.state['imported_files'])} -> {len(migrated)} entries")
-                        self.state["imported_files"] = migrated
-                        
-            except Exception as e:
-                logger.error(f"Error loading state: {e}")
-                self.state = {}
-        
-        if "imported_files" not in self.state:
-            self.state["imported_files"] = {}
-        if "high_water_mark" not in self.state:
-            self.state["high_water_mark"] = 0
-        
-        # Update progress tracker
-        self.progress.update(len(self.state["imported_files"]))
-    
-    async def save_state(self) -> None:
-        """Save state atomically."""
+        """Load persisted state using UnifiedStateManager."""
         try:
-            self.config.state_file.parent.mkdir(parents=True, exist_ok=True)
-            temp_file = self.config.state_file.with_suffix('.tmp')
-            
-            with open(temp_file, 'w') as f:
-                json.dump(self.state, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            
-            if platform.system() == 'Windows':
-                if self.config.state_file.exists():
-                    self.config.state_file.unlink()
-                temp_file.rename(self.config.state_file)
-            else:
-                os.replace(temp_file, self.config.state_file)
-            
-            # Directory fsync for stronger guarantees
-            try:
-                dir_fd = os.open(str(self.config.state_file.parent), os.O_DIRECTORY)
-                os.fsync(dir_fd)
-                os.close(dir_fd)
-            except:
-                pass
-                
+            status = self.state_manager.get_status()
+            imported_count = status["indexed_files"]
+            logger.info(f"Loaded state with {imported_count} files")
+
+            # Update progress tracker
+            self.progress.update(imported_count)
         except Exception as e:
-            logger.error(f"Error saving state: {e}")
+            logger.error(f"Error loading state: {e}")
+            # Initialize progress with 0
+            self.progress.update(0)
+    
     
     def get_collection_name(self, project_path: str) -> str:
         """Get collection name for project."""
@@ -1092,15 +1025,15 @@ class StreamingWatcher:
                             continue
             
             if not all_messages:
-                logger.warning(f"No messages in {file_path}, marking as processed")
-                # Mark file as processed with 0 chunks
-                self.state["imported_files"][str(file_path)] = {
-                    "imported_at": datetime.now().isoformat(),
-                    "_parsed_time": datetime.now().timestamp(),
-                    "chunks": 0,
-                    "collection": collection_name,
-                    "empty_file": True
-                }
+                logger.warning(f"No messages in {file_path}, marking as failed")
+                # Mark as failed to enable retry and correct progress
+                try:
+                    self.state_manager.mark_file_failed(
+                        str(file_path),
+                        "No messages found in conversation (0 chunks)"
+                    )
+                except Exception as e:
+                    logger.exception("Failed to update state for %s", file_path)
                 self.stats["files_processed"] += 1
                 return True
             
@@ -1181,15 +1114,15 @@ class StreamingWatcher:
 
             combined_text = "\n\n".join(text_parts)
             if not combined_text.strip():
-                logger.warning(f"No textual content in {file_path}, marking as processed")
-                # Mark file as processed with 0 chunks (has messages but no extractable text)
-                self.state["imported_files"][str(file_path)] = {
-                    "imported_at": datetime.now().isoformat(),
-                    "_parsed_time": datetime.now().timestamp(),
-                    "chunks": 0,
-                    "collection": collection_name,
-                    "no_text_content": True
-                }
+                logger.warning(f"No textual content in {file_path}, marking as failed")
+                # Mark as failed to enable retry and correct progress
+                try:
+                    self.state_manager.mark_file_failed(
+                        str(file_path),
+                        "No textual content in conversation (0 chunks)"
+                    )
+                except Exception as e:
+                    logger.exception("Failed to update state for %s", file_path)
                 self.stats["files_processed"] += 1
                 return True
 
@@ -1280,23 +1213,34 @@ class StreamingWatcher:
                     if should_cleanup:
                         await self.memory_monitor.cleanup()
             
-            # Update state - use full path as key
-            self.state["imported_files"][str(file_path)] = {
-                "imported_at": datetime.now().isoformat(),
-                "_parsed_time": datetime.now().timestamp(),
-                "chunks": chunks_processed,
-                "collection": collection_name
-            }
-            
+            # Update state using UnifiedStateManager
+            try:
+                self.state_manager.add_imported_file(
+                    file_path=str(file_path),
+                    chunks=chunks_processed,
+                    importer="streaming",
+                    collection=collection_name,
+                    embedding_mode="local" if self.config.prefer_local_embeddings else "cloud",
+                    status="completed"
+                )
+            except Exception as e:
+                logger.error(f"Failed to update state for {file_path}: {e}")
+                return False
+
             self.stats["files_processed"] += 1
             self.stats["chunks_processed"] += chunks_processed
-            
+
             logger.info(f"Completed: {file_path.name} ({chunks_processed} chunks)")
             return True
             
         except Exception as e:
             logger.error(f"Error processing {file_path}: {e}")
             self.stats["failures"] += 1
+            # Mark file as failed using UnifiedStateManager
+            try:
+                self.state_manager.mark_file_failed(str(file_path), str(e))
+            except Exception as mark_error:
+                logger.error(f"Failed to mark file as failed: {mark_error}")
             return False
     
     async def find_new_files(self) -> List[Tuple[Path, FreshnessLevel, int]]:
@@ -1304,46 +1248,50 @@ class StreamingWatcher:
         if not self.config.logs_dir.exists():
             logger.warning(f"Logs dir not found: {self.config.logs_dir}")
             return []
-        
+
         categorized_files = []
-        high_water_mark = self.state.get("high_water_mark", 0)
-        new_high_water = high_water_mark
         now = time.time()
-        
+
+        # Get imported files from UnifiedStateManager
+        try:
+            imported_files = self.state_manager.get_imported_files()
+        except Exception as e:
+            logger.error(f"Error getting imported files: {e}")
+            imported_files = {}
+
         try:
             for project_dir in self.config.logs_dir.iterdir():
                 if not project_dir.is_dir():
                     continue
-                
+
                 try:
                     for jsonl_file in project_dir.glob("*.jsonl"):
                         file_mtime = jsonl_file.stat().st_mtime
-                        new_high_water = max(new_high_water, file_mtime)
-                        
-                        # Check if already processed (using full path)
-                        file_key = str(jsonl_file)
-                        if file_key in self.state["imported_files"]:
-                            stored = self.state["imported_files"][file_key]
-                            if "_parsed_time" in stored:
-                                if file_mtime <= stored["_parsed_time"]:
-                                    continue
-                            elif "imported_at" in stored:
-                                import_time = datetime.fromisoformat(stored["imported_at"]).timestamp()
-                                stored["_parsed_time"] = import_time
-                                if file_mtime <= import_time:
-                                    continue
-                        
+
+                        # Check if already processed (using normalized path)
+                        try:
+                            normalized_path = self.state_manager.normalize_path(str(jsonl_file))
+                            if normalized_path in imported_files:
+                                stored = imported_files[normalized_path]
+                                # Check if file was modified after import
+                                import_time_str = stored.get("imported_at")
+                                if import_time_str:
+                                    import_time = datetime.fromisoformat(import_time_str.replace("Z", "+00:00")).timestamp()
+                                    if file_mtime <= import_time:
+                                        continue
+                        except Exception as e:
+                            logger.debug(f"Error checking import status for {jsonl_file}: {e}")
+                            # If we can't check, assume not imported
+
                         # Categorize file freshness (handles first_seen tracking internally)
                         freshness_level, priority_score = self.categorize_freshness(jsonl_file)
-                        
+
                         categorized_files.append((jsonl_file, freshness_level, priority_score))
                 except Exception as e:
                     logger.error(f"Error scanning project dir {project_dir}: {e}")
-                    
+
         except Exception as e:
             logger.error(f"Error scanning logs dir: {e}")
-        
-        self.state["high_water_mark"] = new_high_water
         
         # Sort by priority score (lower = higher priority)
         categorized_files.sort(key=lambda x: x[2])
@@ -1370,7 +1318,7 @@ class StreamingWatcher:
         logger.info("=" * 60)
         logger.info("Claude Self-Reflect Streaming Watcher v3.0.0")
         logger.info("=" * 60)
-        logger.info(f"State file: {self.config.state_file}")
+        logger.info(f"State manager: UnifiedStateManager")
         logger.info(f"Memory: {self.config.memory_warning_mb}MB warning, {self.config.memory_limit_mb}MB limit")
         logger.info(f"CPU limit: {self.cpu_monitor.max_total_cpu:.1f}%")
         logger.info(f"Queue size: {self.config.max_queue_size}")
@@ -1380,9 +1328,10 @@ class StreamingWatcher:
         
         # Initial progress scan
         total_files = self.progress.scan_total_files()
-        indexed_files = len(self.state.get("imported_files", {}))
+        status = self.state_manager.get_status()
+        indexed_files = status["indexed_files"]
         self.progress.update(indexed_files)
-        
+
         initial_progress = self.progress.get_progress()
         logger.info(f"Initial progress: {indexed_files}/{total_files} files ({initial_progress['percent']:.1f}%)")
         
@@ -1433,23 +1382,30 @@ class StreamingWatcher:
                         except FileNotFoundError:
                             logger.warning(f"File disappeared: {file_path}")
                             continue
-                        
-                        imported = self.state["imported_files"].get(file_key)
-                        if imported:
-                            parsed_time = imported.get("_parsed_time")
-                            if not parsed_time and "imported_at" in imported:
-                                parsed_time = datetime.fromisoformat(imported["imported_at"]).timestamp()
-                            if parsed_time and file_mtime <= parsed_time:
-                                logger.debug(f"Skipping already imported: {file_path.name}")
-                                continue
-                        
+
+                        # Check if already imported using UnifiedStateManager
+                        try:
+                            normalized_path = self.state_manager.normalize_path(file_key)
+                            imported_files = self.state_manager.get_imported_files()
+                            if normalized_path in imported_files:
+                                stored = imported_files[normalized_path]
+                                import_time_str = stored.get("imported_at")
+                                if import_time_str:
+                                    import_time = datetime.fromisoformat(import_time_str.replace("Z", "+00:00")).timestamp()
+                                    if file_mtime <= import_time:
+                                        logger.debug(f"Skipping already imported: {file_path.name}")
+                                        continue
+                        except Exception as e:
+                            logger.debug(f"Error checking import status: {e}")
+
                         success = await self.process_file(file_path)
-                        
+
                         if success:
                             # Clean up first_seen tracking to prevent memory leak
                             self.file_first_seen.pop(file_key, None)
-                            await self.save_state()
-                            self.progress.update(len(self.state["imported_files"]))
+                            # Update progress (state is managed by UnifiedStateManager)
+                            status = self.state_manager.get_status()
+                            self.progress.update(status["indexed_files"])
                     
                     # Log comprehensive metrics
                     if batch or cycle_count % 6 == 0:  # Every minute if idle
@@ -1519,7 +1475,6 @@ class StreamingWatcher:
             raise
         finally:
             logger.info("Shutting down...")
-            await self.save_state()
             await self.embedding_provider.close()
             await self.qdrant_service.close()
             
