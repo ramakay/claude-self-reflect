@@ -1025,19 +1025,15 @@ class StreamingWatcher:
                             continue
             
             if not all_messages:
-                logger.warning(f"No messages in {file_path}, marking as processed")
-                # Mark file as processed with 0 chunks using UnifiedStateManager
+                logger.warning(f"No messages in {file_path}, marking as failed")
+                # Mark as failed to enable retry and correct progress
                 try:
-                    self.state_manager.add_imported_file(
-                        file_path=str(file_path),
-                        chunks=0,
-                        importer="streaming",
-                        collection=collection_name,
-                        embedding_mode="local" if self.config.prefer_local_embeddings else "cloud",
-                        status="completed"
+                    self.state_manager.mark_file_failed(
+                        str(file_path),
+                        "No messages found in conversation (0 chunks)"
                     )
                 except Exception as e:
-                    logger.error(f"Failed to update state for {file_path}: {e}")
+                    logger.exception("Failed to update state for %s", file_path)
                 self.stats["files_processed"] += 1
                 return True
             
@@ -1118,19 +1114,15 @@ class StreamingWatcher:
 
             combined_text = "\n\n".join(text_parts)
             if not combined_text.strip():
-                logger.warning(f"No textual content in {file_path}, marking as processed")
-                # Mark file as processed with 0 chunks using UnifiedStateManager
+                logger.warning(f"No textual content in {file_path}, marking as failed")
+                # Mark as failed to enable retry and correct progress
                 try:
-                    self.state_manager.add_imported_file(
-                        file_path=str(file_path),
-                        chunks=0,
-                        importer="streaming",
-                        collection=collection_name,
-                        embedding_mode="local" if self.config.prefer_local_embeddings else "cloud",
-                        status="completed"
+                    self.state_manager.mark_file_failed(
+                        str(file_path),
+                        "No textual content in conversation (0 chunks)"
                     )
                 except Exception as e:
-                    logger.error(f"Failed to update state for {file_path}: {e}")
+                    logger.exception("Failed to update state for %s", file_path)
                 self.stats["files_processed"] += 1
                 return True
 

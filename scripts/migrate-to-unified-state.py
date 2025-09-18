@@ -14,7 +14,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List
 import logging
 
@@ -297,7 +297,7 @@ class StateMigrator:
                 state["metadata"]["total_files"] = len(all_files)
                 state["metadata"]["total_chunks"] = total_chunks
                 state["metadata"]["migration_from"] = "v3-v4-multi-file"
-                state["metadata"]["migration_date"] = datetime.utcnow().isoformat() + "Z"
+                state["metadata"]["migration_date"] = datetime.now(timezone.utc).isoformat()
                 state["metadata"]["migration_stats"] = {
                     "imported_files_count": len(imported_files.get("imported_files", {})),
                     "csr_watcher_count": len(csr_watcher.get("imported_files", {})),

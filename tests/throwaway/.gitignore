@@ -1,0 +1,9 @@
+# Throwaway test files - not part of core system
+*.py
+*.pyc
+__pycache__/
+*.log
+*.tmp
+
+# These are temporary test files created for validation
+# They should not be included in releases

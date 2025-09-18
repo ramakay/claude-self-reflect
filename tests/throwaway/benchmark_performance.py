@@ -33,12 +33,16 @@ def benchmark_unified_state():
 
     manager = UnifiedStateManager(Path(test_file))
 
+    # Create home projects directory for testing
+    home_projects = Path.home() / ".claude" / "projects"
+    home_projects.mkdir(parents=True, exist_ok=True)
+
     # Test 1: Adding files
     print("\n1. File Addition Performance:")
     start = time.time()
     for i in range(100):
         manager.add_imported_file(
-            f"/Users/ramakrishnanannaswamy/.claude/projects/bench{i}.jsonl",
+            str(home_projects / f"bench{i}.jsonl"),
             chunks=10 + i,
             importer="batch" if i % 2 == 0 else "streaming"
         )
@@ -66,12 +70,12 @@ def benchmark_unified_state():
     start = time.time()
     for i in range(50):
         manager.add_imported_file(
-            f"/Users/ramakrishnanannaswamy/.claude/projects/concurrent{i}.jsonl",
+            str(home_projects / f"concurrent{i}.jsonl"),
             chunks=20,
             importer="batch"
         )
         manager.add_imported_file(
-            f"/Users/ramakrishnanannaswamy/.claude/projects/concurrent{i}_stream.jsonl",
+            str(home_projects / f"concurrent{i}_stream.jsonl"),
             chunks=15,
             importer="streaming"
         )
