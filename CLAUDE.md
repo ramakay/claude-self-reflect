@@ -194,18 +194,23 @@ get_embedding_mode()                 # Check current mode
 ### Running CodeRabbit Review Locally
 ```bash
 # Run CodeRabbit in prompt-only mode (recommended)
+# Note: May have issues with terminal modes when run in background
 coderabbit --prompt-only
 
-# Let it run in the background as long as needed
-# This provides comprehensive code analysis and suggestions
-# The tool will analyze your codebase and provide actionable feedback
+# Alternative: Use GitHub PR integration
+# CodeRabbit automatically reviews PRs when enabled on the repository
 ```
+
+**Known Issues:**
+- CodeRabbit CLI has terminal mode issues when running in background processes
+- Error: "Raw mode is not supported on the current process.stdin"
+- **Workaround**: Use the GitHub PR integration instead of local CLI
+- CodeRabbit will automatically review PRs at: https://github.com/ramakay/claude-self-reflect/pulls
 
 **Notes:**
 - CodeRabbit needs to be installed first: Check installation at `~/.local/bin/coderabbit`
-- The `--prompt-only` flag provides plain text output without interactive prompts
-- Let the analysis complete fully for best results - it may take several minutes
-- Fix any issues it identifies before committing code
+- Best practice: Let CodeRabbit review via GitHub PR comments
+- The PR integration provides better formatting and actionable feedback
 
 ---
 *Architecture details, philosophy, and history → See `docs/`*
