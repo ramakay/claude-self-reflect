@@ -189,6 +189,24 @@ switch_embedding_mode(mode="local")  # FastEmbed, privacy-first
 get_embedding_mode()                 # Check current mode
 ```
 
+## 🔍 Code Review with CodeRabbit
+
+### Running CodeRabbit Review Locally
+```bash
+# Run CodeRabbit in prompt-only mode (recommended)
+coderabbit --prompt-only
+
+# Let it run in the background as long as needed
+# This provides comprehensive code analysis and suggestions
+# The tool will analyze your codebase and provide actionable feedback
+```
+
+**Notes:**
+- CodeRabbit needs to be installed first: Check installation at `~/.local/bin/coderabbit`
+- The `--prompt-only` flag provides plain text output without interactive prompts
+- Let the analysis complete fully for best results - it may take several minutes
+- Fix any issues it identifies before committing code
+
 ---
 *Architecture details, philosophy, and history → See `docs/`*
 *Full command reference → See `docs/development/MCP_REFERENCE.md`*
