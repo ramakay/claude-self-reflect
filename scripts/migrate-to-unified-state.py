@@ -141,7 +141,8 @@ class StateMigrator:
                 existing_time = all_files[normalized].get("imported_at", "")
                 new_time = metadata.get("imported_at", "")
 
-                if new_time > existing_time:
+                # Handle None and empty string in comparison
+                if (not existing_time) or (new_time and new_time > existing_time):
                     # Update with newer data
                     all_files[normalized] = {
                         "imported_at": metadata.get("imported_at"),
