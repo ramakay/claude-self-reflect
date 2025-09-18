@@ -260,7 +260,19 @@ class SearchTools:
             else:
                 # Use all collections INCLUDING reflections (with decay)
                 collections_response = await self.qdrant_client.get_collections()
+
+                # Handle None response from Qdrant
+                if collections_response is None or not hasattr(collections_response, 'collections'):
+                    await ctx.debug(f"WARNING: Qdrant returned None or invalid response")
+                    return "<search_results><message>Unable to retrieve collections from Qdrant</message></search_results>"
+
                 collections = collections_response.collections
+
+                # Ensure collections is not None
+                if collections is None:
+                    await ctx.debug(f"WARNING: collections is None!")
+                    return "<search_results><message>No collections available</message></search_results>"
+
                 # Include both conversation collections and reflection collections
                 filtered_collections = [
                     c for c in collections
@@ -271,8 +283,13 @@ class SearchTools:
             
             if not filtered_collections:
                 return "<search_results><message>No collections found for the specified project</message></search_results>"
-            
+
             # Perform PARALLEL search across collections to avoid freeze
+            # Ensure filtered_collections is not None before iterating
+            if filtered_collections is None:
+                await ctx.debug(f"WARNING: filtered_collections is None!")
+                return "<search_results><message>No collections available for search</message></search_results>"
+
             collection_names = [c.name for c in filtered_collections]
             await ctx.debug(f"Starting parallel search across {len(collection_names)} collections")
             

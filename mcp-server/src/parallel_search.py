@@ -88,15 +88,20 @@ async def search_single_collection(
                 logger.warning(f"Search returned None for collection {collection_name}")
                 search_results = []
 
-            # Debug: Log search results
-            logger.debug(f"Search of {collection_name} returned {len(search_results)} results")
+            # Ensure search_results is iterable (additional safety check)
+            if not hasattr(search_results, '__iter__'):
+                logger.error(f"Search results not iterable for collection {collection_name}: {type(search_results)}")
+                search_results = []
 
-            if should_use_decay and not USE_NATIVE_DECAY:
+            # Debug: Log search results
+            logger.debug(f"Search of {collection_name} returned {len(search_results) if search_results else 0} results")
+
+            if should_use_decay and not USE_NATIVE_DECAY and search_results:
                 # Apply client-side decay
                 await ctx.debug(f"Using CLIENT-SIDE decay for {collection_name}")
                 decay_results = []
                 
-                for point in search_results:
+                for point in (search_results or []):
                     try:
                         raw_timestamp = point.payload.get('timestamp', datetime.now().isoformat())
                         clean_timestamp = raw_timestamp.replace('Z', '+00:00') if raw_timestamp.endswith('Z') else raw_timestamp
@@ -178,8 +183,8 @@ async def search_single_collection(
                     results.append(search_result)
             else:
                 # Process standard search results without decay
-                logger.debug(f"Processing {len(search_results)} results from {collection_name}")
-                for point in search_results:
+                logger.debug(f"Processing {len(search_results) if search_results else 0} results from {collection_name}")
+                for point in (search_results or []):
                     raw_timestamp = point.payload.get('timestamp', datetime.now().isoformat())
                     clean_timestamp = raw_timestamp.replace('Z', '+00:00') if raw_timestamp.endswith('Z') else raw_timestamp
 
@@ -307,7 +312,11 @@ async def parallel_search_collections(
             continue
         
         collection_name, results, timing = result
-        all_results.extend(results)
+        # Handle None results safely
+        if results is not None:
+            all_results.extend(results)
+        else:
+            logger.warning(f"Collection {collection_name} returned None results")
         collection_timings.append(timing)
     
     await ctx.debug(f"Parallel search complete: {len(all_results)} total results")
