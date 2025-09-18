@@ -1318,7 +1318,7 @@ class StreamingWatcher:
         logger.info("=" * 60)
         logger.info("Claude Self-Reflect Streaming Watcher v3.0.0")
         logger.info("=" * 60)
-        logger.info(f"State file: {self.config.state_file}")
+        logger.info(f"State manager: UnifiedStateManager")
         logger.info(f"Memory: {self.config.memory_warning_mb}MB warning, {self.config.memory_limit_mb}MB limit")
         logger.info(f"CPU limit: {self.cpu_monitor.max_total_cpu:.1f}%")
         logger.info(f"Queue size: {self.config.max_queue_size}")

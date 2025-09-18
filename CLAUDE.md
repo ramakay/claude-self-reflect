@@ -189,28 +189,167 @@ switch_embedding_mode(mode="local")  # FastEmbed, privacy-first
 get_embedding_mode()                 # Check current mode
 ```
 
-## 🔍 Code Review with CodeRabbit
+## 🚀 Complete Development & Release Workflow
 
-### Running CodeRabbit Review Locally
-```bash
-# Run CodeRabbit in prompt-only mode (recommended)
-# Note: May have issues with terminal modes when run in background
-coderabbit --prompt-only
+### The Full Pipeline: Code → Test → Review → Release → NPM
 
-# Alternative: Use GitHub PR integration
-# CodeRabbit automatically reviews PRs when enabled on the repository
+```mermaid
+graph LR
+    A[Developer Work] --> B[CSR Tester]
+    B --> C[CodeRabbit CLI]
+    C --> D[Fix Issues]
+    D --> E[Open Source Maintainer]
+    E --> F[Create PR]
+    F --> G[CodeRabbit PR Review]
+    G --> H[Merge PR]
+    H --> I[GitHub Release]
+    I --> J[NPM Publish]
 ```
 
-**Known Issues:**
-- CodeRabbit CLI has terminal mode issues when running in background processes
-- Error: "Raw mode is not supported on the current process.stdin"
-- **Workaround**: Use the GitHub PR integration instead of local CLI
-- CodeRabbit will automatically review PRs at: https://github.com/ramakay/claude-self-reflect/pulls
+### 1. Development Phase
+**WHO**: Developer (You)
+**WHAT**: Write code, fix bugs, add features
+**HOW**:
+```bash
+# Create feature branch
+git checkout -b fix/issue-description
 
-**Notes:**
-- CodeRabbit needs to be installed first: Check installation at `~/.local/bin/coderabbit`
-- Best practice: Let CodeRabbit review via GitHub PR comments
-- The PR integration provides better formatting and actionable feedback
+# Make changes
+# ... coding ...
+
+# Run local tests
+python mcp-server/src/status.py
+```
+
+### 2. Testing Phase
+**WHO**: CSR Tester Agent
+**WHAT**: Validate system functionality
+**HOW**: Automatically activated with "test installations" or manually run
+```bash
+# CSR Tester runs comprehensive validation
+# - MCP tools testing
+# - Security scans
+# - Performance checks
+# - CodeRabbit CLI analysis (if terminal compatible)
+```
+
+### 3. Code Review Phase
+**WHO**: CodeRabbit (Automated)
+**WHAT**: Identify code issues, bugs, improvements
+**HOW**:
+```bash
+# Option A: CLI (has terminal mode issues currently)
+script -q /dev/null coderabbit --prompt-only
+
+# Option B: PR Comments (RECOMMENDED)
+gh pr view [PR_NUMBER] --comments | grep -A 10 "coderabbitai"
+```
+
+### 4. Fix Phase
+**WHO**: Developer (You)
+**WHAT**: Address all CodeRabbit-identified issues
+**HOW**:
+```bash
+# Fix issues locally
+# Commit changes
+git add .
+git commit -m "fix: address CodeRabbit feedback"
+```
+
+### 5. Release Management Phase
+**WHO**: Open Source Maintainer Agent
+**WHAT**: Create PR, manage release, publish to NPM
+**WORKFLOW**:
+
+```bash
+# Step 1: Create PR with fixes
+gh pr create --title "fix: address CodeRabbit issues" \
+  --body "Fixes identified by CodeRabbit analysis"
+
+# Step 2: Monitor CodeRabbit PR review
+gh pr view [PR_NUMBER] --comments
+
+# Step 3: Merge when approved
+gh pr merge [PR_NUMBER]
+
+# Step 4: Create GitHub Release
+VERSION="v5.0.1"
+gh release create $VERSION \
+  --title "$VERSION - CodeRabbit Fixes" \
+  --notes "Fixed issues identified by CodeRabbit"
+
+# Step 5: Monitor NPM Publication (automated)
+gh run watch  # Watch CI/CD publish to NPM
+
+# Step 6: Verify NPM Package
+npm view claude-self-reflect@latest version
+```
+
+### 6. Post-Release Phase
+**WHO**: Open Source Maintainer Agent
+**WHAT**: Close issues, update docs, announce
+**HOW**:
+```bash
+# Close related issues
+gh issue close [ISSUE_NUMBER] --comment "Fixed in $VERSION"
+
+# Update documentation
+# Announce in discussions
+```
+
+## 🔍 Code Review with CodeRabbit
+
+### AI Agent Workflow (Recommended)
+```bash
+# For AI coding agents - optimized token-efficient output
+coderabbit --prompt-only
+
+# This creates a powerful workflow:
+# 1. CodeRabbit identifies problems with full codebase context
+# 2. AI agent (Claude) implements the fixes
+# 3. Expert-level issue detection + AI-powered implementation
+```
+
+### Command Reference
+```bash
+# Interactive mode (default)
+coderabbit
+
+# Plain text detailed feedback
+coderabbit --plain
+
+# Minimal output for AI agents (BEST FOR CLAUDE)
+coderabbit --prompt-only
+
+# Short alias works too
+cr --prompt-only
+```
+
+### Additional Options
+```bash
+# Review specific types
+coderabbit --type all          # Review everything (default)
+coderabbit --type committed    # Only committed changes
+coderabbit --type uncommitted  # Only uncommitted changes
+
+# Compare against base
+coderabbit --base main                    # Compare to branch
+coderabbit --base-commit HEAD~2          # Compare to commit
+
+# Additional config
+coderabbit --config claude.md coderabbit.yaml
+
+# Disable colors
+coderabbit --no-color
+```
+
+### GitHub PR Integration (Alternative)
+```bash
+# Check PR comments for CodeRabbit feedback
+gh pr view [PR_NUMBER] --comments | grep -A 10 "coderabbitai"
+```
+
+**Note:** PR reviews and CLI reviews will differ - CLI optimizes for immediate development feedback, while PR reviews provide comprehensive team collaboration context.
 
 ---
 *Architecture details, philosophy, and history → See `docs/`*
