@@ -114,16 +114,19 @@ def format_search_results_rich(
         concept_frequency = {}
 
         for result in results:
-            # Count file modifications
-            for file in result.get('files_analyzed', []):
+            # Count file modifications - ensure we handle None values properly
+            files = result.get('files_analyzed') or []
+            for file in files:
                 file_frequency[file] = file_frequency.get(file, 0) + 1
 
-            # Count tool usage
-            for tool in result.get('tools_used', []):
+            # Count tool usage - ensure we handle None values properly
+            tools = result.get('tools_used') or []
+            for tool in tools:
                 tool_frequency[tool] = tool_frequency.get(tool, 0) + 1
 
-            # Count concepts
-            for concept in result.get('concepts', []):
+            # Count concepts - ensure we handle None values properly
+            concepts = result.get('concepts') or []
+            for concept in concepts:
                 concept_frequency[concept] = concept_frequency.get(concept, 0) + 1
 
         # Show most frequently modified files

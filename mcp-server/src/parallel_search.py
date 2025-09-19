@@ -176,9 +176,9 @@ async def search_single_collection(
                         'collection_name': collection_name,
                         'raw_payload': point.payload,  # Renamed from 'payload' for consistency
                         'code_patterns': point.payload.get('code_patterns'),
-                        'files_analyzed': point.payload.get('files_analyzed'),
-                        'tools_used': list(point.payload.get('tools_used', [])) if isinstance(point.payload.get('tools_used'), set) else point.payload.get('tools_used'),
-                        'concepts': point.payload.get('concepts')
+                        'files_analyzed': point.payload.get('files_analyzed') or [],
+                        'tools_used': list(point.payload.get('tools_used', [])) if isinstance(point.payload.get('tools_used'), set) else (point.payload.get('tools_used') or []),
+                        'concepts': point.payload.get('concepts') or []
                     }
                     results.append(search_result)
             else:
@@ -219,9 +219,9 @@ async def search_single_collection(
                         'collection_name': collection_name,
                         'raw_payload': point.payload,
                         'code_patterns': point.payload.get('code_patterns'),
-                        'files_analyzed': point.payload.get('files_analyzed'),
-                        'tools_used': list(point.payload.get('tools_used', [])) if isinstance(point.payload.get('tools_used'), set) else point.payload.get('tools_used'),
-                        'concepts': point.payload.get('concepts')
+                        'files_analyzed': point.payload.get('files_analyzed') or [],
+                        'tools_used': list(point.payload.get('tools_used', [])) if isinstance(point.payload.get('tools_used'), set) else (point.payload.get('tools_used') or []),
+                        'concepts': point.payload.get('concepts') or []
                     }
                     results.append(search_result)
     
