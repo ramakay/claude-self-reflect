@@ -59,14 +59,30 @@ with open(tracker_file, 'w') as f:
 fi
 
 # Run quality check on session files only
-# Show output to the agent so it can see quality issues
+# Use exit code 2 to make Claude see quality issues
 if [ -n "$EDITED_FILES" ]; then
-    # Run the session quality tracker and show results
-    python3 "$PROJECT_ROOT/scripts/session_quality_tracker.py" --use-tracker 2>&1 | head -30
+    # Use venv Python if available, otherwise fall back to python3
+    if [ -f "$PROJECT_ROOT/venv/bin/python" ]; then
+        PYTHON_CMD="$PROJECT_ROOT/venv/bin/python"
+    else
+        PYTHON_CMD="python3"
+    fi
 
-    # Update statusline cache in background
-    (python3 "$PROJECT_ROOT/scripts/session_quality_tracker.py" --use-tracker --update-cache-only 2>/dev/null &)
+    # Run quality analysis with timeout
+    QUALITY_OUTPUT=$(timeout 1s $PYTHON_CMD "$PROJECT_ROOT/scripts/session_quality_tracker.py" --use-tracker 2>&1)
+
+    # Check if there are critical issues
+    if echo "$QUALITY_OUTPUT" | grep -q "🔴\|🟠\|Issues:"; then
+        # Exit code 2 makes Claude see the stderr output
+        echo "$QUALITY_OUTPUT" | head -15 >&2
+        echo "" >&2
+        echo "⚠️ Quality issues detected. Please review and fix the above issues." >&2
+        exit 2  # This makes Claude see and respond to the quality feedback!
+    fi
+
+    # Update statusline cache in background (non-blocking)
+    ($PYTHON_CMD "$PROJECT_ROOT/scripts/session_quality_tracker.py" --use-tracker --update-cache-only 2>/dev/null &)
 fi
 
-# Don't block Claude's response
+# No issues or no edits
 exit 0

@@ -1,10 +1,10 @@
 {
   "file": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/src/server.py",
-  "timestamp": "2025-09-19T09:07:35.183218",
+  "timestamp": "2025-09-19T09:24:31.047595",
   "language": "python",
   "engine": "ast-grep-py + unified registry",
   "registry_info": {
-    "total_patterns_available": 39,
+    "total_patterns_available": 44,
     "patterns_matched": 15,
     "patterns_errored": 3,
     "categories_found": [

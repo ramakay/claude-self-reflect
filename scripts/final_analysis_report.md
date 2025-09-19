@@ -2,7 +2,7 @@
 
 **File**: /Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/src/server.py
 **Language**: python
-**Timestamp**: 2025-09-19T09:07:35.183218
+**Timestamp**: 2025-09-19T09:24:31.047595
 **Engine**: ast-grep-py + unified registry
 
 ## Quality Overview
@@ -95,7 +95,7 @@ However, we can use the [`rewriter`](https://ast-grep.github.io/reference/yaml/r
     """Current impor...`
 
 ## Pattern Registry Statistics
-- **Patterns Available**: 39
+- **Patterns Available**: 44
 - **Patterns Matched**: 15
 - **Categories Found**: python_async, python_logging, python_typing, python_antipatterns, python_mcp, python_runtime_modification, python_catalog
 
