@@ -257,15 +257,15 @@ class FinalASTGrepAnalyzer:
         return '\n'.join(report)
 
 
-def run_final_analysis():
+def run_final_analysis(file_path=None):
     """Run final AST-GREP analysis with unified registry."""
     print("🚀 FINAL AST-GREP Analysis with Unified Registry")
     print("=" * 60)
 
     analyzer = FinalASTGrepAnalyzer()
 
-    # Analyze server.py
-    server_path = "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/src/server.py"
+    # Use provided path or default
+    server_path = file_path if file_path else "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/src/server.py"
 
     print(f"\nAnalyzing: {server_path}")
     print("-" * 40)
@@ -325,4 +325,11 @@ def run_final_analysis():
 
 
 if __name__ == "__main__":
-    run_final_analysis()
+    import sys
+    if len(sys.argv) > 1:
+        # Use provided file path
+        file_path = sys.argv[1]
+    else:
+        # Default to server.py
+        file_path = "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/src/server.py"
+    run_final_analysis(file_path)
