@@ -55,3 +55,4 @@ GLOBAL_VAR = "bad"  # Global variable
 print(f"Debug: {GLOBAL_VAR}")  # Debug print
 print("Another one")  # More prints
 print("Even more prints!")  # Testing hook visibility
+print("Final test of improved formatting")  # Better feedback

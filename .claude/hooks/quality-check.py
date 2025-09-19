@@ -70,25 +70,41 @@ def main():
 
             # If there are issues, report them to Claude
             if has_critical or has_issues or (quality_score and quality_score < 70):
-                # Format the feedback
-                feedback = f"Quality analysis for {Path(file_path).name}:\n\n"
+                # Build formatted feedback like the examples show
+                file_name = Path(file_path).name
 
-                # Extract relevant lines from output
-                relevant_lines = []
-                for line in output.split('\n'):
-                    if any(indicator in line for indicator in ['Issue', 'Warning', 'Error', 'Score', '🔴', '🟠', '🟡']):
-                        relevant_lines.append(line)
+                # Extract issue details
+                issues_found = []
+                if "print-call" in output:
+                    for line in output.split('\n'):
+                        if "print-call:" in line:
+                            issues_found.append("• Replace print statements with logger")
+                            break
 
-                if relevant_lines:
-                    feedback += '\n'.join(relevant_lines[:10])  # First 10 issue lines
-                else:
-                    feedback += output[:500]  # First 500 chars if no specific issues found
+                if "nested-if" in output:
+                    issues_found.append("• Refactor deeply nested if statements")
 
-                feedback += "\n\n⚠️ Please review and fix the quality issues in the code you just wrote."
+                if "nested-loops" in output:
+                    issues_found.append("• Optimize nested loops for performance")
+
+                if "bare-except" in output or "broad-except" in output:
+                    issues_found.append("• Use specific exception handlers")
+
+                # Format the message like their examples
+                feedback_parts = [
+                    f"Code quality check failed for {file_name}:",
+                    f"• Quality Score: {quality_score:.1f}% (threshold: 70%)"
+                ]
+
+                if issues_found:
+                    feedback_parts.append("\nTop issues to fix:")
+                    feedback_parts.extend(issues_found[:5])
+
+                feedback_parts.append("\nPlease fix these quality issues before proceeding.")
+
+                feedback = '\n'.join(feedback_parts)
 
                 # Exit code 2 with stderr makes Claude see the feedback
-                # Also print to stdout for visibility
-                print(feedback)
                 print(feedback, file=sys.stderr)
                 sys.exit(2)
 

@@ -1,6 +1,6 @@
 {
   "file": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/terrible_quality.py",
-  "timestamp": "2025-09-19T09:44:08.995783",
+  "timestamp": "2025-09-19T09:44:52.770968",
   "language": "python",
   "engine": "ast-grep-py + unified registry",
   "registry_info": {
@@ -21,7 +21,7 @@
         "description": "Print statement",
         "quality": "bad",
         "weight": -1,
-        "count": 17,
+        "count": 18,
         "locations": [
           {
             "line": 5,
@@ -58,7 +58,7 @@
         "description": "List comprehensions like `[x for x in range(10)]` are a concise way to create lists in Python. However, we can achieve better memory efficiency by using generator expressions like `(x for x in range(10))` instead. List comprehensions create the entire list in memory, while generator expressions generate each element one at a time. We can make the change by replacing the square brackets with parentheses.",
         "quality": "good",
         "weight": 3,
-        "count": 246,
+        "count": 255,
         "locations": [
           {
             "line": 1,
@@ -178,7 +178,7 @@
       "description": "Print statement",
       "quality": "bad",
       "weight": -1,
-      "count": 17,
+      "count": 18,
       "locations": [
         {
           "line": 5,
@@ -213,7 +213,7 @@
       "description": "List comprehensions like `[x for x in range(10)]` are a concise way to create lists in Python. However, we can achieve better memory efficiency by using generator expressions like `(x for x in range(10))` instead. List comprehensions create the entire list in memory, while generator expressions generate each element one at a time. We can make the change by replacing the square brackets with parentheses.",
       "quality": "good",
       "weight": 3,
-      "count": 246,
+      "count": 255,
       "locations": [
         {
           "line": 1,
@@ -341,15 +341,15 @@
     }
   ],
   "quality_metrics": {
-    "quality_score": 0.512,
-    "good_patterns_found": 252,
-    "bad_patterns_found": 22,
+    "quality_score": 0.508,
+    "good_patterns_found": 261,
+    "bad_patterns_found": 23,
     "unique_patterns_matched": 5,
-    "total_issues": 22,
-    "total_good_practices": 252
+    "total_issues": 23,
+    "total_good_practices": 261
   },
   "recommendations": [
     "\ud83d\udfe1 Warning: Several anti-patterns detected",
-    "Replace 17 print statements with logger"
+    "Replace 18 print statements with logger"
   ]
 }
