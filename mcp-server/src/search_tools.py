@@ -20,6 +20,26 @@ from .rich_formatting import format_search_results_rich
 logger = logging.getLogger(__name__)
 
 
+def is_searchable_collection(name: str) -> bool:
+    """
+    Check if collection name matches searchable patterns.
+    Supports both v3 and v4 collection naming conventions.
+    """
+    return (
+        # v3 patterns
+        name.endswith('_local')
+        or name.endswith('_voyage')
+        # v4 patterns
+        or name.endswith('_384d')  # Local v4 collections
+        or name.endswith('_1024d')  # Cloud v4 collections
+        or '_cloud_' in name  # Cloud v4 intermediate naming
+        # Reflections
+        or name.startswith('reflections')
+        # CSR prefixed collections
+        or name.startswith('csr_')
+    )
+
+
 class SearchTools:
     """Handles all search operations for the MCP server."""
     
@@ -114,6 +134,11 @@ class SearchTools:
             # Convert results to dict format
             results = []
             for result in search_results:
+                # Guard against None payload
+                if result.payload is None:
+                    logger.warning(f"Result in {collection_name} has None payload, skipping")
+                    continue
+
                 results.append({
                     'conversation_id': result.payload.get('conversation_id'),
                     'timestamp': result.payload.get('timestamp'),
@@ -274,10 +299,10 @@ class SearchTools:
                     return "<search_results><message>No collections available</message></search_results>"
 
                 # Include both conversation collections and reflection collections
+                # Use module-level function for consistency
                 filtered_collections = [
                     c for c in collections
-                    if (c.name.endswith('_local') or c.name.endswith('_voyage') or
-                        c.name.startswith('reflections'))
+                    if is_searchable_collection(c.name)
                 ]
                 await ctx.debug(f"Searching across {len(filtered_collections)} collections")
             
@@ -403,8 +428,7 @@ class SearchTools:
                 # Include both conversation collections and reflection collections
                 filtered_collections = [
                     c for c in collections
-                    if (c.name.endswith('_local') or c.name.endswith('_voyage') or
-                        c.name.startswith('reflections'))
+                    if is_searchable_collection(c.name)
                 ]
             
             # Quick PARALLEL count across collections
@@ -493,8 +517,7 @@ class SearchTools:
                 # Include both conversation collections and reflection collections
                 filtered_collections = [
                     c for c in collections
-                    if (c.name.endswith('_local') or c.name.endswith('_voyage') or
-                        c.name.startswith('reflections'))
+                    if is_searchable_collection(c.name)
                 ]
             
             # Gather results for summary using PARALLEL search
@@ -590,8 +613,7 @@ class SearchTools:
                 # Include both conversation collections and reflection collections
                 filtered_collections = [
                     c for c in collections
-                    if (c.name.endswith('_local') or c.name.endswith('_voyage') or
-                        c.name.startswith('reflections'))
+                    if is_searchable_collection(c.name)
                 ]
             
             # Gather all results using PARALLEL search
