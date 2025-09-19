@@ -647,6 +647,8 @@ if __name__ == "__main__":
     parser.add_argument('--project-name', help='Name of the project for cache file')
     parser.add_argument('--use-tracker', action='store_true',
                         help='Use session edit tracker for analysis')
+    parser.add_argument('--update-cache-only', action='store_true',
+                        help='Only update cache without printing report')
     args = parser.parse_args()
 
     # If external project specified, change to that directory
@@ -657,5 +659,13 @@ if __name__ == "__main__":
     if args.project_name:
         # This will be used in the main() function for cache naming
         os.environ['QUALITY_PROJECT_NAME'] = args.project_name
+
+    # For cache-only mode, suppress output
+    if args.update_cache_only:
+        # Redirect logger to null
+        import os
+        import sys
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
 
     main(use_tracker=args.use_tracker)

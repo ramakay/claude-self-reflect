@@ -58,11 +58,15 @@ with open(tracker_file, 'w') as f:
 " 2>/dev/null
 fi
 
-# Run quality check on session files only (non-blocking)
-(
-    # Run the session quality tracker with session mode
-    python3 "$PROJECT_ROOT/scripts/session_quality_tracker.py" --use-tracker 2>/dev/null &
-) &
+# Run quality check on session files only
+# Show output to the agent so it can see quality issues
+if [ -n "$EDITED_FILES" ]; then
+    # Run the session quality tracker and show results
+    python3 "$PROJECT_ROOT/scripts/session_quality_tracker.py" --use-tracker 2>&1 | head -30
+
+    # Update statusline cache in background
+    (python3 "$PROJECT_ROOT/scripts/session_quality_tracker.py" --use-tracker --update-cache-only 2>/dev/null &)
+fi
 
 # Don't block Claude's response
 exit 0
