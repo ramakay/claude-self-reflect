@@ -87,6 +87,8 @@ def main():
                 feedback += "\n\n⚠️ Please review and fix the quality issues in the code you just wrote."
 
                 # Exit code 2 with stderr makes Claude see the feedback
+                # Also print to stdout for visibility
+                print(feedback)
                 print(feedback, file=sys.stderr)
                 sys.exit(2)
 
