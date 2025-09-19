@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 import logging
+from .safe_getters import safe_get_list, safe_get_str
 
 logger = logging.getLogger(__name__)
 
@@ -114,18 +115,18 @@ def format_search_results_rich(
         concept_frequency = {}
 
         for result in results:
-            # Count file modifications - ensure we handle None values properly
-            files = result.get('files_analyzed') or []
+            # Count file modifications - using safe_get_list for consistency
+            files = safe_get_list(result, 'files_analyzed')
             for file in files:
                 file_frequency[file] = file_frequency.get(file, 0) + 1
 
-            # Count tool usage - ensure we handle None values properly
-            tools = result.get('tools_used') or []
+            # Count tool usage - using safe_get_list for consistency
+            tools = safe_get_list(result, 'tools_used')
             for tool in tools:
                 tool_frequency[tool] = tool_frequency.get(tool, 0) + 1
 
-            # Count concepts - ensure we handle None values properly
-            concepts = result.get('concepts') or []
+            # Count concepts - using safe_get_list for consistency
+            concepts = safe_get_list(result, 'concepts')
             for concept in concepts:
                 concept_frequency[concept] = concept_frequency.get(concept, 0) + 1
 
