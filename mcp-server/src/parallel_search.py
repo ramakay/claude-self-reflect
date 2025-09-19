@@ -8,6 +8,7 @@ import time
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import logging
+from .safe_getters import safe_get_list, safe_get_str
 
 logger = logging.getLogger(__name__)
 
@@ -176,9 +177,9 @@ async def search_single_collection(
                         'collection_name': collection_name,
                         'raw_payload': point.payload,  # Renamed from 'payload' for consistency
                         'code_patterns': point.payload.get('code_patterns'),
-                        'files_analyzed': point.payload.get('files_analyzed'),
-                        'tools_used': list(point.payload.get('tools_used', [])) if isinstance(point.payload.get('tools_used'), set) else point.payload.get('tools_used'),
-                        'concepts': point.payload.get('concepts')
+                        'files_analyzed': safe_get_list(point.payload, 'files_analyzed'),
+                        'tools_used': safe_get_list(point.payload, 'tools_used'),
+                        'concepts': safe_get_list(point.payload, 'concepts')
                     }
                     results.append(search_result)
             else:
@@ -219,9 +220,9 @@ async def search_single_collection(
                         'collection_name': collection_name,
                         'raw_payload': point.payload,
                         'code_patterns': point.payload.get('code_patterns'),
-                        'files_analyzed': point.payload.get('files_analyzed'),
-                        'tools_used': list(point.payload.get('tools_used', [])) if isinstance(point.payload.get('tools_used'), set) else point.payload.get('tools_used'),
-                        'concepts': point.payload.get('concepts')
+                        'files_analyzed': safe_get_list(point.payload, 'files_analyzed'),
+                        'tools_used': safe_get_list(point.payload, 'tools_used'),
+                        'concepts': safe_get_list(point.payload, 'concepts')
                     }
                     results.append(search_result)
     

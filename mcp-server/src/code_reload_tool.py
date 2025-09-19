@@ -5,11 +5,22 @@ import sys
 import importlib
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Literal
+from typing import Dict, List, Optional
 from fastmcp import Context
 from pydantic import Field
 import hashlib
 import json
+import asyncio
+
+# Import security module - handle both relative and absolute imports
+try:
+    from .security_patches import ModuleWhitelist
+except ImportError:
+    try:
+        from security_patches import ModuleWhitelist
+    except ImportError:
+        # Security module is required - fail closed, not open
+        raise RuntimeError("Security module 'security_patches' is required for code reload functionality")
 
 logger = logging.getLogger(__name__)
 
@@ -19,20 +30,36 @@ class CodeReloader:
 
     def __init__(self):
         """Initialize the code reloader."""
-        self.module_hashes: Dict[str, str] = {}
-        self.reload_history: List[Dict] = []
         self.cache_dir = Path.home() / '.claude-self-reflect' / 'reload_cache'
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        # Test comment: Hot reload test at 2025-09-15
-        logger.info("CodeReloader initialized with hot reload support")
+        self.hash_file = self.cache_dir / 'module_hashes.json'
+        self._lock = asyncio.Lock()  # Thread safety for async operations
+
+        # Load persisted hashes from disk with error handling
+        if self.hash_file.exists():
+            try:
+                with open(self.hash_file, 'r') as f:
+                    self.module_hashes: Dict[str, str] = json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                logger.error(f"Failed to load module hashes: {e}. Starting fresh.")
+                self.module_hashes: Dict[str, str] = {}
+        else:
+            self.module_hashes: Dict[str, str] = {}
+
+        self.reload_history: List[Dict] = []
+        logger.info(f"CodeReloader initialized with {len(self.module_hashes)} cached hashes")
 
     def _get_file_hash(self, filepath: Path) -> str:
         """Get SHA256 hash of a file."""
         with open(filepath, 'rb') as f:
             return hashlib.sha256(f.read()).hexdigest()
 
-    def _get_changed_modules(self) -> List[str]:
-        """Detect which modules have changed since last check."""
+    def _detect_changed_modules(self) -> List[str]:
+        """Detect which modules have changed since last check.
+        
+        This method ONLY detects changes, it does NOT update the stored hashes.
+        Use _update_module_hashes() to update hashes after successful reload.
+        """
         changed = []
         src_dir = Path(__file__).parent
 
@@ -43,13 +70,61 @@ class CodeReloader:
             module_name = f"src.{py_file.stem}"
             current_hash = self._get_file_hash(py_file)
 
+            # Only detect changes, DO NOT update hashes here
             if module_name in self.module_hashes:
                 if self.module_hashes[module_name] != current_hash:
                     changed.append(module_name)
-
-            self.module_hashes[module_name] = current_hash
+                    logger.debug(f"Change detected in {module_name}: {self.module_hashes[module_name][:8]} -> {current_hash[:8]}")
+            else:
+                # New module not seen before
+                changed.append(module_name)
+                logger.debug(f"New module detected: {module_name}")
 
         return changed
+
+    def _update_module_hashes(self, modules: Optional[List[str]] = None) -> None:
+        """Update the stored hashes for specified modules or all modules.
+        
+        This should be called AFTER successful reload to mark modules as up-to-date.
+        
+        Args:
+            modules: List of module names to update. If None, updates all modules.
+        """
+        src_dir = Path(__file__).parent
+        updated = []
+
+        for py_file in src_dir.glob("*.py"):
+            if py_file.name == "__pycache__":
+                continue
+
+            module_name = f"src.{py_file.stem}"
+            
+            # If specific modules provided, only update those
+            if modules is not None and module_name not in modules:
+                continue
+            
+            current_hash = self._get_file_hash(py_file)
+            old_hash = self.module_hashes.get(module_name, "new")
+            self.module_hashes[module_name] = current_hash
+            
+            if old_hash != current_hash:
+                updated.append(module_name)
+                logger.debug(f"Updated hash for {module_name}: {old_hash[:8] if old_hash != 'new' else 'new'} -> {current_hash[:8]}")
+
+        # Persist the updated hashes to disk using atomic write
+        temp_file = Path(str(self.hash_file) + '.tmp')
+        try:
+            with open(temp_file, 'w') as f:
+                json.dump(self.module_hashes, f, indent=2)
+            # Atomic rename on POSIX systems
+            temp_file.replace(self.hash_file)
+        except Exception as e:
+            logger.error(f"Failed to persist module hashes: {e}")
+            if temp_file.exists():
+                temp_file.unlink()  # Clean up temp file on failure
+        
+        if updated:
+            logger.info(f"Updated hashes for {len(updated)} modules: {', '.join(updated)}")
 
     async def reload_modules(
         self,
@@ -61,93 +136,98 @@ class CodeReloader:
 
         await ctx.debug("Starting code reload process...")
 
-        try:
-            # Track what we're reloading
-            reload_targets = []
+        async with self._lock:  # Ensure thread safety for reload operations
+            try:
+                # Track what we're reloading
+                reload_targets = []
 
-            if auto_detect:
-                # Detect changed modules
-                changed = self._get_changed_modules()
-                if changed:
-                    reload_targets.extend(changed)
-                    await ctx.debug(f"Auto-detected changes in: {changed}")
+                if auto_detect:
+                    # Detect changed modules (without updating hashes)
+                    changed = self._detect_changed_modules()
+                    if changed:
+                        reload_targets.extend(changed)
+                        await ctx.debug(f"Auto-detected changes in: {changed}")
 
-            if modules:
-                # Add explicitly requested modules
-                reload_targets.extend(modules)
+                if modules:
+                    # Add explicitly requested modules
+                    reload_targets.extend(modules)
 
-            if not reload_targets:
-                return "📊 No modules to reload. All code is up to date!"
+                if not reload_targets:
+                    return "📊 No modules to reload. All code is up to date!"
 
-            # Perform the reload
-            reloaded = []
-            failed = []
+                # Perform the reload
+                reloaded = []
+                failed = []
 
-            for module_name in reload_targets:
-                try:
-                    # SECURITY FIX: Validate module is in whitelist
-                    from .security_patches import ModuleWhitelist
-                    if not ModuleWhitelist.is_allowed_module(module_name):
-                        logger.warning(f"Module not in whitelist, skipping: {module_name}")
-                        failed.append((module_name, "Module not in whitelist"))
-                        continue
+                for module_name in reload_targets:
+                    try:
+                        # SECURITY FIX: Validate module is in whitelist
+                        if not ModuleWhitelist.is_allowed_module(module_name):
+                            logger.warning(f"Module not in whitelist, skipping: {module_name}")
+                            failed.append((module_name, "Module not in whitelist"))
+                            continue
 
-                    if module_name in sys.modules:
-                        # Store old module reference for rollback
-                        old_module = sys.modules[module_name]
+                        if module_name in sys.modules:
+                            # Store old module reference for rollback
+                            old_module = sys.modules[module_name]
 
-                        # Reload the module
-                        logger.info(f"Reloading module: {module_name}")
-                        reloaded_module = importlib.reload(sys.modules[module_name])
+                            # Reload the module
+                            logger.info(f"Reloading module: {module_name}")
+                            reloaded_module = importlib.reload(sys.modules[module_name])
 
-                        # Update any global references if needed
-                        self._update_global_references(module_name, reloaded_module)
+                            # Update any global references if needed
+                            self._update_global_references(module_name, reloaded_module)
 
-                        reloaded.append(module_name)
-                        await ctx.debug(f"✅ Reloaded: {module_name}")
-                    else:
-                        # Module not loaded yet, import it
-                        importlib.import_module(module_name)
-                        reloaded.append(module_name)
-                        await ctx.debug(f"✅ Imported: {module_name}")
+                            reloaded.append(module_name)
+                            await ctx.debug(f"✅ Reloaded: {module_name}")
+                        else:
+                            # Module not loaded yet, import it
+                            importlib.import_module(module_name)
+                            reloaded.append(module_name)
+                            await ctx.debug(f"✅ Imported: {module_name}")
 
-                except Exception as e:
-                    logger.error(f"Failed to reload {module_name}: {e}", exc_info=True)
-                    failed.append((module_name, str(e)))
-                    await ctx.debug(f"❌ Failed: {module_name} - {e}")
+                    except Exception as e:
+                        logger.error(f"Failed to reload {module_name}: {e}", exc_info=True)
+                        failed.append((module_name, str(e)))
+                        await ctx.debug(f"❌ Failed: {module_name} - {e}")
 
-            # Record reload history
-            self.reload_history.append({
-                "timestamp": os.environ.get('MCP_REQUEST_ID', 'unknown'),
-                "reloaded": reloaded,
-                "failed": failed
-            })
+                # Update hashes ONLY for successfully reloaded modules
+                if reloaded:
+                    self._update_module_hashes(reloaded)
+                    await ctx.debug(f"Updated hashes for {len(reloaded)} successfully reloaded modules")
 
-            # Build response
-            response = "🔄 **Code Reload Results**\n\n"
+                # Record reload history
+                self.reload_history.append({
+                    "timestamp": os.environ.get('MCP_REQUEST_ID', 'unknown'),
+                    "reloaded": reloaded,
+                    "failed": failed
+                })
 
-            if reloaded:
-                response += f"**Successfully Reloaded ({len(reloaded)}):**\n"
-                for module in reloaded:
-                    response += f"- ✅ {module}\n"
-                response += "\n"
+                # Build response
+                response = "🔄 **Code Reload Results**\n\n"
 
-            if failed:
-                response += f"**Failed to Reload ({len(failed)}):**\n"
-                for module, error in failed:
-                    response += f"- ❌ {module}: {error}\n"
-                response += "\n"
+                if reloaded:
+                    response += f"**Successfully Reloaded ({len(reloaded)}):**\n"
+                    for module in reloaded:
+                        response += f"- ✅ {module}\n"
+                    response += "\n"
 
-            response += "**Important Notes:**\n"
-            response += "- Class instances created before reload keep old code\n"
-            response += "- New requests will use the reloaded code\n"
-            response += "- Some changes may require full restart (e.g., new tools)\n"
+                if failed:
+                    response += f"**Failed to Reload ({len(failed)}):**\n"
+                    for module, error in failed:
+                        response += f"- ❌ {module}: {error}\n"
+                    response += "\n"
 
-            return response
+                response += "**Important Notes:**\n"
+                response += "- Class instances created before reload keep old code\n"
+                response += "- New requests will use the reloaded code\n"
+                response += "- Some changes may require full restart (e.g., new tools)\n"
 
-        except Exception as e:
-            logger.error(f"Code reload failed: {e}", exc_info=True)
-            return f"❌ Code reload failed: {str(e)}"
+                return response
+
+            except Exception as e:
+                logger.error(f"Code reload failed: {e}", exc_info=True)
+                return f"❌ Code reload failed: {str(e)}"
 
     def _update_global_references(self, module_name: str, new_module):
         """Update global references after module reload."""
@@ -171,8 +251,8 @@ class CodeReloader:
         """Get the current reload status and history."""
 
         try:
-            # Check for changed files
-            changed = self._get_changed_modules()
+            # Check for changed files (WITHOUT updating hashes)
+            changed = self._detect_changed_modules()
 
             response = "📊 **Code Reload Status**\n\n"
 
@@ -224,6 +304,24 @@ class CodeReloader:
             logger.error(f"Failed to clear cache: {e}", exc_info=True)
             return f"❌ Failed to clear cache: {str(e)}"
 
+    async def force_update_hashes(self, ctx: Context) -> str:
+        """Force update all module hashes to current state.
+        
+        This is useful when you want to mark all current code as 'baseline'
+        without actually reloading anything.
+        """
+        try:
+            await ctx.debug("Force updating all module hashes...")
+            
+            # Update all module hashes
+            self._update_module_hashes(modules=None)
+            
+            return f"✅ Force updated hashes for all {len(self.module_hashes)} tracked modules"
+        
+        except Exception as e:
+            logger.error(f"Failed to force update hashes: {e}", exc_info=True)
+            return f"❌ Failed to force update hashes: {str(e)}"
+
 
 def register_code_reload_tool(mcp, get_embedding_manager):
     """Register the code reloading tool with the MCP server."""
@@ -257,6 +355,8 @@ def register_code_reload_tool(mcp, get_embedding_manager):
 
         Shows which files have been modified since last reload and
         the history of recent reload operations.
+        
+        Note: This only checks for changes, it does not update the stored hashes.
         """
         return await reloader.get_reload_status(ctx)
 
@@ -267,5 +367,14 @@ def register_code_reload_tool(mcp, get_embedding_manager):
         Useful when reload isn't working due to cached bytecode.
         """
         return await reloader.clear_python_cache(ctx)
+    
+    @mcp.tool()
+    async def force_update_module_hashes(ctx: Context) -> str:
+        """Force update all module hashes to mark current code as baseline.
+        
+        Use this when you want to ignore current changes and treat
+        the current state as the new baseline without reloading.
+        """
+        return await reloader.force_update_hashes(ctx)
 
     logger.info("Code reload tools registered successfully")
