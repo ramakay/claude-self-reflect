@@ -1,6 +1,7 @@
 #!/bin/bash
 # Post-generation hook for Claude Self-Reflect
 # Tracks edited files and runs quality analysis on session edits only
+set -euo pipefail
 
 # Get the directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,7 +9,27 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TRACKER_FILE="$HOME/.claude-self-reflect/current_session_edits.json"
 
 # Check if any files were edited in the last minute
-EDITED_FILES=$(find . -type f \( -name "*.py" -o -name "*.ts" -o -name "*.js" -o -name "*.tsx" -o -name "*.jsx" \) -mmin -1 2>/dev/null)
+# Use Python for portable file finding (BSD find doesn't support -mmin)
+EDITED_FILES=$(python3 - <<'PY'
+import os, sys, time
+exts = {'.py','.ts','.js','.tsx','.jsx'}
+cutoff = time.time() - 60
+skip_dirs = {'.git','node_modules','venv','.venv','dist','build','__pycache__'}
+for root, dirs, files in os.walk('.'):
+    # Skip unwanted directories
+    dirs[:] = [d for d in dirs if d not in skip_dirs]
+    if any(s in root for s in skip_dirs):
+        continue
+    for fn in files:
+        if os.path.splitext(fn)[1] in exts:
+            p = os.path.join(root, fn)
+            try:
+                if os.path.getmtime(p) >= cutoff:
+                    print(p)
+            except OSError:
+                pass
+PY
+)
 
 if [ -z "$EDITED_FILES" ]; then
     exit 0  # No recent edits, nothing to analyze

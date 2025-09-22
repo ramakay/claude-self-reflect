@@ -1,5 +1,6 @@
 #!/bin/bash
 # Optimize Docker memory allocation for CSR
+set -euo pipefail
 
 echo "🚀 Docker Memory Optimization for CSR"
 echo "====================================="

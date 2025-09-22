@@ -1,19 +1,33 @@
 #!/bin/bash
 # Emergency memory fix for typing lag
+set -euo pipefail
+IFS=$'\n\t'
 
 echo "🚨 EMERGENCY MEMORY RECOVERY"
 echo "============================"
 echo ""
 
-# 1. Kill Chrome processes aggressively
-echo "🌐 Killing old Chrome processes..."
-ps aux | grep "Google Chrome" | grep -v "Helper (GPU)" | awk '{print $2}' | tail -100 | while read pid; do
-    kill -9 $pid 2>/dev/null
+# 1. Quit Chrome gracefully, then TERM → KILL as fallback
+echo "🌐 Stopping Chrome gracefully..."
+osascript -e 'quit app "Google Chrome"' 2>/dev/null || true
+sleep 2
+# Then use SIGTERM
+pgrep -f "Google Chrome" | while read pid; do
+    kill -TERM "$pid" 2>/dev/null || true
+done
+sleep 1
+# Finally SIGKILL if still running
+pgrep -f "Google Chrome" | while read pid; do
+    kill -KILL "$pid" 2>/dev/null || true
 done
 
-# 2. Kill Slack if running
+# 2. Quit Slack gracefully, then TERM → KILL as fallback
 echo "💬 Stopping Slack temporarily..."
-pkill -9 Slack 2>/dev/null
+osascript -e 'quit app "Slack"' 2>/dev/null || true
+sleep 1
+pkill -TERM Slack 2>/dev/null || true
+sleep 1
+pkill -KILL Slack 2>/dev/null || true
 
 # 3. Restart Docker Desktop with lower memory
 echo "🐳 Restarting Docker with 4GB limit..."

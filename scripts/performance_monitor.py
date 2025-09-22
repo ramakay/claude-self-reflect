@@ -35,10 +35,8 @@ class PerformanceMonitor:
     def get_process_stats(self):
         """Get stats for Claude and Docker VM using ps command."""
         try:
-            # Use ps to get process information
-            cmd = [
-                'ps', 'aux', '-o', 'pid,ppid,%cpu,%mem,rss,vsz,threads,command'
-            ]
+            # Use ps with compatible options (aux doesn't support -o on macOS)
+            cmd = ['ps', 'aux']
             result = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
             stats = {

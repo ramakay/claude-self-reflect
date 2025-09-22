@@ -54,9 +54,16 @@ def load_existing_cache(cache_file):
 
 def save_cache_atomic(cache_file, cache_data):
     """Save cache with atomic write."""
+    import tempfile
     try:
         cache_content = json.dumps(cache_data, indent=2)
-        cache_file.write_text(cache_content)
+        # Write to temp file first, then rename atomically
+        with tempfile.NamedTemporaryFile(mode='w', dir=cache_file.parent,
+                                         delete=False, suffix='.tmp') as tmp:
+            tmp.write(cache_content)
+            tmp_path = Path(tmp.name)
+        # Atomic rename
+        tmp_path.replace(cache_file)
     except:
         pass
 
