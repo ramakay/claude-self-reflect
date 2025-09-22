@@ -1,11 +1,11 @@
 {
-  "file": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/terrible_quality.py",
-  "timestamp": "2025-09-19T09:44:52.770968",
+  "file": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/.claude/hooks/quality-check.py",
+  "timestamp": "2025-09-19T12:48:33.596607",
   "language": "python",
   "engine": "ast-grep-py + unified registry",
   "registry_info": {
     "total_patterns_available": 44,
-    "patterns_matched": 5,
+    "patterns_matched": 4,
     "patterns_errored": 3,
     "categories_found": [
       "python_logging",
@@ -17,36 +17,21 @@
     "python_logging": [
       {
         "category": "python_logging",
-        "id": "print-call",
-        "description": "Print statement",
-        "quality": "bad",
-        "weight": -1,
-        "count": 18,
+        "id": "logger-call",
+        "description": "Logger usage",
+        "quality": "good",
+        "weight": 2,
+        "count": 2,
         "locations": [
           {
-            "line": 5,
-            "column": 0,
-            "text": "print(\"Bad 1\")"
+            "line": 255,
+            "column": 16,
+            "text": "logger.info(json.dumps(output))"
           },
           {
-            "line": 6,
-            "column": 0,
-            "text": "print(\"Bad 2\")"
-          },
-          {
-            "line": 7,
-            "column": 0,
-            "text": "print(\"Bad 3\")"
-          },
-          {
-            "line": 8,
-            "column": 0,
-            "text": "print(\"Bad 4\")"
-          },
-          {
-            "line": 9,
-            "column": 0,
-            "text": "print(\"Bad 5\")"
+            "line": 267,
+            "column": 12,
+            "text": "logger.error(f\"Quality check error: {e}\")"
           }
         ]
       }
@@ -58,12 +43,12 @@
         "description": "List comprehensions like `[x for x in range(10)]` are a concise way to create lists in Python. However, we can achieve better memory efficiency by using generator expressions like `(x for x in range(10))` instead. List comprehensions create the entire list in memory, while generator expressions generate each element one at a time. We can make the change by replacing the square brackets with parentheses.",
         "quality": "good",
         "weight": 3,
-        "count": 255,
+        "count": 1554,
         "locations": [
           {
             "line": 1,
             "column": 0,
-            "text": "#!/usr/bin/env python3\n\"\"\"File with terrible quality to trigger the hook.\"\"\"\n\n# "
+            "text": "#!/usr/bin/env python3\n\"\"\"\nQuality check hook for Claude Code PostToolUse events"
           },
           {
             "line": 1,
@@ -73,12 +58,12 @@
           {
             "line": 2,
             "column": 0,
-            "text": "\"\"\"File with terrible quality to trigger the hook.\"\"\""
+            "text": "\"\"\"\nQuality check hook for Claude Code PostToolUse events.\nAnalyzes code quality"
           },
           {
             "line": 2,
             "column": 0,
-            "text": "\"\"\"File with terrible quality to trigger the hook.\"\"\""
+            "text": "\"\"\"\nQuality check hook for Claude Code PostToolUse events.\nAnalyzes code quality"
           },
           {
             "line": 2,
@@ -93,32 +78,32 @@
         "description": "The walrus operator (`:=`) introduced in Python 3.8 allows you to assign values to variables as part of an expression. This rule aims to simplify code by using the walrus operator in `if` statements.\n\nThis first part of the rule identifies cases where a variable is assigned a value and then immediately used in an `if` statement to control flow.",
         "quality": "good",
         "weight": 3,
-        "count": 6,
+        "count": 21,
         "locations": [
           {
-            "line": 17,
-            "column": 0,
-            "text": "if True:\n    if True:\n        if True:\n            if True:\n                if T"
-          },
-          {
-            "line": 18,
-            "column": 4,
-            "text": "if True:\n        if True:\n            if True:\n                if True:\n        "
-          },
-          {
-            "line": 19,
+            "line": 30,
             "column": 8,
-            "text": "if True:\n            if True:\n                if True:\n                    print"
+            "text": "if \"nested\" in issue.lower() or \"refactor\" in issue.lower():\n            medium_"
           },
           {
-            "line": 20,
-            "column": 12,
-            "text": "if True:\n                if True:\n                    print(\"Too deep!\")"
+            "line": 37,
+            "column": 4,
+            "text": "if has_critical:\n        critical_count = max(1, critical_count)"
           },
           {
-            "line": 21,
-            "column": 16,
-            "text": "if True:\n                    print(\"Too deep!\")"
+            "line": 44,
+            "column": 4,
+            "text": "if not cache_file.exists():\n        return {}"
+          },
+          {
+            "line": 115,
+            "column": 4,
+            "text": "if quality_score is not None:\n        file_scores[file_path] = {\n            \"sc"
+          },
+          {
+            "line": 137,
+            "column": 8,
+            "text": "if tool_name not in [\"Edit\", \"Write\", \"MultiEdit\", \"NotebookEdit\"]:\n            "
           }
         ]
       }
@@ -126,46 +111,16 @@
     "python_complexity": [
       {
         "category": "python_complexity",
-        "id": "nested-if-depth-3",
-        "description": "Deeply nested if statements (3+ levels)",
+        "id": "long-function",
+        "description": "Long function (10+ statements)",
         "quality": "bad",
-        "weight": -4,
-        "count": 3,
+        "weight": -2,
+        "count": 1,
         "locations": [
           {
-            "line": 17,
+            "line": 101,
             "column": 0,
-            "text": "if True:\n    if True:\n        if True:\n            if True:\n                if T"
-          },
-          {
-            "line": 18,
-            "column": 4,
-            "text": "if True:\n        if True:\n            if True:\n                if True:\n        "
-          },
-          {
-            "line": 19,
-            "column": 8,
-            "text": "if True:\n            if True:\n                if True:\n                    print"
-          }
-        ]
-      },
-      {
-        "category": "python_complexity",
-        "id": "nested-loops",
-        "description": "Nested loops (performance risk)",
-        "quality": "bad",
-        "weight": -3,
-        "count": 2,
-        "locations": [
-          {
-            "line": 29,
-            "column": 0,
-            "text": "for i in range(10):\n    for j in range(10):\n        for k in range(10):\n        "
-          },
-          {
-            "line": 30,
-            "column": 4,
-            "text": "for j in range(10):\n        for k in range(10):\n            print(f\"{i},{j},{k}\""
+            "text": "def write_realtime_cache(file_path, quality_score, issues_found, has_critical, h"
           }
         ]
       }
@@ -174,36 +129,21 @@
   "all_matches": [
     {
       "category": "python_logging",
-      "id": "print-call",
-      "description": "Print statement",
-      "quality": "bad",
-      "weight": -1,
-      "count": 18,
+      "id": "logger-call",
+      "description": "Logger usage",
+      "quality": "good",
+      "weight": 2,
+      "count": 2,
       "locations": [
         {
-          "line": 5,
-          "column": 0,
-          "text": "print(\"Bad 1\")"
+          "line": 255,
+          "column": 16,
+          "text": "logger.info(json.dumps(output))"
         },
         {
-          "line": 6,
-          "column": 0,
-          "text": "print(\"Bad 2\")"
-        },
-        {
-          "line": 7,
-          "column": 0,
-          "text": "print(\"Bad 3\")"
-        },
-        {
-          "line": 8,
-          "column": 0,
-          "text": "print(\"Bad 4\")"
-        },
-        {
-          "line": 9,
-          "column": 0,
-          "text": "print(\"Bad 5\")"
+          "line": 267,
+          "column": 12,
+          "text": "logger.error(f\"Quality check error: {e}\")"
         }
       ]
     },
@@ -213,12 +153,12 @@
       "description": "List comprehensions like `[x for x in range(10)]` are a concise way to create lists in Python. However, we can achieve better memory efficiency by using generator expressions like `(x for x in range(10))` instead. List comprehensions create the entire list in memory, while generator expressions generate each element one at a time. We can make the change by replacing the square brackets with parentheses.",
       "quality": "good",
       "weight": 3,
-      "count": 255,
+      "count": 1554,
       "locations": [
         {
           "line": 1,
           "column": 0,
-          "text": "#!/usr/bin/env python3\n\"\"\"File with terrible quality to trigger the hook.\"\"\"\n\n# "
+          "text": "#!/usr/bin/env python3\n\"\"\"\nQuality check hook for Claude Code PostToolUse events"
         },
         {
           "line": 1,
@@ -228,12 +168,12 @@
         {
           "line": 2,
           "column": 0,
-          "text": "\"\"\"File with terrible quality to trigger the hook.\"\"\""
+          "text": "\"\"\"\nQuality check hook for Claude Code PostToolUse events.\nAnalyzes code quality"
         },
         {
           "line": 2,
           "column": 0,
-          "text": "\"\"\"File with terrible quality to trigger the hook.\"\"\""
+          "text": "\"\"\"\nQuality check hook for Claude Code PostToolUse events.\nAnalyzes code quality"
         },
         {
           "line": 2,
@@ -248,77 +188,47 @@
       "description": "The walrus operator (`:=`) introduced in Python 3.8 allows you to assign values to variables as part of an expression. This rule aims to simplify code by using the walrus operator in `if` statements.\n\nThis first part of the rule identifies cases where a variable is assigned a value and then immediately used in an `if` statement to control flow.",
       "quality": "good",
       "weight": 3,
-      "count": 6,
+      "count": 21,
       "locations": [
-        {
-          "line": 17,
-          "column": 0,
-          "text": "if True:\n    if True:\n        if True:\n            if True:\n                if T"
-        },
-        {
-          "line": 18,
-          "column": 4,
-          "text": "if True:\n        if True:\n            if True:\n                if True:\n        "
-        },
-        {
-          "line": 19,
-          "column": 8,
-          "text": "if True:\n            if True:\n                if True:\n                    print"
-        },
-        {
-          "line": 20,
-          "column": 12,
-          "text": "if True:\n                if True:\n                    print(\"Too deep!\")"
-        },
-        {
-          "line": 21,
-          "column": 16,
-          "text": "if True:\n                    print(\"Too deep!\")"
-        }
-      ]
-    },
-    {
-      "category": "python_complexity",
-      "id": "nested-if-depth-3",
-      "description": "Deeply nested if statements (3+ levels)",
-      "quality": "bad",
-      "weight": -4,
-      "count": 3,
-      "locations": [
-        {
-          "line": 17,
-          "column": 0,
-          "text": "if True:\n    if True:\n        if True:\n            if True:\n                if T"
-        },
-        {
-          "line": 18,
-          "column": 4,
-          "text": "if True:\n        if True:\n            if True:\n                if True:\n        "
-        },
-        {
-          "line": 19,
-          "column": 8,
-          "text": "if True:\n            if True:\n                if True:\n                    print"
-        }
-      ]
-    },
-    {
-      "category": "python_complexity",
-      "id": "nested-loops",
-      "description": "Nested loops (performance risk)",
-      "quality": "bad",
-      "weight": -3,
-      "count": 2,
-      "locations": [
-        {
-          "line": 29,
-          "column": 0,
-          "text": "for i in range(10):\n    for j in range(10):\n        for k in range(10):\n        "
-        },
         {
           "line": 30,
+          "column": 8,
+          "text": "if \"nested\" in issue.lower() or \"refactor\" in issue.lower():\n            medium_"
+        },
+        {
+          "line": 37,
           "column": 4,
-          "text": "for j in range(10):\n        for k in range(10):\n            print(f\"{i},{j},{k}\""
+          "text": "if has_critical:\n        critical_count = max(1, critical_count)"
+        },
+        {
+          "line": 44,
+          "column": 4,
+          "text": "if not cache_file.exists():\n        return {}"
+        },
+        {
+          "line": 115,
+          "column": 4,
+          "text": "if quality_score is not None:\n        file_scores[file_path] = {\n            \"sc"
+        },
+        {
+          "line": 137,
+          "column": 8,
+          "text": "if tool_name not in [\"Edit\", \"Write\", \"MultiEdit\", \"NotebookEdit\"]:\n            "
+        }
+      ]
+    },
+    {
+      "category": "python_complexity",
+      "id": "long-function",
+      "description": "Long function (10+ statements)",
+      "quality": "bad",
+      "weight": -2,
+      "count": 1,
+      "locations": [
+        {
+          "line": 101,
+          "column": 0,
+          "text": "def write_realtime_cache(file_path, quality_score, issues_found, has_critical, h"
         }
       ]
     }
@@ -341,15 +251,14 @@
     }
   ],
   "quality_metrics": {
-    "quality_score": 0.508,
-    "good_patterns_found": 261,
-    "bad_patterns_found": 23,
-    "unique_patterns_matched": 5,
-    "total_issues": 23,
-    "total_good_practices": 261
+    "quality_score": 0.885,
+    "good_patterns_found": 1577,
+    "bad_patterns_found": 1,
+    "unique_patterns_matched": 4,
+    "total_issues": 1,
+    "total_good_practices": 1577
   },
   "recommendations": [
-    "\ud83d\udfe1 Warning: Several anti-patterns detected",
-    "Replace 18 print statements with logger"
+    "\ud83d\udfe2 Good: Code follows most best practices"
   ]
 }

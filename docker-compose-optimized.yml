@@ -31,8 +31,8 @@ services:
     image: claude-reflection-watcher:latest
     container_name: claude-reflection-safe-watcher
     volumes:
-      - ~/.claude:/app/claude_conversations:ro
-      - ~/.claude-self-reflect:/app/.claude-self-reflect
+      - ${HOME}/.claude:/app/claude_conversations:ro
+      - ${HOME}/.claude-self-reflect:/app/.claude-self-reflect
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - QDRANT_URL=http://qdrant:6333

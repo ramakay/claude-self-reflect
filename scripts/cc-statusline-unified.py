@@ -149,6 +149,38 @@ def format_statusline_quality(critical=0, medium=0, low=0):
 
 def get_session_health():
     """Get cached session health with icon-based quality display."""
+    # First check realtime cache (highest priority)
+    realtime_cache = Path.home() / ".claude-self-reflect" / "realtime_quality.json"
+
+    if realtime_cache.exists():
+        try:
+            # Check realtime cache age
+            mtime = datetime.fromtimestamp(realtime_cache.stat().st_mtime)
+            age = datetime.now() - mtime
+
+            if age < timedelta(minutes=5):  # Fresh realtime data
+                with open(realtime_cache, 'r') as f:
+                    realtime_data = json.load(f)
+
+                if "session_aggregate" in realtime_data:
+                    agg = realtime_data["session_aggregate"]
+                    issues = agg.get("total_issues", {})
+                    critical = issues.get("critical", 0)
+                    medium = issues.get("medium", 0)
+                    low = issues.get("low", 0)
+
+                    # Include score in display if significantly below threshold
+                    score = agg.get("average_score", 100)
+                    if score < 70:
+                        # Use red icon for scores below threshold
+                        icon = "🔴"
+                        return f"{icon} {score:.0f}%"
+                    else:
+                        return format_statusline_quality(critical, medium, low)
+        except Exception:
+            pass  # Fall back to session_quality.json
+
+    # Fall back to session_quality.json
     cache_file = Path.home() / ".claude-self-reflect" / "session_quality.json"
 
     if not cache_file.exists():

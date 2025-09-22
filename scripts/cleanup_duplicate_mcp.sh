@@ -8,15 +8,15 @@ cleanup_duplicates() {
     local pattern="$1"
     local name="$2"
 
-    # Get all PIDs for this pattern, sorted by start time (oldest first)
-    pids=$(ps aux | grep -E "$pattern" | grep -v grep | awk '{print $2}' | head -n -1)
+    # Get all PIDs, keep newest (highest PID), kill the rest
+    pids=$(pgrep -f "$pattern" | sort -n | head -n -1)
 
     if [ -n "$pids" ]; then
         count=$(echo "$pids" | wc -l | tr -d ' ')
         echo "  Found $((count + 1)) $name processes, keeping newest, killing $count duplicates"
         for pid in $pids; do
             echo "    Killing PID $pid"
-            kill -TERM $pid 2>/dev/null
+            kill -TERM "$pid" 2>/dev/null || true
         done
     else
         total=$(ps aux | grep -E "$pattern" | grep -v grep | wc -l)

@@ -80,7 +80,7 @@ async def check_ast_grep_coverage():
 
                 # Check for quality scores
                 if "quality_score" in payload:
-                    if "quality_score" not in collection_stats:
+                    if "quality_score_range" not in collection_stats:
                         collection_stats["quality_score_range"] = {
                             "min": payload["quality_score"],
                             "max": payload["quality_score"]
