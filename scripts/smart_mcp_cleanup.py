@@ -8,11 +8,18 @@ from collections import defaultdict
 
 def get_mcp_processes():
     """Get all MCP-related processes with details."""
-    cmd = "ps aux | grep -E 'mcp|context7|playwright|zen-mcp|memento|mantis|blender'"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # Use proper argument list instead of shell=True
+    ps_result = subprocess.run(['ps', 'aux'], capture_output=True, text=True, timeout=5)
+    grep_pattern = 'mcp|context7|playwright|zen-mcp|memento|mantis|blender'
+
+    # Filter lines manually instead of using shell pipe
+    lines = ps_result.stdout.strip().split('\n')
+    filtered_lines = [line for line in lines if any(keyword in line.lower()
+                     for keyword in ['mcp', 'context7', 'playwright', 'zen-mcp',
+                                     'memento', 'mantis', 'blender'])]
 
     processes = []
-    for line in result.stdout.strip().split('\n'):
+    for line in filtered_lines:
         if 'grep' in line:
             continue
 
@@ -77,7 +84,8 @@ def cleanup_duplicates(grouped):
         kept.append(procs[0])
         for proc in procs[1:]:
             try:
-                subprocess.run(f"kill -TERM {proc['pid']}", shell=True, check=False)
+                # Use proper argument list instead of shell=True
+                subprocess.run(['kill', '-TERM', proc['pid']], check=False, timeout=2)
                 killed.append(proc)
             except:
                 pass
