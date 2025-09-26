@@ -57,7 +57,9 @@ class MetadataExtractor:
                             message_count += 1
 
                         if text_content:
-                            all_text.append(text_content[:1000])
+                            # Limit text accumulation to prevent memory issues
+                            if len(all_text) < MAX_CONCEPT_MESSAGES:
+                                all_text.append(text_content[:1000])
 
         except Exception as e:
             logger.warning(f"Error extracting metadata: {e}")
@@ -107,9 +109,11 @@ class MetadataExtractor:
                 return self._process_tool_entry(data, metadata)
 
         except json.JSONDecodeError:
+            # Expected for non-JSON lines, skip silently
             pass
-        except Exception:
-            pass
+        except (KeyError, TypeError, ValueError) as e:
+            # Log specific parsing errors for debugging
+            logger.debug(f"Error parsing line: {e}")
 
         return None
 

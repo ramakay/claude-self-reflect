@@ -12,15 +12,17 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Constants for metadata limits
-MAX_CONCEPTS = 10
-MAX_AST_ELEMENTS = 30
-MAX_CODE_BLOCKS = 5
-MAX_ELEMENTS_PER_BLOCK = 10
-MAX_FILES_ANALYZED = 20
-MAX_FILES_EDITED = 20
-MAX_TOOLS_USED = 15
-MAX_CONCEPT_MESSAGES = 50
+# Constants for metadata limits (can be overridden via environment variables)
+import os
+
+MAX_CONCEPTS = int(os.getenv("MAX_CONCEPTS", "10"))
+MAX_AST_ELEMENTS = int(os.getenv("MAX_AST_ELEMENTS", "30"))
+MAX_CODE_BLOCKS = int(os.getenv("MAX_CODE_BLOCKS", "5"))
+MAX_ELEMENTS_PER_BLOCK = int(os.getenv("MAX_ELEMENTS_PER_BLOCK", "10"))
+MAX_FILES_ANALYZED = int(os.getenv("MAX_FILES_ANALYZED", "20"))
+MAX_FILES_EDITED = int(os.getenv("MAX_FILES_EDITED", "20"))
+MAX_TOOLS_USED = int(os.getenv("MAX_TOOLS_USED", "15"))
+MAX_CONCEPT_MESSAGES = int(os.getenv("MAX_CONCEPT_MESSAGES", "50"))
 
 
 class MessageProcessor(ABC):

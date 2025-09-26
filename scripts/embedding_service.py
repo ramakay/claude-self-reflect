@@ -77,16 +77,16 @@ class CloudEmbeddingProvider(EmbeddingProvider):
     """Cloud embedding provider using Voyage AI."""
 
     def __init__(self, api_key: str):
-        self.api_key = api_key
+        # Don't store API key directly, use it only for client initialization
         self.client = None
         self.dimension = 1024
-        self._initialize_client()
+        self._initialize_client(api_key)
 
-    def _initialize_client(self):
+    def _initialize_client(self, api_key: str):
         """Initialize the Voyage AI client."""
         try:
             import voyageai
-            self.client = voyageai.Client(api_key=self.api_key)
+            self.client = voyageai.Client(api_key=api_key)
             logger.info("Initialized Voyage AI client (1024 dimensions)")
         except ImportError:
             logger.error("voyageai not installed. Install with: pip install voyageai")
@@ -157,9 +157,13 @@ class EmbeddingService:
 
     def _fallback_to_cloud(self):
         """Fallback to cloud provider."""
+        if not self.voyage_api_key:
+            raise RuntimeError("No Voyage API key available for cloud fallback")
         try:
             self.provider = CloudEmbeddingProvider(self.voyage_api_key)
             logger.info("Fallback to cloud embedding provider")
+            # Clear the key after use
+            self.voyage_api_key = None
         except Exception as e:
             raise RuntimeError(f"Failed to initialize any embedding provider: {e}")
 

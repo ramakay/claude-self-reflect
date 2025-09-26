@@ -7,7 +7,7 @@ import gc
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Generator
 from datetime import datetime
 
 from message_processors import MessageProcessorFactory
@@ -55,7 +55,7 @@ class MessageStreamReader:
         self.processor_factory = MessageProcessorFactory()
         self.current_message_index = 0
 
-    def read_messages(self, file_path: Path):
+    def read_messages(self, file_path: Path) -> Generator[Dict[str, Any], None, None]:
         """Generator that yields processed messages from a JSONL file."""
         self.current_message_index = 0
 
@@ -209,11 +209,13 @@ class StreamImportStrategy(ImportStrategy):
     This is the main refactored implementation.
     """
 
-    def __init__(self, client, process_chunk_fn, state_manager, max_chunk_size: int = 50):
+    def __init__(self, client, process_chunk_fn, state_manager, max_chunk_size: int = 50,
+                 cleanup_tolerance: int = 5):
         self.client = client
         self.process_chunk_fn = process_chunk_fn
         self.state_manager = state_manager
         self.max_chunk_size = max_chunk_size
+        self.cleanup_tolerance = cleanup_tolerance  # Configurable tolerance for old point cleanup
         self.stream_reader = MessageStreamReader()
 
     def import_file(self, jsonl_file: Path, collection_name: str, project_path: Path) -> int:
@@ -274,7 +276,7 @@ class StreamImportStrategy(ImportStrategy):
     def _process_buffer(self, chunk_buffer: ChunkBuffer, chunk_index: int,
                         conversation_id: str, created_at: str, metadata: Dict[str, Any],
                         collection_name: str, project_path: Path, total_messages: int) -> int:
-        """Process a buffer of messages."""
+        """Process a buffer of messages and return number of chunks created."""
         messages = chunk_buffer.get_and_clear()
         return self.process_chunk_fn(
             messages, chunk_index, conversation_id,
@@ -296,7 +298,7 @@ class StreamImportStrategy(ImportStrategy):
                 limit=1
             )[0]
 
-            if len(old_points) > total_chunks + 5:  # Allow some tolerance
+            if len(old_points) > total_chunks + self.cleanup_tolerance:
                 self.client.delete(
                     collection_name=collection_name,
                     points_selector=old_count_filter,

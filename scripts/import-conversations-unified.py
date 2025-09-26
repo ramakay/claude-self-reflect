@@ -266,8 +266,16 @@ class ConversationImporter:
                 continue
 
             try:
+                # Calculate expected chunks based on file size
+                file_size = jsonl_file.stat().st_size
+                expected_chunks = max(1, file_size // (1024 * 100))  # Rough estimate
+
                 chunks = self.import_file(jsonl_file, collection_name, project_path)
+
+                # Validate chunk count is reasonable
                 if chunks > 0:
+                    if chunks > expected_chunks * 10:
+                        logger.warning(f"Unusual chunk count for {jsonl_file.name}: {chunks} chunks (expected ~{expected_chunks})")
                     stats["imported"] += 1
                 else:
                     stats["failed"] += 1

@@ -1,7 +1,7 @@
 {
   "source": "unified-ast-grep-auto-updated",
   "version": "3.0.0",
-  "timestamp": "2025-09-19T09:13:32.536967",
+  "timestamp": "2025-09-25T20:55:42.702664",
   "patterns": {
     "python_async": [
       {
@@ -1177,166 +1177,10 @@
         "quality": "good",
         "weight": 3
       }
-    ],
-    "python_complexity": [
-      {
-        "id": "nested-if-depth-3",
-        "pattern": "if $COND1:\n    $$$\n    if $COND2:\n        $$$\n        if $COND3:\n            $$$",
-        "description": "Deeply nested if statements (3+ levels)",
-        "quality": "bad",
-        "weight": -4,
-        "severity": "medium",
-        "language": "python",
-        "category": "python_complexity"
-      },
-      {
-        "id": "complex-condition",
-        "pattern": "if $A and $B and $C and $D",
-        "description": "Complex conditional with 4+ conditions",
-        "quality": "bad",
-        "weight": -2,
-        "severity": "low",
-        "language": "python",
-        "category": "python_complexity"
-      },
-      {
-        "id": "nested-loops",
-        "pattern": "for $VAR1 in $ITER1:\n    $$$\n    for $VAR2 in $ITER2:\n        $$$",
-        "description": "Nested loops (performance risk)",
-        "quality": "bad",
-        "weight": -3,
-        "severity": "medium",
-        "language": "python",
-        "category": "python_complexity"
-      },
-      {
-        "id": "multiple-elif",
-        "pattern": "if $COND1:\n    $$$\nelif $COND2:\n    $$$\nelif $COND3:\n    $$$\nelif $COND4:\n    $$$\nelif $COND5:\n    $$$",
-        "description": "Many elif branches (5+)",
-        "quality": "bad",
-        "weight": -3,
-        "severity": "medium",
-        "language": "python",
-        "category": "python_complexity"
-      },
-      {
-        "id": "long-function",
-        "pattern": "def $FUNC($$$):\n    $LINE1\n    $LINE2\n    $LINE3\n    $LINE4\n    $LINE5\n    $LINE6\n    $LINE7\n    $LINE8\n    $LINE9\n    $LINE10\n    $$$",
-        "description": "Long function (10+ statements)",
-        "quality": "bad",
-        "weight": -2,
-        "severity": "low",
-        "language": "python",
-        "category": "python_complexity"
-      }
-    ],
-    "typescript_complexity": [
-      {
-        "id": "nested-if-depth-3-ts",
-        "pattern": "if ($COND1) {\n  $$$\n  if ($COND2) {\n    $$$\n    if ($COND3) {\n      $$$\n    }\n  }\n}",
-        "description": "Deeply nested if statements (3+ levels)",
-        "quality": "bad",
-        "weight": -4,
-        "severity": "medium",
-        "language": "typescript",
-        "category": "typescript_complexity"
-      },
-      {
-        "id": "complex-condition-ts",
-        "pattern": "if ($A && $B && $C && $D)",
-        "description": "Complex conditional with 4+ conditions",
-        "quality": "bad",
-        "weight": -2,
-        "severity": "low",
-        "language": "typescript",
-        "category": "typescript_complexity"
-      },
-      {
-        "id": "nested-loops-ts",
-        "pattern": "for ($INIT1; $COND1; $INC1) {\n  $$$\n  for ($INIT2; $COND2; $INC2) {\n    $$$\n  }\n}",
-        "description": "Nested loops (performance risk)",
-        "quality": "bad",
-        "weight": -3,
-        "severity": "medium",
-        "language": "typescript",
-        "category": "typescript_complexity"
-      },
-      {
-        "id": "callback-hell",
-        "pattern": "$FUNC1(($ARG1) => {\n  $$$\n  $FUNC2(($ARG2) => {\n    $$$\n    $FUNC3(($ARG3) => {\n      $$$\n    })\n  })\n})",
-        "description": "Callback hell (3+ levels)",
-        "quality": "bad",
-        "weight": -4,
-        "severity": "high",
-        "language": "typescript",
-        "category": "typescript_complexity"
-      },
-      {
-        "id": "switch-many-cases",
-        "pattern": "switch ($VAR) {\n  case $CASE1:\n    $$$\n  case $CASE2:\n    $$$\n  case $CASE3:\n    $$$\n  case $CASE4:\n    $$$\n  case $CASE5:\n    $$$\n  case $CASE6:\n    $$$\n  case $CASE7:\n    $$$\n}",
-        "description": "Switch with many cases (7+)",
-        "quality": "bad",
-        "weight": -3,
-        "severity": "medium",
-        "language": "typescript",
-        "category": "typescript_complexity"
-      }
-    ],
-    "javascript_complexity": [
-      {
-        "id": "nested-if-depth-3-js",
-        "pattern": "if ($COND1) {\n  $$$\n  if ($COND2) {\n    $$$\n    if ($COND3) {\n      $$$\n    }\n  }\n}",
-        "description": "Deeply nested if statements (3+ levels)",
-        "quality": "bad",
-        "weight": -4,
-        "severity": "medium",
-        "language": "javascript",
-        "category": "javascript_complexity"
-      },
-      {
-        "id": "complex-condition-js",
-        "pattern": "if ($A && $B && $C && $D)",
-        "description": "Complex conditional with 4+ conditions",
-        "quality": "bad",
-        "weight": -2,
-        "severity": "low",
-        "language": "javascript",
-        "category": "javascript_complexity"
-      },
-      {
-        "id": "nested-loops-js",
-        "pattern": "for ($INIT1; $COND1; $INC1) {\n  $$$\n  for ($INIT2; $COND2; $INC2) {\n    $$$\n  }\n}",
-        "description": "Nested loops (performance risk)",
-        "quality": "bad",
-        "weight": -3,
-        "severity": "medium",
-        "language": "javascript",
-        "category": "javascript_complexity"
-      },
-      {
-        "id": "callback-hell",
-        "pattern": "$FUNC1(($ARG1) => {\n  $$$\n  $FUNC2(($ARG2) => {\n    $$$\n    $FUNC3(($ARG3) => {\n      $$$\n    })\n  })\n})",
-        "description": "Callback hell (3+ levels)",
-        "quality": "bad",
-        "weight": -4,
-        "severity": "high",
-        "language": "javascript",
-        "category": "javascript_complexity"
-      },
-      {
-        "id": "switch-many-cases",
-        "pattern": "switch ($VAR) {\n  case $CASE1:\n    $$$\n  case $CASE2:\n    $$$\n  case $CASE3:\n    $$$\n  case $CASE4:\n    $$$\n  case $CASE5:\n    $$$\n  case $CASE6:\n    $$$\n  case $CASE7:\n    $$$\n}",
-        "description": "Switch with many cases (7+)",
-        "quality": "bad",
-        "weight": -3,
-        "severity": "medium",
-        "language": "javascript",
-        "category": "javascript_complexity"
-      }
     ]
   },
   "stats": {
-    "total_patterns": 74,
+    "total_patterns": 59,
     "categories": [
       "python_async",
       "python_error_handling",
@@ -1356,25 +1200,22 @@
       "cpp_catalog",
       "yaml_catalog",
       "c_catalog",
-      "ruby_catalog",
-      "python_complexity",
-      "typescript_complexity",
-      "javascript_complexity"
+      "ruby_catalog"
     ],
     "languages": [
-      "java",
-      "cpp",
-      "kotlin",
-      "rust",
-      "ruby",
-      "tsx",
-      "c",
-      "yaml",
-      "python",
       "typescript",
+      "kotlin",
+      "java",
+      "go",
+      "yaml",
+      "c",
+      "ruby",
       "html",
-      "go"
+      "cpp",
+      "rust",
+      "tsx",
+      "python"
     ],
-    "last_update": "2025-09-17T13:35:10.444745"
+    "last_update": "2025-09-25T20:55:42.702689"
   }
 }
