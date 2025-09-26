@@ -9,6 +9,8 @@ import sys
 import gc
 import argparse
 import logging
+import hashlib
+import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -104,11 +106,11 @@ class ConversationImporter:
         if not messages:
             return 0
 
-        # Extract text for embedding
-        texts = [msg['content'] for msg in messages]
+        # Combine all message content into a single text for the chunk
+        combined_text = "\n".join([msg['content'] for msg in messages])
 
-        # Generate embeddings
-        embeddings = self.embedding_service.generate_embeddings(texts)
+        # Generate a single embedding for the entire chunk
+        embeddings = self.embedding_service.generate_embeddings([combined_text])
         if not embeddings:
             return 0
 
@@ -137,7 +139,10 @@ class ConversationImporter:
     ) -> List[PointStruct]:
         """Create Qdrant points from messages and embeddings."""
         points = []
-        chunk_id = f"{conversation_id}_chunk_{chunk_index}"
+        # Generate a proper UUID for the chunk ID
+        # Use a deterministic UUID based on conversation_id and chunk_index for consistency
+        chunk_string = f"{conversation_id}_chunk_{chunk_index}"
+        chunk_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk_string))
 
         # Build conversation snippet
         snippet_parts = []
@@ -147,10 +152,11 @@ class ConversationImporter:
             snippet_parts.append(f"{role}: {content}")
         conversation_snippet = "\n".join(snippet_parts)
 
-        # Create point
+        # Create point with proper vector format
+        # Always use the first embedding for a chunk (combining messages into one embedding)
         point = PointStruct(
-            id=chunk_id,
-            vector=embeddings[0] if len(embeddings) == 1 else embeddings,
+            id=chunk_uuid,
+            vector=embeddings[0],
             payload={
                 "conversation_id": conversation_id,
                 "chunk_index": chunk_index,
@@ -189,9 +195,12 @@ class ConversationImporter:
         if not file_path.exists() or file_path.stat().st_size == 0:
             return False
 
-        # Check state manager
-        file_state = self.state_manager.get_file_state(str(file_path))
-        if file_state:
+        # Check if file was already imported
+        imported_files = self.state_manager.get_imported_files()
+        normalized_path = self.state_manager.normalize_path(str(file_path))
+
+        if normalized_path in imported_files.get('files', {}):
+            file_state = imported_files['files'][normalized_path]
             file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
             state_mtime = datetime.fromisoformat(file_state.get('modified_time', ''))
             if file_mtime <= state_mtime:
@@ -223,14 +232,11 @@ class ConversationImporter:
     def update_file_state(self, file_path: Path, chunks: int, collection_name: str):
         """Update state for successfully imported file."""
         try:
-            self.state_manager.update_file_import(
-                str(file_path),
-                datetime.now().isoformat(),
-                {
-                    'chunks': chunks,
-                    'collection': collection_name,
-                    'embedding_model': self.embedding_service.get_provider_name()
-                }
+            self.state_manager.add_imported_file(
+                file_path=str(file_path),
+                chunks=chunks,
+                collection=collection_name,
+                embedding_mode="local" if "Local" in self.embedding_service.get_provider_name() else "cloud"
             )
             logger.debug(f"Updated state for {file_path.name}")
         except Exception as e:
