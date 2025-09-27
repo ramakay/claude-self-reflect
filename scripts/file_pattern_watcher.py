@@ -88,7 +88,7 @@ class FilePatternWatcher:
         """Analyze patterns in a specific file."""
         try:
             # Expand path
-            expanded_path = os.path.expanduser(file_path.replace('~/', '/Users/ramakrishnanannaswamy/'))
+            expanded_path = os.path.expanduser(file_path)
 
             if not os.path.exists(expanded_path):
                 return {'error': f'File not found: {file_path}'}
@@ -233,7 +233,11 @@ def demo_watcher():
     watcher = FilePatternWatcher()
 
     # Test on current conversation
-    test_file = '/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/167aec1d-9226-48a2-9a9b-dc18c679532c.jsonl'
+    # Use home directory for test file
+    test_file = os.path.join(
+        os.path.expanduser("~"),
+        ".claude/projects/-Users-" + os.path.expanduser("~").replace("/", "-") + "-projects-claude-self-reflect/167aec1d-9226-48a2-9a9b-dc18c679532c.jsonl"
+    )
 
     print("File Pattern Watcher Demo")
     print("=" * 60)

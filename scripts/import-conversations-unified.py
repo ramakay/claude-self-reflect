@@ -195,17 +195,24 @@ class ConversationImporter:
         if not file_path.exists() or file_path.stat().st_size == 0:
             return False
 
-        # Check if file was already imported
+        # Check if file was already imported using UnifiedStateManager API
         imported_files = self.state_manager.get_imported_files()
         normalized_path = self.state_manager.normalize_path(str(file_path))
 
-        if normalized_path in imported_files.get('files', {}):
-            file_state = imported_files['files'][normalized_path]
+        # UnifiedStateManager returns files directly, not nested in 'files' key
+        file_state = imported_files.get(normalized_path)
+        if file_state:
             file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
-            state_mtime = datetime.fromisoformat(file_state.get('modified_time', ''))
-            if file_mtime <= state_mtime:
-                logger.debug(f"Skipping {file_path.name} - already imported")
-                return False
+            # Handle both old and new timestamp field names
+            state_mtime_str = file_state.get('last_modified') or file_state.get('imported_at')
+            if state_mtime_str:
+                try:
+                    state_mtime = datetime.fromisoformat(state_mtime_str)
+                    if file_mtime <= state_mtime:
+                        logger.debug(f"Skipping {file_path.name} - already imported")
+                        return False
+                except ValueError:
+                    logger.debug(f"Invalid timestamp in state for {file_path.name}; will re-import")
 
         return True
 

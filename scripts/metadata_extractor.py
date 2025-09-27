@@ -177,7 +177,8 @@ class MetadataExtractor:
         try:
             data = json.loads(line)
             return data.get('timestamp')
-        except:
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.debug(f"Failed to extract timestamp: {e}")
             return None
 
     def _post_process_metadata(self, metadata: Dict[str, Any], all_text: list, file_path: str):

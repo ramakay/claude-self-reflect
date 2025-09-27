@@ -150,7 +150,9 @@ async def main():
     print(f"Overall pattern coverage: {stats.get('overall_pattern_percentage', 0):.1f}%")
 
     # Save detailed report
-    report_path = "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/docs/analysis/ast-grep-coverage-report.json"
+    # Use relative path from script location
+    script_dir = Path(__file__).parent
+    report_path = script_dir.parent / "docs" / "analysis" / "ast-grep-coverage-report.json"
     os.makedirs(os.path.dirname(report_path), exist_ok=True)
 
     with open(report_path, "w") as f:

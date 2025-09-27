@@ -265,7 +265,10 @@ def run_final_analysis(file_path=None):
     analyzer = FinalASTGrepAnalyzer()
 
     # Use provided path or default
-    server_path = file_path if file_path else "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/src/server.py"
+    # Use relative path from script location
+    script_dir = Path(__file__).parent
+    default_path = script_dir.parent / "mcp-server" / "src" / "server.py"
+    server_path = file_path if file_path else str(default_path)
 
     print(f"\nAnalyzing: {server_path}")
     print("-" * 40)
@@ -299,14 +302,14 @@ def run_final_analysis(file_path=None):
 
         # Generate and save report
         report = analyzer.generate_report(result)
-        report_path = "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/scripts/final_analysis_report.md"
+        report_path = script_dir / "final_analysis_report.md"
         with open(report_path, 'w') as f:
             f.write(report)
 
         print(f"\n📝 Full report saved to: {report_path}")
 
         # Save JSON results
-        json_path = "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/scripts/final_analysis_result.json"
+        json_path = script_dir / "final_analysis_result.json"
         with open(json_path, 'w') as f:
             json.dump(result, f, indent=2)
 
@@ -331,5 +334,5 @@ if __name__ == "__main__":
         file_path = sys.argv[1]
     else:
         # Default to server.py
-        file_path = "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/src/server.py"
+        file_path = str(default_path)  # Use the same default path from above
     run_final_analysis(file_path)

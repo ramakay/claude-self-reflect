@@ -48,9 +48,9 @@ from shared.normalization import normalize_project_name
 import hashlib
 
 test_paths = [
-    "/Users/ramakrishnanannaswamy/projects/claude-self-reflect",
-    "/Users/ramakrishnanannaswamy/projects/memento",
-    "/Users/ramakrishnanannaswamy/projects/cc-enhance"
+    str(Path.home() / "projects" / "claude-self-reflect"),
+    str(Path.home() / "projects" / "memento"),
+    str(Path.home() / "projects" / "cc-enhance")
 ]
 
 for path in test_paths:

@@ -4,6 +4,7 @@ Import strategies using Strategy pattern to reduce complexity of stream_import_f
 
 import json
 import gc
+import os
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -31,9 +32,15 @@ class ChunkBuffer:
         self.buffer: List[Dict[str, Any]] = []
         self.max_size = max_size
         self.current_index = 0
+        # Add memory limit for message content
+        self.max_content_length = int(os.getenv('MAX_MESSAGE_CONTENT_LENGTH', '5000'))
 
     def add(self, message: Dict[str, Any]) -> bool:
         """Add a message to the buffer. Returns True if buffer is full."""
+        # Truncate long content to prevent memory issues
+        if 'content' in message and len(message['content']) > self.max_content_length:
+            message = message.copy()
+            message['content'] = message['content'][:self.max_content_length] + '...[truncated]'
         self.buffer.append(message)
         return len(self.buffer) >= self.max_size
 
@@ -210,12 +217,13 @@ class StreamImportStrategy(ImportStrategy):
     """
 
     def __init__(self, client, process_chunk_fn, state_manager, max_chunk_size: int = 50,
-                 cleanup_tolerance: int = 5):
+                 cleanup_tolerance: int = None):
         self.client = client
         self.process_chunk_fn = process_chunk_fn
         self.state_manager = state_manager
         self.max_chunk_size = max_chunk_size
-        self.cleanup_tolerance = cleanup_tolerance  # Configurable tolerance for old point cleanup
+        # Make cleanup tolerance configurable via environment variable
+        self.cleanup_tolerance = cleanup_tolerance or int(os.getenv('CLEANUP_TOLERANCE', '5'))
         self.stream_reader = MessageStreamReader()
 
     def import_file(self, jsonl_file: Path, collection_name: str, project_path: Path) -> int:
@@ -307,7 +315,7 @@ class StreamImportStrategy(ImportStrategy):
                 logger.info(f"Deleted old points for conversation {conversation_id}")
 
         except Exception as e:
-            logger.warning(f"Could not clean up old points for {conversation_id}: {e}")
+            logger.debug(f"Could not clean up old points for {conversation_id}: {e}")
 
     def _mark_failed(self, jsonl_file: Path, error: str):
         """Mark a file as failed in state manager."""

@@ -45,11 +45,11 @@ class LocalEmbeddingProvider(EmbeddingProvider):
             from fastembed import TextEmbedding
             self.model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
             logger.info("Initialized local FastEmbed model (384 dimensions)")
-        except ImportError:
+        except ImportError as e:
             logger.error("FastEmbed not installed. Install with: pip install fastembed")
             raise
         except Exception as e:
-            logger.error(f"Failed to initialize FastEmbed: {e}")
+            logger.exception(f"Failed to initialize FastEmbed: {e}")
             raise
 
     def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
@@ -88,11 +88,11 @@ class CloudEmbeddingProvider(EmbeddingProvider):
             import voyageai
             self.client = voyageai.Client(api_key=api_key)
             logger.info("Initialized Voyage AI client (1024 dimensions)")
-        except ImportError:
+        except ImportError as e:
             logger.error("voyageai not installed. Install with: pip install voyageai")
             raise
         except Exception as e:
-            logger.error(f"Failed to initialize Voyage AI: {e}")
+            logger.exception(f"Failed to initialize Voyage AI: {e}")
             raise
 
     def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
