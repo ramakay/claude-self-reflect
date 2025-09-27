@@ -127,7 +127,7 @@ class UnifiedStateManager:
         if HAS_FILELOCK:
             lock = filelock.FileLock(str(self.lock_file), timeout=timeout)
             try:
-                with lock.acquire(timeout=timeout):
+                with lock:
                     yield lock
             except filelock.Timeout:
                 raise TimeoutError(f"Could not acquire lock within {timeout} seconds")
