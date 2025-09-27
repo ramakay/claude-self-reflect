@@ -61,7 +61,10 @@ class ConversationImporter:
         self.import_strategy = None
 
     def _init_qdrant_client(self) -> QdrantClient:
-        """Initialize Qdrant client."""
+        """Initialize Qdrant client with optional authentication."""
+        api_key = os.getenv("QDRANT_API_KEY")
+        if api_key:
+            return QdrantClient(url=QDRANT_URL, api_key=api_key, timeout=30)
         return QdrantClient(url=QDRANT_URL, timeout=30)
 
     def _init_state_manager(self) -> UnifiedStateManager:

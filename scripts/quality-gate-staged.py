@@ -12,6 +12,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import time
+from typing import ClassVar
 
 # Try to import AST-GREP, fall back to simpler analysis if not available
 try:
@@ -22,25 +23,28 @@ except ImportError:
 
 class FastQualityGate:
     """Fast quality gate for pre-commit hooks"""
-    
-    CACHE_DIR = Path('.git/quality-cache')
-    CACHE_FILE = CACHE_DIR / 'analysis.json'
-    MIN_QUALITY_SCORE = 0.60
-    MAX_WORKERS = 4
-    CACHE_TTL_SECONDS = 86400  # 24 hours
-    
+
+    CACHE_DIR: ClassVar[Path] = Path('.git/quality-cache')
+    CACHE_FILE: ClassVar[Path] = Path('.git/quality-cache') / 'analysis.json'
+    MIN_QUALITY_SCORE: ClassVar[float] = 0.60
+    MAX_WORKERS: ClassVar[int] = 4
+    CACHE_TTL_SECONDS: ClassVar[int] = 86400  # 24 hours
+
     # Critical patterns to check (even without AST-GREP)
-    CRITICAL_PATTERNS = [
+    CRITICAL_PATTERNS: ClassVar[list] = [
         ('eval(', 'Direct eval usage - security risk'),
         ('exec(', 'Direct exec usage - security risk'),
         ('__import__(', 'Dynamic import - security risk'),
         ('os.system(', 'Shell command execution - security risk'),
         ('subprocess.call(shell=True', 'Shell injection vulnerability'),
+        ('subprocess.run(', 'Potential shell invocation - check for shell=True'),
+        ('subprocess.Popen(', 'Potential shell invocation - check for shell=True'),
         ('pickle.loads(', 'Unsafe deserialization'),
+        ('yaml.load(', 'Unsafe YAML loading - use safe_load'),
     ]
-    
+
     # Common bad patterns (for simple analysis)
-    BAD_PATTERNS = [
+    BAD_PATTERNS: ClassVar[list] = [
         ('except:', 'Bare except clause'),
         ('import *', 'Wildcard import'),
         ('global ', 'Global variable usage'),
@@ -78,10 +82,10 @@ class FastQualityGate:
             return []
     
     def get_file_hash(self, filepath):
-        """Quick SHA-1 hash for cache key"""
+        """Quick SHA-256 hash for cache key"""
         try:
             with open(filepath, 'rb') as f:
-                return hashlib.sha1(f.read()).hexdigest()
+                return hashlib.sha256(f.read()).hexdigest()
         except FileNotFoundError:
             return None
     
@@ -274,7 +278,7 @@ class FastQualityGate:
                         'description': pattern_def.get('description', ''),
                         'count': len(matches)
                     })
-            except:
+            except Exception:
                 continue
         
         # Calculate quality score

@@ -212,9 +212,11 @@ class MetadataExtractor:
             quality_scores = []
 
             for file_path in files_to_analyze:
-                if self._is_code_file(file_path) and os.path.exists(file_path):
+                # Expand file path for proper checking
+                expanded_path = os.path.expanduser(file_path) if file_path.startswith('~') else file_path
+                if self._is_code_file(expanded_path) and os.path.exists(expanded_path):
                     try:
-                        result = analyzer.analyze_file(file_path)
+                        result = analyzer.analyze_file(expanded_path)
                         metrics = result['quality_metrics']
                         pattern_quality[file_path] = {
                             'score': metrics['quality_score'],

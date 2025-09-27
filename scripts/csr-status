@@ -6,6 +6,7 @@ Standalone script that doesn't require venv activation.
 
 import json
 import time
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 import sys
