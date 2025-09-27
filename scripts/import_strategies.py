@@ -96,8 +96,10 @@ class MessageStreamReader:
 
         except json.JSONDecodeError:
             logger.debug(f"Skipping invalid JSON at line {line_num}")
+        except (KeyError, TypeError, ValueError) as e:
+            logger.debug(f"Error processing data at line {line_num}: {e}")
         except Exception as e:
-            logger.debug(f"Error processing line {line_num}: {e}")
+            logger.warning(f"Unexpected error at line {line_num}: {e}")
 
         return None
 
@@ -276,8 +278,16 @@ class StreamImportStrategy(ImportStrategy):
             logger.info(f"Imported {total_chunks} chunks from {jsonl_file.name}")
             return total_chunks
 
+        except (IOError, OSError) as e:
+            logger.error(f"Failed to read file {jsonl_file}: {e}")
+            self._mark_failed(jsonl_file, str(e))
+            return 0
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in {jsonl_file}: {e}")
+            self._mark_failed(jsonl_file, str(e))
+            return 0
         except Exception as e:
-            logger.error(f"Failed to import {jsonl_file}: {e}")
+            logger.error(f"Unexpected error importing {jsonl_file}: {e}")
             self._mark_failed(jsonl_file, str(e))
             return 0
 
@@ -314,12 +324,16 @@ class StreamImportStrategy(ImportStrategy):
                 )
                 logger.info(f"Deleted old points for conversation {conversation_id}")
 
+        except ImportError as e:
+            logger.debug(f"Qdrant client import error: {e}")
         except Exception as e:
-            logger.debug(f"Could not clean up old points for {conversation_id}: {e}")
+            logger.warning(f"Could not clean up old points for {conversation_id}: {e}")
 
     def _mark_failed(self, jsonl_file: Path, error: str):
         """Mark a file as failed in state manager."""
         try:
             self.state_manager.mark_file_failed(str(jsonl_file), error)
+        except AttributeError as e:
+            logger.debug(f"State manager method not available: {e}")
         except Exception as e:
-            logger.warning(f"Could not mark file as failed in state: {e}")
+            logger.warning(f"Unexpected error marking file as failed: {e}")

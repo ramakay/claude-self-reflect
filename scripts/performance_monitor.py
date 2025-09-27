@@ -71,7 +71,18 @@ class PerformanceMonitor:
 
             return stats
 
+        except psutil.NoSuchProcess as e:
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'error': f"Process not found: {e}"
+            }
+        except psutil.AccessDenied as e:
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'error': f"Access denied to process: {e}"
+            }
         except Exception as e:
+            logger.error(f"Unexpected error in performance monitoring: {e}")
             return {
                 'timestamp': datetime.now().isoformat(),
                 'error': str(e)
@@ -80,9 +91,9 @@ class PerformanceMonitor:
     def enrich_with_top_stats(self, stats):
         """Enrich stats using top command for better CPU measurements."""
         try:
-            # Get top snapshot
+            # Get top snapshot (using list args - no shell injection risk)
             cmd = ['top', '-l', '1', '-n', '10', '-stats', 'pid,command,cpu,mem,threads,ports']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)  # Safe: no shell=True
 
             for line in result.stdout.split('\n'):
                 if 'Claude' in line and 'Helper' not in line:
@@ -91,8 +102,8 @@ class PerformanceMonitor:
                         cpu_str = parts[2].replace('%', '')
                         try:
                             stats['claude']['cpu_percent'] = float(cpu_str)
-                        except:
-                            pass
+                        except (ValueError, TypeError):
+                            pass  # Skip if CPU value can't be parsed
                         if len(parts) >= 5:
                             stats['claude']['threads'] = parts[4]
                         if len(parts) >= 6:
@@ -104,15 +115,17 @@ class PerformanceMonitor:
                         cpu_str = parts[2].replace('%', '')
                         try:
                             stats['docker_vm']['cpu_percent'] = float(cpu_str)
-                        except:
-                            pass
+                        except (ValueError, TypeError):
+                            pass  # Skip if CPU value can't be parsed
                         if len(parts) >= 5:
                             stats['docker_vm']['threads'] = parts[4]
                         if len(parts) >= 6:
                             stats['docker_vm']['ports'] = parts[5]
 
-        except Exception:
-            pass  # Silently fail enrichment
+        except subprocess.SubprocessError:
+            pass  # Top command failed, skip enrichment
+        except (ValueError, IndexError):
+            pass  # Parsing error, skip enrichment
 
     def log_stats(self, stats):
         """Log stats to both JSONL and CSV files."""

@@ -61,8 +61,12 @@ class MetadataExtractor:
                             if len(all_text) < MAX_CONCEPT_MESSAGES:
                                 all_text.append(text_content[:1000])
 
+        except (IOError, OSError) as e:
+            logger.warning(f"Error reading file {file_path}: {e}")
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Error parsing JSON in {file_path}: {e}")
         except Exception as e:
-            logger.warning(f"Error extracting metadata: {e}")
+            logger.error(f"Unexpected error extracting metadata from {file_path}: {e}")
 
         # Post-process collected data
         self._post_process_metadata(metadata, all_text, file_path)
@@ -225,8 +229,12 @@ class MetadataExtractor:
                             'issues': metrics['total_issues']
                         }
                         quality_scores.append(metrics['quality_score'])
+                    except (IOError, OSError) as e:
+                        logger.debug(f"Could not read file {file_path}: {e}")
+                    except (KeyError, ValueError) as e:
+                        logger.debug(f"Error parsing AST results for {file_path}: {e}")
                     except Exception as e:
-                        logger.debug(f"Could not analyze {file_path}: {e}")
+                        logger.warning(f"Unexpected error analyzing {file_path}: {e}")
 
             # Calculate average quality
             if quality_scores:

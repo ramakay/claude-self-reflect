@@ -53,6 +53,9 @@ class TextMessageProcessor(MessageProcessor):
 
     def _extract_code_ast_elements(self, text: str, metadata: Dict[str, Any]):
         """Extract AST elements from code blocks in text."""
+        if 'ast_elements' not in metadata:
+            metadata['ast_elements'] = []
+
         if len(metadata['ast_elements']) >= MAX_AST_ELEMENTS:
             return
 
@@ -91,6 +94,9 @@ class ToolMessageProcessor(MessageProcessor):
         tool_name = item.get('name', '')
 
         # Track tool usage
+        if 'tools_used' not in metadata:
+            metadata['tools_used'] = []
+
         if tool_name and tool_name not in metadata['tools_used']:
             if len(metadata['tools_used']) < MAX_TOOLS_USED:
                 metadata['tools_used'].append(tool_name)
@@ -107,6 +113,12 @@ class ToolMessageProcessor(MessageProcessor):
         """Extract file references from tool input."""
         if not isinstance(input_data, dict):
             return
+
+        # Initialize metadata lists if not present
+        if 'files_edited' not in metadata:
+            metadata['files_edited'] = []
+        if 'files_analyzed' not in metadata:
+            metadata['files_analyzed'] = []
 
         is_edit = tool_name in ['Edit', 'Write', 'MultiEdit', 'NotebookEdit']
 
