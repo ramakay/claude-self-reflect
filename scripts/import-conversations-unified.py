@@ -209,12 +209,12 @@ class ConversationImporter:
         # UnifiedStateManager returns files directly, not nested in 'files' key
         file_state = imported_files.get(normalized_path)
         if file_state:
-            file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
+            file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime).replace(tzinfo=None)
             # Handle both old and new timestamp field names
             state_mtime_str = file_state.get('last_modified') or file_state.get('imported_at')
             if state_mtime_str:
                 try:
-                    state_mtime = datetime.fromisoformat(state_mtime_str)
+                    state_mtime = datetime.fromisoformat(state_mtime_str).replace(tzinfo=None)
                     if file_mtime <= state_mtime:
                         logger.debug(f"Skipping {file_path.name} - already imported")
                         return False
