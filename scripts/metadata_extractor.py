@@ -156,7 +156,8 @@ class MetadataExtractor:
             text_parts.append(f"[Result] {result_content[:1000]}")
 
         content = "\n".join(text_parts)
-        return (content, True) if content else None
+        # Tool entries should not count as messages (only user/assistant messages count)
+        return (content, False) if content else None
 
     def _extract_tool_result_content(self, data: Dict[str, Any]) -> str:
         """Extract content from tool result data."""

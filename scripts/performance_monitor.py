@@ -13,6 +13,18 @@ from datetime import datetime
 from pathlib import Path
 import threading
 import os
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
+
+# Import psutil for process monitoring
+try:
+    import psutil
+except ImportError:
+    logger.error("psutil not installed. Install with: pip install psutil")
+    psutil = None
 
 class PerformanceMonitor:
     def __init__(self, log_dir="/tmp/claude-performance-logs"):
@@ -71,15 +83,17 @@ class PerformanceMonitor:
 
             return stats
 
-        except psutil.NoSuchProcess as e:
+        except subprocess.SubprocessError as e:
+            logger.error(f"Subprocess error in performance monitoring: {e}")
             return {
                 'timestamp': datetime.now().isoformat(),
-                'error': f"Process not found: {e}"
+                'error': f"Subprocess error: {e}"
             }
-        except psutil.AccessDenied as e:
+        except (ValueError, IndexError) as e:
+            logger.warning(f"Parsing error in performance monitoring: {e}")
             return {
                 'timestamp': datetime.now().isoformat(),
-                'error': f"Access denied to process: {e}"
+                'error': f"Parsing error: {e}"
             }
         except Exception as e:
             logger.error(f"Unexpected error in performance monitoring: {e}")
