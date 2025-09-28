@@ -306,23 +306,28 @@ class StreamImportStrategy(ImportStrategy):
         try:
             from qdrant_client.models import Filter, FieldCondition, MatchValue
 
-            # Count old points
+            # Count old points using count API
             old_count_filter = Filter(
                 must=[FieldCondition(key="conversation_id", match=MatchValue(value=conversation_id))]
             )
-            old_points = self.client.scroll(
-                collection_name=collection_name,
-                scroll_filter=old_count_filter,
-                limit=1
-            )[0]
 
-            if len(old_points) > total_chunks + self.cleanup_tolerance:
+            # Use count API to get actual count
+            old_count = self.client.count(
+                collection_name=collection_name,
+                count_filter=old_count_filter,
+                exact=True
+            ).count
+
+            if old_count > total_chunks + self.cleanup_tolerance:
+                # Use filter parameter for delete
                 self.client.delete(
                     collection_name=collection_name,
-                    points_selector=old_count_filter,
+                    points_selector=Filter(
+                        must=[FieldCondition(key="conversation_id", match=MatchValue(value=conversation_id))]
+                    ),
                     wait=True
                 )
-                logger.info(f"Deleted old points for conversation {conversation_id}")
+                logger.info(f"Deleted {old_count - total_chunks} old points for conversation {conversation_id}")
 
         except ImportError as e:
             logger.debug(f"Qdrant client import error: {e}")

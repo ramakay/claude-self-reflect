@@ -34,8 +34,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 try:
     from shared.normalization import normalize_project_name
 except ImportError:
-    from utils import normalize_project_name
-    logging.warning("Using legacy utils.normalize_project_name")
+    try:
+        from importer.utils.project_normalizer import normalize_project_name
+        logging.debug("Using importer.utils.project_normalizer.normalize_project_name")
+    except ImportError:
+        from utils import normalize_project_name
+        logging.warning("Using legacy utils.normalize_project_name")
 
 # Set up logging
 logging.basicConfig(
