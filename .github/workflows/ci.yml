@@ -74,6 +74,10 @@ jobs:
 
     - name: Test Docker stack
       run: |
+        # Create config directory and copy qdrant config for mount
+        mkdir -p ~/.claude-self-reflect/config
+        cp config/qdrant-config.yaml ~/.claude-self-reflect/config/
+
         docker compose up -d qdrant
         sleep 10
         curl -f http://localhost:6333/ || exit 1
