@@ -117,7 +117,7 @@ jobs:
 
         # Validate docker-compose.yaml syntax and CONFIG_PATH expansion
         export CONFIG_PATH=~/.claude-self-reflect/config
-        docker compose -f docker-compose.yaml config > /tmp/compose-rendered.yml
+        docker-compose -f docker-compose.yaml config > /tmp/compose-rendered.yml
 
         # Verify mount path uses expanded CONFIG_PATH (not ./config)
         if grep -q "claude-self-reflect/config/qdrant-config.yaml" /tmp/compose-rendered.yml; then
