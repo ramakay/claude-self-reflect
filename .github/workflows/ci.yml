@@ -140,7 +140,7 @@ jobs:
         fi
 
         # Verify mount path is within Docker Desktop allowed paths
-        if grep -q "^/Users/" /tmp/compose-rendered.yml || grep -q "^/tmp/" /tmp/compose-rendered.yml; then
+        if grep -q "/Users/" /tmp/compose-rendered.yml || grep -q "/tmp/" /tmp/compose-rendered.yml; then
           echo "✅ Mount path is within Docker Desktop allowed paths"
         else
           echo "❌ Mount path may not be accessible by Docker Desktop on macOS"
