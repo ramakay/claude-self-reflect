@@ -233,59 +233,87 @@ python mcp-server/src/status.py
 # - CodeRabbit CLI analysis (if terminal compatible)
 ```
 
-### 3. Code Review Phase
-**WHO**: CodeRabbit (Automated)
-**WHAT**: Identify code issues, bugs, improvements
+### 2.5. Pre-PR Quality Gates (REQUIRED)
+**WHO**: Developer + AI Code Reviewers (CodeRabbit CLI + Codex)
+**WHAT**: Local code review before PR creation
+**WHY**: Catch issues early, reduce CI/CD review cycles, ensure architectural soundness
+**HOW**:
+
+```bash
+# Step 1: Run CodeRabbit CLI for local review
+coderabbit --prompt-only
+
+# Review output and fix all critical/high issues
+# Commit fixes: git commit -am "fix: address CodeRabbit local review"
+
+# Step 2: Use codex-evaluator agent for architectural review
+# Say: "codex evaluate the changes in this branch"
+# Or trigger agent with: "Need architectural review for Docker and npm changes"
+# Codex agent will analyze: Docker configs, npm package structure, cross-platform compatibility
+
+# Review Codex recommendations and apply improvements
+# Commit fixes: git commit -am "refactor: apply Codex architectural recommendations"
+
+# Step 3: Re-run CodeRabbit to verify fixes
+coderabbit --prompt-only
+
+# Ensure no critical/high issues remain before proceeding
+```
+
+**Quality Gates**:
+- ✅ CodeRabbit CLI: No critical or high severity issues
+- ✅ Codex Agent: Architectural review passes with no major concerns
+- ✅ All fixes committed and tested locally
+
+### 3. Code Review Phase - CI/CD
+**WHO**: CodeRabbit (Automated PR Review)
+**WHAT**: Comprehensive PR review in CI/CD pipeline
+**WHEN**: After PR creation, runs automatically on every push
 **HOW**:
 ```bash
-# Option A: CLI (has terminal mode issues currently)
-script -q /dev/null coderabbit --prompt-only
+# Create PR after local quality gates pass
+gh pr create --title "fix: description" --body "Fixes #issue"
 
-# Option B: PR Comments (RECOMMENDED)
+# Monitor CI/CD CodeRabbit review
 gh pr view [PR_NUMBER] --comments | grep -A 10 "coderabbitai"
+
+# If new issues found in CI/CD review, fix them
+git checkout fix/branch-name
+# ... make fixes ...
+git commit -am "fix: address CI/CD CodeRabbit review"
+git push
+
+# Repeat until CodeRabbit approves and all CI tests pass
 ```
 
-### 4. Fix Phase
-**WHO**: Developer (You)
-**WHAT**: Address all CodeRabbit-identified issues
-**HOW**:
-```bash
-# Fix issues locally
-# Commit changes
-git add .
-git commit -m "fix: address CodeRabbit feedback"
-```
+**Quality Gates**:
+- ✅ CodeRabbit CI/CD review: No blocking issues
+- ✅ All CI/CD tests pass: python-test, npm-package-test, docker-build
+- ✅ PR approved by maintainers
 
-### 5. Release Management Phase
+### 4. Release Management Phase
 **WHO**: Open Source Maintainer Agent
-**WHAT**: Create PR, manage release, publish to NPM
+**WHAT**: Merge PR, create release, publish to NPM
 **WORKFLOW**:
 
 ```bash
-# Step 1: Create PR with fixes
-gh pr create --title "fix: address CodeRabbit issues" \
-  --body "Fixes identified by CodeRabbit analysis"
+# Step 1: Merge PR after all quality gates pass
+gh pr merge [PR_NUMBER] --squash
 
-# Step 2: Monitor CodeRabbit PR review
-gh pr view [PR_NUMBER] --comments
-
-# Step 3: Merge when approved
-gh pr merge [PR_NUMBER]
-
-# Step 4: Create GitHub Release
+# Step 2: Create GitHub Release
 VERSION="v5.0.1"
 gh release create $VERSION \
   --title "$VERSION - CodeRabbit Fixes" \
   --notes "Fixed issues identified by CodeRabbit"
 
-# Step 5: Monitor NPM Publication (automated)
+# Step 3: Monitor NPM Publication (automated via CI/CD)
 gh run watch  # Watch CI/CD publish to NPM
 
-# Step 6: Verify NPM Package
+# Step 4: Verify NPM Package
 npm view claude-self-reflect@latest version
 ```
 
-### 6. Post-Release Phase
+### 5. Post-Release Phase
 **WHO**: Open Source Maintainer Agent
 **WHAT**: Close issues, update docs, announce
 **HOW**:

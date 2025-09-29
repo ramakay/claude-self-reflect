@@ -123,6 +123,20 @@ async function configureEnvironment() {
     } catch {
       // No old config directory, nothing to migrate
     }
+
+    // Copy qdrant-config.yaml from npm package to user config directory
+    // This is critical for global npm installs where Docker cannot mount from /opt/homebrew
+    const sourceQdrantConfig = join(projectRoot, 'config', 'qdrant-config.yaml');
+    const targetQdrantConfig = join(userConfigDir, 'qdrant-config.yaml');
+    try {
+      await fs.copyFile(sourceQdrantConfig, targetQdrantConfig);
+      console.log('✅ Qdrant config copied to user directory');
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        console.log('⚠️  Could not copy qdrant-config.yaml:', err.message);
+        console.log('   Docker may have issues starting Qdrant service');
+      }
+    }
   } catch (error) {
     console.log(`❌ Could not create config directory: ${error.message}`);
     console.log('   This may cause Docker mount issues. Please check permissions.');
