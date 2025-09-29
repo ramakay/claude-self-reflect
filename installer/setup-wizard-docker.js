@@ -71,23 +71,64 @@ async function checkDocker() {
   try {
     safeExec('docker', ['info'], { stdio: 'ignore' });
     console.log('✅ Docker is installed and running');
-    
+
     // Check docker compose
     try {
       safeExec('docker', ['compose', 'version'], { stdio: 'ignore' });
-      console.log('✅ Docker Compose v2 is available');
+      console.log('✅ Docker Compose is available');
       return true;
     } catch {
-      console.log('❌ Docker Compose v2 not found');
-      console.log('   Please update Docker Desktop to the latest version');
+      console.log('❌ Docker Compose not found');
+      console.log('   Please update Docker Desktop to include Compose v2');
       return false;
     }
   } catch {
-    console.log('❌ Docker is not running or not installed');
-    console.log('\n📋 Please install Docker:');
-    console.log('   • macOS/Windows: https://docker.com/products/docker-desktop');
-    console.log('   • Linux: https://docs.docker.com/engine/install/');
-    console.log('\n   After installation, make sure Docker is running and try again.');
+    console.log('❌ Docker is not running or not installed\n');
+    console.log('📋 Claude Self-Reflect requires Docker Desktop');
+    console.log('   (Includes Docker Engine + Compose - everything you need)\n');
+
+    const platform = process.platform;
+    const arch = process.arch;
+
+    if (platform === 'darwin') {
+      const archType = arch === 'arm64' ? 'Apple Silicon (M1/M2/M3/M4)' : 'Intel';
+      console.log(`🍎 macOS (${archType}) Installation:\n`);
+
+      if (arch === 'arm64') {
+        console.log('   Download: https://desktop.docker.com/mac/main/arm64/Docker.dmg');
+      } else {
+        console.log('   Download: https://desktop.docker.com/mac/main/amd64/Docker.dmg');
+      }
+
+      console.log('   1. Open the downloaded Docker.dmg');
+      console.log('   2. Drag Docker.app to Applications folder');
+      console.log('   3. Launch Docker Desktop from Applications');
+      console.log('   4. Wait for Docker to start (whale icon in menu bar)');
+      console.log('   5. Re-run: claude-self-reflect setup\n');
+
+    } else if (platform === 'win32') {
+      console.log('🪟 Windows Installation:\n');
+      console.log('   Download: https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe');
+      console.log('   1. Run the installer');
+      console.log('   2. Follow installation prompts');
+      console.log('   3. Restart computer if prompted');
+      console.log('   4. Launch Docker Desktop');
+      console.log('   5. Re-run: claude-self-reflect setup\n');
+
+    } else {
+      console.log('🐧 Linux Installation:\n');
+      console.log('   Install Docker Engine (includes Compose):');
+      console.log('   • Ubuntu/Debian: https://docs.docker.com/engine/install/ubuntu/');
+      console.log('   • Fedora: https://docs.docker.com/engine/install/fedora/');
+      console.log('   • Arch: https://wiki.archlinux.org/title/docker');
+      console.log('   • CentOS: https://docs.docker.com/engine/install/centos/\n');
+    }
+
+    console.log('ℹ️  Docker Desktop is free for:');
+    console.log('   • Personal use');
+    console.log('   • Small businesses (<250 employees, <$10M revenue)');
+    console.log('   • Education and open source projects\n');
+
     return false;
   }
 }

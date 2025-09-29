@@ -86,7 +86,6 @@ jobs:
   npm-global-install-test:
     needs: [python-test, npm-package-test]
     runs-on: macos-latest
-    continue-on-error: true  # Docker Desktop installation on macOS runners can take >5min
 
     steps:
     - uses: actions/checkout@v5
@@ -95,65 +94,50 @@ jobs:
       with:
         node-version: '20.x'
 
-    - name: Set up Docker Desktop
+    - name: Test npm global install and config paths
       run: |
-        brew install --cask docker
-        open -a Docker
-        # Wait for Docker to start (max 5 minutes)
-        timeout=300
-        elapsed=0
-        while ! docker info > /dev/null 2>&1; do
-          if [ $elapsed -ge $timeout ]; then
-            echo "Docker failed to start within 5 minutes"
-            exit 1
-          fi
-          sleep 5
-          elapsed=$((elapsed + 5))
-        done
-        echo "Docker is running"
-
-    - name: Test global install and Docker mount fix
-      run: |
-        # Create npm package
+        # Test npm global install
         npm pack
-
-        # Install globally (simulates user installation)
         npm install -g ./claude-self-reflect-*.tgz
 
-        # Simulate setup copying config file to user directory
+        # Verify config directory structure (simulates setup wizard)
         mkdir -p ~/.claude-self-reflect/config
         cp config/qdrant-config.yaml ~/.claude-self-reflect/config/
 
-        # Verify config file exists in user directory
+        # Verify file exists
         test -f ~/.claude-self-reflect/config/qdrant-config.yaml || {
           echo "❌ qdrant-config.yaml not found in user config directory"
           exit 1
         }
         echo "✅ Config file copied to user directory"
 
-        # Test Docker compose with CONFIG_PATH environment variable
-        export CONFIG_PATH=~/.claude-self-reflect/config
-        docker compose config > /tmp/compose-rendered.yml
+        # Install docker-compose CLI only (GitHub Actions runners have brew)
+        # This is lightweight - no Docker Desktop needed for validation
+        brew install docker-compose
 
-        # Verify the mount path uses CONFIG_PATH (not ./config)
+        # Validate docker-compose.yaml syntax and CONFIG_PATH expansion
+        export CONFIG_PATH=~/.claude-self-reflect/config
+        docker compose -f docker-compose.yaml config > /tmp/compose-rendered.yml
+
+        # Verify mount path uses expanded CONFIG_PATH (not ./config)
         if grep -q "claude-self-reflect/config/qdrant-config.yaml" /tmp/compose-rendered.yml; then
-          echo "✅ Docker compose uses CONFIG_PATH for qdrant-config.yaml mount"
+          echo "✅ CONFIG_PATH variable expanded correctly"
         else
-          echo "❌ Docker compose does not use CONFIG_PATH correctly"
+          echo "❌ CONFIG_PATH not used correctly"
           cat /tmp/compose-rendered.yml | grep -A5 "qdrant:"
           exit 1
         fi
 
-        # Verify mount path is within Docker Desktop allowed paths
-        if grep -q "/Users/" /tmp/compose-rendered.yml || grep -q "/tmp/" /tmp/compose-rendered.yml; then
-          echo "✅ Mount path is within Docker Desktop allowed paths"
+        # Verify mount path is within Docker Desktop allowed paths on macOS
+        if grep -q "/Users/" /tmp/compose-rendered.yml; then
+          echo "✅ Mount path within Docker Desktop allowed paths (/Users/)"
         else
           echo "❌ Mount path may not be accessible by Docker Desktop on macOS"
           cat /tmp/compose-rendered.yml | grep -A5 "volumes:"
           exit 1
         fi
 
-        echo "✅ Global install test passed - Docker mount fix verified"
+        echo "✅ macOS global install validated (file operations & path resolution)"
 
   publish-npm:
     needs: [python-test, npm-package-test, docker-build]
