@@ -59,7 +59,11 @@ def parse_jsonl_file(file_path):
     return messages
 
 if __name__ == "__main__":
-    file_path = "/Users/ramakrishnanannaswamy/.claude/projects/-Users-ramakrishnanannaswamy-projects-claude-self-reflect/7b3354ed-d6d2-4eab-b328-1fced4bb63bb.jsonl"
+    # Use home directory path
+    from pathlib import Path
+    home = Path.home()
+    file_path = home / ".claude" / "projects" / f"-{home}-projects-claude-self-reflect" / "7b3354ed-d6d2-4eab-b328-1fced4bb63bb.jsonl"
+    file_path = str(file_path)
     
     print(f"Parsing: {file_path}")
     print("=" * 60)

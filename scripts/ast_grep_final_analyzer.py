@@ -257,15 +257,18 @@ class FinalASTGrepAnalyzer:
         return '\n'.join(report)
 
 
-def run_final_analysis():
+def run_final_analysis(file_path=None):
     """Run final AST-GREP analysis with unified registry."""
     print("🚀 FINAL AST-GREP Analysis with Unified Registry")
     print("=" * 60)
 
     analyzer = FinalASTGrepAnalyzer()
 
-    # Analyze server.py
-    server_path = "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/src/server.py"
+    # Use provided path or default
+    # Use relative path from script location
+    script_dir = Path(__file__).parent
+    default_path = script_dir.parent / "mcp-server" / "src" / "server.py"
+    server_path = file_path if file_path else str(default_path)
 
     print(f"\nAnalyzing: {server_path}")
     print("-" * 40)
@@ -299,14 +302,14 @@ def run_final_analysis():
 
         # Generate and save report
         report = analyzer.generate_report(result)
-        report_path = "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/scripts/final_analysis_report.md"
+        report_path = script_dir / "final_analysis_report.md"
         with open(report_path, 'w') as f:
             f.write(report)
 
         print(f"\n📝 Full report saved to: {report_path}")
 
         # Save JSON results
-        json_path = "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/scripts/final_analysis_result.json"
+        json_path = script_dir / "final_analysis_result.json"
         with open(json_path, 'w') as f:
             json.dump(result, f, indent=2)
 
@@ -325,4 +328,11 @@ def run_final_analysis():
 
 
 if __name__ == "__main__":
-    run_final_analysis()
+    import sys
+    if len(sys.argv) > 1:
+        # Use provided file path
+        file_path = sys.argv[1]
+    else:
+        # Default to server.py
+        file_path = str(default_path)  # Use the same default path from above
+    run_final_analysis(file_path)

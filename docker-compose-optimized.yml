@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: claude-reflection-qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+    environment:
+      - QDRANT__LOG_LEVEL=INFO
+      - QDRANT__TELEMETRY_DISABLED=true
+    deploy:
+      resources:
+        limits:
+          # Reduced from 4GB to 2GB (2x current usage for safety)
+          memory: 2G
+        reservations:
+          # Reserve only what's typically used
+          memory: 1G
+    restart: unless-stopped
+    # Health check to detect OOM conditions
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  watcher:
+    image: claude-reflection-watcher:latest
+    container_name: claude-reflection-safe-watcher
+    volumes:
+      - ${HOME}/.claude:/app/claude_conversations:ro
+      - ${HOME}/.claude-self-reflect:/app/.claude-self-reflect
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - VOYAGE_API_KEY=${VOYAGE_API_KEY}
+      - UNIFIED_STATE_PATH=/app/.claude-self-reflect/config/unified-state.json
+    deploy:
+      resources:
+        limits:
+          # Reduced from 7.6GB to 1GB (2x current usage)
+          memory: 1G
+        reservations:
+          # Reserve typical usage
+          memory: 512M
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+
+networks:
+  default:
+    name: claude-reflection-network
+    driver: bridge
+
+# Docker memory optimization settings
+x-memory-settings: &memory-defaults
+  # Use memory efficiently
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"

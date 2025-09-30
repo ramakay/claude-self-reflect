@@ -6,6 +6,7 @@ Standalone script that doesn't require venv activation.
 
 import json
 import time
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 import sys
@@ -147,6 +148,51 @@ def format_statusline_quality(critical=0, medium=0, low=0):
 
 def get_session_health():
     """Get cached session health with icon-based quality display."""
+    # Get project-specific cache based on current directory
+    project_dir = os.getcwd()
+    project_name = os.path.basename(project_dir) if project_dir else "default"
+
+    # Check project-specific realtime cache first
+    quality_dir = Path.home() / ".claude-self-reflect" / "quality_by_project"
+    realtime_cache = quality_dir / f"{project_name}.json"
+
+    # Fallback to global cache if project-specific doesn't exist
+    if not realtime_cache.exists():
+        realtime_cache = Path.home() / ".claude-self-reflect" / "realtime_quality.json"
+
+    if realtime_cache.exists():
+        try:
+            # Check realtime cache age
+            mtime = datetime.fromtimestamp(realtime_cache.stat().st_mtime)
+            age = datetime.now() - mtime
+
+            if age < timedelta(minutes=5):  # Fresh realtime data
+                with open(realtime_cache, 'r') as f:
+                    realtime_data = json.load(f)
+
+                if "session_aggregate" in realtime_data:
+                    agg = realtime_data["session_aggregate"]
+                    issues = agg.get("total_issues", {})
+                    critical = issues.get("critical", 0)
+                    medium = issues.get("medium", 0)
+                    low = issues.get("low", 0)
+
+                    # Include score in display if significantly below threshold
+                    score = agg.get("average_score", 100)
+                    if critical > 0 or medium > 0 or low > 0:
+                        # Show issue counts when there are any issues
+                        return format_statusline_quality(critical, medium, low)
+                    elif score < 70:
+                        # Use red icon for scores below threshold (no issues but poor score)
+                        icon = "🔴"
+                        return f"{icon} {score:.0f}%"
+                    else:
+                        # Good quality, no issues
+                        return format_statusline_quality(critical, medium, low)
+        except Exception:
+            pass  # Fall back to old cache system
+
+    # Fall back to old cache system
     # Check for session edit tracker to show appropriate label
     tracker_file = Path.home() / ".claude-self-reflect" / "current_session_edits.json"
 
@@ -363,8 +409,63 @@ def get_compact_status():
             except:
                 pass
 
-    # Get quality grade - PER PROJECT cache
-    # BUG FIX: Cache must be per-project, not global!
+    # Get project-specific cache based on current directory
+    project_name = os.path.basename(os.getcwd()) if os.getcwd() else "default"
+
+    # Check project-specific realtime cache first
+    quality_dir = Path.home() / ".claude-self-reflect" / "quality_by_project"
+    realtime_cache = quality_dir / f"{project_name}.json"
+
+    # Fallback to global cache if project-specific doesn't exist
+    if not realtime_cache.exists():
+        realtime_cache = Path.home() / ".claude-self-reflect" / "realtime_quality.json"
+
+    grade_str = ""
+    quality_valid = False
+
+    if realtime_cache.exists():
+        try:
+            mtime = datetime.fromtimestamp(realtime_cache.stat().st_mtime)
+            age = datetime.now() - mtime
+            if age < timedelta(minutes=5):  # Fresh realtime data
+                with open(realtime_cache, 'r') as f:
+                    realtime_data = json.load(f)
+
+                if "session_aggregate" in realtime_data:
+                    agg = realtime_data["session_aggregate"]
+                    issues = agg.get("total_issues", {})
+                    critical = issues.get("critical", 0)
+                    medium = issues.get("medium", 0)
+                    low = issues.get("low", 0)
+                    score = agg.get("average_score", 100)
+
+                    # Get icon based on score and issues
+                    if score < 70:
+                        icon = "🔴"  # Red for below threshold
+                    else:
+                        icon = get_quality_icon(critical, medium, low)
+
+                    # Build compact display
+                    if critical > 0 or medium > 0 or low > 0:
+                        # Show issue counts when there are any issues
+                        colored_parts = []
+                        if critical > 0:
+                            colored_parts.append(f"C:{critical}")
+                        if medium > 0:
+                            colored_parts.append(f"M:{medium}")
+                        if low > 0:
+                            colored_parts.append(f"L:{low}")
+                        grade_str = f"[{icon}:{'·'.join(colored_parts)}]"
+                    elif score < 70:
+                        # Show score when below threshold but no specific issues
+                        grade_str = f"[{icon}:{score:.0f}%]"
+                    else:
+                        grade_str = f"[{icon}]"
+                    quality_valid = True
+        except:
+            pass
+
+    # Setup cache file path for fallback
     project_name = os.path.basename(os.getcwd())
     # Secure sanitization with whitelist approach
     import re
@@ -372,21 +473,23 @@ def get_compact_status():
     cache_dir = Path.home() / ".claude-self-reflect" / "quality_cache"
     cache_file = cache_dir / f"{safe_project_name}.json"
 
-    # If the exact cache file doesn't exist, try to find one that ends with this project name
-    # This handles cases like "metafora-Atlas-gold.json" for project "Atlas-gold"
-    if not cache_file.exists():
-        # Look for files ending with the project name
-        possible_files = list(cache_dir.glob(f"*-{safe_project_name}.json"))
-        if possible_files:
-            cache_file = possible_files[0]  # Use the first match
+    # Fall back to old cache if no realtime data
+    if not quality_valid:
 
-    # Validate cache file path stays within cache directory
-    if cache_file.exists() and not str(cache_file.resolve()).startswith(str(cache_dir.resolve())):
-        # Security issue - return placeholder
-        grade_str = "[...]"
-    else:
-        cache_file.parent.mkdir(exist_ok=True, parents=True)
-    grade_str = ""
+        # If the exact cache file doesn't exist, try to find one that ends with this project name
+        # This handles cases like "metafora-Atlas-gold.json" for project "Atlas-gold"
+        if not cache_file.exists():
+            # Look for files ending with the project name
+            possible_files = list(cache_dir.glob(f"*-{safe_project_name}.json"))
+            if possible_files:
+                cache_file = possible_files[0]  # Use the first match
+
+        # Validate cache file path stays within cache directory
+        if cache_file.exists() and not str(cache_file.resolve()).startswith(str(cache_dir.resolve())):
+            # Security issue - return placeholder
+            grade_str = "[...]"
+        else:
+            cache_file.parent.mkdir(exist_ok=True, parents=True)
 
     # Try to get quality data (regenerate if too old or missing)
     quality_valid = False

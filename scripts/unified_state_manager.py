@@ -21,7 +21,7 @@ import logging
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Optional, List, Set
+from typing import Dict, Any, Optional, List, Set, Union
 from contextlib import contextmanager
 
 # Try to import filelock, fall back to platform-specific implementation
@@ -62,14 +62,17 @@ class UnifiedStateManager:
     LOCK_TIMEOUT = 5.0
     LOCK_EXPIRY = timedelta(seconds=30)
 
-    def __init__(self, state_file: Optional[Path] = None):
+    def __init__(self, state_file: Optional[Union[Path, str]] = None):
         """
         Initialize the unified state manager.
 
         Args:
             state_file: Path to the state file (defaults to ~/.claude-self-reflect/config/unified-state.json)
         """
-        self.state_file = state_file or Path.home() / ".claude-self-reflect" / "config" / "unified-state.json"
+        if state_file:
+            self.state_file = Path(state_file) if isinstance(state_file, str) else state_file
+        else:
+            self.state_file = Path.home() / ".claude-self-reflect" / "config" / "unified-state.json"
         self.lock_file = self.state_file.with_suffix('.lock')
         self.temp_file = self.state_file.with_suffix('.tmp')
         self._file_lock = None
@@ -127,7 +130,7 @@ class UnifiedStateManager:
         if HAS_FILELOCK:
             lock = filelock.FileLock(str(self.lock_file), timeout=timeout)
             try:
-                with lock.acquire(timeout=timeout):
+                with lock:
                     yield lock
             except filelock.Timeout:
                 raise TimeoutError(f"Could not acquire lock within {timeout} seconds")

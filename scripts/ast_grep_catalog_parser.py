@@ -287,7 +287,9 @@ if __name__ == "__main__":
                 print(f"    Pattern: {pattern['pattern'][:50]}...")
 
     # Save to JSON
-    output_path = Path("/Users/ramakrishnanannaswamy/projects/claude-self-reflect/scripts/catalog_registry.json")
+    # Use relative path from script location
+    script_dir = Path(__file__).parent
+    output_path = script_dir / "catalog_registry.json"
     with open(output_path, 'w') as f:
         json.dump(registry, f, indent=2)
 
