@@ -18,7 +18,9 @@ services:
       - "${QDRANT_PORT:-6333}:6333"
     volumes:
       - qdrant_data:/qdrant/storage
-      - ./config/qdrant-config.yaml:/qdrant/config/config.yaml:ro
+      # Note: Using CONFIG_PATH variable to support global npm installs (fixes #71)
+      # macOS Docker Desktop restricts mounts to /Users, /Volumes, /private, /tmp
+      - ${CONFIG_PATH:-~/.claude-self-reflect/config}/qdrant-config.yaml:/qdrant/config/config.yaml:ro
     environment:
       - QDRANT__LOG_LEVEL=INFO
       - QDRANT__SERVICE__HTTP_PORT=6333
