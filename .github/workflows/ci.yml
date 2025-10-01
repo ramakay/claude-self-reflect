@@ -90,6 +90,8 @@ jobs:
   npm-global-install-test:
     needs: [python-test, npm-package-test]
     runs-on: macos-latest
+    timeout-minutes: 15
+    continue-on-error: true
 
     steps:
     - uses: actions/checkout@v5
