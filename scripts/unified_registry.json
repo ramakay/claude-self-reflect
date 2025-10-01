@@ -1177,10 +1177,46 @@
         "quality": "good",
         "weight": 3
       }
+    ],
+    "python_testing": [
+      {
+        "id": "swallow-assertion-failure",
+        "pattern": "except Exception: $$$\nreturn False",
+        "description": "Test swallowing assertion failures by catching Exception and returning False",
+        "quality": "bad",
+        "weight": -5,
+        "language": "python"
+      },
+      {
+        "id": "test-bare-except-return-false",
+        "pattern": "except: $$$\nreturn False",
+        "description": "Test hiding failures with bare except and return False",
+        "quality": "bad",
+        "weight": -5,
+        "language": "python"
+      },
+      {
+        "id": "test-file-root-location",
+        "pattern": "test_*.py",
+        "description": "Test file at repository root instead of tests/ directory",
+        "quality": "bad",
+        "weight": -3,
+        "language": "python"
+      }
+    ],
+    "npm_packaging": [
+      {
+        "id": "missing-script-in-package-json",
+        "pattern": "scripts/$FILE.py",
+        "description": "Python script in scripts/ directory should be in package.json files array",
+        "quality": "neutral",
+        "weight": 0,
+        "language": "python"
+      }
     ]
   },
   "stats": {
-    "total_patterns": 59,
+    "total_patterns": 63,
     "categories": [
       "python_async",
       "python_error_handling",
@@ -1189,6 +1225,8 @@
       "python_antipatterns",
       "python_qdrant",
       "python_mcp",
+      "python_testing",
+      "npm_packaging",
       "go_catalog",
       "python_catalog",
       "tsx_catalog",
@@ -1216,6 +1254,6 @@
       "c",
       "ruby"
     ],
-    "last_update": "2025-10-01T06:23:27.845565"
+    "last_update": "2025-10-01T14:00:00.000000"
   }
 }
