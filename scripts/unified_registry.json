@@ -1,7 +1,6 @@
 {
-  "source": "unified-ast-grep-auto-updated",
-  "version": "3.0.0",
-  "timestamp": "2025-10-01T06:23:27.845535",
+  "source": "unified-ast-grep",
+  "version": "2.0.0",
   "patterns": {
     "python_async": [
       {
@@ -35,6 +34,27 @@
         "quality": "neutral",
         "weight": 1,
         "language": "python"
+      },
+      {
+        "id": "await-in-loop",
+        "pattern": "for $ITEM in $ITEMS:\n    await $FUNC($$$)",
+        "description": "Sequential await in loop (inefficient, consider asyncio.gather)",
+        "quality": "bad",
+        "weight": -3,
+        "language": "python",
+        "severity": "medium"
+      },
+      {
+        "id": "blocking-io-in-async",
+        "pattern": "$FILE.read($$$)",
+        "description": "Blocking file I/O in async function (use aiofiles)",
+        "quality": "bad",
+        "weight": -4,
+        "language": "python",
+        "severity": "high",
+        "inside": {
+          "pattern": "async def $FUNC($$$): $$$"
+        }
       }
     ],
     "python_error_handling": [
@@ -61,6 +81,33 @@
         "quality": "good",
         "weight": 2,
         "language": "python"
+      },
+      {
+        "id": "except-exception",
+        "pattern": "except Exception: $$$",
+        "description": "Overly broad Exception catch (catch specific types)",
+        "quality": "bad",
+        "weight": -2,
+        "language": "python",
+        "severity": "low"
+      },
+      {
+        "id": "silent-except",
+        "pattern": "except $ERROR:\n    pass",
+        "description": "Silent exception handler",
+        "quality": "bad",
+        "weight": -4,
+        "language": "python",
+        "severity": "high"
+      },
+      {
+        "id": "except-continue",
+        "pattern": "except $ERROR:\n    continue",
+        "description": "Exception handler that silently continues",
+        "quality": "bad",
+        "weight": -3,
+        "language": "python",
+        "severity": "medium"
       }
     ],
     "python_logging": [
@@ -97,13 +144,13 @@
         "language": "python"
       },
       {
-        "id": "debug-print",
-        "pattern": "print(f$$$)",
-        "description": "F-string print",
+        "id": "print-statement",
+        "pattern": "print($$$)",
+        "description": "Print statement (use logging instead)",
         "quality": "bad",
         "weight": -2,
         "language": "python",
-        "category": "python_logging"
+        "severity": "low"
       }
     ],
     "python_typing": [
@@ -172,6 +219,112 @@
         "quality": "bad",
         "weight": -4,
         "language": "python"
+      },
+      {
+        "id": "sync-voyage-embed",
+        "pattern": "$CLIENT.embed($$$)",
+        "description": "Blocking Voyage embed in async context",
+        "quality": "bad",
+        "weight": -5,
+        "language": "python",
+        "inside": "async def $FUNC($$$): $$$"
+      },
+      {
+        "id": "thread-join-async",
+        "pattern": "$THREAD.join($$$)",
+        "description": "Thread join blocking async context",
+        "quality": "bad",
+        "weight": -5,
+        "language": "python",
+        "inside": "async def $FUNC($$$): $$$"
+      },
+      {
+        "id": "invalid-env-var-hyphen",
+        "pattern": "os.getenv('$VAR')",
+        "description": "Environment variable with hyphen (invalid in shells)",
+        "quality": "bad",
+        "weight": -3,
+        "language": "python",
+        "constraint": "$VAR matches .*-.*"
+      },
+      {
+        "id": "dotenv-override-runtime",
+        "pattern": "load_dotenv($$$, override=True)",
+        "description": "Runtime environment mutation in MCP",
+        "quality": "bad",
+        "weight": -3,
+        "language": "python"
+      },
+      {
+        "id": "mutable-default-dict",
+        "pattern": "def $FUNC($$$, $ARG={}): $$$",
+        "description": "Mutable default argument (dict)",
+        "quality": "bad",
+        "weight": -4,
+        "language": "python",
+        "severity": "high"
+      },
+      {
+        "id": "mutable-default-set",
+        "pattern": "def $FUNC($$$, $ARG=set()): $$$",
+        "description": "Mutable default argument (set)",
+        "quality": "bad",
+        "weight": -4,
+        "language": "python",
+        "severity": "high"
+      },
+      {
+        "id": "none-comparison-equals",
+        "pattern": "$VAR == None",
+        "description": "Comparing with None using == instead of is",
+        "quality": "bad",
+        "weight": -3,
+        "language": "python",
+        "severity": "medium",
+        "fix": "$VAR is None",
+        "autofix": true
+      },
+      {
+        "id": "none-comparison-not-equals",
+        "pattern": "$VAR != None",
+        "description": "Comparing with None using != instead of is not",
+        "quality": "bad",
+        "weight": -3,
+        "language": "python",
+        "severity": "medium",
+        "fix": "$VAR is not None",
+        "autofix": true
+      },
+      {
+        "id": "len-truthiness",
+        "pattern": "if len($COLLECTION): $$$",
+        "description": "Using len() for truthiness check (empty collections are falsy)",
+        "quality": "bad",
+        "weight": -2,
+        "language": "python",
+        "severity": "low",
+        "fix": "if $COLLECTION: $$$",
+        "autofix": true
+      },
+      {
+        "id": "assert-in-production",
+        "pattern": "assert $CONDITION",
+        "description": "Assert statement (disabled with python -O)",
+        "quality": "bad",
+        "weight": -3,
+        "language": "python",
+        "severity": "medium"
+      },
+      {
+        "id": "type-comparison",
+        "pattern": "type($VAR) == $TYPE",
+        "description": "Type comparison using type() instead of isinstance()",
+        "quality": "bad",
+        "weight": -2,
+        "language": "python",
+        "severity": "low",
+        "fix": "isinstance($VAR, $TYPE)",
+        "autofix": true
       }
     ],
     "python_qdrant": [
@@ -216,6 +369,306 @@
         "quality": "good",
         "weight": 5,
         "language": "python"
+      },
+      {
+        "id": "missing-embedding-guard",
+        "pattern": "query_embedding = await $MGR.generate_embedding($$$)\n$$$\nawait $CLIENT.search($$$, query_vector=query_embedding, $$$)",
+        "description": "Missing None check after embedding generation",
+        "quality": "bad",
+        "weight": -4,
+        "language": "python"
+      },
+      {
+        "id": "attr-vs-api",
+        "pattern": "$MGR.model_name",
+        "description": "Accessing non-existent attribute instead of API",
+        "quality": "bad",
+        "weight": -3,
+        "language": "python",
+        "note": "Use get_model_info() instead"
+      },
+      {
+        "id": "duplicate-import",
+        "pattern": "import $MODULE\n$$$\ndef $FUNC($$$):\n    $$$\n    import $MODULE",
+        "description": "Duplicate import inside function",
+        "quality": "bad",
+        "weight": -2,
+        "language": "python"
+      }
+    ],
+    "python_runtime_modification": [
+      {
+        "id": "singleton-state-change",
+        "pattern": "$SINGLETON.$ATTR = $VALUE",
+        "description": "Runtime singleton state modification",
+        "quality": "neutral",
+        "weight": 0,
+        "language": "python",
+        "note": "Can be good for mode switching, bad if uncontrolled"
+      },
+      {
+        "id": "public-init-exposure",
+        "pattern": "def try_initialize_$TYPE(self): $$$",
+        "description": "Public initialization method for runtime config",
+        "quality": "neutral",
+        "weight": 0,
+        "language": "python"
+      }
+    ],
+    "typescript_async": [
+      {
+        "id": "no-await-in-promise-all",
+        "pattern": "await $A",
+        "inside": "Promise.all($_)",
+        "description": "No await in Promise.all array",
+        "quality": "bad",
+        "weight": -4,
+        "language": "typescript",
+        "fix": "$A"
+      },
+      {
+        "id": "async-function-ts",
+        "pattern": "async function $FUNC($$$) { $$$ }",
+        "description": "Async function",
+        "quality": "good",
+        "weight": 2,
+        "language": "typescript"
+      },
+      {
+        "id": "async-arrow",
+        "pattern": "async ($$$) => { $$$ }",
+        "description": "Async arrow function",
+        "quality": "good",
+        "weight": 2,
+        "language": "typescript"
+      }
+    ],
+    "typescript_console": [
+      {
+        "id": "no-console-log",
+        "pattern": "console.log($$$)",
+        "description": "Console.log usage",
+        "quality": "bad",
+        "weight": -2,
+        "language": "typescript",
+        "fix": ""
+      },
+      {
+        "id": "no-console-debug",
+        "pattern": "console.debug($$$)",
+        "description": "Console.debug usage",
+        "quality": "bad",
+        "weight": -2,
+        "language": "typescript",
+        "fix": ""
+      },
+      {
+        "id": "console-error-in-catch",
+        "pattern": "console.error($$$)",
+        "inside": "catch ($_) { $$$ }",
+        "description": "Console.error in catch (OK)",
+        "quality": "neutral",
+        "weight": 0,
+        "language": "typescript"
+      }
+    ],
+    "typescript_react": [
+      {
+        "id": "useState-hook",
+        "pattern": "const [$STATE, $SETTER] = useState($$$)",
+        "description": "React useState hook",
+        "quality": "good",
+        "weight": 2,
+        "language": "typescript"
+      },
+      {
+        "id": "useEffect-hook",
+        "pattern": "useEffect(() => { $$$ }, $DEPS)",
+        "description": "React useEffect hook",
+        "quality": "neutral",
+        "weight": 1,
+        "language": "typescript"
+      },
+      {
+        "id": "useEffect-no-deps",
+        "pattern": "useEffect(() => { $$$ })",
+        "description": "useEffect without dependencies",
+        "quality": "bad",
+        "weight": -3,
+        "language": "typescript"
+      }
+    ],
+    "typescript_imports": [
+      {
+        "id": "barrel-import",
+        "pattern": "import { $$$ } from '$MODULE'",
+        "description": "Named import",
+        "quality": "neutral",
+        "weight": 0,
+        "language": "typescript"
+      },
+      {
+        "id": "default-import",
+        "pattern": "import $NAME from '$MODULE'",
+        "description": "Default import",
+        "quality": "neutral",
+        "weight": 0,
+        "language": "typescript"
+      },
+      {
+        "id": "import-all",
+        "pattern": "import * as $NAME from '$MODULE'",
+        "description": "Import all",
+        "quality": "neutral",
+        "weight": -1,
+        "language": "typescript"
+      }
+    ],
+    "javascript_async": [
+      {
+        "id": "callback-hell",
+        "pattern": "$FUNC($$$, function($$$) { $$$ })",
+        "description": "Callback pattern (consider promises)",
+        "quality": "bad",
+        "weight": -2,
+        "language": "javascript"
+      },
+      {
+        "id": "promise-then",
+        "pattern": "$PROMISE.then($$$)",
+        "description": "Promise then chain",
+        "quality": "neutral",
+        "weight": 0,
+        "language": "javascript"
+      },
+      {
+        "id": "async-await",
+        "pattern": "await $PROMISE",
+        "description": "Async/await usage",
+        "quality": "good",
+        "weight": 2,
+        "language": "javascript"
+      }
+    ],
+    "javascript_var": [
+      {
+        "id": "var-declaration",
+        "pattern": "var $VAR = $$$",
+        "description": "Var declaration (use const/let)",
+        "quality": "bad",
+        "weight": -3,
+        "language": "javascript"
+      },
+      {
+        "id": "const-declaration",
+        "pattern": "const $VAR = $$$",
+        "description": "Const declaration",
+        "quality": "good",
+        "weight": 2,
+        "language": "javascript"
+      },
+      {
+        "id": "let-declaration",
+        "pattern": "let $VAR = $$$",
+        "description": "Let declaration",
+        "quality": "good",
+        "weight": 1,
+        "language": "javascript"
+      }
+    ],
+    "shell_env_handling": [
+      {
+        "id": "unused-shell-var",
+        "pattern": "$VAR=\"$VALUE\"",
+        "description": "Assigned but never referenced variable",
+        "quality": "bad",
+        "weight": -2,
+        "language": "bash",
+        "note": "Check if variable is used later"
+      },
+      {
+        "id": "unsafe-var-check",
+        "pattern": "[ ! -z \"$VAR\" ]",
+        "description": "Unsafe variable check (breaks with set -u)",
+        "quality": "bad",
+        "weight": -3,
+        "language": "bash",
+        "fix": "[ -n \"${VAR:-}\" ]"
+      },
+      {
+        "id": "redundant-export",
+        "pattern": "export $VAR=\"$VAR\"",
+        "description": "Redundant export of same value",
+        "quality": "bad",
+        "weight": -2,
+        "language": "bash"
+      },
+      {
+        "id": "missing-safety-flags",
+        "pattern": "#!/bin/bash",
+        "description": "Missing safety flags",
+        "quality": "bad",
+        "weight": -3,
+        "language": "bash",
+        "note": "Add 'set -euo pipefail' after shebang"
+      }
+    ],
+    "python_security": [
+      {
+        "id": "sql-injection-fstring",
+        "pattern": "$CURSOR.execute(f\"$SQL\")",
+        "description": "SQL injection via f-string formatting",
+        "quality": "bad",
+        "weight": -5,
+        "language": "python",
+        "severity": "critical"
+      },
+      {
+        "id": "sql-injection-concat",
+        "pattern": "$CURSOR.execute(\"$SQL\" + $VAR)",
+        "description": "SQL injection via string concatenation",
+        "quality": "bad",
+        "weight": -5,
+        "language": "python",
+        "severity": "critical"
+      },
+      {
+        "id": "hardcoded-password",
+        "pattern": "password = \"$PWD\"",
+        "description": "Hardcoded password in source",
+        "quality": "bad",
+        "weight": -5,
+        "language": "python",
+        "severity": "critical"
+      },
+      {
+        "id": "hardcoded-api-key",
+        "pattern": "api_key = \"$KEY\"",
+        "description": "Hardcoded API key",
+        "quality": "bad",
+        "weight": -5,
+        "language": "python",
+        "severity": "critical"
+      },
+      {
+        "id": "unsafe-yaml-load",
+        "pattern": "yaml.load($DATA)",
+        "description": "Unsafe YAML loading (allows arbitrary code execution)",
+        "quality": "bad",
+        "weight": -5,
+        "language": "python",
+        "severity": "critical",
+        "fix": "yaml.safe_load($DATA)",
+        "autofix": true
+      },
+      {
+        "id": "unsafe-pickle",
+        "pattern": "pickle.loads($DATA)",
+        "description": "Unsafe pickle deserialization from untrusted source",
+        "quality": "bad",
+        "weight": -4,
+        "language": "python",
+        "severity": "high"
       }
     ],
     "go_catalog": [
@@ -334,12 +787,76 @@
         "weight": 3
       }
     ],
+    "typescript_antipatterns": [
+      {
+        "id": "double-equals",
+        "pattern": "$A == $B",
+        "description": "Using == instead of === for comparison",
+        "quality": "bad",
+        "weight": -3,
+        "language": "typescript",
+        "severity": "medium",
+        "fix": "$A === $B",
+        "autofix": true
+      },
+      {
+        "id": "not-double-equals",
+        "pattern": "$A != $B",
+        "description": "Using != instead of !== for comparison",
+        "quality": "bad",
+        "weight": -3,
+        "language": "typescript",
+        "severity": "medium",
+        "fix": "$A !== $B",
+        "autofix": true
+      },
+      {
+        "id": "var-declaration-ts",
+        "pattern": "var $VAR = $$$",
+        "description": "Using var instead of const/let",
+        "quality": "bad",
+        "weight": -3,
+        "language": "typescript",
+        "severity": "low",
+        "fix": "const $VAR = $$$",
+        "autofix": false
+      },
+      {
+        "id": "promise-not-awaited",
+        "pattern": "$PROMISE.$THEN($$$)",
+        "description": "Promise chain instead of async/await",
+        "quality": "bad",
+        "weight": -2,
+        "language": "typescript",
+        "severity": "low"
+      }
+    ],
+    "typescript_security": [
+      {
+        "id": "dangerouslySetInnerHTML",
+        "pattern": "dangerouslySetInnerHTML={{__html: $HTML}}",
+        "description": "XSS vulnerability via dangerouslySetInnerHTML",
+        "quality": "bad",
+        "weight": -5,
+        "language": "tsx",
+        "severity": "critical"
+      },
+      {
+        "id": "eval-usage-ts",
+        "pattern": "eval($CODE)",
+        "description": "eval() allows arbitrary code execution",
+        "quality": "bad",
+        "weight": -5,
+        "language": "typescript",
+        "severity": "critical"
+      }
+    ],
     "tsx_catalog": [
       {
         "id": "unnecessary-react-hook",
         "title": "Avoid Unnecessary React Hook",
         "description": "React hook is a powerful feature in React that allows you to use state and other React features in a functional component.\n\nHowever, you should avoid using hooks when you don't need them. If the code does not contain using any other React hooks,\nit can be rewritten to a plain function. This can help to separate your application logic from the React-specific UI logic.",
-        "language": "Tsx",
+        "language": "tsx",
         "file": "unnecessary-react-hook.md",
         "has_fix": false,
         "patterns": [
@@ -361,7 +878,7 @@
         "id": "do-what-brooooooklyn-said",
         "title": "Avoid `&&` short circuit in JSX",
         "description": "In [React](https://react.dev/learn/conditional-rendering), you can conditionally render JSX using JavaScript syntax like `if` statements, `&&`, and `? :` operators.\nHowever, you should almost never put numbers on the left side of `&&`. This is because React will render the number `0`, instead of the JSX element on the right side. A concrete example will be conditionally rendering a list when the list is not empty.\n\nThis rule will find and fix any short-circuit rendering in JSX and rewrite it to a ternary operator.",
-        "language": "Tsx",
+        "language": "tsx",
         "file": "avoid-jsx-short-circuit.md",
         "has_fix": true,
         "fix": "{$A ? $B : null}",
@@ -462,7 +979,7 @@
         "id": "find-all-imports-and-identifiers",
         "title": "Find Import Identifiers",
         "description": "Finding import metadata can be useful. Below is a comprehensive snippet for extracting identifiers from various import statements:\n\n* Alias Imports (`import { hello as world } from './file'`)\n* Default & Regular Imports (`import test from './my-test`')\n* Dynamic Imports (`require(...)`, and `import(...)`)\n* Side Effect & Namespace Imports (`import * as myCode from './code`')\n\n<!-- Use YAML in the example. Delete this section if use pattern. -->",
-        "language": "TypeScript",
+        "language": "typescript",
         "file": "find-import-identifiers.md",
         "has_fix": false,
         "patterns": [
@@ -888,7 +1405,7 @@
         "id": "missing-component-decorator",
         "title": "Missing Component Decorator",
         "description": "Angular lifecycle methods are a set of methods that allow you to hook into the lifecycle of an Angular component or directive.\nThey must be used within a class that is decorated with the `@Component()` decorator.",
-        "language": "TypeScript",
+        "language": "typescript",
         "file": "missing-component-decorator.md",
         "has_fix": false,
         "pattern": {
@@ -1027,7 +1544,7 @@
         "id": "upgrade-ant-design-vue",
         "title": "Upgrade Ant Design Vue",
         "description": "ast-grep can be used to upgrade Vue template using the HTML parser.\n\nThis rule is an example to upgrade [one breaking change](https://next.antdv.com/docs/vue/migration-v4#component-api-adjustment) in [Ant Design Vue](https://next.antdv.com/components/overview) from v3 to v4, unifying the controlled visible API of the component popup.\n\nIt is designed to identify and replace the `visible` attribute with the `open` attribute for specific components like `a-modal` and `a-tooltip`. Note the rule should not replace other visible attributes that are not related to the component popup like `a-tag`.\n\nThe rule can be broken down into the following steps:\n1. Find the target attribute name by `kind` and `regex`\n2. Find the attribute's enclosing element using `inside`, and get its tag name\n3. Ensure the tag name is related to popup components, using constraints\n\n<!-- Use YAML in the example. Delete this section if use pattern. -->",
-        "language": "HTML",
+        "language": "html",
         "file": "upgrade-ant-design-vue.md",
         "has_fix": true,
         "fix": ":open",
@@ -1065,7 +1582,7 @@
         "id": "fix-format-security-error",
         "title": "Fix Format String Vulnerability",
         "description": "The [Format String exploit](https://owasp.org/www-community/attacks/Format_string_attack) occurs when the submitted data of an input string is evaluated as a command by the application.\n\nFor example, using `sprintf(s, var)` can lead to format string vulnerabilities if `var` contains user-controlled data. This can be exploited to execute arbitrary code. By explicitly specifying the format string as `\"%s\"`, you ensure that `var` is treated as a string, mitigating this risk.\n\n<!-- Use YAML in the example. Delete this section if use pattern. -->",
-        "language": "Cpp",
+        "language": "cpp",
         "file": "fix-format-vuln.md",
         "has_fix": true,
         "pattern": "$PRINTF($S, $VAR)",
@@ -1185,7 +1702,8 @@
         "description": "Test swallowing assertion failures by catching Exception and returning False",
         "quality": "bad",
         "weight": -5,
-        "language": "python"
+        "language": "python",
+        "severity": "high"
       },
       {
         "id": "test-bare-except-return-false",
@@ -1193,15 +1711,8 @@
         "description": "Test hiding failures with bare except and return False",
         "quality": "bad",
         "weight": -5,
-        "language": "python"
-      },
-      {
-        "id": "test-file-root-location",
-        "pattern": "test_*.py",
-        "description": "Test file at repository root instead of tests/ directory",
-        "quality": "bad",
-        "weight": -3,
-        "language": "python"
+        "language": "python",
+        "severity": "high"
       }
     ],
     "npm_packaging": [
@@ -1216,7 +1727,26 @@
     ]
   },
   "stats": {
-    "total_patterns": 63,
+    "total_patterns": 117,
+    "good_patterns": 34,
+    "bad_patterns": 57,
+    "languages": [
+      "js",
+      "kotlin",
+      "tsx",
+      "html",
+      "ruby",
+      "yaml",
+      "typescript",
+      "rust",
+      "java",
+      "javascript",
+      "c",
+      "bash",
+      "python",
+      "go",
+      "cpp"
+    ],
     "categories": [
       "python_async",
       "python_error_handling",
@@ -1225,10 +1755,19 @@
       "python_antipatterns",
       "python_qdrant",
       "python_mcp",
-      "python_testing",
-      "npm_packaging",
+      "python_runtime_modification",
+      "typescript_async",
+      "typescript_console",
+      "typescript_react",
+      "typescript_imports",
+      "javascript_async",
+      "javascript_var",
+      "shell_env_handling",
+      "python_security",
       "go_catalog",
       "python_catalog",
+      "typescript_antipatterns",
+      "typescript_security",
       "tsx_catalog",
       "typescript_catalog",
       "rust_catalog",
@@ -1238,22 +1777,9 @@
       "cpp_catalog",
       "yaml_catalog",
       "c_catalog",
-      "ruby_catalog"
-    ],
-    "languages": [
-      "rust",
-      "java",
-      "kotlin",
-      "yaml",
-      "tsx",
-      "go",
-      "html",
-      "typescript",
-      "python",
-      "cpp",
-      "c",
-      "ruby"
-    ],
-    "last_update": "2025-10-01T14:00:00.000000"
+      "ruby_catalog",
+      "python_testing",
+      "npm_packaging"
+    ]
   }
 }
