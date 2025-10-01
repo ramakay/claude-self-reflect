@@ -214,6 +214,83 @@ safety check -r mcp-server/requirements.txt
 # For Node: npm test
 ```
 
+#### 4.1. NPM Packaging Validation (MANDATORY)
+
+**CRITICAL**: Always verify npm package contents before release to prevent issues like #71.
+
+```bash
+echo "=== NPM Packaging Validation ==="
+
+# 1. Run packaging regression test
+python tests/test_npm_package_contents.py
+if [ $? -ne 0 ]; then
+    echo "❌ Packaging test failed! Fix before releasing."
+    exit 1
+fi
+
+# 2. Review npm pack output
+echo "📦 Reviewing package contents..."
+npm pack --dry-run 2>&1 | tee /tmp/npm-pack-output.txt
+
+# 3. Verify critical modules present
+echo "🔍 Checking critical Python modules..."
+CRITICAL_MODULES=(
+    "scripts/metadata_extractor.py"
+    "scripts/message_processors.py"
+    "scripts/import_strategies.py"
+    "scripts/embedding_service.py"
+    "scripts/doctor.py"
+    "scripts/unified_state_manager.py"
+    "scripts/import-conversations-unified.py"
+)
+
+MISSING=0
+for module in "${CRITICAL_MODULES[@]}"; do
+    if ! grep -q "$module" /tmp/npm-pack-output.txt; then
+        echo "❌ Missing: $module"
+        MISSING=$((MISSING + 1))
+    else
+        echo "✅ Found: $module"
+    fi
+done
+
+if [ $MISSING -gt 0 ]; then
+    echo "❌ $MISSING critical modules missing from package!"
+    echo "Add them to package.json 'files' array"
+    exit 1
+fi
+
+# 4. Check package size (should be 200-400KB)
+npm pack
+TARBALL=$(ls -1 claude-self-reflect-*.tgz | tail -1)
+SIZE=$(du -h "$TARBALL" | cut -f1)
+echo "📦 Package size: $SIZE"
+
+# 5. Test local installation
+echo "🧪 Testing local installation..."
+npm install -g "./$TARBALL"
+claude-self-reflect --version || {
+    echo "❌ CLI failed to load!"
+    exit 1
+}
+
+# 6. Smoke test setup command
+claude-self-reflect setup --help || {
+    echo "❌ Setup command failed!"
+    exit 1
+}
+
+echo "✅ NPM packaging validation passed!"
+echo "Package: $TARBALL ($SIZE)"
+
+# Clean up test tarball
+rm -f "$TARBALL"
+```
+
+**Reference**: See `PACKAGING_CHECKLIST.md` for full guidelines.
+
+**History**: Added after Issue #71 (v5.0.4 → v5.0.5) where refactored modules were missing from npm package.
+
 #### 4.5. Create Professional Release Notes
 ```bash
 # Create release notes file

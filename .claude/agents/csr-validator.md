@@ -93,6 +93,49 @@ find . -type f \( -name "*test_*.py" -o -name "test_*.py" -o -name "*benchmark*.
 echo "=== Suggest archiving to: tests/throwaway/ ==="
 ```
 
+### 8. NPM Package Validation (Regression Check for #71)
+```bash
+echo "=== NPM Package Contents Check ==="
+
+# Quick check - verify critical refactored modules are packaged
+npm pack --dry-run 2>&1 | tee /tmp/npm-pack-check.txt
+
+CRITICAL_MODULES=(
+  "metadata_extractor.py"
+  "message_processors.py"
+  "import_strategies.py"
+  "embedding_service.py"
+  "doctor.py"
+)
+
+echo "Checking for critical modules..."
+MISSING=0
+for module in "${CRITICAL_MODULES[@]}"; do
+  if grep -q "$module" /tmp/npm-pack-check.txt; then
+    echo "✅ $module"
+  else
+    echo "❌ MISSING: $module"
+    MISSING=$((MISSING + 1))
+  fi
+done
+
+if [ $MISSING -eq 0 ]; then
+  echo "✅ All critical modules packaged"
+else
+  echo "❌ $MISSING modules missing - update package.json!"
+fi
+
+# Also run the regression test if available
+if [ -f tests/test_npm_package_contents.py ]; then
+  echo "Running regression test..."
+  python tests/test_npm_package_contents.py && echo "✅ Packaging test passed" || echo "❌ Packaging test failed"
+else
+  echo "⚠️  Regression test not found (expected: tests/test_npm_package_contents.py)"
+fi
+
+rm -f /tmp/npm-pack-check.txt
+```
+
 ## Output Format
 
 ```

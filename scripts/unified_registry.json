@@ -1,7 +1,7 @@
 {
   "source": "unified-ast-grep-auto-updated",
   "version": "3.0.0",
-  "timestamp": "2025-10-01T06:08:36.040858",
+  "timestamp": "2025-10-01T06:23:27.845535",
   "patterns": {
     "python_async": [
       {
@@ -1203,19 +1203,19 @@
       "ruby_catalog"
     ],
     "languages": [
-      "html",
-      "python",
-      "ruby",
-      "go",
       "rust",
       "java",
-      "c",
-      "typescript",
-      "tsx",
       "kotlin",
+      "yaml",
+      "tsx",
+      "go",
+      "html",
+      "typescript",
+      "python",
       "cpp",
-      "yaml"
+      "c",
+      "ruby"
     ],
-    "last_update": "2025-10-01T06:08:36.040879"
+    "last_update": "2025-10-01T06:23:27.845565"
   }
 }
