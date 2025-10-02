@@ -77,8 +77,9 @@ class MetadataExtractor:
         return metadata, first_timestamp or datetime.now().isoformat(), message_count
 
     def _initialize_metadata(self) -> Dict[str, Any]:
-        """Initialize empty metadata structure."""
+        """Initialize empty metadata structure with Memory Tool integration."""
         return {
+            # Core file tracking
             "files_analyzed": [],
             "files_edited": [],
             "tools_used": [],
@@ -87,8 +88,16 @@ class MetadataExtractor:
             "has_code_blocks": False,
             "total_messages": 0,
             "project_path": None,
+
+            # AST-GREP quality analysis
             "pattern_analysis": {},
-            "avg_quality_score": 0.0
+            "avg_quality_score": 0.0,
+
+            # Memory Tool integration (v6.0)
+            "memory_references": [],  # Paths to /memories/ files with stored patterns
+            "quality_evolution": [],  # Track quality changes over time
+            "pattern_frequency": {},  # Track recurring patterns across conversations
+            "context_importance": 0.0  # Calculated importance score for context clearing
         }
 
     def _process_line(self, line: str, metadata: Dict[str, Any]) -> Optional[Tuple[str, bool]]:
@@ -246,6 +255,108 @@ class MetadataExtractor:
 
         metadata['pattern_analysis'] = pattern_quality
         metadata['avg_quality_score'] = round(avg_quality_score, 3)
+
+        # Auto-store high-quality patterns to Memory Tool
+        memory_refs = self._auto_store_high_quality_patterns(pattern_quality, files_to_analyze)
+        if memory_refs:
+            metadata['memory_references'] = memory_refs
+
+        # Track quality evolution
+        if quality_scores:
+            metadata['quality_evolution'] = [{
+                'timestamp': datetime.now().isoformat(),
+                'avg_score': avg_quality_score,
+                'file_count': len(quality_scores),
+                'scores': quality_scores[:10]  # Track top 10 scores
+            }]
+
+        # Track pattern frequency (CodeRabbit fix - implement pattern counting)
+        metadata['pattern_frequency'] = self._count_pattern_frequency(pattern_quality)
+
+        # Calculate context importance for Context Editing API
+        metadata['context_importance'] = self._calculate_context_importance(
+            avg_quality_score, len(metadata.get('memory_references', [])), len(metadata.get('concepts', []))
+        )
+
+    def _auto_store_high_quality_patterns(
+        self,
+        pattern_quality: Dict[str, Dict[str, Any]],
+        files_analyzed: list
+    ) -> list:
+        """
+        Auto-store high-quality patterns (score >90) to Memory Tool.
+        Complexity: 3 (filter, delegate to helper, error handling)
+        """
+        memory_references = []
+
+        try:
+            # Filter high-quality files
+            high_quality_files = [
+                (file, info) for file, info in pattern_quality.items()
+                if info.get('score', 0) > 0.90
+            ]
+
+            if not high_quality_files:
+                return memory_references
+
+            # Delegate to helper class
+            from .pattern_storage_helper import HighQualityPatternStore
+            store = HighQualityPatternStore()
+
+            memory_references = store.store_patterns(high_quality_files)
+
+        except Exception as e:
+            logger.debug(f"Memory Tool auto-storage not available: {e}")
+
+        return memory_references
+
+    def _count_pattern_frequency(self, pattern_quality: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+        """
+        Count frequency of recurring patterns across analyzed files.
+        Complexity: 3 (iterate files, extract patterns, count)
+        """
+        pattern_freq = {}
+
+        for file_path, quality_info in pattern_quality.items():
+            # Extract pattern types from the analysis
+            good_count = quality_info.get('good_patterns', 0)
+            bad_count = quality_info.get('bad_patterns', 0)
+
+            if good_count > 0:
+                pattern_freq['good_practices'] = pattern_freq.get('good_practices', 0) + good_count
+            if bad_count > 0:
+                pattern_freq['anti_patterns'] = pattern_freq.get('anti_patterns', 0) + bad_count
+
+        return pattern_freq
+
+    def _calculate_context_importance(
+        self,
+        avg_quality: float,
+        memory_refs_count: int,
+        concepts_count: int
+    ) -> float:
+        """
+        Calculate context importance score for Context Editing API.
+        Higher scores = more important to keep in context.
+        Complexity: 2 (simple weighted calculation)
+        """
+        # Weight factors
+        quality_weight = 0.5  # Quality is most important
+        memory_weight = 0.3   # Memory storage indicates value
+        concept_weight = 0.2  # Concept diversity matters
+
+        # Normalize memory and concept counts (cap at reasonable max)
+        memory_score = min(memory_refs_count / 5.0, 1.0)  # Max 5 refs = 1.0
+        concept_score = min(concepts_count / 10.0, 1.0)    # Max 10 concepts = 1.0
+
+        # Calculate weighted score
+        importance = (
+            (avg_quality * quality_weight) +
+            (memory_score * memory_weight) +
+            (concept_score * concept_weight)
+        )
+
+        return round(importance, 3)
 
     def _is_code_file(self, file_path: str) -> bool:
         """Check if file is a code file."""

@@ -585,6 +585,262 @@ def generate_statusline():
 
 ---
 
+## Phase 4.5: Code Review & Quality Gates (Week 7.5)
+
+### 4.5.1 Automated Code Review Process
+
+**Step 1: Cyclomatic Complexity Check**
+```bash
+#!/bin/bash
+echo "=== CYCLOMATIC COMPLEXITY VALIDATION ==="
+
+# Install radon if not present
+pip install radon 2>/dev/null
+
+# Check all new modules
+NEW_MODULES=(
+    "mcp-server/src/context_manager.py"
+    "mcp-server/src/memory_tools.py"
+    "scripts/enhanced_metadata.py"
+)
+
+for module in "${NEW_MODULES[@]}"; do
+    echo "Checking: $module"
+
+    # Get complexity stats
+    STATS=$(radon cc "$module" -s -a)
+    AVG_COMPLEXITY=$(echo "$STATS" | grep "Average complexity:" | awk '{print $3}' | tr -d '()')
+
+    # Parse average complexity
+    if (( $(echo "$AVG_COMPLEXITY > 5.0" | bc -l) )); then
+        echo "❌ FAIL: $module has avg complexity $AVG_COMPLEXITY (must be <5)"
+        exit 1
+    fi
+
+    # Check individual functions
+    HIGH_COMPLEXITY=$(radon cc "$module" -n C)  # C grade = complexity >10
+    if [ -n "$HIGH_COMPLEXITY" ]; then
+        echo "❌ FAIL: $module has functions with complexity >10"
+        echo "$HIGH_COMPLEXITY"
+        exit 1
+    fi
+
+    echo "✅ PASS: $module (avg: $AVG_COMPLEXITY)"
+done
+
+echo "✅ All modules pass complexity requirements"
+```
+
+**Step 2: Zen Tools Code Review**
+```bash
+# Use mcp__zen__codereview for comprehensive analysis
+echo "=== ZEN TOOLS CODE REVIEW ==="
+
+# Review context_manager.py
+mcp__zen__codereview \
+    --files "mcp-server/src/context_manager.py" \
+    --model "anthropic/claude-opus-4" \
+    --review-type "full" \
+    --focus-on "complexity,security,api-integration" \
+    --prompt "Review Context Management implementation focusing on:
+    1. Cyclomatic complexity (must be <5 avg, <10 max)
+    2. API integration with Claude 2.0.1 beta headers
+    3. Security of stats tracking and file I/O
+    4. Error handling completeness"
+
+# Review memory_tools.py
+mcp__zen__codereview \
+    --files "mcp-server/src/memory_tools.py" \
+    --model "anthropic/claude-opus-4" \
+    --review-type "security" \
+    --focus-on "path-traversal,injection,complexity" \
+    --prompt "Security-focused review of Memory Tool:
+    1. Path traversal prevention completeness
+    2. Input sanitization for all operations
+    3. Cyclomatic complexity verification
+    4. Race condition potential in file operations"
+```
+
+**Step 3: AST-GREP Quality Validation**
+```bash
+# Validate code quality with existing AST-grep patterns
+echo "=== AST-GREP QUALITY CHECK ==="
+
+python scripts/ast_grep_final_analyzer.py \
+    --files mcp-server/src/context_manager.py \
+    --files mcp-server/src/memory_tools.py \
+    --output quality-report.json
+
+# Check quality scores
+SCORE=$(jq '.overall_quality_score' quality-report.json)
+if (( $(echo "$SCORE < 90" | bc -l) )); then
+    echo "❌ FAIL: Quality score $SCORE is below 90 threshold"
+    jq '.issues' quality-report.json
+    exit 1
+fi
+
+echo "✅ Quality score: $SCORE/100"
+```
+
+### 4.5.2 Pre-commit Validation
+
+**Use mcp__zen__precommit for Git Changes Review:**
+```bash
+# Comprehensive pre-commit validation
+mcp__zen__precommit \
+    --path /Users/ramakrishnanannaswamy/projects/claude-self-reflect \
+    --model "anthropic/claude-opus-4" \
+    --include-staged true \
+    --include-unstaged true \
+    --prompt "Validate Memory & Context Management integration:
+
+    ORIGINAL REQUEST: Integrate Claude 2.0.1 Memory Tool and Context Editing
+
+    REQUIREMENTS:
+    1. Context Management with beta API support
+    2. Memory Tool with path traversal protection
+    3. Hybrid search (Memory + Vector)
+    4. Statusline visualization
+    5. Cyclomatic complexity <5 avg, <10 max
+    6. AST-grep quality score >90
+
+    CRITICAL CHECKS:
+    - All functions complexity validated
+    - Security: path traversal prevention
+    - API: correct beta headers
+    - Tests: comprehensive coverage
+    - Documentation: complete and accurate"
+```
+
+### 4.5.3 CI/CD Integration
+
+**Update CI Pipeline (.github/workflows/ci.yml):**
+```yaml
+quality-gates:
+  runs-on: ubuntu-latest
+
+  steps:
+  - uses: actions/checkout@v5
+
+  - name: Install quality tools
+    run: |
+      pip install radon pytest pytest-asyncio
+
+  - name: Cyclomatic Complexity Check
+    run: |
+      radon cc mcp-server/src/context_manager.py -s -a
+      radon cc mcp-server/src/memory_tools.py -s -a
+
+      # Fail if avg complexity >5
+      python -c "
+      import sys
+      import subprocess
+      result = subprocess.run(['radon', 'cc', 'mcp-server/src/', '-a', '-j'],
+                             capture_output=True, text=True)
+      import json
+      data = json.loads(result.stdout)
+      for file, metrics in data.items():
+          if metrics.get('average_complexity', 0) > 5.0:
+              print(f'FAIL: {file} complexity too high')
+              sys.exit(1)
+      print('PASS: All modules within complexity limits')
+      "
+
+  - name: Security Scan
+    run: |
+      # Check for hardcoded secrets
+      if grep -r "VOYAGE_KEY\|API_KEY.*=" mcp-server/src/ --include="*.py" | grep -v "os.environ"; then
+        echo "FAIL: Hardcoded secrets found"
+        exit 1
+      fi
+
+      # Check path traversal patterns
+      if grep -r "os.path.join.*\.\." mcp-server/src/ --include="*.py"; then
+        echo "WARNING: Potential path traversal pattern"
+      fi
+
+  - name: AST-GREP Quality Validation
+    run: |
+      python scripts/ast_grep_final_analyzer.py \
+        --files mcp-server/src/context_manager.py \
+        --files mcp-server/src/memory_tools.py \
+        --min-score 90
+
+memory-context-tests:
+  needs: quality-gates
+  runs-on: ubuntu-latest
+
+  steps:
+  - uses: actions/checkout@v5
+
+  - name: Test Context Management
+    run: |
+      python -m pytest tests/test_context_manager.py -v
+
+  - name: Test Memory Tools
+    run: |
+      python -m pytest tests/test_memory_tools.py -v
+
+  - name: Test Hybrid Search
+    run: |
+      python -m pytest tests/test_hybrid_search.py -v
+```
+
+### 4.5.4 Manual Code Review Checklist
+
+**Before PR Submission:**
+- [ ] Run cyclomatic complexity check: All modules <5 avg
+- [ ] Run Zen code review: No critical/high issues
+- [ ] Run AST-GREP validation: Score >90
+- [ ] Run precommit validation: All checks pass
+- [ ] Test all 3 agents: csr-validator, claude-self-reflect-test, reflect-tester
+- [ ] Update documentation: README, CHANGELOG, integration plan
+- [ ] Create test coverage report: Show >80% coverage
+- [ ] Run security scan: No secrets, no path traversal
+- [ ] Verify statusline display: All components shown correctly
+- [ ] Test both embedding modes: Local and Cloud compatible
+
+**PR Description Template:**
+```markdown
+## Summary
+[Brief description of changes]
+
+## Code Quality Validation
+- ✅ Cyclomatic complexity: Avg <5, Max <10
+- ✅ Zen code review: Grade A (no critical issues)
+- ✅ AST-GREP score: [score]/100
+- ✅ Security scan: No issues
+- ✅ Test coverage: [percentage]%
+
+## Testing
+- ✅ csr-validator: [status]
+- ✅ claude-self-reflect-test: [status]
+- ✅ reflect-tester: [status]
+- ✅ Unit tests: [count] passing
+- ✅ Integration tests: [count] passing
+
+## Breaking Changes
+[None/List any breaking changes]
+
+## Documentation
+- [ ] README updated
+- [ ] CHANGELOG updated
+- [ ] API docs updated
+- [ ] Migration guide (if needed)
+```
+
+**Checklist:**
+- [ ] Run automated complexity check
+- [ ] Run Zen Tools code review
+- [ ] Run AST-GREP quality validation
+- [ ] Run precommit validation
+- [ ] Run security scan
+- [ ] Update CI/CD pipeline
+- [ ] Create manual review checklist
+- [ ] Test PR submission process
+
+---
+
 ## Phase 5: Testing & Validation (Week 8)
 
 ### 5.1 Test with All 3 Specialized Agents
@@ -625,6 +881,8 @@ test_hybrid_search() {
 - [ ] Hybrid search works
 - [ ] Statusline shows all components
 - [ ] All 3 test agents pass
+- [ ] Code quality gates pass
+- [ ] CI/CD pipeline passes
 
 ---
 

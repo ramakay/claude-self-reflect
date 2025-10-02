@@ -180,6 +180,43 @@ Your code quality displayed live as you work:
 
 </details>
 
+## ⭐ What's New in v6.0
+
+<details open>
+<summary><b>Claude 2.0.1 Memory & Context Management</b></summary>
+
+**🧠 Memory Tool Integration (Instant Pattern Recall)**
+- Store high-quality code patterns to persistent memory (auto-stores patterns with score >90)
+- O(1) file-based lookup for learned patterns
+- Hybrid search combines Memory Tool + Vector search (Memory results score 0.95)
+- Security: 21-test suite validates path traversal protection
+
+**🔄 Context Editing API (Automatic Context Management)**
+- Automatic tool result clearing at 30k tokens
+- Keeps memory/reflection tools (excludes from clearing)
+- Statusline shows context stats: `Context: 70k→25k (-45k↓ -8🔧)`
+- Beta header: `context-management-2025-06-27`
+
+**📊 Enhanced Metadata Tracking**
+- `memory_references`: Track auto-stored patterns
+- `pattern_frequency`: Count good practices vs anti-patterns
+- `quality_evolution`: Timeline of code quality
+- `context_importance`: Score for Context Editing API (0.0-1.0)
+
+**🛡️ Security & Performance**
+- Path traversal protection (blocks `../../../etc/passwd` attacks)
+- 1MB file size limit prevents OOM in search
+- 21 comprehensive security tests (all passing)
+- Grade A- code quality (87.7/100, complexity 3.54 avg)
+
+**📈 Statusline Enhancements**
+```bash
+# Compact mode now shows all v6.0 components:
+[100%][🟢] • Context: 28k (clearing soon) • Memory: 12 files (5p/3i/4q) • Quality: 0.92 (3 auto-stored)
+```
+
+</details>
+
 ## Key Features
 
 <details>
@@ -193,7 +230,13 @@ Your code quality displayed live as you work:
 - `search_by_concept` - Search for conversations about development concepts
 - `get_full_conversation` - Retrieve complete JSONL conversation files (v2.8.8)
 
-**NEW: Temporal Query Tools (v3.3.0):**
+**NEW: Memory Tool (v6.0) - Persistent Pattern Storage:**
+- `view_memory` - View contents of memory files
+- `store_to_memory` - Store patterns to persistent memory (with optional Qdrant dual-storage)
+- `search_memory` - Search memory files for text patterns
+- `list_memories` - List all memory files (filterable by category: patterns/insights/quality/projects)
+
+**Temporal Query Tools (v3.3.0):**
 - `get_recent_work` - Answer "What did we work on last?" with session grouping
 - `search_by_recency` - Time-constrained search like "docker issues last week"
 - `get_timeline` - Activity timeline with statistics and patterns

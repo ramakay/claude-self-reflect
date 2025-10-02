@@ -309,6 +309,40 @@ class SearchTools:
             if not filtered_collections:
                 return "<search_results><message>No collections found for the specified project</message></search_results>"
 
+            # HYBRID SEARCH: Check Memory Tool first for instant pattern recall
+            memory_results = []
+            memory_search_time = 0
+            try:
+                memory_start = time.time()
+                from .memory_tools import get_memory_handler
+                memory_handler = get_memory_handler()
+
+                # Quick text search in Memory Tool files
+                memory_matches = await memory_handler.search(query, category=None)
+
+                if memory_matches:
+                    await ctx.debug(f"Found {len(memory_matches)} Memory Tool matches")
+
+                    # Convert memory matches to result format
+                    for mem in memory_matches[:3]:  # Top 3 memory files
+                        memory_results.append({
+                            'id': f"memory:{mem['path']}",
+                            'score': 0.95,  # High priority for memory matches
+                            'timestamp': datetime.now().isoformat(),
+                            'role': 'memory',
+                            'excerpt': mem['preview'],
+                            'project_name': target_project or 'general',
+                            'conversation_id': mem['path'],
+                            'collection_name': 'Memory Tool',
+                            'source': 'memory_tool'
+                        })
+
+                memory_search_time = time.time() - memory_start
+                timing_info['memory_search_ms'] = round(memory_search_time * 1000, 2)
+
+            except Exception as e:
+                await ctx.debug(f"Memory Tool search skipped: {e}")
+
             # Perform PARALLEL search across collections to avoid freeze
             # Ensure filtered_collections is not None before iterating
             if filtered_collections is None:
@@ -355,12 +389,20 @@ class SearchTools:
             else:
                 await ctx.debug(f"No results found. Timing info: {timing_info}")
 
+            # Merge memory results with vector search results
+            if memory_results:
+                all_results = memory_results + all_results
+                await ctx.debug(f"Merged {len(memory_results)} memory results with {len(all_results) - len(memory_results)} vector results")
+
             if not all_results:
                 return "<search_results><message>No matching conversations found</message></search_results>"
-            
-            # Sort and limit results
+
+            # Sort and limit results (memory results will be at top due to 0.95 score)
             all_results.sort(key=lambda x: x['score'], reverse=True)
             final_results = all_results[:limit]
+
+            # Add suggestion to store high-value findings if none in memory yet
+            suggest_storage = len(memory_results) == 0 and len(final_results) > 0 and final_results[0]['score'] > 0.8
 
             # Use rich formatting for default XML format
             if response_format == "xml" and not brief:
@@ -377,7 +419,9 @@ class SearchTools:
                     start_time=start_time,
                     brief=brief,
                     include_raw=include_raw,
-                    indexing_status=indexing_status
+                    indexing_status=indexing_status,
+                    memory_count=len(memory_results),
+                    suggest_storage=suggest_storage
                 )
             else:
                 # Fall back to standard formatting for markdown or brief mode

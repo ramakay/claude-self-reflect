@@ -34,6 +34,7 @@ from .search_tools import register_search_tools
 from .reflection_tools import register_reflection_tools
 from .mode_switch_tool import register_mode_switch_tool
 from .code_reload_tool import register_code_reload_tool
+from .memory_tools import get_memory_handler
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.models import (
@@ -775,6 +776,128 @@ register_code_reload_tool(
     mcp,
     get_embedding_manager
 )
+
+# Memory Tool MCP Integration
+memory_handler = get_memory_handler()
+
+@mcp.tool()
+async def view_memory(
+    ctx: Context,
+    path: str = Field(description="Relative path to memory file (e.g., 'patterns/api-design.md')")
+) -> str:
+    """View contents of a memory file from persistent storage.
+
+    Memory files are organized in:
+    - patterns/ - Recurring code patterns and solutions
+    - insights/ - Key learnings and best practices
+    - quality/ - Quality improvement patterns
+    - projects/ - Project-specific knowledge
+    """
+    return await memory_handler.view(path)
+
+@mcp.tool()
+async def store_to_memory(
+    ctx: Context,
+    path: str = Field(description="Relative path to memory file (e.g., 'patterns/async-error-handling.md')"),
+    content: str = Field(description="Content to store in memory"),
+    category: str = Field(default="general", description="Category: patterns, insights, quality, or projects"),
+    also_reflect: bool = Field(default=True, description="Also store to Qdrant reflections for searchability")
+) -> str:
+    """Store important insights to persistent Memory Tool and optionally to Qdrant.
+
+    This creates a two-tier memory system:
+    - Memory Tool: Instant O(1) file lookup for learned patterns
+    - Qdrant: Full vector search with semantic similarity
+
+    Args:
+        path: File path within memory directory
+        content: The insight or pattern to store
+        category: Organizational category for the memory
+        also_reflect: If True, also stores to Qdrant for semantic search
+    """
+    # Store to Memory Tool
+    memory_result = await memory_handler.create(path, content)
+
+    # Also store to Qdrant reflections for searchability
+    if also_reflect:
+        # Create reflection tools instance for dual storage
+        from .reflection_tools import ReflectionTools
+
+        reflection_tools = ReflectionTools(
+            qdrant_client=qdrant_client,
+            qdrant_url=QDRANT_URL,
+            get_embedding_manager=get_embedding_manager,
+            normalize_project_name=normalize_project_name
+        )
+
+        tags = [category, f"memory:{path}"]
+        reflection_result = await reflection_tools.store_reflection(ctx, content, tags)
+        return f"{memory_result}\n{reflection_result}"
+
+    return memory_result
+
+@mcp.tool()
+async def search_memory(
+    ctx: Context,
+    query: str = Field(description="Text to search for in memory files"),
+    category: Optional[str] = Field(default=None, description="Optional category filter: patterns, insights, quality, projects")
+) -> str:
+    """Search memory files for specific text patterns.
+
+    This is a simple text search through Memory Tool files.
+    For semantic search across all conversations, use csr_reflect_on_past instead.
+
+    Args:
+        query: Text to search for (case-insensitive)
+        category: Optional category to limit search scope
+    """
+    try:
+        results = await memory_handler.search(query, category)
+
+        if not results:
+            return f"No memory files found matching '{query}'"
+
+        # Format results
+        output = [f"Found {len(results)} memory file(s) matching '{query}':\n"]
+
+        for i, result in enumerate(results, 1):
+            output.append(f"\n{i}. {result['path']}")
+            output.append(f"   Preview: {result['preview']}")
+            output.append(f"   Size: {result['size']} bytes")
+
+        return "\n".join(output)
+    except Exception as e:
+        logger.exception(f"Error searching memory: {e}")
+        return f"Error searching memory: {str(e)}"
+
+@mcp.tool()
+async def list_memories(
+    ctx: Context,
+    category: Optional[str] = Field(default=None, description="Optional category filter: patterns, insights, quality, projects")
+) -> str:
+    """List all memory files, optionally filtered by category.
+
+    Shows the structure of your persistent memory storage.
+    """
+    try:
+        memories = await memory_handler.list_memories(category)
+
+        if not memories:
+            scope = f"in category '{category}'" if category else ""
+            return f"No memory files found {scope}"
+
+        # Format results
+        output = [f"Found {len(memories)} memory file(s):\n"]
+
+        for i, mem in enumerate(memories, 1):
+            output.append(f"{i}. {mem['path']}")
+            output.append(f"   Size: {mem['size']} bytes")
+            output.append(f"   Modified: {mem['modified']}")
+
+        return "\n".join(output)
+    except Exception as e:
+        logger.exception(f"Error listing memories: {e}")
+        return f"Error listing memories: {str(e)}"
 
 # Run the server
 if __name__ == "__main__":

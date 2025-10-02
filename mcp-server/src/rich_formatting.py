@@ -19,7 +19,9 @@ def format_search_results_rich(
     start_time: float,
     brief: bool = False,
     include_raw: bool = False,
-    indexing_status: Optional[Dict] = None
+    indexing_status: Optional[Dict] = None,
+    memory_count: int = 0,
+    suggest_storage: bool = False
 ) -> str:
     """Format search results with rich formatting including emojis and performance metrics."""
 
@@ -29,14 +31,24 @@ def format_search_results_rich(
     # Show result summary with emojis
     if results:
         score_info = "high" if results[0]['score'] >= 0.85 else "good" if results[0]['score'] >= 0.75 else "partial"
-        upfront_summary += f"🎯 RESULTS: {len(results)} matches ({score_info} relevance, top score: {results[0]['score']:.3f})\n"
+
+        # Include memory source indicator
+        source_info = f" ({memory_count} from Memory Tool)" if memory_count > 0 else ""
+        upfront_summary += f"🎯 RESULTS: {len(results)} matches{source_info} ({score_info} relevance, top score: {results[0]['score']:.3f})\n"
 
         # Show performance metrics
         total_time = time.time() - start_time
         indexing_info = ""
         if indexing_status and indexing_status.get("percentage", 100) < 100.0:
             indexing_info = f" | 📊 {indexing_status['indexed_conversations']}/{indexing_status['total_conversations']} indexed"
-        upfront_summary += f"⚡ PERFORMANCE: {int(total_time * 1000)}ms ({collections_searched} collections searched{indexing_info})\n"
+
+        # Include memory search time if available
+        memory_time = f" | 🔍 Memory: {timing_info.get('memory_search_ms', 0)}ms" if memory_count > 0 else ""
+        upfront_summary += f"⚡ PERFORMANCE: {int(total_time * 1000)}ms ({collections_searched} collections searched{indexing_info}{memory_time})\n"
+
+        # Add storage suggestion if applicable
+        if suggest_storage:
+            upfront_summary += f"💡 TIP: Consider storing this high-value finding to Memory Tool for instant future recall\n"
     else:
         upfront_summary += f"❌ NO RESULTS: No conversations found matching '{query}'\n"
 

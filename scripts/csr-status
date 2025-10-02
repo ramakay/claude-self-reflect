@@ -146,6 +146,127 @@ def format_statusline_quality(critical=0, medium=0, low=0):
         return f"{icon}"  # Perfect - no counts needed
 
 
+def get_context_stats():
+    """
+    Get context management statistics for statusline.
+    Returns formatted string or None if no context data available.
+    """
+    unified_state = Path.home() / ".claude-self-reflect" / "config" / "unified-state.json"
+
+    if not unified_state.exists():
+        return None
+
+    try:
+        with open(unified_state, 'r') as f:
+            state = json.load(f)
+
+        context = state.get("context_management", {})
+
+        # No clearing yet (CodeRabbit fix: check for None explicitly, not falsy)
+        if context.get("total_cleared_tokens") is None or context.get("total_cleared_tokens") == 0:
+            current = context.get("current_tokens", 0)
+            if current > 25000:
+                return f"Context: {format_tokens(current)} (clearing soon)"
+            return None
+
+        # Recent clearing - show last event
+        events = context.get("clearing_events", [])
+        if events:
+            last = events[-1]
+            orig = format_tokens(last["original_tokens"])
+            after = format_tokens(last["after_tokens"])
+            cleared = format_tokens(last["cleared_tokens"])
+            tools = last["cleared_tools"]
+
+            return f"Context: {orig}→{after} (-{cleared}↓ -{tools}🔧)"
+
+        # Session total
+        total = format_tokens(context["total_cleared_tokens"])
+        tools = context["total_cleared_tools"]
+        return f"Session: {total} saved • {tools} tools"
+
+    except Exception:
+        return None
+
+
+def format_tokens(tokens):
+    """Format token count for display."""
+    if tokens >= 1000:
+        return f"{tokens//1000}k"
+    return str(tokens)
+
+
+def get_memory_stats():
+    """
+    Get Memory Tool statistics for statusline.
+    Returns formatted string or None if no memory data available.
+    """
+    memory_base = Path.home() / ".claude" / "memories"
+
+    if not memory_base.exists():
+        return None
+
+    try:
+        # Count memory files by category
+        categories = {}
+        total_files = 0
+
+        for category in ["patterns", "insights", "quality", "projects"]:
+            category_path = memory_base / category
+            if category_path.exists():
+                count = len(list(category_path.rglob("*.md")))
+                if count > 0:
+                    categories[category] = count
+                    total_files += count
+
+        if total_files == 0:
+            return None
+
+        # Format: "Memory: 12 files (5p/3i/4q)"
+        category_str = "/".join([f"{count}{cat[0]}" for cat, count in categories.items()])
+        return f"Memory: {total_files} files ({category_str})"
+
+    except Exception:
+        return None
+
+
+def get_session_quality():
+    """
+    Get session quality statistics for statusline.
+    Returns formatted string or None if no quality data available.
+    """
+    unified_state = Path.home() / ".claude-self-reflect" / "config" / "unified-state.json"
+
+    if not unified_state.exists():
+        return None
+
+    try:
+        with open(unified_state, 'r') as f:
+            state = json.load(f)
+
+        quality = state.get("session_quality", {})
+
+        if not quality:
+            return None
+
+        avg_score = quality.get("avg_quality_score", 0)
+        auto_stored = quality.get("auto_stored_patterns", 0)
+
+        if avg_score == 0 and auto_stored == 0:
+            return None
+
+        # Format: "Quality: 0.85 (3 auto-stored)"
+        score_str = f"{avg_score:.2f}" if avg_score > 0 else "N/A"
+
+        if auto_stored > 0:
+            return f"Quality: {score_str} ({auto_stored} auto-stored)"
+        else:
+            return f"Quality: {score_str}"
+
+    except Exception:
+        return None
+
+
 def get_session_health():
     """Get cached session health with icon-based quality display."""
     # Get project-specific cache based on current directory
@@ -593,6 +714,13 @@ def main():
             print(get_import_status())
         elif sys.argv[1] == "--health":
             print(get_session_health())
+        elif sys.argv[1] == "--context":
+            # Show context management stats
+            context_stats = get_context_stats()
+            if context_stats:
+                print(context_stats)
+            else:
+                print("")  # Empty if no context data
         elif sys.argv[1] == "--quality-only":
             # Only show quality, not import (to avoid duplication with MCP status)
             health = get_session_health()
@@ -600,14 +728,39 @@ def main():
             if "Code:" in health:
                 print(health)
         elif sys.argv[1] == "--compact":
-            print(get_compact_status())
+            # Include context, memory, and quality stats in compact mode
+            compact = get_compact_status()
+            context_stats = get_context_stats()
+            memory_stats = get_memory_stats()
+            quality_stats = get_session_quality()
+
+            # Build status line with all components
+            parts = [compact]
+            if context_stats:
+                parts.append(context_stats)
+            if memory_stats:
+                parts.append(memory_stats)
+            if quality_stats:
+                parts.append(quality_stats)
+
+            print(" • ".join(parts))
         else:
-            # Default to compact mode
-            print(get_compact_status())
+            # Default to compact mode with context
+            compact = get_compact_status()
+            context_stats = get_context_stats()
+            if context_stats:
+                print(f"{compact} • {context_stats}")
+            else:
+                print(compact)
         return
 
-    # Default to compact format (no cycling)
-    print(get_compact_status())
+    # Default to compact format with context stats
+    compact = get_compact_status()
+    context_stats = get_context_stats()
+    if context_stats:
+        print(f"{compact} • {context_stats}")
+    else:
+        print(compact)
 
 
 if __name__ == "__main__":
