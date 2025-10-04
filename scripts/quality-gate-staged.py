@@ -68,6 +68,13 @@ class FastQualityGate:
         else:
             self.registry = None
         
+    # Files that define patterns or are test scripts (intentional print/debug statements)
+    SKIP_FILES: ClassVar[set] = {
+        'scripts/quality-gate-staged.py',  # Don't analyze pattern definitions (self-flagging)
+        'tests/test_npm_package_contents.py',  # Test script with intentional print statements
+        'scripts/ast_grep_final_analyzer.py',  # Analysis tool with intentional print
+    }
+
     def get_staged_files(self):
         """Get list of staged files that need analysis"""
         try:
@@ -76,8 +83,10 @@ class FastQualityGate:
                 capture_output=True, text=True, check=True
             )
             files = result.stdout.strip().split('\n') if result.stdout.strip() else []
-            # Filter for analyzable files
-            return [f for f in files if f and f.endswith(('.py', '.ts', '.tsx', '.js', '.jsx'))]
+            # Filter for analyzable files, exclude skip list
+            return [f for f in files
+                   if f and f.endswith(('.py', '.ts', '.tsx', '.js', '.jsx'))
+                   and f not in self.SKIP_FILES]
         except subprocess.CalledProcessError:
             return []
     
