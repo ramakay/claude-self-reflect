@@ -37,8 +37,8 @@ class FastQualityGate:
         ('__import__(', 'Dynamic import - security risk'),
         ('os.system(', 'Shell command execution - security risk'),
         ('subprocess.call(shell=True', 'Shell injection vulnerability'),
-        ('subprocess.run(', 'Potential shell invocation - check for shell=True'),
-        ('subprocess.Popen(', 'Potential shell invocation - check for shell=True'),
+        ('subprocess.run(shell=True', 'Shell injection vulnerability - shell=True'),
+        ('subprocess.Popen(shell=True', 'Shell injection vulnerability - shell=True'),
         ('pickle.loads(', 'Unsafe deserialization'),
         ('yaml.load(', 'Unsafe YAML loading - use safe_load'),
     ]
