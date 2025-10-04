@@ -31,6 +31,10 @@ REQUIRED_MODULES = [
     # Import scripts
     "scripts/import-conversations-unified.py",
 
+    # Shell scripts (required for Docker services)
+    "scripts/watcher-loop.sh",
+    "scripts/precompact-hook.sh",
+
     # MCP server
     "mcp-server/src/server.py",
     "mcp-server/src/embedding_manager.py",

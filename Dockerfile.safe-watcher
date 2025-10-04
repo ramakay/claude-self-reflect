@@ -43,6 +43,10 @@ WORKDIR /app
 # Copy application scripts
 COPY scripts/ /app/scripts/
 
+# Create symlink for backwards compatibility with /scripts path
+# This allows both /app/scripts and /scripts to work
+RUN ln -s /app/scripts /scripts
+
 # Make watcher-loop.sh executable
 RUN chmod +x /app/scripts/watcher-loop.sh
 

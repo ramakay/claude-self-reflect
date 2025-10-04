@@ -28,6 +28,10 @@ RUN pip install --no-cache-dir \
 # This ensures scripts are available even without volume mounts
 COPY scripts/ /app/scripts/
 
+# Create symlink for backwards compatibility with /scripts path
+# This allows both /app/scripts and /scripts to work
+RUN ln -s /app/scripts /scripts
+
 # Note: Volume mounts in docker-compose.yaml will override these files in local development
 # This provides compatibility for both local development and global npm installs
 

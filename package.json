@@ -60,6 +60,7 @@
     "scripts/delta-metadata-update-safe.py",
     "scripts/force-metadata-recovery.py",
     "scripts/precompact-hook.sh",
+    "scripts/watcher-loop.sh",
     "scripts/import-latest.py",
     "scripts/metadata_extractor.py",
     "scripts/message_processors.py",
