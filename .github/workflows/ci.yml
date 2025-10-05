@@ -62,9 +62,67 @@ jobs:
       run: |
         python3 tests/test_npm_package_contents.py
 
-  docker-build:
+  npm-pack-smoke-test:
     runs-on: ubuntu-latest
     needs: [python-test, npm-package-test]
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Pack and install as user would
+      run: |
+        # Create the actual tarball
+        npm pack
+
+        # Install in clean directory (simulates first-time user)
+        mkdir /tmp/test-install && cd /tmp/test-install
+        npm install $GITHUB_WORKSPACE/claude-self-reflect-*.tgz
+
+    - name: Test Python imports work
+      run: |
+        cd /tmp/test-install/node_modules/claude-self-reflect
+
+        # Test critical imports that have caused issues
+        python3 -c "from scripts.import_strategies import *" || {
+          echo "❌ Failed to import scripts.import_strategies"
+          exit 1
+        }
+        python3 -c "from scripts.metadata_extractor import *" || {
+          echo "❌ Failed to import scripts.metadata_extractor"
+          exit 1
+        }
+        python3 -c "from scripts.message_processors import *" || {
+          echo "❌ Failed to import scripts.message_processors"
+          exit 1
+        }
+        python3 -c "from scripts.embedding_service import *" || {
+          echo "❌ Failed to import scripts.embedding_service"
+          exit 1
+        }
+
+        echo "✅ All Python imports successful"
+
+    - name: Test CLI works
+      run: |
+        cd /tmp/test-install/node_modules/claude-self-reflect
+        node installer/cli.js help || {
+          echo "❌ CLI failed to execute"
+          exit 1
+        }
+        echo "✅ CLI execution successful"
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [python-test, npm-package-test, npm-pack-smoke-test]
 
     steps:
     - uses: actions/checkout@v5
@@ -146,7 +204,7 @@ jobs:
         echo "✅ macOS global install validated (file operations & path resolution)"
 
   publish-npm:
-    needs: [python-test, npm-package-test, docker-build]
+    needs: [python-test, npm-package-test, npm-pack-smoke-test, docker-build]
     runs-on: ubuntu-latest
     if: github.event_name == 'release' && github.event.action == 'created'
     
