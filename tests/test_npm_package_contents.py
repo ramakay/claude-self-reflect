@@ -148,8 +148,10 @@ def validate_critical_files(actual_files: Set[str]) -> List[str]:
         # MCP server entry point
         "mcp-server/src/server.py",
         "mcp-server/pyproject.toml",
-        # Import system
-        "scripts/import-conversations-unified.py",
+        # Import system (v6.0.0+ in src/runtime/)
+        "src/runtime/import-conversations-unified.py",
+        "src/runtime/unified_state_manager.py",
+        "src/importer/**/*.py",
         # Essential shell scripts
         "mcp-server/run-mcp.sh",
         # Docker infrastructure
