@@ -1,51 +1,118 @@
-# Development files
+# .npmignore - Convention-based Packaging (Issue #86)
+# Excludes development/test files from npm package
+# Working with package.json 'files' array for optimal package size
+
+# =============================================================================
+# Test Files and Test Directories
+# =============================================================================
+tests/
+test-*/
+**/tests/
+**/test_*.py
+**/test-*.js
+**/*_test.py
+**/*.test.js
+**/*.spec.js
+**/test*.py
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# =============================================================================
+# Development and Build Artifacts
+# =============================================================================
 *.log
 *.pyc
-__pycache__/
+*.pyo
+*.pyd
+**/__pycache__/
+**/*.pyc
 .env
 .env.*
-venv/
-.venv/
+!.env.example
+**/venv/
+**/.venv/
+**/env/
 build/
 dist/
 *.egg-info/
-.pytest_cache/
+*.egg
+*.whl
 
-# Test files
-test-*/
-**/test_*.py
-**/test-*.js
+# =============================================================================
+# CI/CD and Automation
+# =============================================================================
+.github/
+.gitlab-ci.yml
+.travis.yml
+.circleci/
+.azure-pipelines.yml
 
-# Development directories
+# =============================================================================
+# Development Directories (not needed in package)
+# =============================================================================
 archived/
 data/
 docs/
 qdrant_storage/
-# Note: config/ not excluded - qdrant-config.yaml is needed in package
+# Note: config/ NOT excluded - qdrant-config.yaml is needed in package
 
-# Git files
+# =============================================================================
+# Version Control
+# =============================================================================
 .git/
 .gitignore
+.gitattributes
 
-# IDE files
+# =============================================================================
+# IDE and Editor Files
+# =============================================================================
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
-# OS files
+# =============================================================================
+# OS Files
+# =============================================================================
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Build artifacts
+# =============================================================================
+# Node/npm
+# =============================================================================
 node_modules/
 package-lock.json
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Note: Docker files NOT excluded here - package.json files array controls inclusion
-# (docker-compose.yaml and Dockerfile.* are explicitly included in package.json)
-
-# Scripts we don't want to include
+# =============================================================================
+# Development Scripts (not needed in production)
+# =============================================================================
 scripts/publish-npm.sh
 scripts/test-*.py
 scripts/fixes/
 scripts/setup/
+scripts/quality-gate-staged.py
+scripts/ast_grep_final_analyzer.py
+scripts/ast_grep_unified_registry.py
+scripts/update_patterns.py
+scripts/backup-qdrant.py
+scripts/migrate-*.py
+scripts/add-timestamp-indexes.py
+scripts/check-collections.py
+scripts/validate-package-imports.py
+
+# =============================================================================
+# Notes for Maintainers
+# =============================================================================
+# - Docker files (docker-compose.yaml, Dockerfile.*) are INCLUDED via package.json
+# - Essential scripts are INCLUDED via package.json files array patterns
+# - This file works WITH package.json, not instead of it
+# - When adding new dev-only files, add patterns here
+# - When adding new production files, add to package.json 'files' array
