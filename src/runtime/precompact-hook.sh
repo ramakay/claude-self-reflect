@@ -23,7 +23,7 @@ fi
 echo "Updating conversation memory..." >&2
 timeout $IMPORT_TIMEOUT bash -c "
     source '$VENV_PATH/bin/activate' 2>/dev/null
-    python '$CLAUDE_REFLECT_DIR/scripts/import-latest.py' 2>&1 | \
+    python '$CLAUDE_REFLECT_DIR/src/runtime/import-latest.py' 2>&1 | \
         grep -E '(Quick import completed|Imported|Warning)' >&2
 " || {
     echo "Quick import timed out after ${IMPORT_TIMEOUT}s" >&2

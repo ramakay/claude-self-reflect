@@ -329,7 +329,7 @@ test_unified_importer() {
     fi
     
     # Test with limit
-    python scripts/import-conversations-unified.py --file "$TEST_FILE" --limit 1
+    python src/runtime/import-conversations-unified.py --file "$TEST_FILE" --limit 1
     
     if [ $? -eq 0 ]; then
         echo "✅ Unified importer works"
@@ -343,7 +343,7 @@ test_zero_chunks_detection() {
     echo "Testing zero chunks/vectors detection..."
 
     # Check recent imports for zero chunks
-    IMPORT_LOG=$(python scripts/import-conversations-unified.py --limit 5 2>&1)
+    IMPORT_LOG=$(python src/runtime/import-conversations-unified.py --limit 5 2>&1)
 
     # Check for zero chunks warnings
     if echo "$IMPORT_LOG" | grep -q "Imported 0 chunks"; then
@@ -761,7 +761,7 @@ full_cloud_mode_test() {
     echo "Running test import with cloud embeddings..."
     cd /Users/$(whoami)/projects/claude-self-reflect
     source venv/bin/activate
-    PREFER_LOCAL_EMBEDDINGS=false python scripts/import-conversations-unified.py --limit 5
+    PREFER_LOCAL_EMBEDDINGS=false python src/runtime/import-conversations-unified.py --limit 5
 
     # 4. Verify cloud collections created
     echo "Verifying cloud collections..."

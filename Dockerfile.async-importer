@@ -25,12 +25,14 @@ COPY scripts/requirements.txt /app/
 # Install Python dependencies  
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the streaming importer script
-COPY scripts/streaming-importer.py /scripts/
+# Copy source code
+COPY src/ /app/src/
+COPY shared/ /app/shared/
 
-# Set environment variables for memory management
+# Set environment variables for memory management and Python path
 ENV MALLOC_ARENA_MAX=2
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
 
 # Run the streaming importer
-CMD ["python", "/scripts/streaming-importer.py"]
+CMD ["python", "/app/src/runtime/streaming-importer.py"]

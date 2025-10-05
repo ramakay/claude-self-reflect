@@ -726,12 +726,12 @@ source .venv/bin/activate  # or source venv/bin/activate
 
 # For local embeddings (default)
 export PREFER_LOCAL_EMBEDDINGS=true
-python scripts/import-conversations-unified.py
+python src/runtime/import-conversations-unified.py
 
 # For cloud embeddings (Voyage AI)
 export PREFER_LOCAL_EMBEDDINGS=false
 export VOYAGE_KEY=your-voyage-api-key
-python scripts/import-conversations-unified.py
+python src/runtime/import-conversations-unified.py
 ```
 
 ### Import Troubleshooting
