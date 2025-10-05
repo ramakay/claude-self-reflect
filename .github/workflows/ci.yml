@@ -62,9 +62,111 @@ jobs:
       run: |
         python3 tests/test_npm_package_contents.py
 
-  docker-build:
+    - name: Monitor package size and file count
+      run: |
+        # Get package stats from npm pack
+        npm pack --dry-run 2>&1 | tee /tmp/pack-output.txt
+
+        # Extract metrics (last field of each line)
+        FILE_COUNT=$(grep "total files:" /tmp/pack-output.txt | grep -oE '[0-9]+$')
+        PKG_SIZE=$(grep "package size:" /tmp/pack-output.txt | grep -oE '[0-9]+\.[0-9]+')
+
+        echo ""
+        echo "📦 Package Metrics:"
+        echo "  Files: $FILE_COUNT"
+        echo "  Size: ${PKG_SIZE}kB"
+        echo ""
+
+        # Assert file count threshold
+        if [ "$FILE_COUNT" -gt 200 ]; then
+          echo "❌ FAIL: File count ($FILE_COUNT) exceeds limit (200)"
+          echo "   This may indicate unwanted files are being packaged"
+          exit 1
+        fi
+
+        # Assert package size threshold (use bc for float comparison)
+        if [ -n "$PKG_SIZE" ] && [ "$(echo "$PKG_SIZE > 500" | bc -l)" -eq 1 ]; then
+          echo "❌ FAIL: Package size (${PKG_SIZE}kB) exceeds limit (500kB)"
+          echo "   Package may include unnecessary large files"
+          exit 1
+        fi
+
+        # Calculate percentages for reporting
+        FILE_PCT=$(( FILE_COUNT * 100 / 200 ))
+        SIZE_PCT=$(echo "scale=0; $PKG_SIZE * 100 / 500" | bc -l)
+
+        echo "✅ Package metrics within acceptable limits"
+        echo "   Files: $FILE_COUNT/200 ($FILE_PCT%)"
+        echo "   Size: ${PKG_SIZE}kB/500kB ($SIZE_PCT%)"
+
+  npm-pack-smoke-test:
     runs-on: ubuntu-latest
     needs: [python-test, npm-package-test]
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Pack and install as user would
+      run: |
+        # Create the actual tarball
+        npm pack
+
+        # Install in clean directory (simulates first-time user)
+        # Use runner.temp for cross-platform compatibility
+        TEST_DIR="${{ runner.temp }}/test-install"
+        mkdir "$TEST_DIR" && cd "$TEST_DIR"
+        npm install $GITHUB_WORKSPACE/claude-self-reflect-*.tgz
+
+    - name: Verify refactored modules included (regression test for #71)
+      run: |
+        cd ${{ runner.temp }}/test-install/node_modules/claude-self-reflect
+
+        # Verify refactored modules that were previously missing in v5.0.4/v5.0.5
+        MISSING_FILES=()
+
+        # Check main scripts
+        [ -f "scripts/import_strategies.py" ] || MISSING_FILES+=("import_strategies.py")
+        [ -f "scripts/metadata_extractor.py" ] || MISSING_FILES+=("metadata_extractor.py")
+        [ -f "scripts/message_processors.py" ] || MISSING_FILES+=("message_processors.py")
+        [ -f "scripts/embedding_service.py" ] || MISSING_FILES+=("embedding_service.py")
+
+        # Check other critical files
+        [ -f "scripts/import-conversations-unified.py" ] || MISSING_FILES+=("import-conversations-unified.py")
+        [ -f "scripts/doctor.py" ] || MISSING_FILES+=("doctor.py")
+        [ -f "installer/cli.js" ] || MISSING_FILES+=("installer/cli.js")
+
+        if [ ${#MISSING_FILES[@]} -gt 0 ]; then
+          echo "❌ FAIL: Missing critical files in npm package:"
+          printf '  - %s\n' "${MISSING_FILES[@]}"
+          echo ""
+          echo "📦 Package structure:"
+          ls -la scripts/ | head -20
+          exit 1
+        fi
+
+        echo "✅ All critical files present in package"
+
+    - name: Test CLI works
+      run: |
+        cd ${{ runner.temp }}/test-install/node_modules/claude-self-reflect
+        node installer/cli.js help || {
+          echo "❌ CLI failed to execute"
+          exit 1
+        }
+        echo "✅ CLI execution successful"
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [python-test, npm-package-test, npm-pack-smoke-test]
 
     steps:
     - uses: actions/checkout@v5
@@ -146,7 +248,7 @@ jobs:
         echo "✅ macOS global install validated (file operations & path resolution)"
 
   publish-npm:
-    needs: [python-test, npm-package-test, docker-build]
+    needs: [python-test, npm-package-test, npm-pack-smoke-test, docker-build]
     runs-on: ubuntu-latest
     if: github.event_name == 'release' && github.event.action == 'created'
     
