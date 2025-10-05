@@ -62,6 +62,40 @@ jobs:
       run: |
         python3 tests/test_npm_package_contents.py
 
+    - name: Monitor package size and file count
+      run: |
+        # Get package stats from npm pack
+        npm pack --dry-run 2>&1 | tee /tmp/pack-output.txt
+
+        # Extract metrics (last field of each line)
+        FILE_COUNT=$(grep "total files:" /tmp/pack-output.txt | grep -oE '[0-9]+$')
+        PKG_SIZE=$(grep "package size:" /tmp/pack-output.txt | grep -oE '[0-9]+\.[0-9]+')
+
+        echo ""
+        echo "📦 Package Metrics:"
+        echo "  Files: $FILE_COUNT"
+        echo "  Size: ${PKG_SIZE}kB"
+        echo ""
+
+        # Assert file count threshold
+        if [ "$FILE_COUNT" -gt 200 ]; then
+          echo "❌ FAIL: File count ($FILE_COUNT) exceeds limit (200)"
+          echo "   This may indicate unwanted files are being packaged"
+          exit 1
+        fi
+
+        # Assert package size threshold (convert to integer)
+        PKG_SIZE_INT=$(echo "$PKG_SIZE" | cut -d. -f1)
+        if [ "$PKG_SIZE_INT" -gt 500 ]; then
+          echo "❌ FAIL: Package size (${PKG_SIZE}kB) exceeds limit (500kB)"
+          echo "   Package may include unnecessary large files"
+          exit 1
+        fi
+
+        echo "✅ Package metrics within acceptable limits"
+        echo "   Files: $FILE_COUNT/200 (${FILE_COUNT}%)"
+        echo "   Size: ${PKG_SIZE}kB/500kB (${PKG_SIZE_INT}%)"
+
   npm-pack-smoke-test:
     runs-on: ubuntu-latest
     needs: [python-test, npm-package-test]
