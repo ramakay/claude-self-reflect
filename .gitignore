@@ -11,6 +11,7 @@ dist/
 build/
 *.egg-info/
 .tsc-cache/
+*.tgz
 
 # Environment files
 .env
