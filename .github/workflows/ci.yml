@@ -126,22 +126,23 @@ jobs:
         mkdir "$TEST_DIR" && cd "$TEST_DIR"
         npm install $GITHUB_WORKSPACE/claude-self-reflect-*.tgz
 
-    - name: Verify refactored modules included (regression test for #71)
+    - name: Verify refactored modules included (regression test for #71, v6.0.0 paths)
       run: |
         cd ${{ runner.temp }}/test-install/node_modules/claude-self-reflect
 
-        # Verify refactored modules that were previously missing in v5.0.4/v5.0.5
+        # Verify v6.0.0 production modules in src/runtime/
         MISSING_FILES=()
 
-        # Check main scripts
-        [ -f "scripts/import_strategies.py" ] || MISSING_FILES+=("import_strategies.py")
-        [ -f "scripts/metadata_extractor.py" ] || MISSING_FILES+=("metadata_extractor.py")
-        [ -f "scripts/message_processors.py" ] || MISSING_FILES+=("message_processors.py")
-        [ -f "scripts/embedding_service.py" ] || MISSING_FILES+=("embedding_service.py")
+        # Check main runtime scripts (v6.0.0 paths)
+        [ -f "src/runtime/import_strategies.py" ] || MISSING_FILES+=("src/runtime/import_strategies.py")
+        [ -f "src/runtime/metadata_extractor.py" ] || MISSING_FILES+=("src/runtime/metadata_extractor.py")
+        [ -f "src/runtime/message_processors.py" ] || MISSING_FILES+=("src/runtime/message_processors.py")
+        [ -f "src/runtime/embedding_service.py" ] || MISSING_FILES+=("src/runtime/embedding_service.py")
 
-        # Check other critical files
-        [ -f "scripts/import-conversations-unified.py" ] || MISSING_FILES+=("import-conversations-unified.py")
-        [ -f "scripts/doctor.py" ] || MISSING_FILES+=("doctor.py")
+        # Check other critical files (v6.0.0 paths)
+        [ -f "src/runtime/import-conversations-unified.py" ] || MISSING_FILES+=("src/runtime/import-conversations-unified.py")
+        [ -f "src/runtime/doctor.py" ] || MISSING_FILES+=("src/runtime/doctor.py")
+        [ -f "src/runtime/unified_state_manager.py" ] || MISSING_FILES+=("src/runtime/unified_state_manager.py")
         [ -f "installer/cli.js" ] || MISSING_FILES+=("installer/cli.js")
 
         if [ ${#MISSING_FILES[@]} -gt 0 ]; then
@@ -149,11 +150,11 @@ jobs:
           printf '  - %s\n' "${MISSING_FILES[@]}"
           echo ""
           echo "📦 Package structure:"
-          ls -la scripts/ | head -20
+          ls -la src/runtime/ | head -20
           exit 1
         fi
 
-        echo "✅ All critical files present in package"
+        echo "✅ All critical files present in package (v6.0.0 structure)"
 
     - name: Test CLI works
       run: |
