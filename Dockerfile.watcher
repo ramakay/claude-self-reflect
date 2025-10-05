@@ -32,26 +32,18 @@ RUN mkdir -p /home/watcher/.cache && \
     FASTEMBED_CACHE_PATH=/home/watcher/.cache/fastembed python -c "from fastembed import TextEmbedding; import os; os.environ['FASTEMBED_CACHE_PATH']='/home/watcher/.cache/fastembed'; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')" && \
     chown -R watcher:watcher /home/watcher/.cache
 
-# Create scripts directory and copy required files
-RUN mkdir -p /scripts
-
-# Copy all necessary scripts
-COPY scripts/import-conversations-unified.py /scripts/
-COPY scripts/import-watcher.py /scripts/
-COPY scripts/streaming-importer.py /scripts/
-COPY scripts/utils.py /scripts/
-COPY scripts/trigger-import.py /scripts/
-
-# Copy MCP server directory for utils
-COPY mcp-server/src/utils.py /mcp-server/src/utils.py
-
-RUN chmod +x /scripts/*.py
-
-# Set working directory
+# Copy source code
 WORKDIR /app
+COPY src/ /app/src/
+COPY shared/ /app/shared/
+
+# Set PYTHONPATH for proper imports
+ENV PYTHONPATH=/app
+
+RUN chmod +x /app/src/runtime/*.sh /app/src/runtime/*.py
 
 # Switch to non-root user
 USER watcher
 
 # Default command - use streaming importer for low memory usage
-CMD ["python", "/scripts/streaming-importer.py"]
+CMD ["python", "/app/src/runtime/streaming-importer.py"]

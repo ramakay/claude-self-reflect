@@ -24,13 +24,13 @@ RUN pip install --no-cache-dir \
     voyageai==0.3.4 \
     tenacity==9.1.2
 
-# Copy scripts into the image for npm package compatibility
-# This ensures scripts are available even without volume mounts
-COPY scripts/ /app/scripts/
+# Copy src and shared modules into the image for npm package compatibility
+# This ensures code is available even without volume mounts
+COPY src/ /app/src/
+COPY shared/ /app/shared/
 
-# Create symlink for backwards compatibility with /scripts path
-# This allows both /app/scripts and /scripts to work
-RUN ln -s /app/scripts /scripts
+# Set PYTHONPATH for proper module imports
+ENV PYTHONPATH=/app
 
 # Note: Volume mounts in docker-compose.yaml will override these files in local development
 # This provides compatibility for both local development and global npm installs

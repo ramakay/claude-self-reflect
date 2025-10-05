@@ -241,7 +241,7 @@ CRITICAL_MODULES=(
     "scripts/embedding_service.py"
     "scripts/doctor.py"
     "scripts/unified_state_manager.py"
-    "scripts/import-conversations-unified.py"
+    "src/runtime/import-conversations-unified.py"
 )
 
 MISSING=0

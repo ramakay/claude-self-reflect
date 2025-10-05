@@ -23,7 +23,7 @@ while true; do
     echo "[$(date)] Starting watcher (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
     
     # Run the streaming watcher
-    python /app/scripts/streaming-watcher.py
+    python /app/src/runtime/streaming-watcher.py
     EXIT_CODE=$?
     
     if [ $EXIT_CODE -eq 0 ]; then

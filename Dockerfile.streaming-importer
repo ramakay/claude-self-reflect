@@ -47,8 +47,15 @@ RUN useradd -m -u 1000 importer
 # Set working directory
 WORKDIR /app
 
+# Copy source code
+COPY src/ /app/src/
+COPY shared/ /app/shared/
+
+# Set PYTHONPATH for proper imports
+ENV PYTHONPATH=/app
+
 # Note: Running as root for now due to fastembed cache permissions
 # TODO: Fix cache permissions to run as non-root user
 
 # Default command
-CMD ["python", "/scripts/streaming-importer.py"]
+CMD ["python", "/app/src/runtime/streaming-importer.py"]

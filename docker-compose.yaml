@@ -40,7 +40,8 @@ services:
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-      - ./scripts:/scripts:ro
+      - ./src:/app/src:ro
+      - ./shared:/app/shared:ro
     environment:
       - QDRANT_URL=http://qdrant:6333
       - STATE_FILE=/config/imported-files.json
@@ -53,9 +54,10 @@ services:
       - BATCH_SIZE=${BATCH_SIZE:-50}
       - CHUNK_SIZE=${CHUNK_SIZE:-10}
       - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
     restart: "no"
     profiles: ["import"]
-    command: python /scripts/import-conversations-unified.py
+    command: python /app/src/runtime/import-conversations-unified.py
 
   # Continuous watcher service (optional) - DEPRECATED, use streaming-importer
   watcher:
@@ -69,7 +71,8 @@ services:
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-      - ./scripts:/scripts:ro
+      - ./src:/app/src:ro
+      - ./shared:/app/shared:ro
       - /tmp:/tmp
     environment:
       - QDRANT_URL=http://qdrant:6333
@@ -100,7 +103,8 @@ services:
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-      - ./scripts:/scripts:ro
+      - ./src:/app/src:ro
+      - ./shared:/app/shared:ro
     environment:
       - QDRANT_URL=http://qdrant:6333
       - STATE_FILE=/config/streaming-state.json  # FIXED: Use streaming-specific state file
@@ -140,7 +144,8 @@ services:
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-      - ./scripts:/scripts:ro
+      - ./src:/app/src:ro
+      - ./shared:/app/shared:ro
     environment:
       - QDRANT_URL=http://qdrant:6333
       - STATE_FILE=/config/imported-files.json
@@ -176,7 +181,8 @@ services:
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-      - ./scripts:/scripts:ro
+      - ./src:/app/src:ro
+      - ./shared:/app/shared:ro
     environment:
       - QDRANT_URL=http://qdrant:6333
       - STATE_FILE=/config/csr-watcher.json
