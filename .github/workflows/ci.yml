@@ -84,17 +84,20 @@ jobs:
           exit 1
         fi
 
-        # Assert package size threshold (convert to integer)
-        PKG_SIZE_INT=$(echo "$PKG_SIZE" | cut -d. -f1)
-        if [ "$PKG_SIZE_INT" -gt 500 ]; then
+        # Assert package size threshold (use bc for float comparison)
+        if [ -n "$PKG_SIZE" ] && [ "$(echo "$PKG_SIZE > 500" | bc -l)" -eq 1 ]; then
           echo "❌ FAIL: Package size (${PKG_SIZE}kB) exceeds limit (500kB)"
           echo "   Package may include unnecessary large files"
           exit 1
         fi
 
+        # Calculate percentages for reporting
+        FILE_PCT=$(( FILE_COUNT * 100 / 200 ))
+        SIZE_PCT=$(echo "scale=0; $PKG_SIZE * 100 / 500" | bc -l)
+
         echo "✅ Package metrics within acceptable limits"
-        echo "   Files: $FILE_COUNT/200 (${FILE_COUNT}%)"
-        echo "   Size: ${PKG_SIZE}kB/500kB (${PKG_SIZE_INT}%)"
+        echo "   Files: $FILE_COUNT/200 ($FILE_PCT%)"
+        echo "   Size: ${PKG_SIZE}kB/500kB ($SIZE_PCT%)"
 
   npm-pack-smoke-test:
     runs-on: ubuntu-latest
@@ -123,37 +126,27 @@ jobs:
         mkdir "$TEST_DIR" && cd "$TEST_DIR"
         npm install $GITHUB_WORKSPACE/claude-self-reflect-*.tgz
 
-    - name: Test Python imports work
+    - name: Test Python scripts execution
       run: |
         cd ${{ runner.temp }}/test-install/node_modules/claude-self-reflect
 
-        # Test critical imports that have caused issues (with diagnostic context)
-        python3 -c "from scripts.import_strategies import *" || {
-          echo "❌ Failed to import scripts.import_strategies"
-          echo "📦 Package structure:"
-          ls -la scripts/ | head -20
-          exit 1
-        }
-        python3 -c "from scripts.metadata_extractor import *" || {
-          echo "❌ Failed to import scripts.metadata_extractor"
-          echo "📦 Package structure:"
-          ls -la scripts/ | head -20
-          exit 1
-        }
-        python3 -c "from scripts.message_processors import *" || {
-          echo "❌ Failed to import scripts.message_processors"
-          echo "📦 Package structure:"
-          ls -la scripts/ | head -20
-          exit 1
-        }
-        python3 -c "from scripts.embedding_service import *" || {
-          echo "❌ Failed to import scripts.embedding_service"
+        # Test critical scripts as executables (how users actually run them)
+        # Scripts add their own directory to sys.path, so they import siblings
+        python3 scripts/import-conversations-unified.py --help || {
+          echo "❌ Failed to execute import-conversations-unified.py"
           echo "📦 Package structure:"
           ls -la scripts/ | head -20
           exit 1
         }
 
-        echo "✅ All Python imports successful"
+        python3 scripts/doctor.py --help || {
+          echo "❌ Failed to execute doctor.py"
+          echo "📦 Package structure:"
+          ls -la scripts/ | head -20
+          exit 1
+        }
+
+        echo "✅ All Python scripts execute successfully"
 
     - name: Test CLI works
       run: |
