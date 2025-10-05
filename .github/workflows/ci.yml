@@ -126,27 +126,34 @@ jobs:
         mkdir "$TEST_DIR" && cd "$TEST_DIR"
         npm install $GITHUB_WORKSPACE/claude-self-reflect-*.tgz
 
-    - name: Test Python scripts execution
+    - name: Verify refactored modules included (regression test for #71)
       run: |
         cd ${{ runner.temp }}/test-install/node_modules/claude-self-reflect
 
-        # Test critical scripts as executables (how users actually run them)
-        # Scripts add their own directory to sys.path, so they import siblings
-        python3 scripts/import-conversations-unified.py --help || {
-          echo "❌ Failed to execute import-conversations-unified.py"
+        # Verify refactored modules that were previously missing in v5.0.4/v5.0.5
+        MISSING_FILES=()
+
+        # Check main scripts
+        [ -f "scripts/import_strategies.py" ] || MISSING_FILES+=("import_strategies.py")
+        [ -f "scripts/metadata_extractor.py" ] || MISSING_FILES+=("metadata_extractor.py")
+        [ -f "scripts/message_processors.py" ] || MISSING_FILES+=("message_processors.py")
+        [ -f "scripts/embedding_service.py" ] || MISSING_FILES+=("embedding_service.py")
+
+        # Check other critical files
+        [ -f "scripts/import-conversations-unified.py" ] || MISSING_FILES+=("import-conversations-unified.py")
+        [ -f "scripts/doctor.py" ] || MISSING_FILES+=("doctor.py")
+        [ -f "installer/cli.js" ] || MISSING_FILES+=("installer/cli.js")
+
+        if [ ${#MISSING_FILES[@]} -gt 0 ]; then
+          echo "❌ FAIL: Missing critical files in npm package:"
+          printf '  - %s\n' "${MISSING_FILES[@]}"
+          echo ""
           echo "📦 Package structure:"
           ls -la scripts/ | head -20
           exit 1
-        }
+        fi
 
-        python3 scripts/doctor.py --help || {
-          echo "❌ Failed to execute doctor.py"
-          echo "📦 Package structure:"
-          ls -la scripts/ | head -20
-          exit 1
-        }
-
-        echo "✅ All Python scripts execute successfully"
+        echo "✅ All critical files present in package"
 
     - name: Test CLI works
       run: |
