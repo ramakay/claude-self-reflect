@@ -19,9 +19,9 @@ test-*/
 # Development directories
 archived/
 data/
-config/
 docs/
 qdrant_storage/
+# Note: config/ not excluded - qdrant-config.yaml is needed in package
 
 # Git files
 .git/
@@ -41,9 +41,8 @@ Thumbs.db
 node_modules/
 package-lock.json
 
-# Docker files
-docker-compose*.yaml
-Dockerfile*
+# Note: Docker files NOT excluded here - package.json files array controls inclusion
+# (docker-compose.yaml and Dockerfile.* are explicitly included in package.json)
 
 # Scripts we don't want to include
 scripts/publish-npm.sh
