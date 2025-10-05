@@ -84,28 +84,38 @@ jobs:
         npm pack
 
         # Install in clean directory (simulates first-time user)
-        mkdir /tmp/test-install && cd /tmp/test-install
+        # Use runner.temp for cross-platform compatibility
+        TEST_DIR="${{ runner.temp }}/test-install"
+        mkdir "$TEST_DIR" && cd "$TEST_DIR"
         npm install $GITHUB_WORKSPACE/claude-self-reflect-*.tgz
 
     - name: Test Python imports work
       run: |
-        cd /tmp/test-install/node_modules/claude-self-reflect
+        cd ${{ runner.temp }}/test-install/node_modules/claude-self-reflect
 
-        # Test critical imports that have caused issues
+        # Test critical imports that have caused issues (with diagnostic context)
         python3 -c "from scripts.import_strategies import *" || {
           echo "❌ Failed to import scripts.import_strategies"
+          echo "📦 Package structure:"
+          ls -la scripts/ | head -20
           exit 1
         }
         python3 -c "from scripts.metadata_extractor import *" || {
           echo "❌ Failed to import scripts.metadata_extractor"
+          echo "📦 Package structure:"
+          ls -la scripts/ | head -20
           exit 1
         }
         python3 -c "from scripts.message_processors import *" || {
           echo "❌ Failed to import scripts.message_processors"
+          echo "📦 Package structure:"
+          ls -la scripts/ | head -20
           exit 1
         }
         python3 -c "from scripts.embedding_service import *" || {
           echo "❌ Failed to import scripts.embedding_service"
+          echo "📦 Package structure:"
+          ls -la scripts/ | head -20
           exit 1
         }
 
@@ -113,7 +123,7 @@ jobs:
 
     - name: Test CLI works
       run: |
-        cd /tmp/test-install/node_modules/claude-self-reflect
+        cd ${{ runner.temp }}/test-install/node_modules/claude-self-reflect
         node installer/cli.js help || {
           echo "❌ CLI failed to execute"
           exit 1
