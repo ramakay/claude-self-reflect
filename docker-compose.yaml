@@ -40,8 +40,6 @@ services:
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-      - ./src:/app/src:ro
-      - ./shared:/app/shared:ro
     environment:
       - QDRANT_URL=http://qdrant:6333
       - STATE_FILE=/config/imported-files.json
@@ -71,8 +69,6 @@ services:
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-      - ./src:/app/src:ro
-      - ./shared:/app/shared:ro
       - /tmp:/tmp
     environment:
       - QDRANT_URL=http://qdrant:6333
@@ -103,8 +99,6 @@ services:
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-      - ./src:/app/src:ro
-      - ./shared:/app/shared:ro
     environment:
       - QDRANT_URL=http://qdrant:6333
       - STATE_FILE=/config/streaming-state.json  # FIXED: Use streaming-specific state file
@@ -144,8 +138,6 @@ services:
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-      - ./src:/app/src:ro
-      - ./shared:/app/shared:ro
     environment:
       - QDRANT_URL=http://qdrant:6333
       - STATE_FILE=/config/imported-files.json
@@ -181,8 +173,6 @@ services:
     volumes:
       - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-      - ./src:/app/src:ro
-      - ./shared:/app/shared:ro
     environment:
       - QDRANT_URL=http://qdrant:6333
       - STATE_FILE=/config/csr-watcher.json

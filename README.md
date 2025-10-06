@@ -175,9 +175,6 @@ Your code quality displayed live as you work:
 3. **Quality Scoring**: Weighted scoring normalized by lines of code
 4. **Statusline Display**: Real-time feedback as you code
 
-> [!TIP]
-> Run `python scripts/session_quality_tracker.py` to analyze your current session quality!
-
 </details>
 
 ## Key Features
