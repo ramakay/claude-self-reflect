@@ -165,9 +165,20 @@ jobs:
         }
         echo "✅ CLI execution successful"
 
+  docker-compose-validation:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Validate docker-compose.yaml
+      run: |
+        chmod +x scripts/ci/validate-docker-compose.sh
+        ./scripts/ci/validate-docker-compose.sh
+
   docker-build:
     runs-on: ubuntu-latest
-    needs: [python-test, npm-package-test, npm-pack-smoke-test]
+    needs: [python-test, npm-package-test, npm-pack-smoke-test, docker-compose-validation]
 
     steps:
     - uses: actions/checkout@v5
