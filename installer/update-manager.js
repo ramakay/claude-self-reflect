@@ -42,9 +42,9 @@ class UpdateManager {
     async checkCCStatusline() {
         try {
             execSync('npm list -g cc-statusline', { stdio: 'ignore' });
-            return { installed: true, name: 'cc-statusline', critical: false };
+            return { installed: true, name: 'cc-statusline', critical: true };
         } catch {
-            return { installed: false, name: 'cc-statusline', critical: false, fix: () => this.installCCStatusline() };
+            return { installed: false, name: 'cc-statusline', critical: true, fix: () => this.installCCStatusline() };
         }
     }
 
@@ -77,18 +77,18 @@ class UpdateManager {
         // Check for both 'ast-grep' (brew) and 'sg' (npm) binaries
         try {
             execSync('ast-grep --version', { stdio: 'ignore' });
-            return { installed: true, name: 'AST-Grep', critical: false };
+            return { installed: true, name: 'AST-Grep', critical: true };
         } catch {
             // Try 'sg' binary (npm install -g @ast-grep/cli)
             try {
                 execSync('sg --version', { stdio: 'ignore' });
-                return { installed: true, name: 'AST-Grep (sg)', critical: false };
+                return { installed: true, name: 'AST-Grep (sg)', critical: true };
             } catch {
                 return {
                     installed: false,
-                    name: 'AST-Grep (optional)',
-                    critical: false,
-                    fix: () => this.suggestASTGrep()
+                    name: 'AST-Grep',
+                    critical: true,
+                    fix: () => this.installASTGrep()
                 };
             }
         }
@@ -193,11 +193,43 @@ class UpdateManager {
         return await fallback.run();
     }
 
-    async suggestASTGrep() {
-        this.log('AST-Grep is optional but recommended for code quality features', 'info');
-        this.log('Install with: brew install ast-grep  (macOS)', 'info');
-        this.log('         or: npm install -g @ast-grep/cli', 'info');
-        return true;  // Not critical
+    async installASTGrep() {
+        // Try npm installation first (works on all platforms)
+        this.log('Installing AST-Grep via npm...', 'info');
+        try {
+            execSync('npm install -g @ast-grep/cli', { stdio: 'inherit' });
+            this.log('AST-Grep installed successfully', 'success');
+            return true;
+        } catch (npmError) {
+            // Check for permission errors
+            const isPermissionError = npmError.code === 'EACCES' ||
+                                     npmError.code === 'EPERM' ||
+                                     (npmError.stderr && npmError.stderr.toString().includes('EACCES')) ||
+                                     (npmError.message && npmError.message.includes('permission'));
+
+            if (isPermissionError) {
+                this.log('Failed to install AST-Grep via npm: Permission denied', 'error');
+                this.log('Alternative installation methods:', 'info');
+                this.log('  1. With sudo: sudo npm install -g @ast-grep/cli', 'info');
+                this.log('  2. With brew: brew install ast-grep  (macOS/Linux)', 'info');
+                this.log('  3. Use nvm for user-local npm installs', 'info');
+                return false;
+            }
+
+            // If npm fails for other reasons, try suggesting brew on macOS
+            if (process.platform === 'darwin') {
+                this.log('npm installation failed. Checking for Homebrew...', 'warning');
+                try {
+                    execSync('brew --version', { stdio: 'ignore' });
+                    this.log('Install AST-Grep with: brew install ast-grep', 'info');
+                } catch {
+                    this.log('Homebrew not found. Install from: https://brew.sh', 'info');
+                }
+            }
+
+            this.log(`AST-Grep installation failed: ${npmError.message}`, 'error');
+            return false;
+        }
     }
 
     async startQdrant() {
