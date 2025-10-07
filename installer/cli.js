@@ -252,9 +252,11 @@ async function update() {
     await manager.run();
   } catch (error) {
     // Check if update-manager.js itself is missing (not a nested dependency)
+    // Node uses file:// URLs in error messages, not relative paths
     const isUpdateManagerMissing =
-      (error.code === 'ERR_MODULE_NOT_FOUND' && error.message.includes('./update-manager.js')) ||
-      (error.message && error.message.includes('Cannot find module') && error.message.includes('./update-manager.js'));
+      (error.code === 'ERR_MODULE_NOT_FOUND' &&
+       (error.message.includes('update-manager.js') || error.message.includes('update-manager'))) ||
+      (error.message && error.message.includes('Cannot find module') && error.message.includes('update-manager'));
 
     if (isUpdateManagerMissing) {
       console.error('❌ Update manager not found');

@@ -269,6 +269,10 @@ class UpdateManager {
                         this.log(`Failed to fix: ${issue.name}`, 'error');
                         unresolvedCritical.push(issue);
                     }
+                } else {
+                    // Issue has no fix and no error message - track as unresolved
+                    this.log(`${issue.name} is missing (no automatic fix available)`, 'error');
+                    unresolvedCritical.push(issue);
                 }
             }
         }
