@@ -20,8 +20,6 @@ class UpdateManager {
     constructor() {
         this.homeDir = os.homedir();
         this.packageRoot = path.dirname(__dirname);
-        this.features = [];
-        this.issues = [];
     }
 
     log(message, type = 'info') {
@@ -142,13 +140,36 @@ class UpdateManager {
 
     // Fix functions
     async installCCStatusline() {
+        // Check npm is available
+        try {
+            execSync('npm --version', { stdio: 'ignore' });
+        } catch {
+            this.log('npm is required but not found', 'error');
+            this.log('Please install Node.js and npm from nodejs.org', 'error');
+            return false;
+        }
+
         this.log('Installing cc-statusline...', 'info');
         try {
             execSync('npm install -g cc-statusline', { stdio: 'inherit' });
             this.log('cc-statusline installed', 'success');
             return true;
         } catch (error) {
-            this.log(`Failed to install cc-statusline: ${error.message}`, 'error');
+            // Check for permission errors
+            const isPermissionError = error.code === 'EACCES' ||
+                                     error.code === 'EPERM' ||
+                                     (error.stderr && error.stderr.toString().includes('EACCES')) ||
+                                     (error.message && error.message.includes('permission'));
+
+            if (isPermissionError) {
+                this.log('Failed to install cc-statusline: Permission denied', 'error');
+                this.log('Try one of:', 'info');
+                this.log('  1. Run with elevated privileges: sudo npm install -g cc-statusline', 'info');
+                this.log('  2. Use a node version manager like nvm', 'info');
+                this.log('  3. Configure npm for user-local installs', 'info');
+            } else {
+                this.log(`Failed to install cc-statusline: ${error.message}`, 'error');
+            }
             return false;
         }
     }

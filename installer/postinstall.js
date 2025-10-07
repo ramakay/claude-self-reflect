@@ -2,8 +2,6 @@
 
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import StatuslineSetup from './statusline-setup.js';
-import FastEmbedFallback from './fastembed-fallback.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);

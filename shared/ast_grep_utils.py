@@ -4,6 +4,7 @@ Gracefully handles AST-Grep availability for code quality features
 """
 import shutil
 import subprocess
+from functools import wraps
 from typing import Optional
 
 def is_ast_grep_installed() -> bool:
@@ -54,6 +55,7 @@ def check_ast_grep_or_warn(feature_name: str = "Quality analysis") -> bool:
 
 def ast_grep_required(func):
     """Decorator to mark functions that require AST-Grep"""
+    @wraps(func)
     def wrapper(*args, **kwargs):
         if not check_ast_grep_or_warn(func.__name__):
             return None
