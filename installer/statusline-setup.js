@@ -23,6 +23,34 @@ class StatuslineSetup {
         this.statuslineBackup = path.join(this.claudeDir, 'statusline-wrapper.sh.backup');
     }
 
+    checkCCStatusline() {
+        try {
+            execSync('npm list -g cc-statusline', { stdio: 'ignore' });
+            this.log('cc-statusline is installed', 'success');
+            return true;
+        } catch {
+            this.log('cc-statusline not found', 'warning');
+            return false;
+        }
+    }
+
+    installCCStatusline() {
+        if (this.checkCCStatusline()) {
+            return true;
+        }
+
+        this.log('Installing cc-statusline...', 'info');
+        try {
+            execSync('npm install -g cc-statusline', { stdio: 'inherit' });
+            this.log('cc-statusline installed successfully', 'success');
+            return true;
+        } catch (error) {
+            this.log(`Failed to install cc-statusline: ${error.message}`, 'error');
+            this.log('Statusline features will not be available', 'warning');
+            return false;
+        }
+    }
+
     log(message, type = 'info') {
         const colors = {
             info: '\x1b[36m',
@@ -34,6 +62,15 @@ class StatuslineSetup {
     }
 
     checkPrerequisites() {
+        // Check npm is available
+        try {
+            execSync('npm --version', { stdio: 'ignore' });
+        } catch {
+            this.log('npm is required but not found', 'error');
+            this.log('Please install Node.js and npm from nodejs.org', 'error');
+            return false;
+        }
+
         // Check if Claude Code directory exists
         if (!fs.existsSync(this.claudeDir)) {
             this.log('Claude Code directory not found. Please ensure Claude Code is installed.', 'warning');
@@ -67,14 +104,47 @@ class StatuslineSetup {
                 }
             }
 
+            // Try user-local installation first (no sudo needed)
+            const userBin = path.join(this.homeDir, 'bin');
+            const userLocalBin = path.join(userBin, 'csr-status');
+
+            if (!fs.existsSync(userBin)) {
+                fs.mkdirSync(userBin, { recursive: true });
+            }
+
+            // Create symlink in ~/bin
+            try {
+                if (fs.existsSync(userLocalBin)) {
+                    fs.unlinkSync(userLocalBin);
+                }
+                fs.symlinkSync(this.csrScript, userLocalBin);
+                // Note: Don't chmod symlink - ensure source script is executable instead
+
+                this.log('csr-status installed to ~/bin (no sudo required)', 'success');
+                this.log('Add ~/bin to PATH: export PATH="$HOME/bin:$PATH"', 'info');
+
+                // Check if ~/bin is in PATH
+                const pathDirs = process.env.PATH.split(':');
+                if (!pathDirs.includes(userBin) && !pathDirs.includes('~/bin')) {
+                    this.log('⚠️ Add this to ~/.bashrc or ~/.zshrc:', 'warning');
+                    this.log('   export PATH="$HOME/bin:$PATH"', 'info');
+                }
+
+                return true;
+            } catch (userError) {
+                this.log(`User-local install failed: ${userError.message}`, 'warning');
+            }
+
+            // Fallback to global install if user has sudo access
+            if (needsSudo) {
+                this.log('Attempting global install (requires sudo)...', 'info');
+                this.log('Corporate machines may not allow this - using user-local is fine', 'info');
+            }
+
             // Create symlink
             const cmd = needsSudo
                 ? `sudo ln -sf "${this.csrScript}" "${this.globalBin}"`
                 : `ln -sf "${this.csrScript}" "${this.globalBin}"`;
-
-            if (needsSudo) {
-                this.log('Installing global csr-status command (may require password)...', 'info');
-            }
 
             execSync(cmd, { stdio: 'inherit' });
 
@@ -87,10 +157,10 @@ class StatuslineSetup {
             this.log('Global csr-status command installed successfully', 'success');
             return true;
         } catch (error) {
-            this.log(`Failed to install global command: ${error.message}`, 'warning');
-            this.log('You can manually install by running:', 'info');
-            this.log(`  sudo ln -sf "${this.csrScript}" "${this.globalBin}"`, 'info');
-            return false;
+            this.log('Statusline installation skipped (no sudo access)', 'info');
+            this.log('This is normal on corporate machines', 'info');
+            this.log('✅ Core MCP search works fine without statusline!', 'success');
+            return false;  // Return false but don't treat as critical error
         }
     }
 
@@ -228,6 +298,7 @@ class StatuslineSetup {
         }
 
         const steps = [
+            { name: 'Install cc-statusline', fn: () => this.installCCStatusline() },
             { name: 'Install global command', fn: () => this.installGlobalCommand() },
             { name: 'Patch statusline wrapper', fn: () => this.patchStatuslineWrapper() },
             { name: 'Validate integration', fn: () => this.validateIntegration() }
