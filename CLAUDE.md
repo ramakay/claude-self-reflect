@@ -287,21 +287,37 @@ python mcp-server/src/status.py
 **HOW**:
 
 ```bash
-# Step 1: Run CodeRabbit CLI for local review
-coderabbit --prompt-only
+# PARALLEL EXECUTION: Run both reviews simultaneously
+# In Claude Code, use parallel tool execution:
+# 1. Start CodeRabbit in background: coderabbit --prompt-only 2>&1 | tee /tmp/coderabbit.log &
+# 2. Trigger codex-evaluator agent in parallel
+# 3. Wait for both to complete, then review results
 
-# Review output and fix all critical/high issues
-# Commit fixes: git commit -am "fix: address CodeRabbit local review"
+# Method 1: Manual parallel execution
+coderabbit --prompt-only > /tmp/coderabbit.log 2>&1 &
+CODERABBIT_PID=$!
 
-# Step 2: Use codex-evaluator agent for architectural review
+# While CodeRabbit runs, trigger Codex evaluation:
 # Say: "codex evaluate the changes in this branch"
-# Or trigger agent with: "Need architectural review for Docker and npm changes"
-# Codex agent will analyze: Docker configs, npm package structure, cross-platform compatibility
+# Or: "Need architectural review for Docker and npm changes"
 
-# Review Codex recommendations and apply improvements
-# Commit fixes: git commit -am "refactor: apply Codex architectural recommendations"
+# Wait for CodeRabbit to finish
+wait $CODERABBIT_PID
+cat /tmp/coderabbit.log
 
-# Step 3: Re-run CodeRabbit to verify fixes
+# Method 2: Claude Code parallel tool execution (RECOMMENDED)
+# Claude can execute both tools in a single message:
+# "Run coderabbit --prompt-only and codex evaluation in parallel"
+
+# Review both outputs:
+# - CodeRabbit: Code quality, security, best practices
+# - Codex: Architecture, design patterns, cross-platform compatibility
+
+# Fix all CRITICAL issues (must fix before release)
+# Fix all HIGH severity issues (strongly recommended)
+# Commit fixes: git commit -am "fix: address CodeRabbit + Codex reviews"
+
+# Re-run CodeRabbit to verify fixes
 coderabbit --prompt-only
 
 # Ensure no critical/high issues remain before proceeding
@@ -310,7 +326,10 @@ coderabbit --prompt-only
 **Quality Gates**:
 - ✅ CodeRabbit CLI: No critical or high severity issues
 - ✅ Codex Agent: Architectural review passes with no major concerns
+- ✅ All CRITICAL issues fixed (even if not in your changes)
 - ✅ All fixes committed and tested locally
+
+**IMPORTANT**: If CodeRabbit or Codex find CRITICAL issues anywhere in the codebase (even in files you didn't modify), those issues MUST be fixed before release and documented in release notes.
 
 ### 3. Code Review Phase - CI/CD
 **WHO**: CodeRabbit (Automated PR Review)

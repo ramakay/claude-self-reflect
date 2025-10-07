@@ -43,8 +43,10 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         """Initialize the FastEmbed model."""
         try:
             from fastembed import TextEmbedding
-            self.model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-            logger.info("Initialized local FastEmbed model (384 dimensions)")
+            # CRITICAL: Use the correct model that matches the rest of the system
+            # This must be sentence-transformers/all-MiniLM-L6-v2 (384 dimensions)
+            self.model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            logger.info("Initialized local FastEmbed model: sentence-transformers/all-MiniLM-L6-v2 (384 dimensions)")
         except ImportError as e:
             logger.error("FastEmbed not installed. Install with: pip install fastembed")
             raise
