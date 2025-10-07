@@ -6,7 +6,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import https from 'https';
 import os from 'os';
 
@@ -65,19 +65,29 @@ class FastEmbedFallback {
 
         try {
             // Download with curl (handles proxies better than Node's https)
+            // SECURITY: Use array-based arguments to prevent shell injection
             this.log(`Downloading ${this.modelFile} (79MB)...`, 'info');
-            execSync(`curl -L -o "${tarPath}" "${this.gcsUrl}"`, {
+            const curlResult = spawnSync('curl', ['-L', '-o', tarPath, this.gcsUrl], {
                 stdio: 'inherit',
                 timeout: 300000  // 5 minute timeout
             });
 
+            if (curlResult.error || curlResult.status !== 0) {
+                throw new Error(`curl failed: ${curlResult.error?.message || `exit code ${curlResult.status}`}`);
+            }
+
             this.log('Download complete. Extracting...', 'success');
 
             // Extract (with 2 minute timeout to prevent hanging)
-            execSync(`tar -xzf "${tarPath}" -C "${this.cacheDir}"`, {
+            // SECURITY: Use array-based arguments to prevent shell injection
+            const tarResult = spawnSync('tar', ['-xzf', tarPath, '-C', this.cacheDir], {
                 stdio: 'inherit',
                 timeout: 120000  // 2 minute timeout
             });
+
+            if (tarResult.error || tarResult.status !== 0) {
+                throw new Error(`tar extraction failed: ${tarResult.error?.message || `exit code ${tarResult.status}`}`);
+            }
 
             // Verify extraction
             if (this.checkModelExists()) {
