@@ -54,6 +54,12 @@ spawnSync('tar', ['-xzf', tarPath, '-C', this.cacheDir])
 - **Fix**: Added explicit comments clarifying timeout is cleared before all exit paths
 - **File**: `installer/update-manager.js:133-142`
 
+### 7. **Qdrant Verification Timing (MEDIUM)**
+- **Issue**: Re-verification ran immediately after starting Qdrant, before service ready
+- **Impact**: False negatives - verification failed even though Qdrant starts successfully
+- **Fix**: Added 5-second delay before re-checking Qdrant status after startup
+- **File**: `installer/update-manager.js:379-382`
+
 ## 📦 What Changed
 
 ### Security & Stability
@@ -76,24 +82,26 @@ spawnSync('tar', ['-xzf', tarPath, '-C', this.cacheDir])
 + Re-verification after fixes
 + Docker config verification
 + Undefined recheckResult guard
++ Qdrant startup delay before verification
 ```
 
 ### Code Quality
 - Removed unused import (`join`) in `postinstall.js`
 - Verified `functools.wraps` exists in `ast_grep_utils.py` decorator
-- Removed unnecessary chmod on symlinks in `statusline-setup.js`
+- Clarified comment in `statusline-setup.js` regarding chmod on symlinks (no functional change)
 
 ## 🔧 Files Changed
 
 | File | Lines | Changes |
 |------|-------|---------|
 | `installer/fastembed-fallback.js` | +16/-8 | Shell injection fix |
-| `installer/update-manager.js` | +94/-14 | Multiple stability fixes + CodeRabbit |
+| `installer/update-manager.js` | +96/-14 | Multiple stability fixes + CI/CD review |
 | `installer/postinstall.js` | +1/-1 | Remove unused import |
-| `installer/statusline-setup.js` | +1/-1 | Fix symlink comment |
+| `installer/statusline-setup.js` | +1/-1 | Clarify symlink comment |
 | `package.json` | +1/-1 | Version bump |
+| `docs/RELEASE_NOTES_v6.0.4.md` | +6/-3 | Update release notes |
 
-**Total**: 5 files, 113 insertions(+), 25 deletions(-)
+**Total**: 6 files, 121 insertions(+), 28 deletions(-)
 
 ## 📊 Impact Assessment
 
@@ -146,18 +154,23 @@ None specific to this release.
 ## 📈 Quality Metrics
 
 - **Security**: Shell injection vulnerability fixed
-- **Stability**: 4 high-priority + 2 medium/low issues resolved
+- **Stability**: 4 high-priority + 3 medium/low issues resolved
 - **Compatibility**: Docker Compose v1 & v2 support
-- **Error Handling**: Comprehensive retry and verification
-- **Code Quality**: CodeRabbit automated review passed
+- **Error Handling**: Comprehensive retry and verification with proper timing
+- **Code Quality**: CodeRabbit CI/CD review passed (all issues fixed)
 
 ## 🙏 Credits
 
-Fixed based on CodeRabbit automated review identifying:
+Fixed based on CodeRabbit automated reviews:
+
+**Local CLI Review** (pre-PR):
 - 1 critical security issue
 - 3 high-priority stability issues
-- 2 medium/low verification improvements
-- 3 code quality improvements
+- 1 medium verification improvement
+
+**CI/CD Review** (during PR):
+- 2 major issues (timing + documentation)
+- 1 markdown formatting issue
 
 ## 📚 Documentation Updates
 
@@ -183,4 +196,4 @@ Fixed based on CodeRabbit automated review identifying:
 
 ---
 
-**Full Changelog:** https://github.com/ramakay/claude-self-reflect/compare/v6.0.3...v6.0.4
+**Full Changelog:** <https://github.com/ramakay/claude-self-reflect/compare/v6.0.3...v6.0.4>

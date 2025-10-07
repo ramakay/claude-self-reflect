@@ -376,6 +376,9 @@ class UpdateManager {
                         } else if (recheckName.includes('docker') && !recheckName.includes('config')) {
                             recheckResult = await this.checkDocker();
                         } else if (recheckName.includes('qdrant')) {
+                            // Give Qdrant a moment to come online before rechecking
+                            this.log('Waiting 5 seconds for Qdrant to start...', 'info');
+                            await new Promise(resolve => setTimeout(resolve, 5000));
                             recheckResult = await this.checkQdrant();
                         } else if (recheckName.includes('fastembed')) {
                             recheckResult = await this.checkFastEmbedModel();
