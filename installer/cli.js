@@ -251,10 +251,16 @@ async function update() {
     const manager = new UpdateManager();
     await manager.run();
   } catch (error) {
-    console.error('❌ Update manager not found');
-    console.error('   Please ensure update-manager.js is present or reinstall claude-self-reflect');
-    if (process.env.DEBUG) {
-      console.error('   Debug:', error.message);
+    // Differentiate between module load failures and runtime errors
+    if (error.code === 'ERR_MODULE_NOT_FOUND' || error.message.includes('Cannot find module')) {
+      console.error('❌ Update manager not found');
+      console.error('   Please reinstall: npm install -g claude-self-reflect');
+    } else {
+      console.error('❌ Update check failed:', error.message);
+      console.error('   Run with DEBUG=1 for more details');
+      if (process.env.DEBUG) {
+        console.error('\nStack trace:', error.stack);
+      }
     }
     process.exit(1);
   }

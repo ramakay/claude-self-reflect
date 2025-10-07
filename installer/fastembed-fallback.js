@@ -73,8 +73,11 @@ class FastEmbedFallback {
 
             this.log('Download complete. Extracting...', 'success');
 
-            // Extract
-            execSync(`tar -xzf "${tarPath}" -C "${this.cacheDir}"`, { stdio: 'inherit' });
+            // Extract (with 2 minute timeout to prevent hanging)
+            execSync(`tar -xzf "${tarPath}" -C "${this.cacheDir}"`, {
+                stdio: 'inherit',
+                timeout: 120000  // 2 minute timeout
+            });
 
             // Verify extraction
             if (this.checkModelExists()) {
@@ -105,7 +108,7 @@ class FastEmbedFallback {
         }
 
         try {
-            let content = fs.readFileSync(dockerComposePath, 'utf8');
+            const content = fs.readFileSync(dockerComposePath, 'utf8');
 
             // Check if already configured
             if (content.includes('HF_HUB_OFFLINE')) {
@@ -113,37 +116,56 @@ class FastEmbedFallback {
                 return true;
             }
 
-            // Add cache mount and offline mode to all services that need it
+            // Line-by-line processing is more reliable than regex for YAML
+            const lines = content.split('\n');
             const services = ['importer', 'watcher', 'streaming-importer', 'async-importer', 'safe-watcher', 'mcp-server'];
+            let currentService = null;
+            let inEnvironment = false;
+            let environmentIndent = '';
 
-            for (const service of services) {
-                // Add volume mount for cache
-                const volumePattern = new RegExp(`(\\s+${service}:[\\s\\S]*?volumes:[\\s\\S]*?)(\\s+-\\s+.*?\\n)(\\s+environment:)`, 'g');
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                const trimmed = line.trim();
 
-                if (volumePattern.test(content)) {
-                    content = content.replace(volumePattern, (match, p1, p2, p3) => {
-                        if (!match.includes('.cache/fastembed')) {
-                            return `${p1}${p2}      - ~/.cache/fastembed:/root/.cache/fastembed:ro\\n${p3}`;
-                        }
-                        return match;
-                    });
+                // Track which service we're in
+                for (const service of services) {
+                    if (trimmed === `${service}:`) {
+                        currentService = service;
+                        inEnvironment = false;
+                        break;
+                    }
                 }
 
-                // Add HF_HUB_OFFLINE environment variable
-                const envPattern = new RegExp(`(\\s+${service}:[\\s\\S]*?environment:[\\s\\S]*?)(\\s+-\\s+.*?\\n)(\\s+restart:)`, 'g');
+                // Detect environment section
+                if (currentService && trimmed === 'environment:') {
+                    inEnvironment = true;
+                    environmentIndent = line.match(/^(\s+)/)?.[1] || '    ';
+                }
 
-                if (envPattern.test(content)) {
-                    content = content.replace(envPattern, (match, p1, p2, p3) => {
-                        if (!match.includes('HF_HUB_OFFLINE')) {
-                            return `${p1}${p2}      - HF_HUB_OFFLINE=1\\n${p3}`;
-                        }
-                        return match;
-                    });
+                // Add HF_HUB_OFFLINE after first environment entry
+                if (inEnvironment && trimmed.startsWith('-') && !content.includes('HF_HUB_OFFLINE')) {
+                    lines.splice(i + 1, 0, `${environmentIndent}  - HF_HUB_OFFLINE=1`);
+                    inEnvironment = false;
+                }
+
+                // Add volume mount after volumes section
+                if (currentService && trimmed === 'volumes:' && !content.includes('.cache/fastembed')) {
+                    const volumeIndent = line.match(/^(\s+)/)?.[1] || '    ';
+                    // Find next line with volume entry
+                    if (lines[i + 1] && lines[i + 1].trim().startsWith('-')) {
+                        lines.splice(i + 2, 0, `${volumeIndent}  - ~/.cache/fastembed:/root/.cache/fastembed:ro`);
+                    }
+                }
+
+                // Reset when we exit a service (next service or same-level key)
+                if (currentService && line.match(/^\s{0,2}\w+:/) && !trimmed.startsWith(`${currentService}:`)) {
+                    currentService = null;
+                    inEnvironment = false;
                 }
             }
 
             // Write back
-            fs.writeFileSync(dockerComposePath, content);
+            fs.writeFileSync(dockerComposePath, lines.join('\n'));
             this.log('docker-compose.yaml updated for offline mode', 'success');
             return true;
         } catch (error) {

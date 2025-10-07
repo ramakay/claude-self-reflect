@@ -8,17 +8,26 @@ from functools import wraps
 from typing import Optional
 
 def is_ast_grep_installed() -> bool:
-    """Check if ast-grep is available in PATH"""
-    return shutil.which('ast-grep') is not None
+    """Check if ast-grep or sg (npm install) is available in PATH"""
+    return shutil.which('ast-grep') is not None or shutil.which('sg') is not None
+
+def get_ast_grep_command() -> Optional[str]:
+    """Get the available AST-Grep command (ast-grep or sg)"""
+    if shutil.which('ast-grep'):
+        return 'ast-grep'
+    elif shutil.which('sg'):
+        return 'sg'
+    return None
 
 def get_ast_grep_version() -> Optional[str]:
     """Get installed AST-Grep version"""
-    if not is_ast_grep_installed():
+    cmd = get_ast_grep_command()
+    if not cmd:
         return None
 
     try:
         result = subprocess.run(
-            ['ast-grep', '--version'],
+            [cmd, '--version'],
             capture_output=True,
             text=True,
             timeout=5

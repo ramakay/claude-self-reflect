@@ -246,6 +246,7 @@ class UpdateManager {
         console.log();
 
         // Handle critical issues
+        const unresolvedCritical = [];
         if (critical.length > 0) {
             this.log(`Found ${critical.length} critical issue(s) that need fixing`, 'error');
             console.log();
@@ -253,11 +254,13 @@ class UpdateManager {
             for (const issue of critical) {
                 if (issue.error) {
                     this.log(issue.error, 'error');
+                    unresolvedCritical.push(issue);
                 } else if (issue.fix) {
                     this.log(`Fixing: ${issue.name}...`, 'info');
                     const success = await issue.fix();
                     if (!success) {
                         this.log(`Failed to fix: ${issue.name}`, 'error');
+                        unresolvedCritical.push(issue);
                     }
                 }
             }
@@ -278,9 +281,9 @@ class UpdateManager {
 
         // Final status
         console.log();
-        if (critical.length === 0 && optional.length === 0) {
+        if (unresolvedCritical.length === 0 && optional.length === 0) {
             this.log('All features are up to date! ✨', 'success');
-        } else if (critical.length === 0) {
+        } else if (unresolvedCritical.length === 0) {
             this.log('Core features are working. Optional features installed.', 'success');
         } else {
             this.log('Please address critical issues before using Claude Self-Reflect', 'error');
