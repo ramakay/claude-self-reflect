@@ -305,17 +305,18 @@ class UpdateManager {
         console.log();
 
         // Run all checks with Promise.allSettled to prevent throw on first failure
+        // Store checks as objects with name property for maintainability
         const checks = [
-            this.checkDocker(),
-            this.checkQdrant(),
-            this.checkFastEmbedModel(),
-            this.checkDockerComposeConfig(),
-            this.checkCCStatusline(),
-            this.checkCSRStatusScript(),
-            this.checkASTGrep()
+            { name: 'Docker', fn: () => this.checkDocker() },
+            { name: 'Qdrant', fn: () => this.checkQdrant() },
+            { name: 'FastEmbed', fn: () => this.checkFastEmbedModel() },
+            { name: 'Docker Config', fn: () => this.checkDockerComposeConfig() },
+            { name: 'cc-statusline', fn: () => this.checkCCStatusline() },
+            { name: 'csr-status', fn: () => this.checkCSRStatusScript() },
+            { name: 'AST-Grep', fn: () => this.checkASTGrep() }
         ];
 
-        const settledResults = await Promise.allSettled(checks);
+        const settledResults = await Promise.allSettled(checks.map(c => c.fn()));
 
         // Convert settled results to standard format, treating rejections as failures
         const results = settledResults.map((result, index) => {
@@ -323,12 +324,14 @@ class UpdateManager {
                 return result.value;
             } else {
                 // Rejected check - treat as critical failure
-                const checkNames = ['Docker', 'Qdrant', 'FastEmbed', 'Docker Config', 'cc-statusline', 'csr-status', 'AST-Grep'];
-                this.log(`Check failed: ${checkNames[index]} - ${result.reason?.message || result.reason}`, 'error');
+                this.log(
+                    `Check failed: ${checks[index].name} - ${result.reason?.message || result.reason}`,
+                    'error'
+                );
                 return {
                     installed: false,
                     critical: true,
-                    name: checkNames[index],
+                    name: checks[index].name,
                     error: `Check threw error: ${result.reason?.message || result.reason}`
                 };
             }

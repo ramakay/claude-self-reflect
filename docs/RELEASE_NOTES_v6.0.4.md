@@ -60,6 +60,12 @@ spawnSync('tar', ['-xzf', tarPath, '-C', this.cacheDir])
 - **Fix**: Added 5-second delay before re-checking Qdrant status after startup
 - **File**: `installer/update-manager.js:379-382`
 
+### 8. **Hardcoded Parallel Array (MAJOR)**
+- **Issue**: Used separate checkNames array that must stay synchronized with checks array
+- **Impact**: Brittle code - reordering checks causes incorrect error messages
+- **Fix**: Refactored to store checks as objects with name property for maintainability
+- **File**: `installer/update-manager.js:307-338`
+
 ## 📦 What Changed
 
 ### Security & Stability
@@ -83,6 +89,10 @@ spawnSync('tar', ['-xzf', tarPath, '-C', this.cacheDir])
 + Docker config verification
 + Undefined recheckResult guard
 + Qdrant startup delay before verification
+
+// Code maintainability
+- Hardcoded parallel checkNames array (brittle)
++ Object-based checks with name property (maintainable)
 ```
 
 ### Code Quality
@@ -95,13 +105,13 @@ spawnSync('tar', ['-xzf', tarPath, '-C', this.cacheDir])
 | File | Lines | Changes |
 |------|-------|---------|
 | `installer/fastembed-fallback.js` | +16/-8 | Shell injection fix |
-| `installer/update-manager.js` | +96/-14 | Multiple stability fixes + CI/CD review |
+| `installer/update-manager.js` | +106/-22 | Security + stability + maintainability |
 | `installer/postinstall.js` | +1/-1 | Remove unused import |
 | `installer/statusline-setup.js` | +1/-1 | Clarify symlink comment |
 | `package.json` | +1/-1 | Version bump |
-| `docs/RELEASE_NOTES_v6.0.4.md` | +6/-3 | Update release notes |
+| `docs/RELEASE_NOTES_v6.0.4.md` | +14/-11 | Comprehensive release notes |
 
-**Total**: 6 files, 121 insertions(+), 28 deletions(-)
+**Total**: 6 files, 139 insertions(+), 44 deletions(-)
 
 ## 📊 Impact Assessment
 
@@ -154,10 +164,11 @@ None specific to this release.
 ## 📈 Quality Metrics
 
 - **Security**: Shell injection vulnerability fixed
-- **Stability**: 4 high-priority + 3 medium/low issues resolved
+- **Stability**: 4 high-priority + 3 medium issues resolved
 - **Compatibility**: Docker Compose v1 & v2 support
 - **Error Handling**: Comprehensive retry and verification with proper timing
-- **Code Quality**: CodeRabbit CI/CD review passed (all issues fixed)
+- **Maintainability**: Eliminated brittle parallel arrays
+- **Code Quality**: CodeRabbit CI/CD review passed (all major issues fixed)
 
 ## 🙏 Credits
 
@@ -169,7 +180,7 @@ Fixed based on CodeRabbit automated reviews:
 - 1 medium verification improvement
 
 **CI/CD Review** (during PR):
-- 2 major issues (timing + documentation)
+- 3 major issues (timing + documentation + maintainability)
 - 1 markdown formatting issue
 
 ## 📚 Documentation Updates
