@@ -74,16 +74,23 @@ class UpdateManager {
     }
 
     async checkASTGrep() {
+        // Check for both 'ast-grep' (brew) and 'sg' (npm) binaries
         try {
             execSync('ast-grep --version', { stdio: 'ignore' });
             return { installed: true, name: 'AST-Grep', critical: false };
         } catch {
-            return {
-                installed: false,
-                name: 'AST-Grep (optional)',
-                critical: false,
-                fix: () => this.suggestASTGrep()
-            };
+            // Try 'sg' binary (npm install -g @ast-grep/cli)
+            try {
+                execSync('sg --version', { stdio: 'ignore' });
+                return { installed: true, name: 'AST-Grep (sg)', critical: false };
+            } catch {
+                return {
+                    installed: false,
+                    name: 'AST-Grep (optional)',
+                    critical: false,
+                    fix: () => this.suggestASTGrep()
+                };
+            }
         }
     }
 
