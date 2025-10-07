@@ -110,12 +110,45 @@ class UpdateManager {
     }
 
     async checkQdrant() {
+        // Check if fetch is available (Node.js 18+)
+        if (typeof fetch === 'undefined') {
+            this.log('fetch not available, skipping Qdrant health check', 'warning');
+            return {
+                installed: false,
+                name: 'Qdrant',
+                critical: true,
+                fix: () => this.startQdrant(),
+                error: 'Cannot verify Qdrant (fetch not available)'
+            };
+        }
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000); // 3 second timeout
+
         try {
-            const response = await fetch('http://localhost:6333');
+            const response = await fetch('http://localhost:6333', {
+                signal: controller.signal
+            });
+
+            // Clear timeout immediately after successful fetch
+            clearTimeout(timeout);
+
             if (response.ok) {
+                // Timeout already cleared above, safe to return
                 return { installed: true, name: 'Qdrant', critical: true };
+            } else {
+                // Timeout already cleared above, log and fall through
+                this.log(`Qdrant responded with status: ${response.status}`, 'warning');
             }
-        } catch {}
+        } catch (error) {
+            clearTimeout(timeout);
+
+            if (error.name === 'AbortError') {
+                this.log('Qdrant health check timed out after 3 seconds', 'warning');
+            } else {
+                this.log(`Qdrant health check failed: ${error.message}`, 'warning');
+            }
+        }
 
         return {
             installed: false,
@@ -234,16 +267,30 @@ class UpdateManager {
 
     async startQdrant() {
         this.log('Starting Qdrant...', 'info');
+
+        // Try Docker Compose v2 first (docker compose)
         try {
             execSync('docker compose up -d qdrant', {
                 cwd: this.packageRoot,
                 stdio: 'inherit'
             });
-            this.log('Qdrant started', 'success');
+            this.log('Qdrant started (Docker Compose v2)', 'success');
             return true;
-        } catch (error) {
-            this.log(`Failed to start Qdrant: ${error.message}`, 'error');
-            return false;
+        } catch (v2Error) {
+            this.log('Docker Compose v2 failed, trying v1...', 'warning');
+
+            // Fallback to Docker Compose v1 (docker-compose)
+            try {
+                execSync('docker-compose up -d qdrant', {
+                    cwd: this.packageRoot,
+                    stdio: 'inherit'
+                });
+                this.log('Qdrant started (Docker Compose v1)', 'success');
+                return true;
+            } catch (v1Error) {
+                this.log(`Failed to start Qdrant with both v1 and v2: ${v1Error.message}`, 'error');
+                return false;
+            }
         }
     }
 
@@ -257,18 +304,38 @@ class UpdateManager {
         this.log('Analyzing installation...', 'info');
         console.log();
 
-        // Run all checks
+        // Run all checks with Promise.allSettled to prevent throw on first failure
+        // Store checks as objects with name property for maintainability
         const checks = [
-            this.checkDocker(),
-            this.checkQdrant(),
-            this.checkFastEmbedModel(),
-            this.checkDockerComposeConfig(),
-            this.checkCCStatusline(),
-            this.checkCSRStatusScript(),
-            this.checkASTGrep()
+            { name: 'Docker', fn: () => this.checkDocker() },
+            { name: 'Qdrant', fn: () => this.checkQdrant() },
+            { name: 'FastEmbed', fn: () => this.checkFastEmbedModel() },
+            { name: 'Docker Config', fn: () => this.checkDockerComposeConfig() },
+            { name: 'cc-statusline', fn: () => this.checkCCStatusline() },
+            { name: 'csr-status', fn: () => this.checkCSRStatusScript() },
+            { name: 'AST-Grep', fn: () => this.checkASTGrep() }
         ];
 
-        const results = await Promise.all(checks);
+        const settledResults = await Promise.allSettled(checks.map(c => c.fn()));
+
+        // Convert settled results to standard format, treating rejections as failures
+        const results = settledResults.map((result, index) => {
+            if (result.status === 'fulfilled') {
+                return result.value;
+            } else {
+                // Rejected check - treat as critical failure
+                this.log(
+                    `Check failed: ${checks[index].name} - ${result.reason?.message || result.reason}`,
+                    'error'
+                );
+                return {
+                    installed: false,
+                    critical: true,
+                    name: checks[index].name,
+                    error: `Check threw error: ${result.reason?.message || result.reason}`
+                };
+            }
+        });
 
         // Categorize results
         const missing = results.filter(r => !r.installed);
@@ -300,6 +367,40 @@ class UpdateManager {
                     if (!success) {
                         this.log(`Failed to fix: ${issue.name}`, 'error');
                         unresolvedCritical.push(issue);
+                    } else {
+                        // Re-verify the fix worked by re-running the check
+                        this.log(`Verifying fix for ${issue.name}...`, 'info');
+                        const recheckName = issue.name.toLowerCase();
+                        let recheckResult;
+
+                        if (recheckName.includes('docker') && recheckName.includes('config')) {
+                            // Docker config specific check
+                            recheckResult = await this.checkDockerComposeConfig();
+                        } else if (recheckName.includes('docker') && !recheckName.includes('config')) {
+                            recheckResult = await this.checkDocker();
+                        } else if (recheckName.includes('qdrant')) {
+                            // Give Qdrant a moment to come online before rechecking
+                            this.log('Waiting 5 seconds for Qdrant to start...', 'info');
+                            await new Promise(resolve => setTimeout(resolve, 5000));
+                            recheckResult = await this.checkQdrant();
+                        } else if (recheckName.includes('fastembed')) {
+                            recheckResult = await this.checkFastEmbedModel();
+                        } else if (recheckName.includes('cc-statusline')) {
+                            recheckResult = await this.checkCCStatusline();
+                        } else if (recheckName.includes('csr-status')) {
+                            recheckResult = await this.checkCSRStatusScript();
+                        } else if (recheckName.includes('ast-grep')) {
+                            recheckResult = await this.checkASTGrep();
+                        }
+
+                        // Guard against undefined recheckResult (no matching verifier)
+                        if (recheckResult === undefined) {
+                            this.log(`No verifier found for ${issue.name} - cannot verify fix`, 'error');
+                            unresolvedCritical.push(issue);
+                        } else if (!recheckResult.installed) {
+                            this.log(`Fix verification failed for ${issue.name}`, 'error');
+                            unresolvedCritical.push(issue);
+                        }
                     }
                 } else {
                     // Issue has no fix and no error message - track as unresolved

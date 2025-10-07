@@ -118,7 +118,7 @@ class StatuslineSetup {
                     fs.unlinkSync(userLocalBin);
                 }
                 fs.symlinkSync(this.csrScript, userLocalBin);
-                // Note: Don't chmod symlink - ensure source script is executable instead
+                // Note: Symlink permissions don't matter - source script permissions are used
 
                 this.log('csr-status installed to ~/bin (no sudo required)', 'success');
                 this.log('Add ~/bin to PATH: export PATH="$HOME/bin:$PATH"', 'info');
