@@ -130,11 +130,14 @@ class UpdateManager {
                 signal: controller.signal
             });
 
+            // Clear timeout immediately after successful fetch
             clearTimeout(timeout);
 
             if (response.ok) {
+                // Timeout already cleared above, safe to return
                 return { installed: true, name: 'Qdrant', critical: true };
             } else {
+                // Timeout already cleared above, log and fall through
                 this.log(`Qdrant responded with status: ${response.status}`, 'warning');
             }
         } catch (error) {
@@ -367,7 +370,10 @@ class UpdateManager {
                         const recheckName = issue.name.toLowerCase();
                         let recheckResult;
 
-                        if (recheckName.includes('docker') && !recheckName.includes('config')) {
+                        if (recheckName.includes('docker') && recheckName.includes('config')) {
+                            // Docker config specific check
+                            recheckResult = await this.checkDockerComposeConfig();
+                        } else if (recheckName.includes('docker') && !recheckName.includes('config')) {
                             recheckResult = await this.checkDocker();
                         } else if (recheckName.includes('qdrant')) {
                             recheckResult = await this.checkQdrant();
@@ -381,7 +387,11 @@ class UpdateManager {
                             recheckResult = await this.checkASTGrep();
                         }
 
-                        if (recheckResult && !recheckResult.installed) {
+                        // Guard against undefined recheckResult (no matching verifier)
+                        if (recheckResult === undefined) {
+                            this.log(`No verifier found for ${issue.name} - cannot verify fix`, 'error');
+                            unresolvedCritical.push(issue);
+                        } else if (!recheckResult.installed) {
                             this.log(`Fix verification failed for ${issue.name}`, 'error');
                             unresolvedCritical.push(issue);
                         }
