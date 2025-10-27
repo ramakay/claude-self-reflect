@@ -2,13 +2,15 @@ volumes:
   qdrant_data:
 
 services:
-  # Fix permissions for config directory
+  # Fix permissions for config directory (UID 1001 matches appuser in Dockerfiles)
   init-permissions:
     image: alpine
-    command: chown -R 1000:1000 /config
+    command: sh -c "chown -R 1001:1001 /config && chown -R 1001:1001 /batch_queue && chown -R 1001:1001 /batch_state"
     volumes:
       - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/config
-    profiles: ["watch", "import", "async", "safe-watch"]
+      - ${CSR_BATCH_QUEUE_DIR:-~/.claude-self-reflect/batch_queue}:/batch_queue
+      - ${CSR_BATCH_STATE_DIR:-~/.claude-self-reflect/batch_state}:/batch_state
+    profiles: ["watch", "import", "async", "safe-watch", "batch-automation"]
 
   # Qdrant vector database - the heart of semantic search
   qdrant:
@@ -196,9 +198,9 @@ services:
       - MALLOC_ARENA_MAX=2
     restart: unless-stopped
     profiles: ["safe-watch", "watch"]  # Requires explicit profile to run
-    mem_limit: 1g  # Increased to 1GB to match MEMORY_LIMIT_MB
-    memswap_limit: 1g
-    cpus: 1.0  # Single CPU core limit
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 4.0
 
   # MCP server for Claude integration
   mcp-server:
@@ -220,6 +222,98 @@ services:
     stdin_open: true
     tty: true
     profiles: ["mcp"]
+
+  # Batch watcher - Queues conversations and triggers batch narrative generation
+  batch-watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.batch-watcher
+    container_name: claude-reflection-batch-watcher
+    depends_on:
+      - init-permissions
+      - qdrant
+    volumes:
+      - ${CLAUDE_LOGS_PATH:-~/.claude/projects}:/logs:ro
+      - ${CONFIG_PATH:-~/.claude-self-reflect/config}:/home/appuser/.claude-self-reflect/config
+      - ${CSR_BATCH_QUEUE_DIR:-~/.claude-self-reflect/batch_queue}:/home/appuser/.claude-self-reflect/batch_queue
+      - ${CSR_BATCH_STATE_DIR:-~/.claude-self-reflect/batch_state}:/home/appuser/.claude-self-reflect/batch_state
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # Set CSR paths to match mounted volumes
+      - CSR_HOME=/home/appuser/.claude-self-reflect
+      - CSR_CONFIG_DIR=/home/appuser/.claude-self-reflect/config
+      - CSR_BATCH_QUEUE_DIR=/home/appuser/.claude-self-reflect/batch_queue
+      - CSR_BATCH_STATE_DIR=/home/appuser/.claude-self-reflect/batch_state
+      - CLAUDE_PROJECTS_DIR=/logs
+      # Batch configuration
+      - BATCH_SIZE_TRIGGER=${BATCH_SIZE_TRIGGER:-10}
+      - BATCH_TIME_TRIGGER_MINUTES=${BATCH_TIME_TRIGGER_MINUTES:-30}
+      - HOT_WINDOW_MINUTES=${HOT_WINDOW_MINUTES:-5}
+      - WARM_WINDOW_HOURS=${WARM_WINDOW_HOURS:-24}
+      - MAX_COLD_FILES=${MAX_COLD_FILES:-5}
+      - SUBPROCESS_TIMEOUT_SECONDS=${SUBPROCESS_TIMEOUT_SECONDS:-1800}
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+    restart: unless-stopped
+    profiles: ["batch-automation"]
+    mem_limit: 2g
+    memswap_limit: 2g
+    # Health check: verify process is running and responsive
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -q '[p]ython.*batch_watcher' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Log rotation configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "service=batch-watcher"
+
+  # Batch monitor - Monitors batch API jobs and triggers evaluations
+  batch-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.batch-monitor
+    container_name: claude-reflection-batch-monitor
+    depends_on:
+      - init-permissions
+      - qdrant
+    volumes:
+      - ${CSR_BATCH_STATE_DIR:-~/.claude-self-reflect/batch_state}:/home/appuser/.claude-self-reflect/batch_state
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # Set CSR paths to match mounted volumes
+      - CSR_HOME=/home/appuser/.claude-self-reflect
+      - CSR_BATCH_STATE_DIR=/home/appuser/.claude-self-reflect/batch_state
+      - CHECK_INTERVAL=${BATCH_MONITOR_INTERVAL:-60}
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+    restart: unless-stopped
+    profiles: ["batch-automation"]
+    mem_limit: 512m
+    memswap_limit: 512m
+    # Health check: verify process is running and responsive
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -q '[p]ython.*batch_monitor' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Log rotation configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "service=batch-monitor"
 
 networks:
   default:
