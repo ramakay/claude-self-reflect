@@ -22,16 +22,63 @@ For maximum security:
 docker run --read-only --tmpfs /tmp claude-self-reflect
 ```
 
+## Deployment Modes & API Keys
+
+Claude Self-Reflect supports two deployment modes with different security requirements:
+
+### 🏠 Standalone Mode (Single User) - DEFAULT
+
+**Use Case**: Personal installation on your own machine
+**Security**: Local-only access, no authentication needed
+
+**When to use**:
+- You're the only person using this installation
+- Qdrant runs on `localhost` (default)
+- All data stays on your personal computer
+
+**Configuration**:
+```bash
+# .env file for standalone mode
+QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=  # Leave empty! No auth needed for local-only
+```
+
+### 🏢 Shared Mode (Team/Multi-User)
+
+**Use Case**: Multiple people accessing the same Qdrant database
+**Security**: Authentication REQUIRED with `QDRANT_API_KEY`
+
+**When to use**:
+- Multiple team members share one Qdrant instance
+- Qdrant runs on a remote server or shared machine
+- You want to centralize team conversation data
+
+**Configuration**:
+```bash
+# .env file for shared mode
+QDRANT_URL=http://qdrant-server:6333  # Remote server
+QDRANT_API_KEY=your-strong-random-key  # REQUIRED!
+```
+
+**Generate secure API key**:
+```bash
+# macOS/Linux
+openssl rand -base64 32
+
+# Or Python
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
 ## Privacy & Data Security
 
-### 🔒 Privacy & Data Exchange
+### 🔒 Embedding Privacy Modes
 
 | Mode | Data Storage | External API Calls | Data Sent | Search Quality |
 |------|--------------|-------------------|-----------|----------------|
 | **Local (Default)** | Your machine only | None | Nothing leaves your computer | Good - uses efficient local embeddings |
 | **Cloud (Opt-in)** | Your machine | Voyage AI | Conversation text for embedding generation | Better - uses state-of-the-art models |
 
-**Note**: Cloud mode sends conversation content to Voyage AI for processing. Review their [privacy policy](https://www.voyageai.com/privacy) before enabling.
+**Note**: Cloud embedding mode sends conversation content to Voyage AI for processing. Review their [privacy policy](https://www.voyageai.com/privacy) before enabling.
 
 ### Data Protection
 - **Local by default**: Your conversations never leave your machine unless you explicitly enable cloud embeddings

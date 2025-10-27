@@ -5,25 +5,25 @@ All performance-impacting hooks and commands have been disabled to resolve Claud
 
 ## Changes Applied
 
-### 1. Global Settings (/Users/ramakrishnanannaswamy/.claude/settings.json)
+### 1. Global Settings (/Users/username/.claude/settings.json)
 - ✅ Set `CLAUDE_FLOW_HOOKS_ENABLED` to `false`
 - ✅ Cleared all hooks from `hooks: {}`
 
-### 2. Project Settings (/Users/ramakrishnanannaswamy/projects/claude-self-reflect/.claude/settings.json)
+### 2. Project Settings (/Users/username/projects/claude-self-reflect/.claude/settings.json)
 - ✅ Removed PreCompact hook (precompact-auto.py)
 - ✅ Removed PostToolUse hooks (quality-check.py)
 - ✅ Set to empty `hooks: {}`
 
-### 3. Statusline Wrapper (/Users/ramakrishnanannaswamy/.claude/statusline-wrapper.sh)
+### 3. Statusline Wrapper (/Users/username/.claude/statusline-wrapper.sh)
 - ✅ Disabled ccusage commands (was taking 2+ seconds)
 - ✅ Disabled csr-status calls
 - ✅ Shows "Active" instead of time calculations
 
-### 4. Contrarian Hook (/Users/ramakrishnanannaswamy/.claude/hooks/contrarian_hook.py)
+### 4. Contrarian Hook (/Users/username/.claude/hooks/contrarian_hook.py)
 - ✅ Added early exit (`sys.exit(0)`) to disable without breaking Claude
 - ✅ Removed from UserPromptSubmit configuration
 
-### 5. Opus Time Script (/Users/ramakrishnanannaswamy/.claude/opus-time-final.sh)
+### 5. Opus Time Script (/Users/username/.claude/opus-time-final.sh)
 - ✅ Disabled ccusage command
 - ✅ Shows "⏰ Active" immediately
 

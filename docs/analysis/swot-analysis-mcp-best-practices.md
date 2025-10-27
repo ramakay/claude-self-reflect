@@ -106,7 +106,7 @@ Better: "Qdrant unavailable. Try: 1) Check Docker status 2) Use --limit 3) Wait 
 ### 6. No Natural Language IDs
 ❌ **UUID-heavy responses**:
 - `conversation_id: 46534b91-1878-4ddf-a07b-02e729da9bbd`
-- `project: -Users-ramakrishnanannaswamy-projects-projectname`
+- `project: -Users-username-projects-projectname`
 
 **Better**: `conversation_id: testing-session-2025-09-15`
 

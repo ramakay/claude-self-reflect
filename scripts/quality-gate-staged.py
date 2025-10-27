@@ -73,6 +73,8 @@ class FastQualityGate:
         'scripts/quality-gate-staged.py',  # Don't analyze pattern definitions (self-flagging)
         'tests/test_npm_package_contents.py',  # Test script with intentional print statements
         'scripts/ast_grep_final_analyzer.py',  # Analysis tool with intentional print
+        'docs/design/spike_lazy_chunking_skills.py',  # Experimental spike - safe os.system for pip
+        'docs/design/spike_optimized_caching.py',  # Experimental spike - safe os.system for pip
     }
 
     def get_staged_files(self):

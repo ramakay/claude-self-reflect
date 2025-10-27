@@ -115,7 +115,7 @@ This document outlines the comprehensive plan to consolidate multiple state file
 ### Phase 1: Foundation (Week 1)
 
 #### Day 1-2: State Manager Implementation
-Create `/Users/ramakrishnanannaswamy/projects/claude-self-reflect/scripts/unified_state_manager.py`:
+Create `/Users/username/projects/claude-self-reflect/scripts/unified_state_manager.py`:
 
 ```python
 import json
@@ -251,7 +251,7 @@ class UnifiedStateManager:
 ```
 
 #### Day 3: Migration Script
-Create `/Users/ramakrishnanannaswamy/projects/claude-self-reflect/scripts/migrate-to-unified-state.py`:
+Create `/Users/username/projects/claude-self-reflect/scripts/migrate-to-unified-state.py`:
 
 ```python
 #!/usr/bin/env python3

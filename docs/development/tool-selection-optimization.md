@@ -61,7 +61,7 @@ async def quick_search(...):
 The new tool names with `csr_` prefix will be available after:
 ```bash
 claude mcp remove claude-self-reflect
-claude mcp add claude-self-reflect "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333" -s user
+claude mcp add claude-self-reflect "/Users/username/projects/claude-self-reflect/mcp-server/run-mcp.sh" -e QDRANT_URL="http://localhost:6333" -s user
 # Then restart Claude Code
 ```
 

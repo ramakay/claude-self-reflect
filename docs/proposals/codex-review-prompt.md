@@ -86,5 +86,5 @@ Please provide:
 5. Comparison with industry best practices
 
 ## Files to Review
-- `/Users/ramakrishnanannaswamy/projects/claude-self-reflect/docs/proposals/mcp-evaluation-system.md`
-- `/Users/ramakrishnanannaswamy/projects/claude-self-reflect/docs/analysis/swot-analysis-mcp-best-practices.md`
+- `/Users/username/projects/claude-self-reflect/docs/proposals/mcp-evaluation-system.md`
+- `/Users/username/projects/claude-self-reflect/docs/analysis/swot-analysis-mcp-best-practices.md`

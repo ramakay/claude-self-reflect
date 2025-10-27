@@ -479,9 +479,9 @@ Concurrent Users: 100+
 
 ### 1. CLAUDE.md Files
 **Files to Update**:
-- `/Users/ramakrishnanannaswamy/.claude/CLAUDE.md` (global preferences)
-- `/Users/ramakrishnanannaswamy/projects/claude-self-reflect/CLAUDE.md` (project-specific)
-- `/Users/ramakrishnanannaswamy/projects/CLAUDE.md` (workspace-level)
+- `/Users/username/.claude/CLAUDE.md` (global preferences)
+- `/Users/username/projects/claude-self-reflect/CLAUDE.md` (project-specific)
+- `/Users/username/projects/CLAUDE.md` (workspace-level)
 
 **Required Changes**:
 ```markdown
