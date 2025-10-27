@@ -70,6 +70,49 @@ python scripts/import-conversations-unified.py --limit 5  # Test first
 python scripts/import-conversations-unified.py           # Full import
 ```
 
+### Generate Rich Narratives (9.3x Better Search Quality!)
+Convert conversations to problem-solution narratives with full metadata enrichment.
+
+**Quick Start**:
+```bash
+source venv/bin/activate
+
+# Step 1: Backup Qdrant (REQUIRED)
+docker run --rm \
+  -v claude-self-reflect_qdrant_data:/data \
+  -v ~/.claude-self-reflect/backups/pre-narrative-batch:/backup \
+  alpine tar czf /backup/qdrant_pre_narrative_$(date +%Y%m%d_%H%M%S).tar.gz /data
+
+# Step 2: Run batch import (uses Batch API = 50% cost savings)
+python3 docs/design/batch_import_all_projects.py 2>&1 | tee /tmp/batch-narrative-import.log
+
+# Step 3: Backup again (post-import)
+docker run --rm \
+  -v claude-self-reflect_qdrant_data:/data \
+  -v ~/.claude-self-reflect/backups/post-narrative-batch:/backup \
+  alpine tar czf /backup/qdrant_post_narrative_$(date +%Y%m%d_%H%M%S).tar.gz /data
+
+# Step 4: Validate results
+curl -s http://localhost:6333/collections/v3_all_projects | python3 -m json.tool | grep points_count
+```
+
+**Key Files**:
+- `docs/design/batch_import_all_projects.py` - Main batch importer
+- `docs/design/conversation-analyzer/SKILL_V2.md` - Narrative template
+- `docs/design/extract_events_v3.py` - V3 extraction logic
+
+**What You Get**:
+- 9.3x better search scores (0.691 vs 0.074)
+- 82% token compression
+- Rich metadata: tools, concepts, files
+- Problem-solution patterns
+- Cost: ~$0.012 per conversation (Batch API)
+
+**Search stored reflections** for complete guide:
+```python
+csr_reflect_on_past("narrative batch import quick reference guide")
+```
+
 ## ⚠️ Critical Rules
 
 1. **PATH RULE**: Always use `/Users/username/...` never `~/...` in MCP commands
@@ -159,6 +202,10 @@ docker start claude-reflection-safe-watcher  # Auto-importer
 | Unified state | `~/.claude-self-reflect/config/unified-state.json` | Single source of truth (v5.0) |
 | State manager | `scripts/unified_state_manager.py` | Unified state management |
 | MCP server | `mcp-server/src/server.py` | Main server (728 lines) |
+| Narrative importer | `docs/design/batch_import_all_projects.py` | Batch narrative generator |
+| Narrative template | `docs/design/conversation-analyzer/SKILL_V2.md` | Rich narrative format |
+| V3 extraction | `docs/design/extract_events_v3.py` | Event extraction logic |
+| Metadata extractor | `src/runtime/delta-metadata-update.py` | Tools/concepts/files extraction |
 
 ## 🤖 Agent Activation Keywords
 
