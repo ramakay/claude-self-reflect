@@ -95,14 +95,24 @@ class BatchQueue:
         self.config.queue_dir.mkdir(parents=True, exist_ok=True)
         self.queue_state_file = config.queue_state_file
 
-        # Load existing queue
-        self.queue = self._load_queue()
-        self.last_batch_time = datetime.now()
+        # Load existing queue and last batch time
+        queue_state = self._load_queue_state()
+        self.queue = queue_state.get('queued_files', [])
 
-    def _load_queue(self) -> List[Dict]:
+        # Restore last_batch_time from state, or use current time if not available
+        last_batch_str = queue_state.get('last_batch_time')
+        if last_batch_str:
+            try:
+                self.last_batch_time = datetime.fromisoformat(last_batch_str)
+            except (ValueError, TypeError):
+                self.last_batch_time = datetime.now()
+        else:
+            self.last_batch_time = datetime.now()
+
+    def _load_queue_state(self) -> Dict:
         """Load queue state from file with file locking."""
         if not self.queue_state_file.exists():
-            return []
+            return {"queued_files": [], "last_batch_time": None}
 
         try:
             with open(self.queue_state_file, 'r', encoding='utf-8') as f:
@@ -110,14 +120,14 @@ class BatchQueue:
                 fcntl.flock(f.fileno(), fcntl.LOCK_SH)
                 try:
                     data = json.load(f)
-                    return data.get("queued_files", [])
+                    return data
                 finally:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except FileNotFoundError:
-            return []
+            return {"queued_files": [], "last_batch_time": None}
         except Exception as e:
             logger.error(f"Error loading queue: {e}")
-            return []
+            return {"queued_files": [], "last_batch_time": None}
 
     def _save_queue(self):
         """Save queue state to file with exclusive file locking."""

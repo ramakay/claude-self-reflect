@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Qdrant connection utilities with retry logic.
 """
@@ -64,8 +63,8 @@ def connect_to_qdrant_with_retry(
                 time.sleep(delay)
                 delay *= 2  # Exponential backoff
             else:
-                logger.error(
-                    f"❌ Failed to connect to Qdrant after {max_retries} attempts"
+                logger.exception(
+                    f"Failed to connect to Qdrant after {max_retries} attempts"
                 )
                 raise
 

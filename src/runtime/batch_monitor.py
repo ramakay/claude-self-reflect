@@ -196,8 +196,10 @@ class BatchMonitor:
                     }
                 }
 
-                response = requests.post(url, json=payload)
-                points = response.json()['result']['points']
+                response = requests.post(url, json=payload, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                points = data.get('result', {}).get('points', [])
 
                 if points:
                     # Create and submit evaluation batch
