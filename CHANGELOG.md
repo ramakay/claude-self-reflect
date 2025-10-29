@@ -5,6 +5,172 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.0.0] - 2025-10-28
+
+### BREAKING CHANGES
+
+#### Docker Security Hardening
+- Non-root Docker images: All containers now run as non-root user (appuser, UID 1001)
+- Volume path migration: Paths changed from /root/.claude-self-reflect to /home/appuser/.claude-self-reflect
+- Impact: Existing Docker volumes may need permission fixes. Run migration script or recreate containers.
+
+#### Centralized Configuration
+- New config system: All environment variables and paths centralized in src/runtime/config.py
+- Impact: Custom scripts importing runtime modules must update to use centralized config
+
+#### Batch Automation
+- New optional feature: Batch narrative generation with Anthropic Batch API
+- Disabled by default: Enable with docker compose --profile batch-automation up -d
+- Requirements: Requires ANTHROPIC_API_KEY environment variable
+- Impact: New directories created at ~/.claude-self-reflect/batch_queue and batch_state
+
+### Added
+
+#### Security Hardening
+- Non-root Docker users (appuser, UID 1001) across all containers
+- Exponential backoff retry logic for Qdrant connections with src/runtime/qdrant_connection.py
+- File locking (fcntl) with atomic writes to prevent race conditions
+- Docker health checks for all long-running services (30s interval, 3 retries)
+- Log rotation (10MB max, 3 files per service) to prevent unbounded growth
+- Centralized configuration in src/runtime/config.py eliminates hardcoded paths
+
+#### Batch Automation (Optional)
+- src/runtime/batch_watcher.py: Queues conversations, triggers batch processing
+- src/runtime/batch_monitor.py: Monitors Anthropic Batch API jobs
+- Dockerfile.batch-watcher: Secure Docker image for batch watcher
+- Dockerfile.batch-monitor: Secure Docker image for batch monitor
+- Docker Compose profile "batch-automation" for optional batch services
+- Automated narrative generation (9.3x better search quality)
+- Cost: ~$0.012 per conversation using Batch API (50% savings)
+
+#### Infrastructure
+- Centralized requirements.txt for all Python dependencies
+- Exponential backoff retry for Qdrant connections (max 5 retries, 1s initial delay)
+- UTF-8 encoding enforced on all file operations
+- Subprocess timeout configuration (30 minute default for batch operations)
+
+### Changed
+
+#### Configuration
+- .env.example: Added batch automation section with detailed comments
+- docker-compose.yaml: Added batch-watcher and batch-monitor services
+- docker-compose.yaml: Updated init-permissions to UID 1001 and added batch volumes
+- All services now use /home/appuser instead of /root
+
+#### Deployment Terminology
+- Changed from "dev vs prod" to "standalone vs shared" deployment modes
+- Standalone: Single user, no QDRANT_API_KEY needed
+- Shared: Multi-user, requires QDRANT_API_KEY for security
+
+### Security
+
+#### Critical Fixes (7 issues)
+1. Non-root Docker users prevent privilege escalation
+2. Centralized config prevents injection attacks
+3. Qdrant retry logic prevents startup race conditions
+4. File locking prevents concurrent write corruption
+5. Health checks enable automatic recovery
+6. Log rotation prevents disk space exhaustion
+7. PII sanitization in documentation (replaced /Users/username paths)
+
+#### High Priority Fixes (5 issues)
+1. Increased batch-watcher memory to 2GB (prevents OOM)
+2. Added fcntl file locking with atomic writes
+3. Added Docker health checks (30s interval, 3 retries)
+4. Configured log rotation (10MB max, 3 files)
+5. Clean dependency graph (no circular imports)
+
+### Documentation
+- Added docs/SECURITY.md with standalone vs shared deployment security model
+- Updated .env.example with batch automation configuration
+- All documentation sanitized (replaced /Users/ramakrishnanannaswamy with /Users/username)
+- UTF-8 encoding documented for all file operations
+
+### Fixed
+- Docker startup race conditions with Qdrant retry logic
+- Concurrent file writes with fcntl locking and atomic operations
+- Memory exhaustion with 2GB limit for batch-watcher
+- Disk space exhaustion with log rotation
+- PII exposure in documentation
+
+### Migration Guide: v6.x to v7.0
+
+#### For Docker Users
+
+1. Backup Qdrant data (REQUIRED):
+```bash
+docker run --rm \
+  -v claude-self-reflect_qdrant_data:/data \
+  -v ~/.claude-self-reflect/backups:/backup \
+  alpine tar czf /backup/qdrant_pre_v7.tar.gz /data
+```
+
+2. Update to v7.0:
+```bash
+npm install -g claude-self-reflect@7.0.0
+```
+
+3. Fix volume permissions (if needed):
+```bash
+docker compose down
+docker compose --profile watch up -d
+# init-permissions service will fix ownership to UID 1001
+```
+
+4. Enable batch automation (optional):
+```bash
+# Add to .env:
+ANTHROPIC_API_KEY=your-key-here
+
+# Start batch services:
+docker compose --profile batch-automation up -d
+```
+
+#### For Custom Script Users
+
+Update imports to use centralized config:
+```python
+# Old (v6.x):
+import os
+qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+
+# New (v7.0):
+from src.runtime.config import QDRANT_URL, QDRANT_API_KEY
+from src.runtime.qdrant_connection import connect_to_qdrant_with_retry
+
+qdrant = connect_to_qdrant_with_retry(
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY if QDRANT_API_KEY else None
+)
+```
+
+#### For Batch Automation Users
+
+New directories created:
+- ~/.claude-self-reflect/batch_queue - Conversation queue
+- ~/.claude-self-reflect/batch_state - Batch API state tracking
+
+Configure in .env:
+```bash
+ANTHROPIC_API_KEY=your-key-here
+BATCH_SIZE_TRIGGER=10
+BATCH_TIME_TRIGGER_MINUTES=30
+SUBPROCESS_TIMEOUT_SECONDS=1800
+```
+
+Enable services:
+```bash
+docker compose --profile batch-automation up -d
+```
+
+Monitor batches:
+```bash
+docker logs -f claude-reflection-batch-watcher
+docker logs -f claude-reflection-batch-monitor
+```
+
+---
+
 ## [5.0.4] - 2025-09-30
 
 ### 🎯 Major Code Quality Release - Import Script Refactoring
