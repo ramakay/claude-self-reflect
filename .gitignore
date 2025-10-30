@@ -137,5 +137,6 @@ qdrant_cleanup_manifest*
 voyage_test_log.txt
 import_log.txt
 prompt.txt
+batch_ground_truth_id.txt
 backups/
 cache/

@@ -45,6 +45,7 @@ tqdm>=4.67.0
 
 # Human-readable formatting
 humanize>=4.13.0
+rich>=13.0.0
 
 # System utilities
 psutil>=7.0.0
