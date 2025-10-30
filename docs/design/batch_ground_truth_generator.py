@@ -41,8 +41,16 @@ class BatchGroundTruthGenerator:
 
     def __init__(self):
         """Initialize with Anthropic client and Qdrant connection."""
-        # Anthropic client will automatically use ANTHROPIC_API_KEY from environment
-        self.client = anthropic.Anthropic()
+        # Validate API key
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "ANTHROPIC_API_KEY environment variable required. "
+                "Set it in your .env file or export it in your shell."
+            )
+
+        # Initialize Anthropic client
+        self.client = anthropic.Anthropic(api_key=api_key)
         self.qdrant_url = "http://localhost:6333"
         self.collection_name = "v3_all_projects"
         self.ground_truth_collection = "ground_truth_evals"

@@ -140,3 +140,13 @@ prompt.txt
 batch_ground_truth_id.txt
 backups/
 cache/
+
+# Batch automation output files (PRIVATE DATA - DO NOT COMMIT)
+batch_*.jsonl
+*_narrative*.jsonl
+*_ground_truth*.jsonl
+*_evaluation*.jsonl
+ground_truth_*.jsonl
+narrative_*.txt
+batch_requests*.jsonl
+batch_results*.jsonl

@@ -270,7 +270,16 @@ def main():
 
     # Initialize clients
     print("\n🔧 Initializing clients...")
-    anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+    # Validate API key
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "ANTHROPIC_API_KEY environment variable required. "
+            "Set it in your .env file or export it in your shell."
+        )
+
+    anthropic_client = anthropic.Anthropic(api_key=api_key)
     qdrant_client = QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"))
 
     # Initialize embedding model

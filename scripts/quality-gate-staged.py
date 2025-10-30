@@ -73,6 +73,14 @@ class FastQualityGate:
         'scripts/quality-gate-staged.py',  # Don't analyze pattern definitions (self-flagging)
         'tests/test_npm_package_contents.py',  # Test script with intentional print statements
         'scripts/ast_grep_final_analyzer.py',  # Analysis tool with intentional print
+        # Batch automation scripts - standalone tools with intentional print for user feedback
+        'docs/design/batch_import_all_projects.py',
+        'docs/design/batch_import_v3.py',
+        'docs/design/batch_ground_truth_generator.py',
+        'docs/design/import_existing_batch.py',
+        'docs/design/recover_all_batches.py',
+        'docs/design/recover_batch_results.py',
+        'docs/design/extract_events_v3.py',
     }
 
     def get_staged_files(self):
