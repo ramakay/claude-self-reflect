@@ -26,8 +26,7 @@ Give Claude perfect memory of all your conversations. Search past discussions in
 
 **100% Local by Default** • **20x Faster** • **Zero Configuration** • **Production Ready**
 
-> **NEW IN v7.0: Automated Narrative Generation**
-> 9.3x better search quality via AI-powered conversation summaries. Automatically processes conversations into rich problem-solution narratives with 50% cost savings using Anthropic's Batch API ($0.012 per conversation). See [v7.0 Release Notes](#v70-automated-narrative-generation).
+> **Latest: v7.0 Automated Narratives** - 9.3x better search quality via AI-powered summaries. [Learn more →](#v70-automated-narrative-generation)
 
 ## Why This Exists
 
@@ -66,7 +65,7 @@ claude-self-reflect setup
 ```
 
 > [!TIP]
-> **v4.0+ Auto-Migration**: Updates from v3.x automatically migrate during npm install - no manual steps needed!
+> **Auto-Migration**: Updates automatically handle breaking changes. Simply run `npm update -g claude-self-reflect`.
 
 <details open>
 <summary>Cloud Mode (Better Search Accuracy)</summary>
@@ -87,18 +86,15 @@ claude-self-reflect setup --voyage-key=YOUR_ACTUAL_KEY_HERE
 
 ## Performance
 
-<details open>
-<summary><b>v4.0 Performance Improvements</b></summary>
-
-| Metric | v3.x | v4.0 | Improvement |
-|--------|------|------|-------------|
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
 | **Status Check** | 119ms | 6ms | **20x faster** |
 | **Storage Usage** | 100MB | 50MB | **50% reduction** |
 | **Import Speed** | 10/sec | 100/sec | **10x faster** |
 | **Memory Usage** | 500MB | 50MB | **90% reduction** |
 | **Search Latency** | 15ms | 3ms | **5x faster** |
 
-### How We Compare
+### Competitive Comparison
 
 | Feature | Claude Self-Reflect | MemGPT | LangChain Memory |
 |---------|---------------------|---------|------------------|
@@ -108,8 +104,6 @@ claude-self-reflect setup --voyage-key=YOUR_ACTUAL_KEY_HERE
 | **Search speed** | <3ms | ~50ms | ~100ms |
 | **Setup time** | 5 min | 30+ min | 20+ min |
 | **Docker required** | Yes | Python | Python |
-
-</details>
 
 ## The Magic
 
@@ -268,27 +262,27 @@ For complete documentation, see [Batch Automation Guide](docs/testing/NARRATIVE_
 <details>
 <summary><b>MCP Tools Available to Claude</b></summary>
 
-**Search & Memory Tools:**
+**Search & Memory:**
 - `reflect_on_past` - Search past conversations using semantic similarity with time decay (supports quick/summary modes)
 - `store_reflection` - Store important insights or learnings for future reference
 - `get_next_results` - Paginate through additional search results
 - `search_by_file` - Find conversations that analyzed specific files
 - `search_by_concept` - Search for conversations about development concepts
-- `get_full_conversation` - Retrieve complete JSONL conversation files (v2.8.8)
+- `get_full_conversation` - Retrieve complete JSONL conversation files
 
-**NEW: Temporal Query Tools (v3.3.0):**
+**Temporal Queries:**
 - `get_recent_work` - Answer "What did we work on last?" with session grouping
 - `search_by_recency` - Time-constrained search like "docker issues last week"
 - `get_timeline` - Activity timeline with statistics and patterns
 
-**Runtime Configuration Tools (v4.0):**
+**Runtime Configuration:**
 - `switch_embedding_mode` - Switch between local/cloud modes without restart
 - `get_embedding_mode` - Check current embedding configuration
 - `reload_code` - Hot reload Python code changes
 - `reload_status` - Check reload state
 - `clear_module_cache` - Clear Python cache
 
-**Status & Monitoring Tools:**
+**Status & Monitoring:**
 - `get_status` - Real-time import progress and system status
 - `get_health` - Comprehensive system health check
 - `collection_status` - Check Qdrant collection health and stats
@@ -382,9 +376,6 @@ Files are categorized by age and processed with priority queuing to ensure newes
 
 ## Requirements
 
-> [!WARNING]
-> **Breaking Change in v4.0**: Collections now use prefixed naming (e.g., `csr_project_local_384d`). Run migration automatically via `npm update`.
-
 <details>
 <summary><b>System Requirements</b></summary>
 
@@ -462,20 +453,44 @@ npm uninstall -g claude-self-reflect
 
 ## Keeping Up to Date
 
-> [!TIP]
-> **For Existing Users**: Simply run `npm update -g claude-self-reflect` to get the latest features and improvements. Updates are automatic and preserve your data.
+```bash
+npm update -g claude-self-reflect
+```
+
+Updates are automatic and preserve your data. See [full changelog](docs/release-history.md) for details.
 
 <details>
-<summary>Recent Improvements</summary>
+<summary><b>Release Evolution</b></summary>
 
-- **20x faster performance** - Status checks, search, and imports
-- **Runtime configuration** - Switch modes without restarting
-- **Unified state management** - Single source of truth
-- **AST-GREP integration** - Code quality analysis
-- **Temporal search tools** - Find recent work and time-based queries
-- **Auto-migration** - Updates handle breaking changes automatically
+### v7.0 - Automated Narratives (Oct 2025)
+- **9.3x better search quality** via AI-powered conversation summaries
+- **50% cost savings** using Anthropic Batch API ($0.012 per conversation)
+- **82% token compression** while maintaining searchability
+- Rich metadata extraction (tools, concepts, files)
+- Problem-solution narrative structure
+- Automated batch processing with Docker monitoring
 
-[Full changelog](docs/release-history.md)
+### v4.0 - Performance Revolution (Sep 2025)
+- **20x faster** status checks (119ms → 6ms)
+- **50% storage reduction** via unified state management
+- **10x faster imports** (10/sec → 100/sec)
+- **90% memory reduction** (500MB → 50MB)
+- Runtime mode switching (no restart required)
+- Prefixed collection naming (breaking change)
+- Code quality tracking with AST-GREP (100+ patterns)
+
+### v3.3 - Temporal Intelligence (Aug 2025)
+- Time-based search: "docker issues last week"
+- Session grouping: "What did we work on last?"
+- Activity timelines with statistics
+- Recency-aware queries
+
+### v2.8 - Full Context Access (Jul 2025)
+- Complete conversation retrieval
+- JSONL file access for deeper analysis
+- Enhanced debugging capabilities
+
+[View complete changelog →](docs/release-history.md)
 
 </details>
 
