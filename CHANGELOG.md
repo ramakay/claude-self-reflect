@@ -7,41 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [7.0.0] - 2025-10-28
 
+### 🚀 MAJOR FEATURE: Automated Narrative Generation
+
+**9.3x Better Search Quality** • **50% Cost Savings** • **Fully Automated**
+
+v7.0.0 introduces AI-powered conversation narratives that transform raw conversation excerpts into rich problem-solution summaries with comprehensive metadata extraction.
+
+#### Search Quality Improvements
+- **Search Scores**: 0.074 → 0.691 (9.3x improvement)
+- **Token Compression**: 82% reduction while maintaining searchability
+- **Metadata Richness**: Automatic extraction of tools used, technical concepts, and files modified
+- **Problem-Solution Patterns**: Conversations structured as challenges encountered and solutions implemented
+
+#### Cost-Effective Processing
+- **Anthropic Batch API**: ~$0.012 per conversation (50% savings vs $0.025 standard)
+- **Automatic Queuing**: Batch processing triggered when threshold reached (default: 10 conversations)
+- **Progress Monitoring**: Docker containers for real-time batch monitoring
+- **Quality Assurance**: Automated evaluation generation
+
+#### New Components
+- `src/runtime/batch_watcher.py`: Queues conversations, triggers batch processing
+- `src/runtime/batch_monitor.py`: Monitors Anthropic Batch API jobs
+- `docs/design/batch_import_all_projects.py`: Batch narrative generator (PRIMARY SCRIPT)
+- `docs/design/batch_ground_truth_generator.py`: Evaluation generator
+- `docs/design/extract_events_v3.py`: V3 event extraction with metadata enrichment
+- `docs/design/conversation-analyzer/SKILL_V2.md`: Rich narrative template
+- Docker Compose profile "batch-automation" for optional batch services
+- Dockerfiles: batch-watcher and batch-monitor for secure container deployment
+
 ### BREAKING CHANGES
 
-#### Docker Security Hardening
-- Non-root Docker images: All containers now run as non-root user (appuser, UID 1001)
-- Volume path migration: Paths changed from /root/.claude-self-reflect to /home/appuser/.claude-self-reflect
-- Impact: Existing Docker volumes may need permission fixes. Run migration script or recreate containers.
+#### Docker Security Migration (Required)
+- **Non-root Containers**: All containers now run as non-root user (appuser, UID 1001)
+- **Volume Paths Changed**: /root/.claude-self-reflect → /home/appuser/.claude-self-reflect
+- **Impact**: Existing Docker volumes may need permission fixes. See migration guide below.
 
-#### Centralized Configuration
-- New config system: All environment variables and paths centralized in src/runtime/config.py
-- Impact: Custom scripts importing runtime modules must update to use centralized config
+#### Batch Automation (Optional)
+- **New Feature**: Batch narrative generation with Anthropic Batch API
+- **Disabled by Default**: Enable with `docker compose --profile batch-automation up -d`
+- **Requirements**: Requires `ANTHROPIC_API_KEY` environment variable
+- **Impact**: New directories created at ~/.claude-self-reflect/batch_queue and batch_state
 
-#### Batch Automation
-- New optional feature: Batch narrative generation with Anthropic Batch API
-- Disabled by default: Enable with docker compose --profile batch-automation up -d
-- Requirements: Requires ANTHROPIC_API_KEY environment variable
-- Impact: New directories created at ~/.claude-self-reflect/batch_queue and batch_state
+#### Configuration Centralization
+- **New System**: All environment variables and paths centralized in src/runtime/config.py
+- **Impact**: Custom scripts importing runtime modules must update to use centralized config
 
 ### Added
 
-#### Security Hardening
+#### Infrastructure & Security
 - Non-root Docker users (appuser, UID 1001) across all containers
-- Exponential backoff retry logic for Qdrant connections with src/runtime/qdrant_connection.py
+- Exponential backoff retry logic for Qdrant connections (5 retries, 1s initial delay)
 - File locking (fcntl) with atomic writes to prevent race conditions
 - Docker health checks for all long-running services (30s interval, 3 retries)
 - Log rotation (10MB max, 3 files per service) to prevent unbounded growth
 - Centralized configuration in src/runtime/config.py eliminates hardcoded paths
-
-#### Batch Automation (Optional)
-- src/runtime/batch_watcher.py: Queues conversations, triggers batch processing
-- src/runtime/batch_monitor.py: Monitors Anthropic Batch API jobs
-- Dockerfile.batch-watcher: Secure Docker image for batch watcher
-- Dockerfile.batch-monitor: Secure Docker image for batch monitor
-- Docker Compose profile "batch-automation" for optional batch services
-- Automated narrative generation (9.3x better search quality)
-- Cost: ~$0.012 per conversation using Batch API (50% savings)
+- UTF-8 encoding enforced on all file operations
+- Subprocess timeout configuration (30 minute default for batch operations)
 
 #### Infrastructure
 - Centralized requirements.txt for all Python dependencies
