@@ -27,7 +27,11 @@ pydantic-settings>=2.0.0
 # ============================================================================
 # Data Processing
 # ============================================================================
-numpy>=1.24.0,<2.0.0
+# NumPy version varies by Python version:
+# - Python <3.13: NumPy 1.x (fastembed compatible)
+# - Python >=3.13: NumPy 2.x (required by fastembed 0.7.1+)
+numpy>=1.24.0,<2.0.0; python_version<"3.13"
+numpy>=2.1.0; python_version>="3.13"
 
 # ============================================================================
 # Utilities

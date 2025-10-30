@@ -51,9 +51,6 @@ def connect_to_qdrant_with_retry(
             # Test connection by fetching collections
             client.get_collections()
 
-            logger.info(f"✅ Connected to Qdrant at {url}")
-            return client
-
         except Exception as e:
             if attempt < max_retries - 1:
                 logger.warning(
@@ -67,6 +64,10 @@ def connect_to_qdrant_with_retry(
                     f"Failed to connect to Qdrant after {max_retries} attempts"
                 )
                 raise
+        else:
+            # Connection successful
+            logger.info(f"✅ Connected to Qdrant at {url}")
+            return client
 
-    # Should never reach here, but just in case
+    # Should never reach here due to raise in except block
     raise Exception(f"Failed to connect to Qdrant at {url} after {max_retries} attempts")

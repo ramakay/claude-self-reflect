@@ -14,6 +14,8 @@ import sys
 import time
 import json
 import logging
+import fcntl
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -63,17 +65,35 @@ class BatchMonitor:
         self.eval_state = self.state_dir / "eval_batches.json"
 
     def load_batch_state(self, state_file: Path) -> Dict:
-        """Load batch state from file."""
+        """Load batch state from file with shared lock."""
         if not state_file.exists():
             return {"active": [], "completed": [], "failed": []}
 
         with open(state_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            # Acquire shared lock for reading
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                return json.load(f)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
     def save_batch_state(self, state_file: Path, state: Dict):
-        """Save batch state to file."""
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(state, f, indent=2)
+        """Save batch state to file atomically with exclusive lock."""
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write to temp file with exclusive lock, then atomically replace
+        with tempfile.NamedTemporaryFile('w', delete=False, dir=state_file.parent, encoding='utf-8') as tmp:
+            fcntl.flock(tmp.fileno(), fcntl.LOCK_EX)
+            try:
+                json.dump(state, tmp, indent=2)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            finally:
+                fcntl.flock(tmp.fileno(), fcntl.LOCK_UN)
+            temp_name = tmp.name
+
+        # Atomic replace
+        os.replace(temp_name, state_file)
 
     def register_narrative_batch(self, batch_id: str, metadata: Dict):
         """Register a new narrative generation batch."""

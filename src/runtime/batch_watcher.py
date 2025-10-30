@@ -296,35 +296,35 @@ class BatchWatcher:
 
             # Run batch import script with configurable timeout
             result = subprocess.run(
-                ["python", str(BATCH_IMPORT_SCRIPT)],
+                [sys.executable, str(BATCH_IMPORT_SCRIPT)],
                 capture_output=True,
                 text=True,
-                timeout=SUBPROCESS_TIMEOUT_SECONDS  # Default: 1800s (30 min)
+                timeout=SUBPROCESS_TIMEOUT_SECONDS,  # Default: 1800s (30 min)
+                check=True
             )
 
-            if result.returncode == 0:
-                logger.info(f"\n✅ Batch triggered successfully")
-                logger.info(f"   Output:\n{result.stdout}")
+            logger.info("\n✅ Batch triggered successfully")
+            logger.info("   Output:\n%s", result.stdout)
 
-                # Mark files as processed
-                for entry in batch_files:
-                    self.state_manager.add_imported_file(
-                        file_path=entry["file_path"],
-                        chunks=0,  # Will be updated by batch import
-                        metadata={"batch_queued": True}
-                    )
+            # Mark files as processed
+            for entry in batch_files:
+                self.state_manager.add_imported_file(
+                    file_path=entry["file_path"],
+                    chunks=0,  # Will be updated by batch import
+                    metadata={"batch_queued": True}
+                )
 
-            else:
-                logger.error(f"❌ Batch import failed:")
-                logger.error(f"   Stdout: {result.stdout}")
-                logger.error(f"   Stderr: {result.stderr}")
+        except subprocess.CalledProcessError as cpe:
+            logger.error("❌ Batch import failed (rc=%s)", cpe.returncode)
+            logger.error("   Stdout: %s", cpe.stdout)
+            logger.error("   Stderr: %s", cpe.stderr)
 
-                # Re-queue failed files
-                for entry in batch_files:
-                    self.batch_queue.add(entry["file_path"], entry["project"])
+            # Re-queue failed files
+            for entry in batch_files:
+                self.batch_queue.add(entry["file_path"], entry["project"])
 
         except Exception as e:
-            logger.error(f"❌ Error triggering batch: {e}", exc_info=True)
+            logger.error("❌ Error triggering batch: %s", e, exc_info=True)
 
             # Re-queue failed files
             for entry in batch_files:
