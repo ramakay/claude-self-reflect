@@ -81,6 +81,14 @@ class FastQualityGate:
         'docs/design/recover_all_batches.py',
         'docs/design/recover_batch_results.py',
         'docs/design/extract_events_v3.py',
+        # CLI installer scripts - user-facing tools that REQUIRE console.log for UX
+        'installer/setup-wizard.js',
+        'installer/setup-wizard-docker.js',
+        'installer/cli.js',
+        'installer/postinstall.js',
+        'installer/fastembed-fallback.js',
+        'installer/statusline-setup.js',
+        'installer/update-manager.js',
     }
 
     def get_staged_files(self):

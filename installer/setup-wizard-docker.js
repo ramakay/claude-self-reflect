@@ -557,6 +557,109 @@ async function enrichMetadata() {
   }
 }
 
+async function setupBatchAutomation() {
+  console.log('\n🚀 AI-Powered Narratives (NEW in v7.0!)...');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('Transform your conversations into rich, searchable narratives.');
+  console.log('');
+  console.log('📊 Benefits:');
+  console.log('   • 9.3x better search quality (0.074 → 0.691 relevance score)');
+  console.log('   • 82% token compression while maintaining searchability');
+  console.log('   • 50% cost savings using Anthropic Batch API (~$0.012/conversation)');
+  console.log('   • Automatic extraction: tools used, files modified, concepts');
+  console.log('');
+  console.log('📝 What You Get:');
+  console.log('   • Problem-solution structured summaries');
+  console.log('   • Rich metadata (tools, concepts, files)');
+  console.log('   • Fully automated batch processing');
+  console.log('');
+  console.log('⚙️  How It Works:');
+  console.log('   1. Background watcher queues new conversations');
+  console.log('   2. Auto-triggers batch when threshold reached (default: 10)');
+  console.log('   3. Anthropic Batch API generates narratives');
+  console.log('   4. Enhanced narratives auto-imported to Qdrant');
+  console.log('');
+  console.log('🔐 Privacy: Conversations sent to Anthropic Batch API for narrative generation.');
+  console.log('   Review: https://www.anthropic.com/privacy');
+  console.log('');
+
+  const enableChoice = await question('Enable AI-powered narratives? (y/n) [recommended for best search]: ');
+
+  if (enableChoice.toLowerCase() === 'y') {
+    console.log('\n🔑 Anthropic API Key Required');
+    console.log('   Get your key: https://console.anthropic.com/settings/keys');
+    console.log('   Cost: ~$0.012 per conversation via Batch API');
+
+    const apiKey = await question('\nPaste your Anthropic API key (sk-ant-...): ');
+
+    if (apiKey && apiKey.trim().startsWith('sk-ant-')) {
+      // Read current .env
+      const envPath = path.join(projectRoot, '.env');
+      let envContent = '';
+      try {
+        envContent = await fs.readFile(envPath, 'utf8');
+      } catch {
+        // File doesn't exist yet
+      }
+
+      // Remove existing ANTHROPIC_API_KEY if present
+      envContent = envContent.replace(/ANTHROPIC_API_KEY=.*/g, '');
+
+      // Add new key
+      envContent += `\n# Batch Automation (v7.0 AI-Powered Narratives)\nANTHROPIC_API_KEY=${apiKey.trim()}\n`;
+
+      // Write back
+      await fs.writeFile(envPath, envContent.trim() + '\n');
+
+      console.log('✅ API key saved to .env');
+
+      // Start batch automation services
+      console.log('\n🚀 Starting batch automation services...');
+      try {
+        safeExec('docker', ['compose', '--profile', 'batch-automation', 'up', '-d'], {
+          cwd: projectRoot,
+          stdio: 'inherit'
+        });
+
+        console.log('\n✅ Batch automation enabled!');
+        console.log('   • batch-watcher: Monitors for new conversations');
+        console.log('   • batch-monitor: Processes narrative generation');
+        console.log('');
+        console.log('📊 Monitor Progress:');
+        console.log('   docker compose logs batch-watcher -f');
+        console.log('   docker compose logs batch-monitor -f');
+        console.log('');
+        console.log('🎯 Next: New conversations will be automatically enhanced with narratives');
+
+      } catch (error) {
+        console.log('\n⚠️  Could not start batch services automatically');
+        console.log('   Start manually: docker compose --profile batch-automation up -d');
+      }
+
+    } else if (apiKey && apiKey.trim()) {
+      console.log('\n❌ Invalid API key format. Anthropic keys start with "sk-ant-"');
+      console.log('   Skipping batch automation. You can enable it later by:');
+      console.log('   1. Adding ANTHROPIC_API_KEY to .env');
+      console.log('   2. Running: docker compose --profile batch-automation up -d');
+    } else {
+      console.log('\n📝 Skipping batch automation.');
+      console.log('   You can enable it later by:');
+      console.log('   1. Get API key: https://console.anthropic.com/settings/keys');
+      console.log('   2. Add to .env: ANTHROPIC_API_KEY=sk-ant-...');
+      console.log('   3. Run: docker compose --profile batch-automation up -d');
+    }
+
+  } else {
+    console.log('\n📝 Skipping batch automation (staying with standard search).');
+    console.log('   You can enable AI narratives later by:');
+    console.log('   1. Get API key: https://console.anthropic.com/settings/keys');
+    console.log('   2. Add to .env: ANTHROPIC_API_KEY=sk-ant-...');
+    console.log('   3. Run: docker compose --profile batch-automation up -d');
+    console.log('');
+    console.log('💡 Tip: Even without narratives, you still get excellent local search!');
+  }
+}
+
 async function startWatcher() {
   console.log('\n🔄 Starting the streaming watcher...');
   console.log('   • HOT files (<5 min): 2-second processing');
@@ -687,10 +790,13 @@ async function main() {
   
   // Import conversations
   await importConversations();
-  
+
   // Enrich metadata (new in v2.5.19)
   await enrichMetadata();
-  
+
+  // Setup batch automation (new in v7.0)
+  await setupBatchAutomation();
+
   // Start the watcher
   await startWatcher();
   
