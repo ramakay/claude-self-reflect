@@ -1,4 +1,4 @@
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 # SECURITY: CVE-2025-58050 mitigation - PCRE2 heap buffer overflow
 # TODO: Remove explicit PCRE2 upgrade when base image includes patched version
