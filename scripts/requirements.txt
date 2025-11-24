@@ -1,4 +1,4 @@
-qdrant-client==1.15.1
+qdrant-client==1.16.0
 mcp-server-qdrant==0.8.0
 backoff==2.2.1
 tqdm==4.67.1
