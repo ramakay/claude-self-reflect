@@ -1,4 +1,7 @@
 # Claude Self-Reflect
+
+[![Run in Smithery](https://smithery.ai/badge/skills/ramakay)](https://smithery.ai/skills?ns=ramakay&utm_source=github&utm_medium=badge)
+
 <div align="center">
 <img src="https://repobeats.axiom.co/api/embed/e45aa7276c6b2d1fbc46a9a3324e2231718787bb.svg" alt="Repobeats analytics image" />
 </div>
