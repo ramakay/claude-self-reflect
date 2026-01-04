@@ -326,14 +326,27 @@ Claude: [Searches across ALL your projects]
 </details>
 
 <details>
-<summary><b>Ralph Loop Memory Integration</b></summary>
+<summary><b>Ralph Loop Memory Integration (v7.1+)</b></summary>
+
+<div align="center">
+<img src="docs/images/ralph-loop-csr.png" alt="Ralph Loop with CSR Memory - From hamster wheel to upward spiral" width="800"/>
+</div>
 
 Use the [ralph-wiggum plugin](https://github.com/anthropics/claude-code-plugins/tree/main/ralph-wiggum) for long tasks? CSR automatically gives Ralph loops **cross-session memory**:
 
+**Core Features:**
 - **Automatic backup** before context compaction
 - **Past session retrieval** when starting new Ralph loops
 - **Failed approach tracking** - never repeat the same mistakes
 - **Success pattern learning** - reuse what worked before
+
+**v7.1+ Enhanced Features:**
+- **Error Signature Deduplication** - Normalizes errors (removes line numbers, paths, timestamps) to avoid redundant storage
+- **Output Decline Detection** - Circuit breaker pattern that detects >70% drop in output length
+- **Confidence-Based Exit** - 0-100 scoring based on signals (tasks complete, tests passing, no errors)
+- **Anti-Pattern Injection** - "DON'T RETRY THESE" section surfaces failed approaches first
+- **Work Type Tracking** - Categorizes sessions as IMPLEMENTATION/TESTING/DEBUGGING/DOCUMENTATION
+- **Error-Centric Search** - Finds past sessions by error pattern, not just task description
 
 **Setup (one-time):**
 ```bash
@@ -346,9 +359,25 @@ Use the [ralph-wiggum plugin](https://github.com/anthropics/claude-code-plugins/
 2. Work naturally - state is tracked in `.claude/ralph-loop.local.md`
 3. When compaction occurs, state is backed up to CSR
 4. New sessions retrieve past learnings from CSR automatically
+5. Anti-patterns and winning strategies are surfaced first
 
 **Files created:**
 - `.ralph_past_sessions.md` - Injected context from past sessions (auto-generated)
+
+**Verified proof (2026-01-04):**
+```
+# Session start hook injects past sessions:
+INFO: Found 2 relevant results:
+  - Anti-patterns: 0
+  - Winning strategies: 0
+  - Similar tasks: 2
+
+# Sessions stored in Qdrant:
+{
+  "tags": ["ralph_session", "outcome_completed"],
+  "timestamp": "2026-01-04T18:13:03.711262+00:00"
+}
+```
 
 [Full documentation →](docs/development/ralph-memory-integration.md)
 

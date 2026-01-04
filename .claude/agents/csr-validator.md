@@ -93,10 +93,24 @@ find . -type f \( -name "*test_*.py" -o -name "test_*.py" -o -name "*benchmark*.
 echo "=== Suggest archiving to: tests/throwaway/ ==="
 ```
 
-### 8. Ralph Loop Integration Validation (v7.1)
+### 8. Ralph Loop Integration Validation (v7.1+)
 
 **What is Ralph Loop?**
 The Ralph Wiggum technique helps Claude maintain focus on long, complex tasks. With CSR integration, Ralph loops gain cross-session memory through hooks.
+
+**CRITICAL: Runaway Loop Prevention**
+- ALWAYS use `--max-iterations` (PLURAL!) as safety net
+- `--max-iteration` (singular) is IGNORED - loop runs forever!
+- Setting `active: false` does NOT stop loops - must DELETE file
+- To stop: `rm .claude/ralph-loop.local.md`
+
+**v7.1+ Enhanced Features:**
+- **Error Signature Deduplication**: Normalizes errors to avoid storing duplicates
+- **Output Decline Detection**: Circuit breaker pattern (detects >70% output drop)
+- **Confidence-Based Exit**: 0-100 scoring for exit decisions
+- **Anti-Pattern Injection**: "DON'T RETRY THESE" surfaced first
+- **Work Type Tracking**: IMPLEMENTATION/TESTING/DEBUGGING/DOCUMENTATION
+- **Error-Centric Search**: Find past sessions by error pattern, not just task
 
 ```bash
 # Check Ralph hooks in settings.json
@@ -109,16 +123,37 @@ ls -la src/runtime/hooks/session_start_hook.py 2>/dev/null && echo "✅ SessionS
 ls -la src/runtime/hooks/session_end_hook.py 2>/dev/null && echo "✅ SessionEnd" || echo "❌ SessionEnd missing"
 ls -la src/runtime/precompact-hook.sh 2>/dev/null && echo "✅ PreCompact" || echo "❌ PreCompact missing"
 
-# Test RalphStateParser import
+# Test RalphState import (NOT RalphStateParser)
 python3 -c "
 import sys
 sys.path.insert(0, 'src/runtime/hooks')
-from ralph_state import RalphStateParser
-print('✅ RalphStateParser imports')
-" || echo "❌ RalphStateParser import failed"
+from ralph_state import RalphState
+print('✅ RalphState imports')
+" || echo "❌ RalphState import failed"
 
 # Check for Ralph-related CLI integration
 grep -l "ralph" installer/setup-wizard-docker.js && echo "✅ CLI integration" || echo "❌ CLI missing Ralph"
+
+# Test v7.1+ enhanced features
+echo "=== Testing v7.1+ Enhanced Features ==="
+python3 -c "
+import sys
+sys.path.insert(0, 'src/runtime/hooks')
+from ralph_state import RalphState
+
+# Quick feature check
+state = RalphState.create_new('test', 'test')
+state.add_error('Error at line 42')
+state.track_output(1000)
+state.update_confidence({'all_tasks_complete': True})
+state.work_type = 'TESTING'
+
+print('✅ Error dedup:', len(state.error_signatures), 'signatures')
+print('✅ Output tracking:', len(state.output_lengths), 'samples')
+print('✅ Confidence:', state.exit_confidence, '%')
+print('✅ Work type:', state.work_type)
+print('✅ All v7.1+ features work')
+"
 ```
 
 **Test CSR Search for Ralph Sessions:**
@@ -203,14 +238,19 @@ CodeRabbit Analysis: [PASS/FAIL]
 - PR feedback checked: [✓/✗]
 - Issues found: [none/list]
 
-Ralph Loop Integration (v7.1): [PASS/FAIL]
+Ralph Loop Integration (v7.1+): [PASS/FAIL]
 - Hooks in settings.json: [✓/✗]
 - SessionStart hook: [✓/✗]
 - SessionEnd hook: [✓/✗]
 - PreCompact hook: [✓/✗]
-- RalphStateParser: [✓/✗]
+- RalphState module: [✓/✗]
 - CLI integration: [✓/✗]
 - CSR search for Ralph: [✓/✗]
+- v7.1+ Enhanced Features:
+  - Error signature dedup: [✓/✗]
+  - Output decline detection: [✓/✗]
+  - Confidence scoring: [✓/✗]
+  - Work type tracking: [✓/✗]
 
 Critical Issues: [none/list]
 

@@ -76,7 +76,68 @@ python3 scripts/update-quality-all-projects.py --project "$PROJECT_NAME"
 - Corrupted files trigger automatic recreation
 - Session cleanup after 24 hours of inactivity
 
-### 3. user-prompt-submit-hook (Planned)
+### 3. session_start_hook (Ralph Loop Integration)
+**Location**: `src/runtime/hooks/session_start_hook.py`
+**Trigger**: At session start when Ralph loop is detected
+**Purpose**: Search CSR for relevant past Ralph sessions and inject context
+
+**Functionality**:
+- Detects active Ralph session (`.claude/ralph-loop.local.md` or `.ralph_state.md`)
+- Searches CSR for 4 categories of relevant content:
+  - Similar tasks (task-based search)
+  - Similar errors (error-centric search)
+  - Anti-patterns (failed approaches from incomplete sessions)
+  - Winning strategies (successful session patterns)
+- Creates `.ralph_past_sessions.md` with injected context
+- Anti-patterns are surfaced first ("DON'T RETRY THESE" section)
+
+**Key Operations**:
+```bash
+# Hook is called automatically, but can be tested manually:
+echo '{"session_id": "test", "source": "startup"}' | python3 src/runtime/hooks/session_start_hook.py
+```
+
+**v7.1+ Enhanced Features**:
+- Error signature deduplication (normalizes line numbers, paths, timestamps)
+- Output decline detection (circuit breaker pattern)
+- Confidence-based exit scoring (0-100)
+- Work type tracking (IMPLEMENTATION/TESTING/DEBUGGING/DOCUMENTATION)
+
+### 4. session_end_hook (Ralph Loop Integration)
+**Location**: `src/runtime/hooks/session_end_hook.py`
+**Trigger**: At session end when Ralph loop is detected
+**Purpose**: Store session narrative to CSR with rich metadata
+
+**Functionality**:
+- Determines session outcome (COMPLETED, ABANDONED, INCOMPLETE)
+- Extracts structured status blocks if present
+- Stores narrative with searchable tags and metadata
+- Stores winning strategies separately for successful sessions
+- Cleans up temporary files
+
+**Key Operations**:
+```bash
+# Hook is called automatically, but can be tested manually:
+echo '{"session_id": "test", "reason": "user_exit"}' | python3 src/runtime/hooks/session_end_hook.py
+```
+
+**Metadata Stored**:
+- outcome, iterations, work_type
+- exit_confidence, output_declining
+- error_signatures, failed_approaches
+- successful_strategies, learnings, files_modified
+
+### 5. precompact-hook (Ralph Loop Integration)
+**Location**: `src/runtime/precompact-hook.sh`
+**Trigger**: Before context compaction occurs
+**Purpose**: Backup Ralph state to CSR before context is cleared
+
+**Functionality**:
+- Detects active Ralph session
+- Stores current state to CSR for recovery
+- Allows state to be retrieved in next session
+
+### 6. user-prompt-submit-hook (Planned)
 **Purpose**: Validate and enhance user prompts before processing
 **Potential Features**:
 - Risk assessment for operations

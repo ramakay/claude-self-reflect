@@ -5,8 +5,16 @@ Ralph SessionEnd Hook - Stores session narrative to CSR.
 Triggered at session end. Parses .ralph_state.md, determines outcome,
 and stores narrative with metadata for future sessions.
 
+Enhanced Features (v7.1+):
+- Structured status block extraction
+- Rich metadata storage (work type, confidence, error signatures)
+- Output trend tracking for circuit breaker patterns
+
 Input (stdin): JSON with session_id, transcript_path, reason
 Output: None (cannot block session end)
+
+Attribution:
+    Status block format inspired by https://github.com/frankbria/ralph-claude-code
 """
 
 import sys
@@ -24,6 +32,40 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def extract_status_block(content: str) -> dict:
+    """Extract ---RALPH_STATUS--- block if present.
+
+    Format:
+    ---RALPH_STATUS---
+    STATUS: IN_PROGRESS | COMPLETE | BLOCKED
+    WORK_TYPE: IMPLEMENTATION | TESTING | DOCUMENTATION
+    EXIT_SIGNAL: true | false
+    ---END_RALPH_STATUS---
+    """
+    import re
+    match = re.search(
+        r'---RALPH_STATUS---\n(.+?)\n---END_RALPH_STATUS---',
+        content, re.DOTALL
+    )
+    if not match:
+        return {}
+
+    status = {}
+    for line in match.group(1).strip().split('\n'):
+        if ':' in line:
+            key, val = line.split(':', 1)
+            key = key.strip().lower().replace(' ', '_')
+            val = val.strip()
+            # Convert boolean strings
+            if val.lower() in ('true', 'false'):
+                val = val.lower() == 'true'
+            # Convert numeric strings
+            elif val.isdigit():
+                val = int(val)
+            status[key] = val
+    return status
+
+
 def get_project_root() -> Path:
     """Dynamically determine project root (works for any installation)."""
     # This file is at: <project_root>/src/runtime/hooks/session_end_hook.py
@@ -31,7 +73,7 @@ def get_project_root() -> Path:
 
 
 def store_session_narrative(state, session_id: str, reason: str) -> bool:
-    """Store session narrative to CSR."""
+    """Store session narrative to CSR with rich metadata."""
     try:
         # Import CSR standalone client (dynamic path for any installation)
         project_root = get_project_root()
@@ -49,7 +91,15 @@ def store_session_narrative(state, session_id: str, reason: str) -> bool:
         else:
             outcome = "INCOMPLETE"
 
-        # Generate narrative
+        # Get enhanced fields if available (new RalphState fields)
+        work_type = getattr(state, 'work_type', '') or 'UNKNOWN'
+        exit_confidence = getattr(state, 'exit_confidence', 0)
+        error_signatures = getattr(state, 'error_signatures', {})
+        # Handle output_declining as either method or boolean safely
+        output_declining_attr = getattr(state, 'output_declining', None)
+        output_declining = output_declining_attr() if callable(output_declining_attr) else False
+
+        # Generate narrative with enhanced metadata
         narrative = f"""# Ralph Session Complete
 
 ## Metadata
@@ -57,6 +107,9 @@ def store_session_narrative(state, session_id: str, reason: str) -> bool:
 - End Reason: {reason}
 - Timestamp: {datetime.now().isoformat()}
 - Total Iterations: {state.iteration}
+- Work Type: {work_type}
+- Exit Confidence: {exit_confidence}%
+- Output Trend: {"DECLINING" if output_declining else "STABLE"}
 
 ## Task
 {state.task}
@@ -77,6 +130,9 @@ Promise Met: {state.completion_promise_met}
 ## Blocking Errors Encountered
 {chr(10).join(f'- {e}' for e in state.blocking_errors) or '- (none recorded)'}
 
+## Error Signatures (Deduplicated)
+{chr(10).join(f'- `{sig}` (x{count})' for sig, count in error_signatures.items()) or '- (none)'}
+
 ## Key Learnings
 {chr(10).join(f'- {l}' for l in state.learnings) or '- (none recorded)'}
 
@@ -89,22 +145,41 @@ Promise Met: {state.completion_promise_met}
             "ralph_session",
             f"session_{state.session_id}",
             f"outcome_{outcome.lower()}",
-            f"iterations_{state.iteration}"
+            f"iterations_{state.iteration}",
+            f"work_type_{work_type.lower()}"
         ]
 
+        # Rich metadata for better search filtering
+        metadata = {
+            "outcome": outcome,
+            "iterations": state.iteration,
+            "work_type": work_type,
+            "exit_confidence": exit_confidence,
+            "output_declining": output_declining,
+            "error_signatures": list(error_signatures.keys()),
+            "failed_approaches": state.failed_approaches,
+            "successful_strategies": state.successful_strategies,
+            "learnings": state.learnings,
+            "files_modified": state.files_modified,
+        }
+
+        # Note: CSR store_reflection may not support metadata yet,
+        # but we include the rich info in the narrative for searchability
         client.store_reflection(content=narrative, tags=tags)
 
-        logger.info(f"Stored session narrative: {outcome}, {state.iteration} iterations")
+        logger.info(f"Stored session narrative: {outcome}, {state.iteration} iterations, confidence={exit_confidence}%")
 
         # If successful, also store the winning strategy separately
         if outcome == "COMPLETED" and state.successful_strategies:
             success_summary = f"""Successful Ralph approach for '{state.task[:100]}':
 Approach: {state.current_approach}
 Key strategies: {', '.join(state.successful_strategies[:5])}
+Exit confidence: {exit_confidence}%
+Iterations: {state.iteration}
 """
             client.store_reflection(
                 content=success_summary,
-                tags=["ralph_success", "winning_strategy"]
+                tags=["ralph_success", "winning_strategy", f"work_type_{work_type.lower()}"]
             )
 
         return True

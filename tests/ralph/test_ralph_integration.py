@@ -156,6 +156,144 @@ Wiggum task.
         assert state.iteration == 7
         assert "Wiggum" in state.task
 
+    def test_is_ralph_session_respects_active_false(self, tmp_path, monkeypatch):
+        """Test that is_ralph_session returns False when active: false."""
+        monkeypatch.chdir(tmp_path)
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / "ralph-loop.local.md").write_text("""---
+active: false
+iteration: 10
+max_iterations: 50
+completion_promise: "DONE"
+started_at: "2026-01-04T12:00:00Z"
+---
+
+Completed task.
+""")
+
+        # Should return False because active: false
+        assert not is_ralph_session()
+
+    def test_error_signature_deduplication(self):
+        """Test that similar errors are deduplicated by signature."""
+        state = RalphState.create_new("Test task", "Done")
+
+        # Add same error with different line numbers
+        state.add_error("Error at line 42: ImportError: module not found")
+        state.add_error("Error at line 100: ImportError: module not found")
+        state.add_error("Error at line 200: ImportError: module not found")
+
+        # Should only have 1 unique error (line numbers normalized)
+        assert len(state.blocking_errors) == 1
+        # But signature count should be 3
+        assert sum(state.error_signatures.values()) == 3
+
+    def test_error_signature_with_paths(self):
+        """Test that paths are normalized in error signatures."""
+        state = RalphState.create_new("Test task", "Done")
+
+        state.add_error("Failed at /Users/alice/project/src/main.py: TypeError")
+        state.add_error("Failed at /Users/bob/different/path/main.py: TypeError")
+
+        # Should deduplicate because paths are normalized
+        assert len(state.blocking_errors) == 1
+
+    def test_output_tracking(self):
+        """Test output length tracking."""
+        state = RalphState.create_new("Test task", "Done")
+
+        # Track some outputs
+        state.track_output(1000)
+        state.track_output(1200)
+        state.track_output(1100)
+
+        assert len(state.output_lengths) == 3
+        assert state.output_lengths[-1] == 1100
+
+    def test_output_tracking_limits_to_10(self):
+        """Test that output tracking keeps only last 10 entries."""
+        state = RalphState.create_new("Test task", "Done")
+
+        # Track 15 outputs
+        for i in range(15):
+            state.track_output(i * 100)
+
+        assert len(state.output_lengths) == 10
+        assert state.output_lengths[0] == 500  # First kept is 6th entry
+
+    def test_output_declining_detection(self):
+        """Test output decline detection (circuit breaker pattern)."""
+        state = RalphState.create_new("Test task", "Done")
+
+        # Normal output - not declining
+        state.output_lengths = [1000, 1100, 1050, 900, 950]
+        assert not state.output_declining()
+
+        # Declining output - recent much smaller than earlier
+        state.output_lengths = [1000, 1100, 1050, 200, 150, 100]
+        assert state.output_declining()
+
+    def test_output_declining_needs_minimum_data(self):
+        """Test that decline detection requires minimum data points."""
+        state = RalphState.create_new("Test task", "Done")
+
+        state.output_lengths = [100, 50]  # Only 2 points
+        assert not state.output_declining()  # Not enough data
+
+    def test_confidence_scoring(self):
+        """Test confidence-based exit scoring."""
+        state = RalphState.create_new("Test task", "Done")
+
+        # No signals - 0 confidence
+        state.update_confidence({})
+        assert state.exit_confidence == 0
+
+        # All tasks complete - 40 points
+        state.update_confidence({'all_tasks_complete': True})
+        assert state.exit_confidence == 40
+
+        # Multiple signals
+        state.update_confidence({
+            'all_tasks_complete': True,
+            'tests_passing': True,
+            'no_errors': True,
+            'done_keyword': True
+        })
+        assert state.exit_confidence == 90  # 40 + 20 + 20 + 10
+
+    def test_confidence_capped_at_100(self):
+        """Test that confidence is capped at 100."""
+        state = RalphState.create_new("Test task", "Done")
+
+        state.update_confidence({
+            'all_tasks_complete': True,
+            'tests_passing': True,
+            'no_errors': True,
+            'done_keyword': True,
+            'consecutive_test_only': 5  # +10 more
+        })
+        assert state.exit_confidence == 100  # Capped
+
+    def test_state_roundtrip_with_new_fields(self, tmp_path):
+        """Test saving and loading state with new enhanced fields."""
+        state_file = tmp_path / ".ralph_state.md"
+
+        original = RalphState.create_new("Enhanced roundtrip test", "Complete")
+        original.work_type = "IMPLEMENTATION"
+        original.exit_confidence = 75
+        original.output_lengths = [1000, 950, 900]
+        original.error_signatures = {"ImportError: /.../ line N": 3}
+
+        save_state(original, state_file)
+        loaded = load_state(state_file)
+
+        assert loaded.work_type == "IMPLEMENTATION"
+        assert loaded.exit_confidence == 75
+        assert 900 in loaded.output_lengths
+        assert "ImportError" in str(loaded.error_signatures)
+
 
 class TestSessionStartHook:
     """Test SessionStart hook functionality."""

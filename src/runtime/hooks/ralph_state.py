@@ -6,6 +6,18 @@ This module provides:
 1. State file schema definition
 2. Parsing utilities to read/write state
 3. Validation for state integrity
+
+Enhanced Features (v7.1+):
+- Output decline detection (circuit breaker pattern)
+- Error signature deduplication
+- Confidence-based exit signals
+- Work type tracking (IMPLEMENTATION/TESTING/DEBUGGING)
+
+Attribution:
+    Several patterns in this module were inspired by the excellent work in
+    https://github.com/frankbria/ralph-claude-code - a community implementation
+    of autonomous AI development loops. We gratefully acknowledge their
+    contributions to the Ralph loop ecosystem.
 """
 
 import re
@@ -46,8 +58,78 @@ class RalphState:
     completion_promise: str = ""
     completion_promise_met: bool = False
 
+    # Output tracking for decline detection (circuit breaker pattern)
+    output_lengths: List[int] = field(default_factory=list)
+
+    # Confidence-based exit scoring (0-100)
+    exit_confidence: int = 0
+
+    # Work type tracking for filtering
+    work_type: str = ""  # IMPLEMENTATION, TESTING, DEBUGGING, DOCUMENTATION
+
+    # Deduplicated error signatures for anti-pattern detection
+    error_signatures: Dict[str, int] = field(default_factory=dict)  # sig -> count
+
+    def _error_signature(self, error: str) -> str:
+        """Extract error signature for deduplication (removes line numbers, paths)."""
+        sig = re.sub(r'line \d+', 'line N', error)
+        sig = re.sub(r'/[\w/.-]+/', '/.../', sig)
+        sig = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}', 'TIMESTAMP', sig)
+        return sig[:100]
+
+    def add_error(self, error: str) -> None:
+        """Add error with deduplication by signature."""
+        sig = self._error_signature(error)
+        prev_count = self.error_signatures.get(sig, 0)
+        self.error_signatures[sig] = prev_count + 1
+        # Only add to blocking_errors if this is a new signature (O(1) vs O(n²))
+        if prev_count == 0:
+            self.blocking_errors.append(error)
+
+    def track_output(self, length: int) -> None:
+        """Track output length for decline detection."""
+        self.output_lengths.append(length)
+        if len(self.output_lengths) > 10:
+            self.output_lengths = self.output_lengths[-10:]
+
+    def output_declining(self, threshold: float = 0.7) -> bool:
+        """Check if output is declining (circuit breaker signal)."""
+        if len(self.output_lengths) < 3:
+            return False
+        recent = self.output_lengths[-3:]
+        avg_recent = sum(recent) / len(recent)
+        earlier = self.output_lengths[:-3]
+        if not earlier:
+            return False
+        avg_earlier = sum(earlier) / len(earlier)
+        return avg_recent < (avg_earlier * threshold)
+
+    def update_confidence(self, signals: dict) -> None:
+        """Update exit confidence based on multiple signals."""
+        score = 0
+        if signals.get('all_tasks_complete'):
+            score += 40
+        if signals.get('tests_passing'):
+            score += 20
+        if signals.get('no_errors'):
+            score += 20
+        if signals.get('done_keyword'):
+            score += 10
+        if signals.get('consecutive_test_only', 0) >= 3:
+            score += 10
+        self.exit_confidence = min(100, score)
+
     def to_markdown(self) -> str:
         """Convert state to markdown format for .ralph_state.md"""
+        # Format error signatures for display
+        error_sig_display = ""
+        if self.error_signatures:
+            error_sig_display = "\n".join(
+                f"- `{sig}` (x{count})" for sig, count in self.error_signatures.items()
+            )
+        else:
+            error_sig_display = "- (none yet)"
+
         return f"""# Ralph Session State
 
 ## Metadata
@@ -56,6 +138,8 @@ class RalphState:
 - **Iteration:** {self.iteration}
 - **Started:** {self.started_at}
 - **Updated:** {self.updated_at}
+- **Work Type:** {self.work_type or 'UNKNOWN'}
+- **Exit Confidence:** {self.exit_confidence}%
 
 ## Current Approach
 {self.current_approach}
@@ -70,6 +154,9 @@ Met: {self.completion_promise_met}
 ## Blocking Errors
 {self._list_to_md(self.blocking_errors)}
 
+## Error Signatures (Deduplicated)
+{error_sig_display}
+
 ## Successful Strategies
 {self._list_to_md(self.successful_strategies)}
 
@@ -78,6 +165,10 @@ Met: {self.completion_promise_met}
 
 ## Learnings
 {self._list_to_md(self.learnings)}
+
+## Output Tracking
+- Recent lengths: {self.output_lengths[-5:] if self.output_lengths else []}
+- Declining: {self.output_declining()}
 
 ## Next Action
 {self.next_action}
@@ -119,6 +210,12 @@ Met: {self.completion_promise_met}
         if match := re.search(r'\*\*Updated:\*\*\s*(.+)', content):
             state.updated_at = match.group(1).strip()
 
+        # NEW: Parse work type and exit confidence
+        if match := re.search(r'\*\*Work Type:\*\*\s*(.+)', content):
+            state.work_type = match.group(1).strip()
+        if match := re.search(r'\*\*Exit Confidence:\*\*\s*(\d+)', content):
+            state.exit_confidence = int(match.group(1))
+
         # Parse completion promise
         if match := re.search(r'## Completion Promise\n`(.+)`', content):
             state.completion_promise = match.group(1)
@@ -140,7 +237,32 @@ Met: {self.completion_promise_met}
         state.files_modified = cls._parse_list_section(content, "Files Modified")
         state.learnings = cls._parse_list_section(content, "Learnings")
 
+        # NEW: Parse error signatures
+        state.error_signatures = cls._parse_error_signatures(content)
+
+        # NEW: Parse output lengths
+        if match := re.search(r'Recent lengths:\s*\[([^\]]*)\]', content):
+            try:
+                lengths_str = match.group(1).strip()
+                if lengths_str:
+                    state.output_lengths = [int(x.strip()) for x in lengths_str.split(',') if x.strip()]
+            except ValueError:
+                pass
+
         return state
+
+    @staticmethod
+    def _parse_error_signatures(content: str) -> Dict[str, int]:
+        """Parse error signatures section."""
+        signatures = {}
+        pattern = r'## Error Signatures[^\n]*\n((?:- .+\n?)+)'
+        if match := re.search(pattern, content):
+            for line in match.group(1).strip().split('\n'):
+                # Format: - `signature` (xN)
+                sig_match = re.search(r'- `(.+?)` \(x(\d+)\)', line)
+                if sig_match:
+                    signatures[sig_match.group(1)] = int(sig_match.group(2))
+        return signatures
 
     @staticmethod
     def _parse_list_section(content: str, section_name: str) -> List[str]:
