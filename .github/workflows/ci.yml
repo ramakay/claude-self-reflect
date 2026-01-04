@@ -275,26 +275,28 @@ jobs:
     - uses: actions/setup-node@v4
       with:
         node-version: '22.x'
-        # NOTE: Do NOT use registry-url here - it creates .npmrc with token placeholder
-        # which breaks OIDC trusted publishing
+        registry-url: 'https://registry.npmjs.org'
 
-    - name: Install npm 11.5+ for OIDC trusted publishing
+    - name: Install npm and configure OIDC
       run: |
         npm install -g npm@latest
         echo "Node version: $(node --version)"
         echo "npm version: $(npm --version)"
-        # Verify npm 11.5+
-        npm --version | grep -E '^1[1-9]\.' || { echo "ERROR: npm 11.5+ required for OIDC"; exit 1; }
 
-    - name: Configure npm for OIDC and publish
-      run: |
-        # Clean any existing .npmrc (no tokens needed with OIDC)
+        # Remove the .npmrc token placeholder created by setup-node
+        # This allows npm to use OIDC for authentication
         rm -f ~/.npmrc
-        # Configure registry
+
+        # Configure registry without auth token placeholder
+        # npm will automatically request OIDC token when publishing with --provenance
         npm config set registry https://registry.npmjs.org
-        # Publish with provenance - this ENABLES OIDC authentication + adds SLSA attestation
-        # See: https://docs.npmjs.com/generating-provenance-statements
-        npm publish --access public --provenance
+
+        # Debug: show npm config
+        echo "npm config:"
+        npm config list
+
+    - name: Publish with provenance (OIDC auth)
+      run: npm publish --access public --provenance
 
   create-github-release:
     needs: publish-npm
