@@ -29,5 +29,48 @@ timeout $IMPORT_TIMEOUT bash -c "
     echo "Quick import timed out after ${IMPORT_TIMEOUT}s" >&2
 }
 
+# ============================================================
+# RALPH MEMORY INTEGRATION (Added for Memory-Augmented Ralph)
+# ============================================================
+
+# If Ralph session, backup state to CSR before compaction
+# Check both ralph-wiggum format and custom format
+RALPH_STATE_FILE=""
+if [ -f ".claude/ralph-loop.local.md" ]; then
+    RALPH_STATE_FILE=".claude/ralph-loop.local.md"
+elif [ -f ".ralph_state.md" ]; then
+    RALPH_STATE_FILE=".ralph_state.md"
+fi
+
+if [ -n "$RALPH_STATE_FILE" ]; then
+    echo "📝 Backing up Ralph state to CSR..." >&2
+
+    RALPH_STATE_FILE="$RALPH_STATE_FILE" python3 << 'PYTHON' 2>/dev/null || echo "Warning: Could not backup Ralph state" >&2
+import sys
+sys.path.insert(0, '/Users/ramakrishnanannaswamy/projects/claude-self-reflect')
+
+from pathlib import Path
+from datetime import datetime
+
+try:
+    from mcp_server.src.standalone_client import CSRStandaloneClient
+
+    import os
+    ralph_state_file = os.environ.get('RALPH_STATE_FILE', '.ralph_state.md')
+    state_content = Path(ralph_state_file).read_text()
+    client = CSRStandaloneClient()
+
+    client.store_reflection(
+        content=f"Pre-compaction Ralph state backup ({datetime.now().isoformat()}):\n\n{state_content}",
+        tags=["ralph_state", "pre_compact_backup"]
+    )
+    print("✅ Ralph state backed up to CSR", file=sys.stderr)
+except ImportError:
+    print("CSR client not available, skipping backup", file=sys.stderr)
+except Exception as e:
+    print(f"Backup failed: {e}", file=sys.stderr)
+PYTHON
+fi
+
 # Always exit successfully to not block compacting
 exit 0
