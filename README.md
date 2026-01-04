@@ -41,6 +41,7 @@ Claude starts fresh every conversation. You've solved complex bugs, designed arc
 - [Real Examples](#real-examples)
 - [NEW: Real-time Indexing Status](#new-real-time-indexing-status-in-your-terminal)
 - [Key Features](#key-features)
+- [Ralph Loop Memory Integration](#ralph-loop-memory-integration)
 - [Code Quality Insights](#code-quality-insights)
 - [Architecture](#architecture)
 - [Requirements](#requirements)
@@ -321,6 +322,35 @@ Claude: [Searches ONLY MyApp conversations]
 You: "Search all projects for WebSocket implementations"
 Claude: [Searches across ALL your projects]
 ```
+
+</details>
+
+<details>
+<summary><b>Ralph Loop Memory Integration</b></summary>
+
+Use the [ralph-wiggum plugin](https://github.com/anthropics/claude-code-plugins/tree/main/ralph-wiggum) for long tasks? CSR automatically gives Ralph loops **cross-session memory**:
+
+- **Automatic backup** before context compaction
+- **Past session retrieval** when starting new Ralph loops
+- **Failed approach tracking** - never repeat the same mistakes
+- **Success pattern learning** - reuse what worked before
+
+**Setup (one-time):**
+```bash
+./scripts/ralph/install_hooks.sh        # Install CSR hooks
+./scripts/ralph/install_hooks.sh --check  # Verify installation
+```
+
+**How it works:**
+1. Start a Ralph loop: `/ralph-wiggum:ralph-loop "Build feature X"`
+2. Work naturally - state is tracked in `.claude/ralph-loop.local.md`
+3. When compaction occurs, state is backed up to CSR
+4. New sessions retrieve past learnings from CSR automatically
+
+**Files created:**
+- `.ralph_past_sessions.md` - Injected context from past sessions (auto-generated)
+
+[Full documentation →](docs/development/ralph-memory-integration.md)
 
 </details>
 
