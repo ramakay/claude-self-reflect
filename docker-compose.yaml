@@ -3,14 +3,15 @@ volumes:
 
 services:
   # Fix permissions for config directory (UID 1001 matches appuser in Dockerfiles)
+  # Now runs by default since batch services are always-on
   init-permissions:
     image: alpine
-    command: sh -c "chown -R 1001:1001 /config && chown -R 1001:1001 /batch_queue && chown -R 1001:1001 /batch_state"
+    command: sh -c "mkdir -p /config /batch_queue /batch_state && chown -R 1001:1001 /config && chown -R 1001:1001 /batch_queue && chown -R 1001:1001 /batch_state"
     volumes:
       - ${CONFIG_PATH:-${HOME}/.claude-self-reflect/config}:/config
       - ${CSR_BATCH_QUEUE_DIR:-${HOME}/.claude-self-reflect/batch_queue}:/batch_queue
       - ${CSR_BATCH_STATE_DIR:-${HOME}/.claude-self-reflect/batch_state}:/batch_state
-    profiles: ["watch", "import", "async", "safe-watch", "batch-automation"]
+    # No profiles = starts by default (required for batch services)
 
   # Qdrant vector database - the heart of semantic search
   qdrant:
@@ -44,6 +45,7 @@ services:
       - ${CONFIG_PATH:-${HOME}/.claude-self-reflect/config}:/config
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - HF_HUB_OFFLINE=1
       - STATE_FILE=/config/imported-files.json
       - LOGS_DIR=/logs
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
@@ -74,6 +76,7 @@ services:
       - /tmp:/tmp
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - HF_HUB_OFFLINE=1
       - STATE_FILE=/config/imported-files.json
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
@@ -103,6 +106,7 @@ services:
       - ${CONFIG_PATH:-${HOME}/.claude-self-reflect/config}:/config
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - HF_HUB_OFFLINE=1
       - STATE_FILE=/config/streaming-state.json  # FIXED: Use streaming-specific state file
       - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
       - VOYAGE_KEY=${VOYAGE_KEY:-}
@@ -142,6 +146,7 @@ services:
       - ${CONFIG_PATH:-${HOME}/.claude-self-reflect/config}:/config
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - HF_HUB_OFFLINE=1
       - STATE_FILE=/config/imported-files.json
       - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
       - VOYAGE_KEY=${VOYAGE_KEY:-}
@@ -177,6 +182,7 @@ services:
       - ${CONFIG_PATH:-${HOME}/.claude-self-reflect/config}:/config
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - HF_HUB_OFFLINE=1
       - STATE_FILE=/config/csr-watcher.json
       - LOGS_DIR=/logs  # Fixed: Point to mounted volume
       - VOYAGE_KEY=${VOYAGE_KEY:-}
@@ -212,6 +218,7 @@ services:
       - qdrant
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - HF_HUB_OFFLINE=1
       - VOYAGE_KEY=${VOYAGE_KEY:-}
       - PREFER_LOCAL_EMBEDDINGS=${PREFER_LOCAL_EMBEDDINGS:-true}
       - ENABLE_MEMORY_DECAY=${ENABLE_MEMORY_DECAY:-true}
@@ -224,8 +231,8 @@ services:
     profiles: ["mcp"]
 
   # Batch watcher - Queues conversations and triggers batch narrative generation
-  # OPTIONAL: Requires ANTHROPIC_API_KEY. Disabled by default.
-  # Enable via CLI during installation or: docker compose --profile batch-automation up -d
+  # Requires ANTHROPIC_API_KEY for AI-powered narratives (9.3x better search quality)
+  # Now starts by default if ANTHROPIC_API_KEY is set
   batch-watcher:
     build:
       context: .
@@ -241,6 +248,7 @@ services:
       - ${CSR_BATCH_STATE_DIR:-${HOME}/.claude-self-reflect/batch_state}:/home/appuser/.claude-self-reflect/batch_state
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - HF_HUB_OFFLINE=1
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - CSR_HOME=/home/appuser/.claude-self-reflect
@@ -257,11 +265,11 @@ services:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
     restart: unless-stopped
-    profiles: ["batch-automation"]
+    # profiles: ["batch-automation"]  # REMOVED - now starts by default
     mem_limit: 2g
     memswap_limit: 2g
     healthcheck:
-      test: ["CMD-SHELL", "ps aux | grep -q '[p]ython.*batch_watcher' || exit 1"]
+      test: ["CMD-SHELL", "kill -0 1 2>/dev/null || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -274,7 +282,7 @@ services:
         labels: "service=batch-watcher"
 
   # Batch monitor - Monitors batch API jobs and triggers evaluations
-  # OPTIONAL: Requires ANTHROPIC_API_KEY. Disabled by default.
+  # Requires ANTHROPIC_API_KEY. Now starts by default.
   batch-monitor:
     build:
       context: .
@@ -287,6 +295,7 @@ services:
       - ${CSR_BATCH_STATE_DIR:-${HOME}/.claude-self-reflect/batch_state}:/home/appuser/.claude-self-reflect/batch_state
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - HF_HUB_OFFLINE=1
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - CSR_HOME=/home/appuser/.claude-self-reflect
@@ -295,11 +304,11 @@ services:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
     restart: unless-stopped
-    profiles: ["batch-automation"]
+    # profiles: ["batch-automation"]  # REMOVED - now starts by default
     mem_limit: 512m
     memswap_limit: 512m
     healthcheck:
-      test: ["CMD-SHELL", "ps aux | grep -q '[p]ython.*batch_monitor' || exit 1"]
+      test: ["CMD-SHELL", "kill -0 1 2>/dev/null || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

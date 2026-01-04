@@ -165,6 +165,101 @@ When users ask about "narratives", "v7.0 feature", "batch automation", or "searc
 - ✅ 9.3x improvement is real (measured via evaluation dataset)
 - ✅ Privacy: Conversations sent to Anthropic (user must consent)
 
+## 🧪 Session Health Check (Automatic)
+
+### Quick Evaluation at Session Start
+
+If enabled, claude-self-reflect runs a lightweight health check on startup to ensure MCP tools, search quality, and performance are functioning correctly.
+
+**Enable in .env**:
+```bash
+EVAL_ON_STARTUP=true
+```
+
+**What It Checks** (5 tests, <30s):
+- ✅ Qdrant connectivity
+- ✅ Search accuracy (single quick query)
+- ✅ Performance target (<500ms searches)
+- ✅ Token efficiency (brief mode)
+- ✅ Tool availability (all MCP tools)
+
+**Startup Banner Example**:
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🧪 Claude Self-Reflect Health Check
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Qdrant Connection      (12ms)
+✅ Search Accuracy         (245ms, score: 0.68)
+✅ Performance Target      (avg: 234ms, p95: 450ms)
+✅ Token Efficiency        (52% reduction in brief mode)
+✅ Tool Availability       (15/15 tools responding)
+
+📊 Overall: HEALTHY (5/5 passed)
+⏱️  Total time: 1.2s
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### Manual Evaluation Commands
+
+**Quick check** (5 tests, <30s):
+```bash
+python scripts/evaluation/session_start_eval.py --quick
+```
+
+**Full evaluation** (20 tests, ~2 minutes):
+```bash
+python scripts/evaluation/session_start_eval.py
+```
+
+**JSON output** (for scripting):
+```bash
+python scripts/evaluation/session_start_eval.py --quick --json
+```
+
+### Evaluation Task Categories
+
+The system tests 20 real-world scenarios across 6 categories:
+- **Semantic search** (5 tasks) - Find relevant conversations accurately
+- **Temporal search** (3 tasks) - Time-constrained queries ("last week")
+- **File-based search** (3 tasks) - Track file modifications
+- **Concept search** (3 tasks) - Theme-based discovery
+- **Tool selection** (3 tasks) - Use correct tool for each task
+- **Token efficiency** (3 tasks) - Brief mode effectiveness
+
+### Troubleshooting
+
+**"Qdrant Connection Failed"**:
+```bash
+docker ps | grep qdrant  # Is Qdrant running?
+docker compose up -d qdrant
+```
+
+**"Search Accuracy Below Threshold"**:
+- Check if collections exist: `python mcp-server/src/status.py`
+- Verify embeddings are current
+- Run full import if needed
+
+**"Performance Degraded"**:
+- Check Qdrant resource usage: `docker stats qdrant`
+- Clear old collections if disk full
+- Consider increasing Docker memory limits
+
+### Configuration Options
+
+Add to `.env`:
+```bash
+# Evaluation Settings
+EVAL_ON_STARTUP=false           # Enable session-start evals (opt-in)
+EVAL_TIMEOUT_SECONDS=30         # Max time for eval run
+EVAL_PERFORMANCE_TARGET_MS=500  # Target latency for searches
+```
+
+**Files**:
+- Golden query corpus: `scripts/evaluation/evaluation_tasks.json`
+- Session-start script: `scripts/evaluation/session_start_eval.py`
+- Full evaluator: `scripts/evaluation/run_evaluation.py`
+- Ground truth generator: `docs/design/batch_ground_truth_generator.py`
+
 ## ⚠️ Critical Rules
 
 1. **PATH RULE**: Always use `/Users/username/...` never `~/...` in MCP commands
@@ -268,6 +363,107 @@ Say these to auto-activate specialized agents:
 - "performance issues" → performance-tuner
 - "test installations" → reflect-tester
 - "release management" → open-source-maintainer
+
+## 🔄 Ralph Loop Memory Integration
+
+### What It Is
+The Ralph Wiggum technique helps Claude maintain context across long coding sessions through structured markdown files. With CSR integration, Ralph loops gain **cross-session memory**—state is preserved across context compactions and retrievable in future sessions.
+
+### Key Benefits
+- 🧠 **Cross-session memory**: Retrieve insights from past Ralph sessions
+- 💾 **Pre-compaction backup**: State automatically saved to CSR before context compaction
+- 🔍 **Pattern retrieval**: Search for similar past challenges and solutions
+- 📊 **Session narratives**: Complete session summaries stored for future reference
+
+### How It Works
+
+1. **SessionStart Hook**: When a new Ralph session begins, CSR is searched for:
+   - Past sessions with similar tasks
+   - Failed approaches (to avoid repeating mistakes)
+   - Successful patterns (to reuse)
+
+2. **PreCompact Hook**: Before context compaction destroys the session:
+   - Current Ralph state is backed up to CSR
+   - Iteration count, learnings, and approaches are preserved
+
+3. **SessionEnd Hook**: When session completes:
+   - Full narrative is stored to CSR
+   - Tagged for future searchability
+
+### Installation
+
+```bash
+# Install Ralph hooks (also prompted during setup)
+./scripts/ralph/install_hooks.sh
+
+# Verify installation
+./scripts/ralph/install_hooks.sh --check
+
+# Remove hooks
+./scripts/ralph/install_hooks.sh --remove
+```
+
+### Usage
+
+```bash
+# Start a Ralph loop (plugin handles state file creation)
+/ralph-wiggum:ralph-loop
+
+# CSR integration is automatic:
+# - Past insights injected at session start
+# - State backed up before compaction
+# - Narrative stored at session end
+```
+
+### Files
+
+| What | Where | Purpose |
+|------|-------|---------|
+| Ralph state (plugin) | `.claude/ralph-loop.local.md` | ralph-wiggum plugin state |
+| Ralph state (custom) | `.ralph_state.md` | Custom state file |
+| State module | `src/runtime/hooks/ralph_state.py` | State parsing & management |
+| SessionStart hook | `src/runtime/hooks/session_start_hook.py` | Search CSR for past sessions |
+| SessionEnd hook | `src/runtime/hooks/session_end_hook.py` | Store session narrative |
+| PreCompact hook | `src/runtime/precompact-hook.sh` | Backup state before compaction |
+| Standalone client | `mcp-server/src/standalone_client.py` | CSR client for hooks |
+| Tests | `tests/ralph/test_ralph_integration.py` | Integration tests |
+
+### Troubleshooting
+
+**"Hooks not triggering"**:
+```bash
+# Verify hooks are installed
+./scripts/ralph/install_hooks.sh --check
+
+# Check settings.json for hook configuration
+cat ~/.claude/settings.json | grep -A5 ralph
+```
+
+**"CSR connection failed in hooks"**:
+```bash
+# Verify Qdrant is running
+docker ps | grep qdrant
+
+# Test standalone client
+python -c "from mcp_server.src.standalone_client import CSRStandaloneClient; c = CSRStandaloneClient(); print(c.test_connection())"
+```
+
+**"State not being backed up"**:
+```bash
+# Check if ralph state file exists
+ls -la .claude/ralph-loop.local.md .ralph_state.md 2>/dev/null
+
+# Test precompact hook manually
+./src/runtime/precompact-hook.sh
+```
+
+### Agent Reference
+When users ask about "Ralph loop", "memory-augmented Ralph", or "cross-session context":
+- ✅ Feature requires hook installation (`./scripts/ralph/install_hooks.sh`)
+- ✅ Works with ralph-wiggum plugin (`.claude/ralph-loop.local.md`)
+- ✅ Also works with custom state files (`.ralph_state.md`)
+- ✅ Automatic backup before context compaction
+- ✅ Past session search at new session start
 
 ## 🔧 Quality Automation
 

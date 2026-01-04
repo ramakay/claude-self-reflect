@@ -206,8 +206,19 @@ Now generate the narrative following SKILL_V2 format exactly, using ALL the cont
 
 def discover_projects():
     """Find all Claude Code projects with JSONL files."""
+    import os
 
-    projects_dir = Path.home() / ".claude/projects"
+    # Support Docker environment (CLAUDE_PROJECTS_DIR=/logs) and local
+    projects_dir_env = os.environ.get("CLAUDE_PROJECTS_DIR")
+    if projects_dir_env:
+        projects_dir = Path(projects_dir_env)
+    elif Path("/logs").exists():
+        # Docker fallback
+        projects_dir = Path("/logs")
+    else:
+        # Local environment
+        projects_dir = Path.home() / ".claude/projects"
+
     projects = {}
 
     for project_dir in projects_dir.iterdir():

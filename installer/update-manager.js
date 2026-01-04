@@ -94,6 +94,48 @@ class UpdateManager {
         }
     }
 
+    async checkRalphHooks() {
+        // Check if Ralph hooks are installed in ~/.claude/settings.json
+        const claudeSettings = path.join(this.homeDir, '.claude', 'settings.json');
+
+        try {
+            if (!fs.existsSync(claudeSettings)) {
+                return {
+                    installed: false,
+                    name: 'Ralph Memory Hooks',
+                    critical: false,  // Optional feature
+                    fix: () => this.installRalphHooks()
+                };
+            }
+
+            const settings = JSON.parse(fs.readFileSync(claudeSettings, 'utf8'));
+
+            // Check for Ralph hooks in SessionStart or SessionEnd
+            const hasRalphHooks = settings.hooks &&
+                (
+                    (settings.hooks.SessionStart &&
+                     JSON.stringify(settings.hooks.SessionStart).includes('ralph')) ||
+                    (settings.hooks.SessionEnd &&
+                     JSON.stringify(settings.hooks.SessionEnd).includes('ralph'))
+                );
+
+            return {
+                installed: hasRalphHooks,
+                name: 'Ralph Memory Hooks',
+                critical: false,  // Optional feature
+                fix: hasRalphHooks ? null : () => this.installRalphHooks()
+            };
+        } catch (error) {
+            return {
+                installed: false,
+                name: 'Ralph Memory Hooks',
+                critical: false,
+                fix: () => this.installRalphHooks(),
+                error: `Could not check Ralph hooks: ${error.message}`
+            };
+        }
+    }
+
     async checkDocker() {
         try {
             execSync('docker info', { stdio: 'ignore' });
@@ -265,6 +307,48 @@ class UpdateManager {
         }
     }
 
+    async installRalphHooks() {
+        this.log('Installing Ralph Memory Hooks...', 'info');
+
+        // Check if Python 3 is available
+        try {
+            execSync('python3 --version', { stdio: 'ignore' });
+        } catch {
+            this.log('Python 3 is required for Ralph hooks', 'error');
+            this.log('Install Python 3.8+ and run: ./scripts/ralph/install_hooks.sh', 'info');
+            return false;
+        }
+
+        const installScript = path.join(this.packageRoot, 'scripts', 'ralph', 'install_hooks.sh');
+
+        if (!fs.existsSync(installScript)) {
+            this.log(`Ralph hooks script not found: ${installScript}`, 'error');
+            return false;
+        }
+
+        try {
+            // Make sure the script is executable
+            fs.chmodSync(installScript, 0o755);
+
+            execSync(`bash "${installScript}"`, {
+                cwd: this.packageRoot,
+                stdio: 'inherit'
+            });
+
+            this.log('Ralph Memory Hooks installed successfully!', 'success');
+            this.log('', 'info');
+            this.log('To use Ralph loops with memory:', 'info');
+            this.log('  1. Install plugin: /plugin install ralph-wiggum@anthropics', 'info');
+            this.log('  2. Start a loop: /ralph-wiggum:ralph-loop "Your task"', 'info');
+            this.log('  3. Session state will be automatically backed up to CSR', 'info');
+            return true;
+        } catch (error) {
+            this.log(`Failed to install Ralph hooks: ${error.message}`, 'error');
+            this.log('You can install manually: ./scripts/ralph/install_hooks.sh', 'info');
+            return false;
+        }
+    }
+
     async startQdrant() {
         this.log('Starting Qdrant...', 'info');
 
@@ -313,7 +397,8 @@ class UpdateManager {
             { name: 'Docker Config', fn: () => this.checkDockerComposeConfig() },
             { name: 'cc-statusline', fn: () => this.checkCCStatusline() },
             { name: 'csr-status', fn: () => this.checkCSRStatusScript() },
-            { name: 'AST-Grep', fn: () => this.checkASTGrep() }
+            { name: 'AST-Grep', fn: () => this.checkASTGrep() },
+            { name: 'Ralph Hooks', fn: () => this.checkRalphHooks() }
         ];
 
         const settledResults = await Promise.allSettled(checks.map(c => c.fn()));
@@ -391,6 +476,8 @@ class UpdateManager {
                             recheckResult = await this.checkCSRStatusScript();
                         } else if (recheckName.includes('ast-grep')) {
                             recheckResult = await this.checkASTGrep();
+                        } else if (recheckName.includes('ralph')) {
+                            recheckResult = await this.checkRalphHooks();
                         }
 
                         // Guard against undefined recheckResult (no matching verifier)

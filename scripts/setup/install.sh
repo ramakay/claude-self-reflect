@@ -204,6 +204,45 @@ else
 fi
 echo ""
 
+# =============================================================================
+# Ralph Loop Memory Integration (Optional)
+# =============================================================================
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🔄 Ralph Loop Memory Integration (Optional)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "The Ralph Wiggum technique helps Claude maintain context across long sessions."
+echo "With CSR integration, Ralph loops gain cross-session memory:"
+echo "  • Automatic state backup before context compaction"
+echo "  • Session narrative storage for future reference"
+echo "  • Pattern retrieval from past Ralph sessions"
+echo ""
+read -p "Would you like to install Ralph Loop hooks? (y/n) " -n 1 -r
+echo ""
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    print_info "Installing Ralph Loop hooks..."
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+    if [ -f "$PROJECT_ROOT/scripts/ralph/install_hooks.sh" ]; then
+        "$PROJECT_ROOT/scripts/ralph/install_hooks.sh"
+        print_success "Ralph Loop hooks installed!"
+        echo ""
+        echo "📋 Ralph Loop Usage:"
+        echo "1. Start a Ralph loop: /ralph-wiggum:ralph-loop"
+        echo "2. CSR automatically backs up state before compaction"
+        echo "3. New sessions retrieve past insights automatically"
+        echo ""
+    else
+        print_warning "Ralph hook installer not found. Skipping..."
+    fi
+else
+    print_info "Skipping Ralph Loop integration"
+    print_info "You can install later with: ./scripts/ralph/install_hooks.sh"
+fi
+echo ""
+
 # Print success message and next steps
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 print_success "Installation complete! 🎉"

@@ -680,28 +680,106 @@ async function startWatcher() {
   }
 }
 
+async function setupRalphHooks() {
+  console.log('\n🐻 Ralph Loop Memory Integration (NEW!)...');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('The Ralph Wiggum technique helps Claude maintain context across long sessions.');
+  console.log('With CSR integration, Ralph loops gain cross-session memory!');
+  console.log('');
+  console.log('📊 Benefits:');
+  console.log('   • Session state preserved across context compactions');
+  console.log('   • Past learnings automatically injected into new sessions');
+  console.log('   • Failed approaches remembered to avoid repeating mistakes');
+  console.log('   • Works with the ralph-wiggum Claude Code plugin');
+  console.log('');
+  console.log('📝 How It Works:');
+  console.log('   • SessionStart hook: Searches CSR for past Ralph sessions');
+  console.log('   • PreCompact hook: Backs up state before context is lost');
+  console.log('   • SessionEnd hook: Stores session narrative for future reference');
+  console.log('');
+  console.log('⚙️  Requirements:');
+  console.log('   • ralph-wiggum plugin (Claude Code plugin)');
+  console.log('   • Python 3.8+ (for hooks)');
+  console.log('');
+
+  const enableChoice = await question('Enable Ralph Loop memory integration? (y/n) [recommended]: ');
+
+  if (enableChoice.toLowerCase() === 'y') {
+    console.log('\n📦 Installing Ralph hooks...');
+
+    try {
+      // Check if Python 3 is available
+      try {
+        safeExec('python3', ['--version'], { stdio: 'pipe' });
+      } catch {
+        console.log('\n⚠️  Python 3 not found');
+        console.log('   Ralph hooks require Python 3.8+');
+        console.log('   Install Python and run: ./scripts/ralph/install_hooks.sh');
+        return;
+      }
+
+      // Run the hook installation script
+      const installScript = join(projectRoot, 'scripts', 'ralph', 'install_hooks.sh');
+
+      // Make sure the script is executable
+      try {
+        await fs.chmod(installScript, 0o755);
+      } catch {
+        // Ignore if already executable
+      }
+
+      safeExec('bash', [installScript], {
+        cwd: projectRoot,
+        stdio: 'inherit'
+      });
+
+      console.log('\n✅ Ralph hooks installed successfully!');
+      console.log('');
+      console.log('📋 To use Ralph loops with memory:');
+      console.log('   1. Install ralph-wiggum plugin in Claude Code:');
+      console.log('      /plugin install ralph-wiggum@anthropics');
+      console.log('   2. Start a loop: /ralph-wiggum:ralph-loop "Your task"');
+      console.log('   3. Session state will be automatically backed up to CSR');
+      console.log('');
+      console.log('📊 Verify hook installation:');
+      console.log('   ./scripts/ralph/install_hooks.sh --check');
+
+    } catch (error) {
+      console.log('\n⚠️  Could not install Ralph hooks automatically');
+      console.log(`   Error: ${error.message}`);
+      console.log('   You can install manually: ./scripts/ralph/install_hooks.sh');
+    }
+
+  } else {
+    console.log('\n📝 Skipping Ralph hooks installation.');
+    console.log('   You can install later: ./scripts/ralph/install_hooks.sh');
+    console.log('   Docs: https://github.com/ramakay/claude-self-reflect/blob/main/docs/development/ralph-memory-integration.md');
+  }
+}
+
 async function showFinalInstructions() {
   console.log('\n✅ Setup complete!');
-  
+
   console.log('\n🎯 Your Claude Self-Reflect System:');
   console.log('   • 🌐 Qdrant Dashboard: http://localhost:6333/dashboard/');
   console.log('   • 📊 Status: All services running');
   console.log('   • 🔍 Search: Semantic search with memory decay enabled');
   console.log('   • 🚀 Watcher: HOT/WARM/COLD prioritization active');
-  
+
   console.log('\n📋 Quick Reference Commands:');
   console.log('   • Check status: docker compose ps');
   console.log('   • View logs: docker compose logs -f');
   console.log('   • Import conversations: docker compose run --rm importer');
   console.log('   • Enrich metadata: docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.py');
   console.log('   • Start watcher: docker compose --profile watch up -d');
+  console.log('   • Ralph hooks: ./scripts/ralph/install_hooks.sh --check');
   console.log('   • Stop all: docker compose down');
-  
+
   console.log('\n🎯 Next Steps:');
   console.log('1. Restart Claude Code');
   console.log('2. Look for "claude-self-reflect" in the MCP tools');
   console.log('3. Try: "Search my past conversations about Python"');
-  
+
   console.log('\n📚 Documentation: https://github.com/ramakay/claude-self-reflect');
 }
 
@@ -787,7 +865,7 @@ async function main() {
   
   // Configure Claude
   await configureClaude();
-  
+
   // Import conversations
   await importConversations();
 
@@ -797,9 +875,12 @@ async function main() {
   // Setup batch automation (new in v7.0)
   await setupBatchAutomation();
 
+  // Setup Ralph hooks (new in v7.1 - Memory-Augmented Ralph Loops)
+  await setupRalphHooks();
+
   // Start the watcher
   await startWatcher();
-  
+
   // Show final instructions
   await showFinalInstructions();
   
