@@ -458,6 +458,35 @@ INFO: Found 2 relevant results:
 | PreCompact hook | `src/runtime/precompact-hook.sh` | Backup state before compaction |
 | Standalone client | `mcp-server/src/standalone_client.py` | CSR client for hooks |
 | Tests | `tests/ralph/test_ralph_integration.py` | Integration tests |
+| Iteration hook | `src/runtime/hooks/iteration_hook.py` | Iteration-level memory (v7.1.9) |
+
+### Ralph Loop Iteration Protocol (v7.1.9)
+
+When running in a Ralph loop, follow this protocol for iteration-level memory:
+
+1. **At iteration START**: Read `.ralph_state.md` if it exists
+   ```bash
+   cat .ralph_state.md
+   ```
+
+2. **Before trying any approach**: Check "DO NOT RETRY" list in state file
+
+3. **After each significant action**: Update `.ralph_state.md`:
+   - Add failed approaches to `## Failed Approaches`
+   - Add successful patterns to `## Successful Strategies`
+   - Add blocking errors to `## Blocking Errors`
+
+4. **Before iteration ends**: Ensure state file is updated with learnings
+
+**Programmatic usage**:
+```bash
+# Get context for next iteration
+python src/runtime/hooks/iteration_hook.py
+
+# Persist a learning
+python src/runtime/hooks/iteration_hook.py --persist \
+  "approach description" "FAILURE|SUCCESS|PARTIAL" "error msg" "learning"
+```
 
 ### Stopping Ralph Loops
 
