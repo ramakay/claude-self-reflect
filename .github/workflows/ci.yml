@@ -292,8 +292,9 @@ jobs:
         rm -f ~/.npmrc
         # Configure registry
         npm config set registry https://registry.npmjs.org
-        # Publish with OIDC (id-token: write permission handles auth)
-        npm publish --access public
+        # Publish with provenance - this ENABLES OIDC authentication + adds SLSA attestation
+        # See: https://docs.npmjs.com/generating-provenance-statements
+        npm publish --access public --provenance
 
   create-github-release:
     needs: publish-npm
