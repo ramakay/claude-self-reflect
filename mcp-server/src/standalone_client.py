@@ -149,8 +149,13 @@ class CSRStandaloneClient:
             project_norm = self._normalize_project_name(project)
             searchable = [c for c in searchable if project_norm in c]
 
+        # Prioritize reflections collections (where Ralph state is stored)
+        reflections = [c for c in searchable if c.startswith('reflections')]
+        others = [c for c in searchable if not c.startswith('reflections')]
+        searchable = reflections + others
+
         results = []
-        for collection_name in searchable[:5]:  # Limit to 5 collections
+        for collection_name in searchable[:8]:  # Search up to 8 collections
             try:
                 search_results = client.search(
                     collection_name=collection_name,

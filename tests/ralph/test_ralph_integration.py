@@ -256,11 +256,22 @@ class TestCompactionScenarios:
     def csr_client(self):
         """Get CSR client, skip if not available."""
         try:
-            from mcp_server.src.standalone_client import CSRStandaloneClient
+            import sys
+            from pathlib import Path
+            # Add mcp-server/src to path (handles the hyphen in directory name)
+            project_root = Path(__file__).parent.parent.parent
+            mcp_server_path = project_root / "mcp-server" / "src"
+            if str(mcp_server_path) not in sys.path:
+                sys.path.insert(0, str(mcp_server_path))
+
+            from standalone_client import CSRStandaloneClient
             client = CSRStandaloneClient()
             # Quick connectivity check
-            client.search("test", limit=1)
+            if not client.test_connection():
+                pytest.skip("CSR not reachable (Qdrant not running)")
             return client
+        except ImportError as e:
+            pytest.skip(f"CSR client import failed: {e}")
         except Exception as e:
             pytest.skip(f"CSR not available: {e}")
 
