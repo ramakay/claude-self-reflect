@@ -277,26 +277,13 @@ jobs:
         node-version: '22.x'
         registry-url: 'https://registry.npmjs.org'
 
-    - name: Install npm and configure OIDC
-      run: |
-        npm install -g npm@latest
-        echo "Node version: $(node --version)"
-        echo "npm version: $(npm --version)"
-
-        # Remove the .npmrc token placeholder created by setup-node
-        # This allows npm to use OIDC for authentication
-        rm -f ~/.npmrc
-
-        # Configure registry without auth token placeholder
-        # npm will automatically request OIDC token when publishing with --provenance
-        npm config set registry https://registry.npmjs.org
-
-        # Debug: show npm config
-        echo "npm config:"
-        npm config list
-
-    - name: Publish with provenance (OIDC auth)
+    - name: Publish to npm
       run: npm publish --access public --provenance
+      env:
+        # Uses NPM_TOKEN secret for authentication
+        # Token must be a Granular Access Token with Publish permission
+        # Create at: npmjs.com -> Access Tokens -> Generate New Token
+        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   create-github-release:
     needs: publish-npm
