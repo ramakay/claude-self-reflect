@@ -265,7 +265,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'release' && github.event.action == 'created'
     # Environment name MUST match what's configured on npmjs.com Trusted Publisher
-    environment: npm
+    # npmjs.com shows: ramakay/claude-self-reflect, ci.yml, environment: prod
+    environment: prod
 
     steps:
     - uses: actions/checkout@v5
