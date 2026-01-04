@@ -264,7 +264,8 @@ jobs:
     needs: [python-test, npm-package-test, npm-pack-smoke-test, docker-build]
     runs-on: ubuntu-latest
     if: github.event_name == 'release' && github.event.action == 'created'
-    environment: npm-publish
+    # Environment name MUST match what's configured on npmjs.com Trusted Publisher
+    environment: npm
 
     steps:
     - uses: actions/checkout@v5
@@ -273,18 +274,20 @@ jobs:
 
     - uses: actions/setup-node@v4
       with:
-        node-version: '20.x'
+        node-version: '22.x'  # Node 22 has npm 11.x which supports OIDC trusted publishing
+        registry-url: 'https://registry.npmjs.org'
 
-    - name: Configure npm for OIDC-based trusted publishing
+    - name: Verify npm version for OIDC support
       run: |
-        # Remove any existing .npmrc that might have old token references
-        rm -f ~/.npmrc
-        # Configure npm registry without static token (OIDC will handle auth)
-        npm config set registry https://registry.npmjs.org
+        echo "Node version: $(node --version)"
+        echo "npm version: $(npm --version)"
+        # npm 11.5+ required for OIDC trusted publishing
+        npm --version | grep -E '^1[1-9]\.' || { echo "Warning: npm 11.5+ recommended for OIDC"; }
 
-    - name: Publish to npm with provenance (trusted publishing)
-      run: |
-        npm publish --provenance --access public
+    - name: Publish to npm with OIDC trusted publishing
+      run: npm publish --access public
+      # NO NODE_AUTH_TOKEN - OIDC handles authentication via id-token: write permission
+      # Provenance is automatic with trusted publishing
 
   create-github-release:
     needs: publish-npm
