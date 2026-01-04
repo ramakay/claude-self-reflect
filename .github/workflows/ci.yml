@@ -275,11 +275,9 @@ jobs:
         node-version: '20.x'
         registry-url: 'https://registry.npmjs.org'
     
-    - name: Publish to npm with provenance
+    - name: Publish to npm with provenance (trusted publishing)
       run: |
         npm publish --provenance --access public
-      env:
-        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   create-github-release:
     needs: publish-npm
