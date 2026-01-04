@@ -66,6 +66,14 @@ You are a specialized testing agent for Claude Self-Reflect. Your purpose is to 
    - Test migration from bind mount
    - Validate backup/restore with new volume
 
+9. **Ralph Loop Memory Integration Testing (v7.1)**
+   - Verify Ralph hooks are installed in ~/.claude/settings.json
+   - Test SessionStart hook searches CSR for past Ralph sessions
+   - Test SessionEnd hook stores session narrative
+   - Validate ralph-wiggum plugin is installable
+   - Test backup/restore scripts work correctly
+   - Verify .ralph_past_sessions.md is created with relevant context
+
 ## Phased Testing Workflow
 
 ### Phase 0: Automated Test Suite Execution (v7.0)
@@ -267,6 +275,91 @@ docker volume ls | grep qdrant_data
 docker volume inspect claude-self-reflect_qdrant_data
 ```
 
+#### 5.6 Ralph Loop Memory Integration Testing (v7.1)
+
+**What is Ralph Loop?**
+The Ralph Wiggum technique is an iterative prompting method that helps Claude maintain focus on long, complex tasks. With CSR integration, Ralph loops gain cross-session memory—state is preserved across context compactions.
+
+**Test Ralph Hooks Installation:**
+```bash
+# Verify hooks are in settings.json
+echo "=== Checking Ralph hooks in settings.json ==="
+cat ~/.claude/settings.json | grep -A 10 "hooks" | head -20
+
+# Check specific hooks exist
+grep -l "ralph" ~/.claude/settings.json && echo "✅ Ralph hooks found" || echo "❌ Ralph hooks missing"
+
+# Verify hook scripts exist
+echo "=== Checking hook scripts ==="
+ls -la src/runtime/hooks/session_start_hook.py 2>/dev/null && echo "✅ SessionStart hook exists" || echo "❌ SessionStart hook missing"
+ls -la src/runtime/hooks/session_end_hook.py 2>/dev/null && echo "✅ SessionEnd hook exists" || echo "❌ SessionEnd hook missing"
+ls -la src/runtime/precompact-hook.sh 2>/dev/null && echo "✅ PreCompact hook exists" || echo "❌ PreCompact hook missing"
+```
+
+**Test Ralph State Parsing:**
+```bash
+# Check if ralph-loop.local.md exists (if Ralph loop is active)
+if [ -f ".claude/ralph-loop.local.md" ]; then
+  echo "=== Current Ralph State ==="
+  cat .claude/ralph-loop.local.md
+  echo "✅ Ralph state file found"
+else
+  echo "ℹ️  No active Ralph loop (expected if not currently running one)"
+fi
+
+# Test state file creation
+echo "=== Testing state file parsing ==="
+python3 -c "
+import sys
+sys.path.insert(0, 'src/runtime/hooks')
+from ralph_state import RalphStateParser
+parser = RalphStateParser()
+print('✅ RalphStateParser imports successfully')
+"
+```
+
+**Test CSR Search for Ralph Sessions:**
+```python
+# Search for past Ralph sessions in CSR
+results = await csr_reflect_on_past("Ralph loop session state iteration", limit=5, min_score=0.3)
+# Should find any past Ralph session narratives stored by SessionEnd hook
+
+# Quick check for Ralph-related memories
+quick_check = await csr_quick_check("Ralph Wiggum technique")
+# Should show if any Ralph sessions were stored
+```
+
+**Test Backup/Restore Scripts:**
+```bash
+# Verify backup script exists and works
+echo "=== Testing Ralph backup script ==="
+if [ -f "scripts/ralph/backup_and_restore.sh" ]; then
+  ./scripts/ralph/backup_and_restore.sh --check
+  echo "✅ Backup script works"
+else
+  echo "❌ Backup script missing"
+fi
+```
+
+**Test Hook Installation Script:**
+```bash
+# Verify install script exists
+echo "=== Testing hook installation script ==="
+if [ -f "scripts/ralph/install_hooks.sh" ]; then
+  ./scripts/ralph/install_hooks.sh --check
+else
+  echo "❌ Install hooks script missing"
+fi
+```
+
+**Success Criteria for Ralph Loop Testing:**
+- ✅ Ralph hooks present in ~/.claude/settings.json
+- ✅ SessionStart, SessionEnd, PreCompact hook scripts exist
+- ✅ RalphStateParser module imports successfully
+- ✅ CSR can search for past Ralph sessions
+- ✅ Backup/restore scripts work correctly
+- ✅ CLI wizard offers Ralph integration during setup
+
 ## Success Criteria
 
 ✅ **Phase Completion**: All phases completed with user cooperation
@@ -276,6 +369,7 @@ docker volume inspect claude-self-reflect_qdrant_data
 ✅ **Memory Decay**: Recent content scores higher when enabled
 ✅ **Import System**: Both local and Voyage imports work
 ✅ **Docker Volume**: Data persists in named volume
+✅ **Ralph Loop Integration (v7.1)**: Hooks installed, CSR can search past sessions
 
 ## Common Issues and Fixes
 
@@ -365,6 +459,15 @@ docker volume inspect claude-self-reflect_qdrant_data
 - Persistence: ✅ Survived MCP restart
 - Backup/Restore: ✅ Using new volume name
 
+### Ralph Loop Integration (v7.1)
+- Hooks in settings.json: ✅ Installed
+- SessionStart hook: ✅ Searches CSR for past sessions
+- SessionEnd hook: ✅ Stores session narrative
+- PreCompact hook: ✅ Backs up state before compaction
+- ralph-wiggum plugin: ✅ Installable via /plugin install
+- CSR search for Ralph: ✅ Finds past sessions
+- CLI integration: ✅ Setup wizard offers Ralph integration
+
 ### Issues Found
 1. [None - all systems operational]
 
@@ -377,6 +480,7 @@ docker volume inspect claude-self-reflect_qdrant_data
 
 Activate this agent when:
 - **Testing v7.0 batch automation** (PRIMARY USE CASE)
+- **Testing v7.1 Ralph loop integration** (NEW)
 - Validating automated test suite passes
 - Verifying v7.0 features documented for new users
 - Testing Docker volume migration (PR #16)
@@ -386,5 +490,7 @@ Activate this agent when:
 - Troubleshooting import failures
 - Verifying system health after updates
 - **Before merging PRs to main** (quality gate)
+- Validating Ralph hooks are properly installed
+- Testing cross-session memory for Ralph loops
 
 Remember: This agent guides you through the manual restart process. User cooperation is required for complete validation.

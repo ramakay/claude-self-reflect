@@ -336,6 +336,10 @@ class UnifiedStateManager:
         except Exception as e:
             raise ValueError(f"Invalid path: {file_path}: {e}")
 
+        # Detect if running in Docker by checking for Docker-mounted paths
+        docker_paths = ["/logs", "/config", "/app/data"]
+        in_docker = any(Path(dp).exists() for dp in docker_paths)
+
         # Docker to local path mappings
         path_mappings = [
             ("/logs/", "/.claude/projects/"),
@@ -343,8 +347,15 @@ class UnifiedStateManager:
             ("/app/data/", "/.claude/projects/")
         ]
 
-        # Apply Docker mappings if needed
+        # In Docker: validate against Docker paths BEFORE transformation
+        # This ensures security validation uses paths that actually exist
         path_str = str(resolved)
+        original_path_str = path_str  # Keep original for Docker validation
+
+        # Check if this is a Docker path that we should validate directly
+        is_docker_path = in_docker and any(path_str.startswith(dp) for dp in docker_paths)
+
+        # Apply Docker mappings for storage consistency (not for validation)
         for docker_path, local_path in path_mappings:
             if path_str.startswith(docker_path):
                 home = str(Path.home())
@@ -359,21 +370,35 @@ class UnifiedStateManager:
         ]
 
         # Add Docker paths if they exist
-        for docker_path in ["/logs", "/config", "/app/data"]:
+        for docker_path in docker_paths:
             docker_base = Path(docker_path)
             if docker_base.exists():
                 allowed_bases.append(docker_base)
 
         # Check if path is within allowed directories
         path_allowed = False
-        for base in allowed_bases:
-            try:
-                if base.exists():
-                    resolved.relative_to(base)
-                    path_allowed = True
-                    break
-            except ValueError:
-                continue
+
+        # In Docker: validate original path against Docker mounts
+        if is_docker_path:
+            original_resolved = Path(original_path_str).resolve()
+            for base in allowed_bases:
+                try:
+                    if base.exists():
+                        original_resolved.relative_to(base)
+                        path_allowed = True
+                        break
+                except ValueError:
+                    continue
+        else:
+            # Local environment: validate transformed path
+            for base in allowed_bases:
+                try:
+                    if base.exists():
+                        resolved.relative_to(base)
+                        path_allowed = True
+                        break
+                except ValueError:
+                    continue
 
         # Allow test paths when running tests
         if not path_allowed:

@@ -93,7 +93,44 @@ find . -type f \( -name "*test_*.py" -o -name "test_*.py" -o -name "*benchmark*.
 echo "=== Suggest archiving to: tests/throwaway/ ==="
 ```
 
-### 8. NPM Package Validation (Regression Check for #71)
+### 8. Ralph Loop Integration Validation (v7.1)
+
+**What is Ralph Loop?**
+The Ralph Wiggum technique helps Claude maintain focus on long, complex tasks. With CSR integration, Ralph loops gain cross-session memory through hooks.
+
+```bash
+# Check Ralph hooks in settings.json
+echo "=== Ralph Hooks Validation ==="
+grep -c "session_start_hook\|session_end_hook\|precompact" ~/.claude/settings.json && echo "✅ Hooks configured" || echo "❌ Hooks missing"
+
+# Verify hook scripts exist
+echo "=== Hook Scripts ==="
+ls -la src/runtime/hooks/session_start_hook.py 2>/dev/null && echo "✅ SessionStart" || echo "❌ SessionStart missing"
+ls -la src/runtime/hooks/session_end_hook.py 2>/dev/null && echo "✅ SessionEnd" || echo "❌ SessionEnd missing"
+ls -la src/runtime/precompact-hook.sh 2>/dev/null && echo "✅ PreCompact" || echo "❌ PreCompact missing"
+
+# Test RalphStateParser import
+python3 -c "
+import sys
+sys.path.insert(0, 'src/runtime/hooks')
+from ralph_state import RalphStateParser
+print('✅ RalphStateParser imports')
+" || echo "❌ RalphStateParser import failed"
+
+# Check for Ralph-related CLI integration
+grep -l "ralph" installer/setup-wizard-docker.js && echo "✅ CLI integration" || echo "❌ CLI missing Ralph"
+```
+
+**Test CSR Search for Ralph Sessions:**
+```python
+# Search for past Ralph sessions
+results = await csr_reflect_on_past("Ralph loop session", limit=3, min_score=0.3)
+
+# Quick check
+quick = await csr_quick_check("Ralph Wiggum")
+```
+
+### 9. NPM Package Validation (Regression Check for #71)
 ```bash
 echo "=== NPM Package Contents Check ==="
 
@@ -165,6 +202,15 @@ CodeRabbit Analysis: [PASS/FAIL]
 - CLI execution: [✓/✗ - terminal mode issues]
 - PR feedback checked: [✓/✗]
 - Issues found: [none/list]
+
+Ralph Loop Integration (v7.1): [PASS/FAIL]
+- Hooks in settings.json: [✓/✗]
+- SessionStart hook: [✓/✗]
+- SessionEnd hook: [✓/✗]
+- PreCompact hook: [✓/✗]
+- RalphStateParser: [✓/✗]
+- CLI integration: [✓/✗]
+- CSR search for Ralph: [✓/✗]
 
 Critical Issues: [none/list]
 

@@ -1,8 +1,40 @@
 # Ralph Loop Memory Integration
 
+## What is a Ralph Loop?
+
+The **Ralph Wiggum technique** (named after the Simpsons character) is an iterative prompting method that helps Claude maintain focus on long, complex tasks. Instead of Claude losing context after many turns or during context compaction, a Ralph loop:
+
+1. **Defines a completion promise** - What success looks like (e.g., "All tests pass")
+2. **Tracks iterations** - Counts how many attempts have been made
+3. **Maintains state** - Keeps track of what worked and what failed
+4. **Self-corrects** - Uses past failures to avoid repeating mistakes
+
+**Example:**
+```
+/ralph-wiggum:ralph-loop "Fix all failing tests" --completion-promise "npm test passes"
+```
+
+## Prerequisites
+
+| Requirement | Description | How to Install |
+|-------------|-------------|----------------|
+| **Claude Self-Reflect (CSR)** | Vector database for conversation memory | `npm install -g claude-self-reflect` then `claude-self-reflect setup` |
+| **Qdrant** | Vector database (started by CSR) | Included in CSR Docker setup |
+| **ralph-wiggum plugin** | Claude Code plugin that creates Ralph loops | `/plugin install ralph-wiggum@anthropics` |
+| **Python 3.8+** | Required for hooks | [python.org](https://www.python.org/downloads/) |
+
+### Installing the Ralph Plugin
+
+In Claude Code, run:
+```
+/plugin install ralph-wiggum@anthropics
+```
+
+This installs the Ralph Wiggum plugin from the official Anthropic plugins repository.
+
 ## Overview
 
-The Ralph Wiggum technique helps Claude maintain context across long coding sessions. With CSR (Claude Self-Reflect) integration, Ralph loops gain **cross-session memory**—state is preserved across context compactions and retrievable in future sessions.
+With CSR (Claude Self-Reflect) integration, Ralph loops gain **cross-session memory**—state is preserved across context compactions and retrievable in future sessions.
 
 ## How It Works
 
@@ -39,13 +71,40 @@ Session 2 (After Compaction)
 
 ## Installation
 
-### Prerequisites
-- CSR running with Qdrant: `docker compose up -d qdrant`
-- ralph-wiggum plugin installed in Claude Code
+### Option 1: CLI Wizard (Recommended)
 
-### Install Hooks
+During `claude-self-reflect setup`, you'll be prompted:
+
+```
+🐻 Ralph Loop Memory Integration (NEW!)...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The Ralph Wiggum technique helps Claude maintain context across long sessions.
+With CSR integration, Ralph loops gain cross-session memory!
+
+Enable Ralph Loop memory integration? (y/n) [recommended]:
+```
+
+For existing installations, run:
+```bash
+claude-self-reflect update
+```
+
+### Option 2: Manual Installation
+
+Prerequisites:
+- CSR running with Qdrant: `docker compose up -d qdrant`
+- Python 3.8+
+
+Install hooks:
 ```bash
 ./scripts/ralph/install_hooks.sh
+```
+
+### Post-Installation: Install the Plugin
+
+After hooks are installed, you need the ralph-wiggum Claude Code plugin:
+```
+https://github.com/anthropics/claude-code-plugins
 ```
 
 ### Verify Installation
