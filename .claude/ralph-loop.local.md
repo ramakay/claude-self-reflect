@@ -1,6 +1,6 @@
 ---
 active: true
-iteration: 1
+iteration: 2
 max_iterations: 5
 completion_promise: "Release completed"
 started_at: "2026-01-04T20:20:34Z"
