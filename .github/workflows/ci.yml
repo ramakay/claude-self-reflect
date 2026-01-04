@@ -11,6 +11,7 @@ on:
 permissions:
   contents: write
   packages: write
+  id-token: write  # Required for npm trusted publishing (OIDC)
 
 jobs:
   python-test:
@@ -274,9 +275,9 @@ jobs:
         node-version: '20.x'
         registry-url: 'https://registry.npmjs.org'
     
-    - name: Publish to npm
+    - name: Publish to npm with provenance
       run: |
-        npm publish
+        npm publish --provenance --access public
       env:
         NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 

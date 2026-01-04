@@ -364,31 +364,62 @@ Say these to auto-activate specialized agents:
 - "test installations" → reflect-tester
 - "release management" → open-source-maintainer
 
-## 🔄 Ralph Loop Memory Integration
+## Ralph Loop Memory Integration
 
 ### What It Is
-The Ralph Wiggum technique helps Claude maintain context across long coding sessions through structured markdown files. With CSR integration, Ralph loops gain **cross-session memory**—state is preserved across context compactions and retrievable in future sessions.
+The Ralph Wiggum technique helps Claude maintain context across long coding sessions through structured markdown files. With CSR integration, Ralph loops gain **cross-session memory**-state is preserved across context compactions and retrievable in future sessions.
 
 ### Key Benefits
-- 🧠 **Cross-session memory**: Retrieve insights from past Ralph sessions
-- 💾 **Pre-compaction backup**: State automatically saved to CSR before context compaction
-- 🔍 **Pattern retrieval**: Search for similar past challenges and solutions
-- 📊 **Session narratives**: Complete session summaries stored for future reference
+- **Cross-session memory**: Retrieve insights from past Ralph sessions
+- **Pre-compaction backup**: State automatically saved to CSR before context compaction
+- **Pattern retrieval**: Search for similar past challenges and solutions
+- **Session narratives**: Complete session summaries stored for future reference
+
+### v7.1+ Enhanced Features (Verified 2026-01-04)
+- **Error Signature Deduplication**: Normalizes errors (removes line numbers, paths, timestamps)
+- **Output Decline Detection**: Circuit breaker pattern (detects >70% output drop)
+- **Confidence-Based Exit**: 0-100 scoring for exit decisions
+- **Anti-Pattern Injection**: "DON'T RETRY THESE" surfaced first
+- **Work Type Tracking**: IMPLEMENTATION/TESTING/DEBUGGING/DOCUMENTATION
+- **Error-Centric Search**: Find past sessions by error pattern, not just task
 
 ### How It Works
 
 1. **SessionStart Hook**: When a new Ralph session begins, CSR is searched for:
    - Past sessions with similar tasks
-   - Failed approaches (to avoid repeating mistakes)
-   - Successful patterns (to reuse)
+   - **Similar errors** (error-centric search)
+   - **Anti-patterns** (failed approaches from incomplete sessions)
+   - **Winning strategies** (successful session patterns)
 
 2. **PreCompact Hook**: Before context compaction destroys the session:
    - Current Ralph state is backed up to CSR
    - Iteration count, learnings, and approaches are preserved
 
 3. **SessionEnd Hook**: When session completes:
-   - Full narrative is stored to CSR
+   - Full narrative is stored to CSR with rich metadata
    - Tagged for future searchability
+   - Winning strategies stored separately for successful sessions
+
+### Verified Proof
+```
+# Session start hook output (2026-01-04T10:36:30):
+INFO: Found 2 relevant results:
+  - Anti-patterns: 0
+  - Winning strategies: 0
+  - Error matches: 0
+  - Similar tasks: 2
+
+# Qdrant storage (actual data):
+{
+  "tags": ["ralph_session", "outcome_completed", "iterations_8"],
+  "timestamp": "2026-01-04T18:13:03.711262+00:00"
+}
+
+# RalphState features verified:
+- Error dedup: 3 errors -> 2 signatures (same file deduped)
+- Output decline: [1000,950,900,200,100,50] -> Declining: True
+- Confidence: tasks+tests+no_errors = 80%
+```
 
 ### Installation
 
@@ -428,7 +459,47 @@ The Ralph Wiggum technique helps Claude maintain context across long coding sess
 | Standalone client | `mcp-server/src/standalone_client.py` | CSR client for hooks |
 | Tests | `tests/ralph/test_ralph_integration.py` | Integration tests |
 
+### Stopping Ralph Loops
+
+**CRITICAL**: The ralph-wiggum plugin only stops when:
+1. **File is DELETED** (not just `active: false`)
+2. **max_iterations reached** (if set)
+3. **Completion promise detected** in `<promise>` tags
+
+**To stop a runaway loop**:
+```bash
+# Method 1: Delete the state file (RECOMMENDED)
+rm .claude/ralph-loop.local.md
+
+# Method 2: Use the cancel skill
+/ralph-wiggum:cancel-ralph
+
+# Method 3: Output completion promise
+<promise>YOUR_PROMISE_TEXT</promise>
+```
+
+**WARNING**: Setting `active: false` does NOT stop the loop!
+The plugin's stop-hook only checks if the file EXISTS, not the active flag.
+Our `is_ralph_session()` checks `active: false`, but the plugin doesn't.
+
+**ALWAYS use `--max-iterations` as a safety net**:
+```bash
+# Correct (note: plural 'iterations')
+/ralph-loop "task" --max-iterations 50
+
+# WRONG (singular - will be ignored, loop runs forever)
+/ralph-loop "task" --max-iteration 50
+```
+
 ### Troubleshooting
+
+**"Loop won't stop / Runaway loop"**:
+```bash
+# Delete the state file - this is the ONLY reliable way
+rm .claude/ralph-loop.local.md
+
+# Setting active: false does NOT work - plugin ignores it
+```
 
 **"Hooks not triggering"**:
 ```bash

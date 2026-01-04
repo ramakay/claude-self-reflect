@@ -280,6 +280,20 @@ docker volume inspect claude-self-reflect_qdrant_data
 **What is Ralph Loop?**
 The Ralph Wiggum technique is an iterative prompting method that helps Claude maintain focus on long, complex tasks. With CSR integration, Ralph loops gain cross-session memory—state is preserved across context compactions.
 
+**CRITICAL: Runaway Loop Prevention**
+- ALWAYS use `--max-iterations` (PLURAL!) as safety net
+- `--max-iteration` (singular) is IGNORED - loop runs forever!
+- Setting `active: false` does NOT stop loops - must DELETE file
+- To stop: `rm .claude/ralph-loop.local.md`
+
+**New v7.1+ Features (Enhanced Patterns):**
+- **Error Signature Deduplication**: Normalizes errors (removes line numbers, paths, timestamps) to avoid redundant storage
+- **Output Decline Detection**: Tracks response lengths to detect circuit breaker patterns (>70% decline triggers warning)
+- **Confidence-Based Exit**: 0-100 scoring based on signals (tests passing, tasks complete, no errors)
+- **Anti-Pattern Injection**: Session start hook surfaces "DON'T RETRY THESE" section first
+- **Work Type Tracking**: Categorizes sessions as IMPLEMENTATION/TESTING/DEBUGGING/DOCUMENTATION
+- **Error-Centric Search**: Searches past sessions by error signature, not just task description
+
 **Test Ralph Hooks Installation:**
 ```bash
 # Verify hooks are in settings.json
@@ -312,9 +326,48 @@ echo "=== Testing state file parsing ==="
 python3 -c "
 import sys
 sys.path.insert(0, 'src/runtime/hooks')
-from ralph_state import RalphStateParser
-parser = RalphStateParser()
-print('✅ RalphStateParser imports successfully')
+from ralph_state import RalphState
+state = RalphState.create_new('test task', 'tests pass')
+print('✅ RalphState imports successfully')
+"
+```
+
+**Test v7.1+ Enhanced Features:**
+```bash
+echo "=== Testing v7.1+ Enhanced RalphState Features ==="
+python3 -c "
+import sys
+sys.path.insert(0, 'src/runtime/hooks')
+from ralph_state import RalphState
+
+# Test error signature deduplication
+state = RalphState.create_new('test', 'test')
+state.add_error('Error at line 42 in /path/to/file.py')
+state.add_error('Error at line 99 in /different/path.py')  # Same pattern, different numbers
+assert len(state.blocking_errors) == 1, 'Error dedup failed'
+print('✅ Error signature deduplication works')
+
+# Test output tracking
+state.track_output(1000)
+state.track_output(800)
+state.track_output(200)
+assert not state.output_declining(), 'Should not decline with 3 samples'
+state.track_output(100)
+state.track_output(50)
+state.track_output(25)
+print('✅ Output tracking works, declining:', state.output_declining())
+
+# Test confidence scoring
+state.update_confidence({'all_tasks_complete': True, 'tests_passing': True})
+assert state.exit_confidence == 60, f'Expected 60, got {state.exit_confidence}'
+print('✅ Confidence scoring works:', state.exit_confidence, '%')
+
+# Test work type
+state.work_type = 'TESTING'
+assert state.work_type == 'TESTING'
+print('✅ Work type tracking works')
+
+print('✅ All v7.1+ features validated')
 "
 ```
 
