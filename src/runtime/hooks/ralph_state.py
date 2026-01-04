@@ -171,16 +171,27 @@ def save_state(state: RalphState, path: Path = None) -> None:
 
 
 def is_ralph_session() -> bool:
-    """Check if current directory has an active Ralph session.
+    """Check if current directory has an ACTIVE Ralph session.
 
     Checks for both:
     - .claude/ralph-loop.local.md (ralph-wiggum plugin)
     - .ralph_state.md (our custom state file)
+
+    Returns False if file exists but active: false.
     """
-    return (
-        Path('.claude/ralph-loop.local.md').exists() or
-        Path('.ralph_state.md').exists()
-    )
+    for path in [Path('.claude/ralph-loop.local.md'), Path('.ralph_state.md')]:
+        if path.exists():
+            try:
+                content = path.read_text()
+                # Check for active: false explicitly
+                if 'active: false' in content:
+                    return False
+                # Check for active: true or assume active if file exists without active flag
+                if 'active: true' in content or 'active:' not in content:
+                    return True
+            except Exception:
+                pass
+    return False
 
 
 def get_ralph_state_path() -> Optional[Path]:
