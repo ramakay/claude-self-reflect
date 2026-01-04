@@ -264,17 +264,24 @@ jobs:
     needs: [python-test, npm-package-test, npm-pack-smoke-test, docker-build]
     runs-on: ubuntu-latest
     if: github.event_name == 'release' && github.event.action == 'created'
-    
+    environment: npm-publish
+
     steps:
     - uses: actions/checkout@v5
       with:
         fetch-depth: 0
-    
+
     - uses: actions/setup-node@v4
       with:
         node-version: '20.x'
-        registry-url: 'https://registry.npmjs.org'
-    
+
+    - name: Configure npm for OIDC-based trusted publishing
+      run: |
+        # Remove any existing .npmrc that might have old token references
+        rm -f ~/.npmrc
+        # Configure npm registry without static token (OIDC will handle auth)
+        npm config set registry https://registry.npmjs.org
+
     - name: Publish to npm with provenance (trusted publishing)
       run: |
         npm publish --provenance --access public
