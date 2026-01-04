@@ -274,20 +274,26 @@ jobs:
 
     - uses: actions/setup-node@v4
       with:
-        node-version: '22.x'  # Node 22 has npm 11.x which supports OIDC trusted publishing
-        registry-url: 'https://registry.npmjs.org'
+        node-version: '22.x'
+        # NOTE: Do NOT use registry-url here - it creates .npmrc with token placeholder
+        # which breaks OIDC trusted publishing
 
-    - name: Verify npm version for OIDC support
+    - name: Install npm 11.5+ for OIDC trusted publishing
       run: |
+        npm install -g npm@latest
         echo "Node version: $(node --version)"
         echo "npm version: $(npm --version)"
-        # npm 11.5+ required for OIDC trusted publishing
-        npm --version | grep -E '^1[1-9]\.' || { echo "Warning: npm 11.5+ recommended for OIDC"; }
+        # Verify npm 11.5+
+        npm --version | grep -E '^1[1-9]\.' || { echo "ERROR: npm 11.5+ required for OIDC"; exit 1; }
 
-    - name: Publish to npm with OIDC trusted publishing
-      run: npm publish --access public
-      # NO NODE_AUTH_TOKEN - OIDC handles authentication via id-token: write permission
-      # Provenance is automatic with trusted publishing
+    - name: Configure npm for OIDC and publish
+      run: |
+        # Clean any existing .npmrc (no tokens needed with OIDC)
+        rm -f ~/.npmrc
+        # Configure registry
+        npm config set registry https://registry.npmjs.org
+        # Publish with OIDC (id-token: write permission handles auth)
+        npm publish --access public
 
   create-github-release:
     needs: publish-npm
