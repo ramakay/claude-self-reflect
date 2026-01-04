@@ -31,11 +31,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def get_project_root() -> Path:
+    """Dynamically determine project root (works for any installation)."""
+    # This file is at: <project_root>/src/runtime/hooks/session_start_hook.py
+    return Path(__file__).parent.parent.parent.parent
+
+
 def search_past_sessions(task: str, limit: int = 3) -> list:
     """Search CSR for past Ralph sessions with similar tasks."""
     try:
-        # Import CSR standalone client
-        from mcp_server.src.standalone_client import CSRStandaloneClient
+        # Import CSR standalone client (dynamic path for any installation)
+        project_root = get_project_root()
+        mcp_server_path = project_root / "mcp-server" / "src"
+        if str(mcp_server_path) not in sys.path:
+            sys.path.insert(0, str(mcp_server_path))
+        from standalone_client import CSRStandaloneClient
         client = CSRStandaloneClient()
 
         # Search for past Ralph sessions

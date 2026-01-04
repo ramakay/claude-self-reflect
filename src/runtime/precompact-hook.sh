@@ -2,9 +2,21 @@
 # PreCompact hook for Claude Self-Reflect
 # Place this in ~/.claude/hooks/precompact or source it from there
 
-# Configuration
-CLAUDE_REFLECT_DIR="${CLAUDE_REFLECT_DIR:-$HOME/claude-self-reflect}"
-VENV_PATH="${VENV_PATH:-$CLAUDE_REFLECT_DIR/.venv}"
+# Determine project root dynamically from this script's location
+# This file is at: <project_root>/src/runtime/precompact-hook.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Configuration (allows override via environment)
+CLAUDE_REFLECT_DIR="${CLAUDE_REFLECT_DIR:-$DEFAULT_PROJECT_ROOT}"
+# Support both .venv and venv directories
+if [ -d "$CLAUDE_REFLECT_DIR/.venv" ]; then
+    VENV_PATH="${VENV_PATH:-$CLAUDE_REFLECT_DIR/.venv}"
+elif [ -d "$CLAUDE_REFLECT_DIR/venv" ]; then
+    VENV_PATH="${VENV_PATH:-$CLAUDE_REFLECT_DIR/venv}"
+else
+    VENV_PATH="${VENV_PATH:-$CLAUDE_REFLECT_DIR/.venv}"
+fi
 IMPORT_TIMEOUT="${IMPORT_TIMEOUT:-30}"
 
 # Check if Claude Self-Reflect is installed
@@ -45,17 +57,19 @@ fi
 if [ -n "$RALPH_STATE_FILE" ]; then
     echo "📝 Backing up Ralph state to CSR..." >&2
 
-    RALPH_STATE_FILE="$RALPH_STATE_FILE" python3 << 'PYTHON' 2>/dev/null || echo "Warning: Could not backup Ralph state" >&2
+    RALPH_STATE_FILE="$RALPH_STATE_FILE" CLAUDE_REFLECT_DIR="$CLAUDE_REFLECT_DIR" python3 << 'PYTHON' 2>/dev/null || echo "Warning: Could not backup Ralph state" >&2
 import sys
-sys.path.insert(0, '/Users/ramakrishnanannaswamy/projects/claude-self-reflect')
-
+import os
 from pathlib import Path
 from datetime import datetime
 
-try:
-    from mcp_server.src.standalone_client import CSRStandaloneClient
+# Dynamic path resolution
+project_root = os.environ.get('CLAUDE_REFLECT_DIR', str(Path.home() / 'claude-self-reflect'))
+sys.path.insert(0, str(Path(project_root) / 'mcp-server' / 'src'))
 
-    import os
+try:
+    from standalone_client import CSRStandaloneClient
+
     ralph_state_file = os.environ.get('RALPH_STATE_FILE', '.ralph_state.md')
     state_content = Path(ralph_state_file).read_text()
     client = CSRStandaloneClient()

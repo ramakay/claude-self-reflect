@@ -24,10 +24,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def get_project_root() -> Path:
+    """Dynamically determine project root (works for any installation)."""
+    # This file is at: <project_root>/src/runtime/hooks/session_end_hook.py
+    return Path(__file__).parent.parent.parent.parent
+
+
 def store_session_narrative(state, session_id: str, reason: str) -> bool:
     """Store session narrative to CSR."""
     try:
-        from mcp_server.src.standalone_client import CSRStandaloneClient
+        # Import CSR standalone client (dynamic path for any installation)
+        project_root = get_project_root()
+        mcp_server_path = project_root / "mcp-server" / "src"
+        if str(mcp_server_path) not in sys.path:
+            sys.path.insert(0, str(mcp_server_path))
+        from standalone_client import CSRStandaloneClient
         client = CSRStandaloneClient()
 
         # Determine outcome
