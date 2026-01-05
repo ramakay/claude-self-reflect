@@ -5,6 +5,49 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.1.9] - 2026-01-05
+
+### 🚀 FEATURE: Cross-Project Iteration Memory
+
+**Global Hooks** • **Automatic Storage** • **Zero Protocol Needed**
+
+v7.1.9 introduces cross-project iteration-level memory for Ralph loops. Hooks now fire automatically for ALL projects, capturing iteration state with project tags for cross-project visibility.
+
+#### Cross-Project Hook System
+- **Stop Hook**: Captures iteration state after every Claude response
+- **PreCompact Hook**: Backs up Ralph state before context compaction
+- **SessionEnd Hook**: Stores session narrative when session ends
+- **Project Tagging**: All entries tagged with `project_{name}` for cross-project search
+- **Global Configuration**: Hooks configured in `~/.claude/settings.json` work everywhere
+
+#### Technical Changes
+- `iteration_hook.py`: Now stores ALL iterations (even without learnings) with project tags
+- `precompact-hook.sh`: Uses venv Python (fixes missing qdrant_client), adds project tags
+- `standalone_client.py`: Added `collection` parameter for hook-specific storage
+- `session_end_hook.py`: Uses dedicated `csr_hook_sessions_local` collection
+- Hook collection separated from manual reflections (prevents pollution)
+
+#### Hook Collection
+- Dedicated collection: `csr_hook_sessions_local`
+- Hook signature tag: `__csr_hook_auto__` distinguishes auto vs manual stores
+- Project visibility: Search across projects with `project_` prefix tags
+
+### Added
+- Global PreCompact hook configuration
+- Project name extraction from working directory
+- Cross-project iteration tracking
+
+### Fixed
+- PreCompact hook using system Python instead of venv (missing qdrant_client)
+- Stop hook not storing when learnings empty
+- `2>/dev/null` hiding PreCompact success messages
+
+### Changed
+- README.md updated with v7.1.9 features and cross-project examples
+- Removed Ralph Loop Iteration Protocol from CLAUDE.md (hooks are automatic)
+
+---
+
 ## [7.0.0] - 2025-10-28
 
 ### 🚀 MAJOR FEATURE: Automated Narrative Generation

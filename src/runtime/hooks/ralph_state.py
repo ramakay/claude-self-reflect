@@ -119,6 +119,11 @@ class RalphState:
             score += 10
         self.exit_confidence = min(100, score)
 
+    def increment_iteration(self) -> None:
+        """Increment iteration count and update timestamp."""
+        self.iteration += 1
+        self.updated_at = datetime.now().isoformat()
+
     def to_markdown(self) -> str:
         """Convert state to markdown format for .ralph_state.md"""
         # Format error signatures for display
