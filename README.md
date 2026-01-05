@@ -26,7 +26,7 @@ Give Claude perfect memory of all your conversations. Search past discussions in
 
 **100% Local by Default** • **20x Faster** • **Zero Configuration** • **Production Ready**
 
-> **Latest: v7.1.9 Cross-Project Iteration Memory** - Ralph loops now share memory across ALL projects automatically. [Learn more →](#ralph-loop-memory-integration-v719)
+> **Latest: v7.1.9 Cross-Project Iteration Memory** - Ralph loops now share memory across ALL projects automatically. [Learn more →](#ralph-loop-memory)
 
 ## Why This Exists
 
@@ -39,9 +39,8 @@ Claude starts fresh every conversation. You've solved complex bugs, designed arc
 - [The Magic](#the-magic)
 - [Before & After](#before--after)
 - [Real Examples](#real-examples)
-- [NEW: Real-time Indexing Status](#new-real-time-indexing-status-in-your-terminal)
+- [Ralph Loop Memory](#ralph-loop-memory)
 - [Key Features](#key-features)
-- [Ralph Loop Memory Integration](#ralph-loop-memory-integration)
 - [Code Quality Insights](#code-quality-insights)
 - [Architecture](#architecture)
 - [Requirements](#requirements)
@@ -133,17 +132,44 @@ Claude: "Found conversations about JWT patterns including User.authenticate
         PKCE, and social login integration."
 ```
 
-## NEW: Real-time Indexing Status in Your Terminal
+## Ralph Loop Memory
 
-See your conversation indexing progress directly in your statusline:
+<div align="center">
+<img src="docs/images/ralph-loop-csr.png" alt="Ralph Loop with CSR Memory - From hamster wheel to upward spiral" width="800"/>
+</div>
 
-### Fully Indexed (100%)
-![Statusline showing 100% indexed](docs/images/statusbar-1.png)
+**The difference between spinning in circles and building on every iteration.**
 
-### Active Indexing (50% with backlog)
-![Statusline showing 50% indexed with 7h backlog](docs/images/statusbar-2.png)
+Use the [ralph-wiggum plugin](https://github.com/anthropics/claude-code-plugins/tree/main/ralph-wiggum) for long tasks? CSR gives your Ralph loops **persistent memory across sessions and projects**.
 
-Works with [Claude Code Statusline](https://github.com/sirmalloc/ccstatusline) - shows progress bars, percentages, and indexing lag in real-time! The statusline also displays MCP connection status (✓ Connected) and collection counts (28/29 indexed).
+### Without CSR: The Hamster Wheel
+- Each context compaction = everything forgotten
+- Same mistakes repeated across iterations
+- No learning from past sessions
+- Cross-project insights lost forever
+
+### With CSR: The Upward Spiral
+- **Automatic backup** before context compaction
+- **Anti-pattern injection** - "DON'T RETRY THESE" surfaces first
+- **Success pattern learning** - reuse what worked before
+- **Cross-project memory** - learn from ALL your projects
+
+### Quick Setup
+```bash
+./scripts/ralph/install_hooks.sh        # Install hooks globally
+./scripts/ralph/install_hooks.sh --check  # Verify installation
+```
+
+### How It Works
+1. Start a Ralph loop: `/ralph-wiggum:ralph-loop "Build feature X"`
+2. Work naturally - CSR hooks capture state automatically
+3. **Stop hook** stores each iteration's learnings
+4. **PreCompact hook** backs up state before compaction
+5. Next session retrieves past insights, failed approaches, and wins
+
+> **v7.1.9+**: Cross-project iteration memory - hooks work for ALL projects, entries tagged with `project_{name}` for global searchability.
+
+[Full documentation →](docs/development/ralph-memory-integration.md)
 
 ## Code Quality Insights
 
@@ -322,74 +348,6 @@ Claude: [Searches ONLY MyApp conversations]
 You: "Search all projects for WebSocket implementations"
 Claude: [Searches across ALL your projects]
 ```
-
-</details>
-
-<details>
-<summary><b>Ralph Loop Memory Integration (v7.1.9+)</b></summary>
-
-<div align="center">
-<img src="docs/images/ralph-loop-csr.png" alt="Ralph Loop with CSR Memory - From hamster wheel to upward spiral" width="800"/>
-</div>
-
-Use the [ralph-wiggum plugin](https://github.com/anthropics/claude-code-plugins/tree/main/ralph-wiggum) for long tasks? CSR automatically gives Ralph loops **cross-session AND cross-project memory**:
-
-**Core Features:**
-- **Automatic backup** before context compaction
-- **Past session retrieval** when starting new Ralph loops
-- **Failed approach tracking** - never repeat the same mistakes
-- **Success pattern learning** - reuse what worked before
-
-**v7.1.9 Cross-Project Iteration Memory (NEW!):**
-- **Global Hook System** - Hooks fire for ALL projects, not just CSR
-- **Stop Hook** - Captures iteration state after every Claude response
-- **PreCompact Hook** - Backs up Ralph state before context compaction
-- **Project Tagging** - Each entry tagged with `project_{name}` for cross-project visibility
-- **Automatic Storage** - No manual protocol needed, hooks capture everything
-
-**v7.1+ Enhanced Features:**
-- **Error Signature Deduplication** - Normalizes errors (removes line numbers, paths, timestamps)
-- **Output Decline Detection** - Circuit breaker pattern detects >70% output drop
-- **Confidence-Based Exit** - 0-100 scoring (tasks complete, tests passing, no errors)
-- **Anti-Pattern Injection** - "DON'T RETRY THESE" surfaces failed approaches first
-- **Work Type Tracking** - IMPLEMENTATION/TESTING/DEBUGGING/DOCUMENTATION
-- **Error-Centric Search** - Find past sessions by error pattern
-
-**Setup (one-time):**
-```bash
-./scripts/ralph/install_hooks.sh        # Install CSR hooks globally
-./scripts/ralph/install_hooks.sh --check  # Verify installation
-```
-
-**How it works:**
-1. Start a Ralph loop in ANY project: `/ralph-wiggum:ralph-loop "Build feature X"`
-2. Work naturally - state is tracked in `.claude/ralph-loop.local.md`
-3. **Stop hook** captures each iteration automatically
-4. **PreCompact hook** backs up state before compaction
-5. All entries stored with project tags for cross-project search
-
-**Cross-Project Example:**
-```bash
-# In project-a: learned Docker fix
-# In project-b: CSR finds it automatically
-reflect_on_past("docker memory issue")
-# Returns: project_a session with Docker solution
-```
-
-**Verified proof (2026-01-05):**
-```
-# Hook collection shows cross-project entries:
-Total entries: 23
-
-1. 05:25:06 📦 PreCompact | 📧 emailmon
-2. 05:22:00 🔄 Iteration  | 🔍 claude-self-reflect
-3. 05:13:51 🔄 Iteration  | 📧 emailmon
-
-# Entries include project tags:
-tags: ['__csr_hook_auto__', 'project_emailmon', 'ralph_iteration']
-```
-
-[Full documentation →](docs/development/ralph-memory-integration.md)
 
 </details>
 
