@@ -1,6 +1,6 @@
 {
   "name": "claude-self-reflect",
-  "version": "7.1.9",
+  "version": "7.1.10",
   "description": "Give Claude perfect memory of all your conversations - Installation wizard for Python MCP server",
   "keywords": [
     "claude",
@@ -39,6 +39,7 @@
     "scripts/auto-migrate.cjs",
     "scripts/migrate-to-unified-state.py",
     "scripts/csr-status",
+    "scripts/ralph/**",
     "mcp-server/src/**/*.py",
     "mcp-server/pyproject.toml",
     "mcp-server/run-mcp.sh",
