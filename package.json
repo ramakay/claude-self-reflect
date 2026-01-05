@@ -1,6 +1,6 @@
 {
   "name": "claude-self-reflect",
-  "version": "7.1.10",
+  "version": "7.1.11",
   "description": "Give Claude perfect memory of all your conversations - Installation wizard for Python MCP server",
   "keywords": [
     "claude",
@@ -53,6 +53,9 @@
     "config/qdrant-config.yaml",
     "docker-compose.yaml",
     "Dockerfile.*",
+    "docs/design/**/*.py",
+    "docs/design/**/*.md",
+    "docs/design/conversation-analyzer/**",
     ".env.example",
     "README.md",
     "LICENSE"
