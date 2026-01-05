@@ -16,6 +16,7 @@ dependencies = [
     "pydantic-settings>=2.0.0,<3.0.0",
     "fastembed>=0.4.0,<1.0.0",
     "dependency-injector>=4.0.0,<5.0.0",
+    "aiofiles>=25.0.0,<26.0.0",  # Async file I/O for server.py
 ]
 
 [project.scripts]
