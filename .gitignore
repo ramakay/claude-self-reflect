@@ -151,3 +151,4 @@ ground_truth_*.jsonl
 narrative_*.txt
 batch_requests*.jsonl
 batch_results*.jsonl
+.ralph_state.md
