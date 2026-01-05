@@ -188,13 +188,15 @@ class CSRStandaloneClient:
     def store_reflection(
         self,
         content: str,
-        tags: List[str] = None
+        tags: List[str] = None,
+        collection: str = None
     ) -> str:
         """Store a reflection/insight.
 
         Args:
             content: The reflection content
             tags: Optional tags for categorization
+            collection: Optional custom collection name (for hooks to use separate storage)
 
         Returns:
             ID of stored reflection
@@ -204,7 +206,11 @@ class CSRStandaloneClient:
         embeddings = self._get_embedding_manager()
 
         # Determine collection name
-        collection_name = f"reflections_{'local' if self.prefer_local else 'voyage'}"
+        # Hooks can specify a custom collection to keep their data separate
+        if collection:
+            collection_name = collection
+        else:
+            collection_name = f"reflections_{'local' if self.prefer_local else 'voyage'}"
 
         # Ensure collection exists
         try:
@@ -270,6 +276,66 @@ class CSRStandaloneClient:
         normalized = re.sub(r'[^a-z0-9]', '_', normalized)
         normalized = re.sub(r'_+', '_', normalized)
         return normalized.strip('_')
+
+    def get_session_learnings(
+        self,
+        session_id: str,
+        limit: int = 50,
+        collection: str = None
+    ) -> List[Dict[str, Any]]:
+        """Get all learnings from a specific Ralph session.
+
+        This enables iteration-level memory: retrieve what was learned
+        in previous iterations of the SAME Ralph loop session.
+
+        Args:
+            session_id: The session ID (e.g., "ralph_20260104_224757_iter1")
+            limit: Maximum number of reflections to return
+            collection: Optional custom collection (for hook-stored data)
+
+        Returns:
+            List of reflection payloads from this session, each containing:
+            - content: The reflection text
+            - tags: List of tags (includes iteration info)
+            - timestamp: When it was stored
+        """
+        from qdrant_client import models
+
+        client = self._get_client()
+        if collection:
+            collection_name = collection
+        else:
+            collection_name = f"reflections_{'local' if self.prefer_local else 'voyage'}"
+
+        # Filter by session tag - matches reflections stored with session_{id} tag
+        session_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="tags",
+                    match=models.MatchAny(any=[f"session_{session_id}"])
+                )
+            ]
+        )
+
+        try:
+            results, _ = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=session_filter,
+                limit=limit,
+                with_payload=True,
+            )
+
+            return [
+                {
+                    "content": point.payload.get("content", ""),
+                    "tags": point.payload.get("tags", []),
+                    "timestamp": point.payload.get("timestamp", ""),
+                }
+                for point in results
+            ]
+        except Exception as e:
+            logger.error(f"Error getting session learnings: {e}")
+            return []
 
     def test_connection(self) -> bool:
         """Test if CSR is accessible.

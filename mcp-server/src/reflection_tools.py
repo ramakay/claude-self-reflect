@@ -207,12 +207,107 @@ Timestamp: {metadata['timestamp']}"""
 <error>Conversation ID '{conversation_id}' not found in any project.</error>
 <suggestion>The conversation may not have been imported yet, or the ID may be incorrect.</suggestion>
 </conversation_file>"""
-            
+
         except Exception as e:
             logger.error(f"Failed to get conversation file: {e}", exc_info=True)
             return f"""<conversation_file>
 <error>Failed to locate conversation: {str(e)}</error>
 </conversation_file>"""
+
+    async def get_session_learnings(
+        self,
+        ctx: Context,
+        session_id: str,
+        limit: int = 50
+    ) -> str:
+        """Get all learnings from a specific Ralph session.
+
+        This enables iteration-level memory: retrieve what was learned
+        in previous iterations of the SAME Ralph loop session.
+        """
+        from qdrant_client import models
+
+        await ctx.debug(f"Getting learnings for session: {session_id}")
+
+        try:
+            # Check runtime preference from environment
+            prefer_local = os.getenv('PREFER_LOCAL_EMBEDDINGS', 'true').lower() == 'true'
+            embedding_type = "local" if prefer_local else "voyage"
+            collection_name = f"reflections_{embedding_type}"
+
+            # Filter by session tag - matches reflections stored with session_{id} tag
+            session_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="tags",
+                        match=models.MatchAny(any=[f"session_{session_id}"])
+                    )
+                ]
+            )
+
+            results, _ = await self.qdrant_client.scroll(
+                collection_name=collection_name,
+                scroll_filter=session_filter,
+                limit=limit,
+                with_payload=True,
+            )
+
+            if not results:
+                await ctx.debug(f"No learnings found for session {session_id}")
+                return f"""<session_learnings>
+<session_id>{session_id}</session_id>
+<count>0</count>
+<message>No learnings stored yet for this session. Use store_reflection() with tags=['session_{session_id}', 'iteration_N', 'ralph_iteration'] to store iteration learnings.</message>
+</session_learnings>"""
+
+            # Format results
+            learnings = []
+            for point in results:
+                payload = point.payload or {}
+                tags = payload.get("tags", [])
+                # Extract iteration number from tags if present
+                iteration = "unknown"
+                for tag in tags:
+                    if tag.startswith("iteration_"):
+                        iteration = tag.replace("iteration_", "")
+                        break
+
+                learnings.append({
+                    "content": payload.get("content", ""),
+                    "iteration": iteration,
+                    "timestamp": payload.get("timestamp", ""),
+                    "tags": tags
+                })
+
+            # Sort by timestamp (oldest first for chronological order)
+            learnings.sort(key=lambda x: x.get("timestamp", ""))
+
+            await ctx.debug(f"Found {len(learnings)} learnings for session {session_id}")
+
+            # Format as XML for structured output
+            learnings_xml = "\n".join([
+                f"""<learning iteration="{l['iteration']}">
+<timestamp>{l['timestamp']}</timestamp>
+<content>{l['content']}</content>
+<tags>{', '.join(l['tags'])}</tags>
+</learning>"""
+                for l in learnings
+            ])
+
+            return f"""<session_learnings>
+<session_id>{session_id}</session_id>
+<count>{len(learnings)}</count>
+<learnings>
+{learnings_xml}
+</learnings>
+</session_learnings>"""
+
+        except Exception as e:
+            logger.error(f"Failed to get session learnings: {e}", exc_info=True)
+            return f"""<session_learnings>
+<session_id>{session_id}</session_id>
+<error>Failed to retrieve learnings: {str(e)}</error>
+</session_learnings>"""
 
 
 def register_reflection_tools(
@@ -249,5 +344,21 @@ def register_reflection_tools(
         """Get the full JSONL conversation file path for a conversation ID.
         This allows agents to read complete conversations instead of truncated excerpts."""
         return await tools.get_full_conversation(ctx, conversation_id, project)
-    
+
+    @mcp.tool()
+    async def get_session_learnings(
+        ctx: Context,
+        session_id: str = Field(description="Ralph session ID to get learnings from (e.g., 'ralph_20260104_224757_iter1')"),
+        limit: int = Field(default=50, description="Maximum number of learnings to return")
+    ) -> str:
+        """Get all learnings from a specific Ralph session.
+
+        This enables iteration-level memory: retrieve what was learned
+        in previous iterations of the SAME Ralph loop session.
+
+        Use this at the START of each Ralph iteration to see what previous
+        iterations learned. Then use store_reflection() with session tags
+        to save learnings at the END of each iteration."""
+        return await tools.get_session_learnings(ctx, session_id, limit)
+
     logger.info("Reflection tools registered successfully")

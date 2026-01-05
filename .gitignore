@@ -122,6 +122,7 @@ mcp-server/.fastembed-cache/
 
 # Articles and drafts (not for public repo)
 docs/articles/
+docs/linkedin/
 
 # Security - exclude test files with potential keys
 docs/testing/*verification*.md

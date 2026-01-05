@@ -26,7 +26,7 @@ Give Claude perfect memory of all your conversations. Search past discussions in
 
 **100% Local by Default** • **20x Faster** • **Zero Configuration** • **Production Ready**
 
-> **Latest: v7.0 Automated Narratives** - 9.3x better search quality via AI-powered summaries. [Learn more →](#v70-automated-narrative-generation)
+> **Latest: v7.1.9 Cross-Project Iteration Memory** - Ralph loops now share memory across ALL projects automatically. [Learn more →](#ralph-loop-memory-integration-v719)
 
 ## Why This Exists
 
@@ -326,13 +326,13 @@ Claude: [Searches across ALL your projects]
 </details>
 
 <details>
-<summary><b>Ralph Loop Memory Integration (v7.1+)</b></summary>
+<summary><b>Ralph Loop Memory Integration (v7.1.9+)</b></summary>
 
 <div align="center">
 <img src="docs/images/ralph-loop-csr.png" alt="Ralph Loop with CSR Memory - From hamster wheel to upward spiral" width="800"/>
 </div>
 
-Use the [ralph-wiggum plugin](https://github.com/anthropics/claude-code-plugins/tree/main/ralph-wiggum) for long tasks? CSR automatically gives Ralph loops **cross-session memory**:
+Use the [ralph-wiggum plugin](https://github.com/anthropics/claude-code-plugins/tree/main/ralph-wiggum) for long tasks? CSR automatically gives Ralph loops **cross-session AND cross-project memory**:
 
 **Core Features:**
 - **Automatic backup** before context compaction
@@ -340,43 +340,53 @@ Use the [ralph-wiggum plugin](https://github.com/anthropics/claude-code-plugins/
 - **Failed approach tracking** - never repeat the same mistakes
 - **Success pattern learning** - reuse what worked before
 
+**v7.1.9 Cross-Project Iteration Memory (NEW!):**
+- **Global Hook System** - Hooks fire for ALL projects, not just CSR
+- **Stop Hook** - Captures iteration state after every Claude response
+- **PreCompact Hook** - Backs up Ralph state before context compaction
+- **Project Tagging** - Each entry tagged with `project_{name}` for cross-project visibility
+- **Automatic Storage** - No manual protocol needed, hooks capture everything
+
 **v7.1+ Enhanced Features:**
-- **Error Signature Deduplication** - Normalizes errors (removes line numbers, paths, timestamps) to avoid redundant storage
-- **Output Decline Detection** - Circuit breaker pattern that detects >70% drop in output length
-- **Confidence-Based Exit** - 0-100 scoring based on signals (tasks complete, tests passing, no errors)
-- **Anti-Pattern Injection** - "DON'T RETRY THESE" section surfaces failed approaches first
-- **Work Type Tracking** - Categorizes sessions as IMPLEMENTATION/TESTING/DEBUGGING/DOCUMENTATION
-- **Error-Centric Search** - Finds past sessions by error pattern, not just task description
+- **Error Signature Deduplication** - Normalizes errors (removes line numbers, paths, timestamps)
+- **Output Decline Detection** - Circuit breaker pattern detects >70% output drop
+- **Confidence-Based Exit** - 0-100 scoring (tasks complete, tests passing, no errors)
+- **Anti-Pattern Injection** - "DON'T RETRY THESE" surfaces failed approaches first
+- **Work Type Tracking** - IMPLEMENTATION/TESTING/DEBUGGING/DOCUMENTATION
+- **Error-Centric Search** - Find past sessions by error pattern
 
 **Setup (one-time):**
 ```bash
-./scripts/ralph/install_hooks.sh        # Install CSR hooks
+./scripts/ralph/install_hooks.sh        # Install CSR hooks globally
 ./scripts/ralph/install_hooks.sh --check  # Verify installation
 ```
 
 **How it works:**
-1. Start a Ralph loop: `/ralph-wiggum:ralph-loop "Build feature X"`
+1. Start a Ralph loop in ANY project: `/ralph-wiggum:ralph-loop "Build feature X"`
 2. Work naturally - state is tracked in `.claude/ralph-loop.local.md`
-3. When compaction occurs, state is backed up to CSR
-4. New sessions retrieve past learnings from CSR automatically
-5. Anti-patterns and winning strategies are surfaced first
+3. **Stop hook** captures each iteration automatically
+4. **PreCompact hook** backs up state before compaction
+5. All entries stored with project tags for cross-project search
 
-**Files created:**
-- `.ralph_past_sessions.md` - Injected context from past sessions (auto-generated)
-
-**Verified proof (2026-01-04):**
+**Cross-Project Example:**
+```bash
+# In project-a: learned Docker fix
+# In project-b: CSR finds it automatically
+reflect_on_past("docker memory issue")
+# Returns: project_a session with Docker solution
 ```
-# Session start hook injects past sessions:
-INFO: Found 2 relevant results:
-  - Anti-patterns: 0
-  - Winning strategies: 0
-  - Similar tasks: 2
 
-# Sessions stored in Qdrant:
-{
-  "tags": ["ralph_session", "outcome_completed"],
-  "timestamp": "2026-01-04T18:13:03.711262+00:00"
-}
+**Verified proof (2026-01-05):**
+```
+# Hook collection shows cross-project entries:
+Total entries: 23
+
+1. 05:25:06 📦 PreCompact | 📧 emailmon
+2. 05:22:00 🔄 Iteration  | 🔍 claude-self-reflect
+3. 05:13:51 🔄 Iteration  | 📧 emailmon
+
+# Entries include project tags:
+tags: ['__csr_hook_auto__', 'project_emailmon', 'ralph_iteration']
 ```
 
 [Full documentation →](docs/development/ralph-memory-integration.md)

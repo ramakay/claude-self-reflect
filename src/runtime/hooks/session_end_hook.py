@@ -141,7 +141,10 @@ Promise Met: {state.completion_promise_met}
 """
 
         # Store with outcome-aware tags
+        # IMPORTANT: __csr_hook_auto__ is a distinct signature that identifies
+        # hook-stored reflections vs manually-stored ones during development
         tags = [
+            "__csr_hook_auto__",  # Hook signature - don't manually use this tag!
             "ralph_session",
             f"session_{state.session_id}",
             f"outcome_{outcome.lower()}",
@@ -165,7 +168,12 @@ Promise Met: {state.completion_promise_met}
 
         # Note: CSR store_reflection may not support metadata yet,
         # but we include the rich info in the narrative for searchability
-        client.store_reflection(content=narrative, tags=tags)
+        # Use hook-specific collection so random agents don't pollute it
+        client.store_reflection(
+            content=narrative,
+            tags=tags,
+            collection="csr_hook_sessions_local"  # Separate from user reflections
+        )
 
         logger.info(f"Stored session narrative: {outcome}, {state.iteration} iterations, confidence={exit_confidence}%")
 
@@ -179,7 +187,8 @@ Iterations: {state.iteration}
 """
             client.store_reflection(
                 content=success_summary,
-                tags=["ralph_success", "winning_strategy", f"work_type_{work_type.lower()}"]
+                tags=["__csr_hook_auto__", "ralph_success", "winning_strategy", f"work_type_{work_type.lower()}"],
+                collection="csr_hook_sessions_local"
             )
 
         return True

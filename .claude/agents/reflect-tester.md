@@ -1,7 +1,7 @@
 ---
 name: reflect-tester
 description: Comprehensive testing specialist for validating reflection system functionality. Use PROACTIVELY when testing installations, validating configurations, or troubleshooting system issues.
-tools: Read, Bash, Grep, LS, WebFetch, ListMcpResourcesTool, mcp__claude-self-reflect__reflect_on_past, mcp__claude-self-reflect__store_reflection
+tools: Read, Bash, Grep, LS, WebFetch, ListMcpResourcesTool, mcp__claude-self-reflect__reflect_on_past, mcp__claude-self-reflect__store_reflection, mcp__claude-self-reflect__get_session_learnings
 ---
 
 # Reflect Tester Agent
@@ -73,6 +73,12 @@ You are a specialized testing agent for Claude Self-Reflect. Your purpose is to 
    - Validate ralph-wiggum plugin is installable
    - Test backup/restore scripts work correctly
    - Verify .ralph_past_sessions.md is created with relevant context
+
+10. **Iteration-Level Memory Testing (v7.1.9)**
+    - Test `get_session_learnings` MCP tool
+    - Validate store → retrieve cycle with session tags
+    - Test iteration memory flow (store in iter 1, retrieve in iter 2)
+    - Verify session tag filtering works correctly
 
 ## Phased Testing Workflow
 
@@ -413,6 +419,136 @@ fi
 - ✅ Backup/restore scripts work correctly
 - ✅ CLI wizard offers Ralph integration during setup
 
+#### 5.7 Iteration-Level Memory Testing (v7.1.9)
+
+**What is Iteration Memory?**
+Within a single Ralph loop session, each iteration can store learnings that subsequent iterations can retrieve. This prevents Claude from retrying failed approaches and allows building on successful patterns across iterations.
+
+**CRITICAL: Iteration vs Session Memory**
+- **Iteration memory** (v7.1.9): Within-session, stores at iteration end, retrieves at next iteration start
+- **Session memory** (v7.1.0): Cross-session, stores at session end, retrieves at next session start
+
+**Test `get_session_learnings` MCP Tool:**
+```python
+# Test 1: Get learnings from current session (should be empty if just started)
+session_id = "ralph_20260104_224757_iter1"  # Use actual session ID from .ralph_state.md
+learnings = await get_session_learnings(session_id)
+# Expected: Either 0 results or previous iteration results
+
+# Test 2: Store a learning with proper iteration tags
+await store_reflection(
+    content="ITERATION 1 LEARNING: CSR storage works, search scores ~0.6-0.7",
+    tags=["session_ralph_20260104_224757_iter1", "iteration_1", "ralph_iteration"]
+)
+
+# Test 3: Retrieve the learning immediately
+learnings = await get_session_learnings("ralph_20260104_224757_iter1")
+# Expected: Count >= 1, contains the learning we just stored
+
+# Test 4: Verify iteration extraction
+# The tool should parse "iteration_1" from tags and include in output
+```
+
+**Test Store → Retrieve Cycle (Full Flow):**
+```bash
+# Step 1: Get current Ralph session ID (if in Ralph loop)
+SESSION_ID=$(grep -o 'Session ID:\*\* [^[:space:]]*' .ralph_state.md | cut -d' ' -f3)
+echo "Session ID: $SESSION_ID"
+
+# Step 2: Use Python to test the store → retrieve cycle
+python3 -c "
+import sys
+sys.path.insert(0, 'mcp-server/src')
+from standalone_client import CSRStandaloneClient
+
+client = CSRStandaloneClient()
+
+# Test connection
+if not client.test_connection():
+    print('❌ CSR connection failed')
+    sys.exit(1)
+print('✅ CSR connection works')
+
+# Store with session tag
+session_id = '$SESSION_ID'
+if not session_id:
+    session_id = 'test_session_001'
+
+reflection_id = client.store_reflection(
+    content='TEST: Iteration memory store/retrieve cycle works',
+    tags=[f'session_{session_id}', 'iteration_test', 'ralph_iteration']
+)
+print(f'✅ Stored reflection: {reflection_id}')
+
+# Retrieve by session
+learnings = client.get_session_learnings(session_id)
+print(f'✅ Retrieved {len(learnings)} learnings')
+
+if len(learnings) > 0:
+    print('✅ Store → Retrieve cycle WORKS')
+    print(f'   Latest: {learnings[0][\"content\"][:50]}...')
+else:
+    print('❌ Store → Retrieve cycle FAILED (no results)')
+"
+```
+
+**Test Iteration Memory Flow (Simulated Multi-Iteration):**
+```bash
+echo "=== Simulating 2-Iteration Flow ==="
+python3 -c "
+import sys
+sys.path.insert(0, 'mcp-server/src')
+from standalone_client import CSRStandaloneClient
+
+client = CSRStandaloneClient()
+session_id = 'sim_session_test'
+
+# Simulate ITERATION 1 END
+print('--- Iteration 1 End ---')
+client.store_reflection(
+    content='ITER 1: Tried npm 10.x, failed with ENEEDAUTH',
+    tags=[f'session_{session_id}', 'iteration_1', 'ralph_iteration', 'outcome_failure']
+)
+print('✅ Iteration 1 learning stored')
+
+# Simulate ITERATION 2 START
+print('--- Iteration 2 Start ---')
+learnings = client.get_session_learnings(session_id)
+if len(learnings) > 0:
+    print(f'✅ Found {len(learnings)} prior learnings')
+    for l in learnings:
+        iter_tag = [t for t in l['tags'] if t.startswith('iteration_')]
+        print(f'   [{iter_tag[0] if iter_tag else \"?\"}] {l[\"content\"][:60]}...')
+else:
+    print('❌ No prior learnings found - iteration memory not working')
+
+# Simulate ITERATION 2 END
+client.store_reflection(
+    content='ITER 2: Discovered environment mismatch - npm vs prod',
+    tags=[f'session_{session_id}', 'iteration_2', 'ralph_iteration', 'outcome_success']
+)
+print('✅ Iteration 2 learning stored')
+
+# Simulate ITERATION 3 START - should see both learnings
+print('--- Iteration 3 Start ---')
+all_learnings = client.get_session_learnings(session_id)
+print(f'✅ Total learnings available: {len(all_learnings)}')
+
+if len(all_learnings) >= 2:
+    print('✅ ITERATION MEMORY FULLY WORKS')
+else:
+    print('❌ ITERATION MEMORY INCOMPLETE')
+"
+```
+
+**Success Criteria for Iteration Memory (v7.1.9):**
+- ✅ `get_session_learnings` MCP tool exists and callable
+- ✅ Store with session tags → retrieve returns stored content
+- ✅ Multiple iterations accumulate learnings
+- ✅ Iteration number extracted from tags
+- ✅ Learnings sorted chronologically (oldest first)
+- ✅ Standalone client method works for hooks
+
 ## Success Criteria
 
 ✅ **Phase Completion**: All phases completed with user cooperation
@@ -520,6 +656,14 @@ fi
 - ralph-wiggum plugin: ✅ Installable via /plugin install
 - CSR search for Ralph: ✅ Finds past sessions
 - CLI integration: ✅ Setup wizard offers Ralph integration
+
+### Iteration-Level Memory (v7.1.9)
+- `get_session_learnings` MCP tool: ✅ Available
+- Standalone client method: ✅ Works
+- Store → Retrieve cycle: ✅ Works
+- Multi-iteration accumulation: ✅ Verified
+- Iteration tag extraction: ✅ Works
+- Chronological sorting: ✅ Oldest first
 
 ### Issues Found
 1. [None - all systems operational]

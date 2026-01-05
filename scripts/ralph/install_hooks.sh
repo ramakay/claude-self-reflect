@@ -129,13 +129,13 @@ ralph_hooks = {
         "matcher": "startup|resume",
         "hooks": [{
             "type": "command",
-            "command": f"python3 {project_root}/src/runtime/hooks/session_start_hook.py 2>/dev/null || true"
+            "command": f"{project_root}/venv/bin/python3 {project_root}/src/runtime/hooks/session_start_hook.py 2>/dev/null || true"
         }]
     }],
     "SessionEnd": [{
         "hooks": [{
             "type": "command",
-            "command": f"python3 {project_root}/src/runtime/hooks/session_end_hook.py 2>/dev/null || true"
+            "command": f"{project_root}/venv/bin/python3 {project_root}/src/runtime/hooks/session_end_hook.py 2>/dev/null || true"
         }]
     }]
 }
