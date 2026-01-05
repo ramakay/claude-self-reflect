@@ -151,11 +151,12 @@ def format_iteration_context(learnings: list, current_iteration: int) -> str:
 
 def main():
     """Main hook entry point - fires at each iteration boundary."""
-    # Read hook input
+    # Read hook input (required by Claude Code hook framework, but we use Ralph state file instead)
+    # The stdin contains transcript data, but Ralph state file is the authoritative source
     try:
-        input_data = json.load(sys.stdin)
+        _ = json.load(sys.stdin)  # Consume stdin as required by hook protocol
     except (json.JSONDecodeError, EOFError):
-        input_data = {}
+        pass  # No input is fine - we get state from .ralph_state.md
 
     # Check if Ralph loop active
     if not is_ralph_session():

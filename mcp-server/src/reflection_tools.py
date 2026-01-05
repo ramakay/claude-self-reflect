@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 from pathlib import Path
 import uuid
+from xml.sax.saxutils import escape as xml_escape
 
 from fastmcp import Context
 from pydantic import Field
@@ -284,12 +285,12 @@ Timestamp: {metadata['timestamp']}"""
 
             await ctx.debug(f"Found {len(learnings)} learnings for session {session_id}")
 
-            # Format as XML for structured output
+            # Format as XML for structured output (escape special chars for safety)
             learnings_xml = "\n".join([
-                f"""<learning iteration="{l['iteration']}">
-<timestamp>{l['timestamp']}</timestamp>
-<content>{l['content']}</content>
-<tags>{', '.join(l['tags'])}</tags>
+                f"""<learning iteration="{xml_escape(str(l['iteration']))}">
+<timestamp>{xml_escape(str(l['timestamp']))}</timestamp>
+<content>{xml_escape(str(l['content']))}</content>
+<tags>{xml_escape(', '.join(str(t) for t in l['tags']))}</tags>
 </learning>"""
                 for l in learnings
             ])
