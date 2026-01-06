@@ -5,7 +5,7 @@ import hashlib
 import re
 from pathlib import Path
 from typing import Optional, List, Tuple
-from config import logger, CLAUDE_PROJECTS_PATH
+from .config import logger, CLAUDE_PROJECTS_PATH
 
 class ProjectResolver:
     """Resolves project names and paths for Claude conversations."""

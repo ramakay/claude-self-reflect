@@ -16,8 +16,14 @@ RUN apt-get update && \
 # Copy the MCP server package files
 COPY mcp-server/pyproject.toml ./
 COPY mcp-server/src ./src
+# Copy shared module for cross-package imports
+COPY shared/ ./shared/
+# Set PYTHONPATH for proper imports
+ENV PYTHONPATH=/app
 
 # Install the package in development mode
+# Upgrade pip first to ensure all dependencies are resolved correctly
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir -e .
 
 # Create a non-root user

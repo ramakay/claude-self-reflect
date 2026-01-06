@@ -52,12 +52,21 @@ class BatchMonitor:
         """Initialize batch monitor."""
         # Validate API key is configured
         api_key = os.getenv("ANTHROPIC_API_KEY")
+
         if not api_key:
             raise ValueError(
                 "ANTHROPIC_API_KEY environment variable required for batch automation. "
                 "Get your key at: https://console.anthropic.com/settings/keys"
             )
-        self.client = anthropic.Anthropic(api_key=api_key)
+
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        if not base_url:
+            raise ValueError(
+                "ANTHROPIC_BASE_URL environment variable required for batch automation. "
+                "Get your key at: https://console.anthropic.com/settings/keys"
+            )
+
+        self.client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
 
         # Initialize Qdrant with retry logic
         self.qdrant = connect_to_qdrant_with_retry(
