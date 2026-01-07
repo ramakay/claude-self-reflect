@@ -137,6 +137,91 @@ def compare_expected_vs_actual(expected_files: Set[str], actual_files: Set[str])
     return missing_from_package, extra_in_package
 
 
+def extract_dockerfile_copy_sources() -> Set[str]:
+    """
+    Extract all COPY source paths from Dockerfile.* files.
+    This ensures npm package includes all files needed for Docker builds.
+
+    Fixes issue #124: Docker build failures due to missing files.
+    """
+    repo_root = get_repo_root()
+    copy_sources = set()
+
+    # Deprecated Dockerfiles that reference old paths (pre-v6.0.0 refactoring)
+    # These are legacy and should be updated or removed in a future cleanup
+    deprecated_dockerfiles = {
+        'Dockerfile.importer-isolated',
+        'Dockerfile.importer-isolated.alpine',
+        'Dockerfile.importer.alpine',
+        'Dockerfile.streaming-importer.alpine',
+    }
+
+    # Find all Dockerfile.* files
+    all_dockerfiles = list(repo_root.glob("Dockerfile.*"))
+    dockerfiles = [d for d in all_dockerfiles if d.name not in deprecated_dockerfiles]
+
+    if deprecated_dockerfiles:
+        excluded = [d.name for d in all_dockerfiles if d.name in deprecated_dockerfiles]
+        if excluded:
+            print(f"   ⚠️  Excluding {len(excluded)} deprecated Dockerfiles: {', '.join(excluded)}")
+
+    for dockerfile in dockerfiles:
+        try:
+            with open(dockerfile, 'r') as f:
+                content = f.read()
+
+            # Parse COPY statements: COPY source dest
+            # Match: COPY path/to/source ./dest OR COPY path/to/source .
+            for line in content.split('\n'):
+                line = line.strip()
+                if line.startswith('COPY ') and not line.startswith('COPY --from'):
+                    # Extract source path (first argument after COPY)
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        source = parts[1]
+                        # Normalize: remove trailing slashes, handle directories
+                        source = source.rstrip('/')
+                        copy_sources.add(source)
+        except Exception as e:
+            print(f"   ⚠️  Warning: Could not parse {dockerfile}: {e}")
+
+    return copy_sources
+
+
+def validate_dockerfile_sources(actual_files: Set[str], copy_sources: Set[str]) -> List[str]:
+    """
+    Validate that all Dockerfile COPY sources exist in the npm package.
+    This prevents Docker build failures after npm install.
+
+    Returns list of missing sources.
+    """
+    missing_sources = []
+
+    for source in copy_sources:
+        # Normalize the source path
+        source_normalized = source.rstrip('/')
+
+        # Check if source exists in actual files
+        # For directories like "src/", check if any file starts with that prefix
+        # For files like "requirements.txt", check exact match
+        found = False
+
+        for f in actual_files:
+            # Exact file match
+            if f == source_normalized:
+                found = True
+                break
+            # Directory match: file starts with "source/"
+            if f.startswith(source_normalized + '/'):
+                found = True
+                break
+
+        if not found:
+            missing_sources.append(source)
+
+    return missing_sources
+
+
 def validate_critical_files(actual_files: Set[str]) -> List[str]:
     """
     Validate that critical files are present in the package.
@@ -213,6 +298,13 @@ def main():
     print("-" * 70)
     missing_critical = validate_critical_files(actual_packaged_files)
 
+    # Validate Dockerfile COPY sources (Issue #124 prevention)
+    print("\n🐳 Validating Dockerfile COPY sources...")
+    print("-" * 70)
+    dockerfile_sources = extract_dockerfile_copy_sources()
+    print(f"   Found {len(dockerfile_sources)} COPY sources in Dockerfile.* files")
+    missing_dockerfile_sources = validate_dockerfile_sources(actual_packaged_files, dockerfile_sources)
+
     # Report findings
     print("")
     print("=" * 70)
@@ -230,6 +322,17 @@ def main():
         for pattern in sorted(missing_critical):
             print(f"  - {pattern}")
         print("\n💡 Fix: Ensure these patterns are in package.json 'files' array")
+        print("")
+
+    # Report missing Dockerfile COPY sources (ERRORS - Issue #124)
+    if missing_dockerfile_sources:
+        has_errors = True
+        print(f"❌ CRITICAL: {len(missing_dockerfile_sources)} Dockerfile COPY sources missing!")
+        print("\nMissing Dockerfile sources (will cause Docker build failures):")
+        for source in sorted(missing_dockerfile_sources):
+            print(f"  - {source}")
+        print("\n💡 Fix: Add these to package.json 'files' array")
+        print("   See issue #124 for details on this failure mode")
         print("")
 
     # Report files expected but not packaged (WARNINGS - might be npm defaults)
@@ -258,6 +361,7 @@ def main():
         print("=" * 70)
         print("\nThis test prevents issues like:")
         print("  - Issue #71: ModuleNotFoundError for refactored modules")
+        print("  - Issue #124: Docker build failures due to missing files")
         print("  - Discussion #70: Users unable to run setup")
         print("")
         print("Action required: Update package.json 'files' array with missing patterns")
@@ -271,6 +375,7 @@ def main():
         print("Package validation:")
         print(f"  ✓ {len(actual_packaged_files)} files will be packaged")
         print(f"  ✓ All critical patterns present")
+        print(f"  ✓ All Dockerfile COPY sources included")
         print(f"  ✓ package.json globs are working correctly")
         print("")
         print("=" * 70)
