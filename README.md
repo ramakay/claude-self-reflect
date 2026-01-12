@@ -205,6 +205,9 @@ Your code quality displayed live as you work:
 
 **9.3x Better Search Quality** • **50% Cost Savings** • **Fully Automated**
 
+> [!IMPORTANT]
+> **Opt-In Feature**: AI narratives require an Anthropic API key and are **enabled during CLI setup** when you answer "yes" to "Enable AI-powered narratives?". This sends conversation data to Anthropic for processing. Without an API key, CSR works normally with local-only search.
+
 v7.0 introduces AI-powered conversation narratives that transform raw conversation excerpts into rich problem-solution summaries with comprehensive metadata extraction.
 
 ### Before/After Comparison
