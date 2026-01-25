@@ -152,3 +152,6 @@ narrative_*.txt
 batch_requests*.jsonl
 batch_results*.jsonl
 .ralph_state.md
+
+# Local video projects
+video/
