@@ -364,26 +364,26 @@ class UnifiedStateManager:
                 break
 
         # Validate path is within allowed directories
+        # Base allowed paths for local environment
         allowed_bases = [
             Path.home() / ".claude",
             Path.home() / ".claude-self-reflect",
         ]
-
-        # Add Docker paths without existence check - relative_to() works mathematically
-        # on paths. Security validation is maintained via ValueError from relative_to()
-        # when path is not under allowed base. This fixes initial setup when dirs don't exist yet.
-        for docker_path in docker_paths:
-            docker_base = Path(docker_path)
-            allowed_bases.append(docker_base)
 
         # Check if path is within allowed directories
         path_allowed = False
 
         # In Docker: validate original path against Docker mounts
         # Note: No existence check needed - relative_to() works mathematically on paths
+        # Docker paths only added to allowed_bases when actually running in Docker context
         if is_docker_path:
+            # Add Docker mount paths only when validating Docker paths (security: don't widen trust on local)
+            docker_allowed_bases = allowed_bases.copy()
+            for docker_path in docker_paths:
+                docker_allowed_bases.append(Path(docker_path))
+
             original_resolved = Path(original_path_str).resolve()
-            for base in allowed_bases:
+            for base in docker_allowed_bases:
                 try:
                     original_resolved.relative_to(base)
                     path_allowed = True
@@ -391,7 +391,7 @@ class UnifiedStateManager:
                 except ValueError:
                     continue
         else:
-            # Local environment: validate transformed path
+            # Local environment: validate transformed path (no Docker paths in allowed list)
             for base in allowed_bases:
                 try:
                     resolved.relative_to(base)

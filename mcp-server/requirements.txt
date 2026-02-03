@@ -6,4 +6,4 @@ pydantic>=2.0.0
 pydantic-settings>=2.0.0
 numpy>=1.24.0
 fastembed>=0.2.0
-aiofiles>=23.0.0
+aiofiles>=23.0.0,<25.0.0
