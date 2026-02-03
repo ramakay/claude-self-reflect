@@ -3,6 +3,13 @@
 Batch import ALL Claude Code projects with V3+SKILL_V2 to Qdrant.
 
 Uses batching for efficient API calls and tracks costs across all projects.
+
+Configuration:
+  MIN_FILE_SIZE_KB: Minimum file size to process (default: 50KB)
+                    Files below this threshold are skipped as they're likely
+                    empty/initialization sessions that waste API costs.
+
+  Model: claude-haiku-4-5-20251001 (cost-efficient, ~$0.50/conversation)
 """
 
 import os
@@ -124,7 +131,7 @@ Now generate the narrative following SKILL_V2 format exactly, using ALL the cont
         batch_requests.append({
             "custom_id": data['conv_id'],
             "params": {
-                "model": "claude-sonnet-4-5-20250929",
+                "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 2048,
                 "system": skill_instructions,
                 "messages": [{"role": "user", "content": prompt}]
@@ -229,8 +236,12 @@ def discover_projects():
         if project_dir.name in ['test-streaming-project', 'test-voyage-import', 'claude-self-reflect-stress-test']:
             continue  # Skip test projects
 
-        # Count JSONL files
-        jsonl_files = list(project_dir.glob("*.jsonl"))
+        # Count JSONL files (filter out small/empty files)
+        MIN_FILE_SIZE = 50_000  # 50KB minimum - skip empty/initialization sessions
+        jsonl_files = [
+            f for f in project_dir.glob("*.jsonl")
+            if f.stat().st_size >= MIN_FILE_SIZE
+        ]
         if jsonl_files:
             # Extract project name from directory
             # Format: "-Users-rama-projects-procsolve-website" -> "procsolve-website"

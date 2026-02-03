@@ -94,7 +94,7 @@ def process_conversation(jsonl_path: Path, client: anthropic.Anthropic, skill_in
 Now generate the narrative following SKILL_V2 format exactly."""
 
     response = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
+        model="claude-haiku-4-5-20251001",
         max_tokens=2048,
         system=skill_instructions,
         messages=[{"role": "user", "content": prompt}]
