@@ -369,7 +369,9 @@ class UnifiedStateManager:
             Path.home() / ".claude-self-reflect",
         ]
 
-        # Add Docker paths (no existence check - relative_to works mathematically)
+        # Add Docker paths without existence check - relative_to() works mathematically
+        # on paths. Security validation is maintained via ValueError from relative_to()
+        # when path is not under allowed base. This fixes initial setup when dirs don't exist yet.
         for docker_path in docker_paths:
             docker_base = Path(docker_path)
             allowed_bases.append(docker_base)
