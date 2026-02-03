@@ -369,34 +369,32 @@ class UnifiedStateManager:
             Path.home() / ".claude-self-reflect",
         ]
 
-        # Add Docker paths if they exist
+        # Add Docker paths (no existence check - relative_to works mathematically)
         for docker_path in docker_paths:
             docker_base = Path(docker_path)
-            if docker_base.exists():
-                allowed_bases.append(docker_base)
+            allowed_bases.append(docker_base)
 
         # Check if path is within allowed directories
         path_allowed = False
 
         # In Docker: validate original path against Docker mounts
+        # Note: No existence check needed - relative_to() works mathematically on paths
         if is_docker_path:
             original_resolved = Path(original_path_str).resolve()
             for base in allowed_bases:
                 try:
-                    if base.exists():
-                        original_resolved.relative_to(base)
-                        path_allowed = True
-                        break
+                    original_resolved.relative_to(base)
+                    path_allowed = True
+                    break
                 except ValueError:
                     continue
         else:
             # Local environment: validate transformed path
             for base in allowed_bases:
                 try:
-                    if base.exists():
-                        resolved.relative_to(base)
-                        path_allowed = True
-                        break
+                    resolved.relative_to(base)
+                    path_allowed = True
+                    break
                 except ValueError:
                     continue
 
