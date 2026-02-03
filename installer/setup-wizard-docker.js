@@ -537,7 +537,7 @@ async function enrichMetadata() {
         '-e', 'RATE_LIMIT_DELAY=0.5',
         '-e', 'MAX_CONCURRENT_UPDATES=2',
         'importer',
-        'python', '/app/scripts/delta-metadata-update-safe.py'
+        'python', '/app/src/runtime/delta-metadata-update-safe.py'
       ], {
         cwd: projectRoot,
         stdio: 'inherit'
@@ -548,12 +548,12 @@ async function enrichMetadata() {
     } catch (error) {
       console.log('\n⚠️  Metadata enrichment had some issues but continuing setup');
       console.log('   You can retry later with:');
-      console.log('   docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.py');
+      console.log('   docker compose run --rm importer python /app/src/runtime/delta-metadata-update-safe.py');
     }
   } else {
     console.log('\n📝 Skipping metadata enrichment.');
     console.log('   You can run it later with:');
-    console.log('   docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.py');
+    console.log('   docker compose run --rm importer python /app/src/runtime/delta-metadata-update-safe.py');
   }
 }
 
@@ -770,7 +770,7 @@ async function showFinalInstructions() {
   console.log('   • Check status: docker compose ps');
   console.log('   • View logs: docker compose logs -f');
   console.log('   • Import conversations: docker compose run --rm importer');
-  console.log('   • Enrich metadata: docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.py');
+  console.log('   • Enrich metadata: docker compose run --rm importer python /app/src/runtime/delta-metadata-update-safe.py');
   console.log('   • Start watcher: docker compose --profile watch up -d');
   console.log('   • Ralph hooks: ./scripts/ralph/install_hooks.sh --check');
   console.log('   • Stop all: docker compose down');
@@ -817,7 +817,7 @@ async function checkExistingInstallation() {
         console.log('\n📋 Quick Commands:');
         console.log('   • View status: docker compose ps');
         console.log('   • View logs: docker compose logs -f');
-        console.log('   • Enrich metadata: docker compose run --rm importer python /app/scripts/delta-metadata-update-safe.py');
+        console.log('   • Enrich metadata: docker compose run --rm importer python /app/src/runtime/delta-metadata-update-safe.py');
         console.log('   • Restart: docker compose restart');
         console.log('   • Stop: docker compose down');
         
