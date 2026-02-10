@@ -291,10 +291,10 @@ class BatchWatcher:
         logger.info(f"   Files: {len(batch_files)}")
         logger.info(f"{'='*60}\n")
 
-        try:
-            import subprocess
+        import subprocess
 
-            # Run batch import script with configurable timeout
+        # Step 1: Run the batch import
+        try:
             result = subprocess.run(
                 [sys.executable, str(BATCH_IMPORT_SCRIPT)],
                 capture_output=True,
@@ -306,29 +306,35 @@ class BatchWatcher:
             logger.info("\n✅ Batch triggered successfully")
             logger.info("   Output:\n%s", result.stdout)
 
-            # Mark files as processed
-            for entry in batch_files:
-                self.state_manager.add_imported_file(
-                    file_path=entry["file_path"],
-                    chunks=0,  # Will be updated by batch import
-                    metadata={"batch_queued": True}
-                )
-
         except subprocess.CalledProcessError as cpe:
             logger.error("❌ Batch import failed (rc=%s)", cpe.returncode)
             logger.error("   Stdout: %s", cpe.stdout)
             logger.error("   Stderr: %s", cpe.stderr)
 
-            # Re-queue failed files
+            # Re-queue only on actual batch failure
             for entry in batch_files:
                 self.batch_queue.add(entry["file_path"], entry["project"])
+            return
 
-        except Exception as e:
-            logger.error("❌ Error triggering batch: %s", e, exc_info=True)
+        except subprocess.TimeoutExpired as te:
+            logger.error("❌ Batch import timed out after %ss", SUBPROCESS_TIMEOUT_SECONDS)
 
-            # Re-queue failed files
+            # Re-queue on timeout
             for entry in batch_files:
                 self.batch_queue.add(entry["file_path"], entry["project"])
+            return
+
+        # Step 2: Mark files as processed (batch succeeded, don't re-queue on failure here)
+        for entry in batch_files:
+            try:
+                self.state_manager.add_imported_file(
+                    file_path=entry["file_path"],
+                    chunks=0,
+                    importer="batch",
+                    status="completed"
+                )
+            except Exception as e:
+                logger.warning("⚠️ Failed to mark %s as processed: %s", entry["file_path"], e)
 
     def _hot_cycle(self):
         """Fast cycle to check for HOT files only."""
