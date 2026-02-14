@@ -1,0 +1,31 @@
+[package]
+name = "csr-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Claude Self-Reflect: Rust MCP server with embedded vector search"
+
+[dependencies]
+rmcp = { version = "0.15", features = ["server", "transport-io"] }
+fastembed = "5.9"
+hnsw_rs = "0.3"
+rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "v5"] }
+dirs = "6"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[[bench]]
+name = "spike_bench"
+harness = false
