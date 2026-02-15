@@ -293,6 +293,7 @@ mod tests {
                 timestamp: "2026-01-15T10:00:00Z".into(),
                 content: "hello".into(),
                 message_count: 1,
+                summary: None,
             },
             ConversationChunk {
                 id: "2".into(),
@@ -301,6 +302,7 @@ mod tests {
                 timestamp: "2026-01-15T14:00:00Z".into(),
                 content: "world".into(),
                 message_count: 1,
+                summary: None,
             },
             ConversationChunk {
                 id: "3".into(),
@@ -309,6 +311,7 @@ mod tests {
                 timestamp: "2026-01-16T10:00:00Z".into(),
                 content: "other".into(),
                 message_count: 1,
+                summary: None,
             },
         ];
 
@@ -395,6 +398,7 @@ mod tests {
                 timestamp: "2026-01-15T10:00:00Z".into(),
                 content: "with Z".into(),
                 message_count: 1,
+                summary: None,
             },
             ConversationChunk {
                 id: "2".into(),
@@ -403,6 +407,7 @@ mod tests {
                 timestamp: "2026-01-15T14:00:00.123456".into(),
                 content: "without Z".into(),
                 message_count: 1,
+                summary: None,
             },
         ];
 

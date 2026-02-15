@@ -20,8 +20,8 @@ fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
 
 pub fn insert_chunk(conn: &Connection, chunk: &ConversationChunk, embedding: &[f32]) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             chunk.id,
             chunk.conversation_id,
@@ -29,6 +29,7 @@ pub fn insert_chunk(conn: &Connection, chunk: &ConversationChunk, embedding: &[f
             chunk.timestamp,
             chunk.content,
             chunk.message_count as i64,
+            chunk.summary,
         ],
     )?;
 
@@ -68,7 +69,7 @@ pub fn get_chunks_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<Conver
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(
-        "SELECT id, conversation_id, project_name, timestamp, content, message_count
+        "SELECT id, conversation_id, project_name, timestamp, content, message_count, summary
          FROM chunks WHERE id = ?1",
     )?;
     let mut chunks = Vec::new();
@@ -161,19 +162,10 @@ pub fn get_chunks_by_project(
     limit: usize,
 ) -> Result<Vec<ConversationChunk>> {
     let mut stmt = conn.prepare(
-        "SELECT id, conversation_id, project_name, timestamp, content, message_count
+        "SELECT id, conversation_id, project_name, timestamp, content, message_count, summary
          FROM chunks WHERE project_name = ?1 ORDER BY timestamp DESC LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![project, limit as i64], |row| {
-        Ok(ConversationChunk {
-            id: row.get(0)?,
-            conversation_id: row.get(1)?,
-            project_name: row.get(2)?,
-            timestamp: row.get(3)?,
-            content: row.get(4)?,
-            message_count: row.get::<_, i64>(5)? as usize,
-        })
-    })?;
+    let rows = stmt.query_map(params![project, limit as i64], row_to_chunk)?;
     let mut chunks = Vec::new();
     for row in rows {
         chunks.push(row?);
@@ -194,7 +186,7 @@ pub fn get_recent_chunks(
     let mut stmt;
     let rows = if let Some(p) = project.filter(|p| *p != "all") {
         stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary
              FROM chunks c
              INNER JOIN (
                  SELECT conversation_id, MAX(timestamp) as max_ts
@@ -208,7 +200,7 @@ pub fn get_recent_chunks(
         stmt.query_map(params![p, fetch_limit], row_to_chunk)?
     } else {
         stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary
              FROM chunks c
              INNER JOIN (
                  SELECT conversation_id, MAX(timestamp) as max_ts
@@ -242,7 +234,7 @@ pub fn get_chunks_in_timerange(
 ) -> Result<Vec<ConversationChunk>> {
     let chunks = if let Some(p) = project.filter(|p| *p != "all") {
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, project_name, timestamp, content, message_count
+            "SELECT id, conversation_id, project_name, timestamp, content, message_count, summary
              FROM chunks WHERE timestamp BETWEEN ?1 AND ?2 AND project_name = ?3
              ORDER BY timestamp DESC",
         )?;
@@ -250,7 +242,7 @@ pub fn get_chunks_in_timerange(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, project_name, timestamp, content, message_count
+            "SELECT id, conversation_id, project_name, timestamp, content, message_count, summary
              FROM chunks WHERE timestamp BETWEEN ?1 AND ?2
              ORDER BY timestamp DESC",
         )?;
@@ -302,7 +294,7 @@ pub fn fts5_search(
 
     let chunks = if let Some(p) = project.filter(|p| *p != "all") {
         let mut stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary
              FROM chunks c
              JOIN chunks_fts fts ON fts.rowid = c.rowid
              WHERE chunks_fts MATCH ?1 AND c.project_name = ?2
@@ -313,7 +305,7 @@ pub fn fts5_search(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         let mut stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary
              FROM chunks c
              JOIN chunks_fts fts ON fts.rowid = c.rowid
              WHERE chunks_fts MATCH ?1
@@ -359,6 +351,7 @@ pub fn get_reflections_by_tag(
 }
 
 /// Helper: map a row to ConversationChunk.
+/// Expects columns: id, conversation_id, project_name, timestamp, content, message_count, summary
 fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
     Ok(ConversationChunk {
         id: row.get(0)?,
@@ -367,6 +360,7 @@ fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
         timestamp: row.get(3)?,
         content: row.get(4)?,
         message_count: row.get::<_, i64>(5)? as usize,
+        summary: row.get(6)?,
     })
 }
 

@@ -84,6 +84,14 @@ pub fn run(conn: &Connection) -> Result<()> {
         );
     }
 
+    // Migration: add summary column to chunks table if missing (for timeline display)
+    let has_summary_col: bool = conn
+        .prepare("SELECT summary FROM chunks LIMIT 0")
+        .is_ok();
+    if !has_summary_col {
+        let _ = conn.execute_batch("ALTER TABLE chunks ADD COLUMN summary TEXT;");
+    }
+
     // FTS5 for hybrid search — CREATE VIRTUAL TABLE doesn't support IF NOT EXISTS
     // so we check manually
     let has_fts: bool = conn

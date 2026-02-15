@@ -72,11 +72,14 @@ async fn handle_inner(
             if !chunks.is_empty() {
                 output.push_str("\n\n\u{1f4cb} Recent sessions:");
                 for chunk in &chunks {
-                    output.push_str(&format!("\n  {}", format_timeline_line(&chunk.timestamp, chunk.message_count, &chunk.content, &now)));
+                    // Prefer summary over raw content for readable timeline
+                    let display_text = chunk.summary.as_deref().unwrap_or(&chunk.content);
+                    output.push_str(&format!("\n  {}", format_timeline_line(&chunk.timestamp, chunk.message_count, display_text, &now)));
                 }
 
-                // Infer next action from the most recent session
-                let suggestion = infer_next_action(&chunks[0].content);
+                // Infer next action from summary if available, else raw content
+                let best_text = chunks[0].summary.as_deref().unwrap_or(&chunks[0].content);
+                let suggestion = infer_next_action(best_text);
                 output.push_str(&format!("\n\n\u{1f4a1} Suggested next: {suggestion}"));
                 output.push_str("\n\u{1f50d} Drill down: use get_recent_work, reflect_on_past, or get_full_conversation");
             }

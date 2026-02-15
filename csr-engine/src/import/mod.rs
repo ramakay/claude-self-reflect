@@ -16,6 +16,9 @@ pub struct ConversationChunk {
     pub timestamp: String,
     pub content: String,
     pub message_count: usize,
+    /// Human-readable summary from JSONL `{"type":"summary"}` line, or first user message.
+    /// Used for timeline display instead of raw tool-heavy content.
+    pub summary: Option<String>,
 }
 
 /// Namespace UUID for deterministic chunk IDs (UUIDv5).
@@ -110,6 +113,9 @@ pub fn list_jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Parse a JSONL conversation file into chunks of ~50 messages each.
 /// Uses BufReader streaming + sonic-rs for ~2.8x faster parsing.
+///
+/// Extracts conversation summary from `{"type":"summary"}` lines when available.
+/// Falls back to the first user message for timeline display.
 pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<ConversationChunk>> {
     let conversation_id = path
         .file_stem()
@@ -121,6 +127,8 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     let reader = BufReader::new(file);
     let mut messages: Vec<String> = Vec::new();
     let mut first_timestamp: Option<String> = None;
+    let mut summary: Option<String> = None;
+    let mut first_user_message: Option<String> = None;
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -142,6 +150,16 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
+        // Capture summary line (Claude Code writes {"type":"summary","summary":"..."})
+        if msg_type == "summary" {
+            if let Some(s) = parsed.get("summary").and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    summary = Some(s.to_string());
+                }
+            }
+            continue;
+        }
+
         // Include human/user/assistant messages (Claude Code uses "user", not "human")
         if msg_type != "human" && msg_type != "user" && msg_type != "assistant" {
             continue;
@@ -151,6 +169,21 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
         if first_timestamp.is_none() {
             if let Some(ts) = parsed.get("timestamp").and_then(|v| v.as_str()) {
                 first_timestamp = Some(ts.to_string());
+            }
+        }
+
+        // Capture first user message as fallback summary (what the user was trying to do)
+        if first_user_message.is_none() && (msg_type == "user" || msg_type == "human") {
+            let text = extract_message_text(&parsed);
+            if !text.is_empty() && text.len() > 5 {
+                // Truncate to 200 chars for timeline preview
+                let preview = if text.len() > 200 {
+                    let boundary = text.floor_char_boundary(200);
+                    format!("{}...", &text[..boundary])
+                } else {
+                    text.clone()
+                };
+                first_user_message = Some(preview);
             }
         }
 
@@ -175,6 +208,9 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
 
     let timestamp = first_timestamp.unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
+    // Priority: JSONL summary > first user message > None
+    let chunk_summary = summary.or(first_user_message);
+
     // Chunk into groups of 50 messages
     let chunk_size = 50;
     let mut chunks = Vec::new();
@@ -190,6 +226,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             timestamp: timestamp.clone(),
             content: combined,
             message_count: chunk_msgs.len(),
+            summary: chunk_summary.clone(),
         });
     }
 

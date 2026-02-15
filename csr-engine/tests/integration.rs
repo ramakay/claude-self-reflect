@@ -58,6 +58,7 @@ fn test_storage_insert_and_retrieve() {
         timestamp: "2026-01-15T10:00:00Z".into(),
         content: "Docker memory issue discussion".into(),
         message_count: 4,
+        summary: None,
     };
 
     // Fake 384-dim embedding
@@ -89,6 +90,7 @@ fn test_project_filtering() {
                 timestamp: format!("2026-01-{}T10:00:00Z", 15 + i),
                 content: format!("Content from {} chunk {}", project, j),
                 message_count: 2,
+                summary: None,
             };
             storage.insert_chunk(&chunk, &fake_emb).unwrap();
         }
@@ -126,6 +128,7 @@ fn test_time_range_filtering() {
             timestamp: ts.to_string(),
             content: format!("Content at {}", ts),
             message_count: 1,
+            summary: None,
         };
         storage.insert_chunk(&chunk, &fake_emb).unwrap();
     }
@@ -157,6 +160,7 @@ fn test_fts5_search() {
             timestamp: "2026-01-15T10:00:00Z".into(),
             content: "We modified docker-compose.yaml to fix the memory limit".into(),
             message_count: 2,
+            summary: None,
         },
         ConversationChunk {
             id: "fts-2".into(),
@@ -165,6 +169,7 @@ fn test_fts5_search() {
             timestamp: "2026-01-16T10:00:00Z".into(),
             content: "Authentication was added using JWT tokens in auth.rs".into(),
             message_count: 2,
+            summary: None,
         },
     ];
 
@@ -360,6 +365,7 @@ fn test_format_search_results_structure() {
             timestamp: "2026-01-15T10:00:00Z".into(),
             content: "Docker memory fix applied".into(),
             message_count: 4,
+            summary: None,
         },
     }];
 
@@ -384,6 +390,7 @@ fn test_format_quick_check_structure() {
             timestamp: "2026-01-15T10:00:00Z".into(),
             content: "JWT authentication setup".into(),
             message_count: 2,
+            summary: None,
         },
     }];
 
@@ -415,6 +422,7 @@ fn test_xml_escaping_in_output() {
             timestamp: "2026-01-15T10:00:00Z".into(),
             content: "Content with <script>alert('xss')</script> & \"quotes\"".into(),
             message_count: 1,
+            summary: None,
         },
     }];
 
@@ -511,6 +519,7 @@ fn test_recent_chunks() {
             timestamp: format!("2026-01-{}T10:00:00Z", 15 + i),
             content: format!("Content {}", i),
             message_count: 1,
+            summary: None,
         };
         storage.insert_chunk(&chunk, &fake_emb).unwrap();
     }
@@ -534,6 +543,7 @@ fn test_timeline_grouping() {
             timestamp: "2026-01-15T10:00:00Z".into(),
             content: "morning".into(),
             message_count: 1,
+            summary: None,
         },
         ConversationChunk {
             id: "tl-2".into(),
@@ -542,6 +552,7 @@ fn test_timeline_grouping() {
             timestamp: "2026-01-15T14:00:00Z".into(),
             content: "afternoon".into(),
             message_count: 1,
+            summary: None,
         },
         ConversationChunk {
             id: "tl-3".into(),
@@ -550,6 +561,7 @@ fn test_timeline_grouping() {
             timestamp: "2026-01-16T10:00:00Z".into(),
             content: "next day".into(),
             message_count: 1,
+            summary: None,
         },
     ];
 
@@ -584,6 +596,7 @@ fn test_full_pipeline_storage_search_format() {
             timestamp: "2026-01-15T10:00:00Z".into(),
             content: content.to_string(),
             message_count: 2,
+            summary: None,
         };
 
         let mut embedding = vec![0.0f32; 384];
@@ -636,6 +649,7 @@ fn test_vector_storage_roundtrip() {
         timestamp: "2026-01-15T10:00:00Z".into(),
         content: "test content".into(),
         message_count: 1,
+        summary: None,
     };
 
     // Create a specific vector

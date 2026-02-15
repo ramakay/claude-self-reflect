@@ -169,6 +169,7 @@ fn bench_sqlite_operations(c: &mut Criterion) {
                 timestamp: "2026-02-14T10:00:00Z".to_string(),
                 content: format!("Benchmark chunk {} content about Docker and Rust.", i),
                 message_count: 10,
+                summary: None,
             };
             (chunk, vec)
         })
