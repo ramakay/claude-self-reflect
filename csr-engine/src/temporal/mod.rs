@@ -84,13 +84,34 @@ fn parse_dynamic_expression(
     now: DateTime<Utc>,
     today_start: DateTime<Utc>,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    // "past N days" / "last N days"
+    // "past N days/weeks/months" / "last N days/weeks/months"
     for prefix in &["past ", "last "] {
         if expr.starts_with(prefix) {
             let rest = &expr[prefix.len()..];
             if let Some(n_str) = rest.strip_suffix(" days") {
                 if let Ok(n) = n_str.trim().parse::<i64>() {
-                    let start = now - Duration::days(n);
+                    return Ok((now - Duration::days(n), now));
+                }
+            }
+            if let Some(n_str) = rest.strip_suffix(" weeks") {
+                if let Ok(n) = n_str.trim().parse::<i64>() {
+                    return Ok((now - Duration::weeks(n), now));
+                }
+            }
+            if let Some(n_str) = rest
+                .strip_suffix(" months")
+                .or_else(|| rest.strip_suffix(" month"))
+            {
+                if let Ok(n) = n_str.trim().parse::<u32>() {
+                    let n = n.min(1200); // Cap at 100 years to prevent DoS
+                    let total_months = now.year() as i32 * 12 + now.month() as i32 - 1 - n as i32;
+                    let year = total_months.div_euclid(12);
+                    let month = (total_months.rem_euclid(12) + 1) as u32;
+                    let start = NaiveDate::from_ymd_opt(year, month, 1)
+                        .unwrap_or_else(|| now.date_naive())
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc();
                     return Ok((start, now));
                 }
             }
@@ -295,6 +316,38 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups["2026-01-15"].len(), 2);
         assert_eq!(groups["2026-01-16"].len(), 1);
+    }
+
+    #[test]
+    fn test_parse_last_n_weeks() {
+        let (start, end) = parse_time_expression("last 2 weeks").unwrap();
+        let diff = end - start;
+        assert!((diff.num_days() - 14).abs() <= 1);
+    }
+
+    #[test]
+    fn test_parse_past_n_weeks() {
+        let (start, end) = parse_time_expression("past 3 weeks").unwrap();
+        let diff = end - start;
+        assert!((diff.num_days() - 21).abs() <= 1);
+    }
+
+    #[test]
+    fn test_parse_last_n_months() {
+        let (start, end) = parse_time_expression("last 6 months").unwrap();
+        assert!(start < end);
+        // Should be roughly 180 days
+        let diff = end - start;
+        assert!(diff.num_days() > 150 && diff.num_days() < 200);
+    }
+
+    #[test]
+    fn test_parse_last_1_month_singular() {
+        let (start, end) = parse_time_expression("last 1 month").unwrap();
+        assert!(start < end);
+        let diff = end - start;
+        // "last 1 month" starts on the 1st of the previous month, so range is 28-62 days
+        assert!(diff.num_days() >= 28 && diff.num_days() <= 62);
     }
 
     #[test]

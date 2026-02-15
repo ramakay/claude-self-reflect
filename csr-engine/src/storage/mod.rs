@@ -220,6 +220,18 @@ impl Storage {
         queries::get_enrichment_reflection_id(&conn, conversation_id, enrichment_type)
     }
 
+    // ─── Count queries (for HNSW cache staleness) ───
+
+    pub fn count_chunk_embeddings(&self) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::count_chunk_embeddings(&conn)
+    }
+
+    pub fn count_reflection_embeddings(&self) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::count_reflection_embeddings(&conn)
+    }
+
     // ─── Import state ───
 
     pub fn is_file_imported(&self, path: &Path) -> Result<bool> {

@@ -184,6 +184,8 @@ pub fn get_chunks_by_project(
 // ─── Temporal queries ───
 
 /// Get recent chunks ordered by timestamp descending.
+/// Returns one representative chunk per unique conversation (the most recent chunk),
+/// ensuring the limit applies to distinct conversations, not raw chunks.
 pub fn get_recent_chunks(
     conn: &Connection,
     limit: usize,
@@ -192,22 +194,42 @@ pub fn get_recent_chunks(
     let mut stmt;
     let rows = if let Some(p) = project.filter(|p| *p != "all") {
         stmt = conn.prepare(
-            "SELECT id, conversation_id, project_name, timestamp, content, message_count
-             FROM chunks WHERE project_name = ?1 ORDER BY timestamp DESC LIMIT ?2",
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count
+             FROM chunks c
+             INNER JOIN (
+                 SELECT conversation_id, MAX(timestamp) as max_ts
+                 FROM chunks WHERE project_name = ?1
+                 GROUP BY conversation_id
+             ) latest ON c.conversation_id = latest.conversation_id AND c.timestamp = latest.max_ts
+             WHERE c.project_name = ?1
+             ORDER BY c.timestamp DESC LIMIT ?2",
         )?;
-        stmt.query_map(params![p, limit as i64], row_to_chunk)?
+        let fetch_limit = (limit * 2) as i64; // Over-fetch to compensate for timestamp dupes
+        stmt.query_map(params![p, fetch_limit], row_to_chunk)?
     } else {
         stmt = conn.prepare(
-            "SELECT id, conversation_id, project_name, timestamp, content, message_count
-             FROM chunks ORDER BY timestamp DESC LIMIT ?1",
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count
+             FROM chunks c
+             INNER JOIN (
+                 SELECT conversation_id, MAX(timestamp) as max_ts
+                 FROM chunks
+                 GROUP BY conversation_id
+             ) latest ON c.conversation_id = latest.conversation_id AND c.timestamp = latest.max_ts
+             ORDER BY c.timestamp DESC LIMIT ?1",
         )?;
-        stmt.query_map(params![limit as i64], row_to_chunk)?
+        let fetch_limit = (limit * 2) as i64; // Over-fetch to compensate for timestamp dupes
+        stmt.query_map(params![fetch_limit], row_to_chunk)?
     };
 
     let mut chunks = Vec::new();
     for row in rows {
         chunks.push(row?);
     }
+    // Deduplicate: multiple chunks can share the same max timestamp per conversation.
+    // Keep the first (latest) chunk per conversation_id, then truncate to requested limit.
+    let mut seen = std::collections::HashSet::new();
+    chunks.retain(|c| seen.insert(c.conversation_id.clone()));
+    chunks.truncate(limit);
     Ok(chunks)
 }
 
@@ -510,4 +532,21 @@ pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Resu
         params![path_str, conv_id, chunks as i64],
     )?;
     Ok(())
+}
+
+// ─── Count queries (for HNSW persistence staleness detection) ───
+
+/// Fast O(1) count of chunk embeddings for HNSW cache staleness check.
+pub fn count_chunk_embeddings(conn: &Connection) -> Result<usize> {
+    let count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |row| row.get(0))?;
+    Ok(count as usize)
+}
+
+/// Fast O(1) count of reflection embeddings for HNSW cache staleness check.
+pub fn count_reflection_embeddings(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM reflection_embeddings", [], |row| {
+        row.get(0)
+    })?;
+    Ok(count as usize)
 }

@@ -18,6 +18,7 @@ pub struct Engine {
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
     projects_dir: PathBuf,
+    index_dir: PathBuf,
 }
 
 impl Engine {
@@ -28,20 +29,17 @@ impl Engine {
         search: Arc<RwLock<SearchEngine>>,
         projects_dir: PathBuf,
     ) -> Self {
+        // Derive index_dir from projects_dir for test constructor
+        let index_dir = projects_dir.join("index");
         Self {
             storage,
             embeddings,
             search,
             projects_dir,
+            index_dir,
         }
     }
 
-    // TODO(phase-3): HNSW rebuild is 13.6s at 14K chunks (13.5s of that is insertion).
-    // Every hook invocation pays this cost. Fix options:
-    // (1) Serialize HNSW to disk (hnsw_rs supports file I/O) — load in ~100ms
-    // (2) Lazy init for hooks that don't search (Stop, PostToolUse file tracking)
-    // (3) Persistent daemon mode for hooks instead of per-invocation processes
-    // Measured 2026-02-15: storage=1ms, embed=89ms, vectors=13ms, hnsw=13496ms
     pub fn new(db_path: &Path, projects_dir: &Path) -> Result<Self> {
         let t0 = std::time::Instant::now();
 
@@ -53,45 +51,88 @@ impl Engine {
         let embeddings = Arc::new(EmbeddingEngine::new()?);
         let t_embed = t0.elapsed();
 
-        tracing::info!("building search index from stored vectors");
+        // Compute index cache directory alongside the database
+        let index_dir = db_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("index");
 
-        // Load existing vectors from SQLite into HNSW
-        let chunk_vecs = storage.load_all_chunk_vectors()?;
-        let t_load = t0.elapsed();
+        // Fast O(1) counts for staleness check (~1ms)
+        let chunk_count = storage.count_chunk_embeddings()?;
+        let reflection_count = storage.count_reflection_embeddings()?;
+        let t_count = t0.elapsed();
 
-        // Size HNSW to actual data + 20% headroom for growth
-        let estimated_size = (chunk_vecs.len() + 1000).max(10_000);
-        let mut search = SearchEngine::new(estimated_size);
-        for (id, vec) in &chunk_vecs {
-            search.insert_chunk(id.clone(), vec.clone());
-        }
-        let reflection_vecs = storage.load_all_reflection_vectors()?;
-        for (id, vec) in &reflection_vecs {
-            search.insert_reflection(id.clone(), vec.clone());
-        }
-        let t_total = t0.elapsed();
+        // Try loading from disk cache first
+        let search = if let Some(cached) =
+            SearchEngine::load_from_disk(&index_dir, chunk_count, reflection_count)
+        {
+            let t_total = t0.elapsed();
+            eprintln!(
+                "CSR startup: storage={:.0}ms embed={:.0}ms cache_load={:.0}ms total={:.0}ms ({} chunks, cached)",
+                t_storage.as_secs_f64() * 1000.0,
+                (t_embed - t_storage).as_secs_f64() * 1000.0,
+                (t_total - t_count).as_secs_f64() * 1000.0,
+                t_total.as_secs_f64() * 1000.0,
+                chunk_count,
+            );
+            tracing::info!(
+                chunks = chunk_count,
+                reflections = reflection_count,
+                "search index loaded from cache"
+            );
+            cached
+        } else {
+            // Cache miss — rebuild from SQLite vectors
+            tracing::info!("building search index from stored vectors");
 
-        tracing::info!(
-            chunks = chunk_vecs.len(),
-            reflections = reflection_vecs.len(),
-            "search index ready"
-        );
-        // Always emit startup timing to stderr so hooks can surface it
-        eprintln!(
-            "CSR startup: storage={:.0}ms embed={:.0}ms vectors={:.0}ms hnsw={:.0}ms total={:.0}ms ({} chunks)",
-            t_storage.as_secs_f64() * 1000.0,
-            (t_embed - t_storage).as_secs_f64() * 1000.0,
-            (t_load - t_embed).as_secs_f64() * 1000.0,
-            (t_total - t_load).as_secs_f64() * 1000.0,
-            t_total.as_secs_f64() * 1000.0,
-            chunk_vecs.len(),
-        );
+            let chunk_vecs = storage.load_all_chunk_vectors()?;
+            let t_load = t0.elapsed();
+
+            let estimated_size = (chunk_vecs.len() + 1000).max(10_000);
+            let mut search = SearchEngine::new(estimated_size);
+            for (id, vec) in &chunk_vecs {
+                search.insert_chunk(id.clone(), vec.clone());
+            }
+            let reflection_vecs = storage.load_all_reflection_vectors()?;
+            for (id, vec) in &reflection_vecs {
+                search.insert_reflection(id.clone(), vec.clone());
+            }
+            let t_hnsw = t0.elapsed();
+
+            // Re-query counts right before dump to minimize staleness window (E-1)
+            let chunk_count = storage.count_chunk_embeddings().unwrap_or(chunk_count);
+            let reflection_count = storage.count_reflection_embeddings().unwrap_or(reflection_count);
+            // Dump to disk for next startup
+            if let Err(e) = search.dump_to_disk(&index_dir, chunk_count, reflection_count) {
+                tracing::warn!(error = %e, "failed to cache HNSW index (non-fatal)");
+            }
+            let t_total = t0.elapsed();
+
+            tracing::info!(
+                chunks = chunk_vecs.len(),
+                reflections = reflection_vecs.len(),
+                "search index rebuilt and cached"
+            );
+            eprintln!(
+                "CSR startup: storage={:.0}ms embed={:.0}ms vectors={:.0}ms hnsw={:.0}ms dump={:.0}ms total={:.0}ms ({} chunks, rebuilt)",
+                t_storage.as_secs_f64() * 1000.0,
+                (t_embed - t_storage).as_secs_f64() * 1000.0,
+                (t_load - t_count).as_secs_f64() * 1000.0,
+                (t_hnsw - t_load).as_secs_f64() * 1000.0,
+                (t_total - t_hnsw).as_secs_f64() * 1000.0,
+                t_total.as_secs_f64() * 1000.0,
+                chunk_vecs.len(),
+            );
+
+            search
+        };
 
         Ok(Self {
             storage,
             embeddings,
             search: Arc::new(RwLock::new(search)),
             projects_dir: projects_dir.to_path_buf(),
+            index_dir,
         })
     }
 
@@ -168,6 +209,9 @@ impl Engine {
             }
         }
 
+        // Flush index to persist any new vectors from import (M-4)
+        self.flush_index().await;
+
         Ok(total)
     }
 
@@ -189,6 +233,24 @@ impl Engine {
         &self.projects_dir
     }
 
+    pub fn index_dir(&self) -> &Path {
+        &self.index_dir
+    }
+
+    /// Flush the HNSW index to disk if it has been modified.
+    /// Safe to call multiple times — skips if not dirty.
+    pub async fn flush_index(&self) {
+        let mut idx = self.search.write().await;
+        if idx.is_dirty() {
+            // Query current DB counts for staleness-correct manifest
+            let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
+            let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
+            if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
+                tracing::warn!(error = %e, "failed to flush HNSW index (non-fatal)");
+            }
+        }
+    }
+
     /// Start the file system watcher as a background task.
     /// Returns a JoinHandle that can be awaited or dropped.
     pub fn start_watcher(&self) -> tokio::task::JoinHandle<()> {
@@ -197,13 +259,14 @@ impl Engine {
             self.storage.clone(),
             self.embeddings.clone(),
             self.search.clone(),
+            self.index_dir.to_path_buf(),
         );
         watcher.spawn()
     }
 
     /// Start the MCP server on stdio.
     pub async fn serve_mcp(self) -> Result<()> {
-        let server = CsrServer::new(self.storage, self.embeddings, self.search, self.projects_dir);
+        let server = CsrServer::new(self.storage, self.embeddings, self.search, self.projects_dir, self.index_dir);
         let service = server
             .serve(rmcp::transport::io::stdio())
             .await?;

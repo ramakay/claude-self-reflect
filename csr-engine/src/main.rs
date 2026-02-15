@@ -114,6 +114,7 @@ async fn main() -> Result<()> {
             eng.embeddings().clone(),
             eng.search().clone(),
             eng.projects_dir().to_path_buf(),
+            eng.index_dir().to_path_buf(),
             config,
             !no_ai,
         );

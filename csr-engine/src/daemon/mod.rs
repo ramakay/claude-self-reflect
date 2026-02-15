@@ -46,6 +46,7 @@ pub struct Daemon {
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
     projects_dir: PathBuf,
+    index_dir: PathBuf,
     config: DaemonConfig,
     api_client: Option<AnthropicClient>,
 }
@@ -56,6 +57,7 @@ impl Daemon {
         embeddings: Arc<EmbeddingEngine>,
         search: Arc<RwLock<SearchEngine>>,
         projects_dir: PathBuf,
+        index_dir: PathBuf,
         config: DaemonConfig,
         enable_ai: bool,
     ) -> Self {
@@ -69,6 +71,7 @@ impl Daemon {
             embeddings,
             search,
             projects_dir,
+            index_dir,
             config,
             api_client,
         }
@@ -121,6 +124,7 @@ impl Daemon {
             self.storage.clone(),
             self.embeddings.clone(),
             self.search.clone(),
+            self.index_dir.clone(),
         );
         let watcher_handle = watcher.spawn();
         tracing::info!("file watcher started");
@@ -181,6 +185,18 @@ impl Daemon {
             let _ = tokio::time::timeout(timeout, h).await;
         }
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
+
+        // Flush HNSW index to disk before exit
+        let mut idx = self.search.write().await;
+        if idx.is_dirty() {
+            let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
+            let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
+            if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
+                tracing::warn!(error = %e, "failed to flush HNSW index on shutdown");
+            } else {
+                tracing::info!("HNSW index flushed to disk on shutdown");
+            }
+        }
 
         tracing::info!("daemon stopped");
         Ok(())

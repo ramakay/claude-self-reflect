@@ -23,6 +23,7 @@ pub struct FileWatcher {
     storage: Arc<Storage>,
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
+    index_dir: PathBuf,
 }
 
 impl FileWatcher {
@@ -31,12 +32,14 @@ impl FileWatcher {
         storage: Arc<Storage>,
         embeddings: Arc<EmbeddingEngine>,
         search: Arc<RwLock<SearchEngine>>,
+        index_dir: PathBuf,
     ) -> Self {
         Self {
             projects_dir,
             storage,
             embeddings,
             search,
+            index_dir,
         }
     }
 
@@ -119,6 +122,16 @@ impl FileWatcher {
                             error = %e,
                             "failed to import file"
                         );
+                    }
+                }
+
+                // Flush HNSW index to disk after processing batch
+                let mut idx = self.search.write().await;
+                if idx.is_dirty() {
+                    let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
+                    let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
+                    if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
+                        tracing::warn!(error = %e, "failed to flush HNSW index after watcher batch");
                     }
                 }
             }

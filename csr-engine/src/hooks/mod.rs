@@ -86,7 +86,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
 
     let ralph = ralph_state::RalphState::detect_in(&cwd)?;
 
-    match hook_name {
+    let result = match hook_name {
         "session-start" => session_start::handle(&input, ralph.as_ref(), engine, &cwd).await,
         "session-end" => session_end::handle(&input, ralph.as_ref(), engine, &cwd).await,
         "precompact" => precompact::handle(&input, ralph.as_ref(), engine).await,
@@ -97,6 +97,11 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
             eprintln!("unknown hook: {}", hook_name);
             Ok(())
         }
-    }
+    };
+
+    // Flush HNSW index if any hook modified it (session_end, precompact, stop, post_tool_use)
+    engine.flush_index().await;
+
+    result
 }
 

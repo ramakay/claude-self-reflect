@@ -158,6 +158,7 @@ pub struct CsrServer {
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
     projects_dir: PathBuf,
+    index_dir: PathBuf,
     tool_router: ToolRouter<Self>,
 }
 
@@ -168,13 +169,27 @@ impl CsrServer {
         embeddings: Arc<EmbeddingEngine>,
         search: Arc<RwLock<SearchEngine>>,
         projects_dir: PathBuf,
+        index_dir: PathBuf,
     ) -> Self {
         Self {
             storage,
             embeddings,
             search,
             projects_dir,
+            index_dir,
             tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Flush the HNSW index to disk if dirty.
+    async fn flush_index(&self) {
+        let mut idx = self.search.write().await;
+        if idx.is_dirty() {
+            let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
+            let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
+            if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
+                tracing::warn!(error = %e, "failed to flush HNSW index after store_reflection");
+            }
         }
     }
 
@@ -225,6 +240,9 @@ impl CsrServer {
             &tags,
         )
         .await;
+
+        // Flush index to disk so the new reflection persists for other processes (H-3)
+        self.flush_index().await;
 
         tool_result(result)
     }

@@ -142,8 +142,8 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Only include human/assistant messages
-        if msg_type != "human" && msg_type != "assistant" {
+        // Include human/user/assistant messages (Claude Code uses "user", not "human")
+        if msg_type != "human" && msg_type != "user" && msg_type != "assistant" {
             continue;
         }
 
@@ -154,10 +154,18 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             }
         }
 
-        // Extract text content
+        // Extract text content + tool context
         let text = extract_message_text(&parsed);
-        if !text.is_empty() {
-            messages.push(text);
+        let tool_context = extract_tool_context(&parsed);
+        let combined_text = if !text.is_empty() && !tool_context.is_empty() {
+            format!("{}\n{}", text, tool_context)
+        } else if !tool_context.is_empty() {
+            tool_context
+        } else {
+            text
+        };
+        if !combined_text.is_empty() {
+            messages.push(combined_text);
         }
     }
 
@@ -212,7 +220,7 @@ pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if msg_type == "human" || msg_type == "assistant" {
+        if msg_type == "human" || msg_type == "user" || msg_type == "assistant" {
             messages.push(parsed);
         }
     }
@@ -258,6 +266,65 @@ fn extract_message_text(msg: &serde_json::Value) -> String {
     String::new()
 }
 
+/// Extract searchable context from tool_use blocks in a message.
+///
+/// Coding sessions are dominated by tool calls (Read, Edit, Bash, Grep, etc.).
+/// Without this, 70%+ of a session's activity is invisible to search.
+/// Extracts tool name + key parameters (file_path, command, pattern, query).
+fn extract_tool_context(msg: &serde_json::Value) -> String {
+    let content = msg
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array());
+
+    let content = match content {
+        Some(c) => c,
+        None => return String::new(),
+    };
+
+    let mut tool_lines: Vec<String> = Vec::new();
+
+    for item in content {
+        if item.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+            continue;
+        }
+
+        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+        let input = match item.get("input") {
+            Some(i) => i,
+            None => {
+                tool_lines.push(format!("[{}]", name));
+                continue;
+            }
+        };
+
+        // Extract the most searchable parameter for each tool type
+        let detail = if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
+            // Shorten to last 2 path components for searchability
+            let parts: Vec<&str> = fp.rsplit('/').take(2).collect();
+            parts.into_iter().rev().collect::<Vec<_>>().join("/")
+        } else if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+            // Truncate long commands
+            let truncated: String = cmd.chars().take(120).collect();
+            truncated
+        } else if let Some(pat) = input.get("pattern").and_then(|v| v.as_str()) {
+            pat.to_string()
+        } else if let Some(q) = input.get("query").and_then(|v| v.as_str()) {
+            q.to_string()
+        } else {
+            String::new()
+        };
+
+        if detail.is_empty() {
+            tool_lines.push(format!("[{}]", name));
+        } else {
+            tool_lines.push(format!("[{}: {}]", name, detail));
+        }
+    }
+
+    tool_lines.join(" ")
+}
+
 /// Generate a deterministic chunk ID using UUIDv5.
 fn generate_chunk_id(conversation_id: &str, chunk_index: usize) -> String {
     let input = format!("{}-chunk-{}", conversation_id, chunk_index);
@@ -293,5 +360,71 @@ mod tests {
         let id3 = generate_chunk_id("conv-abc", 1);
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_extract_tool_context() {
+        // Message with tool_use blocks
+        let msg: serde_json::Value = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"file_path": "/Users/me/projects/foo/src/engine.rs"}
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {"command": "cargo test --release"}
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Grep",
+                        "input": {"pattern": "dump_to_disk"}
+                    },
+                    {
+                        "type": "text",
+                        "text": "Let me check the files."
+                    }
+                ]
+            }
+        });
+
+        let ctx = extract_tool_context(&msg);
+        assert!(ctx.contains("[Read: src/engine.rs]"));
+        assert!(ctx.contains("[Bash: cargo test --release]"));
+        assert!(ctx.contains("[Grep: dump_to_disk]"));
+        // text blocks should not appear in tool context
+        assert!(!ctx.contains("Let me check"));
+    }
+
+    #[test]
+    fn test_extract_tool_context_empty() {
+        // Message with only text, no tools
+        let msg: serde_json::Value = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "Hello world"}
+                ]
+            }
+        });
+        assert!(extract_tool_context(&msg).is_empty());
+    }
+
+    #[test]
+    fn test_extract_message_text_user_type() {
+        // "user" type messages should work the same as "human"
+        let msg: serde_json::Value = serde_json::json!({
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "Fix the chunking bug"}
+                ]
+            }
+        });
+        assert_eq!(extract_message_text(&msg), "Fix the chunking bug");
     }
 }

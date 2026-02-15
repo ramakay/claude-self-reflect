@@ -175,7 +175,7 @@ pub async fn get_recent_work(
     project: Option<&str>,
     group_by: &str,
 ) -> Result<String> {
-    let chunks = storage.get_recent_chunks(limit * 3, project)?;
+    let chunks = storage.get_recent_chunks(limit, project)?;
     Ok(format::format_recent_work(&chunks, group_by))
 }
 
