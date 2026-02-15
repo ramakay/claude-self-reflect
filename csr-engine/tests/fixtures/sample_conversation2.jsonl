@@ -1,0 +1,2 @@
+{"type":"human","timestamp":"2026-02-10T14:00:00Z","message":{"content":[{"type":"text","text":"How do I implement authentication with JWT tokens?"}]}}
+{"type":"assistant","timestamp":"2026-02-10T14:01:00Z","message":{"content":[{"type":"text","text":"Use the jsonwebtoken crate for Rust JWT handling. Create a Claims struct with sub, exp, and iat fields, then sign with HS256."}]}}

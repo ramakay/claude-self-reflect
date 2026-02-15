@@ -1,0 +1,4 @@
+{"type":"human","timestamp":"2026-01-15T10:00:00Z","message":{"content":[{"type":"text","text":"How do I fix the Docker memory issue with the batch watcher?"}]}}
+{"type":"assistant","timestamp":"2026-01-15T10:01:00Z","message":{"content":[{"type":"text","text":"The Docker container was limited to 2GB. You need to increase the memory limit in docker-compose.yaml to at least 4GB for the batch watcher service."}]}}
+{"type":"human","timestamp":"2026-01-15T10:02:00Z","message":{"content":[{"type":"text","text":"What about the Qdrant container memory?"}]}}
+{"type":"assistant","timestamp":"2026-01-15T10:03:00Z","message":{"content":[{"type":"text","text":"Qdrant typically uses about 500MB for small collections. Set the memory limit to 1GB to be safe. Check docker stats to monitor actual usage."}]}}

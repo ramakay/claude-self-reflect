@@ -27,7 +27,6 @@ impl Storage {
     }
 
     /// Open an in-memory database (for tests).
-    #[cfg(test)]
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         migrations::run(&conn)?;
@@ -77,6 +76,76 @@ impl Storage {
     ) -> Result<Option<(String, Vec<String>, String)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_reflection_by_id(&conn, id)
+    }
+
+    // ─── Project filtering ───
+
+    pub fn get_chunk_ids_for_project(&self, project: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_ids_for_project(&conn, project)
+    }
+
+    pub fn get_chunks_by_project(
+        &self,
+        project: &str,
+        limit: usize,
+    ) -> Result<Vec<ConversationChunk>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunks_by_project(&conn, project, limit)
+    }
+
+    // ─── Temporal queries ───
+
+    pub fn get_recent_chunks(
+        &self,
+        limit: usize,
+        project: Option<&str>,
+    ) -> Result<Vec<ConversationChunk>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_recent_chunks(&conn, limit, project)
+    }
+
+    pub fn get_chunks_in_timerange(
+        &self,
+        start: &str,
+        end: &str,
+        project: Option<&str>,
+    ) -> Result<Vec<ConversationChunk>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunks_in_timerange(&conn, start, end, project)
+    }
+
+    pub fn get_chunk_ids_in_timerange(
+        &self,
+        start: &str,
+        end: &str,
+        project: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_ids_in_timerange(&conn, start, end, project)
+    }
+
+    // ─── FTS5 search ───
+
+    pub fn fts5_search(
+        &self,
+        query: &str,
+        limit: usize,
+        project: Option<&str>,
+    ) -> Result<Vec<ConversationChunk>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::fts5_search(&conn, query, limit, project)
+    }
+
+    // ─── Reflection tag queries ───
+
+    pub fn get_reflections_by_tag(
+        &self,
+        tag: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, Vec<String>, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_reflections_by_tag(&conn, tag, limit)
     }
 
     // ─── Import state ───

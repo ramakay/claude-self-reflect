@@ -1,4 +1,7 @@
+pub mod cross_project;
 pub mod decay;
+
+use std::collections::HashSet;
 
 use hnsw_rs::hnsw::Hnsw;
 use hnsw_rs::prelude::DistCosine;
@@ -19,6 +22,8 @@ pub struct SearchEngine {
     reflection_index: Hnsw<'static, f32, DistCosine>,
     chunk_id_map: Vec<String>,
     reflection_id_map: Vec<String>,
+    chunk_id_set: HashSet<String>,
+    reflection_id_set: HashSet<String>,
 }
 
 // HNSW parameters
@@ -46,16 +51,24 @@ impl SearchEngine {
             ),
             chunk_id_map: Vec::new(),
             reflection_id_map: Vec::new(),
+            chunk_id_set: HashSet::new(),
+            reflection_id_set: HashSet::new(),
         }
     }
 
     pub fn insert_chunk(&mut self, id: String, embedding: Vec<f32>) {
+        if !self.chunk_id_set.insert(id.clone()) {
+            return; // Already indexed — skip duplicate
+        }
         let idx = self.chunk_id_map.len();
         self.chunk_id_map.push(id);
         self.chunk_index.insert((&embedding, idx));
     }
 
     pub fn insert_reflection(&mut self, id: String, embedding: Vec<f32>) {
+        if !self.reflection_id_set.insert(id.clone()) {
+            return; // Already indexed — skip duplicate
+        }
         let idx = self.reflection_id_map.len();
         self.reflection_id_map.push(id);
         self.reflection_index.insert((&embedding, idx));
@@ -130,5 +143,58 @@ impl SearchEngine {
 
     pub fn reflection_count(&self) -> usize {
         self.reflection_id_map.len()
+    }
+
+    /// Search chunk index but only return results whose IDs are in `allowed_ids`.
+    /// Used for project-scoped and time-range-scoped searches.
+    pub fn search_chunks_filtered(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        min_score: f32,
+        allowed_ids: &HashSet<String>,
+    ) -> Vec<SearchResult> {
+        if self.chunk_id_map.is_empty() || allowed_ids.is_empty() {
+            return Vec::new();
+        }
+
+        // Adaptive over-fetch: start at 5x, escalate to full index if sparse
+        let max_elements = self.chunk_id_map.len();
+        let mut fetch_limit = (limit * 5).min(max_elements);
+
+        let mut results = loop {
+            let neighbours = self.chunk_index.search(query_vec, fetch_limit, EF_SEARCH);
+
+            let found: Vec<SearchResult> = neighbours
+                .into_iter()
+                .filter_map(|n| {
+                    let score = 1.0 - n.distance;
+                    if score >= min_score && n.d_id < self.chunk_id_map.len() {
+                        let id = &self.chunk_id_map[n.d_id];
+                        if allowed_ids.contains(id) {
+                            Some(SearchResult {
+                                id: id.clone(),
+                                score,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // If we got enough results or already searched the full index, stop
+            if found.len() >= limit || fetch_limit >= max_elements {
+                break found;
+            }
+            // Escalate: try full index
+            fetch_limit = max_elements;
+        };
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+        results
     }
 }

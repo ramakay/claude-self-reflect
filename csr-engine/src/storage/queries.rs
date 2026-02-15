@@ -28,7 +28,7 @@ pub fn insert_chunk(conn: &Connection, chunk: &ConversationChunk, embedding: &[f
             chunk.project_name,
             chunk.timestamp,
             chunk.content,
-            chunk.message_count,
+            chunk.message_count as i64,
         ],
     )?;
 
@@ -64,22 +64,16 @@ pub fn load_all_chunk_vectors(conn: &Connection) -> Result<Vec<(String, Vec<f32>
 }
 
 pub fn get_chunks_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<ConversationChunk>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, conversation_id, project_name, timestamp, content, message_count
+         FROM chunks WHERE id = ?1",
+    )?;
     let mut chunks = Vec::new();
     for id in ids {
-        let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, project_name, timestamp, content, message_count
-             FROM chunks WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query_map(params![id], |row| {
-            Ok(ConversationChunk {
-                id: row.get(0)?,
-                conversation_id: row.get(1)?,
-                project_name: row.get(2)?,
-                timestamp: row.get(3)?,
-                content: row.get(4)?,
-                message_count: row.get::<_, i64>(5)? as usize,
-            })
-        })?;
+        let mut rows = stmt.query_map(params![id], row_to_chunk)?;
         if let Some(row) = rows.next() {
             chunks.push(row?);
         }
@@ -145,6 +139,213 @@ pub fn get_reflection_by_id(
     } else {
         Ok(None)
     }
+}
+
+// ─── Project filtering queries ───
+
+/// Get all chunk IDs belonging to a specific project.
+pub fn get_chunk_ids_for_project(conn: &Connection, project: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM chunks WHERE project_name = ?1")?;
+    let rows = stmt.query_map(params![project], |row| row.get::<_, String>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    Ok(ids)
+}
+
+/// Get chunks belonging to a specific project, ordered by timestamp descending.
+pub fn get_chunks_by_project(
+    conn: &Connection,
+    project: &str,
+    limit: usize,
+) -> Result<Vec<ConversationChunk>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, conversation_id, project_name, timestamp, content, message_count
+         FROM chunks WHERE project_name = ?1 ORDER BY timestamp DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![project, limit as i64], |row| {
+        Ok(ConversationChunk {
+            id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            project_name: row.get(2)?,
+            timestamp: row.get(3)?,
+            content: row.get(4)?,
+            message_count: row.get::<_, i64>(5)? as usize,
+        })
+    })?;
+    let mut chunks = Vec::new();
+    for row in rows {
+        chunks.push(row?);
+    }
+    Ok(chunks)
+}
+
+// ─── Temporal queries ───
+
+/// Get recent chunks ordered by timestamp descending.
+pub fn get_recent_chunks(
+    conn: &Connection,
+    limit: usize,
+    project: Option<&str>,
+) -> Result<Vec<ConversationChunk>> {
+    let mut stmt;
+    let rows = if let Some(p) = project.filter(|p| *p != "all") {
+        stmt = conn.prepare(
+            "SELECT id, conversation_id, project_name, timestamp, content, message_count
+             FROM chunks WHERE project_name = ?1 ORDER BY timestamp DESC LIMIT ?2",
+        )?;
+        stmt.query_map(params![p, limit as i64], row_to_chunk)?
+    } else {
+        stmt = conn.prepare(
+            "SELECT id, conversation_id, project_name, timestamp, content, message_count
+             FROM chunks ORDER BY timestamp DESC LIMIT ?1",
+        )?;
+        stmt.query_map(params![limit as i64], row_to_chunk)?
+    };
+
+    let mut chunks = Vec::new();
+    for row in rows {
+        chunks.push(row?);
+    }
+    Ok(chunks)
+}
+
+/// Get chunks within a time range, optionally filtered by project.
+pub fn get_chunks_in_timerange(
+    conn: &Connection,
+    start: &str,
+    end: &str,
+    project: Option<&str>,
+) -> Result<Vec<ConversationChunk>> {
+    let chunks = if let Some(p) = project.filter(|p| *p != "all") {
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, project_name, timestamp, content, message_count
+             FROM chunks WHERE timestamp BETWEEN ?1 AND ?2 AND project_name = ?3
+             ORDER BY timestamp DESC",
+        )?;
+        let rows = stmt.query_map(params![start, end, p], row_to_chunk)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, project_name, timestamp, content, message_count
+             FROM chunks WHERE timestamp BETWEEN ?1 AND ?2
+             ORDER BY timestamp DESC",
+        )?;
+        let rows = stmt.query_map(params![start, end], row_to_chunk)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(chunks)
+}
+
+/// Get chunk IDs within a time range (for filtered HNSW search).
+pub fn get_chunk_ids_in_timerange(
+    conn: &Connection,
+    start: &str,
+    end: &str,
+    project: Option<&str>,
+) -> Result<Vec<String>> {
+    let ids = if let Some(p) = project.filter(|p| *p != "all") {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM chunks WHERE timestamp BETWEEN ?1 AND ?2 AND project_name = ?3",
+        )?;
+        let rows = stmt.query_map(params![start, end, p], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM chunks WHERE timestamp BETWEEN ?1 AND ?2",
+        )?;
+        let rows = stmt.query_map(params![start, end], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(ids)
+}
+
+// ─── FTS5 full-text search ───
+
+/// Search chunks using FTS5 full-text search (for file path lookup etc.).
+pub fn fts5_search(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    project: Option<&str>,
+) -> Result<Vec<ConversationChunk>> {
+    // Sanitize for FTS5: remove control chars, escape double quotes, wrap as phrase
+    let sanitized: String = query
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .replace('"', "\"\"");
+    let fts_query = format!("\"{}\"", sanitized);
+
+    let chunks = if let Some(p) = project.filter(|p| *p != "all") {
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count
+             FROM chunks c
+             JOIN chunks_fts fts ON fts.rowid = c.rowid
+             WHERE chunks_fts MATCH ?1 AND c.project_name = ?2
+             ORDER BY fts.rank
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![fts_query, p, limit as i64], row_to_chunk)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count
+             FROM chunks c
+             JOIN chunks_fts fts ON fts.rowid = c.rowid
+             WHERE chunks_fts MATCH ?1
+             ORDER BY fts.rank
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![fts_query, limit as i64], row_to_chunk)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(chunks)
+}
+
+// ─── Reflection tag queries ───
+
+/// Get reflections matching a specific tag substring (for session learnings).
+pub fn get_reflections_by_tag(
+    conn: &Connection,
+    tag: &str,
+    limit: usize,
+) -> Result<Vec<(String, String, Vec<String>, String)>> {
+    // Escape LIKE wildcards to prevent injection
+    let escaped_tag = tag.replace('%', "\\%").replace('_', "\\_");
+    let pattern = format!("%{}%", escaped_tag);
+    let mut stmt = conn.prepare(
+        "SELECT id, content, tags, timestamp FROM reflections
+         WHERE tags LIKE ?1 ESCAPE '\\' ORDER BY timestamp DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+        let id: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let tags_json: String = row.get(2)?;
+        let timestamp: String = row.get(3)?;
+        Ok((id, content, tags_json, timestamp))
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        let (id, content, tags_json, timestamp) = row?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        results.push((id, content, tags, timestamp));
+    }
+    Ok(results)
+}
+
+/// Helper: map a row to ConversationChunk.
+fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
+    Ok(ConversationChunk {
+        id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        project_name: row.get(2)?,
+        timestamp: row.get(3)?,
+        content: row.get(4)?,
+        message_count: row.get::<_, i64>(5)? as usize,
+    })
 }
 
 pub fn is_file_imported(conn: &Connection, path: &Path) -> Result<bool> {

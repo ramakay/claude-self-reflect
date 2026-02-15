@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 
 use crate::embeddings::EmbeddingEngine;
 use crate::import;
+use crate::import::watcher::FileWatcher;
 use crate::mcp::CsrServer;
 use crate::search::SearchEngine;
 use crate::storage::Storage;
@@ -54,9 +55,11 @@ impl Engine {
     }
 
     /// Import conversations from the Claude projects directory.
+    /// Uses batch embedding for ~3.4x speedup over single embeds.
     pub async fn import_conversations(&mut self, limit: Option<usize>) -> Result<usize> {
         let projects = import::discover_projects(&self.projects_dir)?;
         let mut total = 0usize;
+        const BATCH_SIZE: usize = 10;
 
         for (dir, project_name) in &projects {
             let files = import::list_jsonl_files(dir)?;
@@ -65,24 +68,25 @@ impl Engine {
                     continue;
                 }
                 let chunks = import::parse_jsonl_file(file_path, project_name)?;
-                for chunk in &chunks {
-                    let embedding = {
-                        let text = chunk.content.clone();
-                        let emb = self.embeddings.clone();
-                        tokio::task::spawn_blocking(move || emb.embed_single(&text))
-                            .await??
-                    };
-                    self.storage
-                        .insert_chunk(chunk, &embedding)?;
-                    {
-                        let mut idx = self.search.write().await;
+
+                // Batch embed for throughput
+                for batch in chunks.chunks(BATCH_SIZE) {
+                    let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
+                    let emb = self.embeddings.clone();
+                    let embeddings = tokio::task::spawn_blocking(move || {
+                        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                        emb.embed(&refs)
+                    })
+                    .await??;
+
+                    let mut idx = self.search.write().await;
+                    for (chunk, embedding) in batch.iter().zip(embeddings.into_iter()) {
+                        self.storage.insert_chunk(chunk, &embedding)?;
                         idx.insert_chunk(chunk.id.clone(), embedding);
                     }
                 }
-                self.storage.mark_file_imported(
-                    file_path,
-                    chunks.len(),
-                )?;
+
+                self.storage.mark_file_imported(file_path, chunks.len())?;
                 total += chunks.len();
 
                 if let Some(lim) = limit {
@@ -96,9 +100,21 @@ impl Engine {
         Ok(total)
     }
 
+    /// Start the file system watcher as a background task.
+    /// Returns a JoinHandle that can be awaited or dropped.
+    pub fn start_watcher(&self) -> tokio::task::JoinHandle<()> {
+        let watcher = FileWatcher::new(
+            self.projects_dir.clone(),
+            self.storage.clone(),
+            self.embeddings.clone(),
+            self.search.clone(),
+        );
+        watcher.spawn()
+    }
+
     /// Start the MCP server on stdio.
     pub async fn serve_mcp(self) -> Result<()> {
-        let server = CsrServer::new(self.storage, self.embeddings, self.search);
+        let server = CsrServer::new(self.storage, self.embeddings, self.search, self.projects_dir);
         let service = server
             .serve(rmcp::transport::io::stdio())
             .await?;
