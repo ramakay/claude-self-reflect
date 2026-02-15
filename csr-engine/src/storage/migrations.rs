@@ -39,12 +39,50 @@ pub fn run(conn: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS import_state (
             file_path TEXT PRIMARY KEY,
+            conversation_id TEXT,
             chunks_imported INTEGER,
             imported_at TEXT DEFAULT (datetime('now')),
             file_mtime TEXT
         );
+
+        CREATE INDEX IF NOT EXISTS idx_import_conversation_id
+            ON import_state(conversation_id);
         ",
     )?;
+
+    // Enrichment state — tracks per-conversation progressive enrichment
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS enrichment_state (
+            conversation_id TEXT NOT NULL,
+            enrichment_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            reflection_id TEXT,
+            batch_id TEXT,
+            error_message TEXT,
+            file_path TEXT,
+            chunk_count INTEGER,
+            prompt_hash TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (conversation_id, enrichment_type)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_enrichment_status
+            ON enrichment_state(enrichment_type, status);
+        ",
+    )?;
+
+    // Migration: add conversation_id to import_state if missing (for existing DBs)
+    let has_conv_col: bool = conn
+        .prepare("SELECT conversation_id FROM import_state LIMIT 0")
+        .is_ok();
+    if !has_conv_col {
+        let _ = conn.execute_batch(
+            "ALTER TABLE import_state ADD COLUMN conversation_id TEXT;
+             CREATE INDEX IF NOT EXISTS idx_import_conversation_id ON import_state(conversation_id);",
+        );
+    }
 
     // FTS5 for hybrid search — CREATE VIRTUAL TABLE doesn't support IF NOT EXISTS
     // so we check manually

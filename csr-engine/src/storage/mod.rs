@@ -148,6 +148,78 @@ impl Storage {
         queries::get_reflections_by_tag(&conn, tag, limit)
     }
 
+    // ─── Enrichment state ───
+
+    pub fn is_conversation_enriched(
+        &self,
+        conversation_id: &str,
+        enrichment_type: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::is_conversation_enriched(&conn, conversation_id, enrichment_type)
+    }
+
+    pub fn mark_enrichment_completed(
+        &self,
+        conversation_id: &str,
+        enrichment_type: &str,
+        reflection_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_enrichment_completed(&conn, conversation_id, enrichment_type, reflection_id)
+    }
+
+    pub fn mark_enrichment_failed(
+        &self,
+        conversation_id: &str,
+        enrichment_type: &str,
+        error: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_enrichment_failed(&conn, conversation_id, enrichment_type, error)
+    }
+
+    pub fn get_unenriched_conversations(
+        &self,
+        enrichment_type: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_unenriched_conversations(&conn, enrichment_type, limit)
+    }
+
+    pub fn set_batch_id(
+        &self,
+        conversation_id: &str,
+        batch_id: &str,
+        prompt_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::set_batch_id(&conn, conversation_id, batch_id, prompt_hash)
+    }
+
+    pub fn get_conversations_by_batch(
+        &self,
+        batch_id: &str,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_conversations_by_batch(&conn, batch_id)
+    }
+
+    pub fn delete_reflection(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::delete_reflection(&conn, id)
+    }
+
+    pub fn get_enrichment_reflection_id(
+        &self,
+        conversation_id: &str,
+        enrichment_type: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_enrichment_reflection_id(&conn, conversation_id, enrichment_type)
+    }
+
     // ─── Import state ───
 
     pub fn is_file_imported(&self, path: &Path) -> Result<bool> {

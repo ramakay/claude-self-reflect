@@ -102,6 +102,36 @@ impl Engine {
                 }
 
                 self.storage.mark_file_imported(file_path, chunks.len())?;
+
+                // Layer 1: Heuristic enrichment (inline, instant, free)
+                let conv_id = file_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                if !self
+                    .storage
+                    .is_conversation_enriched(&conv_id, "heuristic")
+                    .unwrap_or(false)
+                {
+                    if let Err(e) = crate::extraction::heuristic::enrich_conversation(
+                        file_path,
+                        &conv_id,
+                        project_name,
+                        &self.storage,
+                        &self.embeddings,
+                        &self.search,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            conv = %conv_id,
+                            error = %e,
+                            "heuristic enrichment failed (non-fatal)"
+                        );
+                    }
+                }
+
                 total += chunks.len();
 
                 if let Some(lim) = limit {

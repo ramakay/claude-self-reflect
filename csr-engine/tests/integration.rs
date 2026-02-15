@@ -658,7 +658,185 @@ fn test_vector_storage_roundtrip() {
     }
 }
 
-// ─── Test 19: HNSW dedup on re-insert ───
+// ─── Test 19: Enrichment state tracking ───
+
+#[test]
+fn test_enrichment_state_crud() {
+    let storage = Storage::open_memory().unwrap();
+
+    // Initially not enriched
+    assert!(!storage
+        .is_conversation_enriched("conv-1", "heuristic")
+        .unwrap());
+
+    // Mark completed
+    storage
+        .mark_enrichment_completed("conv-1", "heuristic", "refl-heur-1")
+        .unwrap();
+    assert!(storage
+        .is_conversation_enriched("conv-1", "heuristic")
+        .unwrap());
+
+    // Different type is not enriched
+    assert!(!storage
+        .is_conversation_enriched("conv-1", "extracted_v3")
+        .unwrap());
+}
+
+#[test]
+fn test_enrichment_state_idempotent() {
+    let storage = Storage::open_memory().unwrap();
+
+    // Mark completed twice — should not error
+    storage
+        .mark_enrichment_completed("conv-1", "heuristic", "refl-1")
+        .unwrap();
+    storage
+        .mark_enrichment_completed("conv-1", "heuristic", "refl-2")
+        .unwrap();
+    assert!(storage
+        .is_conversation_enriched("conv-1", "heuristic")
+        .unwrap());
+}
+
+#[test]
+fn test_enrichment_failure_tracking() {
+    let storage = Storage::open_memory().unwrap();
+
+    storage
+        .mark_enrichment_failed("conv-1", "ai_narrative", "API timeout")
+        .unwrap();
+    // Failed enrichment is NOT considered complete
+    assert!(!storage
+        .is_conversation_enriched("conv-1", "ai_narrative")
+        .unwrap());
+}
+
+#[test]
+fn test_batch_id_tracking() {
+    let storage = Storage::open_memory().unwrap();
+
+    storage.set_batch_id("conv-1", "batch_abc", "hash_123").unwrap();
+    storage.set_batch_id("conv-2", "batch_abc", "hash_123").unwrap();
+
+    let convs = storage.get_conversations_by_batch("batch_abc").unwrap();
+    assert_eq!(convs.len(), 2);
+    assert!(convs.contains(&"conv-1".to_string()));
+    assert!(convs.contains(&"conv-2".to_string()));
+}
+
+#[test]
+fn test_reflection_deletion() {
+    let storage = Storage::open_memory().unwrap();
+    let fake_emb: Vec<f32> = vec![0.1; 384];
+
+    storage
+        .insert_reflection("to-delete", "content", &["tag1".into()], &fake_emb)
+        .unwrap();
+    assert!(storage.get_reflection_by_id("to-delete").unwrap().is_some());
+
+    storage.delete_reflection("to-delete").unwrap();
+    assert!(storage
+        .get_reflection_by_id("to-delete")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn test_enrichment_reflection_id_lookup() {
+    let storage = Storage::open_memory().unwrap();
+
+    // No enrichment yet
+    assert!(storage
+        .get_enrichment_reflection_id("conv-1", "heuristic")
+        .unwrap()
+        .is_none());
+
+    // Mark completed
+    storage
+        .mark_enrichment_completed("conv-1", "heuristic", "refl-h-1")
+        .unwrap();
+    let id = storage
+        .get_enrichment_reflection_id("conv-1", "heuristic")
+        .unwrap();
+    assert_eq!(id, Some("refl-h-1".to_string()));
+}
+
+// ─── Test 20: V3 extraction with fixture ───
+
+#[test]
+fn test_v3_extraction_with_fixture() {
+    use csr_engine::extraction;
+
+    let file = fixtures_dir().join("sample_conversation.jsonl");
+    let messages = import::parse_jsonl_messages(&file).unwrap();
+    assert!(!messages.is_empty());
+
+    let result = extraction::extract_v3(&messages);
+    assert!(result.stats.original_messages > 0);
+    assert!(!result.search_index.is_empty());
+    assert!(!result.context_cache.is_empty());
+}
+
+// ─── Test 21: Heuristic enrichment with fixture ───
+
+#[test]
+fn test_heuristic_enrichment_with_fixture() {
+    use csr_engine::extraction::heuristic;
+
+    let file = fixtures_dir().join("sample_conversation.jsonl");
+    let messages = import::parse_jsonl_messages(&file).unwrap();
+    assert!(!messages.is_empty());
+
+    let result = heuristic::extract_heuristic(&messages);
+    assert!(result.message_count > 0);
+    assert!(result.user_message_count > 0);
+
+    let reflection = heuristic::format_as_reflection(&result, "test-project");
+    assert!(reflection.contains("[Heuristic]"));
+    assert!(reflection.contains("test-project"));
+}
+
+// ─── Test 22: Search engine remove_reflection ───
+
+#[test]
+fn test_search_engine_remove_reflection() {
+    let mut engine = SearchEngine::new(100);
+
+    let mut emb = vec![0.0f32; 384];
+    emb[0] = 1.0;
+
+    engine.insert_reflection("refl-keep".to_string(), emb.clone());
+    engine.insert_reflection("refl-remove".to_string(), emb.clone());
+    assert_eq!(engine.reflection_count(), 2);
+
+    engine.remove_reflection("refl-remove");
+
+    // After removal, searching should not return the removed reflection
+    let results = engine.search_reflections(&emb, 10, 0.0);
+    for r in &results {
+        assert_ne!(r.id, "refl-remove", "removed reflection should not appear");
+    }
+}
+
+// ─── Test 23: parse_jsonl_messages ───
+
+#[test]
+fn test_parse_jsonl_messages() {
+    let file = fixtures_dir().join("sample_conversation.jsonl");
+    let messages = import::parse_jsonl_messages(&file).unwrap();
+    assert!(!messages.is_empty());
+    // Each message should have a type field
+    for msg in &messages {
+        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            msg_type == "human" || msg_type == "assistant",
+            "unexpected type: {msg_type}"
+        );
+    }
+}
+
+// ─── Test 24: HNSW dedup on re-insert ───
 
 #[test]
 fn test_hnsw_dedup_insert() {

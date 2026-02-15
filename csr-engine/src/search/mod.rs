@@ -24,6 +24,7 @@ pub struct SearchEngine {
     reflection_id_map: Vec<String>,
     chunk_id_set: HashSet<String>,
     reflection_id_set: HashSet<String>,
+    active_reflection_count: usize,
 }
 
 // HNSW parameters
@@ -53,6 +54,7 @@ impl SearchEngine {
             reflection_id_map: Vec::new(),
             chunk_id_set: HashSet::new(),
             reflection_id_set: HashSet::new(),
+            active_reflection_count: 0,
         }
     }
 
@@ -72,6 +74,19 @@ impl SearchEngine {
         let idx = self.reflection_id_map.len();
         self.reflection_id_map.push(id);
         self.reflection_index.insert((&embedding, idx));
+        self.active_reflection_count += 1;
+    }
+
+    /// Remove a reflection from search results.
+    /// Note: HNSW doesn't support true deletion, but we remove the ID mapping
+    /// so search results won't include this reflection. The vector stays in the
+    /// index but maps to nothing.
+    pub fn remove_reflection(&mut self, id: &str) {
+        if let Some(pos) = self.reflection_id_map.iter().position(|x| x == id) {
+            self.reflection_id_map[pos] = String::new(); // Blank out the mapping
+            self.active_reflection_count = self.active_reflection_count.saturating_sub(1);
+        }
+        self.reflection_id_set.remove(id);
     }
 
     /// Search chunk index. Returns results sorted by descending score.
@@ -121,7 +136,10 @@ impl SearchEngine {
             .filter_map(|n| {
                 // hnsw_rs DistCosine returns distance = 1.0 - cosine_similarity
                 let score = 1.0 - n.distance;
-                if score >= min_score && n.d_id < id_map.len() {
+                if score >= min_score
+                    && n.d_id < id_map.len()
+                    && !id_map[n.d_id].is_empty()
+                {
                     Some(SearchResult {
                         id: id_map[n.d_id].clone(),
                         score,
@@ -142,7 +160,7 @@ impl SearchEngine {
     }
 
     pub fn reflection_count(&self) -> usize {
-        self.reflection_id_map.len()
+        self.active_reflection_count
     }
 
     /// Search chunk index but only return results whose IDs are in `allowed_ids`.

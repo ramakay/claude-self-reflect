@@ -51,6 +51,20 @@ enum Commands {
         #[arg(long)]
         apply: bool,
     },
+    /// Run the enrichment daemon (file watcher + Layer 2 + Layer 3)
+    Daemon {
+        /// Max conversations per AI narrative batch
+        #[arg(long, default_value_t = 10)]
+        batch_size: usize,
+
+        /// Minutes before forcing a batch submission
+        #[arg(long, default_value_t = 30)]
+        batch_time: u64,
+
+        /// Skip AI narrative generation (Layer 1+2 only, no API key needed)
+        #[arg(long)]
+        no_ai: bool,
+    },
 }
 
 fn default_db_path() -> PathBuf {
@@ -78,7 +92,34 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Handle hook subcommand separately (may not need full engine init)
+    // Handle subcommands separately
+    if let Some(Commands::Daemon {
+        batch_size,
+        batch_time,
+        no_ai,
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let config = csr_engine::daemon::DaemonConfig {
+            extraction_interval_secs: 30,
+            batch_size_trigger: batch_size,
+            batch_time_trigger_secs: batch_time * 60,
+            batch_poll_interval_secs: 60,
+        };
+        let daemon = csr_engine::daemon::Daemon::new(
+            eng.storage().clone(),
+            eng.embeddings().clone(),
+            eng.search().clone(),
+            eng.projects_dir().to_path_buf(),
+            config,
+            !no_ai,
+        );
+        return daemon.run().await;
+    }
+
     if let Some(Commands::Hook { ref name, apply }) = args.command {
         if name == "install" {
             return csr_engine::hooks::install::handle(apply);

@@ -348,6 +348,147 @@ fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
     })
 }
 
+// ─── Enrichment state queries ───
+
+/// Check if a conversation has been enriched with a specific type.
+pub fn is_conversation_enriched(
+    conn: &Connection,
+    conversation_id: &str,
+    enrichment_type: &str,
+) -> Result<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT 1 FROM enrichment_state
+         WHERE conversation_id = ?1 AND enrichment_type = ?2 AND status = 'completed'",
+    )?;
+    Ok(stmt.exists(params![conversation_id, enrichment_type])?)
+}
+
+/// Mark enrichment as completed and link to the stored reflection.
+pub fn mark_enrichment_completed(
+    conn: &Connection,
+    conversation_id: &str,
+    enrichment_type: &str,
+    reflection_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO enrichment_state (conversation_id, enrichment_type, status, reflection_id, updated_at)
+         VALUES (?1, ?2, 'completed', ?3, datetime('now'))
+         ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
+             status = 'completed', reflection_id = ?3, updated_at = datetime('now')",
+        params![conversation_id, enrichment_type, reflection_id],
+    )?;
+    Ok(())
+}
+
+/// Mark enrichment as failed with an error message.
+pub fn mark_enrichment_failed(
+    conn: &Connection,
+    conversation_id: &str,
+    enrichment_type: &str,
+    error: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO enrichment_state (conversation_id, enrichment_type, status, error_message, updated_at)
+         VALUES (?1, ?2, 'failed', ?3, datetime('now'))
+         ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
+             status = 'failed', error_message = ?3, updated_at = datetime('now')",
+        params![conversation_id, enrichment_type, error],
+    )?;
+    Ok(())
+}
+
+/// Get conversations that need enrichment of a given type.
+/// Returns (conversation_id, file_path) pairs.
+pub fn get_unenriched_conversations(
+    conn: &Connection,
+    enrichment_type: &str,
+    limit: usize,
+) -> Result<Vec<(String, String)>> {
+    // Find conversations that have been imported (in import_state)
+    // but don't have completed enrichment of this type.
+    // Uses equality JOIN on conversation_id (not LIKE) for correctness and performance.
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT c.conversation_id, i.file_path
+         FROM chunks c
+         JOIN import_state i ON i.conversation_id = c.conversation_id
+         LEFT JOIN enrichment_state e
+             ON e.conversation_id = c.conversation_id AND e.enrichment_type = ?1
+         WHERE e.status IS NULL OR e.status = 'failed'
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![enrichment_type, limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Set the Anthropic batch ID and prompt hash for a conversation's AI narrative enrichment.
+pub fn set_batch_id(
+    conn: &Connection,
+    conversation_id: &str,
+    batch_id: &str,
+    prompt_hash: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO enrichment_state (conversation_id, enrichment_type, status, batch_id, prompt_hash, updated_at)
+         VALUES (?1, 'ai_narrative', 'processing', ?2, ?3, datetime('now'))
+         ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
+             status = 'processing', batch_id = ?2, prompt_hash = ?3, updated_at = datetime('now')",
+        params![conversation_id, batch_id, prompt_hash],
+    )?;
+    Ok(())
+}
+
+/// Get conversations with a specific batch ID (for result retrieval).
+pub fn get_conversations_by_batch(
+    conn: &Connection,
+    batch_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT conversation_id FROM enrichment_state
+         WHERE batch_id = ?1 AND enrichment_type = 'ai_narrative'",
+    )?;
+    let rows = stmt.query_map(params![batch_id], |row| row.get::<_, String>(0))?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Delete a reflection by ID (for layer supersession — Layer 2 replaces Layer 1).
+pub fn delete_reflection(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM reflection_embeddings WHERE reflection_id = ?1", params![id])?;
+    conn.execute("DELETE FROM reflections WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Get the reflection ID for a conversation's enrichment (for supersession).
+pub fn get_enrichment_reflection_id(
+    conn: &Connection,
+    conversation_id: &str,
+    enrichment_type: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT reflection_id FROM enrichment_state
+         WHERE conversation_id = ?1 AND enrichment_type = ?2 AND status = 'completed'",
+    )?;
+    let mut rows = stmt.query_map(params![conversation_id, enrichment_type], |row| {
+        row.get::<_, Option<String>>(0)
+    })?;
+    if let Some(row) = rows.next() {
+        Ok(row?)
+    } else {
+        Ok(None)
+    }
+}
+
+// ─── Import state queries ───
+
 pub fn is_file_imported(conn: &Connection, path: &Path) -> Result<bool> {
     let path_str = path.to_string_lossy().to_string();
     let mut stmt = conn.prepare("SELECT 1 FROM import_state WHERE file_path = ?1")?;
@@ -356,9 +497,14 @@ pub fn is_file_imported(conn: &Connection, path: &Path) -> Result<bool> {
 
 pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Result<()> {
     let path_str = path.to_string_lossy().to_string();
+    // Extract conversation_id from filename (stem of the JSONL file)
+    let conv_id = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     conn.execute(
-        "INSERT OR REPLACE INTO import_state (file_path, chunks_imported) VALUES (?1, ?2)",
-        params![path_str, chunks as i64],
+        "INSERT OR REPLACE INTO import_state (file_path, conversation_id, chunks_imported) VALUES (?1, ?2, ?3)",
+        params![path_str, conv_id, chunks as i64],
     )?;
     Ok(())
 }

@@ -188,6 +188,38 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     Ok(chunks)
 }
 
+/// Parse a JSONL file into raw serde_json::Value messages (for extraction module).
+/// Returns all messages with their original structure intact.
+pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
+    let file = fs::File::open(path).context("opening JSONL file for extraction")?;
+    let reader = BufReader::new(file);
+    let mut messages = Vec::new();
+
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed: serde_json::Value = match sonic_rs::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let msg_type = parsed
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if msg_type == "human" || msg_type == "assistant" {
+            messages.push(parsed);
+        }
+    }
+
+    Ok(messages)
+}
+
 /// Extract text content from a JSONL message entry.
 fn extract_message_text(msg: &serde_json::Value) -> String {
     // Try "message.content" array format (Claude's format)
