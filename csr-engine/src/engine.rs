@@ -36,17 +36,28 @@ impl Engine {
         }
     }
 
+    // TODO(phase-3): HNSW rebuild is 13.6s at 14K chunks (13.5s of that is insertion).
+    // Every hook invocation pays this cost. Fix options:
+    // (1) Serialize HNSW to disk (hnsw_rs supports file I/O) — load in ~100ms
+    // (2) Lazy init for hooks that don't search (Stop, PostToolUse file tracking)
+    // (3) Persistent daemon mode for hooks instead of per-invocation processes
+    // Measured 2026-02-15: storage=1ms, embed=89ms, vectors=13ms, hnsw=13496ms
     pub fn new(db_path: &Path, projects_dir: &Path) -> Result<Self> {
+        let t0 = std::time::Instant::now();
+
         tracing::info!(?db_path, "opening storage");
         let storage = Arc::new(Storage::open(db_path)?);
+        let t_storage = t0.elapsed();
 
         tracing::info!("initializing embedding engine");
         let embeddings = Arc::new(EmbeddingEngine::new()?);
+        let t_embed = t0.elapsed();
 
         tracing::info!("building search index from stored vectors");
 
         // Load existing vectors from SQLite into HNSW
         let chunk_vecs = storage.load_all_chunk_vectors()?;
+        let t_load = t0.elapsed();
 
         // Size HNSW to actual data + 20% headroom for growth
         let estimated_size = (chunk_vecs.len() + 1000).max(10_000);
@@ -58,10 +69,22 @@ impl Engine {
         for (id, vec) in &reflection_vecs {
             search.insert_reflection(id.clone(), vec.clone());
         }
+        let t_total = t0.elapsed();
+
         tracing::info!(
             chunks = chunk_vecs.len(),
             reflections = reflection_vecs.len(),
             "search index ready"
+        );
+        // Always emit startup timing to stderr so hooks can surface it
+        eprintln!(
+            "CSR startup: storage={:.0}ms embed={:.0}ms vectors={:.0}ms hnsw={:.0}ms total={:.0}ms ({} chunks)",
+            t_storage.as_secs_f64() * 1000.0,
+            (t_embed - t_storage).as_secs_f64() * 1000.0,
+            (t_load - t_embed).as_secs_f64() * 1000.0,
+            (t_total - t_load).as_secs_f64() * 1000.0,
+            t_total.as_secs_f64() * 1000.0,
+            chunk_vecs.len(),
         );
 
         Ok(Self {
