@@ -407,13 +407,16 @@ pub fn get_unenriched_conversations(
     // Find conversations that have been imported (in import_state)
     // but don't have completed enrichment of this type.
     // Uses equality JOIN on conversation_id (not LIKE) for correctness and performance.
+    // Ordered by most recent chunk timestamp so recent conversations are enriched first.
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT c.conversation_id, i.file_path
+        "SELECT c.conversation_id, i.file_path
          FROM chunks c
          JOIN import_state i ON i.conversation_id = c.conversation_id
          LEFT JOIN enrichment_state e
              ON e.conversation_id = c.conversation_id AND e.enrichment_type = ?1
          WHERE e.status IS NULL OR e.status = 'failed'
+         GROUP BY c.conversation_id, i.file_path
+         ORDER BY MAX(c.timestamp) DESC
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![enrichment_type, limit as i64], |row| {
