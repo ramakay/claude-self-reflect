@@ -1,6 +1,7 @@
 pub mod embeddings;
 pub mod engine;
 pub mod format;
+pub mod hooks;
 pub mod import;
 pub mod mcp;
 pub mod search;

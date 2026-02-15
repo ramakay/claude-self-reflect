@@ -100,6 +100,24 @@ impl Engine {
         Ok(total)
     }
 
+    // ─── Accessors for hooks ───
+
+    pub fn storage(&self) -> &Arc<Storage> {
+        &self.storage
+    }
+
+    pub fn embeddings(&self) -> &Arc<EmbeddingEngine> {
+        &self.embeddings
+    }
+
+    pub fn search(&self) -> &Arc<RwLock<SearchEngine>> {
+        &self.search
+    }
+
+    pub fn projects_dir(&self) -> &Path {
+        &self.projects_dir
+    }
+
     /// Start the file system watcher as a background task.
     /// Returns a JoinHandle that can be awaited or dropped.
     pub fn start_watcher(&self) -> tokio::task::JoinHandle<()> {

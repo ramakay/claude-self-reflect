@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -9,12 +9,15 @@ use csr_engine::engine;
 #[command(name = "csr-engine", about = "Claude Self-Reflect Rust Engine")]
 struct Args {
     /// SQLite database path
-    #[arg(long, default_value_os_t = default_db_path())]
+    #[arg(long, default_value_os_t = default_db_path(), global = true)]
     db_path: PathBuf,
 
     /// Claude projects directory
-    #[arg(long, default_value_os_t = default_projects_dir())]
+    #[arg(long, default_value_os_t = default_projects_dir(), global = true)]
     projects_dir: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
 
     /// Import conversations then exit (or combine with --serve)
     #[arg(long)]
@@ -37,6 +40,19 @@ struct Args {
     bench: bool,
 }
 
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Handle Claude Code hook events
+    Hook {
+        /// Hook name: session-start, session-end, precompact, install
+        name: String,
+
+        /// For install: auto-apply to settings.json
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
 fn default_db_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -55,12 +71,28 @@ fn default_projects_dir() -> PathBuf {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .with_writer(std::io::stderr)
         .init();
 
     let args = Args::parse();
+
+    // Handle hook subcommand separately (may not need full engine init)
+    if let Some(Commands::Hook { ref name, apply }) = args.command {
+        if name == "install" {
+            return csr_engine::hooks::install::handle(apply);
+        }
+
+        // Other hooks need the engine
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        csr_engine::hooks::dispatch_hook(name, &eng).await?;
+        return Ok(());
+    }
 
     // Ensure DB directory exists
     if let Some(parent) = args.db_path.parent() {
