@@ -25,6 +25,11 @@ pub fn handle(apply: bool) -> Result<()> {
     Ok(())
 }
 
+/// Generate the hook configuration JSON (public for testing).
+pub fn generate_hook_config_for_test(binary_path: &str) -> serde_json::Value {
+    generate_hook_config(binary_path)
+}
+
 /// Generate the hook configuration JSON.
 fn generate_hook_config(binary_path: &str) -> serde_json::Value {
     serde_json::json!({
@@ -45,6 +50,9 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
             "PostToolUse": [{
                 "matcher": "Edit|Write|MultiEdit|NotebookEdit",
                 "hooks": [{"type": "command", "command": format!("{} hook post-tool-use", binary_path)}]
+            }],
+            "UserPromptSubmit": [{
+                "hooks": [{"type": "command", "command": format!("{} hook prompt-submit", binary_path)}]
             }]
         }
     })
@@ -85,9 +93,28 @@ fn apply_to_settings(config: &serde_json::Value) -> Result<()> {
             .or_insert_with(|| serde_json::json!({}));
 
         for (hook_type, entries) in new_hooks {
-            // Replace entries for each hook type (SessionStart, etc.)
-            // CSR owns these entries; other tools use different hook types
-            hooks_obj[hook_type] = entries.clone();
+            // Merge CSR entries: remove existing CSR entries, then append new ones.
+            // Preserves entries from other tools under the same hook type.
+            if let Some(existing_arr) = hooks_obj.get_mut(hook_type).and_then(|v| v.as_array_mut())
+            {
+                // Remove existing CSR entries (identified by command containing "csr-engine")
+                existing_arr.retain(|entry| {
+                    let is_csr = entry
+                        .get("hooks")
+                        .and_then(|h| h.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|h| h.get("command"))
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|cmd| cmd.contains("csr-engine"));
+                    !is_csr
+                });
+                // Append new CSR entries
+                if let Some(new_arr) = entries.as_array() {
+                    existing_arr.extend(new_arr.iter().cloned());
+                }
+            } else {
+                hooks_obj[hook_type] = entries.clone();
+            }
         }
     }
 

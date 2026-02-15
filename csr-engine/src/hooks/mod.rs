@@ -9,6 +9,7 @@
 pub mod install;
 pub mod post_tool_use;
 pub mod precompact;
+pub mod prompt_submit;
 pub mod ralph_state;
 pub mod session_end;
 pub mod session_start;
@@ -34,6 +35,8 @@ pub struct HookInput {
     pub tool_input: Option<serde_json::Value>,
     /// Whether the Stop hook is re-entering (to prevent infinite loops)
     pub stop_hook_active: Option<bool>,
+    /// User's prompt text for UserPromptSubmit hook
+    pub prompt: Option<String>,
 }
 
 /// Read and parse JSON from stdin. Returns a default HookInput if stdin is empty or invalid.
@@ -89,6 +92,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
         "precompact" => precompact::handle(&input, ralph.as_ref(), engine).await,
         "stop" => stop::handle(&input, ralph.as_ref(), engine, &cwd).await,
         "post-tool-use" => post_tool_use::handle(&input, ralph.as_ref(), engine, &cwd).await,
+        "prompt-submit" => prompt_submit::handle(&input, ralph.as_ref(), engine, &cwd).await,
         _ => {
             eprintln!("unknown hook: {}", hook_name);
             Ok(())

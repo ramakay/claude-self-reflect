@@ -15,9 +15,23 @@ use anyhow::Result;
 use super::ralph_state::RalphState;
 use super::HookInput;
 use crate::engine::Engine;
+use crate::injection::anti_pattern;
 
 /// Handle the session-start hook.
+/// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code (C-1 fix).
 pub async fn handle(
+    input: &HookInput,
+    ralph: Option<&RalphState>,
+    engine: &Engine,
+    cwd: &Path,
+) -> Result<()> {
+    if let Err(e) = handle_inner(input, ralph, engine, cwd).await {
+        eprintln!("CSR: session-start hook error (non-fatal): {}", e);
+    }
+    Ok(()) // Always succeed
+}
+
+async fn handle_inner(
     input: &HookInput,
     ralph: Option<&RalphState>,
     engine: &Engine,
@@ -53,23 +67,17 @@ pub async fn handle(
     let mut similar_count = 0usize;
 
     // 1. Search for anti-patterns (incomplete/abandoned sessions) — output FIRST
-    let anti_query = format!("failed approach don't retry: {}", ralph.task);
-    let anti_results = search_reflections_by_tag(
-        storage,
-        embeddings,
-        search,
-        &anti_query,
-        0.5,
-        2,
-        &["outcome_incomplete", "outcome_abandoned"],
+    // Uses shared anti_pattern module (also used by prompt_submit hook)
+    let anti_items = anti_pattern::find_anti_patterns(
+        storage, embeddings, search, &ralph.task, 0.5, 2,
     )
     .await;
 
-    if !anti_results.is_empty() {
-        anti_pattern_count = anti_results.len();
+    if !anti_items.is_empty() {
+        anti_pattern_count = anti_items.len();
         let mut section = String::from("## DON'T RETRY THESE (Anti-Patterns from Past Sessions)\n\n");
-        for (content, score) in &anti_results {
-            section.push_str(&format!("**[Score: {:.2}]**\n{}\n\n---\n\n", score, content));
+        for item in &anti_items {
+            section.push_str(&format!("**[Score: {:.2}]**\n{}\n\n---\n\n", item.score, item.content));
         }
         context_parts.push(section);
     }
@@ -97,7 +105,7 @@ pub async fn handle(
 
     // 3. Search for winning strategies (completed sessions)
     let win_query = format!("successful solution: {}", ralph.task);
-    let win_results = search_reflections_by_tag(
+    let win_results = anti_pattern::search_reflections_by_tag(
         storage,
         embeddings,
         search,
@@ -167,44 +175,6 @@ pub async fn handle(
     }
 
     Ok(())
-}
-
-/// Search reflections filtered by any of the given tags.
-async fn search_reflections_by_tag(
-    storage: &std::sync::Arc<crate::storage::Storage>,
-    embeddings: &std::sync::Arc<crate::embeddings::EmbeddingEngine>,
-    search: &std::sync::Arc<tokio::sync::RwLock<crate::search::SearchEngine>>,
-    query: &str,
-    min_score: f32,
-    limit: usize,
-    tags: &[&str],
-) -> Vec<(String, f32)> {
-    // First do semantic search on reflections
-    let query_vec = match embed_query(embeddings, query).await {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    let results = {
-        let idx = search.read().await;
-        idx.search_reflections(&query_vec, limit * 3, min_score) // Over-fetch for filtering
-    };
-
-    // Then filter by tags
-    let mut filtered = Vec::new();
-    for result in &results {
-        if let Ok(Some((_content, ref_tags, _ts))) = storage.get_reflection_by_id(&result.id) {
-            let has_matching_tag = tags.iter().any(|t| ref_tags.iter().any(|rt| rt == t));
-            if has_matching_tag {
-                filtered.push((_content, result.score));
-                if filtered.len() >= limit {
-                    break;
-                }
-            }
-        }
-    }
-
-    filtered
 }
 
 /// Search reflections without tag filtering.

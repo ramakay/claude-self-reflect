@@ -21,6 +21,21 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Create an engine from pre-built components (for testing).
+    pub fn from_parts(
+        storage: Arc<Storage>,
+        embeddings: Arc<EmbeddingEngine>,
+        search: Arc<RwLock<SearchEngine>>,
+        projects_dir: PathBuf,
+    ) -> Self {
+        Self {
+            storage,
+            embeddings,
+            search,
+            projects_dir,
+        }
+    }
+
     pub fn new(db_path: &Path, projects_dir: &Path) -> Result<Self> {
         tracing::info!(?db_path, "opening storage");
         let storage = Arc::new(Storage::open(db_path)?);

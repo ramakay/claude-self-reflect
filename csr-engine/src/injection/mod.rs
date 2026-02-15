@@ -3,7 +3,9 @@
 //! Used by both the Stop hook (per-iteration) and SessionStart hook.
 //! Token-budgeted formatting ensures compact output (≤300 tokens by default).
 
+pub mod anti_pattern;
 pub mod formatter;
+pub mod predictor;
 pub mod stuck_detector;
 
 /// Context assembled for injection into Claude's context.

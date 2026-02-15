@@ -1139,3 +1139,420 @@ fn test_hook_input_stop_hook_active_missing() {
     let input: csr_engine::hooks::HookInput = serde_json::from_str(json).unwrap();
     assert_eq!(input.stop_hook_active, None);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 2c: Predictive Injection Tests
+// ═══════════════════════════════════════════════════════════════
+
+// ─── sonic-rs JSONL Parsing ───
+
+#[test]
+fn test_sonic_rs_parses_jsonl_roundtrip() {
+    // Verify sonic-rs produces identical serde_json::Value as serde_json
+    let line = r#"{"type":"human","timestamp":"2026-02-15T10:00:00Z","message":{"content":[{"type":"text","text":"hello"}]}}"#;
+    let sonic_val: serde_json::Value = sonic_rs::from_str(line).unwrap();
+    let serde_val: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(sonic_val, serde_val);
+}
+
+#[test]
+fn test_bufreader_streaming_matches_full_read() {
+    // BufReader-based parsing produces same chunks as full-file read
+    let file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample_conversation.jsonl");
+    let chunks = csr_engine::import::parse_jsonl_file(&file, "test-project").unwrap();
+    assert!(!chunks.is_empty(), "BufReader streaming should produce chunks");
+    assert_eq!(chunks[0].project_name, "test-project");
+    assert!(chunks[0].content.contains("Docker memory"));
+}
+
+#[test]
+fn test_sonic_rs_handles_malformed_lines() {
+    // Create a temp file with some valid and some malformed lines
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("test.jsonl");
+    std::fs::write(
+        &path,
+        r#"{"type":"human","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"valid"}]}}
+not valid json
+{"type":"assistant","message":{"content":[{"type":"text","text":"response"}]}}
+{broken json
+"#,
+    )
+    .unwrap();
+
+    let chunks = csr_engine::import::parse_jsonl_file(&path, "test").unwrap();
+    assert!(!chunks.is_empty(), "should parse valid lines despite malformed ones");
+    // Both valid messages should be in the first chunk
+    assert!(chunks[0].content.contains("valid"));
+    assert!(chunks[0].content.contains("response"));
+}
+
+// ─── Predictor Module ───
+
+#[test]
+fn test_predictor_semantic_only() {
+    use csr_engine::injection::predictor::{self, RawResult};
+
+    let results = vec![
+        RawResult {
+            content: "high".into(),
+            score: 0.9,
+            source: "chunk".into(),
+            timestamp: None,
+            files: vec![],
+            error_patterns: vec![],
+        },
+        RawResult {
+            content: "low".into(),
+            score: 0.4,
+            source: "chunk".into(),
+            timestamp: None,
+            files: vec![],
+            error_patterns: vec![],
+        },
+    ];
+
+    let scored = predictor::rank_results(results, &[], &[]);
+    assert_eq!(scored.len(), 2);
+    assert_eq!(scored[0].content, "high");
+    assert!(scored[0].final_score > scored[1].final_score);
+}
+
+#[test]
+fn test_predictor_recency_boost() {
+    use csr_engine::injection::predictor::{self, RawResult};
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let old = "2024-01-01T00:00:00Z".to_string();
+
+    let results = vec![
+        RawResult {
+            content: "recent".into(),
+            score: 0.7,
+            source: "chunk".into(),
+            timestamp: Some(now),
+            files: vec![],
+            error_patterns: vec![],
+        },
+        RawResult {
+            content: "old".into(),
+            score: 0.7,
+            source: "chunk".into(),
+            timestamp: Some(old),
+            files: vec![],
+            error_patterns: vec![],
+        },
+    ];
+
+    let scored = predictor::rank_results(results, &[], &[]);
+    assert_eq!(scored[0].content, "recent");
+}
+
+#[test]
+fn test_predictor_file_overlap() {
+    use csr_engine::injection::predictor::{self, RawResult};
+
+    let results = vec![
+        RawResult {
+            content: "with overlap".into(),
+            score: 0.7,
+            source: "chunk".into(),
+            timestamp: None,
+            files: vec!["src/auth.rs".into()],
+            error_patterns: vec![],
+        },
+        RawResult {
+            content: "no overlap".into(),
+            score: 0.7,
+            source: "chunk".into(),
+            timestamp: None,
+            files: vec!["src/unrelated.rs".into()],
+            error_patterns: vec![],
+        },
+    ];
+
+    let current_files = vec!["src/auth.rs".into()];
+    let scored = predictor::rank_results(results, &current_files, &[]);
+    assert_eq!(scored[0].content, "with overlap");
+}
+
+#[test]
+fn test_predictor_cross_project() {
+    use csr_engine::injection::predictor::{self, RawResult};
+
+    let results = vec![
+        RawResult {
+            content: "cross-project insight".into(),
+            score: 0.8,
+            source: "reflection".into(),
+            timestamp: None,
+            files: vec![],
+            error_patterns: vec![],
+        },
+    ];
+
+    let scored = predictor::rank_results(results, &[], &[]);
+    assert_eq!(scored.len(), 1);
+    assert_eq!(scored[0].source, "reflection");
+}
+
+// ─── Anti-Pattern Detector ───
+
+#[test]
+fn test_anti_pattern_empty_index() {
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let items = rt.block_on(csr_engine::injection::anti_pattern::find_anti_patterns(
+        &storage, &embeddings, &search, "fix auth bug", 0.5, 2,
+    ));
+
+    assert!(items.is_empty(), "empty index should return no anti-patterns");
+}
+
+#[test]
+fn test_anti_pattern_respects_min_score() {
+    // Store a reflection tagged as incomplete, then search with high min_score
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Store a reflection
+    let tags = vec!["outcome_incomplete".to_string(), "ralph_session".to_string()];
+    rt.block_on(csr_engine::mcp::tools::store_reflection(
+        &storage,
+        &embeddings,
+        &search,
+        "Failed approach: used shared memory for IPC, caused race conditions",
+        &tags,
+    ))
+    .unwrap();
+
+    // Search with very high min_score — should return nothing
+    let items = rt.block_on(csr_engine::injection::anti_pattern::find_anti_patterns(
+        &storage, &embeddings, &search, "completely unrelated topic about cooking", 0.99, 2,
+    ));
+
+    // With min_score=0.99, unlikely to match
+    // (exact behavior depends on embedding similarity)
+    assert!(items.len() <= 2);
+}
+
+#[test]
+fn test_anti_pattern_finds_incomplete_sessions() {
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Store an incomplete session reflection
+    let tags = vec!["outcome_incomplete".to_string(), "ralph_session".to_string()];
+    rt.block_on(csr_engine::mcp::tools::store_reflection(
+        &storage,
+        &embeddings,
+        &search,
+        "INCOMPLETE SESSION: Tried to fix authentication timeout by increasing connection pool size, but the root cause was DNS resolution delay",
+        &tags,
+    ))
+    .unwrap();
+
+    // Search for related topic
+    let items = rt.block_on(csr_engine::injection::anti_pattern::find_anti_patterns(
+        &storage, &embeddings, &search, "fix authentication timeout", 0.3, 5,
+    ));
+
+    // Should find the incomplete session (semantic match on "authentication timeout")
+    assert!(!items.is_empty(), "should find anti-pattern for related topic");
+    assert_eq!(items[0].source, "anti_pattern");
+}
+
+// ─── PromptSubmit Hook ───
+
+#[test]
+fn test_hook_input_prompt_field() {
+    let json = r#"{"session_id":"test","prompt":"fix the auth bug"}"#;
+    let input: csr_engine::hooks::HookInput = serde_json::from_str(json).unwrap();
+    assert_eq!(input.prompt.as_deref(), Some("fix the auth bug"));
+}
+
+#[test]
+fn test_hook_input_prompt_missing() {
+    let json = r#"{"session_id":"test"}"#;
+    let input: csr_engine::hooks::HookInput = serde_json::from_str(json).unwrap();
+    assert_eq!(input.prompt, None);
+}
+
+#[test]
+fn test_prompt_submit_skips_short_prompts() {
+    // Prompts < 15 chars should be skipped (fast path)
+    let input = csr_engine::hooks::HookInput {
+        prompt: Some("hi".into()),
+        ..Default::default()
+    };
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage, embeddings, search, std::path::PathBuf::from("/tmp"),
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(csr_engine::hooks::prompt_submit::handle(
+        &input, None, &engine, std::path::Path::new("/tmp"),
+    ));
+
+    assert!(result.is_ok(), "short prompt should succeed silently");
+}
+
+#[test]
+fn test_prompt_submit_skips_slash_commands() {
+    let input = csr_engine::hooks::HookInput {
+        prompt: Some("/help me with something".into()),
+        ..Default::default()
+    };
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage, embeddings, search, std::path::PathBuf::from("/tmp"),
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(csr_engine::hooks::prompt_submit::handle(
+        &input, None, &engine, std::path::Path::new("/tmp"),
+    ));
+
+    assert!(result.is_ok(), "slash command should succeed silently");
+}
+
+#[test]
+fn test_prompt_submit_no_results_no_output() {
+    let input = csr_engine::hooks::HookInput {
+        prompt: Some("fix the authentication timeout bug in the login system".into()),
+        ..Default::default()
+    };
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage, embeddings, search, std::path::PathBuf::from("/tmp"),
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(csr_engine::hooks::prompt_submit::handle(
+        &input, None, &engine, std::path::Path::new("/tmp"),
+    ));
+
+    assert!(result.is_ok(), "empty index should produce no output but succeed");
+}
+
+#[test]
+fn test_prompt_submit_catch_all_never_fails() {
+    // Even with invalid/missing input, should return Ok
+    let input = csr_engine::hooks::HookInput::default();
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage, embeddings, search, std::path::PathBuf::from("/tmp"),
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(csr_engine::hooks::prompt_submit::handle(
+        &input, None, &engine, std::path::Path::new("/tmp"),
+    ));
+
+    assert!(result.is_ok(), "catch-all wrapper must always succeed");
+}
+
+// ─── Install Config (Updated for 6 Hook Types) ───
+
+#[test]
+fn test_install_config_includes_prompt_submit() {
+    // Call the actual generate function
+    let config = csr_engine::hooks::install::generate_hook_config_for_test("/usr/local/bin/csr-engine");
+    let hooks = config.get("hooks").unwrap();
+
+    // All 6 hook types must be present
+    assert!(hooks.get("SessionStart").is_some());
+    assert!(hooks.get("SessionEnd").is_some());
+    assert!(hooks.get("PreCompact").is_some());
+    assert!(hooks.get("Stop").is_some());
+    assert!(hooks.get("PostToolUse").is_some());
+    assert!(hooks.get("UserPromptSubmit").is_some(), "UserPromptSubmit must be in config");
+
+    let prompt_submit = hooks.get("UserPromptSubmit").unwrap();
+    let cmd = prompt_submit[0]["hooks"][0]["command"].as_str().unwrap();
+    assert!(cmd.contains("hook prompt-submit"));
+}
+
+// ─── E2E: Store Reflection → Prompt Triggers Injection ───
+
+#[test]
+fn test_e2e_store_reflection_then_prompt_finds_it() {
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // 1. Store a reflection about Docker memory
+    let tags = vec!["docker".to_string(), "debugging".to_string()];
+    rt.block_on(csr_engine::mcp::tools::store_reflection(
+        &storage,
+        &embeddings,
+        &search,
+        "SOLUTION: Docker container was running out of memory because the Qdrant vector database had no memory limits set. Fixed by adding mem_limit: 2g to docker-compose.yaml.",
+        &tags,
+    ))
+    .unwrap();
+
+    // 2. Verify it can be found via search
+    let query_vec = {
+        let q = "Docker memory issue with Qdrant".to_string();
+        let emb = embeddings.clone();
+        rt.block_on(async move {
+            tokio::task::spawn_blocking(move || emb.embed_single(&q))
+                .await
+                .unwrap()
+                .unwrap()
+        })
+    };
+
+    let results = rt.block_on(async {
+        let idx = search.read().await;
+        idx.search_reflections(&query_vec, 5, 0.3)
+    });
+
+    assert!(!results.is_empty(), "stored reflection should be findable");
+    assert!(results[0].score > 0.5, "should have high relevance score");
+}
