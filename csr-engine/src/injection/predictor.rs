@@ -107,15 +107,13 @@ fn compute_recency_boost(timestamp: Option<&str>) -> f32 {
         None => return 0.5, // No timestamp → neutral boost
     };
 
-    let parsed = match chrono::DateTime::parse_from_rfc3339(ts) {
-        Ok(dt) => dt,
-        Err(_) => return 0.5,
+    let parsed = match crate::temporal::parse_timestamp(ts) {
+        Some(dt) => dt,
+        None => return 0.5,
     };
 
     let now = chrono::Utc::now();
-    let age_days = (now - parsed.with_timezone(&chrono::Utc))
-        .num_days()
-        .max(0) as f64;
+    let age_days = (now - parsed).num_days().max(0) as f64;
 
     // 2^(-age/30): 1.0 today, 0.5 at 30 days, 0.25 at 60 days
     (2.0_f64.powf(-age_days / 30.0)) as f32

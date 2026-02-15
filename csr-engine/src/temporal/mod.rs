@@ -1,9 +1,26 @@
 use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Utc};
 
 use crate::import::ConversationChunk;
+
+/// Parse a timestamp string that may or may not have a timezone designator.
+/// Handles RFC 3339 (with `Z` or offset) and bare ISO 8601 (assumes UTC).
+pub fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
+    // Try RFC 3339 first (has timezone like Z or +00:00)
+    if let Ok(ts) = s.parse::<DateTime<Utc>>() {
+        return Some(ts);
+    }
+    // Fall back to NaiveDateTime (no timezone, assume UTC)
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(naive.and_utc());
+    }
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Some(naive.and_utc());
+    }
+    None
+}
 
 /// Parse a natural language or ISO time expression into a (start, end) UTC range.
 pub fn parse_time_expression(expr: &str) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
@@ -139,7 +156,7 @@ pub fn group_chunks_by_period<'a>(
     let mut groups: BTreeMap<String, Vec<&ConversationChunk>> = BTreeMap::new();
 
     for chunk in chunks {
-        let key = if let Ok(ts) = chunk.timestamp.parse::<DateTime<Utc>>() {
+        let key = if let Some(ts) = parse_timestamp(&chunk.timestamp) {
             match granularity {
                 "hour" => ts.format("%Y-%m-%d %H:00").to_string(),
                 "day" => ts.format("%Y-%m-%d").to_string(),
@@ -283,5 +300,62 @@ mod tests {
     #[test]
     fn test_parse_invalid() {
         assert!(parse_time_expression("gobbledygook").is_err());
+    }
+
+    #[test]
+    fn test_parse_timestamp_rfc3339() {
+        let ts = parse_timestamp("2026-01-15T10:30:00Z");
+        assert!(ts.is_some());
+        assert_eq!(ts.unwrap().year(), 2026);
+    }
+
+    #[test]
+    fn test_parse_timestamp_no_timezone() {
+        // Qdrant-imported timestamps often lack Z suffix
+        let ts = parse_timestamp("2025-10-23T04:22:13.723731");
+        assert!(ts.is_some());
+        let dt = ts.unwrap();
+        assert_eq!(dt.year(), 2025);
+        assert_eq!(dt.month(), 10);
+    }
+
+    #[test]
+    fn test_parse_timestamp_no_fractional() {
+        let ts = parse_timestamp("2026-01-15T10:30:00");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn test_parse_timestamp_invalid() {
+        assert!(parse_timestamp("not a timestamp").is_none());
+        assert!(parse_timestamp("").is_none());
+    }
+
+    #[test]
+    fn test_group_by_day_mixed_timestamps() {
+        // Mix of Z-suffixed and bare timestamps
+        let chunks = vec![
+            ConversationChunk {
+                id: "1".into(),
+                conversation_id: "c1".into(),
+                project_name: "test".into(),
+                timestamp: "2026-01-15T10:00:00Z".into(),
+                content: "with Z".into(),
+                message_count: 1,
+            },
+            ConversationChunk {
+                id: "2".into(),
+                conversation_id: "c2".into(),
+                project_name: "test".into(),
+                timestamp: "2026-01-15T14:00:00.123456".into(),
+                content: "without Z".into(),
+                message_count: 1,
+            },
+        ];
+
+        let groups = group_chunks_by_period(&chunks, "day");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups["2026-01-15"].len(), 2);
+        assert!(!groups.contains_key("unknown"));
     }
 }

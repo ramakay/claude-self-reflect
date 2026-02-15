@@ -97,7 +97,9 @@ fn apply_to_settings(config: &serde_json::Value) -> Result<()> {
             // Preserves entries from other tools under the same hook type.
             if let Some(existing_arr) = hooks_obj.get_mut(hook_type).and_then(|v| v.as_array_mut())
             {
-                // Remove existing CSR entries (identified by command containing "csr-engine")
+                // Remove existing CSR entries — both Rust ("csr-engine") and Python
+                // ("claude-self-reflect" hooks). Both live under the claude-self-reflect
+                // project path, so matching that catches legacy Python hooks too.
                 existing_arr.retain(|entry| {
                     let is_csr = entry
                         .get("hooks")
@@ -105,7 +107,9 @@ fn apply_to_settings(config: &serde_json::Value) -> Result<()> {
                         .and_then(|arr| arr.first())
                         .and_then(|h| h.get("command"))
                         .and_then(|c| c.as_str())
-                        .is_some_and(|cmd| cmd.contains("csr-engine"));
+                        .is_some_and(|cmd| {
+                            cmd.contains("csr-engine") || cmd.contains("claude-self-reflect")
+                        });
                     !is_csr
                 });
                 // Append new CSR entries
@@ -129,6 +133,84 @@ fn apply_to_settings(config: &serde_json::Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_retain_removes_python_csr_hooks() {
+        // Simulate existing settings with Python CSR hooks + a non-CSR hook
+        let mut settings: serde_json::Value = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "hooks": [{"type": "command", "command": "node \"/Users/me/.claude/hooks/gsd-check-update.js\""}]
+                    },
+                    {
+                        "hooks": [{"type": "command", "command": "python /Users/me/projects/claude-self-reflect/src/runtime/hooks/session_start_hook.py"}],
+                        "matcher": "startup|resume"
+                    }
+                ],
+                "SessionEnd": [
+                    {
+                        "hooks": [{"type": "command", "command": "/Users/me/projects/claude-self-reflect/src/runtime/hooks/session_end_hook.py"}]
+                    }
+                ],
+                "PreCompact": [
+                    {
+                        "hooks": [{"type": "command", "command": "/Users/me/projects/claude-self-reflect/src/runtime/precompact-hook.sh"}]
+                    }
+                ]
+            }
+        });
+
+        let new_config = generate_hook_config("/usr/local/bin/csr-engine");
+
+        // Apply merge logic (same as apply_to_settings but inline)
+        if let Some(new_hooks) = new_config.get("hooks").and_then(|h| h.as_object()) {
+            let hooks_obj = settings.get_mut("hooks").unwrap();
+            for (hook_type, entries) in new_hooks {
+                if let Some(existing_arr) =
+                    hooks_obj.get_mut(hook_type).and_then(|v| v.as_array_mut())
+                {
+                    existing_arr.retain(|entry| {
+                        let is_csr = entry
+                            .get("hooks")
+                            .and_then(|h| h.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|h| h.get("command"))
+                            .and_then(|c| c.as_str())
+                            .is_some_and(|cmd| {
+                                cmd.contains("csr-engine") || cmd.contains("claude-self-reflect")
+                            });
+                        !is_csr
+                    });
+                    if let Some(new_arr) = entries.as_array() {
+                        existing_arr.extend(new_arr.iter().cloned());
+                    }
+                } else {
+                    hooks_obj[hook_type] = entries.clone();
+                }
+            }
+        }
+
+        // GSD hook should survive
+        let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 2); // GSD + new CSR
+        let gsd_cmd = session_start[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(gsd_cmd.contains("gsd-check-update"), "GSD hook should survive");
+        let csr_cmd = session_start[1]["hooks"][0]["command"].as_str().unwrap();
+        assert!(csr_cmd.contains("csr-engine"), "New CSR hook should be added");
+
+        // Python hooks should be replaced with Rust hooks
+        let session_end = settings["hooks"]["SessionEnd"].as_array().unwrap();
+        assert_eq!(session_end.len(), 1); // Only new CSR, Python removed
+        let cmd = session_end[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("csr-engine"), "Python hook should be replaced");
+        assert!(!cmd.contains("session_end_hook.py"), "Python hook must be gone");
+
+        let precompact = settings["hooks"]["PreCompact"].as_array().unwrap();
+        assert_eq!(precompact.len(), 1);
+        let cmd = precompact[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("csr-engine"), "Python precompact should be replaced");
+    }
 
     #[test]
     fn test_generate_hook_config() {

@@ -44,10 +44,13 @@ impl Engine {
         let embeddings = Arc::new(EmbeddingEngine::new()?);
 
         tracing::info!("building search index from stored vectors");
-        let mut search = SearchEngine::new(10_000);
 
         // Load existing vectors from SQLite into HNSW
         let chunk_vecs = storage.load_all_chunk_vectors()?;
+
+        // Size HNSW to actual data + 20% headroom for growth
+        let estimated_size = (chunk_vecs.len() + 1000).max(10_000);
+        let mut search = SearchEngine::new(estimated_size);
         for (id, vec) in &chunk_vecs {
             search.insert_chunk(id.clone(), vec.clone());
         }

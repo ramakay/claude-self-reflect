@@ -1,6 +1,7 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
 use crate::import::ConversationChunk;
+use crate::temporal::parse_timestamp;
 
 /// Escape special XML characters in user-generated content.
 fn xml_escape(s: &str) -> String {
@@ -112,7 +113,7 @@ pub fn format_search_results(
         out.push_str(&format!("      <p>{}</p>\n", xml_escape(&r.chunk.project_name)));
 
         // Relative time
-        if let Ok(ts) = r.chunk.timestamp.parse::<DateTime<Utc>>() {
+        if let Some(ts) = parse_timestamp(&r.chunk.timestamp) {
             let now = Utc::now();
             let days_ago = (now - ts).num_days();
             let time_str = match days_ago {
@@ -210,7 +211,7 @@ pub fn format_recent_work(
             let mut groups: std::collections::BTreeMap<String, Vec<&ConversationChunk>> =
                 std::collections::BTreeMap::new();
             for chunk in chunks {
-                let key = if let Ok(ts) = chunk.timestamp.parse::<DateTime<Utc>>() {
+                let key = if let Some(ts) = parse_timestamp(&chunk.timestamp) {
                     ts.format("%Y-%m-%d").to_string()
                 } else {
                     "unknown".into()
@@ -511,7 +512,7 @@ pub fn format_session_learnings(
 
 /// Helper: compute relative time string from an ISO timestamp.
 fn relative_time_str(timestamp: &str) -> String {
-    if let Ok(ts) = timestamp.parse::<DateTime<Utc>>() {
+    if let Some(ts) = parse_timestamp(timestamp) {
         let days_ago = (Utc::now() - ts).num_days();
         match days_ago {
             0 => "today".into(),
