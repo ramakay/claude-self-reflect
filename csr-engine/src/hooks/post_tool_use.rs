@@ -6,6 +6,26 @@
 //!
 //! For non-Ralph sessions or non-edit tools, exits immediately.
 //! Always returns Ok(()) — never blocks Claude Code (C-2 fix).
+//!
+//! ## Design Decision: Why only file edits?
+//!
+//! We intentionally limit PostToolUse tracking to file-modifying tools (Edit, Write,
+//! MultiEdit, NotebookEdit) rather than capturing all tool calls. Reasons:
+//!
+//! 1. **Import-time capture is comprehensive**: `extract_tool_context()` in the JSONL
+//!    import pipeline already extracts ALL tool names + params from tool_use blocks.
+//!    This gives us searchable tool context for every conversation at index time.
+//!
+//! 2. **Avoid duplicate storage**: Expanding to all tools would duplicate what import
+//!    already captures, adding ~2ms per tool call with no incremental search value.
+//!
+//! 3. **Ralph iteration memory**: File edits are tracked specifically because Ralph
+//!    loops need to know "what files did I touch this iteration?" for stuck detection
+//!    and iteration-level dedup. Other tool calls don't serve this purpose.
+//!
+//! 4. **Reactive injection covers real-time**: The `prompt_submit` hook provides
+//!    real-time context injection when relevant, addressing the "availability gap"
+//!    between tool execution and next import without per-tool-call overhead.
 
 use std::path::Path;
 
