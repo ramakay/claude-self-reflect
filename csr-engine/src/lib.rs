@@ -3,6 +3,7 @@ pub mod engine;
 pub mod format;
 pub mod hooks;
 pub mod import;
+pub mod injection;
 pub mod mcp;
 pub mod search;
 pub mod storage;

@@ -7,10 +7,12 @@
 //! 4. Exits with code 0 (never blocks the session)
 
 pub mod install;
+pub mod post_tool_use;
 pub mod precompact;
 pub mod ralph_state;
 pub mod session_end;
 pub mod session_start;
+pub mod stop;
 
 use std::io::Read;
 
@@ -26,6 +28,12 @@ pub struct HookInput {
     pub transcript_path: Option<String>,
     pub cwd: Option<String>,
     pub reason: Option<String>,
+    /// Tool name for PostToolUse hook
+    pub tool_name: Option<String>,
+    /// Tool input for PostToolUse hook (contains file_path, content, etc.)
+    pub tool_input: Option<serde_json::Value>,
+    /// Whether the Stop hook is re-entering (to prevent infinite loops)
+    pub stop_hook_active: Option<bool>,
 }
 
 /// Read and parse JSON from stdin. Returns a default HookInput if stdin is empty or invalid.
@@ -79,6 +87,8 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
         "session-start" => session_start::handle(&input, ralph.as_ref(), engine, &cwd).await,
         "session-end" => session_end::handle(&input, ralph.as_ref(), engine, &cwd).await,
         "precompact" => precompact::handle(&input, ralph.as_ref(), engine).await,
+        "stop" => stop::handle(&input, ralph.as_ref(), engine, &cwd).await,
+        "post-tool-use" => post_tool_use::handle(&input, ralph.as_ref(), engine, &cwd).await,
         _ => {
             eprintln!("unknown hook: {}", hook_name);
             Ok(())

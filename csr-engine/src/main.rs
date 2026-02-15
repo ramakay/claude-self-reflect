@@ -44,7 +44,7 @@ struct Args {
 enum Commands {
     /// Handle Claude Code hook events
     Hook {
-        /// Hook name: session-start, session-end, precompact, install
+        /// Hook name: session-start, session-end, precompact, stop, post-tool-use, install
         name: String,
 
         /// For install: auto-apply to settings.json

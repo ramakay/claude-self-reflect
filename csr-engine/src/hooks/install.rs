@@ -31,13 +31,20 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
         "hooks": {
             "SessionStart": [{
                 "matcher": "startup|resume",
-                "command": format!("{} hook session-start", binary_path)
+                "hooks": [{"type": "command", "command": format!("{} hook session-start", binary_path)}]
             }],
             "SessionEnd": [{
-                "command": format!("{} hook session-end", binary_path)
+                "hooks": [{"type": "command", "command": format!("{} hook session-end", binary_path)}]
             }],
             "PreCompact": [{
-                "command": format!("{} hook precompact", binary_path)
+                "hooks": [{"type": "command", "command": format!("{} hook precompact", binary_path)}]
+            }],
+            "Stop": [{
+                "hooks": [{"type": "command", "command": format!("{} hook stop", binary_path)}]
+            }],
+            "PostToolUse": [{
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "hooks": [{"type": "command", "command": format!("{} hook post-tool-use", binary_path)}]
             }]
         }
     })
@@ -103,15 +110,27 @@ mod tests {
 
         let session_start = hooks.get("SessionStart").unwrap();
         assert!(session_start.is_array());
-        let cmd = session_start[0]["command"].as_str().unwrap();
+        let cmd = session_start[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("csr-engine hook session-start"));
 
         let session_end = hooks.get("SessionEnd").unwrap();
-        let cmd = session_end[0]["command"].as_str().unwrap();
+        let cmd = session_end[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("csr-engine hook session-end"));
 
         let precompact = hooks.get("PreCompact").unwrap();
-        let cmd = precompact[0]["command"].as_str().unwrap();
+        let cmd = precompact[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("csr-engine hook precompact"));
+
+        let stop = hooks.get("Stop").unwrap();
+        let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("csr-engine hook stop"));
+
+        let post_tool_use = hooks.get("PostToolUse").unwrap();
+        let cmd = post_tool_use[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("csr-engine hook post-tool-use"));
+        assert_eq!(
+            post_tool_use[0]["matcher"].as_str().unwrap(),
+            "Edit|Write|MultiEdit|NotebookEdit"
+        );
     }
 }

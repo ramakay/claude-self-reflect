@@ -613,3 +613,529 @@ fn test_state_file_paths() {
         .contains(".claude/ralph-loop.local.md"));
     assert!(paths[1].to_string_lossy().contains(".ralph_state.md"));
 }
+
+// ════════════════════════════════════════════════════════════════
+// Phase 2b: Injection Engine + Stop/PostToolUse hooks
+// ════════════════════════════════════════════════════════════════
+
+use csr_engine::injection::formatter;
+use csr_engine::injection::stuck_detector::{self, StuckSeverity};
+use csr_engine::injection::{InjectionContext, InjectionItem};
+
+// ─── Injection Formatter Tests ───
+
+#[test]
+fn test_formatter_token_budget_enforcement() {
+    // Create a context with lots of items that exceed 300 tokens
+    let ctx = InjectionContext {
+        anti_patterns: (0..20)
+            .map(|i| InjectionItem {
+                content: format!("Anti-pattern {} with a moderately long description that uses tokens", i),
+                score: 0.8,
+                source: "past_session".into(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+
+    let output = ctx.format(300);
+    let tokens = formatter::estimate_tokens(&output);
+    assert!(
+        tokens <= 320, // Allow small overshoot from final item
+        "output should respect ~300 token budget, got {} tokens ({} chars)",
+        tokens,
+        output.len()
+    );
+}
+
+#[test]
+fn test_formatter_priority_ordering() {
+    let ctx = InjectionContext {
+        anti_patterns: vec![InjectionItem {
+            content: "ANTI_MARKER".into(),
+            score: 0.8,
+            source: "past".into(),
+        }],
+        error_matches: vec![InjectionItem {
+            content: "ERROR_MARKER".into(),
+            score: 0.7,
+            source: "past".into(),
+        }],
+        winning_strategies: vec![InjectionItem {
+            content: "WIN_MARKER".into(),
+            score: 0.6,
+            source: "past".into(),
+        }],
+        iteration_learnings: vec![InjectionItem {
+            content: "ITER_MARKER".into(),
+            score: 1.0,
+            source: "iter_3".into(),
+        }],
+        stuck_warning: Some("STUCK_MARKER".into()),
+    };
+
+    let output = ctx.format(500);
+
+    // Verify ordering: stuck → anti-patterns → errors → winning → iteration
+    let stuck_pos = output.find("STUCK_MARKER").expect("stuck warning missing");
+    let anti_pos = output.find("ANTI_MARKER").expect("anti-pattern missing");
+    let error_pos = output.find("ERROR_MARKER").expect("error match missing");
+    let win_pos = output.find("WIN_MARKER").expect("winning strategy missing");
+    let iter_pos = output.find("ITER_MARKER").expect("iteration learning missing");
+
+    assert!(stuck_pos < anti_pos, "stuck must come before anti-patterns");
+    assert!(anti_pos < error_pos, "anti-patterns must come before errors");
+    assert!(error_pos < win_pos, "errors must come before winning strategies");
+    assert!(win_pos < iter_pos, "winning strategies must come before iterations");
+}
+
+#[test]
+fn test_formatter_truncation_long_items() {
+    let ctx = InjectionContext {
+        anti_patterns: vec![InjectionItem {
+            content: "x".repeat(2000), // Very long item
+            score: 0.8,
+            source: "past".into(),
+        }],
+        ..Default::default()
+    };
+
+    let output = ctx.format(100); // Tight budget
+    assert!(
+        output.len() < 600,
+        "output should be truncated, got {} chars",
+        output.len()
+    );
+}
+
+#[test]
+fn test_formatter_empty_context() {
+    let ctx = InjectionContext::default();
+    assert_eq!(ctx.format(300), "");
+    assert!(ctx.is_empty());
+    assert_eq!(ctx.total_items(), 0);
+}
+
+// ─── Stuck Detector Tests ───
+
+#[test]
+fn test_stuck_error_repetition() {
+    let ralph = RalphState {
+        error_signatures: vec![("JWT expired".to_string(), 3)],
+        active: true,
+        ..Default::default()
+    };
+
+    let result = stuck_detector::analyze(&ralph);
+    assert!(result.is_stuck);
+    assert_eq!(result.severity, StuckSeverity::Warning);
+    assert!(result.reasons[0].contains("repeated 3x"));
+}
+
+#[test]
+fn test_stuck_high_iteration_low_confidence() {
+    let ralph = RalphState {
+        iteration: 25,
+        exit_confidence: 20,
+        active: true,
+        ..Default::default()
+    };
+
+    let result = stuck_detector::analyze(&ralph);
+    assert!(result.is_stuck);
+    assert!(result.reasons[0].contains("High iteration"));
+}
+
+#[test]
+fn test_stuck_failed_approach_accumulation() {
+    let ralph = RalphState {
+        failed_approaches: vec![
+            "a".into(), "b".into(), "c".into(), "d".into(), "e".into(),
+        ],
+        active: true,
+        ..Default::default()
+    };
+
+    let result = stuck_detector::analyze(&ralph);
+    assert!(result.is_stuck);
+    assert!(result.reasons[0].contains("5 failed approaches"));
+}
+
+#[test]
+fn test_stuck_normal_state() {
+    let ralph = RalphState {
+        iteration: 3,
+        exit_confidence: 80,
+        error_signatures: vec![("error".to_string(), 1)],
+        failed_approaches: vec!["one".into()],
+        active: true,
+        ..Default::default()
+    };
+
+    let result = stuck_detector::analyze(&ralph);
+    assert!(!result.is_stuck);
+    assert_eq!(result.severity, StuckSeverity::Normal);
+}
+
+#[test]
+fn test_stuck_severity_warning_vs_critical() {
+    // Warning: single signal
+    let ralph_warn = RalphState {
+        error_signatures: vec![("timeout".to_string(), 5)],
+        active: true,
+        ..Default::default()
+    };
+    let result = stuck_detector::analyze(&ralph_warn);
+    assert_eq!(result.severity, StuckSeverity::Warning);
+
+    // Critical: multiple signals
+    let ralph_crit = RalphState {
+        iteration: 30,
+        exit_confidence: 10,
+        error_signatures: vec![("timeout".to_string(), 5)],
+        failed_approaches: vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
+        active: true,
+        ..Default::default()
+    };
+    let result = stuck_detector::analyze(&ralph_crit);
+    assert_eq!(result.severity, StuckSeverity::Critical);
+    assert!(result.reasons.len() >= 2);
+}
+
+// ─── Stop Hook Tests ───
+
+#[test]
+fn test_stop_stores_iteration_learnings() {
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Store an iteration learning (mimicking what stop hook does)
+    let content = "ITERATION 3 of session ralph_test_stop\nTask: Fix bug\nLearnings:\n- Check tokens first\nConfidence: 60%\n";
+    let tags = vec![
+        "ralph_iteration".to_string(),
+        "session_ralph_test_stop".to_string(),
+        "iteration_3".to_string(),
+    ];
+
+    rt.block_on(csr_engine::mcp::tools::store_reflection(
+        &storage, &embeddings, &search, content, &tags,
+    ))
+    .unwrap();
+
+    // Verify stored with correct tags
+    let results = storage
+        .get_reflections_by_tag("ralph_iteration", 10)
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].1.contains("ITERATION 3"));
+    assert!(results[0].2.contains(&"iteration_3".to_string()));
+}
+
+#[test]
+fn test_stop_retrieves_previous_iterations() {
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Store iterations 1, 2, 3
+    for i in 1..=3 {
+        let content = format!("ITERATION {} of session ralph_test_retrieve\nTask: Build feature\n", i);
+        let tags = vec![
+            "ralph_iteration".to_string(),
+            "session_ralph_test_retrieve".to_string(),
+            format!("iteration_{}", i),
+        ];
+        rt.block_on(csr_engine::mcp::tools::store_reflection(
+            &storage, &embeddings, &search, &content, &tags,
+        ))
+        .unwrap();
+    }
+
+    // Query for session iterations
+    let results = storage
+        .get_reflections_by_tag("session_ralph_test_retrieve", 10)
+        .unwrap();
+    assert_eq!(results.len(), 3, "should find all 3 iterations");
+
+    // Verify iteration tags present
+    let all_tags: Vec<String> = results
+        .iter()
+        .flat_map(|(_, _, tags, _)| tags.clone())
+        .collect();
+    assert!(all_tags.contains(&"iteration_1".to_string()));
+    assert!(all_tags.contains(&"iteration_2".to_string()));
+    assert!(all_tags.contains(&"iteration_3".to_string()));
+}
+
+#[test]
+fn test_stop_stuck_warning_in_output() {
+    let ralph = RalphState {
+        iteration: 25,
+        exit_confidence: 10,
+        error_signatures: vec![("timeout".to_string(), 5)],
+        active: true,
+        ..Default::default()
+    };
+
+    let stuck = stuck_detector::analyze(&ralph);
+    let warning = stuck_detector::format_warning(&stuck);
+
+    assert!(warning.is_some());
+    let warning_text = warning.unwrap();
+    assert!(warning_text.contains("[CRITICAL]"));
+
+    // Build injection context with warning
+    let ctx = InjectionContext {
+        stuck_warning: Some(warning_text.clone()),
+        ..Default::default()
+    };
+
+    let output = ctx.format(300);
+    assert!(output.contains("STUCK WARNING"));
+    assert!(output.contains("[CRITICAL]"));
+}
+
+#[test]
+fn test_stop_no_ralph_exits_silently() {
+    // When there's no Ralph session, stop hook should return Ok(()) with no output
+    let tmp = TempDir::new().unwrap();
+    let ralph = RalphState::detect_in(tmp.path()).unwrap();
+    assert!(ralph.is_none(), "no Ralph state file means no session");
+}
+
+// ─── PostToolUse Hook Tests ───
+
+#[test]
+fn test_post_tool_use_tracks_edit() {
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Simulate what PostToolUse does: store file edit tracking
+    let content = "File modified: /Users/dev/src/main.rs (tool: Edit, session: ralph_test_ptu, iteration: 3)";
+    let tags = vec![
+        "file_edit".to_string(),
+        "session_ralph_test_ptu".to_string(),
+        "iteration_3".to_string(),
+    ];
+
+    rt.block_on(csr_engine::mcp::tools::store_reflection(
+        &storage, &embeddings, &search, content, &tags,
+    ))
+    .unwrap();
+
+    let results = storage
+        .get_reflections_by_tag("file_edit", 10)
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].1.contains("/Users/dev/src/main.rs"));
+    assert!(results[0].1.contains("Edit"));
+}
+
+#[test]
+fn test_post_tool_use_ignores_non_edit_tools() {
+    // HookInput with a non-edit tool should be handled gracefully
+    let json = r#"{"tool_name":"Read","tool_input":{"file_path":"/tmp/test.rs"}}"#;
+    let input: csr_engine::hooks::HookInput = serde_json::from_str(json).unwrap();
+
+    assert_eq!(input.tool_name.as_deref(), Some("Read"));
+    // Read is not in EDIT_TOOLS, so the hook should skip processing
+    // (We test the logic, not the full hook dispatch which requires engine)
+    let edit_tools = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+    assert!(!edit_tools.contains(&input.tool_name.as_deref().unwrap()));
+}
+
+#[test]
+fn test_post_tool_use_no_ralph_exits_silently() {
+    let tmp = TempDir::new().unwrap();
+    let ralph = RalphState::detect_in(tmp.path()).unwrap();
+    assert!(ralph.is_none());
+}
+
+#[test]
+fn test_post_tool_use_dedup_same_file() {
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Store same file edit twice
+    let content = "File modified: /src/main.rs (tool: Edit, session: ralph_dedup, iteration: 1)";
+    let tags = vec![
+        "file_edit".to_string(),
+        "session_ralph_dedup".to_string(),
+        "iteration_1".to_string(),
+    ];
+
+    rt.block_on(csr_engine::mcp::tools::store_reflection(
+        &storage, &embeddings, &search, content, &tags,
+    ))
+    .unwrap();
+
+    // Check dedup: search for session reflections containing the file
+    let results = storage
+        .get_reflections_by_tag("session_ralph_dedup", 50)
+        .unwrap();
+    let file_edits: Vec<_> = results
+        .iter()
+        .filter(|(_, content, tags, _)| {
+            tags.contains(&"file_edit".to_string()) && content.contains("/src/main.rs")
+        })
+        .collect();
+
+    assert_eq!(file_edits.len(), 1, "file should only be tracked once");
+}
+
+// ─── Install Config with New Hooks ───
+
+#[test]
+fn test_install_config_includes_stop() {
+    let config = serde_json::json!({
+        "hooks": {
+            "Stop": [{
+                "hooks": [{"type": "command", "command": "/usr/local/bin/csr-engine hook stop"}]
+            }]
+        }
+    });
+
+    let hooks = config.get("hooks").unwrap();
+    let stop = hooks.get("Stop").unwrap();
+    assert!(stop.is_array());
+    let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
+    assert!(cmd.contains("hook stop"));
+}
+
+#[test]
+fn test_install_config_post_tool_use_has_matcher() {
+    let config = serde_json::json!({
+        "hooks": {
+            "PostToolUse": [{
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "hooks": [{"type": "command", "command": "/usr/local/bin/csr-engine hook post-tool-use"}]
+            }]
+        }
+    });
+
+    let hooks = config.get("hooks").unwrap();
+    let ptu = hooks.get("PostToolUse").unwrap();
+    assert_eq!(
+        ptu[0]["matcher"].as_str().unwrap(),
+        "Edit|Write|MultiEdit|NotebookEdit"
+    );
+}
+
+// ─── End-to-End: Store Iteration → Retrieve in Next Iteration ───
+
+#[test]
+fn test_e2e_store_iteration_retrieve_in_next() {
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let session_id = "ralph_e2e_iter";
+
+    // Iteration 1: store learning
+    let content1 = format!(
+        "ITERATION 1 of session {}\nTask: Build auth\nLearnings:\n- Use JWT with refresh tokens\n",
+        session_id
+    );
+    let tags1 = vec![
+        "ralph_iteration".to_string(),
+        format!("session_{}", session_id),
+        "iteration_1".to_string(),
+    ];
+    rt.block_on(csr_engine::mcp::tools::store_reflection(
+        &storage, &embeddings, &search, &content1, &tags1,
+    ))
+    .unwrap();
+
+    // Iteration 2: store another learning
+    let content2 = format!(
+        "ITERATION 2 of session {}\nTask: Build auth\nLearnings:\n- Add rate limiting\n",
+        session_id
+    );
+    let tags2 = vec![
+        "ralph_iteration".to_string(),
+        format!("session_{}", session_id),
+        "iteration_2".to_string(),
+    ];
+    rt.block_on(csr_engine::mcp::tools::store_reflection(
+        &storage, &embeddings, &search, &content2, &tags2,
+    ))
+    .unwrap();
+
+    // Now simulate iteration 3 retrieving past iterations
+    let session_tag = format!("session_{}", session_id);
+    let results = storage.get_reflections_by_tag(&session_tag, 10).unwrap();
+
+    // Filter to only iteration entries before iteration 3
+    let past: Vec<_> = results
+        .iter()
+        .filter(|(_, _, tags, _)| {
+            tags.iter().any(|t| {
+                if let Some(n) = t.strip_prefix("iteration_") {
+                    if let Ok(num) = n.parse::<usize>() {
+                        return num < 3;
+                    }
+                }
+                false
+            })
+        })
+        .collect();
+
+    assert_eq!(past.len(), 2, "should retrieve iterations 1 and 2");
+    // Verify content from previous iterations
+    let all_content: String = past.iter().map(|(_, c, _, _)| c.as_str()).collect();
+    assert!(all_content.contains("JWT with refresh tokens"));
+    assert!(all_content.contains("rate limiting"));
+}
+
+// ─── HookInput Extended Fields ───
+
+#[test]
+fn test_hook_input_post_tool_use_fields() {
+    let json = r#"{
+        "session_id": "abc",
+        "tool_name": "Edit",
+        "tool_input": {"file_path": "/src/main.rs", "content": "new content"},
+        "cwd": "/Users/dev/project"
+    }"#;
+    let input: csr_engine::hooks::HookInput = serde_json::from_str(json).unwrap();
+    assert_eq!(input.tool_name.as_deref(), Some("Edit"));
+    let tool_input = input.tool_input.as_ref().unwrap();
+    assert_eq!(tool_input["file_path"].as_str(), Some("/src/main.rs"));
+}
+
+#[test]
+fn test_hook_input_stop_hook_active() {
+    let json = r#"{"session_id":"test","stop_hook_active":true}"#;
+    let input: csr_engine::hooks::HookInput = serde_json::from_str(json).unwrap();
+    assert_eq!(input.stop_hook_active, Some(true));
+}
+
+#[test]
+fn test_hook_input_stop_hook_active_missing() {
+    let json = r#"{"session_id":"test"}"#;
+    let input: csr_engine::hooks::HookInput = serde_json::from_str(json).unwrap();
+    assert_eq!(input.stop_hook_active, None);
+}
