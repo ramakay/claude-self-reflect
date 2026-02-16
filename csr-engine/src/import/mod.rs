@@ -127,6 +127,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     let reader = BufReader::new(file);
     let mut messages: Vec<String> = Vec::new();
     let mut first_timestamp: Option<String> = None;
+    let mut last_timestamp: Option<String> = None;
     let mut summary: Option<String> = None;
     let mut first_user_message: Option<String> = None;
 
@@ -165,11 +166,12 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             continue;
         }
 
-        // Capture first timestamp
-        if first_timestamp.is_none() {
-            if let Some(ts) = parsed.get("timestamp").and_then(|v| v.as_str()) {
+        // Capture first and last timestamps
+        if let Some(ts) = parsed.get("timestamp").and_then(|v| v.as_str()) {
+            if first_timestamp.is_none() {
                 first_timestamp = Some(ts.to_string());
             }
+            last_timestamp = Some(ts.to_string());
         }
 
         // Capture first user message as fallback summary (what the user was trying to do)
@@ -206,7 +208,11 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
         return Ok(Vec::new());
     }
 
-    let timestamp = first_timestamp.unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    // Use last_timestamp for ordering (shows "last active" not "started at")
+    // Fall back to first_timestamp if somehow no last, then to now()
+    let timestamp = last_timestamp
+        .or(first_timestamp)
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
     // Priority: JSONL summary > first user message > None
     let chunk_summary = summary.or(first_user_message);

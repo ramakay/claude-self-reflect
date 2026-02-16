@@ -30,7 +30,8 @@ fn test_parse_jsonl_file() {
     assert_eq!(chunks[0].project_name, "test-project");
     assert!(chunks[0].content.contains("Docker memory"));
     assert!(chunks[0].content.contains("Qdrant"));
-    assert_eq!(chunks[0].timestamp, "2026-01-15T10:00:00Z");
+    // Chunks use last_timestamp (most recent activity) for ordering
+    assert_eq!(chunks[0].timestamp, "2026-01-15T10:03:00Z");
 }
 
 #[test]

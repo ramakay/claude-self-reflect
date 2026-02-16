@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use chrono;
 use rusqlite::{params, Connection};
 
 use crate::import::ConversationChunk;
@@ -183,45 +184,29 @@ pub fn get_recent_chunks(
     limit: usize,
     project: Option<&str>,
 ) -> Result<Vec<ConversationChunk>> {
+    // Pick one representative chunk per conversation (first chunk = best summary)
+    // and order by last-activity timestamp.
     let mut stmt;
     let rows = if let Some(p) = project.filter(|p| *p != "all") {
         stmt = conn.prepare(
             "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary
              FROM chunks c
-             INNER JOIN (
-                 SELECT conversation_id, MAX(timestamp) as max_ts
-                 FROM chunks WHERE project_name = ?1
-                 GROUP BY conversation_id
-             ) latest ON c.conversation_id = latest.conversation_id AND c.timestamp = latest.max_ts
              WHERE c.project_name = ?1
+               AND c.rowid = (SELECT MIN(c2.rowid) FROM chunks c2 WHERE c2.conversation_id = c.conversation_id)
              ORDER BY c.timestamp DESC LIMIT ?2",
         )?;
-        let fetch_limit = (limit * 2) as i64; // Over-fetch to compensate for timestamp dupes
-        stmt.query_map(params![p, fetch_limit], row_to_chunk)?
+        stmt.query_map(params![p, limit as i64], row_to_chunk)?
     } else {
         stmt = conn.prepare(
             "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary
              FROM chunks c
-             INNER JOIN (
-                 SELECT conversation_id, MAX(timestamp) as max_ts
-                 FROM chunks
-                 GROUP BY conversation_id
-             ) latest ON c.conversation_id = latest.conversation_id AND c.timestamp = latest.max_ts
+             WHERE c.rowid = (SELECT MIN(c2.rowid) FROM chunks c2 WHERE c2.conversation_id = c.conversation_id)
              ORDER BY c.timestamp DESC LIMIT ?1",
         )?;
-        let fetch_limit = (limit * 2) as i64; // Over-fetch to compensate for timestamp dupes
-        stmt.query_map(params![fetch_limit], row_to_chunk)?
+        stmt.query_map(params![limit as i64], row_to_chunk)?
     };
 
-    let mut chunks = Vec::new();
-    for row in rows {
-        chunks.push(row?);
-    }
-    // Deduplicate: multiple chunks can share the same max timestamp per conversation.
-    // Keep the first (latest) chunk per conversation_id, then truncate to requested limit.
-    let mut seen = std::collections::HashSet::new();
-    chunks.retain(|c| seen.insert(c.conversation_id.clone()));
-    chunks.truncate(limit);
+    let chunks: Vec<ConversationChunk> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(chunks)
 }
 
@@ -508,10 +493,39 @@ pub fn get_enrichment_reflection_id(
 
 // ─── Import state queries ───
 
+/// Check if a file has been imported AND hasn't changed since.
+/// Compares stored file_mtime against current mtime to detect grown conversations.
 pub fn is_file_imported(conn: &Connection, path: &Path) -> Result<bool> {
     let path_str = path.to_string_lossy().to_string();
-    let mut stmt = conn.prepare("SELECT 1 FROM import_state WHERE file_path = ?1")?;
-    Ok(stmt.exists(params![path_str])?)
+    let mut stmt =
+        conn.prepare("SELECT file_mtime FROM import_state WHERE file_path = ?1")?;
+
+    let stored_mtime: Option<String> = stmt
+        .query_row(params![path_str], |row| row.get(0))
+        .ok();
+
+    let Some(stored) = stored_mtime else {
+        return Ok(false); // Never imported
+    };
+
+    // Compare against current file modification time
+    let current_mtime = file_mtime_str(path);
+    if stored != current_mtime {
+        return Ok(false); // File has changed — needs re-import
+    }
+
+    Ok(true)
+}
+
+/// Get file modification time as a string for comparison.
+fn file_mtime_str(path: &Path) -> String {
+    path.metadata()
+        .and_then(|m| m.modified())
+        .map(|t| {
+            let dt: chrono::DateTime<chrono::Utc> = t.into();
+            dt.to_rfc3339()
+        })
+        .unwrap_or_default()
 }
 
 pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Result<()> {
@@ -521,9 +535,10 @@ pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Resu
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
+    let mtime = file_mtime_str(path);
     conn.execute(
-        "INSERT OR REPLACE INTO import_state (file_path, conversation_id, chunks_imported) VALUES (?1, ?2, ?3)",
-        params![path_str, conv_id, chunks as i64],
+        "INSERT OR REPLACE INTO import_state (file_path, conversation_id, chunks_imported, file_mtime) VALUES (?1, ?2, ?3, ?4)",
+        params![path_str, conv_id, chunks as i64, mtime],
     )?;
     Ok(())
 }
