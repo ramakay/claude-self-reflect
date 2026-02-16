@@ -5,6 +5,7 @@
 
 use serde_json::Value;
 
+use super::ast_analysis::CodeContext;
 use super::errors::ErrorContext;
 use super::patterns::EditPattern;
 use super::get_message_data;
@@ -15,10 +16,12 @@ use super::get_message_data;
 /// - User request (exact words)
 /// - Solution type + tools used
 /// - Files modified + operation types
+/// - Code context (functions, types, imports, patterns)
 pub fn build_search_index(
     messages: &[Value],
     patterns: &[EditPattern],
     errors: &[ErrorContext],
+    code_context: &CodeContext,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -79,6 +82,14 @@ pub fn build_search_index(
             let truncated: String = err.error_text.chars().take(100).collect();
             parts.push(truncated);
         }
+        parts.push(String::new());
+    }
+
+    // Code context from AST analysis
+    if !code_context.is_empty() {
+        let code_text = code_context.to_search_text();
+        parts.push("## Code Context".to_string());
+        parts.push(code_text);
         parts.push(String::new());
     }
 
@@ -155,7 +166,7 @@ mod tests {
         let messages = vec![
             json!({"role": "user", "content": "Fix the authentication bug in the login flow that causes session timeout issues"}),
         ];
-        let index = build_search_index(&messages, &[], &[]);
+        let index = build_search_index(&messages, &[], &[], &CodeContext::default());
         assert!(index.contains("User Request"));
         assert!(index.contains("authentication"));
     }
@@ -169,9 +180,23 @@ mod tests {
             pattern_description: "In-place modification".to_string(),
             why: "Fix auth".to_string(),
         }];
-        let index = build_search_index(&[], &patterns, &[]);
+        let index = build_search_index(&[], &patterns, &[], &CodeContext::default());
         assert!(index.contains("Solution Pattern"));
         assert!(index.contains("login.rs"));
+    }
+
+    #[test]
+    fn test_search_index_includes_code_context() {
+        let mut code_ctx = CodeContext::default();
+        code_ctx.functions.insert("dispatch_hook".to_string());
+        code_ctx.types.insert("Engine".to_string());
+        code_ctx.languages.insert("Rust".to_string());
+        code_ctx.patterns.insert("async".to_string());
+
+        let index = build_search_index(&[], &[], &[], &code_ctx);
+        assert!(index.contains("Code Context"), "index should have Code Context section: {}", index);
+        assert!(index.contains("dispatch_hook"), "index should contain function name: {}", index);
+        assert!(index.contains("Engine"), "index should contain type name: {}", index);
     }
 
     #[test]

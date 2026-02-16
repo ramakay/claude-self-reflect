@@ -3,10 +3,12 @@
 //! Produces a 500-token search index + 1000-token context cache per conversation.
 //! Pure computation, no IO.
 
+pub mod ast_analysis;
 pub mod errors;
 pub mod heuristic;
 pub mod index_builder;
 pub mod patterns;
+pub mod quality;
 pub mod scoring;
 pub mod signature;
 
@@ -23,6 +25,7 @@ pub struct ExtractionResult {
     pub search_index: String,
     pub context_cache: String,
     pub signature: ConversationSignature,
+    pub code_context: ast_analysis::CodeContext,
     pub stats: ExtractionStats,
 }
 
@@ -117,12 +120,21 @@ pub fn extract_v3(messages: &[Value]) -> ExtractionResult {
         }
     }
 
-    // Build outputs
-    let search_index = index_builder::build_search_index(messages, &edit_patterns, &error_contexts);
+    // AST-based code context extraction
+    let code_context = ast_analysis::extract_code_context(messages);
+
+    // Build outputs (search index now includes code context)
+    let search_index = index_builder::build_search_index(messages, &edit_patterns, &error_contexts, &code_context);
     let context_cache =
         index_builder::build_context_cache(messages, &edit_patterns, &error_contexts);
-    let conv_signature =
+    let mut conv_signature =
         signature::build_signature(messages, &error_contexts, &edit_patterns);
+
+    // Enrich signature concepts from AST analysis
+    if !code_context.is_empty() {
+        conv_signature.concepts.extend(code_context.patterns.iter().cloned());
+        conv_signature.concepts.extend(code_context.languages.iter().map(|l| format!("lang:{l}")));
+    }
 
     let search_tokens = search_index.len() / 4;
     let cache_tokens = context_cache.len() / 4;
@@ -131,6 +143,7 @@ pub fn extract_v3(messages: &[Value]) -> ExtractionResult {
         search_index,
         context_cache,
         signature: conv_signature,
+        code_context,
         stats: ExtractionStats {
             original_messages: total,
             search_index_tokens: search_tokens,

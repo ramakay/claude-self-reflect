@@ -232,6 +232,13 @@ impl Storage {
         queries::count_reflection_embeddings(&conn)
     }
 
+    /// Run SQLite integrity check. Returns true if database is healthy.
+    pub fn integrity_check(&self) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        Ok(result == "ok")
+    }
+
     // ─── Import state ───
 
     pub fn is_file_imported(&self, path: &Path) -> Result<bool> {

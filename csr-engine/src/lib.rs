@@ -2,6 +2,7 @@ pub mod api;
 pub mod daemon;
 pub mod embeddings;
 pub mod engine;
+pub mod eval;
 pub mod extraction;
 pub mod format;
 pub mod hooks;

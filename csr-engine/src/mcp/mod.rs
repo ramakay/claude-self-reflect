@@ -1,3 +1,4 @@
+pub mod resources;
 pub mod tools;
 
 use std::path::PathBuf;
@@ -7,7 +8,8 @@ use tokio::sync::RwLock;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -159,6 +161,7 @@ pub struct CsrServer {
     search: Arc<RwLock<SearchEngine>>,
     projects_dir: PathBuf,
     index_dir: PathBuf,
+    db_path: String,
     tool_router: ToolRouter<Self>,
 }
 
@@ -171,12 +174,20 @@ impl CsrServer {
         projects_dir: PathBuf,
         index_dir: PathBuf,
     ) -> Self {
+        // Derive db_path from index_dir (sibling: index_dir/../csr-engine.db)
+        let db_path = index_dir
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("csr-engine.db")
+            .to_string_lossy()
+            .to_string();
         Self {
             storage,
             embeddings,
             search,
             projects_dir,
             index_dir,
+            db_path,
             tool_router: Self::tool_router(),
         }
     }
@@ -501,13 +512,61 @@ impl ServerHandler for CsrServer {
             instructions: Some(
                 "Claude Self-Reflect: Search past conversations and store reflections with semantic search and time-based memory decay.".into(),
             ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
             server_info: Implementation {
                 name: "csr-engine".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 ..Default::default()
             },
             ..Default::default()
+        }
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_ {
+        async {
+            let mut health = RawResource::new("status://system-health", "System Health");
+            health.description = Some("Current system health: index stats, cache status, version".into());
+            health.mime_type = Some("application/json".into());
+
+            Ok(ListResourcesResult {
+                resources: vec![health.no_annotation()],
+                next_cursor: None,
+                meta: None,
+            })
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_ {
+        async move {
+            match request.uri.as_str() {
+                "status://system-health" => {
+                    let text = resources::system_health(
+                        &self.storage,
+                        &self.search,
+                        &self.db_path,
+                        &self.index_dir.to_string_lossy(),
+                    )
+                    .await;
+                    Ok(ReadResourceResult {
+                        contents: vec![ResourceContents::text(text, &request.uri)],
+                    })
+                }
+                _ => Err(rmcp::ErrorData::resource_not_found(
+                    format!("Unknown resource: {}", request.uri),
+                    None,
+                )),
+            }
         }
     }
 }

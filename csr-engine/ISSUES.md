@@ -64,6 +64,73 @@
 - **"last 999999 days"**: Timeline starts at `-0712-03-21` (712 BC). Works but start date display is absurd. Consider capping at data range.
 - **"3 days ago" as time_range**: Returns no results for recency search. This parses as a specific day, not "last 3 days". Correct behavior but potentially confusing.
 
+---
+
+## Re-verification (Post Chunker Fix, 2026-02-15)
+
+### 12 MCP Tools — ALL PASS
+
+| # | Tool | Status | Latency | Notes |
+|---|------|--------|---------|-------|
+| A | `csr_reflect_on_past` | PASS | 4ms | 5 results, scores 0.491-0.542 |
+| B | `csr_quick_check` | PASS | instant | 1 match for HNSW query, score 0.488 |
+| C | `get_recent_work` | PASS | instant | 8 conversations returned |
+| D | `csr_search_by_file` | PASS | instant | 3 results for docker-compose.yaml |
+| E | `csr_search_by_concept` | PASS | instant | 3 results for "performance optimization" |
+| F | `store_reflection` | PASS | instant | Stored with ID + tags + round-trip search |
+| G | `get_timeline` | PASS | instant | 6 day periods, last 2 weeks |
+| H | `csr_get_more` | PASS | instant | 3 more results at offset 5, 8 total |
+| I | `csr_search_insights` | PASS | instant | 10 matches, avg score 0.578 |
+| J | `get_full_conversation` | PASS | instant | Correct file path returned |
+| K | `search_by_recency` | PASS | instant | 3 results filtered to today |
+| L | `get_session_learnings` | PASS | instant | 0 results for nonexistent session (graceful) |
+
+### Red Team Re-test — ALL PASS
+
+| # | Attack | Status | Notes |
+|---|--------|--------|-------|
+| 1 | SQL injection in search | PASS | Treated as semantic query, found SQL-related chunks |
+| 2 | SQL injection in get_full_conversation | PASS | Rejected by validation |
+| 3 | Path traversal in file search | CHANGED | Now returns 1 result (nearest neighbor), previously 0. Not a vulnerability — HNSW returns closest match |
+| 4 | XSS in search query | PASS | Properly escaped to `&lt;script&gt;` in XML output |
+| 5 | Empty string search | PASS | 0 results, 2ms |
+| 6 | Very long string (500 chars) | PASS | 0 results, 6ms, no crash |
+| 7 | Special chars in store_reflection | PASS | Quotes, backticks, unicode, emoji, shell expansion, XML tags — all stored successfully |
+| 8 | Nonexistent session ID | PASS | 0 results with helpful message |
+
+### NEW Red Team Tests (Chunker-Specific)
+
+| # | Attack | Status | Notes |
+|---|--------|--------|-------|
+| 9 | HTML in tool_use name (`<script>alert(1)</script>`) | PASS | Stored as text, XML-escaped in MCP output |
+| 10 | Shell injection in tool_use command (`rm -rf / && curl evil.com`) | PASS | Stored as text only, never executed |
+| 11 | Extremely long file_path (727 chars) in tool_use | PASS | Processed without crash, `rsplit('/').take(2)` shortens but doesn't cap |
+| 12 | Path traversal in tool_use file_path (`../../../../etc/passwd`) | PASS | Stored as `[Read: etc/passwd]` — text only, no file access |
+
+### Temporal Edge Cases — ALL PASS
+
+| Expression | Status | Notes |
+|------------|--------|-------|
+| `last 6 months` | PASS | Bug 1 fix confirmed — 5 monthly periods |
+| `last 2 weeks` | PASS | Bug 1 fix confirmed — 3 weekly periods |
+| `last 1 month` | PASS | Bug 6 fix confirmed — singular unit works |
+| `yesterday` | PASS | 3 hourly periods |
+| `today` / `this week` / `this month` | PASS | Semantic match required for results |
+| `last 0 days` | PASS | Empty result, graceful handling |
+| `last 999999 days` | KNOWN | Timeline starts at 712 BC — cosmetic, not a vulnerability |
+
+### Tool Context Quality Assessment
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Chunks with tool context | 246 / 14,557 | 1.7% of total |
+| Avg size (tool context chunks) | 12,787 chars | 6x normal (2,059 chars) |
+| Max chunk size | 89,182 chars | From heavy tool-use session |
+| Search improvement | Tool names/paths now searchable | `[Edit: search/mod.rs]` findable |
+
+### Quality Observation (not a bug)
+- **OBS-001**: Tool-heavy chunks can be very large (up to 89KB). Consider capping chunk content length or splitting tool-dense messages for better embedding quality in a future release.
+
 ## Bug 7: JSONL chunker drops 74% of coding session content
 - **Severity**: HIGH
 - **File**: `src/import/mod.rs:146`

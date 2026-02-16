@@ -65,6 +65,17 @@ enum Commands {
         #[arg(long)]
         no_ai: bool,
     },
+    /// Analyze code quality using AST patterns
+    Quality {
+        /// File path to analyze
+        path: PathBuf,
+    },
+    /// Run evaluation tests
+    Eval {
+        /// Run full evaluation (20 tests) instead of quick (5 tests)
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 fn default_db_path() -> PathBuf {
@@ -119,6 +130,38 @@ async fn main() -> Result<()> {
             !no_ai,
         );
         return daemon.run().await;
+    }
+
+    if let Some(Commands::Quality { ref path }) = args.command {
+        let report = csr_engine::extraction::quality::analyze_file(path)?;
+        print!("{}", report.format_text());
+        return Ok(());
+    }
+
+    if let Some(Commands::Eval { full }) = args.command {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let report = if full {
+            csr_engine::eval::run_full(
+                eng.storage(),
+                eng.embeddings(),
+                eng.search(),
+                eng.index_dir(),
+            )
+            .await
+        } else {
+            csr_engine::eval::run_quick(
+                eng.storage(),
+                eng.embeddings(),
+                eng.search(),
+                eng.index_dir(),
+            )
+            .await
+        };
+        print!("{}", report.format_text());
+        return Ok(());
     }
 
     if let Some(Commands::Hook { ref name, apply }) = args.command {

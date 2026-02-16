@@ -28,6 +28,14 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 async-trait = "0.1"
 sha2 = "0.10"
 fs2 = "0.4"
+ast-grep-core = { version = "0.40", features = ["tree-sitter"] }
+ast-grep-language = { version = "0.40", default-features = false, features = [
+    "tree-sitter-python",
+    "tree-sitter-typescript",
+    "tree-sitter-rust",
+    "tree-sitter-javascript",
+    "tree-sitter-go",
+] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
