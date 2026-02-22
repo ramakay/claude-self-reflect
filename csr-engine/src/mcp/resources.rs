@@ -39,8 +39,6 @@ pub async fn system_health(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn test_system_health_format() {
         // Just verify the function signature compiles and returns valid JSON

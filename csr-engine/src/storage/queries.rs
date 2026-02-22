@@ -6,6 +6,18 @@ use rusqlite::{params, Connection};
 
 use crate::import::ConversationChunk;
 
+/// Aggregated session info for timeline display.
+/// JOINs chunk data with enrichment reflections for rich context.
+pub struct SessionInfo {
+    pub conversation_id: String,
+    pub project_name: String,
+    pub timestamp: String,
+    pub total_messages: usize,
+    pub chunk_count: usize,
+    pub summary: Option<String>,
+    pub enrichment: Option<String>,
+}
+
 /// Serialize a f32 vector to bytes (little-endian).
 fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
@@ -489,6 +501,78 @@ pub fn get_enrichment_reflection_id(
     } else {
         Ok(None)
     }
+}
+
+// ─── Session aggregate queries (for timeline display) ───
+
+/// Get recent sessions with aggregated message counts and enrichment data.
+/// Returns one entry per conversation, ordered by last activity.
+pub fn get_recent_sessions(
+    conn: &Connection,
+    limit: usize,
+    project: Option<&str>,
+) -> Result<Vec<SessionInfo>> {
+    let sql = if project.filter(|p| *p != "all").is_some() {
+        "SELECT c.conversation_id, c.project_name,
+                MAX(c.timestamp) as last_active,
+                SUM(c.message_count) as total_messages,
+                COUNT(*) as chunk_count,
+                (SELECT c2.summary FROM chunks c2
+                 WHERE c2.conversation_id = c.conversation_id
+                 ORDER BY c2.rowid ASC LIMIT 1) as summary,
+                (SELECT r.content FROM enrichment_state e
+                 JOIN reflections r ON r.id = e.reflection_id
+                 WHERE e.conversation_id = c.conversation_id
+                   AND e.enrichment_type = 'heuristic' AND e.status = 'completed'
+                 LIMIT 1) as enrichment
+         FROM chunks c
+         WHERE c.project_name = ?1
+         GROUP BY c.conversation_id
+         ORDER BY MAX(c.timestamp) DESC LIMIT ?2"
+    } else {
+        "SELECT c.conversation_id, c.project_name,
+                MAX(c.timestamp) as last_active,
+                SUM(c.message_count) as total_messages,
+                COUNT(*) as chunk_count,
+                (SELECT c2.summary FROM chunks c2
+                 WHERE c2.conversation_id = c.conversation_id
+                 ORDER BY c2.rowid ASC LIMIT 1) as summary,
+                (SELECT r.content FROM enrichment_state e
+                 JOIN reflections r ON r.id = e.reflection_id
+                 WHERE e.conversation_id = c.conversation_id
+                   AND e.enrichment_type = 'heuristic' AND e.status = 'completed'
+                 LIMIT 1) as enrichment
+         FROM chunks c
+         GROUP BY c.conversation_id
+         ORDER BY MAX(c.timestamp) DESC LIMIT ?1"
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+
+    let rows = if let Some(p) = project.filter(|p| *p != "all") {
+        stmt.query_map(params![p, limit as i64], row_to_session)?
+    } else {
+        stmt.query_map(params![limit as i64], row_to_session)?
+    };
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Helper: map a row to SessionInfo.
+fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<SessionInfo> {
+    Ok(SessionInfo {
+        conversation_id: row.get(0)?,
+        project_name: row.get(1)?,
+        timestamp: row.get(2)?,
+        total_messages: row.get::<_, i64>(3)? as usize,
+        chunk_count: row.get::<_, i64>(4)? as usize,
+        summary: row.get(5)?,
+        enrichment: row.get(6)?,
+    })
 }
 
 // ─── Import state queries ───

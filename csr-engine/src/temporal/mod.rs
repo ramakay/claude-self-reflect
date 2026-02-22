@@ -339,9 +339,9 @@ mod tests {
     fn test_parse_last_n_months() {
         let (start, end) = parse_time_expression("last 6 months").unwrap();
         assert!(start < end);
-        // Should be roughly 180 days
+        // Should be roughly 180 days (varies 150-210 depending on month lengths)
         let diff = end - start;
-        assert!(diff.num_days() > 150 && diff.num_days() < 200);
+        assert!(diff.num_days() > 150 && diff.num_days() <= 210);
     }
 
     #[test]

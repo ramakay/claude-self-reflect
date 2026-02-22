@@ -105,6 +105,15 @@ impl Storage {
         queries::get_recent_chunks(&conn, limit, project)
     }
 
+    pub fn get_recent_sessions(
+        &self,
+        limit: usize,
+        project: Option<&str>,
+    ) -> Result<Vec<queries::SessionInfo>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_recent_sessions(&conn, limit, project)
+    }
+
     pub fn get_chunks_in_timerange(
         &self,
         start: &str,
