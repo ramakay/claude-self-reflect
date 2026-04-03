@@ -229,6 +229,74 @@ impl Storage {
         queries::get_enrichment_reflection_id(&conn, conversation_id, enrichment_type)
     }
 
+    // ─── Story backfill queries ───
+
+    pub fn get_conversations_missing_stories(&self) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_conversations_missing_stories(&conn)
+    }
+
+    pub fn get_project_for_conversation(&self, conversation_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_project_for_conversation(&conn, conversation_id)
+    }
+
+    // ─── Backfill queries ───
+
+    pub fn get_conversations_missing_import_state(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_conversations_missing_import_state(&conn)
+    }
+
+    pub fn get_conversations_needing_heuristic(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_conversations_needing_heuristic(&conn)
+    }
+
+    // ─── Status queries ───
+
+    pub fn count_conversations(&self) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::count_conversations(&conn)
+    }
+
+    pub fn count_projects(&self) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::count_projects(&conn)
+    }
+
+    pub fn count_imported_files(&self) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::count_imported_files(&conn)
+    }
+
+    pub fn get_enrichment_breakdown(&self) -> Result<Vec<(String, String, usize)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_enrichment_breakdown(&conn)
+    }
+
+    pub fn get_newest_chunk_timestamp(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_newest_chunk_timestamp(&conn)
+    }
+
+    pub fn get_db_size(&self) -> Result<u64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_db_size(&conn)
+    }
+
+    // ─── Incremental import queries ───
+
+    pub fn get_imported_chunk_count(&self, path: &Path) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_imported_chunk_count(&conn, path)
+    }
+
+    pub fn get_chunk_content(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_content(&conn, id)
+    }
+
     // ─── Count queries (for HNSW cache staleness) ───
 
     pub fn count_chunk_embeddings(&self) -> Result<usize> {

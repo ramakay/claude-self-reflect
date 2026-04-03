@@ -437,6 +437,77 @@ pub fn spawn_detached_story_generation(transcript: &str, cwd: &str) {
     }
 }
 
+/// Backfill stories for all conversations that have V3/heuristic enrichment but no story.
+/// Tier 1: V3 → synthesize locally (free). Tier 2: Heuristic → template (free).
+pub async fn backfill_stories_cli(
+    engine: &Engine,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let candidates = engine.storage().get_conversations_missing_stories()?;
+    eprintln!("CSR: {} conversations missing stories", candidates.len());
+
+    let mut tier1 = 0usize;
+    let mut tier2 = 0usize;
+
+    for (conv_id, enrichment_type, reflection_id) in &candidates {
+        // Get the enrichment content
+        let content = match engine.storage().get_reflection_by_id(reflection_id)? {
+            Some((content, _, _)) => content,
+            None => continue, // phantom reference
+        };
+
+        let project = engine
+            .storage()
+            .get_project_for_conversation(conv_id)?
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let story = if enrichment_type == "extracted_v3" {
+            tier1 += 1;
+            crate::extraction::story::synthesize_story_from_v3(&content, &project)
+        } else {
+            tier2 += 1;
+            Some(crate::extraction::story::synthesize_story_from_heuristic(&content, &project))
+        };
+
+        if let Some(story_text) = story {
+            if !dry_run {
+                let story_id = format!("story_{}", conv_id);
+                let tags = vec![
+                    "session_story".to_string(),
+                    format!("project_{}", project),
+                    format!("conv_{}", conv_id),
+                ];
+                crate::mcp::tools::store_reflection(
+                    engine.storage(),
+                    engine.embeddings(),
+                    engine.search(),
+                    &story_text,
+                    &tags,
+                )
+                .await?;
+                engine
+                    .storage()
+                    .mark_enrichment_completed(conv_id, "session_story", &story_id)?;
+            }
+            let cid_short = if conv_id.len() > 8 { &conv_id[..8] } else { conv_id };
+            eprintln!(
+                "  [{}] {} ({}chars)",
+                if enrichment_type == "extracted_v3" { "V3" } else { "heuristic" },
+                cid_short,
+                story_text.len()
+            );
+        }
+    }
+
+    eprintln!(
+        "CSR backfill: {} V3-synthesized, {} heuristic-templated{}",
+        tier1,
+        tier2,
+        if dry_run { " (dry run)" } else { "" }
+    );
+    Ok(())
+}
+
 /// Log story generation events to hook-timing.log for diagnostics.
 fn log_story_event(project: &str, conv_id: &str, event: &str) {
     if let Some(home) = dirs::home_dir() {

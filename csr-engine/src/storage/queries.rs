@@ -512,42 +512,58 @@ pub fn get_recent_sessions(
     limit: usize,
     project: Option<&str>,
 ) -> Result<Vec<SessionInfo>> {
+    // Enrichment subquery: COALESCE across enrichment types with priority.
+    // Heuristic reflection may be deleted by v3 supersession, so fall through.
+    let enrichment_subquery = "COALESCE(
+                    (SELECT r.content FROM enrichment_state e
+                     JOIN reflections r ON r.id = e.reflection_id
+                     WHERE e.conversation_id = c.conversation_id
+                       AND e.enrichment_type = 'heuristic' AND e.status = 'completed'
+                     LIMIT 1),
+                    (SELECT r.content FROM enrichment_state e
+                     JOIN reflections r ON r.id = e.reflection_id
+                     WHERE e.conversation_id = c.conversation_id
+                       AND e.enrichment_type = 'extracted_v3' AND e.status = 'completed'
+                     LIMIT 1),
+                    (SELECT r.content FROM enrichment_state e
+                     JOIN reflections r ON r.id = e.reflection_id
+                     WHERE e.conversation_id = c.conversation_id
+                       AND e.enrichment_type = 'ai_narrative' AND e.status = 'completed'
+                     LIMIT 1)
+                ) as enrichment";
+
     let sql = if project.filter(|p| *p != "all").is_some() {
-        "SELECT c.conversation_id, c.project_name,
+        format!(
+            "SELECT c.conversation_id, c.project_name,
                 MAX(c.timestamp) as last_active,
                 SUM(c.message_count) as total_messages,
                 COUNT(*) as chunk_count,
                 (SELECT c2.summary FROM chunks c2
                  WHERE c2.conversation_id = c.conversation_id
                  ORDER BY c2.rowid ASC LIMIT 1) as summary,
-                (SELECT r.content FROM enrichment_state e
-                 JOIN reflections r ON r.id = e.reflection_id
-                 WHERE e.conversation_id = c.conversation_id
-                   AND e.enrichment_type = 'heuristic' AND e.status = 'completed'
-                 LIMIT 1) as enrichment
+                {enrichment_subquery}
          FROM chunks c
          WHERE c.project_name = ?1
          GROUP BY c.conversation_id
          ORDER BY MAX(c.timestamp) DESC LIMIT ?2"
+        )
     } else {
-        "SELECT c.conversation_id, c.project_name,
+        format!(
+            "SELECT c.conversation_id, c.project_name,
                 MAX(c.timestamp) as last_active,
                 SUM(c.message_count) as total_messages,
                 COUNT(*) as chunk_count,
                 (SELECT c2.summary FROM chunks c2
                  WHERE c2.conversation_id = c.conversation_id
                  ORDER BY c2.rowid ASC LIMIT 1) as summary,
-                (SELECT r.content FROM enrichment_state e
-                 JOIN reflections r ON r.id = e.reflection_id
-                 WHERE e.conversation_id = c.conversation_id
-                   AND e.enrichment_type = 'heuristic' AND e.status = 'completed'
-                 LIMIT 1) as enrichment
+                {enrichment_subquery}
          FROM chunks c
          GROUP BY c.conversation_id
          ORDER BY MAX(c.timestamp) DESC LIMIT ?1"
+        )
     };
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
 
     let rows = if let Some(p) = project.filter(|p| *p != "all") {
         stmt.query_map(params![p, limit as i64], row_to_session)?
@@ -625,6 +641,184 @@ pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Resu
         params![path_str, conv_id, chunks as i64, mtime],
     )?;
     Ok(())
+}
+
+// ─── Backfill queries (for enrichment pipeline repair) ───
+
+/// Get conversation IDs that exist in chunks but have no import_state row.
+pub fn get_conversations_missing_import_state(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT conversation_id FROM chunks
+         WHERE conversation_id NOT IN (
+             SELECT conversation_id FROM import_state WHERE conversation_id IS NOT NULL
+         )",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Get conversations that need heuristic enrichment, NOT gated by import_state.
+/// Returns (conversation_id, project_name) pairs.
+pub fn get_conversations_needing_heuristic(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT c.conversation_id, c.project_name FROM chunks c
+         LEFT JOIN enrichment_state e
+             ON e.conversation_id = c.conversation_id AND e.enrichment_type = 'heuristic'
+         WHERE e.status IS NULL OR e.status = 'failed'",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Get conversations that have V3 or heuristic enrichment but no session_story.
+/// Returns (conversation_id, enrichment_type, reflection_id) for each candidate.
+pub fn get_conversations_missing_stories(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.conversation_id, e.enrichment_type, e.reflection_id
+         FROM enrichment_state e
+         WHERE e.enrichment_type IN ('extracted_v3', 'heuristic')
+           AND e.status = 'completed'
+           AND e.conversation_id NOT IN (
+               SELECT conversation_id FROM enrichment_state
+               WHERE enrichment_type = 'session_story' AND status = 'completed'
+           )
+         ORDER BY e.updated_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Get the project name for a conversation from its chunks.
+pub fn get_project_for_conversation(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT project_name FROM chunks WHERE conversation_id = ?1 LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(params![conversation_id], |row| row.get::<_, String>(0))?;
+    match rows.next() {
+        Some(Ok(name)) => Ok(Some(name)),
+        _ => Ok(None),
+    }
+}
+
+// ─── Status queries (for csr-engine status) ───
+
+/// Count distinct conversations in the database.
+pub fn count_conversations(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT conversation_id) FROM chunks",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// Count distinct projects in the database.
+pub fn count_projects(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT project_name) FROM chunks",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// Count imported files.
+pub fn count_imported_files(conn: &Connection) -> Result<usize> {
+    let count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM import_state", [], |row| row.get(0))?;
+    Ok(count as usize)
+}
+
+/// Get enrichment breakdown: count of conversations per enrichment type/status.
+pub fn get_enrichment_breakdown(conn: &Connection) -> Result<Vec<(String, String, usize)>> {
+    let mut stmt = conn.prepare(
+        "SELECT enrichment_type, status, COUNT(*) FROM enrichment_state GROUP BY enrichment_type, status",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? as usize,
+        ))
+    })?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Get the newest chunk timestamp (for staleness reporting).
+pub fn get_newest_chunk_timestamp(conn: &Connection) -> Result<Option<String>> {
+    let result: Option<String> = conn
+        .query_row(
+            "SELECT MAX(timestamp) FROM chunks",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(result)
+}
+
+/// Get the database file size in bytes.
+pub fn get_db_size(conn: &Connection) -> Result<u64> {
+    let page_count: i64 =
+        conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: i64 =
+        conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    Ok((page_count * page_size) as u64)
+}
+
+// ─── Incremental import queries ───
+
+/// Get the number of chunks previously imported for a file (for incremental import).
+/// Returns 0 if never imported.
+pub fn get_imported_chunk_count(conn: &Connection, path: &Path) -> Result<usize> {
+    let path_str = path.to_string_lossy();
+    let result: rusqlite::Result<i64> = conn
+        .prepare("SELECT chunks_imported FROM import_state WHERE file_path = ?1")?
+        .query_row(params![path_str.as_ref()], |row| row.get(0));
+    match result {
+        Ok(count) => Ok(count as usize),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get chunk content by chunk ID (for post-compact context injection).
+pub fn get_chunk_content(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT content FROM chunks WHERE id = ?1")?;
+    let result: rusqlite::Result<String> = stmt.query_row(params![id], |row| row.get(0));
+    match result {
+        Ok(content) => Ok(Some(content)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ─── Count queries (for HNSW persistence staleness detection) ───

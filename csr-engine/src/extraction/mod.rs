@@ -11,6 +11,7 @@ pub mod patterns;
 pub mod quality;
 pub mod scoring;
 pub mod signature;
+pub mod story;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

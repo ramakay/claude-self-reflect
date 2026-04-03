@@ -38,10 +38,26 @@ struct Args {
     /// Run benchmarks instead of MCP server
     #[arg(long)]
     bench: bool,
+
+    /// Backfill import_state and run heuristic enrichment for all conversations
+    #[arg(long)]
+    enrich: bool,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// One-shot setup: import, register MCP, install hooks
+    Setup {
+        /// Anthropic API key for AI narrative enrichment (optional)
+        #[arg(long)]
+        anthropic_key: Option<String>,
+    },
+    /// Show system status (JSON by default, --compact for statusline)
+    Status {
+        /// One-line output for statusline integration
+        #[arg(long)]
+        compact: bool,
+    },
     /// Handle Claude Code hook events
     Hook {
         /// Hook name: session-start, session-end, precompact, stop, post-tool-use, prompt-submit, install
@@ -76,6 +92,22 @@ enum Commands {
         #[arg(long)]
         full: bool,
     },
+    /// Backfill session stories from V3/heuristic data (zero cost)
+    BackfillStories {
+        /// Preview without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Generate a Haiku-curated session story (fire-and-forget from SessionEnd)
+    GenerateStory {
+        /// Path to the session transcript JSONL
+        #[arg(long)]
+        transcript: PathBuf,
+
+        /// Current working directory (for project resolution)
+        #[arg(long)]
+        cwd: String,
+    },
 }
 
 fn default_db_path() -> PathBuf {
@@ -103,7 +135,15 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Handle subcommands separately
+    // Handle subcommands that don't need Engine::new()
+    if let Some(Commands::Setup { anthropic_key }) = args.command {
+        return csr_engine::setup::handle(&args.db_path, &args.projects_dir, anthropic_key).await;
+    }
+
+    if let Some(Commands::Status { compact }) = args.command {
+        return csr_engine::status::handle(&args.db_path, &args.projects_dir, compact);
+    }
+
     if let Some(Commands::Daemon {
         batch_size,
         batch_time,
@@ -164,6 +204,26 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(Commands::BackfillStories { dry_run }) = args.command {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        return csr_engine::summarizer::backfill_stories_cli(&eng, dry_run).await;
+    }
+
+    if let Some(Commands::GenerateStory {
+        ref transcript,
+        ref cwd,
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        return csr_engine::summarizer::generate_story_cli(&eng, transcript, cwd).await;
+    }
+
     if let Some(Commands::Hook { ref name, apply }) = args.command {
         if name == "install" {
             return csr_engine::hooks::install::handle(apply);
@@ -184,11 +244,19 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+    let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
 
     if args.import {
         let count = eng.import_conversations(args.limit).await?;
         tracing::info!(count, "conversations imported");
+    }
+
+    if args.enrich {
+        let (backfilled, enriched) = eng.backfill_and_enrich().await?;
+        eprintln!(
+            "CSR: backfilled {} import_state rows, enriched {} conversations",
+            backfilled, enriched
+        );
     }
 
     if args.bench {
@@ -204,7 +272,7 @@ async fn main() -> Result<()> {
     };
 
     // Start MCP stdio server if --serve or no explicit action
-    let should_serve = args.serve || (!args.import && !args.bench && !args.watch);
+    let should_serve = args.serve || (!args.import && !args.bench && !args.watch && !args.enrich);
     if should_serve {
         eng.serve_mcp().await?;
     } else if args.watch {
