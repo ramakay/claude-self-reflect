@@ -14,6 +14,7 @@
 //!
 //! Always returns Ok(()) — never blocks Claude Code (catch-all wrapper).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Result;
@@ -22,6 +23,7 @@ use super::ralph_state::RalphState;
 use super::HookInput;
 use crate::engine::Engine;
 use crate::injection::anti_pattern;
+use crate::injection::formatter;
 use crate::injection::predictor::{self, RawResult};
 use crate::injection::{InjectionContext, InjectionItem};
 
@@ -42,6 +44,13 @@ pub async fn handle(
     if let Err(e) = handle_inner(input, ralph, engine, cwd).await {
         eprintln!("CSR: prompt-submit hook error (non-fatal): {}", e);
     }
+
+    // Chunk the active transcript after injection is printed to stdout.
+    // Incremental: mtime check makes this a no-op when nothing changed (~0ms).
+    // When new content exists: ~30-50ms for 1-2 chunks (well under perceptible lag).
+    // Content becomes searchable by the next prompt submit.
+    super::import_current_transcript(input, engine, cwd).await;
+
     Ok(()) // Always succeed
 }
 
@@ -103,11 +112,26 @@ async fn handle_inner(
         ..Default::default()
     };
 
+    // Content-based dedup: skip items whose first 100 chars overlap with already-seen items
+    let mut seen_prefixes: HashSet<String> = HashSet::new();
+
     // Distribute scored results into context categories.
     // Skip anti_patterns here — they're already loaded from find_anti_patterns() above.
     for result in scored.iter().take(5) {
         // Deduplicate: skip anti-patterns already found by find_anti_patterns
         if result.source == "anti_pattern" {
+            continue;
+        }
+
+        // Content-based dedup (Bug 9): skip near-duplicate content
+        // Use 200-char prefix to avoid false dedup on items sharing common preambles (F5 fix)
+        let prefix: String = result.content.chars().take(200).collect();
+        if !seen_prefixes.insert(prefix) {
+            continue;
+        }
+
+        // Self-referential noise filter (Bug 4/5): skip content about CSR internals
+        if is_self_referential_noise(&result.content) {
             continue;
         }
 
@@ -117,9 +141,10 @@ async fn handle_inner(
             source: result.source.clone(),
         };
 
+        // Bug 1 fix: route chunks to relevant_context, reflections to winning_strategies
         match result.source.as_str() {
             "reflection" => ctx.winning_strategies.push(item),
-            _ => ctx.winning_strategies.push(item), // chunks also go to winning strategies
+            _ => ctx.relevant_context.push(item),
         }
     }
 
@@ -127,21 +152,25 @@ async fn handle_inner(
         return Ok(());
     }
 
-    // 6. Format with 500-token budget and output to stdout
     let formatted = ctx.format(PROMPT_TOKEN_BUDGET);
     if !formatted.is_empty() {
         // stdout injection: Claude Code prepends this to the system prompt.
         // Uses print! (not println!) to avoid double-newline — formatter output ends with \n.
         print!("{}", formatted);
+    }
 
-        // Summary to stderr (not visible to Claude, only to debug logs)
-        let anti_count = ctx.anti_patterns.len();
-        let total = ctx.total_items();
+    // Structured log to stderr (not visible to Claude, only to debug logs)
+    let anti_count = ctx.anti_patterns.len();
+    let total = ctx.total_items();
+    if total > 0 {
         eprintln!(
             "CSR: Injected {} items ({} anti-patterns) for prompt",
             total, anti_count
         );
     }
+
+    // Detailed injection log for diagnostics (written to hook-timing.log)
+    log_injection_detail("prompt-submit", prompt, total, anti_count, formatted.len(), &scored);
 
     Ok(())
 }
@@ -176,7 +205,7 @@ async fn search_chunks_for_prompt(
         if let Ok(chunks) = storage.get_chunks_by_ids(&[result.id.clone()]) {
             if let Some(chunk) = chunks.into_iter().next() {
                 raw_results.push(RawResult {
-                    content: truncate_content(&chunk.content, 300),
+                    content: formatter::truncate_content(&chunk.content, 300),
                     score: result.score,
                     source: "chunk".to_string(),
                     timestamp: Some(chunk.timestamp),
@@ -224,7 +253,7 @@ async fn search_reflections_for_prompt(
                 "reflection"
             };
             raw_results.push(RawResult {
-                content: truncate_content(&content, 300),
+                content: formatter::truncate_content(&content, 300),
                 score: result.score,
                 source: source.to_string(),
                 timestamp: Some(timestamp),
@@ -276,19 +305,62 @@ fn extract_error_patterns(content: &str) -> Vec<String> {
     patterns
 }
 
-/// Truncate content to max chars, preserving first line.
-/// Uses char boundaries to avoid UTF-8 panics.
-fn truncate_content(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars {
-        return content.to_string();
+/// Log injection details to the hook-timing.log for diagnostics.
+fn log_injection_detail(
+    hook: &str,
+    query: &str,
+    total_items: usize,
+    anti_count: usize,
+    stdout_bytes: usize,
+    scored: &[predictor::ScoredResult],
+) {
+    if let Some(home) = dirs::home_dir() {
+        let log_path = home.join(".claude-self-reflect").join("hook-timing.log");
+        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let query_preview: String = query.chars().take(80).collect();
+        let top_scores: Vec<String> = scored
+            .iter()
+            .take(3)
+            .map(|s| format!("{:.3}/{}", s.final_score, s.source))
+            .collect();
+        let line = format!(
+            "{} CSR {} inject: query=\"{}\" items={} anti={} stdout={}B top=[{}]\n",
+            ts,
+            hook,
+            query_preview,
+            total_items,
+            anti_count,
+            stdout_bytes,
+            top_scores.join(", "),
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
     }
-    let safe_end = content.floor_char_boundary(max_chars);
-    let truncated = &content[..safe_end];
-    if let Some(last_newline) = truncated.rfind('\n') {
-        format!("{}...", &content[..last_newline])
-    } else {
-        format!("{}...", truncated)
-    }
+}
+
+/// Check if content is self-referential noise about CSR internals.
+/// Prevents the tool's own development history from polluting its output (Bug 4/5).
+fn is_self_referential_noise(content: &str) -> bool {
+    const NOISE_PATTERNS: &[&str] = &[
+        "session_start_hook",
+        "session_end_hook",
+        "prompt_submit_hook",
+        "proves the hook",
+        "proves the session",
+        "proves the integration",
+        "Current Ralph State:",
+        "hook success",
+        "hook error",
+        "CSR engine ready",
+        "hooks_integration",
+    ];
+    let lower = content.to_lowercase();
+    NOISE_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(&pattern.to_lowercase()))
 }
 
 #[cfg(test)]
@@ -313,19 +385,6 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_content_short() {
-        assert_eq!(truncate_content("short", 100), "short");
-    }
-
-    #[test]
-    fn test_truncate_content_long() {
-        let long = "line one\nline two\nline three\nline four\nline five";
-        let truncated = truncate_content(long, 25);
-        assert!(truncated.ends_with("..."));
-        assert!(truncated.len() <= 28); // 25 + "..."
-    }
-
-    #[test]
     fn test_slash_command_detection() {
         // Verify our fast-path logic
         assert!("/help".starts_with('/'));
@@ -337,5 +396,30 @@ mod tests {
     fn test_min_prompt_length() {
         assert!("short".len() < MIN_PROMPT_LENGTH);
         assert!("fix the authentication timeout bug".len() >= MIN_PROMPT_LENGTH);
+    }
+
+    #[test]
+    fn test_self_referential_noise_detected() {
+        assert!(is_self_referential_noise(
+            "This proves the session_start_hook.py successfully retrieved"
+        ));
+        assert!(is_self_referential_noise("Current Ralph State: Iteration: 198"));
+        assert!(is_self_referential_noise("hook success: session-end completed"));
+        assert!(is_self_referential_noise("CSR engine ready. Session: abc123"));
+        assert!(is_self_referential_noise("Test in hooks_integration module"));
+        assert!(is_self_referential_noise("proves the hook works correctly"));
+    }
+
+    #[test]
+    fn test_non_noise_content_passes() {
+        assert!(!is_self_referential_noise("Fix the authentication timeout bug"));
+        assert!(!is_self_referential_noise("Docker compose memory issue resolved"));
+        assert!(!is_self_referential_noise(
+            "Use batch embedding for 3x speedup"
+        ));
+        // "proves the" without hook/session/integration should NOT be filtered (F6 fix)
+        assert!(!is_self_referential_noise(
+            "This proves the approach works for authentication"
+        ));
     }
 }

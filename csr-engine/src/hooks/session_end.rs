@@ -1,13 +1,16 @@
-//! SessionEnd hook — generates session narrative and stores to CSR.
+//! SessionEnd hook — imports current conversation and generates session narrative.
 //!
-//! When a Ralph session is active:
-//! 1. Determines outcome (COMPLETED, ABANDONED, INCOMPLETE)
-//! 2. Generates narrative from Ralph state
-//! 3. Stores to CSR with rich tags for future searchability
-//! 4. If COMPLETED, stores winning strategy separately
-//! 5. Cleans up temp files
+//! For ALL sessions:
+//! 1. Imports the current conversation file (real-time indexing)
+//!
+//! When a Ralph session is active, additionally:
+//! 2. Determines outcome (COMPLETED, ABANDONED, INCOMPLETE)
+//! 3. Generates narrative from Ralph state
+//! 4. Stores to CSR with rich tags for future searchability
+//! 5. If COMPLETED, stores winning strategy separately
+//! 6. Cleans up temp files
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -15,6 +18,7 @@ use super::ralph_state::{Outcome, RalphState};
 use super::HookInput;
 use crate::engine::Engine;
 use crate::mcp::tools;
+use crate::search::cross_project::resolve_project_from_cwd;
 
 /// Handle the session-end hook.
 pub async fn handle(
@@ -23,7 +27,26 @@ pub async fn handle(
     engine: &Engine,
     cwd: &Path,
 ) -> Result<()> {
-    // If no Ralph session, exit silently
+    // 1. Final transcript import (shared helper, incremental)
+    super::import_current_transcript(input, engine, cwd).await;
+
+    // 2. V3 extraction ��� produces a genuinely searchable index
+    if let Some(ref tp) = input.transcript_path {
+        let path = PathBuf::from(tp);
+        if path.exists() {
+            if let Err(e) = run_v3_extraction(engine, &path, cwd).await {
+                eprintln!("CSR: V3 extraction failed (non-fatal): {}", e);
+            }
+        }
+    }
+
+    // 3. Spawn detached Haiku story generation (fire-and-forget, outlives this process)
+    if let Some(ref tp) = input.transcript_path {
+        let cwd_str = cwd.to_string_lossy().to_string();
+        crate::summarizer::spawn_detached_story_generation(tp, &cwd_str);
+    }
+
+    // Ralph-specific: generate and store session narrative
     let ralph = match ralph {
         Some(r) => r,
         None => return Ok(()),
@@ -133,3 +156,83 @@ pub async fn handle(
 
     Ok(())
 }
+
+/// Run V3 extraction inline at session-end.
+/// Produces a rich search index (user's words, edit patterns, error recovery, AST context)
+/// and stores it as a reflection that supersedes the Layer 1 heuristic.
+async fn run_v3_extraction(engine: &Engine, transcript_path: &Path, cwd: &Path) -> Result<()> {
+    let cwd_str = cwd.to_string_lossy();
+    let project = resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string());
+    let conv_id = transcript_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // Skip if already V3-extracted
+    if engine
+        .storage()
+        .is_conversation_enriched(&conv_id, "extracted_v3")
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let messages = crate::import::parse_jsonl_messages(transcript_path)?;
+    if messages.len() < 3 {
+        return Ok(()); // skip trivial sessions
+    }
+
+    let result = crate::extraction::extract_v3(&messages);
+    if result.search_index.trim().is_empty() {
+        return Ok(());
+    }
+
+    // Store search index as reflection (supersedes heuristic)
+    let reflection_id = format!("v3_{}", conv_id);
+    let tags = vec![
+        "narrative_v3".to_string(),
+        format!("conv_{}", conv_id),
+        format!("project_{}", project),
+    ];
+
+    let emb = engine.embeddings().clone();
+    let search_idx = result.search_index.clone();
+    let embedding = tokio::task::spawn_blocking(move || emb.embed(&[search_idx.as_str()]))
+        .await??;
+
+    if let Some(vec) = embedding.into_iter().next() {
+        // Supersede heuristic: delete old Layer 1 reflection if it exists
+        if let Ok(Some(old_id)) =
+            engine.storage().get_enrichment_reflection_id(&conv_id, "heuristic")
+        {
+            let _ = engine.storage().delete_reflection(&old_id);
+            // Remove from search index too
+            // (insert_reflection with same slot handles dedup in HNSW)
+        }
+
+        engine.storage().insert_reflection(
+            &reflection_id,
+            &result.search_index,
+            &tags,
+            &vec,
+        )?;
+        let mut idx = engine.search().write().await;
+        idx.insert_reflection(reflection_id.clone(), vec);
+        engine.storage().mark_enrichment_completed(
+            &conv_id,
+            "extracted_v3",
+            &reflection_id,
+        )?;
+
+        eprintln!(
+            "CSR: V3 search index stored ({} tokens, {} patterns, {} errors)",
+            result.stats.search_index_tokens,
+            result.stats.patterns_found,
+            result.stats.errors_found,
+        );
+    }
+
+    Ok(())
+}
+

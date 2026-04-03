@@ -9,9 +9,11 @@
 //! Anti-patterns are placed FIRST in the output (critical for fast loops).
 
 use std::path::Path;
+use std::sync::LazyLock;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use regex::Regex;
 
 use super::ralph_state::RalphState;
 use super::HookInput;
@@ -20,6 +22,10 @@ use crate::injection::anti_pattern;
 use crate::search::cross_project::resolve_project_from_cwd;
 use crate::storage::queries::SessionInfo;
 use crate::temporal;
+
+/// Regex for stripping XML-like tags from preview text (e.g. <local-command-caveat>).
+/// Capped at 50 chars to prevent ReDoS on malformed input (codex R-10).
+static XML_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]{1,50}>").unwrap());
 
 /// Handle the session-start hook.
 /// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code (C-1 fix).
@@ -31,75 +37,101 @@ pub async fn handle(
 ) -> Result<()> {
     if let Err(e) = handle_inner(input, ralph, engine, cwd).await {
         eprintln!("CSR: session-start hook error (non-fatal): {}", e);
+        // Output minimal context so session gets SOMETHING rather than silent "Success"
+        // Keep error details on stderr only — don't leak internal paths to Claude's context
+        println!("CSR engine ready (degraded mode).");
     }
     Ok(()) // Always succeed
 }
 
 async fn handle_inner(
-    input: &HookInput,
+    _input: &HookInput,
     ralph: Option<&RalphState>,
     engine: &Engine,
     cwd: &Path,
 ) -> Result<()> {
-    let session_id = input
-        .session_id
-        .as_deref()
-        .unwrap_or("unknown");
-
-    // If no Ralph session, output status + compact timeline
+    // If no Ralph session, output curated session stories (or fallback to V3 enrichment)
     let ralph = match ralph {
         Some(r) => r,
         None => {
-            // Single lock acquisition for both counts (M-3 fix)
-            let (chunk_count, reflection_count) = {
-                let search = engine.search().read().await;
-                (search.chunk_count(), search.reflection_count())
-            };
-
-            // Resolve project from cwd for scoped lookup
             let project = resolve_project_from_cwd(&cwd.to_string_lossy());
-
-            // Over-fetch 8, filter displayable, take 5 (Bug 3 fix)
-            let sessions = engine
-                .storage()
-                .get_recent_sessions(8, project.as_deref())
-                .unwrap_or_default();
-
-            let displayable: Vec<&SessionInfo> = sessions
-                .iter()
-                .filter(|s| is_displayable(s))
-                .take(5)
-                .collect();
-
+            let project_name = project.as_deref().unwrap_or("unknown");
             let now = Utc::now();
 
-            // Build full output string, single println (L-3 fix)
-            let mut output = format!("CSR engine ready. Session: {session_id}. {chunk_count} chunks, {reflection_count} reflections indexed.");
+            // Try curated session stories first (Haiku-generated, project-scoped)
+            let story_tag = format!("project_{}", project_name);
+            let stories = engine
+                .storage()
+                .get_reflections_by_tag("session_story", 10)
+                .unwrap_or_default();
+            let project_stories: Vec<_> = stories
+                .iter()
+                .filter(|(_, _, tags, _)| tags.iter().any(|t| t == &story_tag))
+                .take(3)
+                .collect();
 
-            if !displayable.is_empty() {
-                output.push_str("\n\nRecent sessions:");
-                for session in &displayable {
-                    output.push_str(&format!("\n  {}", format_session_line(session, &now)));
+            let mut output = String::new();
+            let story_count = project_stories.len();
+            let mut session_count = 0usize;
+
+            if !project_stories.is_empty() {
+                // Curated story path — Haiku-generated summaries
+                for (i, (_id, content, _tags, timestamp)) in project_stories.iter().enumerate() {
+                    let age = relative_time_label(timestamp, &now);
+                    if i == 0 {
+                        output.push_str(&format!("[{}] {}", age, content));
+                    } else {
+                        output.push_str(&format!("\n\n[{}] {}", age, content));
+                    }
                 }
+                output.push_str("\n\nFor deeper context, use csr_reflect_on_past(\"topic\").");
+            } else {
+                // Fallback: V3 enrichment + lookup instructions (no stories yet)
+                let sessions = engine
+                    .storage()
+                    .get_recent_sessions(10, Some(project_name))
+                    .unwrap_or_default();
+                let displayable: Vec<&SessionInfo> = sessions
+                    .iter()
+                    .filter(|s| is_displayable(s))
+                    .take(4)
+                    .collect();
+                session_count = displayable.len();
 
-                // Cross-project pulse: search for related concepts in other projects
-                if let Some(cross_project_note) = cross_project_pulse(
-                    engine,
-                    &displayable,
-                    project.as_deref().unwrap_or(""),
-                )
-                .await
-                {
-                    output.push_str(&format!("\n\n{cross_project_note}"));
+                if !displayable.is_empty() {
+                    for session in &displayable {
+                        let age = relative_time_label(&session.timestamp, &now);
+                        let title = session_title(session);
+                        let enrichment_line = session
+                            .enrichment
+                            .as_deref()
+                            .and_then(enrichment_display)
+                            .unwrap_or_default();
+
+                        if enrichment_line.is_empty() || enrichment_line == title {
+                            output.push_str(&format!("[{}] {} ({} msgs)\n", age, title, session.total_messages));
+                        } else {
+                            output.push_str(&format!(
+                                "[{}] {} ({} msgs)\n  {}\n",
+                                age, title, session.total_messages, enrichment_line
+                            ));
+                        }
+                    }
+                    output.push_str("\nFor deeper context, use csr_reflect_on_past(\"topic\").");
+                } else {
+                    let (chunk_count, reflection_count) = {
+                        let search = engine.search().read().await;
+                        (search.chunk_count(), search.reflection_count())
+                    };
+                    output.push_str(&format!(
+                        "CSR: {} chunks, {} reflections indexed. No recent sessions for this project.",
+                        chunk_count, reflection_count
+                    ));
                 }
-
-                // Enrichment-aware suggestion from most recent displayable session
-                let suggestion = infer_next_action_from_session(displayable[0]);
-                output.push_str(&format!("\n\nSuggested next: {suggestion}"));
-                output.push_str("\nDrill down: use reflect_on_past, search_by_file, or search_by_concept (AST-powered)");
-                output.push_str("\nNote: current session not yet imported — timeline shows prior sessions");
-                output.push_str("\n\n[INSTRUCTION: When the user sends their first message, proactively greet them with the suggested next action above and any cross-project insights. Keep it natural — 1-2 sentences. If the user's message already has a clear task, skip the greeting and focus on their request.]");
             }
+
+            // Log what was injected for diagnostics
+            log_session_start_injection(project_name, &output, story_count, session_count);
 
             println!("{output}");
             return Ok(());
@@ -224,6 +256,15 @@ async fn handle_inner(
         );
     }
 
+    // Log Ralph session-start injection details
+    let project = resolve_project_from_cwd(&cwd.to_string_lossy()).unwrap_or_else(|| "unknown".to_string());
+    let ralph_summary = format!(
+        "ralph=\"{}\" anti={} win={} err={} sim={}",
+        ralph.task.chars().take(60).collect::<String>(),
+        anti_pattern_count, winning_count, error_count, similar_count,
+    );
+    log_session_start_injection(&project, &ralph_summary, 0, 0);
+
     Ok(())
 }
 
@@ -268,6 +309,7 @@ async fn embed_query(
 
 /// Search for cross-project concept matches from the most recent session's enrichment.
 /// Returns a one-line note if a match is found in another project.
+#[allow(dead_code)]
 async fn cross_project_pulse(
     engine: &Engine,
     sessions: &[&SessionInfo],
@@ -325,6 +367,37 @@ async fn cross_project_pulse(
     None
 }
 
+/// Log session-start injection details to hook-timing.log for diagnostics.
+/// Captures: project, stdout size, story count, session count, and content preview.
+fn log_session_start_injection(
+    project: &str,
+    output: &str,
+    story_count: usize,
+    session_count: usize,
+) {
+    if let Some(home) = dirs::home_dir() {
+        let log_path = home.join(".claude-self-reflect").join("hook-timing.log");
+        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let preview: String = output
+            .lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" | ")
+            .chars()
+            .take(200)
+            .collect();
+        let line = format!(
+            "{} CSR session-start inject [{}]: stories={} sessions={} stdout={}B preview=\"{}\"\n",
+            ts, project, story_count, session_count, output.len(), preview,
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    }
+}
+
 /// Format a relative time label with hour-level granularity for same-day sessions.
 /// Uses `temporal::parse_timestamp` for parsing, pure fn with injected `now`.
 fn relative_time_label(timestamp: &str, now: &DateTime<Utc>) -> String {
@@ -366,13 +439,36 @@ fn compact_preview(content: &str, max_chars: usize) -> String {
     format!("{}...", &clean[..boundary])
 }
 
+/// Regex for stripping inline markdown heading markers (e.g. " ## Context " → " Context ").
+static MD_HEADING_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#{1,4}\s+").unwrap());
+
 /// Sanitize a preview string for safe stdout injection.
-/// Collapses newlines to spaces, strips control characters (M-2 fix).
+/// Strips XML-like tags, markdown headers, literal \n, collapses newlines, removes control chars.
 fn sanitize_preview(s: &str) -> String {
-    s.chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .filter(|c| !c.is_control() || *c == ' ')
-        .collect()
+    // Replace literal \n (backslash-n) with space — common in JSONL-sourced content
+    let no_literal_nl = s.replace("\\n", " ");
+    // Strip XML-like tags (e.g. <local-command-caveat>, <system-reminder>)
+    let no_xml = XML_TAG_RE.replace_all(&no_literal_nl, "");
+    // Strip all markdown heading markers (both start-of-line and inline after \n collapse)
+    let no_md = MD_HEADING_RE.replace_all(&no_xml, "");
+    // Collapse to single line, strip whitespace
+    let mut result = String::with_capacity(no_md.len());
+    for line in no_md.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            if !result.is_empty() {
+                result.push(' ');
+            }
+            result.push_str(trimmed);
+        }
+    }
+    // Collapse multiple spaces into one
+    while result.contains("  ") {
+        result = result.replace("  ", " ");
+    }
+    // Strip remaining control characters
+    result.retain(|c| !c.is_control() || c == ' ');
+    result
 }
 
 /// Strip common preamble prefixes that add noise to timeline summaries.
@@ -401,19 +497,93 @@ fn strip_preamble(s: &str) -> &str {
     trimmed
 }
 
+/// Patterns in session summaries that indicate the first message was noise, not a real title.
+/// After XML tag stripping, these remain as leftover content from system wrappers.
+const NOISE_SUMMARIES: &[&str] = &[
+    "caveat: the messages below",
+    "note: this session",
+    "system-reminder",
+    "the following context",
+    "this is a continuation",
+];
+
+/// Extract a clean session title from summary, stripping preamble and sanitizing.
+/// Falls back to enrichment-based title if the summary is noise (e.g. caveat text from /clear).
+fn session_title(session: &SessionInfo) -> String {
+    let raw = session
+        .summary
+        .as_deref()
+        .unwrap_or("(no summary)");
+    let stripped = strip_preamble(raw);
+    let sanitized = sanitize_preview(stripped);
+
+    // Detect noise: if the sanitized summary matches known noise patterns,
+    // try to extract a title from enrichment data instead
+    let lower = sanitized.to_lowercase();
+    let is_noise = NOISE_SUMMARIES.iter().any(|p| lower.starts_with(p));
+
+    if is_noise {
+        // Try enrichment-based title from any enrichment format
+        if let Some(enrichment) = session.enrichment.as_deref() {
+            // Try heuristic format: structured tools/files
+            let fields = parse_enrichment(enrichment);
+            if fields.has_edit_tool && !fields.files.is_empty() {
+                let file_list: Vec<&str> = fields.files.iter().take(3).map(|s| s.as_str()).collect();
+                return format!("Edited {}", file_list.join(", "));
+            }
+            if !fields.tools.is_empty() {
+                let tool_summary: Vec<&str> = fields.tools.iter().take(3).map(|s| s.as_str()).collect();
+                return format!("Session using {}", tool_summary.join(", "));
+            }
+            // Try v3/ai_narrative format: extract search summary
+            if let Some(v3_summary) = extract_v3_summary(enrichment) {
+                return v3_summary;
+            }
+        }
+        return "(session)".to_string();
+    }
+
+    compact_preview(&sanitized, 70)
+}
+
+/// Look up the enrichment reflection for a session and return a ~200 char preview.
+/// Tries enrichment types in priority order: ai_narrative > v3_extraction > heuristic.
+#[allow(dead_code)]
+fn get_session_reflection_preview(engine: &Engine, session: &SessionInfo) -> Option<String> {
+    let cid = &session.conversation_id;
+    let storage = engine.storage();
+
+    for enrichment_type in &["ai_narrative", "v3_extraction", "heuristic"] {
+        if let Ok(Some(ref_id)) = storage.get_enrichment_reflection_id(cid, enrichment_type) {
+            if let Ok(Some((content, _tags, _ts))) = storage.get_reflection_by_id(&ref_id) {
+                let preview: String = content.chars().take(200).collect();
+                let sanitized = sanitize_preview(&preview);
+                if sanitized.len() > 20 {
+                    let truncated = compact_preview(&sanitized, 200);
+                    return Some(truncated);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Check if a session has enough content to be worth displaying.
+/// Threshold: >= 6 messages (codex R-1) OR has enrichment data.
 fn is_displayable(session: &SessionInfo) -> bool {
-    if session.total_messages < 2 {
+    let has_enrichment = session.enrichment.is_some();
+    if has_enrichment {
+        return true;
+    }
+    if session.total_messages < 6 {
         return false;
     }
-    // Must have either a non-empty summary or enrichment
-    let has_summary = session
+    // Must have a non-empty summary
+    session
         .summary
         .as_deref()
         .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    let has_enrichment = session.enrichment.is_some();
-    has_summary || has_enrichment
+        .unwrap_or(false)
 }
 
 /// Parse heuristic enrichment text to extract structured fields.
@@ -450,8 +620,11 @@ fn parse_enrichment(enrichment: &str) -> EnrichmentFields {
 }
 
 /// Build a compact display line from enrichment data (tools + files).
-/// Returns None if no enrichment, falls back to summary.
+/// Handles both heuristic format (`[Heuristic] Project: X\nTools: ...`)
+/// and v3/ai_narrative format (`## Search Summary\nText...`).
+/// Returns None if no structured data found.
 fn enrichment_display(enrichment: &str) -> Option<String> {
+    // Try heuristic format first (structured Tools/Files)
     let fields = parse_enrichment(enrichment);
     let mut parts = Vec::new();
 
@@ -467,29 +640,84 @@ fn enrichment_display(enrichment: &str) -> Option<String> {
         parts.push("Had errors".to_string());
     }
 
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" | "))
+    if !parts.is_empty() {
+        return Some(parts.join(" | "));
     }
+
+    // Try v3/ai_narrative format: extract ## Search Summary paragraph
+    extract_v3_summary(enrichment)
+}
+
+/// Headers to look for in v3/ai_narrative enrichment, in priority order.
+const V3_SUMMARY_HEADERS: &[&str] = &[
+    "## Search Summary",
+    "## User Request",
+    "## Problem-Solution Mapping",
+    "## Implementation Context",
+    "## Context",
+];
+
+/// Extract the first meaningful paragraph from v3/ai_narrative enrichment.
+/// Tries multiple section headers in priority order.
+fn extract_v3_summary(enrichment: &str) -> Option<String> {
+    for header in V3_SUMMARY_HEADERS {
+        if let Some(text) = extract_section_paragraph(enrichment, header) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Extract the first non-empty paragraph after a markdown ## header.
+/// Applies preamble stripping and sanitization for clean display.
+fn extract_section_paragraph(content: &str, header: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == header {
+            in_section = true;
+            continue;
+        }
+        // Stop at next section
+        if in_section && trimmed.starts_with("## ") {
+            break;
+        }
+        if in_section {
+            // Skip empty lines, code fence markers, and short noise
+            if trimmed.is_empty() || trimmed.starts_with("```") {
+                continue;
+            }
+            // Strip leading quotes from User Request content
+            let unquoted = trimmed.trim_start_matches('"').trim_end_matches('"');
+            // Apply preamble stripping ("Implement the following plan:" etc.)
+            let stripped = strip_preamble(unquoted);
+            // Trim leading literal \n then split on \n\n to extract just the title
+            let trimmed_nl = stripped.trim_start_matches("\\n");
+            let title_only = trimmed_nl
+                .split("\\n\\n")
+                .find(|s| !s.is_empty())
+                .unwrap_or(trimmed_nl);
+            let sanitized = sanitize_preview(title_only);
+            if sanitized.len() > 10 {
+                return Some(compact_preview(&sanitized, 80));
+            }
+        }
+    }
+    None
 }
 
 /// Format a session timeline line using enrichment data when available.
+#[allow(dead_code)]
 fn format_session_line(session: &SessionInfo, now: &DateTime<Utc>) -> String {
     let label = relative_time_label(&session.timestamp, now);
 
-    // Prefer enrichment display for rich context, fall back to summary
+    // Prefer enrichment display for rich context, fall back to session_title
+    // (session_title handles noise detection and enrichment-based fallback)
     let display = session
         .enrichment
         .as_deref()
         .and_then(enrichment_display)
-        .or_else(|| {
-            session.summary.as_deref().map(|s| {
-                let cleaned = strip_preamble(s);
-                compact_preview(cleaned, 65)
-            })
-        })
-        .unwrap_or_else(|| "---".to_string());
+        .unwrap_or_else(|| session_title(session));
 
     format!(
         "{:<9} | {:>3} msgs | {}",
@@ -499,6 +727,7 @@ fn format_session_line(session: &SessionInfo, now: &DateTime<Utc>) -> String {
 
 /// Infer a suggested next action from enrichment data.
 /// Uses structured enrichment fields for better accuracy than keyword matching.
+#[allow(dead_code)]
 fn infer_next_action_from_session(session: &SessionInfo) -> String {
     // Try enrichment-based inference first
     if let Some(enrichment) = session.enrichment.as_deref() {
@@ -526,6 +755,7 @@ fn infer_next_action_from_session(session: &SessionInfo) -> String {
 
 /// Infer a suggested next action from the last session's content.
 /// Uses simple keyword heuristics — no embedding needed, ~0ms.
+#[allow(dead_code)]
 fn infer_next_action(content: &str) -> String {
     let lower = content.to_lowercase();
 
@@ -644,9 +874,36 @@ mod tests {
     #[test]
     fn test_sanitize_preview() {
         assert_eq!(sanitize_preview("hello\nworld"), "hello world");
-        assert_eq!(sanitize_preview("no\r\nnewlines"), "no  newlines");
         assert_eq!(sanitize_preview("clean text"), "clean text");
         assert_eq!(sanitize_preview("a\x00b\x01c"), "abc");
+    }
+
+    #[test]
+    fn test_sanitize_preview_strips_xml_tags() {
+        let input = "<local-command-caveat>Caveat: The messages below</local-command-caveat>";
+        let result = sanitize_preview(input);
+        assert!(!result.contains('<'));
+        assert!(!result.contains('>'));
+        assert!(result.contains("Caveat: The messages below"));
+    }
+
+    #[test]
+    fn test_sanitize_preview_strips_markdown_headers() {
+        let input = "## Context\nThe CSR hooks inject context";
+        let result = sanitize_preview(input);
+        assert!(!result.contains("##"));
+        assert!(result.contains("Context"));
+        assert!(result.contains("The CSR hooks inject context"));
+    }
+
+    #[test]
+    fn test_sanitize_preview_combined() {
+        let input = "<system-reminder>## Important\nDo the thing</system-reminder>";
+        let result = sanitize_preview(input);
+        assert!(!result.contains('<'));
+        assert!(!result.contains("##"));
+        assert!(result.contains("Important"));
+        assert!(result.contains("Do the thing"));
     }
 
     // --- relative_time_label tests (Bug 2: hour-level granularity) ---
@@ -798,7 +1055,7 @@ mod tests {
         );
     }
 
-    // --- is_displayable tests (Bug 3) ---
+    // --- is_displayable tests (threshold=6 or has enrichment) ---
 
     #[test]
     fn test_is_displayable_good_session() {
@@ -829,6 +1086,36 @@ mod tests {
     }
 
     #[test]
+    fn test_is_displayable_five_messages_no_enrichment() {
+        // 5 messages is below threshold (6) and no enrichment → not displayable
+        let session = SessionInfo {
+            conversation_id: "abc".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-02-15T10:00:00Z".to_string(),
+            total_messages: 5,
+            chunk_count: 2,
+            summary: Some("Quick chat".to_string()),
+            enrichment: None,
+        };
+        assert!(!is_displayable(&session));
+    }
+
+    #[test]
+    fn test_is_displayable_six_messages_with_summary() {
+        // 6 messages meets threshold → displayable if has summary
+        let session = SessionInfo {
+            conversation_id: "abc".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-02-15T10:00:00Z".to_string(),
+            total_messages: 6,
+            chunk_count: 2,
+            summary: Some("Debugging session".to_string()),
+            enrichment: None,
+        };
+        assert!(is_displayable(&session));
+    }
+
+    #[test]
     fn test_is_displayable_empty_summary_no_enrichment() {
         let session = SessionInfo {
             conversation_id: "abc".to_string(),
@@ -844,16 +1131,101 @@ mod tests {
 
     #[test]
     fn test_is_displayable_enrichment_only() {
+        // Enrichment present → always displayable regardless of message count
+        let session = SessionInfo {
+            conversation_id: "abc".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-02-15T10:00:00Z".to_string(),
+            total_messages: 3,
+            chunk_count: 1,
+            summary: None,
+            enrichment: Some("[Heuristic] Project: test\nTools: Edit".to_string()),
+        };
+        assert!(is_displayable(&session));
+    }
+
+    // --- session_title tests ---
+
+    #[test]
+    fn test_session_title_strips_preamble() {
         let session = SessionInfo {
             conversation_id: "abc".to_string(),
             project_name: "test".to_string(),
             timestamp: "2026-02-15T10:00:00Z".to_string(),
             total_messages: 50,
-            chunk_count: 3,
-            summary: None,
-            enrichment: Some("[Heuristic] Project: test\nTools: Edit".to_string()),
+            chunk_count: 2,
+            summary: Some("Implement the following plan: ## Fix the timeline bugs".to_string()),
+            enrichment: None,
         };
-        assert!(is_displayable(&session));
+        let title = session_title(&session);
+        assert!(!title.contains("Implement the following plan"));
+        assert!(title.contains("Fix the timeline bugs"));
+    }
+
+    #[test]
+    fn test_session_title_caveat_detected_as_noise() {
+        // Caveat text from /clear commands should be detected as noise
+        let session = SessionInfo {
+            conversation_id: "abc".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-02-15T10:00:00Z".to_string(),
+            total_messages: 10,
+            chunk_count: 2,
+            summary: Some("<local-command-caveat>Caveat: The messages below were generated by the user while running local commands</local-command-caveat>".to_string()),
+            enrichment: None,
+        };
+        let title = session_title(&session);
+        assert!(!title.contains('<'));
+        assert!(!title.contains("Caveat"));
+        assert_eq!(title, "(session)");
+    }
+
+    #[test]
+    fn test_session_title_caveat_with_enrichment_fallback() {
+        // When caveat noise is detected, fall back to enrichment-based title
+        let session = SessionInfo {
+            conversation_id: "abc".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-02-15T10:00:00Z".to_string(),
+            total_messages: 10,
+            chunk_count: 2,
+            summary: Some("<local-command-caveat>Caveat: The messages below</local-command-caveat>".to_string()),
+            enrichment: Some("[Heuristic] Project: test\nTools: Edit, Read\nFiles: main.rs, lib.rs".to_string()),
+        };
+        let title = session_title(&session);
+        assert!(title.contains("Edited"));
+        assert!(title.contains("main.rs"));
+    }
+
+    #[test]
+    fn test_session_title_no_summary() {
+        let session = SessionInfo {
+            conversation_id: "abc".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-02-15T10:00:00Z".to_string(),
+            total_messages: 10,
+            chunk_count: 2,
+            summary: None,
+            enrichment: None,
+        };
+        assert_eq!(session_title(&session), "(no summary)");
+    }
+
+    #[test]
+    fn test_session_title_system_reminder_noise() {
+        let session = SessionInfo {
+            conversation_id: "abc".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-02-15T10:00:00Z".to_string(),
+            total_messages: 20,
+            chunk_count: 3,
+            summary: Some("<system-reminder>Note: this session was started from context</system-reminder>".to_string()),
+            enrichment: Some("[Heuristic] Project: test\nTools: Bash, Read".to_string()),
+        };
+        let title = session_title(&session);
+        // Should fall back to enrichment tools since summary is noise
+        assert!(title.contains("Session using"));
+        assert!(title.contains("Bash"));
     }
 
     // --- enrichment parsing + inference tests (Bug 6) ---
@@ -968,6 +1340,43 @@ mod tests {
     fn test_enrichment_display_no_structured_data() {
         let enrichment = "[Heuristic] Project: csr\nMessages: 10 (5 user)";
         assert!(enrichment_display(enrichment).is_none());
+    }
+
+    #[test]
+    fn test_enrichment_display_v3_format() {
+        let enrichment = "```markdown\n## Search Summary\nImplemented Phase 4 code-aware search with tree-sitter AST.\n\n## Problem-Solution Mapping\n**Request**: stuff";
+        let display = enrichment_display(enrichment).unwrap();
+        assert!(display.contains("Implemented Phase 4"));
+        assert!(display.contains("tree-sitter"));
+    }
+
+    #[test]
+    fn test_enrichment_display_v3_long_truncates() {
+        let long_summary = "A".repeat(120);
+        let enrichment = format!("## Search Summary\n{long_summary}\n\n## Other");
+        let display = enrichment_display(&enrichment).unwrap();
+        assert!(display.ends_with("..."));
+        assert!(display.len() <= 85); // 80 + "..."
+    }
+
+    #[test]
+    fn test_extract_v3_summary_empty() {
+        assert!(extract_v3_summary("## Search Summary\n\n## Other").is_none());
+    }
+
+    #[test]
+    fn test_extract_v3_summary_user_request() {
+        let enrichment = "## User Request\n\"Fix the session start hook bugs\"\n\"Review the injection output\"\n\n## Solution Pattern\ncreation: file.md";
+        let display = extract_v3_summary(enrichment).unwrap();
+        assert!(display.contains("Fix the session start hook bugs"));
+    }
+
+    #[test]
+    fn test_enrichment_display_v3_user_request_fallback() {
+        // When v3 has no Search Summary, falls back to User Request
+        let enrichment = "## User Request\n\"Implement the new feature\"\n\n## Solution Pattern\ncreation: file.md";
+        let display = enrichment_display(enrichment).unwrap();
+        assert!(display.contains("Implement the new feature"));
     }
 
     // --- format_session_line tests ---

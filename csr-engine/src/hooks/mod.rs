@@ -16,14 +16,16 @@ pub mod session_start;
 pub mod stop;
 
 use std::io::Read;
+use std::path::Path;
 
 use anyhow::Result;
 use serde::Deserialize;
 
 use crate::engine::Engine;
+use crate::search::cross_project::resolve_project_from_cwd;
 
 /// Input received from Claude Code via stdin JSON.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct HookInput {
     pub session_id: Option<String>,
     pub transcript_path: Option<String>,
@@ -58,9 +60,32 @@ pub fn read_stdin_json() -> HookInput {
     }
 }
 
+/// Shared helper: import the current transcript incrementally.
+/// Used by stop, precompact, and session_end hooks to keep the active session searchable.
+pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: &Path) {
+    let Some(ref transcript) = input.transcript_path else {
+        return;
+    };
+    let tp = std::path::PathBuf::from(transcript);
+    if !tp.exists() {
+        return;
+    }
+
+    let cwd_str = cwd.to_string_lossy();
+    let project = resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string());
+
+    match engine.import_file(&tp, &project).await {
+        Ok(0) => {} // no new content, silent
+        Ok(n) => eprintln!("CSR: indexed {} new chunks from active session", n),
+        Err(e) => eprintln!("CSR: import failed (non-fatal): {}", e),
+    }
+}
+
 /// Main hook dispatcher. Parses stdin, detects Ralph state, routes to handler.
 pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
+    let t0 = std::time::Instant::now();
     let input = read_stdin_json();
+    let t_stdin = t0.elapsed();
 
     // Determine CWD: prefer input.cwd, fall back to process CWD
     // Validate that cwd is a real directory under $HOME (S-3 fix)
@@ -85,11 +110,12 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     };
 
     let ralph = ralph_state::RalphState::detect_in(&cwd)?;
+    let t_setup = t0.elapsed();
 
     let result = match hook_name {
         "session-start" => session_start::handle(&input, ralph.as_ref(), engine, &cwd).await,
         "session-end" => session_end::handle(&input, ralph.as_ref(), engine, &cwd).await,
-        "precompact" => precompact::handle(&input, ralph.as_ref(), engine).await,
+        "precompact" => precompact::handle(&input, ralph.as_ref(), engine, &cwd).await,
         "stop" => stop::handle(&input, ralph.as_ref(), engine, &cwd).await,
         "post-tool-use" => post_tool_use::handle(&input, ralph.as_ref(), engine, &cwd).await,
         "prompt-submit" => prompt_submit::handle(&input, ralph.as_ref(), engine, &cwd).await,
@@ -98,9 +124,39 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
             Ok(())
         }
     };
+    let t_hook = t0.elapsed();
 
     // Flush HNSW index if any hook modified it (session_end, precompact, stop, post_tool_use)
     engine.flush_index().await;
+    let t_total = t0.elapsed();
+
+    // Resolve project name for logging
+    let cwd_str = cwd.to_string_lossy();
+    let project = resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string());
+
+    let timing_line = format!(
+        "CSR hook {} [{}]: stdin={}ms setup={}ms hook={}ms flush={}ms total={}ms",
+        hook_name,
+        project,
+        t_stdin.as_millis(),
+        (t_setup - t_stdin).as_millis(),
+        (t_hook - t_setup).as_millis(),
+        (t_total - t_hook).as_millis(),
+        t_total.as_millis(),
+    );
+    eprintln!("{}", timing_line);
+
+    // Append to timing log file for post-session analysis
+    if let Some(home) = dirs::home_dir() {
+        let log_path = home.join(".claude-self-reflect").join("hook-timing.log");
+        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let line = format!("{} {}\n", ts, timing_line);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    }
 
     result
 }
