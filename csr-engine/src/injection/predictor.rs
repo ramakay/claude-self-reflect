@@ -36,23 +36,31 @@ pub struct RawResult {
     pub files: Vec<String>,
     /// Error signatures in this result.
     pub error_patterns: Vec<String>,
+    /// Tags from storage (for phase boost scoring).
+    pub tags: Vec<String>,
 }
 
 /// Score and rank results for injection.
 ///
-/// Applies multi-signal scoring:
-/// - semantic: raw HNSW cosine similarity (weight 0.5)
-/// - recency: newer results score higher (weight 0.2)
-/// - file_overlap: results mentioning current session files (weight 0.2)
-/// - error_match: results matching current error patterns (weight 0.1)
+/// Applies multi-signal scoring with LAPI (Lifecycle-Aware Predictive Injection):
+/// When `phase` is `Some`, uses phase-specific weight profiles.
+/// When `None`, uses PromptSubmit weights (backward compatible with existing callers).
 pub fn rank_results(
     results: Vec<RawResult>,
     current_files: &[String],
     current_errors: &[String],
+    phase: Option<super::weights::HookPhase>,
 ) -> Vec<ScoredResult> {
+    let weights = phase
+        .map(super::weights::WeightProfile::for_phase)
+        .unwrap_or(super::weights::WeightProfile::for_phase(
+            super::weights::HookPhase::PromptSubmit,
+        ));
+    let phase = phase.unwrap_or(super::weights::HookPhase::PromptSubmit);
+
     let mut scored: Vec<ScoredResult> = results
         .into_iter()
-        .map(|r| score_result(r, current_files, current_errors))
+        .map(|r| score_result(r, current_files, current_errors, &weights, phase))
         .collect();
 
     scored.sort_by(|a, b| {
@@ -68,6 +76,8 @@ fn score_result(
     result: RawResult,
     current_files: &[String],
     current_errors: &[String],
+    weights: &super::weights::WeightProfile,
+    phase: super::weights::HookPhase,
 ) -> ScoredResult {
     let mut signals = Vec::new();
 
@@ -87,8 +97,15 @@ fn score_result(
     let error_match = compute_error_match(&result.error_patterns, current_errors);
     signals.push(Signal::ErrorPatternMatch(error_match));
 
-    // Weighted combination
-    let final_score = semantic * 0.5 + recency * 0.2 + file_overlap * 0.2 + error_match * 0.1;
+    // 5. Phase boost (LAPI: how well does this result type match the hook phase)
+    let phase_boost = super::weights::compute_phase_boost(&result.source, &result.tags, phase);
+
+    // Weighted combination using LAPI weight profile
+    let final_score = semantic * weights.semantic
+        + recency * weights.recency
+        + file_overlap * weights.file_overlap
+        + error_match * weights.error_match
+        + phase_boost * weights.phase_boost;
 
     ScoredResult {
         content: result.content,
@@ -190,6 +207,7 @@ mod tests {
                 timestamp: None,
                 files: vec![],
                 error_patterns: vec![],
+                tags: vec![],
             },
             RawResult {
                 content: "low match".into(),
@@ -198,10 +216,11 @@ mod tests {
                 timestamp: None,
                 files: vec![],
                 error_patterns: vec![],
+                tags: vec![],
             },
         ];
 
-        let scored = rank_results(results, &[], &[]);
+        let scored = rank_results(results, &[], &[], None);
         assert_eq!(scored.len(), 2);
         assert!(scored[0].final_score > scored[1].final_score);
         assert_eq!(scored[0].content, "high match");
@@ -220,6 +239,7 @@ mod tests {
                 timestamp: Some(now),
                 files: vec![],
                 error_patterns: vec![],
+                tags: vec![],
             },
             RawResult {
                 content: "old".into(),
@@ -228,10 +248,11 @@ mod tests {
                 timestamp: Some(old),
                 files: vec![],
                 error_patterns: vec![],
+                tags: vec![],
             },
         ];
 
-        let scored = rank_results(results, &[], &[]);
+        let scored = rank_results(results, &[], &[], None);
         assert!(
             scored[0].final_score > scored[1].final_score,
             "recent result should rank higher with equal semantic score"
@@ -249,6 +270,7 @@ mod tests {
                 timestamp: None,
                 files: vec!["src/auth.rs".into()],
                 error_patterns: vec![],
+                tags: vec![],
             },
             RawResult {
                 content: "no overlap".into(),
@@ -257,11 +279,12 @@ mod tests {
                 timestamp: None,
                 files: vec!["src/other.rs".into()],
                 error_patterns: vec![],
+                tags: vec![],
             },
         ];
 
         let current_files = vec!["src/auth.rs".into()];
-        let scored = rank_results(results, &current_files, &[]);
+        let scored = rank_results(results, &current_files, &[], None);
         assert!(scored[0].final_score > scored[1].final_score);
         assert_eq!(scored[0].content, "with file overlap");
     }
@@ -276,6 +299,7 @@ mod tests {
                 timestamp: None,
                 files: vec![],
                 error_patterns: vec!["connection reset".into()],
+                tags: vec![],
             },
             RawResult {
                 content: "no error match".into(),
@@ -284,11 +308,12 @@ mod tests {
                 timestamp: None,
                 files: vec![],
                 error_patterns: vec!["out of memory".into()],
+                tags: vec![],
             },
         ];
 
         let current_errors = vec!["connection reset".into()];
-        let scored = rank_results(results, &[], &current_errors);
+        let scored = rank_results(results, &[], &current_errors, None);
         assert!(scored[0].final_score > scored[1].final_score);
         assert_eq!(scored[0].content, "matching error");
     }
@@ -305,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_empty_inputs() {
-        let scored = rank_results(vec![], &[], &[]);
+        let scored = rank_results(vec![], &[], &[], None);
         assert!(scored.is_empty());
     }
 }

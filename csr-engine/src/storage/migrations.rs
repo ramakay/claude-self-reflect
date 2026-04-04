@@ -73,6 +73,24 @@ pub fn run(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // TAD: retrieval events — tracks which memories were surfaced and session outcomes
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS retrieval_events (
+            id TEXT PRIMARY KEY,
+            memory_id TEXT NOT NULL,
+            memory_type TEXT NOT NULL,
+            retrieved_at TEXT NOT NULL,
+            hook_phase TEXT NOT NULL,
+            session_outcome TEXT DEFAULT 'neutral',
+            session_id TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_retrieval_memory ON retrieval_events(memory_id);
+        CREATE INDEX IF NOT EXISTS idx_retrieval_session ON retrieval_events(session_id);
+        ",
+    )?;
+
     // Migration: add conversation_id to import_state if missing (for existing DBs)
     let has_conv_col: bool = conn
         .prepare("SELECT conversation_id FROM import_state LIMIT 0")

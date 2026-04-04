@@ -46,6 +46,23 @@ pub async fn handle(
         crate::summarizer::spawn_detached_story_generation(tp, &cwd_str);
     }
 
+    // TAD: Update session outcome for all retrieval events in this session.
+    // For Ralph sessions, use the determined outcome; otherwise default to "neutral".
+    if let Some(ref session_id) = input.session_id {
+        let tad_outcome = ralph
+            .map(|r| {
+                let reason = input.reason.as_deref().unwrap_or("unknown");
+                match r.determine_outcome(reason) {
+                    Outcome::Completed => "success",
+                    Outcome::Abandoned | Outcome::Incomplete => "failed",
+                }
+            })
+            .unwrap_or("neutral");
+        let _ = engine
+            .storage()
+            .update_session_outcome(session_id, tad_outcome);
+    }
+
     // Ralph-specific: generate and store session narrative
     let ralph = match ralph {
         Some(r) => r,

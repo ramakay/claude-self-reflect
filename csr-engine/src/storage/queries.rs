@@ -837,3 +837,77 @@ pub fn count_reflection_embeddings(conn: &Connection) -> Result<usize> {
     })?;
     Ok(count as usize)
 }
+
+// ─── TAD: Retrieval Event Tracking ───
+
+/// Log a retrieval event (memory was surfaced during a hook).
+pub fn log_retrieval_event(
+    conn: &Connection,
+    memory_id: &str,
+    memory_type: &str,
+    hook_phase: &str,
+    session_id: &str,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let id = format!(
+        "ret_{}_{}_{}",
+        &session_id[..8.min(session_id.len())],
+        chrono::Utc::now().timestamp_millis(),
+        seq
+    );
+    conn.execute(
+        "INSERT INTO retrieval_events (id, memory_id, memory_type, retrieved_at, hook_phase, session_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            id,
+            memory_id,
+            memory_type,
+            chrono::Utc::now().to_rfc3339(),
+            hook_phase,
+            session_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Update session outcome for all retrieval events in a session.
+pub fn update_session_outcome(
+    conn: &Connection,
+    session_id: &str,
+    outcome: &str,
+) -> Result<usize> {
+    let updated = conn.execute(
+        "UPDATE retrieval_events SET session_outcome = ?1 WHERE session_id = ?2",
+        params![outcome, session_id],
+    )?;
+    Ok(updated)
+}
+
+/// Get retrieval events for a specific memory (for TAD scoring).
+pub fn get_retrieval_events_for_memory(
+    conn: &Connection,
+    memory_id: &str,
+) -> Result<Vec<(String, String, String)>> {
+    // Returns (retrieved_at, session_outcome, hook_phase)
+    let mut stmt = conn.prepare(
+        "SELECT retrieved_at, session_outcome, hook_phase
+         FROM retrieval_events
+         WHERE memory_id = ?1
+         ORDER BY retrieved_at DESC
+         LIMIT 20",
+    )?;
+    let rows = stmt.query_map(params![memory_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}

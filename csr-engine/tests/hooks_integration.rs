@@ -1201,6 +1201,7 @@ fn test_predictor_semantic_only() {
             timestamp: None,
             files: vec![],
             error_patterns: vec![],
+            tags: vec![],
         },
         RawResult {
             content: "low".into(),
@@ -1209,10 +1210,11 @@ fn test_predictor_semantic_only() {
             timestamp: None,
             files: vec![],
             error_patterns: vec![],
+            tags: vec![],
         },
     ];
 
-    let scored = predictor::rank_results(results, &[], &[]);
+    let scored = predictor::rank_results(results, &[], &[], None);
     assert_eq!(scored.len(), 2);
     assert_eq!(scored[0].content, "high");
     assert!(scored[0].final_score > scored[1].final_score);
@@ -1233,6 +1235,7 @@ fn test_predictor_recency_boost() {
             timestamp: Some(now),
             files: vec![],
             error_patterns: vec![],
+            tags: vec![],
         },
         RawResult {
             content: "old".into(),
@@ -1241,10 +1244,11 @@ fn test_predictor_recency_boost() {
             timestamp: Some(old),
             files: vec![],
             error_patterns: vec![],
+            tags: vec![],
         },
     ];
 
-    let scored = predictor::rank_results(results, &[], &[]);
+    let scored = predictor::rank_results(results, &[], &[], None);
     assert_eq!(scored[0].content, "recent");
 }
 
@@ -1260,6 +1264,7 @@ fn test_predictor_file_overlap() {
             timestamp: None,
             files: vec!["src/auth.rs".into()],
             error_patterns: vec![],
+            tags: vec![],
         },
         RawResult {
             content: "no overlap".into(),
@@ -1268,11 +1273,12 @@ fn test_predictor_file_overlap() {
             timestamp: None,
             files: vec!["src/unrelated.rs".into()],
             error_patterns: vec![],
+            tags: vec![],
         },
     ];
 
     let current_files = vec!["src/auth.rs".into()];
-    let scored = predictor::rank_results(results, &current_files, &[]);
+    let scored = predictor::rank_results(results, &current_files, &[], None);
     assert_eq!(scored[0].content, "with overlap");
 }
 
@@ -1288,10 +1294,11 @@ fn test_predictor_cross_project() {
             timestamp: None,
             files: vec![],
             error_patterns: vec![],
+            tags: vec![],
         },
     ];
 
-    let scored = predictor::rank_results(results, &[], &[]);
+    let scored = predictor::rank_results(results, &[], &[], None);
     assert_eq!(scored.len(), 1);
     assert_eq!(scored[0].source, "reflection");
 }

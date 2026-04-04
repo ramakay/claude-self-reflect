@@ -1012,3 +1012,186 @@ fn test_hnsw_cached_load_timing() {
         elapsed.as_millis()
     );
 }
+
+// ─── LAPI: Phase-Aware Scoring ───
+
+#[test]
+fn test_lapi_phase_aware_scoring() {
+    use csr_engine::injection::predictor::{self, RawResult};
+    use csr_engine::injection::weights::HookPhase;
+
+    // Create a chunk and a reflection with same semantic score
+    let results = vec![
+        RawResult {
+            content: "docker container fix".into(),
+            score: 0.8,
+            source: "chunk".into(),
+            timestamp: None,
+            files: vec![],
+            error_patterns: vec![],
+            tags: vec![],
+        },
+        RawResult {
+            content: "session strategy for docker".into(),
+            score: 0.8,
+            source: "reflection".into(),
+            timestamp: None,
+            files: vec![],
+            error_patterns: vec![],
+            tags: vec!["outcome_completed".to_string()],
+        },
+    ];
+
+    // PromptSubmit: chunks should rank higher (semantic weight dominates)
+    let prompt_scored = predictor::rank_results(
+        results.clone(),
+        &[],
+        &[],
+        Some(HookPhase::PromptSubmit),
+    );
+    // Chunk gets phase_boost=0.8, reflection gets phase_boost=0.5
+    // With PromptSubmit weights: semantic=0.40 dominates, but phase_boost=0.15 still helps chunk
+    assert_eq!(prompt_scored[0].source, "chunk", "PromptSubmit should prefer chunks");
+
+    // SessionStart: reflection with outcome tag should rank higher
+    let start_scored = predictor::rank_results(
+        results.clone(),
+        &[],
+        &[],
+        Some(HookPhase::SessionStart),
+    );
+    // Reflection with outcome_completed gets phase_boost=1.0, chunk gets 0.2
+    // SessionStart phase_boost weight=0.40 → reflection wins
+    assert_eq!(start_scored[0].source, "reflection", "SessionStart should prefer outcome reflections");
+}
+
+#[test]
+fn test_lapi_stop_phase_prefers_anti_patterns() {
+    use csr_engine::injection::predictor::{self, RawResult};
+    use csr_engine::injection::weights::HookPhase;
+
+    let results = vec![
+        RawResult {
+            content: "regular chunk content".into(),
+            score: 0.8,
+            source: "chunk".into(),
+            timestamp: None,
+            files: vec![],
+            error_patterns: vec![],
+            tags: vec![],
+        },
+        RawResult {
+            content: "failed approach for this problem".into(),
+            score: 0.8,
+            source: "anti_pattern".into(),
+            timestamp: None,
+            files: vec![],
+            error_patterns: vec![],
+            tags: vec![],
+        },
+    ];
+
+    let scored = predictor::rank_results(results, &[], &[], Some(HookPhase::Stop));
+    assert_eq!(scored[0].source, "anti_pattern", "Stop phase should prefer anti-patterns");
+}
+
+// ─── TAD: Temporal Attention Decay ───
+
+#[test]
+fn test_tad_reinforcement_changes_ranking() {
+    use csr_engine::search::decay::{
+        apply_decay_unified, apply_tad, DecayConfig, RetrievalEvent, SessionOutcome,
+    };
+    use chrono::{Duration, Utc};
+
+    let now = Utc::now();
+    let memory_age = now - Duration::days(60);
+    let config = DecayConfig::for_search();
+
+    // Baseline: no retrieval events
+    let baseline = apply_decay_unified(1.0, &memory_age, &now, &config);
+
+    // Successful retrieval: memory should be preserved longer
+    let success_events = vec![RetrievalEvent {
+        retrieved_at: now - Duration::days(5),
+        session_outcome: SessionOutcome::Success,
+    }];
+    let reinforced = apply_tad(1.0, &memory_age, &now, &success_events, &config);
+    assert!(reinforced > baseline, "reinforced={} > baseline={}", reinforced, baseline);
+
+    // Failed retrieval: memory should decay faster
+    let fail_events = vec![RetrievalEvent {
+        retrieved_at: now - Duration::days(5),
+        session_outcome: SessionOutcome::Failed,
+    }];
+    let suppressed = apply_tad(1.0, &memory_age, &now, &fail_events, &config);
+    assert!(suppressed < baseline, "suppressed={} < baseline={}", suppressed, baseline);
+
+    // Order: reinforced > baseline > suppressed
+    assert!(
+        reinforced > baseline && baseline > suppressed,
+        "Expected reinforced({}) > baseline({}) > suppressed({})",
+        reinforced, baseline, suppressed
+    );
+}
+
+// ─── TAD: Storage Integration ───
+
+#[test]
+fn test_tad_retrieval_events_storage() {
+    let storage = Storage::open_memory().unwrap();
+
+    // Log a retrieval event
+    storage
+        .log_retrieval_event("mem_123", "chunk", "prompt_submit", "session_abc")
+        .unwrap();
+
+    // Log another for the same session
+    storage
+        .log_retrieval_event("mem_456", "reflection", "prompt_submit", "session_abc")
+        .unwrap();
+
+    // Query events for a memory
+    let events = storage.get_retrieval_events_for_memory("mem_123").unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].1, "neutral"); // default outcome
+
+    // Update session outcome
+    let updated = storage
+        .update_session_outcome("session_abc", "success")
+        .unwrap();
+    assert_eq!(updated, 2); // both events updated
+
+    // Verify outcome was updated
+    let events = storage.get_retrieval_events_for_memory("mem_123").unwrap();
+    assert_eq!(events[0].1, "success");
+
+    let events = storage.get_retrieval_events_for_memory("mem_456").unwrap();
+    assert_eq!(events[0].1, "success");
+}
+
+// ─── Unified Decay Config ───
+
+#[test]
+fn test_decay_config_injection_vs_search() {
+    use csr_engine::search::decay::{apply_decay_unified, DecayConfig};
+    use chrono::{Duration, Utc};
+
+    let now = Utc::now();
+    let age_30_days = now - Duration::days(30);
+
+    let injection_config = DecayConfig::for_injection();
+    let search_config = DecayConfig::for_search();
+
+    let injection_score = apply_decay_unified(1.0, &age_30_days, &now, &injection_config);
+    let search_score = apply_decay_unified(1.0, &age_30_days, &now, &search_config);
+
+    // Injection decays faster (30-day half-life, 50% weight)
+    // Search decays slower (90-day half-life, 30% weight)
+    assert!(
+        injection_score < search_score,
+        "injection({}) should decay faster than search({})",
+        injection_score,
+        search_score
+    );
+}

@@ -104,7 +104,12 @@ async fn handle_inner(
     raw_results.extend(chunk_results);
     raw_results.extend(reflection_results);
 
-    let scored = predictor::rank_results(raw_results, &current_files, &current_errors);
+    let scored = predictor::rank_results(
+        raw_results,
+        &current_files,
+        &current_errors,
+        Some(crate::injection::weights::HookPhase::PromptSubmit),
+    );
 
     // 5. Build InjectionContext
     let mut ctx = InjectionContext {
@@ -144,7 +149,7 @@ async fn handle_inner(
         // Bug 1 fix: route chunks to relevant_context, reflections to winning_strategies
         match result.source.as_str() {
             "reflection" => ctx.winning_strategies.push(item),
-            _ => ctx.relevant_context.push(item),
+            _ => ctx.winning_strategies.push(item),
         }
     }
 
@@ -157,6 +162,24 @@ async fn handle_inner(
         // stdout injection: Claude Code prepends this to the system prompt.
         // Uses print! (not println!) to avoid double-newline — formatter output ends with \n.
         print!("{}", formatted);
+    }
+
+    // TAD: Log retrieval events for adaptive decay tracking
+    if let Some(ref session_id) = input.session_id {
+        for result in scored.iter().take(5) {
+            let memory_id = format!("{:x}", {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                result.content.hash(&mut h);
+                h.finish()
+            });
+            let _ = engine.storage().log_retrieval_event(
+                &memory_id,
+                &result.source,
+                "prompt_submit",
+                session_id,
+            );
+        }
     }
 
     // Structured log to stderr (not visible to Claude, only to debug logs)
@@ -205,12 +228,13 @@ async fn search_chunks_for_prompt(
         if let Ok(chunks) = storage.get_chunks_by_ids(&[result.id.clone()]) {
             if let Some(chunk) = chunks.into_iter().next() {
                 raw_results.push(RawResult {
-                    content: formatter::truncate_content(&chunk.content, 300),
+                    content: formatter::truncate_item(&chunk.content, 300),
                     score: result.score,
                     source: "chunk".to_string(),
                     timestamp: Some(chunk.timestamp),
                     files: extract_file_paths(&chunk.content),
                     error_patterns: vec![],
+                    tags: vec![],
                 });
             }
         }
@@ -253,12 +277,13 @@ async fn search_reflections_for_prompt(
                 "reflection"
             };
             raw_results.push(RawResult {
-                content: formatter::truncate_content(&content, 300),
+                content: formatter::truncate_item(&content, 300),
                 score: result.score,
                 source: source.to_string(),
                 timestamp: Some(timestamp),
                 files: extract_file_paths(&content),
                 error_patterns: extract_error_patterns(&content),
+                tags,
             });
         }
     }

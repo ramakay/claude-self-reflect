@@ -327,4 +327,30 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::mark_file_imported(&conn, path, chunks)
     }
+
+    // ─── TAD: Retrieval Events ───
+
+    pub fn log_retrieval_event(
+        &self,
+        memory_id: &str,
+        memory_type: &str,
+        hook_phase: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::log_retrieval_event(&conn, memory_id, memory_type, hook_phase, session_id)
+    }
+
+    pub fn update_session_outcome(&self, session_id: &str, outcome: &str) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::update_session_outcome(&conn, session_id, outcome)
+    }
+
+    pub fn get_retrieval_events_for_memory(
+        &self,
+        memory_id: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_retrieval_events_for_memory(&conn, memory_id)
+    }
 }
