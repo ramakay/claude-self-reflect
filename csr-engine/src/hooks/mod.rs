@@ -27,15 +27,20 @@ use crate::search::cross_project::resolve_project_from_cwd;
 /// Input received from Claude Code via stdin JSON.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct HookInput {
+    #[serde(alias = "sessionId")]
     pub session_id: Option<String>,
+    #[serde(alias = "transcriptPath")]
     pub transcript_path: Option<String>,
     pub cwd: Option<String>,
     pub reason: Option<String>,
     /// Tool name for PostToolUse hook
+    #[serde(alias = "toolName")]
     pub tool_name: Option<String>,
     /// Tool input for PostToolUse hook (contains file_path, content, etc.)
+    #[serde(alias = "toolInput")]
     pub tool_input: Option<serde_json::Value>,
     /// Whether the Stop hook is re-entering (to prevent infinite loops)
+    #[serde(alias = "stopHookActive")]
     pub stop_hook_active: Option<bool>,
     /// User's prompt text for UserPromptSubmit hook
     pub prompt: Option<String>,
