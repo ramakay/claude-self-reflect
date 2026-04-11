@@ -17,6 +17,7 @@ use anyhow::Result;
 use super::ralph_state::RalphState;
 use super::HookInput;
 use crate::engine::Engine;
+use crate::injection::formatter;
 use crate::injection::stuck_detector;
 use crate::injection::{InjectionContext, InjectionItem};
 use crate::mcp::tools;
@@ -32,7 +33,10 @@ pub async fn handle(
     engine: &Engine,
     cwd: &Path,
 ) -> Result<()> {
-    // Fast path: no Ralph session → exit silently (no engine work needed)
+    // Import growing transcript for ALL sessions (real-time searchability)
+    super::import_current_transcript(input, engine, cwd).await;
+
+    // Ralph iteration memory only applies to Ralph sessions
     if ralph.is_none() {
         return Ok(());
     }
@@ -203,7 +207,7 @@ fn retrieve_past_iterations(ralph: &RalphState, engine: &Engine) -> Vec<Injectio
             }
 
             items.push(InjectionItem {
-                content: truncate_content(&content, 200),
+                content: formatter::truncate_content(&content, 200),
                 score: 1.0,
                 source: format!("iteration_{}", iter_num.unwrap_or(0)),
             });
@@ -217,18 +221,3 @@ fn retrieve_past_iterations(ralph: &RalphState, engine: &Engine) -> Vec<Injectio
     items
 }
 
-/// Truncate content to max chars, preserving first line.
-/// Uses char boundaries to avoid UTF-8 panics (H-4 fix).
-fn truncate_content(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars {
-        return content.to_string();
-    }
-    // Find a safe char boundary (H-4 fix)
-    let safe_end = content.floor_char_boundary(max_chars);
-    let truncated = &content[..safe_end];
-    if let Some(last_newline) = truncated.rfind('\n') {
-        format!("{}...", &content[..last_newline])
-    } else {
-        format!("{}...", truncated)
-    }
-}

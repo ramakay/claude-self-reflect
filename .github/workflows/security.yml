@@ -2,11 +2,10 @@ name: Security Scan
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
   schedule:
-    # Run security scan weekly on Monday at 2 AM UTC
     - cron: '0 2 * * 1'
 
 permissions:
@@ -21,102 +20,35 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      
+
       - name: Run Gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  dependency-scan:
-    name: Scan dependencies
+  cargo-audit:
+    name: Audit Rust dependencies
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      
-      - name: Run pip-audit
-        run: |
-          pip install pip-audit
-          pip-audit --desc || true
-        continue-on-error: true
-      
-      - name: Run npm audit
-        run: npm audit --audit-level=moderate || true
-        continue-on-error: true
 
-  code-quality:
-    name: Code quality checks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-      
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install bandit pylint
-      
-      - name: Run Bandit security linter
-        run: |
-          bandit -r mcp-server/src scripts/*.py -f json -o bandit-report.json || true
-        continue-on-error: true
-      
-      - name: Upload Bandit results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: bandit-results
-          path: bandit-report.json
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
 
-  docker-scan:
-    name: Scan Docker images
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      
-      - name: Check Dockerfiles
-        run: |
-          # Just check that Dockerfiles exist and are valid
-          for dockerfile in Dockerfile.*; do
-            if [ -f "$dockerfile" ]; then
-              echo "Checking $dockerfile..."
-              docker build --no-cache --check -f "$dockerfile" . || true
-            fi
-          done
+      - name: Run audit
+        working-directory: csr-engine
+        run: cargo audit
 
   permissions-check:
     name: Check file permissions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      
+
       - name: Check for sensitive files
         run: |
-          # Check for any .env files that shouldn't be committed
           if git ls-files | grep -E "^\.env$|^\.env\." | grep -v example | grep -v template; then
             echo "ERROR: Found .env files in repository!"
             exit 1
           fi
-          
-          # Check for API keys in code (excluding setup scripts and examples)
-          if grep -r "VOYAGE_KEY=" . --include="*.py" --include="*.js" --include="*.ts" \
-            | grep -v "os.getenv" \
-            | grep -v "process.env" \
-            | grep -v "your-voyage-api-key" \
-            | grep -v "your-api-key" \
-            | grep -v "<your-key>" \
-            | grep -v "installer/" \
-            | grep -v "setup-wizard" \
-            | grep -v "validate-setup"; then
-            echo "ERROR: Found hardcoded API keys!"
-            exit 1
-          fi
-          
-          # Check for binary database files (exclude Python modules)
-          if git ls-files | grep -E "qdrant_storage|data/qdrant" | grep -v "\.py$"; then
-            echo "ERROR: Found database files in repository!"
-            exit 1
-          fi
+          echo "OK: No sensitive files committed"

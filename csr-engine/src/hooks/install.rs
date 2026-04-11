@@ -35,7 +35,7 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
     serde_json::json!({
         "hooks": {
             "SessionStart": [{
-                "matcher": "startup|resume",
+                "matcher": "startup|resume|compact",
                 "hooks": [{"type": "command", "command": format!("{} hook session-start", binary_path)}]
             }],
             "SessionEnd": [{

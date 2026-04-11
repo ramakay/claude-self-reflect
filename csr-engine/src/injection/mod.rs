@@ -14,6 +14,7 @@ pub mod weights;
 pub struct InjectionContext {
     pub anti_patterns: Vec<InjectionItem>,
     pub error_matches: Vec<InjectionItem>,
+    pub relevant_context: Vec<InjectionItem>,
     pub winning_strategies: Vec<InjectionItem>,
     pub iteration_learnings: Vec<InjectionItem>,
     pub stuck_warning: Option<String>,
@@ -38,6 +39,7 @@ impl InjectionContext {
     pub fn is_empty(&self) -> bool {
         self.anti_patterns.is_empty()
             && self.error_matches.is_empty()
+            && self.relevant_context.is_empty()
             && self.winning_strategies.is_empty()
             && self.iteration_learnings.is_empty()
             && self.stuck_warning.is_none()
@@ -46,6 +48,7 @@ impl InjectionContext {
     pub fn total_items(&self) -> usize {
         self.anti_patterns.len()
             + self.error_matches.len()
+            + self.relevant_context.len()
             + self.winning_strategies.len()
             + self.iteration_learnings.len()
     }

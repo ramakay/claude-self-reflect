@@ -1,24 +1,17 @@
 {
   "name": "claude-self-reflect",
-  "version": "7.1.15",
-  "description": "Give Claude perfect memory of all your conversations - Installation wizard for Python MCP server",
+  "version": "8.0.0",
+  "description": "Give Claude perfect memory of all your conversations. Single binary, zero dependencies.",
   "keywords": [
     "claude",
     "mcp",
     "model-context-protocol",
     "semantic-search",
     "conversation-memory",
-    "qdrant",
     "vector-search",
     "ai-memory",
     "claude-code"
   ],
-  "badges": {
-    "npm": "https://badge.fury.io/js/claude-self-reflect.svg",
-    "license": "https://img.shields.io/badge/License-MIT-yellow.svg",
-    "docker": "https://img.shields.io/badge/Docker-Required-blue.svg",
-    "claude": "https://img.shields.io/badge/Claude%20Code-Compatible-green.svg"
-  },
   "homepage": "https://github.com/ramakay/claude-self-reflect#readme",
   "bugs": {
     "url": "https://github.com/ramakay/claude-self-reflect/issues"
@@ -31,38 +24,17 @@
   "author": "Claude-Self-Reflect Contributors",
   "type": "module",
   "bin": {
-    "claude-self-reflect": "installer/cli.js",
-    "csr-status": "scripts/csr-status"
+    "claude-self-reflect": "installer/cli.js"
   },
   "files": [
-    "installer/**/*.js",
-    "scripts/auto-migrate.cjs",
-    "scripts/migrate-to-unified-state.py",
-    "scripts/csr-status",
-    "scripts/ralph/**",
-    "mcp-server/src/**/*.py",
-    "mcp-server/pyproject.toml",
-    "mcp-server/run-mcp.sh",
-    "mcp-server/run-mcp-clean.sh",
-    "mcp-server/run-mcp-docker.sh",
-    "src/**/*.py",
-    "src/**/*.sh",
-    "shared/**/*.py",
-    ".claude/agents/*.md",
-    "!.claude/agents/*test*.md",
-    "config/qdrant-config.yaml",
-    "docker-compose.yaml",
-    "Dockerfile.*",
-    "docs/design/**/*.py",
-    "docs/design/**/*.md",
-    "docs/design/conversation-analyzer/**",
-    "requirements.txt",
-    ".env.example",
+    "installer/cli.js",
+    "installer/postinstall.js",
+    "installer/statusline-setup.js",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "postinstall": "node installer/postinstall.js && node scripts/auto-migrate.cjs || true"
+    "postinstall": "node installer/postinstall.js || true"
   },
   "engines": {
     "node": ">=18.0.0"

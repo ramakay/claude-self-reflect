@@ -40,10 +40,32 @@ pub async fn handle(
         }
     }
 
-    // 3. Spawn detached Haiku story generation (fire-and-forget, outlives this process)
+    // 3. Try local V3 story synthesis BEFORE spawning Haiku (free, instant)
+    //    Falls back to detached Haiku generation if local synthesis fails.
     if let Some(ref tp) = input.transcript_path {
-        let cwd_str = cwd.to_string_lossy().to_string();
-        crate::summarizer::spawn_detached_story_generation(tp, &cwd_str);
+        let conv_id = std::path::Path::new(tp)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let project = resolve_project_from_cwd(&cwd.to_string_lossy())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let has_story = engine
+            .storage()
+            .is_conversation_enriched(&conv_id, "session_story")
+            .unwrap_or(false);
+
+        if !has_story {
+            // Try V3 synthesis first (zero-cost, instant)
+            let synthesized = try_v3_story_synthesis(engine, &conv_id, &project).await;
+
+            if !synthesized {
+                // Fallback: spawn detached Haiku story generation
+                let cwd_str = cwd.to_string_lossy().to_string();
+                crate::summarizer::spawn_detached_story_generation(tp, &cwd_str);
+            }
+        }
     }
 
     // TAD: Update session outcome for all retrieval events in this session.
@@ -172,6 +194,58 @@ pub async fn handle(
     );
 
     Ok(())
+}
+
+/// Try to synthesize a story locally from existing V3 extraction data.
+/// Returns true if a story was successfully synthesized and stored.
+async fn try_v3_story_synthesis(engine: &Engine, conv_id: &str, project: &str) -> bool {
+    // Check if V3 extraction exists for this conversation
+    let ref_id = match engine
+        .storage()
+        .get_enrichment_reflection_id(conv_id, "extracted_v3")
+    {
+        Ok(Some(id)) => id,
+        _ => return false,
+    };
+
+    let v3_content = match engine.storage().get_reflection_by_id(&ref_id) {
+        Ok(Some((content, _, _))) => content,
+        _ => return false,
+    };
+
+    let story = match crate::extraction::story::synthesize_story_from_v3(&v3_content, project) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let story_id = format!("story_{}", conv_id);
+    let tags = vec![
+        "session_story".to_string(),
+        format!("project_{}", project),
+        format!("conv_{}", conv_id),
+    ];
+
+    if let Err(e) = tools::store_reflection(
+        engine.storage(),
+        engine.embeddings(),
+        engine.search(),
+        &story,
+        &tags,
+    )
+    .await
+    {
+        eprintln!("CSR: V3 story store failed (non-fatal): {}", e);
+        return false;
+    }
+
+    let _ = engine
+        .storage()
+        .mark_enrichment_completed(conv_id, "session_story", &story_id);
+    eprintln!(
+        "CSR: V3 story synthesized locally ({}chars), skipping Haiku",
+        story.len()
+    );
+    true
 }
 
 /// Run V3 extraction inline at session-end.

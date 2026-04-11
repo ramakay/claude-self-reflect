@@ -304,6 +304,10 @@ async fn process_v3_extraction(
     Ok(())
 }
 
+/// Minimum JSONL file size (50KB) for AI narrative generation.
+/// Files smaller than this are trivial/subagent sessions not worth the ~$0.012/conversation cost.
+const MIN_FILE_SIZE: u64 = 50_000;
+
 /// Layer 3 narrator loop: accumulates conversations and submits batch API requests.
 async fn narrator_loop(
     storage: Arc<Storage>,
@@ -368,15 +372,42 @@ async fn narrator_loop_inner(
         let mut requests = Vec::new();
 
         for (conv_id, file_path) in &unenriched {
-            let messages = import::parse_jsonl_messages(Path::new(file_path))?;
+            // Skip tiny files (subagent/initialization sessions) — not worth API cost
+            let path = Path::new(file_path);
+            if let Ok(meta) = std::fs::metadata(path) {
+                if meta.len() < MIN_FILE_SIZE {
+                    let _ = storage.mark_enrichment_completed(
+                        conv_id,
+                        "ai_narrative",
+                        "skipped_too_small",
+                    );
+                    tracing::debug!(
+                        conv = %conv_id,
+                        size = meta.len(),
+                        min = MIN_FILE_SIZE,
+                        "skipping tiny conversation for AI narrative"
+                    );
+                    continue;
+                }
+            }
+
+            let messages = import::parse_jsonl_messages(path)?;
             if messages.is_empty() {
                 continue;
             }
 
             // Build a conversation summary for the AI with size cap (D-16)
+            // Sample first 50 + last 50 messages to capture both context and resolution
             let mut summary = String::new();
             let max_prompt_chars: usize = 100_000; // ~25K tokens budget
-            for m in messages.iter().take(100) {
+            let total = messages.len();
+            let head = 50.min(total);
+            let tail_start = if total > 100 { total - 50 } else { head };
+            let sampled: Vec<_> = messages[..head]
+                .iter()
+                .chain(messages[tail_start..].iter())
+                .collect();
+            for m in &sampled {
                 let line = serde_json::to_string(m).unwrap_or_default();
                 if summary.len() + line.len() > max_prompt_chars {
                     break;
@@ -613,5 +644,37 @@ mod tests {
         assert_eq!(config.batch_size_trigger, 10);
         assert_eq!(config.batch_time_trigger_secs, 1800);
         assert_eq!(config.batch_poll_interval_secs, 60);
+    }
+
+    #[test]
+    fn test_conversation_sampling_short() {
+        // For <= 100 messages, all should be included (no gap)
+        let messages: Vec<i32> = (0..80).collect();
+        let total = messages.len();
+        let head = 50.min(total);
+        let tail_start = if total > 100 { total - 50 } else { head };
+        let sampled: Vec<_> = messages[..head]
+            .iter()
+            .chain(messages[tail_start..].iter())
+            .collect();
+        assert_eq!(sampled.len(), 80); // all messages included
+    }
+
+    #[test]
+    fn test_conversation_sampling_long() {
+        // For > 100 messages, should get first 50 + last 50
+        let messages: Vec<i32> = (0..200).collect();
+        let total = messages.len();
+        let head = 50.min(total);
+        let tail_start = if total > 100 { total - 50 } else { head };
+        let sampled: Vec<_> = messages[..head]
+            .iter()
+            .chain(messages[tail_start..].iter())
+            .collect();
+        assert_eq!(sampled.len(), 100);
+        assert_eq!(*sampled[0], 0);
+        assert_eq!(*sampled[49], 49);
+        assert_eq!(*sampled[50], 150); // first of the tail
+        assert_eq!(*sampled[99], 199);
     }
 }

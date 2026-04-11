@@ -1,8 +1,15 @@
-//! PreCompact hook — backs up Ralph state before context compaction.
+//! PreCompact hook — imports transcript + generates session story before compaction.
 //!
-//! Context compaction erases in-context state; this preserves it to CSR
-//! so the session can be recovered or referenced in future sessions.
+//! For ALL sessions:
+//! 1. Imports current transcript (so it's searchable post-compact)
+//! 2. Generates Haiku-curated session story (stored for SessionStart re-injection)
+//!
+//! For Ralph sessions, additionally:
+//! 3. Backs up Ralph state to CSR for cross-session recovery
+//!
 //! Always exits 0 (never blocks compaction).
+
+use std::path::Path;
 
 use anyhow::Result;
 
@@ -17,7 +24,17 @@ pub async fn handle(
     input: &HookInput,
     ralph: Option<&RalphState>,
     engine: &Engine,
+    cwd: &Path,
 ) -> Result<()> {
+    // Import transcript for ALL sessions before compaction destroys context
+    super::import_current_transcript(input, engine, cwd).await;
+
+    // Spawn detached Haiku story generation before compaction (fire-and-forget)
+    if let Some(ref tp) = input.transcript_path {
+        let cwd_str = cwd.to_string_lossy().to_string();
+        crate::summarizer::spawn_detached_story_generation(tp, &cwd_str);
+    }
+
     if let Err(e) = handle_inner(input, ralph, engine).await {
         eprintln!("CSR: precompact error (non-fatal): {}", e);
     }

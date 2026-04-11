@@ -23,11 +23,19 @@ pub trait BatchClient: Send + Sync {
     async fn get_batch_results(&self, batch_id: &str) -> Result<Vec<BatchResultItem>>;
 }
 
+/// Default model for AI narrative generation.
+const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
+
+/// Default Anthropic API version.
+const DEFAULT_API_VERSION: &str = "2023-06-01";
+
 /// Real Anthropic API client using reqwest.
 pub struct AnthropicClient {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    model: String,
+    api_version: String,
 }
 
 impl AnthropicClient {
@@ -38,10 +46,16 @@ impl AnthropicClient {
         if api_key.is_empty() {
             return None;
         }
+        let model = std::env::var("CSR_NARRATIVE_MODEL")
+            .unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        let api_version = std::env::var("CSR_ANTHROPIC_VERSION")
+            .unwrap_or_else(|_| DEFAULT_API_VERSION.to_string());
         Some(Self {
             client: reqwest::Client::new(),
             api_key,
             base_url: "https://api.anthropic.com".to_string(),
+            model,
+            api_version,
         })
     }
 
@@ -56,12 +70,13 @@ impl AnthropicClient {
 #[async_trait]
 impl BatchClient for AnthropicClient {
     async fn create_batch(&self, requests: Vec<BatchRequest>) -> Result<String> {
+        let model = &self.model;
         let body = serde_json::json!({
             "requests": requests.iter().map(|r| {
                 serde_json::json!({
                     "custom_id": r.custom_id,
                     "params": {
-                        "model": "claude-haiku-4-5-20251001",
+                        "model": model,
                         "max_tokens": 4096,
                         "messages": [
                             {"role": "user", "content": r.prompt.clone()}
@@ -75,7 +90,7 @@ impl BatchClient for AnthropicClient {
             .client
             .post(format!("{}/v1/messages/batches", self.base_url))
             .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-version", &self.api_version)
             .header("content-type", "application/json")
             .json(&body)
             .send()
@@ -108,7 +123,7 @@ impl BatchClient for AnthropicClient {
                 self.base_url, batch_id
             ))
             .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-version", &self.api_version)
             .send()
             .await?;
 
@@ -143,7 +158,7 @@ impl BatchClient for AnthropicClient {
                 self.base_url, batch_id
             ))
             .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-version", &self.api_version)
             .send()
             .await?;
 

@@ -1195,3 +1195,51 @@ fn test_decay_config_injection_vs_search() {
         search_score
     );
 }
+
+// ─── Test: get_imported_chunk_count ───
+
+#[test]
+fn test_get_imported_chunk_count() {
+    let storage = Storage::open_memory().unwrap();
+    let path = std::path::Path::new("/tmp/test-incr.jsonl");
+
+    // Never imported = 0
+    assert_eq!(storage.get_imported_chunk_count(path).unwrap(), 0);
+
+    // After marking with 5 chunks
+    storage.mark_file_imported(path, 5).unwrap();
+    assert_eq!(storage.get_imported_chunk_count(path).unwrap(), 5);
+
+    // Update to 10 chunks (transcript grew)
+    storage.mark_file_imported(path, 10).unwrap();
+    assert_eq!(storage.get_imported_chunk_count(path).unwrap(), 10);
+}
+
+// ─── Test: get_chunk_content ───
+
+#[test]
+fn test_get_chunk_content() {
+    let storage = Storage::open_memory().unwrap();
+    let fake_emb: Vec<f32> = vec![0.0; 384];
+
+    // Missing chunk
+    assert!(storage.get_chunk_content("nonexistent").unwrap().is_none());
+
+    // Insert and retrieve
+    let chunk = ConversationChunk {
+        id: "content-test-1".into(),
+        conversation_id: "conv-ct".into(),
+        project_name: "test".into(),
+        timestamp: "2026-02-22T10:00:00Z".into(),
+        content: "This is the chunk content for testing retrieval".into(),
+        message_count: 5,
+        summary: Some("Test summary".into()),
+    };
+    storage.insert_chunk(&chunk, &fake_emb).unwrap();
+
+    let content = storage.get_chunk_content("content-test-1").unwrap();
+    assert_eq!(
+        content.as_deref(),
+        Some("This is the chunk content for testing retrieval")
+    );
+}
