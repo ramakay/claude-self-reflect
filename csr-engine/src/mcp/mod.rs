@@ -145,7 +145,7 @@ pub struct GetFullConversationParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetSessionLearningsParams {
-    /// Ralph session ID to get learnings from
+    /// Session ID to get learnings from
     pub session_id: String,
     /// Maximum number of learnings to return (default: 50)
     pub limit: Option<usize>,
@@ -480,7 +480,7 @@ impl CsrServer {
 
     #[tool(
         name = "get_session_learnings",
-        description = "Get all learnings from a specific Ralph session. Enables iteration-level memory across context resets."
+        description = "Get all learnings from a specific session. Enables iteration-level memory across context resets."
     )]
     async fn get_session_learnings(
         &self,

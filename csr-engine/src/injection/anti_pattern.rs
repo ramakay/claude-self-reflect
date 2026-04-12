@@ -4,7 +4,7 @@
 //! for patterns relevant to the current prompt/task. "Don't retry this approach"
 //! is the highest-value injection — prevents wasted iterations.
 //!
-//! Used by both SessionStart (Ralph sessions) and UserPromptSubmit (all sessions).
+//! Used by SessionStart and UserPromptSubmit hooks.
 
 use std::sync::Arc;
 

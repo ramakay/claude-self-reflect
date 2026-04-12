@@ -95,7 +95,7 @@ pub fn compute_phase_boost(source: &str, tags: &[String], phase: HookPhase) -> f
             0.2
         }
         HookPhase::PreCompact => {
-            if tags.iter().any(|t| t == "ralph_session") {
+            if tags.iter().any(|t| t == "session_story") {
                 return 1.0;
             }
             if source == "reflection" {

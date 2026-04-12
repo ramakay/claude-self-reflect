@@ -394,7 +394,7 @@ pub fn get_full_conversation(
     format::format_full_conversation(conversation_id, None, None)
 }
 
-/// Get learnings for a specific Ralph session.
+/// Get learnings for a specific session.
 pub fn get_session_learnings(
     storage: &Arc<Storage>,
     session_id: &str,

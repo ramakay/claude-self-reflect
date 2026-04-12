@@ -19,7 +19,6 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use super::ralph_state::RalphState;
 use super::HookInput;
 use crate::engine::Engine;
 use crate::injection::anti_pattern;
@@ -37,11 +36,10 @@ const MIN_PROMPT_LENGTH: usize = 15;
 /// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code.
 pub async fn handle(
     input: &HookInput,
-    ralph: Option<&RalphState>,
     engine: &Engine,
     cwd: &Path,
 ) -> Result<()> {
-    if let Err(e) = handle_inner(input, ralph, engine, cwd).await {
+    if let Err(e) = handle_inner(input, engine, cwd).await {
         eprintln!("CSR: prompt-submit hook error (non-fatal): {}", e);
     }
 
@@ -56,7 +54,6 @@ pub async fn handle(
 
 async fn handle_inner(
     input: &HookInput,
-    ralph: Option<&RalphState>,
     engine: &Engine,
     _cwd: &Path,
 ) -> Result<()> {
@@ -93,12 +90,8 @@ async fn handle_inner(
     let reflection_results = search_reflections_for_prompt(engine, prompt, 3, 0.5).await;
 
     // 4. Combine and score results
-    let current_files: Vec<String> = ralph
-        .map(|r| r.files_modified.clone())
-        .unwrap_or_default();
-    let current_errors: Vec<String> = ralph
-        .map(|r| r.error_signatures.iter().map(|(sig, _)| sig.clone()).collect())
-        .unwrap_or_default();
+    let current_files: Vec<String> = Vec::new();
+    let current_errors: Vec<String> = Vec::new();
 
     let mut raw_results: Vec<RawResult> = Vec::new();
     raw_results.extend(chunk_results);

@@ -6,7 +6,6 @@
 pub mod anti_pattern;
 pub mod formatter;
 pub mod predictor;
-pub mod stuck_detector;
 pub mod weights;
 
 /// Context assembled for injection into Claude's context.

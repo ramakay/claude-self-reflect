@@ -10,7 +10,6 @@ pub mod install;
 pub mod post_tool_use;
 pub mod precompact;
 pub mod prompt_submit;
-pub mod ralph_state;
 pub mod session_end;
 pub mod session_start;
 pub mod stop;
@@ -66,7 +65,7 @@ pub fn read_stdin_json() -> HookInput {
 }
 
 /// Shared helper: import the current transcript incrementally.
-/// Used by stop, precompact, and session_end hooks to keep the active session searchable.
+/// Used by stop, precompact, prompt_submit, and session_end hooks.
 pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: &Path) {
     let Some(ref transcript) = input.transcript_path else {
         return;
@@ -86,7 +85,7 @@ pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: 
     }
 }
 
-/// Main hook dispatcher. Parses stdin, detects Ralph state, routes to handler.
+/// Main hook dispatcher. Parses stdin, routes to handler.
 pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     let t0 = std::time::Instant::now();
     let input = read_stdin_json();
@@ -114,16 +113,15 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
         std::env::current_dir()?
     };
 
-    let ralph = ralph_state::RalphState::detect_in(&cwd)?;
     let t_setup = t0.elapsed();
 
     let result = match hook_name {
-        "session-start" => session_start::handle(&input, ralph.as_ref(), engine, &cwd).await,
-        "session-end" => session_end::handle(&input, ralph.as_ref(), engine, &cwd).await,
-        "precompact" => precompact::handle(&input, ralph.as_ref(), engine, &cwd).await,
-        "stop" => stop::handle(&input, ralph.as_ref(), engine, &cwd).await,
-        "post-tool-use" => post_tool_use::handle(&input, ralph.as_ref(), engine, &cwd).await,
-        "prompt-submit" => prompt_submit::handle(&input, ralph.as_ref(), engine, &cwd).await,
+        "session-start" => session_start::handle(&input, engine, &cwd).await,
+        "session-end" => session_end::handle(&input, engine, &cwd).await,
+        "precompact" => precompact::handle(&input, engine, &cwd).await,
+        "stop" => stop::handle(&input, engine, &cwd).await,
+        "post-tool-use" => post_tool_use::handle(&input, engine, &cwd).await,
+        "prompt-submit" => prompt_submit::handle(&input, engine, &cwd).await,
         _ => {
             eprintln!("unknown hook: {}", hook_name);
             Ok(())
@@ -131,7 +129,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     };
     let t_hook = t0.elapsed();
 
-    // Flush HNSW index if any hook modified it (session_end, precompact, stop, post_tool_use)
+    // Flush HNSW index if any hook modified it
     engine.flush_index().await;
     let t_total = t0.elapsed();
 
@@ -165,4 +163,3 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
 
     result
 }
-
