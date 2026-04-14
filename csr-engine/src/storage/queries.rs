@@ -281,13 +281,22 @@ pub fn fts5_search(
     limit: usize,
     project: Option<&str>,
 ) -> Result<Vec<ConversationChunk>> {
-    // Sanitize for FTS5: remove control chars, escape double quotes, wrap as phrase
-    let sanitized: String = query
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .replace('"', "\"\"");
-    let fts_query = format!("\"{}\"", sanitized);
+    // Sanitize for FTS5: split into OR-joined quoted words
+    // "Apify runaway cost" → '"apify" OR "runaway" OR "cost"' (matches any word)
+    // Quoting prevents hyphens/special chars from being parsed as FTS5 operators
+    let words: Vec<String> = query
+        .split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                .collect::<String>()
+        })
+        .filter(|w| w.len() >= 2)
+        .collect();
+    if words.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fts_query = words.iter().map(|w| format!("\"{}\"", w)).collect::<Vec<_>>().join(" OR ");
 
     let chunks = if let Some(p) = project.filter(|p| *p != "all") {
         let mut stmt = conn.prepare(

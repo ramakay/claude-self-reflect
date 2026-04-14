@@ -31,23 +31,27 @@ pub async fn reflect_on_past(
     let embed_ms = embed_start.elapsed().as_millis() as u64;
 
     let search_start = Instant::now();
-    let results = if let Some(ref p) = effective_project {
-        let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+
+    // Search BOTH chunks and reflections, merge by score
+    let (chunk_results, reflection_results) = {
         let idx = search.read().await;
-        idx.search_chunks_filtered(&query_vec, limit, min_score, &ids)
-    } else {
-        let idx = search.read().await;
-        idx.search_chunks(&query_vec, limit, min_score)
+        let chunks = if let Some(ref p) = effective_project {
+            let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+            idx.search_chunks_filtered(&query_vec, limit, min_score, &ids)
+        } else {
+            idx.search_chunks(&query_vec, limit, min_score)
+        };
+        let reflections = idx.search_reflections(&query_vec, limit, min_score);
+        (chunks, reflections)
     };
     let search_ms = search_start.elapsed().as_millis() as u64;
 
-    // Enrich results with chunk metadata
-    let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
-    let chunks = storage.get_chunks_by_ids(&ids)?;
+    // Enrich chunk results with metadata
+    let chunk_ids: Vec<String> = chunk_results.iter().map(|r| r.id.clone()).collect();
+    let chunks = storage.get_chunks_by_ids(&chunk_ids)?;
 
-    // Apply time-based decay to search scores (matching Python server behavior)
     let now = chrono::Utc::now();
-    let enriched: Vec<EnrichedResult> = results
+    let mut enriched: Vec<EnrichedResult> = chunk_results
         .iter()
         .filter_map(|r| {
             chunks
@@ -67,6 +71,81 @@ pub async fn reflect_on_past(
                 })
         })
         .collect();
+
+    // Enrich reflection results — convert to EnrichedResult using reflection content
+    for r in &reflection_results {
+        if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&r.id) {
+            let decayed_score =
+                if let Some(ts) = crate::temporal::parse_timestamp(&timestamp) {
+                    decay::apply_decay(r.score, &ts, &now, None, None)
+                } else {
+                    r.score
+                };
+            // Determine project from tags
+            let project_name = tags.iter()
+                .find(|t| t.starts_with("project_"))
+                .map(|t| t.trim_start_matches("project_").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            // Filter by project if scoped
+            if let Some(ref p) = effective_project {
+                if project_name != *p {
+                    continue;
+                }
+            }
+            let tag_prefix = if tags.iter().any(|t| t == "session_story") {
+                "[story] "
+            } else if tags.iter().any(|t| t.starts_with("narrative_v3")) {
+                "[narrative] "
+            } else {
+                "[reflection] "
+            };
+            enriched.push(EnrichedResult {
+                score: decayed_score,
+                chunk: crate::import::ConversationChunk {
+                    id: r.id.clone(),
+                    conversation_id: r.id.clone(),
+                    project_name,
+                    timestamp,
+                    content: format!("{}{}", tag_prefix, content),
+                    message_count: 0,
+                    summary: None,
+                },
+            });
+        }
+    }
+
+    // FTS5 hybrid fallback: if semantic results are weak (top score < 0.5)
+    // or empty, supplement with keyword search results
+    let semantic_top_score = enriched.iter().map(|e| e.score).fold(0.0f32, f32::max);
+    if semantic_top_score < 0.5 {
+        let fts_project = effective_project.as_deref();
+        if let Ok(fts_chunks) = storage.fts5_search(query, limit, fts_project) {
+            let existing_ids: HashSet<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
+            for chunk in fts_chunks {
+                if existing_ids.contains(&chunk.id) {
+                    continue; // already in semantic results
+                }
+                // FTS5 results get a synthetic score slightly below semantic threshold
+                // so they rank after good semantic matches but above nothing
+                let fts_score = if let Ok(ts) = chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
+                    decay::apply_decay(0.45, &ts, &now, None, None) // base 0.45 + decay
+                } else {
+                    0.40
+                };
+                enriched.push(EnrichedResult {
+                    score: fts_score,
+                    chunk: crate::import::ConversationChunk {
+                        content: format!("[keyword] {}", chunk.content),
+                        ..chunk
+                    },
+                });
+            }
+        }
+    }
+
+    // Sort merged results by score and take top N
+    enriched.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    enriched.truncate(limit);
 
     Ok(format::format_search_results(
         &enriched,
