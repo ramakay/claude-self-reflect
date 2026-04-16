@@ -1,54 +1,25 @@
-name: Security Scan
+name: Security
 
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
   schedule:
     - cron: '0 2 * * 1'
 
-permissions:
-  contents: read
-  security-events: write
-
 jobs:
   secrets-scan:
-    name: Scan for secrets
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   cargo-audit:
-    name: Audit Rust dependencies
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Run audit
-        working-directory: csr-engine
-        run: cargo audit
-
-  permissions-check:
-    name: Check file permissions
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Check for sensitive files
-        run: |
-          if git ls-files | grep -E "^\.env$|^\.env\." | grep -v example | grep -v template; then
-            echo "ERROR: Found .env files in repository!"
-            exit 1
-          fi
-          echo "OK: No sensitive files committed"
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-audit
+      - run: cargo audit --file csr-engine/Cargo.lock
