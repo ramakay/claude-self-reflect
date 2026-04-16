@@ -318,13 +318,8 @@ impl CsrServer {
         let limit = p.limit.unwrap_or(10);
         let group_by = p.group_by.as_deref().unwrap_or("conversation");
 
-        let result = tools::get_recent_work(
-            &self.storage,
-            limit,
-            p.project.as_deref(),
-            group_by,
-        )
-        .await;
+        let result =
+            tools::get_recent_work(&self.storage, limit, p.project.as_deref(), group_by).await;
 
         tool_result(result)
     }
@@ -370,13 +365,8 @@ impl CsrServer {
         let time_range = p.time_range.as_deref().unwrap_or("last week");
         let granularity = p.granularity.as_deref().unwrap_or("day");
 
-        let result = tools::get_timeline(
-            &self.storage,
-            time_range,
-            p.project.as_deref(),
-            granularity,
-        )
-        .await;
+        let result =
+            tools::get_timeline(&self.storage, time_range, p.project.as_deref(), granularity).await;
 
         tool_result(result)
     }
@@ -394,13 +384,8 @@ impl CsrServer {
         let p = params.0;
         let limit = p.limit.unwrap_or(10);
 
-        let result = tools::search_by_file(
-            &self.storage,
-            &p.file_path,
-            limit,
-            p.project.as_deref(),
-        )
-        .await;
+        let result =
+            tools::search_by_file(&self.storage, &p.file_path, limit, p.project.as_deref()).await;
 
         tool_result(result)
     }
@@ -498,10 +483,7 @@ impl CsrServer {
 fn tool_result(result: anyhow::Result<String>) -> Result<CallToolResult, rmcp::ErrorData> {
     match result {
         Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
-        Err(e) => Err(rmcp::ErrorData::internal_error(
-            format!("{e}"),
-            None,
-        )),
+        Err(e) => Err(rmcp::ErrorData::internal_error(format!("{e}"), None)),
     }
 }
 
@@ -525,48 +507,45 @@ impl ServerHandler for CsrServer {
         }
     }
 
-    fn list_resources(
+    async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_ {
-        async {
-            let mut health = RawResource::new("status://system-health", "System Health");
-            health.description = Some("Current system health: index stats, cache status, version".into());
-            health.mime_type = Some("application/json".into());
+    ) -> Result<ListResourcesResult, rmcp::ErrorData> {
+        let mut health = RawResource::new("status://system-health", "System Health");
+        health.description =
+            Some("Current system health: index stats, cache status, version".into());
+        health.mime_type = Some("application/json".into());
 
-            Ok(ListResourcesResult {
-                resources: vec![health.no_annotation()],
-                next_cursor: None,
-                meta: None,
-            })
-        }
+        Ok(ListResourcesResult {
+            resources: vec![health.no_annotation()],
+            next_cursor: None,
+            meta: None,
+        })
     }
 
-    fn read_resource(
+    async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_ {
-        async move {
-            match request.uri.as_str() {
-                "status://system-health" => {
-                    let text = resources::system_health(
-                        &self.storage,
-                        &self.search,
-                        &self.db_path,
-                        &self.index_dir.to_string_lossy(),
-                    )
-                    .await;
-                    Ok(ReadResourceResult {
-                        contents: vec![ResourceContents::text(text, &request.uri)],
-                    })
-                }
-                _ => Err(rmcp::ErrorData::resource_not_found(
-                    format!("Unknown resource: {}", request.uri),
-                    None,
-                )),
+    ) -> Result<ReadResourceResult, rmcp::ErrorData> {
+        match request.uri.as_str() {
+            "status://system-health" => {
+                let text = resources::system_health(
+                    &self.storage,
+                    &self.search,
+                    &self.db_path,
+                    &self.index_dir.to_string_lossy(),
+                )
+                .await;
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContents::text(text, &request.uri)],
+                })
             }
+            _ => Err(rmcp::ErrorData::resource_not_found(
+                format!("Unknown resource: {}", request.uri),
+                None,
+            )),
         }
     }
 }

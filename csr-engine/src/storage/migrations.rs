@@ -103,9 +103,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     }
 
     // Migration: add summary column to chunks table if missing (for timeline display)
-    let has_summary_col: bool = conn
-        .prepare("SELECT summary FROM chunks LIMIT 0")
-        .is_ok();
+    let has_summary_col: bool = conn.prepare("SELECT summary FROM chunks LIMIT 0").is_ok();
     if !has_summary_col {
         let _ = conn.execute_batch("ALTER TABLE chunks ADD COLUMN summary TEXT;");
     }

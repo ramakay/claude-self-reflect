@@ -57,9 +57,7 @@ pub fn read_stdin_json() -> HookInput {
 
     let mut buf = String::new();
     match std::io::stdin().read_to_string(&mut buf) {
-        Ok(_) if !buf.trim().is_empty() => {
-            serde_json::from_str(&buf).unwrap_or_default()
-        }
+        Ok(_) if !buf.trim().is_empty() => serde_json::from_str(&buf).unwrap_or_default(),
         _ => HookInput::default(),
     }
 }
@@ -99,10 +97,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
             let canonical = p.canonicalize()?;
             if let Some(home) = dirs::home_dir() {
                 if !canonical.starts_with(&home) {
-                    anyhow::bail!(
-                        "cwd {} is outside home directory",
-                        canonical.display()
-                    );
+                    anyhow::bail!("cwd {} is outside home directory", canonical.display());
                 }
             }
             canonical

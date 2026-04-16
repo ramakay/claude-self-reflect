@@ -70,10 +70,7 @@ impl Storage {
         queries::load_all_reflection_vectors(&conn)
     }
 
-    pub fn get_reflection_by_id(
-        &self,
-        id: &str,
-    ) -> Result<Option<(String, Vec<String>, String)>> {
+    pub fn get_reflection_by_id(&self, id: &str) -> Result<Option<(String, Vec<String>, String)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_reflection_by_id(&conn, id)
     }
@@ -152,7 +149,7 @@ impl Storage {
         &self,
         tag: &str,
         limit: usize,
-    ) -> Result<Vec<(String, String, Vec<String>, String)>> {
+    ) -> Result<Vec<queries::ReflectionRow>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_reflections_by_tag(&conn, tag, limit)
     }
@@ -207,10 +204,7 @@ impl Storage {
         queries::set_batch_id(&conn, conversation_id, batch_id, prompt_hash)
     }
 
-    pub fn get_conversations_by_batch(
-        &self,
-        batch_id: &str,
-    ) -> Result<Vec<String>> {
+    pub fn get_conversations_by_batch(&self, batch_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_conversations_by_batch(&conn, batch_id)
     }

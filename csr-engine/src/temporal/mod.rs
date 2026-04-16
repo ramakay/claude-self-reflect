@@ -86,8 +86,7 @@ fn parse_dynamic_expression(
 ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     // "past N days/weeks/months" / "last N days/weeks/months"
     for prefix in &["past ", "last "] {
-        if expr.starts_with(prefix) {
-            let rest = &expr[prefix.len()..];
+        if let Some(rest) = expr.strip_prefix(prefix) {
             if let Some(n_str) = rest.strip_suffix(" days") {
                 if let Ok(n) = n_str.trim().parse::<i64>() {
                     return Ok((now - Duration::days(n), now));
@@ -104,7 +103,7 @@ fn parse_dynamic_expression(
             {
                 if let Ok(n) = n_str.trim().parse::<u32>() {
                     let n = n.min(1200); // Cap at 100 years to prevent DoS
-                    let total_months = now.year() as i32 * 12 + now.month() as i32 - 1 - n as i32;
+                    let total_months = now.year() * 12 + now.month() as i32 - 1 - n as i32;
                     let year = total_months.div_euclid(12);
                     let month = (total_months.rem_euclid(12) + 1) as u32;
                     let start = NaiveDate::from_ymd_opt(year, month, 1)
@@ -134,7 +133,10 @@ fn parse_dynamic_expression(
 
     // ISO date (YYYY-MM-DD)
     if let Ok(date) = NaiveDate::parse_from_str(expr, "%Y-%m-%d") {
-        let start = date.and_hms_opt(0, 0, 0).expect("midnight is always valid").and_utc();
+        let start = date
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid")
+            .and_utc();
         let end = start + Duration::days(1);
         return Ok((start, end));
     }

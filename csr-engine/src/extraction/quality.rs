@@ -50,7 +50,10 @@ pub struct QualityReport {
 impl QualityReport {
     pub fn format_text(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("Quality Report: {} ({})\n", self.path, self.language));
+        out.push_str(&format!(
+            "Quality Report: {} ({})\n",
+            self.path, self.language
+        ));
         out.push_str(&format!("Score: {:.0}/100\n", self.score));
         out.push_str(&format!("Findings: {}\n\n", self.findings.len()));
 
@@ -72,10 +75,8 @@ impl QualityReport {
 /// Analyze a file and return a quality report.
 pub fn analyze_file(path: &Path) -> anyhow::Result<QualityReport> {
     let source = std::fs::read_to_string(path)?;
-    let lang = super::ast_analysis::lang_from_path_str(
-        &path.to_string_lossy(),
-    )
-    .ok_or_else(|| anyhow::anyhow!("Unsupported language for: {}", path.display()))?;
+    let lang = super::ast_analysis::lang_from_path_str(&path.to_string_lossy())
+        .ok_or_else(|| anyhow::anyhow!("Unsupported language for: {}", path.display()))?;
 
     Ok(analyze_source(&source, lang, &path.to_string_lossy()))
 }
@@ -139,51 +140,104 @@ fn analyze_source_inner(source: &str, lang: SupportLang, path: &str) -> QualityR
             }
 
             // R3: panic!/todo!/unimplemented! in non-test code
-            check_keyword_pattern(source, "panic!", "rust-panic", Severity::Warning,
-                "panic!() in production code", "Use anyhow::bail! or return Err()", &mut findings);
-            check_keyword_pattern(source, "todo!()", "rust-todo", Severity::Warning,
-                "todo!() marker — incomplete implementation", "Implement or remove before release", &mut findings);
-            check_keyword_pattern(source, "unimplemented!()", "rust-unimplemented", Severity::Warning,
-                "unimplemented!() — missing implementation", "Implement the function body", &mut findings);
+            check_keyword_pattern(
+                source,
+                "panic!",
+                "rust-panic",
+                Severity::Warning,
+                "panic!() in production code",
+                "Use anyhow::bail! or return Err()",
+                &mut findings,
+            );
+            check_keyword_pattern(
+                source,
+                "todo!()",
+                "rust-todo",
+                Severity::Warning,
+                "todo!() marker — incomplete implementation",
+                "Implement or remove before release",
+                &mut findings,
+            );
+            check_keyword_pattern(
+                source,
+                "unimplemented!()",
+                "rust-unimplemented",
+                Severity::Warning,
+                "unimplemented!() — missing implementation",
+                "Implement the function body",
+                &mut findings,
+            );
 
             // R4: .clone() in function signatures (potentially unnecessary)
-            check_keyword_pattern(source, ".clone()", "rust-clone", Severity::Info,
-                ".clone() usage — check if a reference would suffice", "Consider using a reference instead", &mut findings);
+            check_keyword_pattern(
+                source,
+                ".clone()",
+                "rust-clone",
+                Severity::Info,
+                ".clone() usage — check if a reference would suffice",
+                "Consider using a reference instead",
+                &mut findings,
+            );
         }
 
         SupportLang::Python => {
             // P1: Bare except
-            check_keyword_pattern(source, "except:", "py-bare-except", Severity::Warning,
-                "Bare except: catches all exceptions including SystemExit", "Specify exception type: except Exception:", &mut findings);
+            check_keyword_pattern(
+                source,
+                "except:",
+                "py-bare-except",
+                Severity::Warning,
+                "Bare except: catches all exceptions including SystemExit",
+                "Specify exception type: except Exception:",
+                &mut findings,
+            );
 
             // P2: print() in non-test files
             if !path.contains("test") {
-                check_keyword_pattern(source, "print(", "py-print", Severity::Info,
-                    "print() in production code", "Use logging module instead", &mut findings);
+                check_keyword_pattern(
+                    source,
+                    "print(",
+                    "py-print",
+                    Severity::Info,
+                    "print() in production code",
+                    "Use logging module instead",
+                    &mut findings,
+                );
             }
 
             // P3: mutable default argument
             for line in source.lines() {
                 let trimmed = line.trim();
-                if trimmed.starts_with("def ") && (trimmed.contains("=[]") || trimmed.contains("= []")
-                    || trimmed.contains("={}") || trimmed.contains("= {}"))
+                if trimmed.starts_with("def ")
+                    && (trimmed.contains("=[]")
+                        || trimmed.contains("= []")
+                        || trimmed.contains("={}")
+                        || trimmed.contains("= {}"))
                 {
-                    let line_num = source[..source.find(line).unwrap_or(0)]
-                        .lines().count() + 1;
+                    let line_num = source[..source.find(line).unwrap_or(0)].lines().count() + 1;
                     findings.push(QualityFinding {
                         rule: "py-mutable-default".to_string(),
                         severity: Severity::Error,
                         message: "Mutable default argument — shared across calls".to_string(),
                         line: line_num,
                         snippet: truncate_text(trimmed, 80),
-                        suggestion: Some("Use None as default and create inside function".to_string()),
+                        suggestion: Some(
+                            "Use None as default and create inside function".to_string(),
+                        ),
                     });
                 }
             }
 
             // P4: Star import
-            check_keyword_pattern(source, "from ", "py-star-import", Severity::Warning,
-                "Star import — pollutes namespace", "Import specific names", &mut findings);
+            check_keyword_pattern(
+                source,
+                "from ",
+                "py-star-import",
+                Severity::Warning,
+                "Star import — pollutes namespace",
+                "Import specific names",
+                &mut findings,
+            );
             // Refine: only flag lines with "import *"
             findings.retain(|f| f.rule != "py-star-import" || f.snippet.contains("import *"));
         }
@@ -191,13 +245,27 @@ fn analyze_source_inner(source: &str, lang: SupportLang, path: &str) -> QualityR
         SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => {
             // T1: console.log in non-test code
             if !path.contains("test") && !path.contains("spec") {
-                check_keyword_pattern(source, "console.log(", "ts-console-log", Severity::Info,
-                    "console.log() in production code", "Use a proper logger", &mut findings);
+                check_keyword_pattern(
+                    source,
+                    "console.log(",
+                    "ts-console-log",
+                    Severity::Info,
+                    "console.log() in production code",
+                    "Use a proper logger",
+                    &mut findings,
+                );
             }
 
             // T2: any type usage
-            check_keyword_pattern(source, ": any", "ts-any-type", Severity::Warning,
-                "'any' type defeats TypeScript's type safety", "Use a specific type or unknown", &mut findings);
+            check_keyword_pattern(
+                source,
+                ": any",
+                "ts-any-type",
+                Severity::Warning,
+                "'any' type defeats TypeScript's type safety",
+                "Use a specific type or unknown",
+                &mut findings,
+            );
 
             // T3: Empty catch block
             let catch_matcher = KindMatcher::new("catch_clause", lang);
@@ -219,13 +287,27 @@ fn analyze_source_inner(source: &str, lang: SupportLang, path: &str) -> QualityR
 
         SupportLang::Go => {
             // G1: Ignoring error return
-            check_keyword_pattern(source, "_ = ", "go-ignored-error", Severity::Warning,
-                "Ignored return value (possibly error)", "Handle the error explicitly", &mut findings);
+            check_keyword_pattern(
+                source,
+                "_ = ",
+                "go-ignored-error",
+                Severity::Warning,
+                "Ignored return value (possibly error)",
+                "Handle the error explicitly",
+                &mut findings,
+            );
 
             // G2: fmt.Print in non-test code
             if !path.contains("test") {
-                check_keyword_pattern(source, "fmt.Print", "go-fmt-print", Severity::Info,
-                    "fmt.Print() in production code", "Use a structured logger", &mut findings);
+                check_keyword_pattern(
+                    source,
+                    "fmt.Print",
+                    "go-fmt-print",
+                    Severity::Info,
+                    "fmt.Print() in production code",
+                    "Use a structured logger",
+                    &mut findings,
+                );
             }
         }
 
@@ -241,7 +323,7 @@ fn analyze_source_inner(source: &str, lang: SupportLang, path: &str) -> QualityR
             Severity::Info => 1.0,
         })
         .sum();
-    let score = (100.0 - deductions).max(0.0).min(100.0);
+    let score = (100.0 - deductions).clamp(0.0, 100.0);
 
     QualityReport {
         path: path.to_string(),
@@ -283,7 +365,10 @@ fn truncate_text(text: &str, max: usize) -> String {
     if text.len() <= max {
         text.to_string()
     } else {
-        format!("{}...", &text[..text.floor_char_boundary(max.saturating_sub(3))])
+        format!(
+            "{}...",
+            &text[..text.floor_char_boundary(max.saturating_sub(3))]
+        )
     }
 }
 
@@ -312,10 +397,16 @@ fn main() {
 }
 "#;
         let report = analyze_source(source, SupportLang::Rust, "src/main.rs");
-        let unwrap_findings: Vec<_> = report.findings.iter()
+        let unwrap_findings: Vec<_> = report
+            .findings
+            .iter()
             .filter(|f| f.rule == "rust-unwrap")
             .collect();
-        assert!(!unwrap_findings.is_empty(), "should detect .unwrap(): {:?}", report.findings);
+        assert!(
+            !unwrap_findings.is_empty(),
+            "should detect .unwrap(): {:?}",
+            report.findings
+        );
     }
 
     #[test]
@@ -326,8 +417,11 @@ fn handler() {
 }
 "#;
         let report = analyze_source(source, SupportLang::Rust, "src/handler.rs");
-        assert!(report.findings.iter().any(|f| f.rule == "rust-panic"),
-            "should detect panic!: {:?}", report.findings);
+        assert!(
+            report.findings.iter().any(|f| f.rule == "rust-panic"),
+            "should detect panic!: {:?}",
+            report.findings
+        );
     }
 
     #[test]
@@ -339,8 +433,11 @@ except:
     pass
 "#;
         let report = analyze_source(source, SupportLang::Python, "src/handler.py");
-        assert!(report.findings.iter().any(|f| f.rule == "py-bare-except"),
-            "should detect bare except: {:?}", report.findings);
+        assert!(
+            report.findings.iter().any(|f| f.rule == "py-bare-except"),
+            "should detect bare except: {:?}",
+            report.findings
+        );
     }
 
     #[test]
@@ -351,8 +448,14 @@ def process(items=[]):
     return items
 "#;
         let report = analyze_source(source, SupportLang::Python, "src/process.py");
-        assert!(report.findings.iter().any(|f| f.rule == "py-mutable-default"),
-            "should detect mutable default: {:?}", report.findings);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == "py-mutable-default"),
+            "should detect mutable default: {:?}",
+            report.findings
+        );
     }
 
     #[test]
@@ -363,8 +466,11 @@ function handler(data: any): void {
 }
 "#;
         let report = analyze_source(source, SupportLang::TypeScript, "src/handler.ts");
-        assert!(report.findings.iter().any(|f| f.rule == "ts-any-type"),
-            "should detect any type: {:?}", report.findings);
+        assert!(
+            report.findings.iter().any(|f| f.rule == "ts-any-type"),
+            "should detect any type: {:?}",
+            report.findings
+        );
     }
 
     #[test]
@@ -380,7 +486,11 @@ fn bad() {
 }
 "#;
         let report = analyze_source(bad_source, SupportLang::Rust, "src/bad.rs");
-        assert!(report.score < 100.0, "bad code should score < 100: {}", report.score);
+        assert!(
+            report.score < 100.0,
+            "bad code should score < 100: {}",
+            report.score
+        );
     }
 
     #[test]

@@ -42,7 +42,9 @@ pub fn synthesize_story_from_v3(v3_content: &str, project: &str) -> Option<Strin
 
     if parts.is_empty() {
         // Fallback: try to extract anything meaningful from the raw content
-        let first_line = v3_content.lines().find(|l| !l.trim().is_empty() && !l.starts_with('#'));
+        let first_line = v3_content
+            .lines()
+            .find(|l| !l.trim().is_empty() && !l.starts_with('#'));
         if let Some(line) = first_line {
             let cleaned: String = line.trim().chars().take(200).collect();
             if cleaned.len() >= 10 {
@@ -110,7 +112,11 @@ fn extract_section(content: &str, header: &str) -> Option<String> {
             result.push_str(line.trim());
         }
     }
-    if result.is_empty() { None } else { Some(result) }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 fn clean_request_text(raw: &str) -> String {

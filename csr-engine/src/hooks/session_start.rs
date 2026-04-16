@@ -22,11 +22,7 @@ static XML_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]{1,50}>"
 
 /// Handle the session-start hook.
 /// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code (C-1 fix).
-pub async fn handle(
-    input: &HookInput,
-    engine: &Engine,
-    cwd: &Path,
-) -> Result<()> {
+pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
     if let Err(e) = handle_inner(input, engine, cwd).await {
         eprintln!("CSR: session-start hook error (non-fatal): {}", e);
         // Output minimal context so session gets SOMETHING rather than silent "Success"
@@ -36,11 +32,7 @@ pub async fn handle(
     Ok(()) // Always succeed
 }
 
-async fn handle_inner(
-    _input: &HookInput,
-    engine: &Engine,
-    cwd: &Path,
-) -> Result<()> {
+async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
     let project = resolve_project_from_cwd(&cwd.to_string_lossy());
     let project_name = project.as_deref().unwrap_or("unknown");
     let now = Utc::now();
@@ -96,7 +88,10 @@ async fn handle_inner(
                     .unwrap_or_default();
 
                 if enrichment_line.is_empty() || enrichment_line == title {
-                    output.push_str(&format!("[{}] {} ({} msgs)\n", age, title, session.total_messages));
+                    output.push_str(&format!(
+                        "[{}] {} ({} msgs)\n",
+                        age, title, session.total_messages
+                    ));
                 } else {
                     output.push_str(&format!(
                         "[{}] {} ({} msgs)\n  {}\n",
@@ -133,11 +128,9 @@ async fn cross_project_pulse(
     current_project: &str,
 ) -> Option<String> {
     // Use the most recent session's enrichment or summary as the query
-    let query_text = sessions.first().and_then(|s| {
-        s.enrichment
-            .as_deref()
-            .or(s.summary.as_deref())
-    })?;
+    let query_text = sessions
+        .first()
+        .and_then(|s| s.enrichment.as_deref().or(s.summary.as_deref()))?;
 
     if query_text.trim().is_empty() {
         return None;
@@ -163,7 +156,10 @@ async fn cross_project_pulse(
                 .unwrap_or("");
 
             // Also check tags for project info
-            let tag_project = tags.iter().find(|t| t.starts_with("project:")).map(|t| &t[8..]);
+            let tag_project = tags
+                .iter()
+                .find(|t| t.starts_with("project:"))
+                .map(|t| &t[8..]);
 
             let proj = if !other_project.is_empty() {
                 other_project
@@ -192,7 +188,7 @@ async fn embed_query(
 ) -> Result<Vec<f32>> {
     let q = query.to_string();
     let emb = embeddings.clone();
-    Ok(tokio::task::spawn_blocking(move || emb.embed_single(&q)).await??)
+    tokio::task::spawn_blocking(move || emb.embed_single(&q)).await?
 }
 
 /// Log session-start injection details to hook-timing.log for diagnostics.
@@ -214,7 +210,8 @@ fn log_session_start_injection(
             .chars()
             .take(200)
             .collect();
-        let line = format!(
+        let line =
+            format!(
             "{} CSR session-start inject [{}]: stories={} sessions={} stdout={}B preview=\"{}\"\n",
             ts, project, story_count, session_count, output.len(), preview,
         );
@@ -338,10 +335,7 @@ const NOISE_SUMMARIES: &[&str] = &[
 /// Extract a clean session title from summary, stripping preamble and sanitizing.
 /// Falls back to enrichment-based title if the summary is noise (e.g. caveat text from /clear).
 fn session_title(session: &SessionInfo) -> String {
-    let raw = session
-        .summary
-        .as_deref()
-        .unwrap_or("(no summary)");
+    let raw = session.summary.as_deref().unwrap_or("(no summary)");
     let stripped = strip_preamble(raw);
     let sanitized = sanitize_preview(stripped);
 
@@ -356,11 +350,13 @@ fn session_title(session: &SessionInfo) -> String {
             // Try heuristic format: structured tools/files
             let fields = parse_enrichment(enrichment);
             if fields.has_edit_tool && !fields.files.is_empty() {
-                let file_list: Vec<&str> = fields.files.iter().take(3).map(|s| s.as_str()).collect();
+                let file_list: Vec<&str> =
+                    fields.files.iter().take(3).map(|s| s.as_str()).collect();
                 return format!("Edited {}", file_list.join(", "));
             }
             if !fields.tools.is_empty() {
-                let tool_summary: Vec<&str> = fields.tools.iter().take(3).map(|s| s.as_str()).collect();
+                let tool_summary: Vec<&str> =
+                    fields.tools.iter().take(3).map(|s| s.as_str()).collect();
                 return format!("Session using {}", tool_summary.join(", "));
             }
             // Try v3/ai_narrative format: extract search summary
@@ -867,7 +863,10 @@ mod tests {
 
     #[test]
     fn test_strip_preamble_markdown_header() {
-        assert_eq!(strip_preamble("## Phase 3 Implementation"), "Phase 3 Implementation");
+        assert_eq!(
+            strip_preamble("## Phase 3 Implementation"),
+            "Phase 3 Implementation"
+        );
     }
 
     #[test]
@@ -1017,8 +1016,13 @@ mod tests {
             timestamp: "2026-02-15T10:00:00Z".to_string(),
             total_messages: 10,
             chunk_count: 2,
-            summary: Some("<local-command-caveat>Caveat: The messages below</local-command-caveat>".to_string()),
-            enrichment: Some("[Heuristic] Project: test\nTools: Edit, Read\nFiles: main.rs, lib.rs".to_string()),
+            summary: Some(
+                "<local-command-caveat>Caveat: The messages below</local-command-caveat>"
+                    .to_string(),
+            ),
+            enrichment: Some(
+                "[Heuristic] Project: test\nTools: Edit, Read\nFiles: main.rs, lib.rs".to_string(),
+            ),
         };
         let title = session_title(&session);
         assert!(title.contains("Edited"));
@@ -1047,7 +1051,10 @@ mod tests {
             timestamp: "2026-02-15T10:00:00Z".to_string(),
             total_messages: 20,
             chunk_count: 3,
-            summary: Some("<system-reminder>Note: this session was started from context</system-reminder>".to_string()),
+            summary: Some(
+                "<system-reminder>Note: this session was started from context</system-reminder>"
+                    .to_string(),
+            ),
             enrichment: Some("[Heuristic] Project: test\nTools: Bash, Read".to_string()),
         };
         let title = session_title(&session);
@@ -1070,7 +1077,8 @@ mod tests {
 
     #[test]
     fn test_parse_enrichment_no_errors() {
-        let enrichment = "[Heuristic] Project: csr\nMessages: 100 (50 user)\nTools: Read, Grep\nFiles: main.rs";
+        let enrichment =
+            "[Heuristic] Project: csr\nMessages: 100 (50 user)\nTools: Read, Grep\nFiles: main.rs";
         let fields = parse_enrichment(enrichment);
         assert!(!fields.has_errors);
         assert!(!fields.has_edit_tool);
@@ -1085,7 +1093,10 @@ mod tests {
             total_messages: 100,
             chunk_count: 5,
             summary: None,
-            enrichment: Some("[Heuristic] Project: test\nTools: Edit, Bash\nFiles: main.rs\nHad errors: yes".to_string()),
+            enrichment: Some(
+                "[Heuristic] Project: test\nTools: Edit, Bash\nFiles: main.rs\nHad errors: yes"
+                    .to_string(),
+            ),
         };
         let result = infer_next_action_from_session(&session);
         assert!(result.contains("Fix errors"));
@@ -1101,7 +1112,9 @@ mod tests {
             total_messages: 100,
             chunk_count: 5,
             summary: None,
-            enrichment: Some("[Heuristic] Project: test\nTools: Read, Grep\nHad errors: yes".to_string()),
+            enrichment: Some(
+                "[Heuristic] Project: test\nTools: Read, Grep\nHad errors: yes".to_string(),
+            ),
         };
         let result = infer_next_action_from_session(&session);
         assert!(result.contains("Investigate and fix errors"));
@@ -1116,7 +1129,10 @@ mod tests {
             total_messages: 50,
             chunk_count: 3,
             summary: None,
-            enrichment: Some("[Heuristic] Project: test\nTools: Edit, Read\nFiles: session_start.rs, queries.rs".to_string()),
+            enrichment: Some(
+                "[Heuristic] Project: test\nTools: Edit, Read\nFiles: session_start.rs, queries.rs"
+                    .to_string(),
+            ),
         };
         let result = infer_next_action_from_session(&session);
         assert!(result.contains("Continue work on"));
@@ -1132,7 +1148,10 @@ mod tests {
             total_messages: 500,
             chunk_count: 10,
             summary: None,
-            enrichment: Some("[Heuristic] Project: test\nMessages: 500 (200 user)\nTools: Read, Grep".to_string()),
+            enrichment: Some(
+                "[Heuristic] Project: test\nMessages: 500 (200 user)\nTools: Read, Grep"
+                    .to_string(),
+            ),
         };
         let result = infer_next_action_from_session(&session);
         assert!(result.contains("Large session"));
@@ -1222,7 +1241,9 @@ mod tests {
             total_messages: 293,
             chunk_count: 6,
             summary: Some("Some work".to_string()),
-            enrichment: Some("[Heuristic] Project: test\nTools: Edit, Read\nFiles: main.rs".to_string()),
+            enrichment: Some(
+                "[Heuristic] Project: test\nTools: Edit, Read\nFiles: main.rs".to_string(),
+            ),
         };
         let line = format_session_line(&session, &now);
         assert!(line.contains("2h ago"));

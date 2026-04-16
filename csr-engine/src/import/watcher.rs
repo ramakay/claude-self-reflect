@@ -63,7 +63,7 @@ impl FileWatcher {
                 match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) => {
                         for path in event.paths {
-                            if path.extension().map_or(false, |ext| ext == "jsonl") {
+                            if path.extension().is_some_and(|ext| ext == "jsonl") {
                                 let _ = sender.send(path);
                             }
                         }

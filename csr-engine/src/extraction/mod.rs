@@ -125,16 +125,20 @@ pub fn extract_v3(messages: &[Value]) -> ExtractionResult {
     let code_context = ast_analysis::extract_code_context(messages);
 
     // Build outputs (search index now includes code context)
-    let search_index = index_builder::build_search_index(messages, &edit_patterns, &error_contexts, &code_context);
+    let search_index =
+        index_builder::build_search_index(messages, &edit_patterns, &error_contexts, &code_context);
     let context_cache =
         index_builder::build_context_cache(messages, &edit_patterns, &error_contexts);
-    let mut conv_signature =
-        signature::build_signature(messages, &error_contexts, &edit_patterns);
+    let mut conv_signature = signature::build_signature(messages, &error_contexts, &edit_patterns);
 
     // Enrich signature concepts from AST analysis
     if !code_context.is_empty() {
-        conv_signature.concepts.extend(code_context.patterns.iter().cloned());
-        conv_signature.concepts.extend(code_context.languages.iter().map(|l| format!("lang:{l}")));
+        conv_signature
+            .concepts
+            .extend(code_context.patterns.iter().cloned());
+        conv_signature
+            .concepts
+            .extend(code_context.languages.iter().map(|l| format!("lang:{l}")));
     }
 
     let search_tokens = search_index.len() / 4;

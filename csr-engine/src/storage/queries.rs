@@ -6,6 +6,9 @@ use rusqlite::{params, Connection};
 
 use crate::import::ConversationChunk;
 
+/// A reflection row: (id, content, tags, timestamp).
+pub type ReflectionRow = (String, String, Vec<String>, String);
+
 /// Aggregated session info for timeline display.
 /// JOINs chunk data with enrichment reflections for rich context.
 pub struct SessionInfo {
@@ -263,9 +266,7 @@ pub fn get_chunk_ids_in_timerange(
         let rows = stmt.query_map(params![start, end, p], |row| row.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
-        let mut stmt = conn.prepare(
-            "SELECT id FROM chunks WHERE timestamp BETWEEN ?1 AND ?2",
-        )?;
+        let mut stmt = conn.prepare("SELECT id FROM chunks WHERE timestamp BETWEEN ?1 AND ?2")?;
         let rows = stmt.query_map(params![start, end], |row| row.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
@@ -296,7 +297,11 @@ pub fn fts5_search(
     if words.is_empty() {
         return Ok(Vec::new());
     }
-    let fts_query = words.iter().map(|w| format!("\"{}\"", w)).collect::<Vec<_>>().join(" OR ");
+    let fts_query = words
+        .iter()
+        .map(|w| format!("\"{}\"", w))
+        .collect::<Vec<_>>()
+        .join(" OR ");
 
     let chunks = if let Some(p) = project.filter(|p| *p != "all") {
         let mut stmt = conn.prepare(
@@ -331,7 +336,7 @@ pub fn get_reflections_by_tag(
     conn: &Connection,
     tag: &str,
     limit: usize,
-) -> Result<Vec<(String, String, Vec<String>, String)>> {
+) -> Result<Vec<ReflectionRow>> {
     // Escape LIKE wildcards to prevent injection
     let escaped_tag = tag.replace('%', "\\%").replace('_', "\\_");
     let pattern = format!("%{}%", escaped_tag);
@@ -469,10 +474,7 @@ pub fn set_batch_id(
 }
 
 /// Get conversations with a specific batch ID (for result retrieval).
-pub fn get_conversations_by_batch(
-    conn: &Connection,
-    batch_id: &str,
-) -> Result<Vec<String>> {
+pub fn get_conversations_by_batch(conn: &Connection, batch_id: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT conversation_id FROM enrichment_state
          WHERE batch_id = ?1 AND enrichment_type = 'ai_narrative'",
@@ -487,7 +489,10 @@ pub fn get_conversations_by_batch(
 
 /// Delete a reflection by ID (for layer supersession — Layer 2 replaces Layer 1).
 pub fn delete_reflection(conn: &Connection, id: &str) -> Result<()> {
-    conn.execute("DELETE FROM reflection_embeddings WHERE reflection_id = ?1", params![id])?;
+    conn.execute(
+        "DELETE FROM reflection_embeddings WHERE reflection_id = ?1",
+        params![id],
+    )?;
     conn.execute("DELETE FROM reflections WHERE id = ?1", params![id])?;
     Ok(())
 }
@@ -606,12 +611,9 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<SessionInfo> {
 /// Compares stored file_mtime against current mtime to detect grown conversations.
 pub fn is_file_imported(conn: &Connection, path: &Path) -> Result<bool> {
     let path_str = path.to_string_lossy().to_string();
-    let mut stmt =
-        conn.prepare("SELECT file_mtime FROM import_state WHERE file_path = ?1")?;
+    let mut stmt = conn.prepare("SELECT file_mtime FROM import_state WHERE file_path = ?1")?;
 
-    let stored_mtime: Option<String> = stmt
-        .query_row(params![path_str], |row| row.get(0))
-        .ok();
+    let stored_mtime: Option<String> = stmt.query_row(params![path_str], |row| row.get(0)).ok();
 
     let Some(stored) = stored_mtime else {
         return Ok(false); // Never imported
@@ -724,9 +726,8 @@ pub fn get_project_for_conversation(
     conn: &Connection,
     conversation_id: &str,
 ) -> Result<Option<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT project_name FROM chunks WHERE conversation_id = ?1 LIMIT 1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT project_name FROM chunks WHERE conversation_id = ?1 LIMIT 1")?;
     let mut rows = stmt.query_map(params![conversation_id], |row| row.get::<_, String>(0))?;
     match rows.next() {
         Some(Ok(name)) => Ok(Some(name)),
@@ -758,8 +759,7 @@ pub fn count_projects(conn: &Connection) -> Result<usize> {
 
 /// Count imported files.
 pub fn count_imported_files(conn: &Connection) -> Result<usize> {
-    let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM import_state", [], |row| row.get(0))?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM import_state", [], |row| row.get(0))?;
     Ok(count as usize)
 }
 
@@ -785,21 +785,15 @@ pub fn get_enrichment_breakdown(conn: &Connection) -> Result<Vec<(String, String
 /// Get the newest chunk timestamp (for staleness reporting).
 pub fn get_newest_chunk_timestamp(conn: &Connection) -> Result<Option<String>> {
     let result: Option<String> = conn
-        .query_row(
-            "SELECT MAX(timestamp) FROM chunks",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT MAX(timestamp) FROM chunks", [], |row| row.get(0))
         .ok();
     Ok(result)
 }
 
 /// Get the database file size in bytes.
 pub fn get_db_size(conn: &Connection) -> Result<u64> {
-    let page_count: i64 =
-        conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-    let page_size: i64 =
-        conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
     Ok((page_count * page_size) as u64)
 }
 
@@ -834,8 +828,9 @@ pub fn get_chunk_content(conn: &Connection, id: &str) -> Result<Option<String>> 
 
 /// Fast O(1) count of chunk embeddings for HNSW cache staleness check.
 pub fn count_chunk_embeddings(conn: &Connection) -> Result<usize> {
-    let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |row| row.get(0))?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |row| {
+        row.get(0)
+    })?;
     Ok(count as usize)
 }
 
@@ -882,11 +877,7 @@ pub fn log_retrieval_event(
 }
 
 /// Update session outcome for all retrieval events in a session.
-pub fn update_session_outcome(
-    conn: &Connection,
-    session_id: &str,
-    outcome: &str,
-) -> Result<usize> {
+pub fn update_session_outcome(conn: &Connection, session_id: &str, outcome: &str) -> Result<usize> {
     let updated = conn.execute(
         "UPDATE retrieval_events SET session_outcome = ?1 WHERE session_id = ?2",
         params![outcome, session_id],

@@ -28,9 +28,7 @@ pub async fn handle(
     eprintln!("\n=== Claude Self-Reflect Setup ===\n");
 
     // Step 1: Ensure DB directory exists
-    let csr_dir = db_path
-        .parent()
-        .unwrap_or(Path::new("."));
+    let csr_dir = db_path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(csr_dir)?;
     eprintln!("[1/6] Database directory ready: {}", csr_dir.display());
 
@@ -89,9 +87,7 @@ pub async fn handle(
     if anthropic_key.is_some() {
         eprintln!("  3. Run `csr-engine daemon` for AI-powered narrative enrichment");
     } else {
-        eprintln!(
-            "  3. Optional: `csr-engine setup --anthropic-key=sk-ant-...` for AI narratives"
-        );
+        eprintln!("  3. Optional: `csr-engine setup --anthropic-key=sk-ant-...` for AI narratives");
     }
     eprintln!();
 
@@ -107,10 +103,12 @@ fn register_mcp_server() -> Result<()> {
     // Try `claude mcp add` first
     let result = std::process::Command::new("claude")
         .args([
-            "mcp", "add",
+            "mcp",
+            "add",
             "claude-self-reflect",
             &binary_str,
-            "-s", "user",
+            "-s",
+            "user",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

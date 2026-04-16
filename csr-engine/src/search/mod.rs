@@ -131,7 +131,13 @@ impl SearchEngine {
         if self.chunk_id_map.is_empty() {
             return Vec::new();
         }
-        self.search_index(&self.chunk_index, &self.chunk_id_map, query_vec, limit, min_score)
+        self.search_index(
+            &self.chunk_index,
+            &self.chunk_id_map,
+            query_vec,
+            limit,
+            min_score,
+        )
     }
 
     /// Search reflection index. Returns results sorted by descending score.
@@ -168,10 +174,7 @@ impl SearchEngine {
             .filter_map(|n| {
                 // hnsw_rs DistCosine returns distance = 1.0 - cosine_similarity
                 let score = 1.0 - n.distance;
-                if score >= min_score
-                    && n.d_id < id_map.len()
-                    && !id_map[n.d_id].is_empty()
-                {
+                if score >= min_score && n.d_id < id_map.len() && !id_map[n.d_id].is_empty() {
                     Some(SearchResult {
                         id: id_map[n.d_id].clone(),
                         score,
@@ -182,7 +185,11 @@ impl SearchEngine {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         results
     }
@@ -248,7 +255,11 @@ impl SearchEngine {
             fetch_limit = max_elements;
         };
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         results
     }
@@ -268,8 +279,6 @@ impl SearchEngine {
         db_chunk_count: usize,
         db_reflection_count: usize,
     ) -> Result<()> {
-
-
         std::fs::create_dir_all(dir)?;
 
         // Advisory lock prevents concurrent dump/load from separate processes (H-2)
@@ -278,9 +287,9 @@ impl SearchEngine {
             .create(true)
             .truncate(false)
             .open(dir.join("index.lock"))?;
-        lock_file.lock_exclusive().map_err(|e| {
-            anyhow::anyhow!("failed to acquire index lock for dump: {}", e)
-        })?;
+        lock_file
+            .lock_exclusive()
+            .map_err(|e| anyhow::anyhow!("failed to acquire index lock for dump: {}", e))?;
 
         // Dump HNSW graph + data files (skip empty indices — file_dump fails on empty)
         if !self.chunk_id_map.is_empty() {
@@ -389,7 +398,13 @@ impl SearchEngine {
                 }
             }
         } else {
-            Hnsw::new(MAX_NB_CONNECTION, 10_000, MAX_LAYER, EF_CONSTRUCTION, DistCosine {})
+            Hnsw::new(
+                MAX_NB_CONNECTION,
+                10_000,
+                MAX_LAYER,
+                EF_CONSTRUCTION,
+                DistCosine {},
+            )
         };
 
         let refl_hnsw = if manifest.reflection_embeddings_expected > 0 {
@@ -402,7 +417,13 @@ impl SearchEngine {
                 }
             }
         } else {
-            Hnsw::new(MAX_NB_CONNECTION, 1_000, MAX_LAYER, EF_CONSTRUCTION, DistCosine {})
+            Hnsw::new(
+                MAX_NB_CONNECTION,
+                1_000,
+                MAX_LAYER,
+                EF_CONSTRUCTION,
+                DistCosine {},
+            )
         };
 
         // Rebuild ID sets from the loaded maps

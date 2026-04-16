@@ -15,11 +15,7 @@ use crate::engine::Engine;
 
 /// Handle the precompact hook.
 /// Always returns Ok(()) to never block compaction (E-1 fix).
-pub async fn handle(
-    input: &HookInput,
-    engine: &Engine,
-    cwd: &Path,
-) -> Result<()> {
+pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
     // Import transcript for ALL sessions before compaction destroys context
     super::import_current_transcript(input, engine, cwd).await;
 

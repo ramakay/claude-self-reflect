@@ -144,11 +144,7 @@ fn compute_file_overlap(result_files: &[String], current_files: &[String]) -> f3
 
     let overlap_count = current_files
         .iter()
-        .filter(|cf| {
-            result_files
-                .iter()
-                .any(|rf| files_match(rf, cf))
-        })
+        .filter(|cf| result_files.iter().any(|rf| files_match(rf, cf)))
         .count();
 
     (overlap_count as f32) / (current_files.len() as f32)

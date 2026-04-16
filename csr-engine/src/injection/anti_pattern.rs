@@ -93,7 +93,7 @@ pub async fn search_reflections_by_tag(
 async fn embed_query(embeddings: &Arc<EmbeddingEngine>, query: &str) -> Result<Vec<f32>> {
     let q = query.to_string();
     let emb = embeddings.clone();
-    Ok(tokio::task::spawn_blocking(move || emb.embed_single(&q)).await??)
+    tokio::task::spawn_blocking(move || emb.embed_single(&q)).await?
 }
 
 #[cfg(test)]

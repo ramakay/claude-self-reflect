@@ -54,7 +54,14 @@ pub fn calculate_importance(msg: &Value, index: usize, total: usize) -> f64 {
     }
 
     // Blocking errors
-    let error_keywords = ["error", "exception", "traceback", "failed", "failure", "err_"];
+    let error_keywords = [
+        "error",
+        "exception",
+        "traceback",
+        "failed",
+        "failure",
+        "err_",
+    ];
     if error_keywords.iter().any(|kw| content.contains(kw)) {
         score += 9.0;
     }
@@ -79,7 +86,7 @@ pub fn calculate_importance(msg: &Value, index: usize, total: usize) -> f64 {
 
     // Position bias — beginnings and ends are often important
     let relative_pos = index as f64 / total.max(1) as f64;
-    if relative_pos < 0.1 || relative_pos > 0.8 {
+    if !(0.1..=0.8).contains(&relative_pos) {
         score *= 1.1;
     }
 
@@ -95,7 +102,10 @@ mod tests {
     fn test_user_request_high_score() {
         let msg = json!({"role": "user", "content": "Please fix the authentication bug in the login flow that causes session timeout issues"});
         let score = calculate_importance(&msg, 0, 10);
-        assert!(score >= 10.0, "User request should score >= 10, got {score}");
+        assert!(
+            score >= 10.0,
+            "User request should score >= 10, got {score}"
+        );
     }
 
     #[test]
@@ -112,7 +122,10 @@ mod tests {
     fn test_tool_result_noise_low_score() {
         let msg = json!({"role": "user", "content": "tool_result tool_use_id result data"});
         let score = calculate_importance(&msg, 5, 10);
-        assert!(score < 10.0, "Tool result noise should score < 10, got {score}");
+        assert!(
+            score < 10.0,
+            "Tool result noise should score < 10, got {score}"
+        );
     }
 
     #[test]

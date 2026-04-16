@@ -135,17 +135,12 @@ pub async fn enrich_conversation(
 
     let content_clone = content.clone();
     let emb = embeddings.clone();
-    let embeddings_vec = tokio::task::spawn_blocking(move || {
-        emb.embed(&[content_clone.as_str()])
-    })
-    .await??;
+    let embeddings_vec =
+        tokio::task::spawn_blocking(move || emb.embed(&[content_clone.as_str()])).await??;
 
     if let Some(embedding) = embeddings_vec.into_iter().next() {
         let reflection_id = format!("heuristic_{conv_id}");
-        let tags = vec![
-            "narrative_heuristic".to_string(),
-            format!("conv_{conv_id}"),
-        ];
+        let tags = vec!["narrative_heuristic".to_string(), format!("conv_{conv_id}")];
 
         storage.insert_reflection(&reflection_id, &content, &tags, &embedding)?;
         let mut idx = search.write().await;
@@ -194,9 +189,7 @@ mod tests {
 
     #[test]
     fn test_detects_errors() {
-        let messages = vec![
-            json!({"role": "assistant", "content": "error: cannot find module"}),
-        ];
+        let messages = vec![json!({"role": "assistant", "content": "error: cannot find module"})];
         let result = extract_heuristic(&messages);
         assert!(result.has_errors);
     }

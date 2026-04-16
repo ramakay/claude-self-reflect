@@ -36,10 +36,7 @@ pub fn extract_edit_pattern(messages: &[Value], edit_index: usize) -> EditPatter
         if item.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
             continue;
         }
-        let tool_name = item
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let tool_lower = tool_name.to_lowercase();
         if !tool_lower.contains("edit") && !tool_lower.contains("write") {
             continue;
@@ -48,7 +45,10 @@ pub fn extract_edit_pattern(messages: &[Value], edit_index: usize) -> EditPatter
             continue;
         }
 
-        let tool_input = item.get("input").cloned().unwrap_or(Value::Object(Default::default()));
+        let tool_input = item
+            .get("input")
+            .cloned()
+            .unwrap_or(Value::Object(Default::default()));
 
         // Extract file path
         if let Some(fp) = tool_input.get("file_path").and_then(|v| v.as_str()) {
@@ -116,8 +116,8 @@ pub fn extract_edit_pattern(messages: &[Value], edit_index: usize) -> EditPatter
 
         // Find WHY — look at recent user messages
         let start = edit_index.saturating_sub(5);
-        for j in start..edit_index {
-            let check_data = get_message_data(&messages[j]);
+        for msg in &messages[start..edit_index] {
+            let check_data = get_message_data(msg);
             if check_data.get("role").and_then(|v| v.as_str()) != Some("user") {
                 continue;
             }

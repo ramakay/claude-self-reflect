@@ -67,10 +67,7 @@ impl Engine {
         let t_embed = t0.elapsed();
 
         // Compute index cache directory alongside the database
-        let index_dir = db_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("index");
+        let index_dir = db_path.parent().unwrap_or(Path::new(".")).join("index");
 
         // Fast O(1) counts for staleness check (~1ms)
         let chunk_count = storage.count_chunk_embeddings()?;
@@ -118,7 +115,9 @@ impl Engine {
 
             // Re-query counts right before dump to minimize staleness window (E-1)
             let chunk_count = storage.count_chunk_embeddings().unwrap_or(chunk_count);
-            let reflection_count = storage.count_reflection_embeddings().unwrap_or(reflection_count);
+            let reflection_count = storage
+                .count_reflection_embeddings()
+                .unwrap_or(reflection_count);
             // Dump to disk for next startup
             if let Err(e) = search.dump_to_disk(&index_dir, chunk_count, reflection_count) {
                 tracing::warn!(error = %e, "failed to cache HNSW index (non-fatal)");
@@ -285,7 +284,10 @@ impl Engine {
         let mut backfilled = 0usize;
 
         if !missing.is_empty() {
-            eprintln!("CSR: found {} conversations missing import_state rows", missing.len());
+            eprintln!(
+                "CSR: found {} conversations missing import_state rows",
+                missing.len()
+            );
 
             for conv_id in &missing {
                 if let Some((file_path, _)) = conv_to_file.get(conv_id) {
@@ -304,7 +306,10 @@ impl Engine {
         let mut enriched = 0usize;
 
         if !needing.is_empty() {
-            eprintln!("CSR: found {} conversations needing heuristic enrichment", needing.len());
+            eprintln!(
+                "CSR: found {} conversations needing heuristic enrichment",
+                needing.len()
+            );
 
             for (conv_id, project_name) in &needing {
                 if let Some((file_path, _)) = conv_to_file.get(conv_id) {
@@ -325,14 +330,22 @@ impl Engine {
                         );
                     } else {
                         enriched += 1;
-                        if enriched % 100 == 0 {
-                            eprintln!("CSR: enriched {}/{} conversations...", enriched, needing.len());
+                        if enriched.is_multiple_of(100) {
+                            eprintln!(
+                                "CSR: enriched {}/{} conversations...",
+                                enriched,
+                                needing.len()
+                            );
                             self.flush_index().await;
                         }
                     }
                 }
             }
-            eprintln!("CSR: heuristic enrichment complete: {}/{}", enriched, needing.len());
+            eprintln!(
+                "CSR: heuristic enrichment complete: {}/{}",
+                enriched,
+                needing.len()
+            );
         }
 
         // Final flush to persist any remaining vectors
@@ -392,10 +405,14 @@ impl Engine {
 
     /// Start the MCP server on stdio.
     pub async fn serve_mcp(self) -> Result<()> {
-        let server = CsrServer::new(self.storage, self.embeddings, self.search, self.projects_dir, self.index_dir);
-        let service = server
-            .serve(rmcp::transport::io::stdio())
-            .await?;
+        let server = CsrServer::new(
+            self.storage,
+            self.embeddings,
+            self.search,
+            self.projects_dir,
+            self.index_dir,
+        );
+        let service = server.serve(rmcp::transport::io::stdio()).await?;
         service.waiting().await?;
         Ok(())
     }

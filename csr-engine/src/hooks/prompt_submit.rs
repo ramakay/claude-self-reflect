@@ -34,11 +34,7 @@ const MIN_PROMPT_LENGTH: usize = 15;
 
 /// Handle the prompt-submit hook.
 /// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code.
-pub async fn handle(
-    input: &HookInput,
-    engine: &Engine,
-    cwd: &Path,
-) -> Result<()> {
+pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
     if let Err(e) = handle_inner(input, engine, cwd).await {
         eprintln!("CSR: prompt-submit hook error (non-fatal): {}", e);
     }
@@ -52,11 +48,7 @@ pub async fn handle(
     Ok(()) // Always succeed
 }
 
-async fn handle_inner(
-    input: &HookInput,
-    engine: &Engine,
-    _cwd: &Path,
-) -> Result<()> {
+async fn handle_inner(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<()> {
     // Extract prompt from input
     let prompt = match input.prompt.as_deref() {
         Some(p) if !p.is_empty() => p,
@@ -78,10 +70,8 @@ async fn handle_inner(
     let search = engine.search();
 
     // 1. Search for anti-patterns (highest priority)
-    let anti_patterns = anti_pattern::find_anti_patterns(
-        storage, embeddings, search, prompt, 0.5, 2,
-    )
-    .await;
+    let anti_patterns =
+        anti_pattern::find_anti_patterns(storage, embeddings, search, prompt, 0.5, 2).await;
 
     // 2. Search chunks (past conversations)
     let chunk_results = search_chunks_for_prompt(engine, prompt, 5, 0.6).await;
@@ -186,7 +176,14 @@ async fn handle_inner(
     }
 
     // Detailed injection log for diagnostics (written to hook-timing.log)
-    log_injection_detail("prompt-submit", prompt, total, anti_count, formatted.len(), &scored);
+    log_injection_detail(
+        "prompt-submit",
+        prompt,
+        total,
+        anti_count,
+        formatted.len(),
+        &scored,
+    );
 
     Ok(())
 }
@@ -218,7 +215,7 @@ async fn search_chunks_for_prompt(
 
     let mut raw_results = Vec::new();
     for result in &results {
-        if let Ok(chunks) = storage.get_chunks_by_ids(&[result.id.clone()]) {
+        if let Ok(chunks) = storage.get_chunks_by_ids(std::slice::from_ref(&result.id)) {
             if let Some(chunk) = chunks.into_iter().next() {
                 raw_results.push(RawResult {
                     content: formatter::truncate_item(&chunk.content, 300),
@@ -264,7 +261,10 @@ async fn search_reflections_for_prompt(
     let mut raw_results = Vec::new();
     for result in &results {
         if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&result.id) {
-            let source = if tags.iter().any(|t| t == "outcome_incomplete" || t == "outcome_abandoned") {
+            let source = if tags
+                .iter()
+                .any(|t| t == "outcome_incomplete" || t == "outcome_abandoned")
+            {
                 "anti_pattern"
             } else {
                 "reflection"
@@ -286,7 +286,9 @@ async fn search_reflections_for_prompt(
 
 /// Extract file paths from content (simple heuristic: lines containing common extensions).
 fn extract_file_paths(content: &str) -> Vec<String> {
-    let extensions = [".rs", ".py", ".ts", ".js", ".toml", ".json", ".yaml", ".yml"];
+    let extensions = [
+        ".rs", ".py", ".ts", ".js", ".toml", ".json", ".yaml", ".yml",
+    ];
     let mut files = Vec::new();
 
     for line in content.lines() {
@@ -395,7 +397,8 @@ mod tests {
 
     #[test]
     fn test_extract_error_patterns() {
-        let content = "Log:\nError: connection refused\ninfo: compiling\nerror[E0308]: type mismatch";
+        let content =
+            "Log:\nError: connection refused\ninfo: compiling\nerror[E0308]: type mismatch";
         let errors = extract_error_patterns(content);
         assert_eq!(errors.len(), 2);
         assert!(errors[0].contains("connection refused"));
@@ -421,17 +424,29 @@ mod tests {
         assert!(is_self_referential_noise(
             "This proves the session_start_hook.py successfully retrieved"
         ));
-        assert!(is_self_referential_noise("Current Ralph State: Iteration: 198"));
-        assert!(is_self_referential_noise("hook success: session-end completed"));
-        assert!(is_self_referential_noise("CSR engine ready. Session: abc123"));
-        assert!(is_self_referential_noise("Test in hooks_integration module"));
+        assert!(is_self_referential_noise(
+            "Current Ralph State: Iteration: 198"
+        ));
+        assert!(is_self_referential_noise(
+            "hook success: session-end completed"
+        ));
+        assert!(is_self_referential_noise(
+            "CSR engine ready. Session: abc123"
+        ));
+        assert!(is_self_referential_noise(
+            "Test in hooks_integration module"
+        ));
         assert!(is_self_referential_noise("proves the hook works correctly"));
     }
 
     #[test]
     fn test_non_noise_content_passes() {
-        assert!(!is_self_referential_noise("Fix the authentication timeout bug"));
-        assert!(!is_self_referential_noise("Docker compose memory issue resolved"));
+        assert!(!is_self_referential_noise(
+            "Fix the authentication timeout bug"
+        ));
+        assert!(!is_self_referential_noise(
+            "Docker compose memory issue resolved"
+        ));
         assert!(!is_self_referential_noise(
             "Use batch embedding for 3x speedup"
         ));

@@ -127,7 +127,10 @@ fn extract_from_tool_use(item: &Value, ctx: &mut CodeContext) {
     };
 
     // Detect language from file_path
-    let file_path = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    let file_path = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let lang = lang_from_path(file_path);
 
     if tool_name.contains("edit") || tool_name.contains("write") || tool_name.contains("multiedit")
@@ -163,7 +166,7 @@ fn parse_fenced_blocks(text: &str) -> Vec<CodeBlock> {
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
         if trimmed.starts_with("```") && trimmed.len() > 3 {
-            let lang_tag = trimmed[3..].trim().split_whitespace().next().unwrap_or("");
+            let lang_tag = trimmed[3..].split_whitespace().next().unwrap_or("");
             let (lang, _) = lang_from_tag(lang_tag);
 
             let mut source = String::new();
@@ -252,9 +255,11 @@ fn func_kinds(lang: SupportLang) -> &'static [&'static str] {
     match lang {
         SupportLang::Rust => &["function_item"],
         SupportLang::Python => &["function_definition"],
-        SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => {
-            &["function_declaration", "method_definition", "arrow_function"]
-        }
+        SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => &[
+            "function_declaration",
+            "method_definition",
+            "arrow_function",
+        ],
         SupportLang::Go => &["function_declaration", "method_declaration"],
         _ => &["function_definition"],
     }
@@ -265,9 +270,12 @@ fn type_kinds(lang: SupportLang) -> &'static [&'static str] {
     match lang {
         SupportLang::Rust => &["struct_item", "enum_item", "trait_item", "type_item"],
         SupportLang::Python => &["class_definition"],
-        SupportLang::TypeScript | SupportLang::Tsx => {
-            &["class_declaration", "interface_declaration", "type_alias_declaration", "enum_declaration"]
-        }
+        SupportLang::TypeScript | SupportLang::Tsx => &[
+            "class_declaration",
+            "interface_declaration",
+            "type_alias_declaration",
+            "enum_declaration",
+        ],
         SupportLang::JavaScript => &["class_declaration"],
         SupportLang::Go => &["type_declaration"],
         _ => &["class_definition"],
@@ -455,13 +463,37 @@ mod tests {
 "#;
 
         let ctx = analyze_code(source, SupportLang::Rust);
-        assert!(ctx.functions.contains("new"), "should find 'new' function: {:?}", ctx.functions);
-        assert!(ctx.functions.contains("flush_index"), "should find 'flush_index': {:?}", ctx.functions);
-        assert!(ctx.types.contains("Engine"), "should find 'Engine' struct: {:?}", ctx.types);
+        assert!(
+            ctx.functions.contains("new"),
+            "should find 'new' function: {:?}",
+            ctx.functions
+        );
+        assert!(
+            ctx.functions.contains("flush_index"),
+            "should find 'flush_index': {:?}",
+            ctx.functions
+        );
+        assert!(
+            ctx.types.contains("Engine"),
+            "should find 'Engine' struct: {:?}",
+            ctx.types
+        );
         assert!(ctx.languages.contains("Rust"));
-        assert!(ctx.patterns.contains("async"), "should detect async pattern: {:?}", ctx.patterns);
-        assert!(ctx.patterns.contains("error_handling"), "should detect error handling: {:?}", ctx.patterns);
-        assert!(ctx.patterns.contains("test"), "should detect test pattern: {:?}", ctx.patterns);
+        assert!(
+            ctx.patterns.contains("async"),
+            "should detect async pattern: {:?}",
+            ctx.patterns
+        );
+        assert!(
+            ctx.patterns.contains("error_handling"),
+            "should detect error handling: {:?}",
+            ctx.patterns
+        );
+        assert!(
+            ctx.patterns.contains("test"),
+            "should detect test pattern: {:?}",
+            ctx.patterns
+        );
     }
 
     #[test]
@@ -483,9 +515,21 @@ class MyHandler:
 "#;
 
         let ctx = analyze_code(source, SupportLang::Python);
-        assert!(ctx.functions.contains("__init__"), "should find __init__: {:?}", ctx.functions);
-        assert!(ctx.functions.contains("handle_request"), "should find handle_request: {:?}", ctx.functions);
-        assert!(ctx.types.contains("MyHandler"), "should find MyHandler: {:?}", ctx.types);
+        assert!(
+            ctx.functions.contains("__init__"),
+            "should find __init__: {:?}",
+            ctx.functions
+        );
+        assert!(
+            ctx.functions.contains("handle_request"),
+            "should find handle_request: {:?}",
+            ctx.functions
+        );
+        assert!(
+            ctx.types.contains("MyHandler"),
+            "should find MyHandler: {:?}",
+            ctx.types
+        );
         assert!(ctx.patterns.contains("async"));
         assert!(ctx.patterns.contains("error_handling"));
     }
@@ -518,8 +562,16 @@ describe('fetchUser', () => {
 "#;
 
         let ctx = analyze_code(source, SupportLang::TypeScript);
-        assert!(ctx.functions.contains("fetchUser"), "should find fetchUser: {:?}", ctx.functions);
-        assert!(ctx.types.contains("UserConfig"), "should find UserConfig: {:?}", ctx.types);
+        assert!(
+            ctx.functions.contains("fetchUser"),
+            "should find fetchUser: {:?}",
+            ctx.functions
+        );
+        assert!(
+            ctx.types.contains("UserConfig"),
+            "should find UserConfig: {:?}",
+            ctx.types
+        );
         assert!(ctx.patterns.contains("async"));
         assert!(ctx.patterns.contains("error_handling"));
         assert!(ctx.patterns.contains("test"));
@@ -549,7 +601,11 @@ def dispatch_hook(name: str) -> None:
 
         let mut ctx = CodeContext::default();
         extract_from_fenced_blocks(text, &mut ctx);
-        assert!(ctx.functions.contains("dispatch_hook"), "should find dispatch_hook: {:?}", ctx.functions);
+        assert!(
+            ctx.functions.contains("dispatch_hook"),
+            "should find dispatch_hook: {:?}",
+            ctx.functions
+        );
         assert!(ctx.languages.contains("Rust"));
         assert!(ctx.languages.contains("Python"));
     }
@@ -568,8 +624,11 @@ def dispatch_hook(name: str) -> None:
 
         let mut ctx = CodeContext::default();
         extract_from_tool_use(&item, &mut ctx);
-        assert!(ctx.functions.contains("new_method") || ctx.functions.contains("old_method"),
-            "should find function names: {:?}", ctx.functions);
+        assert!(
+            ctx.functions.contains("new_method") || ctx.functions.contains("old_method"),
+            "should find function names: {:?}",
+            ctx.functions
+        );
         assert!(ctx.languages.contains("Rust"));
     }
 
@@ -592,7 +651,11 @@ def dispatch_hook(name: str) -> None:
         ];
 
         let ctx = extract_code_context(&messages);
-        assert!(ctx.functions.contains("dispatch_hook"), "should find dispatch_hook: {:?}", ctx.functions);
+        assert!(
+            ctx.functions.contains("dispatch_hook"),
+            "should find dispatch_hook: {:?}",
+            ctx.functions
+        );
         assert!(ctx.languages.contains("Rust"));
     }
 
@@ -615,8 +678,14 @@ def dispatch_hook(name: str) -> None:
     #[test]
     fn test_lang_from_path() {
         assert_eq!(lang_from_path("src/engine.rs"), Some(SupportLang::Rust));
-        assert_eq!(lang_from_path("scripts/import.py"), Some(SupportLang::Python));
-        assert_eq!(lang_from_path("src/components/App.tsx"), Some(SupportLang::Tsx));
+        assert_eq!(
+            lang_from_path("scripts/import.py"),
+            Some(SupportLang::Python)
+        );
+        assert_eq!(
+            lang_from_path("src/components/App.tsx"),
+            Some(SupportLang::Tsx)
+        );
         assert_eq!(lang_from_path("README.md"), None);
     }
 

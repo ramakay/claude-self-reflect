@@ -46,8 +46,8 @@ impl AnthropicClient {
         if api_key.is_empty() {
             return None;
         }
-        let model = std::env::var("CSR_NARRATIVE_MODEL")
-            .unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        let model =
+            std::env::var("CSR_NARRATIVE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
         let api_version = std::env::var("CSR_ANTHROPIC_VERSION")
             .unwrap_or_else(|_| DEFAULT_API_VERSION.to_string());
         Some(Self {

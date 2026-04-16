@@ -28,27 +28,24 @@ pub fn build_signature(
     errors: &[ErrorContext],
     patterns: &[EditPattern],
 ) -> ConversationSignature {
-    let msg_data_list: Vec<Value> = messages.iter().map(|m| get_message_data(m)).collect();
+    let msg_data_list: Vec<Value> = messages.iter().map(get_message_data).collect();
 
     // Detect completion status from last 10 messages
     let last_10_start = msg_data_list.len().saturating_sub(10);
     let last_10 = &msg_data_list[last_10_start..];
 
     let has_build_success = last_10.iter().any(|m| {
-        let c = content_to_lower(&m);
+        let c = content_to_lower(m);
         c.contains("compiled successfully") || (c.contains("build") && c.contains("success"))
     });
-    let has_test_success = last_10
-        .iter()
-        .any(|m| {
-            let c = content_to_lower(&m);
-            c.contains("test") && c.contains("pass")
-        });
+    let has_test_success = last_10.iter().any(|m| {
+        let c = content_to_lower(m);
+        c.contains("test") && c.contains("pass")
+    });
     let has_completion = last_10.iter().any(|m| {
-        let c = content_to_lower(&m);
+        let c = content_to_lower(m);
         c.contains("all tasks completed")
-            || (c.contains("successfully")
-                && (c.contains("deployment") || c.contains("completed")))
+            || (c.contains("successfully") && (c.contains("deployment") || c.contains("completed")))
     });
 
     // Only count truly blocking unresolved errors in last 20% of conversation
@@ -66,19 +63,20 @@ pub fn build_signature(
         })
         .collect();
 
-    let completion_status =
-        if (has_build_success || has_test_success || has_completion) && blocking_errors.is_empty() {
-            "success"
-        } else if !blocking_errors.is_empty() {
-            "failed"
-        } else {
-            "partial"
-        };
+    let completion_status = if (has_build_success || has_test_success || has_completion)
+        && blocking_errors.is_empty()
+    {
+        "success"
+    } else if !blocking_errors.is_empty() {
+        "failed"
+    } else {
+        "partial"
+    };
 
     // Detect frameworks
     let all_content: String = msg_data_list
         .iter()
-        .map(|m| content_to_lower(&m))
+        .map(content_to_lower)
         .collect::<Vec<_>>()
         .join(" ");
 
@@ -89,7 +87,10 @@ pub fn build_signature(
     if all_content.contains("next.js") || all_content.contains("nextjs") {
         frameworks.push("nextjs".to_string());
     }
-    if all_content.contains("typescript") || all_content.contains(".tsx") || all_content.contains(".ts ") {
+    if all_content.contains("typescript")
+        || all_content.contains(".tsx")
+        || all_content.contains(".ts ")
+    {
         frameworks.push("typescript".to_string());
     }
     if all_content.contains("python") || all_content.contains(".py") {

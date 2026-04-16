@@ -195,21 +195,33 @@ mod tests {
         let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(session_start.len(), 2); // GSD + new CSR
         let gsd_cmd = session_start[0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(gsd_cmd.contains("gsd-check-update"), "GSD hook should survive");
+        assert!(
+            gsd_cmd.contains("gsd-check-update"),
+            "GSD hook should survive"
+        );
         let csr_cmd = session_start[1]["hooks"][0]["command"].as_str().unwrap();
-        assert!(csr_cmd.contains("csr-engine"), "New CSR hook should be added");
+        assert!(
+            csr_cmd.contains("csr-engine"),
+            "New CSR hook should be added"
+        );
 
         // Python hooks should be replaced with Rust hooks
         let session_end = settings["hooks"]["SessionEnd"].as_array().unwrap();
         assert_eq!(session_end.len(), 1); // Only new CSR, Python removed
         let cmd = session_end[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("csr-engine"), "Python hook should be replaced");
-        assert!(!cmd.contains("session_end_hook.py"), "Python hook must be gone");
+        assert!(
+            !cmd.contains("session_end_hook.py"),
+            "Python hook must be gone"
+        );
 
         let precompact = settings["hooks"]["PreCompact"].as_array().unwrap();
         assert_eq!(precompact.len(), 1);
         let cmd = precompact[0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("csr-engine"), "Python precompact should be replaced");
+        assert!(
+            cmd.contains("csr-engine"),
+            "Python precompact should be replaced"
+        );
     }
 
     #[test]

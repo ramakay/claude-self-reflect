@@ -73,7 +73,7 @@ fn build_prompt(ctx: &StoryContext) -> String {
                 rel.summary
             ));
         }
-        prompt.push_str("\n");
+        prompt.push('\n');
     }
 
     prompt.push_str(
@@ -358,17 +358,11 @@ async fn generate_and_store(
     .await?;
 
     // Mark as completed so retries and races skip this conversation
-    let _ = engine.storage().mark_enrichment_completed(
-        conv_id,
-        "session_story",
-        &reflection_id,
-    );
+    let _ = engine
+        .storage()
+        .mark_enrichment_completed(conv_id, "session_story", &reflection_id);
 
-    log_story_event(
-        project,
-        conv_id,
-        &format!("stored:{}chars", story.len()),
-    );
+    log_story_event(project, conv_id, &format!("stored:{}chars", story.len()));
     eprintln!("CSR: stored session story ({} chars)", story.len());
     Ok(())
 }
@@ -414,13 +408,7 @@ pub fn spawn_detached_story_generation(transcript: &str, cwd: &str) {
     };
 
     match std::process::Command::new(exe)
-        .args([
-            "generate-story",
-            "--transcript",
-            transcript,
-            "--cwd",
-            cwd,
-        ])
+        .args(["generate-story", "--transcript", transcript, "--cwd", cwd])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit()) // keep stderr for debug logs
@@ -439,10 +427,7 @@ pub fn spawn_detached_story_generation(transcript: &str, cwd: &str) {
 
 /// Backfill stories for all conversations that have V3/heuristic enrichment but no story.
 /// Tier 1: V3 → synthesize locally (free). Tier 2: Heuristic → template (free).
-pub async fn backfill_stories_cli(
-    engine: &Engine,
-    dry_run: bool,
-) -> anyhow::Result<()> {
+pub async fn backfill_stories_cli(engine: &Engine, dry_run: bool) -> anyhow::Result<()> {
     let candidates = engine.storage().get_conversations_missing_stories()?;
     eprintln!("CSR: {} conversations missing stories", candidates.len());
 
@@ -466,7 +451,9 @@ pub async fn backfill_stories_cli(
             crate::extraction::story::synthesize_story_from_v3(&content, &project)
         } else {
             tier2 += 1;
-            Some(crate::extraction::story::synthesize_story_from_heuristic(&content, &project))
+            Some(crate::extraction::story::synthesize_story_from_heuristic(
+                &content, &project,
+            ))
         };
 
         if let Some(story_text) = story {
@@ -489,10 +476,18 @@ pub async fn backfill_stories_cli(
                     .storage()
                     .mark_enrichment_completed(conv_id, "session_story", &story_id)?;
             }
-            let cid_short = if conv_id.len() > 8 { &conv_id[..8] } else { conv_id };
+            let cid_short = if conv_id.len() > 8 {
+                &conv_id[..8]
+            } else {
+                conv_id
+            };
             eprintln!(
                 "  [{}] {} ({}chars)",
-                if enrichment_type == "extracted_v3" { "V3" } else { "heuristic" },
+                if enrichment_type == "extracted_v3" {
+                    "V3"
+                } else {
+                    "heuristic"
+                },
                 cid_short,
                 story_text.len()
             );
@@ -518,7 +513,10 @@ fn log_story_event(project: &str, conv_id: &str, event: &str) {
         } else {
             conv_id
         };
-        let line = format!("{} CSR story [{}] conv={}: {}\n", ts, project, cid_short, event);
+        let line = format!(
+            "{} CSR story [{}] conv={}: {}\n",
+            ts, project, cid_short, event
+        );
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -603,7 +601,11 @@ mod tests {
         assert!(!result.contains("msg-50"));
         // 11 entries: 5 first + 1 gap + 5 last
         let line_count = result.lines().count();
-        assert_eq!(line_count, 11, "expected 11 lines (5+1+5), got {}", line_count);
+        assert_eq!(
+            line_count, 11,
+            "expected 11 lines (5+1+5), got {}",
+            line_count
+        );
     }
 
     #[test]

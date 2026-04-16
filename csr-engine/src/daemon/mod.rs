@@ -13,8 +13,8 @@ use anyhow::Result;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
-use crate::api::{AnthropicClient, BatchClient};
 use crate::api::types::BatchRequest;
+use crate::api::{AnthropicClient, BatchClient};
 use crate::embeddings::EmbeddingEngine;
 use crate::extraction;
 use crate::import;
@@ -265,10 +265,8 @@ async fn process_v3_extraction(
     // Embed the search_index
     let search_index = result.search_index.clone();
     let emb = embeddings.clone();
-    let embeddings_vec = tokio::task::spawn_blocking(move || {
-        emb.embed(&[search_index.as_str()])
-    })
-    .await??;
+    let embeddings_vec =
+        tokio::task::spawn_blocking(move || emb.embed(&[search_index.as_str()])).await??;
 
     if let Some(embedding) = embeddings_vec.into_iter().next() {
         let reflection_id = format!("extracted_v3_{conv_id}");
@@ -309,6 +307,7 @@ async fn process_v3_extraction(
 const MIN_FILE_SIZE: u64 = 50_000;
 
 /// Layer 3 narrator loop: accumulates conversations and submits batch API requests.
+#[allow(clippy::too_many_arguments)]
 async fn narrator_loop(
     storage: Arc<Storage>,
     embeddings: Arc<EmbeddingEngine>,
@@ -362,10 +361,7 @@ async fn narrator_loop_inner(
 
     // Submit batch when enough conversations accumulate or timeout
     if unenriched.len() >= batch_size || (time_elapsed && !unenriched.is_empty()) {
-        tracing::info!(
-            count = unenriched.len(),
-            "submitting AI narrative batch"
-        );
+        tracing::info!(count = unenriched.len(), "submitting AI narrative batch");
 
         // Build batch requests
         let skill_prompt = load_skill_prompt();
@@ -476,6 +472,7 @@ async fn narrator_loop_inner(
 }
 
 /// Poll a submitted batch until completion, then store results. Runs as a separate task (D-7).
+#[allow(clippy::too_many_arguments)]
 async fn poll_batch_results(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
@@ -547,17 +544,12 @@ async fn store_narrative(
 ) -> Result<()> {
     let narrative_owned = narrative.to_string();
     let emb = embeddings.clone();
-    let embeddings_vec = tokio::task::spawn_blocking(move || {
-        emb.embed(&[narrative_owned.as_str()])
-    })
-    .await??;
+    let embeddings_vec =
+        tokio::task::spawn_blocking(move || emb.embed(&[narrative_owned.as_str()])).await??;
 
     if let Some(embedding) = embeddings_vec.into_iter().next() {
         let reflection_id = format!("ai_narrative_{conv_id}");
-        let tags = vec![
-            "narrative_ai".to_string(),
-            format!("conv_{conv_id}"),
-        ];
+        let tags = vec!["narrative_ai".to_string(), format!("conv_{conv_id}")];
 
         storage.insert_reflection(&reflection_id, narrative, &tags, &embedding)?;
         let mut idx = search.write().await;

@@ -15,7 +15,7 @@ use super::InjectionContext;
 
 /// Approximate token count (chars / 4, standard heuristic).
 pub fn estimate_tokens(text: &str) -> usize {
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 /// Sanitize content for safe injection into formatted output.
@@ -39,7 +39,10 @@ pub fn sanitize_for_injection(content: &str) -> String {
 
         // Strip markdown heading markers (## Foo -> Foo), but only actual headings (# followed by space)
         // Preserves lines like "# of items: 5" where # is not a heading (F3 fix)
-        let cleaned = if trimmed.starts_with("# ") || trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+        let cleaned = if trimmed.starts_with("# ")
+            || trimmed.starts_with("## ")
+            || trimmed.starts_with("### ")
+        {
             trimmed.trim_start_matches('#').trim()
         } else {
             trimmed
@@ -152,11 +155,7 @@ pub fn format_with_budget(ctx: &InjectionContext, max_tokens: usize) -> String {
 }
 
 /// Format a category of items within a character budget.
-fn format_category(
-    title: &str,
-    items: &[super::InjectionItem],
-    max_chars: usize,
-) -> String {
+fn format_category(title: &str, items: &[super::InjectionItem], max_chars: usize) -> String {
     let header = format!("## {}\n", title);
     if header.len() >= max_chars {
         return String::new();
@@ -178,7 +177,8 @@ fn format_category(
             budget -= line.len();
         } else {
             // Truncate this item to fit remaining budget
-            let truncated = truncate_item(&single_line, budget.saturating_sub(item.source.len() + 8));
+            let truncated =
+                truncate_item(&single_line, budget.saturating_sub(item.source.len() + 8));
             let line = format!("- [{}] {}\n", item.source, truncated);
             section.push_str(&line);
             break;
@@ -258,7 +258,10 @@ mod tests {
         let output = ctx.format(300);
         let anti_pos = output.find("DON'T RETRY").unwrap();
         let win_pos = output.find("PROVEN APPROACHES").unwrap();
-        assert!(anti_pos < win_pos, "anti-patterns must come before winning strategies");
+        assert!(
+            anti_pos < win_pos,
+            "anti-patterns must come before winning strategies"
+        );
     }
 
     #[test]

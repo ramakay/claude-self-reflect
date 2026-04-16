@@ -54,35 +54,32 @@ pub async fn reflect_on_past(
     let mut enriched: Vec<EnrichedResult> = chunk_results
         .iter()
         .filter_map(|r| {
-            chunks
-                .iter()
-                .find(|c| c.id == r.id)
-                .map(|c| {
-                    let decayed_score =
-                        if let Ok(ts) = c.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
-                            decay::apply_decay(r.score, &ts, &now, None, None)
-                        } else {
-                            r.score
-                        };
-                    EnrichedResult {
-                        score: decayed_score,
-                        chunk: c.clone(),
-                    }
-                })
+            chunks.iter().find(|c| c.id == r.id).map(|c| {
+                let decayed_score =
+                    if let Ok(ts) = c.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
+                        decay::apply_decay(r.score, &ts, &now, None, None)
+                    } else {
+                        r.score
+                    };
+                EnrichedResult {
+                    score: decayed_score,
+                    chunk: c.clone(),
+                }
+            })
         })
         .collect();
 
     // Enrich reflection results — convert to EnrichedResult using reflection content
     for r in &reflection_results {
         if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&r.id) {
-            let decayed_score =
-                if let Some(ts) = crate::temporal::parse_timestamp(&timestamp) {
-                    decay::apply_decay(r.score, &ts, &now, None, None)
-                } else {
-                    r.score
-                };
+            let decayed_score = if let Some(ts) = crate::temporal::parse_timestamp(&timestamp) {
+                decay::apply_decay(r.score, &ts, &now, None, None)
+            } else {
+                r.score
+            };
             // Determine project from tags
-            let project_name = tags.iter()
+            let project_name = tags
+                .iter()
                 .find(|t| t.starts_with("project_"))
                 .map(|t| t.trim_start_matches("project_").to_string())
                 .unwrap_or_else(|| "unknown".to_string());
@@ -120,18 +117,20 @@ pub async fn reflect_on_past(
     if semantic_top_score < 0.5 {
         let fts_project = effective_project.as_deref();
         if let Ok(fts_chunks) = storage.fts5_search(query, limit, fts_project) {
-            let existing_ids: HashSet<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
+            let existing_ids: HashSet<String> =
+                enriched.iter().map(|e| e.chunk.id.clone()).collect();
             for chunk in fts_chunks {
                 if existing_ids.contains(&chunk.id) {
                     continue; // already in semantic results
                 }
                 // FTS5 results get a synthetic score slightly below semantic threshold
                 // so they rank after good semantic matches but above nothing
-                let fts_score = if let Ok(ts) = chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
-                    decay::apply_decay(0.45, &ts, &now, None, None) // base 0.45 + decay
-                } else {
-                    0.40
-                };
+                let fts_score =
+                    if let Ok(ts) = chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
+                        decay::apply_decay(0.45, &ts, &now, None, None) // base 0.45 + decay
+                    } else {
+                        0.40
+                    };
                 enriched.push(EnrichedResult {
                     score: fts_score,
                     chunk: crate::import::ConversationChunk {
@@ -144,7 +143,11 @@ pub async fn reflect_on_past(
     }
 
     // Sort merged results by score and take top N
-    enriched.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    enriched.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     enriched.truncate(limit);
 
     Ok(format::format_search_results(
@@ -259,6 +262,7 @@ pub async fn get_recent_work(
 }
 
 /// Time-constrained semantic search.
+#[allow(clippy::too_many_arguments)]
 pub async fn search_by_recency(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
@@ -375,6 +379,7 @@ pub async fn search_by_concept(
 }
 
 /// Pagination — get more results at offset.
+#[allow(clippy::too_many_arguments)]
 pub async fn get_more_results(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
@@ -451,7 +456,7 @@ pub fn get_full_conversation(
         if let Ok(files) = std::fs::read_dir(dir) {
             for entry in files.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "jsonl") {
+                if path.extension().is_some_and(|ext| ext == "jsonl") {
                     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
                     if stem.contains(conversation_id) || &*stem == conversation_id {
                         let project_name = dir
@@ -496,7 +501,7 @@ pub fn get_session_learnings(
 async fn embed_query(embeddings: &Arc<EmbeddingEngine>, query: &str) -> Result<Vec<f32>> {
     let q = query.to_string();
     let emb = embeddings.clone();
-    Ok(tokio::task::spawn_blocking(move || emb.embed_single(&q)).await??)
+    tokio::task::spawn_blocking(move || emb.embed_single(&q)).await?
 }
 
 /// Enrich search results with chunk metadata from storage.

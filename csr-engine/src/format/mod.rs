@@ -81,14 +81,20 @@ pub fn format_search_results(
             relevance,
             top_score,
         ));
-        out.push_str(&format!("    <preview>{}</preview>\n", xml_escape(&preview_short)));
+        out.push_str(&format!(
+            "    <preview>{}</preview>\n",
+            xml_escape(&preview_short)
+        ));
         out.push_str("  </summary>\n");
     }
 
     // Meta
     out.push_str("  <meta>\n");
     out.push_str(&format!("    <q>{}</q>\n", xml_escape(query)));
-    out.push_str(&format!("    <scope>{}</scope>\n", xml_escape(project_scope)));
+    out.push_str(&format!(
+        "    <scope>{}</scope>\n",
+        xml_escape(project_scope)
+    ));
     out.push_str(&format!("    <count>{}</count>\n", results.len()));
     if !results.is_empty() {
         let last_score = results.last().unwrap().score;
@@ -110,7 +116,10 @@ pub fn format_search_results(
     for (i, r) in results.iter().enumerate() {
         out.push_str(&format!("    <r rank=\"{}\">\n", i + 1));
         out.push_str(&format!("      <s>{:.3}</s>\n", r.score));
-        out.push_str(&format!("      <p>{}</p>\n", xml_escape(&r.chunk.project_name)));
+        out.push_str(&format!(
+            "      <p>{}</p>\n",
+            xml_escape(&r.chunk.project_name)
+        ));
 
         // Relative time
         if let Some(ts) = parse_timestamp(&r.chunk.timestamp) {
@@ -126,7 +135,10 @@ pub fn format_search_results(
 
         // Excerpt
         let excerpt = &r.chunk.content;
-        out.push_str(&format!("      <excerpt><![CDATA[{}]]></excerpt>\n", excerpt));
+        out.push_str(&format!(
+            "      <excerpt><![CDATA[{}]]></excerpt>\n",
+            excerpt
+        ));
 
         // Conversation ID
         out.push_str(&format!("      <cid>{}</cid>\n", r.chunk.conversation_id));
@@ -140,10 +152,7 @@ pub fn format_search_results(
 }
 
 /// Format a quick check response matching the Python server output.
-pub fn format_quick_check(
-    results: &[EnrichedResult],
-    _query: &str,
-) -> String {
+pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
     let mut out = String::new();
 
     out.push_str("<quick_search>\n");
@@ -153,13 +162,19 @@ pub fn format_quick_check(
     if let Some(top) = results.first() {
         out.push_str("  <top_result>\n");
         out.push_str(&format!("    <score>{:.3}</score>\n", top.score));
-        out.push_str(&format!("    <timestamp>{}</timestamp>\n", top.chunk.timestamp));
+        out.push_str(&format!(
+            "    <timestamp>{}</timestamp>\n",
+            top.chunk.timestamp
+        ));
         let preview = if top.chunk.content.len() > 200 {
             format!("{}...", &top.chunk.content[..200])
         } else {
             top.chunk.content.clone()
         };
-        out.push_str(&format!("    <preview>{}</preview>\n", xml_escape(&preview)));
+        out.push_str(&format!(
+            "    <preview>{}</preview>\n",
+            xml_escape(&preview)
+        ));
         out.push_str("  </top_result>\n");
     }
 
@@ -168,10 +183,7 @@ pub fn format_quick_check(
 }
 
 /// Format search insights/summary as XML.
-pub fn format_search_insights(
-    results: &[EnrichedResult],
-    query: &str,
-) -> String {
+pub fn format_search_insights(results: &[EnrichedResult], query: &str) -> String {
     let mut out = String::new();
 
     if results.is_empty() {
@@ -182,9 +194,15 @@ pub fn format_search_insights(
 
     out.push_str("<search_summary>\n");
     out.push_str(&format!("  <query>{}</query>\n", xml_escape(query)));
-    out.push_str(&format!("  <total_matches>{}</total_matches>\n", results.len()));
-    out.push_str(&format!("  <average_score>{:.3}</average_score>\n", avg_score));
-    out.push_str(&format!("  <collections_matched>1</collections_matched>\n"));
+    out.push_str(&format!(
+        "  <total_matches>{}</total_matches>\n",
+        results.len()
+    ));
+    out.push_str(&format!(
+        "  <average_score>{:.3}</average_score>\n",
+        avg_score
+    ));
+    out.push_str("  <collections_matched>1</collections_matched>\n");
     out.push_str(&format!(
         "  <insight>Found {} matches with average relevance of {:.3}</insight>\n",
         results.len(),
@@ -195,10 +213,7 @@ pub fn format_search_insights(
 }
 
 /// Format recent work results as XML.
-pub fn format_recent_work(
-    chunks: &[ConversationChunk],
-    group_by: &str,
-) -> String {
+pub fn format_recent_work(chunks: &[ConversationChunk], group_by: &str) -> String {
     let mut out = String::new();
 
     if chunks.is_empty() {
@@ -247,15 +262,9 @@ pub fn format_recent_work(
                     .push(chunk);
             }
 
-            out.push_str(&format!(
-                "<recent_work conversations='{}'>\n",
-                convs.len()
-            ));
+            out.push_str(&format!("<recent_work conversations='{}'>\n", convs.len()));
             for (conv_id, conv_chunks) in convs.iter().rev() {
-                let most_recent = conv_chunks
-                    .iter()
-                    .max_by_key(|c| &c.timestamp)
-                    .unwrap();
+                let most_recent = conv_chunks.iter().max_by_key(|c| &c.timestamp).unwrap();
                 let preview = if most_recent.content.len() > 200 {
                     format!("{}...", &most_recent.content[..200])
                 } else {
@@ -266,7 +275,10 @@ pub fn format_recent_work(
                     "  <conversation id='{}' time='{}' project='{}'>\n",
                     conv_id, relative, most_recent.project_name
                 ));
-                out.push_str(&format!("    <preview>{}</preview>\n", xml_escape(&preview)));
+                out.push_str(&format!(
+                    "    <preview>{}</preview>\n",
+                    xml_escape(&preview)
+                ));
                 out.push_str("  </conversation>\n");
             }
             out.push_str("</recent_work>");
@@ -311,7 +323,10 @@ pub fn format_recency_results(
             r.score,
             relative
         ));
-        out.push_str(&format!("    <preview>{}</preview>\n", xml_escape(&preview)));
+        out.push_str(&format!(
+            "    <preview>{}</preview>\n",
+            xml_escape(&preview)
+        ));
         out.push_str(&format!(
             "    <conversation_id>{}</conversation_id>\n",
             xml_escape(&r.chunk.conversation_id)
@@ -347,10 +362,7 @@ pub fn format_timeline(
             period_key,
             chunks.len()
         ));
-        out.push_str(&format!(
-            "    <stats messages='{}'/>\n",
-            msg_count
-        ));
+        out.push_str(&format!("    <stats messages='{}'/>\n", msg_count));
         out.push_str("  </period>\n");
     }
 
@@ -377,8 +389,14 @@ pub fn format_more_results(
     out.push_str("<more_results>\n");
     out.push_str(&format!("  <query>{}</query>\n", xml_escape(query)));
     out.push_str(&format!("  <offset>{}</offset>\n", offset));
-    out.push_str(&format!("  <results_returned>{}</results_returned>\n", results.len()));
-    out.push_str(&format!("  <total_available>{}</total_available>\n", total_available));
+    out.push_str(&format!(
+        "  <results_returned>{}</results_returned>\n",
+        results.len()
+    ));
+    out.push_str(&format!(
+        "  <total_available>{}</total_available>\n",
+        total_available
+    ));
 
     for (i, r) in results.iter().enumerate() {
         let preview = if r.chunk.content.len() > 200 {
@@ -386,13 +404,16 @@ pub fn format_more_results(
         } else {
             r.chunk.content.clone()
         };
-        out.push_str(&format!(
-            "  <result index=\"{}\">\n",
-            offset + i + 1
-        ));
+        out.push_str(&format!("  <result index=\"{}\">\n", offset + i + 1));
         out.push_str(&format!("    <score>{:.3}</score>\n", r.score));
-        out.push_str(&format!("    <timestamp>{}</timestamp>\n", xml_escape(&r.chunk.timestamp)));
-        out.push_str(&format!("    <preview>{}</preview>\n", xml_escape(&preview)));
+        out.push_str(&format!(
+            "    <timestamp>{}</timestamp>\n",
+            xml_escape(&r.chunk.timestamp)
+        ));
+        out.push_str(&format!(
+            "    <preview>{}</preview>\n",
+            xml_escape(&preview)
+        ));
         out.push_str("  </result>\n");
     }
 
@@ -401,10 +422,7 @@ pub fn format_more_results(
 }
 
 /// Format file-based search results.
-pub fn format_file_results(
-    chunks: &[ConversationChunk],
-    file_path: &str,
-) -> String {
+pub fn format_file_results(chunks: &[ConversationChunk], file_path: &str) -> String {
     let mut out = String::new();
 
     if chunks.is_empty() {
@@ -432,7 +450,10 @@ pub fn format_file_results(
             i + 1,
             relative
         ));
-        out.push_str(&format!("    <preview>{}</preview>\n", xml_escape(&preview)));
+        out.push_str(&format!(
+            "    <preview>{}</preview>\n",
+            xml_escape(&preview)
+        ));
         out.push_str(&format!(
             "    <conversation_id>{}</conversation_id>\n",
             xml_escape(&chunk.conversation_id)
@@ -491,12 +512,15 @@ pub fn format_session_learnings(
                 .map(|t| t.strip_prefix("iteration_").unwrap_or("unknown"))
                 .unwrap_or("unknown");
 
+            out.push_str(&format!("    <learning iteration=\"{}\">\n", iteration));
             out.push_str(&format!(
-                "    <learning iteration=\"{}\">\n",
-                iteration
+                "      <timestamp>{}</timestamp>\n",
+                xml_escape(timestamp)
             ));
-            out.push_str(&format!("      <timestamp>{}</timestamp>\n", xml_escape(timestamp)));
-            out.push_str(&format!("      <content>{}</content>\n", xml_escape(content)));
+            out.push_str(&format!(
+                "      <content>{}</content>\n",
+                xml_escape(content)
+            ));
             out.push_str(&format!(
                 "      <tags>{}</tags>\n",
                 xml_escape(&tags.join(", "))

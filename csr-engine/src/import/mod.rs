@@ -23,8 +23,7 @@ pub struct ConversationChunk {
 
 /// Namespace UUID for deterministic chunk IDs (UUIDv5).
 const CSR_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30,
-    0xc8,
+    0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ]);
 
 /// Normalize project name from Claude's dash-separated directory format.
@@ -60,11 +59,7 @@ pub fn normalize_project_name(dir_name: &str) -> String {
     if final_component.is_empty() {
         // Fallback: parent name
         let parent = trimmed.trim_end_matches('/');
-        parent
-            .rsplit('/')
-            .nth(1)
-            .unwrap_or(parent)
-            .to_string()
+        parent.rsplit('/').nth(1).unwrap_or(parent).to_string()
     } else {
         final_component.to_string()
     }
@@ -103,7 +98,7 @@ pub fn list_jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "jsonl") {
+        if path.extension().is_some_and(|ext| ext == "jsonl") {
             files.push(path);
         }
     }
@@ -146,10 +141,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
         };
 
         // Extract message type
-        let msg_type = parsed
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         // Capture summary line (Claude Code writes {"type":"summary","summary":"..."})
         if msg_type == "summary" {
@@ -259,10 +251,7 @@ pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
             Err(_) => continue,
         };
 
-        let msg_type = parsed
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if msg_type == "human" || msg_type == "user" || msg_type == "assistant" {
             messages.push(parsed);
         }
@@ -332,7 +321,10 @@ fn extract_tool_context(msg: &serde_json::Value) -> String {
             continue;
         }
 
-        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+        let name = item
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("unknown");
         let input = match item.get("input") {
             Some(i) => i,
             None => {

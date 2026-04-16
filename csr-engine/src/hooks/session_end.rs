@@ -16,11 +16,7 @@ use crate::mcp::tools;
 use crate::search::cross_project::resolve_project_from_cwd;
 
 /// Handle the session-end hook.
-pub async fn handle(
-    input: &HookInput,
-    engine: &Engine,
-    cwd: &Path,
-) -> Result<()> {
+pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
     // 1. Final transcript import (shared helper, incremental)
     super::import_current_transcript(input, engine, cwd).await;
 
@@ -165,32 +161,28 @@ async fn run_v3_extraction(engine: &Engine, transcript_path: &Path, cwd: &Path) 
 
     let emb = engine.embeddings().clone();
     let search_idx = result.search_index.clone();
-    let embedding = tokio::task::spawn_blocking(move || emb.embed(&[search_idx.as_str()]))
-        .await??;
+    let embedding =
+        tokio::task::spawn_blocking(move || emb.embed(&[search_idx.as_str()])).await??;
 
     if let Some(vec) = embedding.into_iter().next() {
         // Supersede heuristic: delete old Layer 1 reflection if it exists
-        if let Ok(Some(old_id)) =
-            engine.storage().get_enrichment_reflection_id(&conv_id, "heuristic")
+        if let Ok(Some(old_id)) = engine
+            .storage()
+            .get_enrichment_reflection_id(&conv_id, "heuristic")
         {
             let _ = engine.storage().delete_reflection(&old_id);
             // Remove from search index too
             // (insert_reflection with same slot handles dedup in HNSW)
         }
 
-        engine.storage().insert_reflection(
-            &reflection_id,
-            &result.search_index,
-            &tags,
-            &vec,
-        )?;
+        engine
+            .storage()
+            .insert_reflection(&reflection_id, &result.search_index, &tags, &vec)?;
         let mut idx = engine.search().write().await;
         idx.insert_reflection(reflection_id.clone(), vec);
-        engine.storage().mark_enrichment_completed(
-            &conv_id,
-            "extracted_v3",
-            &reflection_id,
-        )?;
+        engine
+            .storage()
+            .mark_enrichment_completed(&conv_id, "extracted_v3", &reflection_id)?;
 
         eprintln!(
             "CSR: V3 search index stored ({} tokens, {} patterns, {} errors)",

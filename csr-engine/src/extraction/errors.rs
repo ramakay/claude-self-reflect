@@ -56,8 +56,8 @@ pub fn extract_error_context(messages: &[Value], error_index: usize) -> ErrorCon
     let end = messages.len().min(error_index + 15);
     let error_lower = error_text.to_lowercase();
 
-    for i in (error_index + 1)..end {
-        let check_data = get_message_data(&messages[i]);
+    for msg in &messages[(error_index + 1)..end] {
+        let check_data = get_message_data(msg);
         let check_str = content_to_lower(&check_data);
 
         // Explicit resolution

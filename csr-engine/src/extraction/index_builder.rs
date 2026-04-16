@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use super::ast_analysis::CodeContext;
 use super::errors::ErrorContext;
-use super::patterns::EditPattern;
 use super::get_message_data;
+use super::patterns::EditPattern;
 
 /// Build a ~500-token search index optimized for keyword matching.
 ///
@@ -63,11 +63,7 @@ pub fn build_search_index(
     if !patterns.is_empty() {
         parts.push("## Solution Pattern".to_string());
         for p in patterns.iter().take(3) {
-            let file_short = p
-                .file
-                .rsplit('/')
-                .next()
-                .unwrap_or(&p.file);
+            let file_short = p.file.rsplit('/').next().unwrap_or(&p.file);
             parts.push(format!("{}: {}", p.operation_type, file_short));
             parts.push(format!("  {}", p.pattern_description));
         }
@@ -194,9 +190,21 @@ mod tests {
         code_ctx.patterns.insert("async".to_string());
 
         let index = build_search_index(&[], &[], &[], &code_ctx);
-        assert!(index.contains("Code Context"), "index should have Code Context section: {}", index);
-        assert!(index.contains("dispatch_hook"), "index should contain function name: {}", index);
-        assert!(index.contains("Engine"), "index should contain type name: {}", index);
+        assert!(
+            index.contains("Code Context"),
+            "index should have Code Context section: {}",
+            index
+        );
+        assert!(
+            index.contains("dispatch_hook"),
+            "index should contain function name: {}",
+            index
+        );
+        assert!(
+            index.contains("Engine"),
+            "index should contain type name: {}",
+            index
+        );
     }
 
     #[test]

@@ -5,8 +5,8 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use std::time::Instant;
+use tokio::sync::RwLock;
 
 use crate::embeddings::EmbeddingEngine;
 use crate::search::SearchEngine;
@@ -124,11 +124,51 @@ pub async fn run_full(
     results.push(test_tool_count());
 
     // Semantic search tests (5)
-    results.push(test_semantic_search(embeddings, search, "docker container debugging", "semantic_docker").await);
-    results.push(test_semantic_search(embeddings, search, "MCP tool implementation", "semantic_mcp").await);
-    results.push(test_semantic_search(embeddings, search, "error handling strategies", "semantic_errors").await);
-    results.push(test_semantic_search(embeddings, search, "performance optimization", "semantic_perf").await);
-    results.push(test_semantic_search(embeddings, search, "authentication security", "semantic_auth").await);
+    results.push(
+        test_semantic_search(
+            embeddings,
+            search,
+            "docker container debugging",
+            "semantic_docker",
+        )
+        .await,
+    );
+    results.push(
+        test_semantic_search(
+            embeddings,
+            search,
+            "MCP tool implementation",
+            "semantic_mcp",
+        )
+        .await,
+    );
+    results.push(
+        test_semantic_search(
+            embeddings,
+            search,
+            "error handling strategies",
+            "semantic_errors",
+        )
+        .await,
+    );
+    results.push(
+        test_semantic_search(
+            embeddings,
+            search,
+            "performance optimization",
+            "semantic_perf",
+        )
+        .await,
+    );
+    results.push(
+        test_semantic_search(
+            embeddings,
+            search,
+            "authentication security",
+            "semantic_auth",
+        )
+        .await,
+    );
 
     // Storage / data quality tests (5)
     results.push(test_chunk_data_quality(storage));
@@ -205,7 +245,12 @@ async fn test_search_accuracy(
     let ms = t.elapsed().as_secs_f64() * 1000.0;
 
     if results.is_empty() {
-        EvalResult::fail("Search Accuracy", "search", ms, "No results returned".to_string())
+        EvalResult::fail(
+            "Search Accuracy",
+            "search",
+            ms,
+            "No results returned".to_string(),
+        )
     } else {
         let top_score = results[0].score;
         if top_score > 0.1 {
@@ -397,7 +442,12 @@ fn test_embedding_dimensions(embeddings: &Arc<EmbeddingEngine>) -> EvalResult {
             let dim = v.len();
             let ms = t.elapsed().as_secs_f64() * 1000.0;
             if dim == 384 {
-                EvalResult::pass("Embedding Dimensions", "data", ms, format!("{dim}d (FastEmbed)"))
+                EvalResult::pass(
+                    "Embedding Dimensions",
+                    "data",
+                    ms,
+                    format!("{dim}d (FastEmbed)"),
+                )
             } else {
                 EvalResult::fail(
                     "Embedding Dimensions",
@@ -458,9 +508,19 @@ fn test_db_integrity(storage: &Arc<Storage>) -> EvalResult {
         Ok(ok) => {
             let ms = t.elapsed().as_secs_f64() * 1000.0;
             if ok {
-                EvalResult::pass("DB Integrity", "data", ms, "PRAGMA integrity_check: ok".to_string())
+                EvalResult::pass(
+                    "DB Integrity",
+                    "data",
+                    ms,
+                    "PRAGMA integrity_check: ok".to_string(),
+                )
             } else {
-                EvalResult::fail("DB Integrity", "data", ms, "integrity check failed".to_string())
+                EvalResult::fail(
+                    "DB Integrity",
+                    "data",
+                    ms,
+                    "integrity check failed".to_string(),
+                )
             }
         }
         Err(e) => EvalResult::fail(
@@ -498,7 +558,12 @@ fn test_v3_extraction_works() -> EvalResult {
             ),
         )
     } else {
-        EvalResult::fail("V3 Extraction", "enrichment", ms, "empty output".to_string())
+        EvalResult::fail(
+            "V3 Extraction",
+            "enrichment",
+            ms,
+            "empty output".to_string(),
+        )
     }
 }
 
@@ -533,7 +598,12 @@ fn test_ast_analysis_works() -> EvalResult {
             ),
         )
     } else {
-        EvalResult::fail("AST Analysis", "enrichment", ms, "no code entities extracted".to_string())
+        EvalResult::fail(
+            "AST Analysis",
+            "enrichment",
+            ms,
+            "no code entities extracted".to_string(),
+        )
     }
 }
 
@@ -567,7 +637,11 @@ fn main() {
             "Quality Analysis",
             "enrichment",
             ms,
-            format!("unexpected: score={}, findings={}", report.score, report.findings.len()),
+            format!(
+                "unexpected: score={}, findings={}",
+                report.score,
+                report.findings.len()
+            ),
         )
     }
 }
@@ -590,7 +664,12 @@ fn test_batch_embedding_speed(embeddings: &Arc<EmbeddingEngine>) -> EvalResult {
                     "Batch Embed Speed",
                     "performance",
                     ms,
-                    format!("{:.1}ms/text ({} texts in {:.0}ms)", per_text, vecs.len(), ms),
+                    format!(
+                        "{:.1}ms/text ({} texts in {:.0}ms)",
+                        per_text,
+                        vecs.len(),
+                        ms
+                    ),
                 )
             } else {
                 EvalResult::fail(
@@ -644,7 +723,10 @@ async fn test_search_latency_p95(
 
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p95_idx = (latencies.len() as f64 * 0.95).ceil() as usize - 1;
-    let p95 = latencies.get(p95_idx.min(latencies.len() - 1)).copied().unwrap_or(0.0);
+    let p95 = latencies
+        .get(p95_idx.min(latencies.len() - 1))
+        .copied()
+        .unwrap_or(0.0);
     let ms = t.elapsed().as_secs_f64() * 1000.0;
 
     if p95 < 10.0 {
@@ -688,7 +770,11 @@ mod tests {
     #[test]
     fn test_v3_extraction_eval() {
         let result = test_v3_extraction_works();
-        assert!(result.passed, "V3 extraction should pass: {}", result.detail);
+        assert!(
+            result.passed,
+            "V3 extraction should pass: {}",
+            result.detail
+        );
     }
 
     #[test]
@@ -700,6 +786,10 @@ mod tests {
     #[test]
     fn test_quality_analysis_eval() {
         let result = test_quality_analysis_works();
-        assert!(result.passed, "Quality analysis should pass: {}", result.detail);
+        assert!(
+            result.passed,
+            "Quality analysis should pass: {}",
+            result.detail
+        );
     }
 }

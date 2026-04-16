@@ -83,7 +83,8 @@ pub fn apply_decay_unified(
         return score;
     }
     let time_factor = 2.0_f64.powf(-age_days / config.base_half_life_days);
-    let adjusted = (score as f64) * ((1.0 - config.decay_weight) + config.decay_weight * time_factor);
+    let adjusted =
+        (score as f64) * ((1.0 - config.decay_weight) + config.decay_weight * time_factor);
     adjusted as f32
 }
 
@@ -124,7 +125,8 @@ pub fn apply_tad(
     }
 
     let time_factor = 2.0_f64.powf(-age_days / effective_half_life);
-    let adjusted = (score as f64) * ((1.0 - config.decay_weight) + config.decay_weight * time_factor);
+    let adjusted =
+        (score as f64) * ((1.0 - config.decay_weight) + config.decay_weight * time_factor);
     adjusted as f32
 }
 
