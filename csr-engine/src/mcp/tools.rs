@@ -51,13 +51,25 @@ pub async fn reflect_on_past(
     let chunks = storage.get_chunks_by_ids(&chunk_ids)?;
 
     let now = chrono::Utc::now();
+
+    // Batch-fetch TAD events for all chunk results (single DB query)
+    let chunk_ids_for_tad: Vec<&str> = chunk_results.iter().map(|r| r.id.as_str()).collect();
+    let tad_events = storage
+        .get_retrieval_events_batch(&chunk_ids_for_tad)
+        .unwrap_or_default();
+    let tad_config = decay::DecayConfig::for_search();
+
     let mut enriched: Vec<EnrichedResult> = chunk_results
         .iter()
         .filter_map(|r| {
             chunks.iter().find(|c| c.id == r.id).map(|c| {
                 let decayed_score =
                     if let Ok(ts) = c.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
-                        decay::apply_decay(r.score, &ts, &now, None, None)
+                        let events = tad_events
+                            .get(&c.id)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
+                        decay::apply_tad(r.score, &ts, &now, events, &tad_config)
                     } else {
                         r.score
                     };
@@ -69,11 +81,22 @@ pub async fn reflect_on_past(
         })
         .collect();
 
+    // Batch-fetch TAD events for reflection results
+    let reflection_ids_for_tad: Vec<&str> =
+        reflection_results.iter().map(|r| r.id.as_str()).collect();
+    let reflection_tad_events = storage
+        .get_retrieval_events_batch(&reflection_ids_for_tad)
+        .unwrap_or_default();
+
     // Enrich reflection results — convert to EnrichedResult using reflection content
     for r in &reflection_results {
         if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&r.id) {
             let decayed_score = if let Some(ts) = crate::temporal::parse_timestamp(&timestamp) {
-                decay::apply_decay(r.score, &ts, &now, None, None)
+                let events = reflection_tad_events
+                    .get(&r.id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                decay::apply_tad(r.score, &ts, &now, events, &tad_config)
             } else {
                 r.score
             };
