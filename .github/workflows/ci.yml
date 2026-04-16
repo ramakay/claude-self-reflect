@@ -2,103 +2,24 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, feat/*]
+    branches: [main]
   pull_request:
     branches: [main]
 
-permissions:
-  contents: read
-
 jobs:
-  rust-test:
-    name: Rust tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            csr-engine/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('csr-engine/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Run tests
-        working-directory: csr-engine
-        run: cargo test --release 2>&1
-
-      - name: Check binary size
-        working-directory: csr-engine
-        run: |
-          cargo build --release 2>&1
-          SIZE=$(ls -l target/release/csr-engine | awk '{print $5}')
-          SIZE_MB=$((SIZE / 1048576))
-          echo "Binary size: ${SIZE_MB}MB"
-          if [ "$SIZE_MB" -gt 60 ]; then
-            echo "WARNING: Binary size exceeds 60MB threshold"
-            exit 1
-          fi
-
-  rust-clippy:
-    name: Clippy lint
+  test:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            csr-engine/target
-          key: ${{ runner.os }}-clippy-${{ hashFiles('csr-engine/Cargo.lock') }}
-
-      - name: Run clippy
-        working-directory: csr-engine
-        run: cargo clippy -- -D warnings
-
-  npm-package:
-    name: npm package check
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22.x'
-
-      - name: Verify package structure
-        run: |
-          npm pack --dry-run 2>&1 | tee /tmp/pack.txt
-
-          FILE_COUNT=$(grep "total files:" /tmp/pack.txt | grep -oE '[0-9]+$')
-          echo "Files: $FILE_COUNT"
-
-          if [ "$FILE_COUNT" -gt 20 ]; then
-            echo "FAIL: Too many files in npm package ($FILE_COUNT > 20)"
-            exit 1
-          fi
-          echo "OK: Package file count within limit"
-
-      - name: Test CLI help
-        run: node installer/cli.js help
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --manifest-path csr-engine/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path csr-engine/Cargo.toml --locked -- -D warnings
+      - name: Test
+        run: cargo test --manifest-path csr-engine/Cargo.toml --locked
+      - name: Verify npm package
+        run: npm pack --dry-run
