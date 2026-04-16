@@ -347,4 +347,12 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_retrieval_events_for_memory(&conn, memory_id)
     }
+
+    pub fn get_retrieval_events_batch(
+        &self,
+        memory_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Vec<crate::search::decay::RetrievalEvent>>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_retrieval_events_batch(&conn, memory_ids)
+    }
 }

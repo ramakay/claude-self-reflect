@@ -376,7 +376,10 @@ fn test_format_search_results_structure() {
     assert!(xml.contains("</search>"), "should close search tag");
     assert!(xml.contains("0.850"), "should contain score");
     assert!(xml.contains("test-project"), "should contain project name");
-    assert!(xml.contains("Docker memory fix applied"), "should contain content");
+    assert!(
+        xml.contains("Docker memory fix applied"),
+        "should contain content"
+    );
     assert!(xml.contains("conv-1"), "should contain conversation ID");
 }
 
@@ -731,8 +734,12 @@ fn test_enrichment_failure_tracking() {
 fn test_batch_id_tracking() {
     let storage = Storage::open_memory().unwrap();
 
-    storage.set_batch_id("conv-1", "batch_abc", "hash_123").unwrap();
-    storage.set_batch_id("conv-2", "batch_abc", "hash_123").unwrap();
+    storage
+        .set_batch_id("conv-1", "batch_abc", "hash_123")
+        .unwrap();
+    storage
+        .set_batch_id("conv-2", "batch_abc", "hash_123")
+        .unwrap();
 
     let convs = storage.get_conversations_by_batch("batch_abc").unwrap();
     assert_eq!(convs.len(), 2);
@@ -751,10 +758,7 @@ fn test_reflection_deletion() {
     assert!(storage.get_reflection_by_id("to-delete").unwrap().is_some());
 
     storage.delete_reflection("to-delete").unwrap();
-    assert!(storage
-        .get_reflection_by_id("to-delete")
-        .unwrap()
-        .is_none());
+    assert!(storage.get_reflection_by_id("to-delete").unwrap().is_none());
 }
 
 #[test]
@@ -980,7 +984,10 @@ fn test_hnsw_persistence_soft_delete() {
     query[2] = 1.0; // Most similar to refl-2
     let results = loaded.search_reflections(&query, 10, 0.0);
     for r in &results {
-        assert_ne!(r.id, "refl-2", "removed reflection should not appear after reload");
+        assert_ne!(
+            r.id, "refl-2",
+            "removed reflection should not appear after reload"
+        );
     }
 }
 
@@ -1043,26 +1050,24 @@ fn test_lapi_phase_aware_scoring() {
     ];
 
     // PromptSubmit: chunks should rank higher (semantic weight dominates)
-    let prompt_scored = predictor::rank_results(
-        results.clone(),
-        &[],
-        &[],
-        Some(HookPhase::PromptSubmit),
-    );
+    let prompt_scored =
+        predictor::rank_results(results.clone(), &[], &[], Some(HookPhase::PromptSubmit));
     // Chunk gets phase_boost=0.8, reflection gets phase_boost=0.5
     // With PromptSubmit weights: semantic=0.40 dominates, but phase_boost=0.15 still helps chunk
-    assert_eq!(prompt_scored[0].source, "chunk", "PromptSubmit should prefer chunks");
+    assert_eq!(
+        prompt_scored[0].source, "chunk",
+        "PromptSubmit should prefer chunks"
+    );
 
     // SessionStart: reflection with outcome tag should rank higher
-    let start_scored = predictor::rank_results(
-        results.clone(),
-        &[],
-        &[],
-        Some(HookPhase::SessionStart),
-    );
+    let start_scored =
+        predictor::rank_results(results.clone(), &[], &[], Some(HookPhase::SessionStart));
     // Reflection with outcome_completed gets phase_boost=1.0, chunk gets 0.2
     // SessionStart phase_boost weight=0.40 → reflection wins
-    assert_eq!(start_scored[0].source, "reflection", "SessionStart should prefer outcome reflections");
+    assert_eq!(
+        start_scored[0].source, "reflection",
+        "SessionStart should prefer outcome reflections"
+    );
 }
 
 #[test]
@@ -1092,17 +1097,20 @@ fn test_lapi_stop_phase_prefers_anti_patterns() {
     ];
 
     let scored = predictor::rank_results(results, &[], &[], Some(HookPhase::Stop));
-    assert_eq!(scored[0].source, "anti_pattern", "Stop phase should prefer anti-patterns");
+    assert_eq!(
+        scored[0].source, "anti_pattern",
+        "Stop phase should prefer anti-patterns"
+    );
 }
 
 // ─── TAD: Temporal Attention Decay ───
 
 #[test]
 fn test_tad_reinforcement_changes_ranking() {
+    use chrono::{Duration, Utc};
     use csr_engine::search::decay::{
         apply_decay_unified, apply_tad, DecayConfig, RetrievalEvent, SessionOutcome,
     };
-    use chrono::{Duration, Utc};
 
     let now = Utc::now();
     let memory_age = now - Duration::days(60);
@@ -1117,7 +1125,12 @@ fn test_tad_reinforcement_changes_ranking() {
         session_outcome: SessionOutcome::Success,
     }];
     let reinforced = apply_tad(1.0, &memory_age, &now, &success_events, &config);
-    assert!(reinforced > baseline, "reinforced={} > baseline={}", reinforced, baseline);
+    assert!(
+        reinforced > baseline,
+        "reinforced={} > baseline={}",
+        reinforced,
+        baseline
+    );
 
     // Failed retrieval: memory should decay faster
     let fail_events = vec![RetrievalEvent {
@@ -1125,13 +1138,20 @@ fn test_tad_reinforcement_changes_ranking() {
         session_outcome: SessionOutcome::Failed,
     }];
     let suppressed = apply_tad(1.0, &memory_age, &now, &fail_events, &config);
-    assert!(suppressed < baseline, "suppressed={} < baseline={}", suppressed, baseline);
+    assert!(
+        suppressed < baseline,
+        "suppressed={} < baseline={}",
+        suppressed,
+        baseline
+    );
 
     // Order: reinforced > baseline > suppressed
     assert!(
         reinforced > baseline && baseline > suppressed,
         "Expected reinforced({}) > baseline({}) > suppressed({})",
-        reinforced, baseline, suppressed
+        reinforced,
+        baseline,
+        suppressed
     );
 }
 
@@ -1174,8 +1194,8 @@ fn test_tad_retrieval_events_storage() {
 
 #[test]
 fn test_decay_config_injection_vs_search() {
-    use csr_engine::search::decay::{apply_decay_unified, DecayConfig};
     use chrono::{Duration, Utc};
+    use csr_engine::search::decay::{apply_decay_unified, DecayConfig};
 
     let now = Utc::now();
     let age_30_days = now - Duration::days(30);
@@ -1241,5 +1261,39 @@ fn test_get_chunk_content() {
     assert_eq!(
         content.as_deref(),
         Some("This is the chunk content for testing retrieval")
+    );
+}
+
+// ─── Test: Batch TAD retrieval events ───
+
+#[test]
+fn test_tad_batch_retrieval_events() {
+    let storage = Storage::open_memory().unwrap();
+
+    let chunk = ConversationChunk {
+        id: "chunk-tad-1".into(),
+        conversation_id: "conv-tad-1".into(),
+        project_name: "test".into(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        content: "test content".into(),
+        message_count: 1,
+        summary: None,
+    };
+    storage.insert_chunk(&chunk, &[0.1; 384]).unwrap();
+    storage
+        .log_retrieval_event("chunk-tad-1", "chunk", "prompt_submit", "session-1")
+        .unwrap();
+    storage.update_session_outcome("session-1", "success").unwrap();
+
+    let events = storage
+        .get_retrieval_events_batch(&["chunk-tad-1", "nonexistent"])
+        .unwrap();
+    assert!(events.contains_key("chunk-tad-1"));
+    assert!(!events.contains_key("nonexistent"));
+    let chunk_events = &events["chunk-tad-1"];
+    assert_eq!(chunk_events.len(), 1);
+    assert_eq!(
+        chunk_events[0].session_outcome,
+        csr_engine::search::decay::SessionOutcome::Success
     );
 }

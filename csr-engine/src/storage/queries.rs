@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
@@ -910,4 +911,59 @@ pub fn get_retrieval_events_for_memory(
         results.push(row?);
     }
     Ok(results)
+}
+
+/// Batch-fetch typed retrieval events for TAD scoring.
+pub fn get_retrieval_events_batch(
+    conn: &Connection,
+    memory_ids: &[&str],
+) -> Result<HashMap<String, Vec<crate::search::decay::RetrievalEvent>>> {
+    use crate::search::decay::{RetrievalEvent, SessionOutcome};
+
+    if memory_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders: Vec<String> = (1..=memory_ids.len()).map(|i| format!("?{}", i)).collect();
+    let sql = format!(
+        "SELECT memory_id, retrieved_at, session_outcome
+         FROM retrieval_events
+         WHERE memory_id IN ({})
+         ORDER BY retrieved_at DESC",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> = memory_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut map: HashMap<String, Vec<RetrievalEvent>> = HashMap::new();
+    for row in rows {
+        let (mid, ts_str, outcome_str) = row?;
+        let retrieved_at = match ts_str.parse::<chrono::DateTime<chrono::Utc>>() {
+            Ok(ts) => ts,
+            Err(_) => continue,
+        };
+        let session_outcome = match outcome_str.as_str() {
+            "success" => SessionOutcome::Success,
+            "failed" => SessionOutcome::Failed,
+            _ => SessionOutcome::Neutral,
+        };
+        map.entry(mid)
+            .or_default()
+            .push(RetrievalEvent {
+                retrieved_at,
+                session_outcome,
+            });
+    }
+    Ok(map)
 }
