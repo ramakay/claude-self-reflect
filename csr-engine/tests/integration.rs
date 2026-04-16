@@ -1108,9 +1108,7 @@ fn test_lapi_stop_phase_prefers_anti_patterns() {
 #[test]
 fn test_tad_reinforcement_changes_ranking() {
     use chrono::{Duration, Utc};
-    use csr_engine::search::decay::{
-        apply_tad, DecayConfig, RetrievalEvent, SessionOutcome,
-    };
+    use csr_engine::search::decay::{apply_tad, DecayConfig, RetrievalEvent, SessionOutcome};
 
     let now = Utc::now();
     let memory_age = now - Duration::days(60);
@@ -1283,7 +1281,9 @@ fn test_tad_batch_retrieval_events() {
     storage
         .log_retrieval_event("chunk-tad-1", "chunk", "prompt_submit", "session-1")
         .unwrap();
-    storage.update_session_outcome("session-1", "success").unwrap();
+    storage
+        .update_session_outcome("session-1", "success")
+        .unwrap();
 
     let events = storage
         .get_retrieval_events_batch(&["chunk-tad-1", "nonexistent"])

@@ -958,12 +958,10 @@ pub fn get_retrieval_events_batch(
             "failed" => SessionOutcome::Failed,
             _ => SessionOutcome::Neutral,
         };
-        map.entry(mid)
-            .or_default()
-            .push(RetrievalEvent {
-                retrieved_at,
-                session_outcome,
-            });
+        map.entry(mid).or_default().push(RetrievalEvent {
+            retrieved_at,
+            session_outcome,
+        });
     }
     Ok(map)
 }

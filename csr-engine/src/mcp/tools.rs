@@ -65,10 +65,7 @@ pub async fn reflect_on_past(
             chunks.iter().find(|c| c.id == r.id).map(|c| {
                 let decayed_score =
                     if let Ok(ts) = c.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
-                        let events = tad_events
-                            .get(&c.id)
-                            .map(|v| v.as_slice())
-                            .unwrap_or(&[]);
+                        let events = tad_events.get(&c.id).map(|v| v.as_slice()).unwrap_or(&[]);
                         decay::apply_tad(r.score, &ts, &now, events, &tad_config)
                     } else {
                         r.score
