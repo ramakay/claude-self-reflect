@@ -2,129 +2,98 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
 
 permissions:
   contents: write
-  id-token: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --manifest-path csr-engine/Cargo.toml --locked
+      - name: Clippy
+        run: cargo clippy --manifest-path csr-engine/Cargo.toml --locked -- -D warnings
+
   build:
+    needs: test
     name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            os: macos-14
+            artifact: csr-engine-aarch64-apple-darwin.tar.gz
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            os: ubuntu-latest
+            artifact: csr-engine-x86_64-unknown-linux-gnu.tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            artifact: csr-engine-aarch64-unknown-linux-gnu.tar.gz
 
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Install cross-compilation tools (Linux ARM)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            csr-engine/target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('csr-engine/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
+          shared-key: release-${{ matrix.target }}
 
       - name: Build release binary
-        working-directory: csr-engine
-        run: cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --manifest-path csr-engine/Cargo.toml
 
       - name: Package binary
         run: |
-          ARCHIVE="csr-engine-${{ matrix.target }}.tar.gz"
-          cd csr-engine/target/${{ matrix.target }}/release
-          tar -czf "${GITHUB_WORKSPACE}/${ARCHIVE}" csr-engine
-          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+          cd csr-engine/target/release
+          tar -czvf ${{ matrix.artifact }} csr-engine
+          mv ${{ matrix.artifact }} ../../../
 
       - name: Generate checksum
-        run: |
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "${{ env.ARCHIVE }}" > "${{ env.ARCHIVE }}.sha256"
-          else
-            shasum -a 256 "${{ env.ARCHIVE }}" > "${{ env.ARCHIVE }}.sha256"
-          fi
+        run: shasum -a 256 ${{ matrix.artifact }} >> checksums-${{ matrix.target }}.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: |
-            ${{ env.ARCHIVE }}
-            ${{ env.ARCHIVE }}.sha256
+            ${{ matrix.artifact }}
+            checksums-${{ matrix.target }}.txt
 
   release:
-    name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          merge-multiple: true
 
-      - name: Collect checksums
-        run: |
-          cat artifacts/*/*.sha256 > checksums.txt
-          echo "Checksums:"
-          cat checksums.txt
+      - name: Combine checksums
+        run: cat checksums-*.txt > checksums.txt
 
-      - name: Create release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
           files: |
-            artifacts/*/*.tar.gz
+            *.tar.gz
             checksums.txt
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          generate_release_notes: true
 
   publish-npm:
-    name: Publish npm package
     needs: release
     runs-on: ubuntu-latest
-    environment: prod
-
     steps:
-      - uses: actions/checkout@v5
-
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22.x'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Update package version from tag
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
-
-      - name: Publish with provenance
-        run: npm publish --access public --provenance
+          node-version: 20
+          registry-url: https://registry.npmjs.org/
+      - run: npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
