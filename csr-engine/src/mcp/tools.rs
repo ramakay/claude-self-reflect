@@ -73,8 +73,18 @@ pub async fn reflect_on_past(
                     } else {
                         r.score
                     };
+                // Cross-project multiplicative penalty
+                let final_score = if let Some(ref p) = effective_project {
+                    if c.project_name != *p {
+                        decayed_score * 0.3
+                    } else {
+                        decayed_score
+                    }
+                } else {
+                    decayed_score
+                };
                 EnrichedResult {
-                    score: decayed_score,
+                    score: final_score,
                     chunk: c.clone(),
                 }
             })
@@ -106,12 +116,16 @@ pub async fn reflect_on_past(
                 .find(|t| t.starts_with("project_"))
                 .map(|t| t.trim_start_matches("project_").to_string())
                 .unwrap_or_else(|| "unknown".to_string());
-            // Filter by project if scoped
-            if let Some(ref p) = effective_project {
+            // Cross-project multiplicative penalty
+            let final_score = if let Some(ref p) = effective_project {
                 if project_name != *p {
-                    continue;
+                    decayed_score * 0.3
+                } else {
+                    decayed_score
                 }
-            }
+            } else {
+                decayed_score
+            };
             let tag_prefix = if tags.iter().any(|t| t == "session_story") {
                 "[story] "
             } else if tags.iter().any(|t| t.starts_with("narrative_v3")) {
@@ -120,7 +134,7 @@ pub async fn reflect_on_past(
                 "[reflection] "
             };
             enriched.push(EnrichedResult {
-                score: decayed_score,
+                score: final_score,
                 chunk: crate::import::ConversationChunk {
                     id: r.id.clone(),
                     conversation_id: r.id.clone(),
@@ -154,8 +168,17 @@ pub async fn reflect_on_past(
                     } else {
                         0.40
                     };
+                let final_fts_score = if let Some(ref p) = effective_project {
+                    if chunk.project_name != *p {
+                        fts_score * 0.3
+                    } else {
+                        fts_score
+                    }
+                } else {
+                    fts_score
+                };
                 enriched.push(EnrichedResult {
-                    score: fts_score,
+                    score: final_fts_score,
                     chunk: crate::import::ConversationChunk {
                         content: format!("[keyword] {}", chunk.content),
                         ..chunk
