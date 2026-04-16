@@ -5,6 +5,8 @@
 //!
 //! Scoring formula: `final = semantic * 0.5 + recency * 0.2 + file_overlap * 0.2 + error_match * 0.1`
 
+use std::collections::HashSet;
+
 /// A search result enriched with multi-signal scoring.
 #[derive(Debug, Clone)]
 pub struct ScoredResult {
@@ -170,23 +172,44 @@ fn files_match(a: &str, b: &str) -> bool {
     a_name == b_name
 }
 
-/// Compute error pattern match: 1.0 if any current error appears in result, 0.0 otherwise.
+/// Compute error pattern match with graduated scoring.
+/// Returns: containment 0.7-1.0, word overlap 0.0-0.7, no match 0.0.
 fn compute_error_match(result_errors: &[String], current_errors: &[String]) -> f32 {
     if current_errors.is_empty() || result_errors.is_empty() {
         return 0.0;
     }
 
-    let has_match = current_errors.iter().any(|ce| {
-        result_errors
-            .iter()
-            .any(|re| re.contains(ce.as_str()) || ce.contains(re.as_str()))
-    });
+    let mut best_score: f32 = 0.0;
+    for ce in current_errors {
+        let ce_lower = ce.to_lowercase();
+        let ce_words: HashSet<&str> = split_error_words(&ce_lower);
+        for re in result_errors {
+            let re_lower = re.to_lowercase();
 
-    if has_match {
-        1.0
-    } else {
-        0.0
+            if re_lower.contains(&ce_lower) || ce_lower.contains(&re_lower) {
+                let shorter = ce_lower.len().min(re_lower.len());
+                let longer = ce_lower.len().max(re_lower.len());
+                if longer > 0 {
+                    best_score = best_score.max(0.7 + 0.3 * (shorter as f32 / longer as f32));
+                }
+            } else {
+                let re_words: HashSet<&str> = split_error_words(&re_lower);
+                let overlap = ce_words.intersection(&re_words).count();
+                let total = ce_words.len().max(re_words.len());
+                if total > 0 {
+                    best_score = best_score.max(overlap as f32 / total as f32);
+                }
+            }
+        }
     }
+    best_score
+}
+
+/// Split error strings into words on whitespace, underscores, hyphens, colons.
+fn split_error_words(s: &str) -> HashSet<&str> {
+    s.split(|c: char| c.is_whitespace() || c == '_' || c == '-' || c == ':')
+        .filter(|w| !w.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -328,5 +351,37 @@ mod tests {
     fn test_empty_inputs() {
         let scored = rank_results(vec![], &[], &[], None);
         assert!(scored.is_empty());
+    }
+
+    #[test]
+    fn test_error_match_exact_containment() {
+        let result_errors = vec!["connection reset by peer".into()];
+        let current_errors = vec!["connection reset".into()];
+        let score = compute_error_match(&result_errors, &current_errors);
+        assert!(score >= 0.7, "containment score={score} should be >= 0.7");
+        assert!(score <= 1.0, "containment score={score} should be <= 1.0");
+    }
+
+    #[test]
+    fn test_error_match_word_overlap() {
+        let result_errors = vec!["timeout waiting for response from server".into()];
+        let current_errors = vec!["timeout error on server connection".into()];
+        let score = compute_error_match(&result_errors, &current_errors);
+        assert!(score > 0.0, "word overlap score={score} should be > 0.0");
+        assert!(score < 0.7, "word overlap score={score} should be < 0.7");
+    }
+
+    #[test]
+    fn test_error_match_no_overlap() {
+        let result_errors = vec!["out of memory".into()];
+        let current_errors = vec!["permission denied".into()];
+        let score = compute_error_match(&result_errors, &current_errors);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn test_error_match_empty_inputs() {
+        assert_eq!(compute_error_match(&[], &["error".into()]), 0.0);
+        assert_eq!(compute_error_match(&["error".into()], &[]), 0.0);
     }
 }
