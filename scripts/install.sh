@@ -161,6 +161,17 @@ main() {
     printf '\n  \033[1mClaude Self-Reflect Installer\033[0m\n\n'
 
     detect_platform
+
+    # Intel Mac: no prebuilt binaries (ort/ONNX dropped x86_64-apple-darwin)
+    if [ "$TARGET" = "x86_64-apple-darwin" ]; then
+        err "Intel Mac (x86_64) binaries are not provided.
+Build from source instead:
+  git clone https://github.com/${REPO}.git
+  cd claude-self-reflect/csr-engine
+  cargo build --release
+  cp target/release/csr-engine ~/.local/bin/"
+    fi
+
     get_latest_version
     download_and_install
     verify
