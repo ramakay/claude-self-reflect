@@ -69,25 +69,6 @@ impl DecayConfig {
     }
 }
 
-/// Unified decay function using DecayConfig.
-/// Replaces both `apply_decay` (for search) and `compute_recency_boost` (for injection)
-/// to eliminate the recency double-counting bug.
-pub fn apply_decay_unified(
-    score: f32,
-    timestamp: &DateTime<Utc>,
-    now: &DateTime<Utc>,
-    config: &DecayConfig,
-) -> f32 {
-    let age_days = (*now - *timestamp).num_seconds() as f64 / 86400.0;
-    if age_days <= 0.0 {
-        return score;
-    }
-    let time_factor = 2.0_f64.powf(-age_days / config.base_half_life_days);
-    let adjusted =
-        (score as f64) * ((1.0 - config.decay_weight) + config.decay_weight * time_factor);
-    adjusted as f32
-}
-
 /// A retrieval event for TAD (Temporal Attention Decay).
 /// Tracks when a memory was surfaced and whether the session succeeded.
 #[derive(Debug, Clone)]
@@ -108,7 +89,7 @@ pub enum SessionOutcome {
 /// persist longer (half-life increases), while memories from failed sessions
 /// decay faster (half-life decreases).
 ///
-/// With no retrieval events, behaves identically to `apply_decay_unified`.
+/// With no retrieval events, behaves identically to `apply_decay` with default config.
 pub fn apply_tad(
     score: f32,
     timestamp: &DateTime<Utc>,
@@ -202,16 +183,16 @@ mod tests {
     }
 
     #[test]
-    fn test_unified_decay_matches_original() {
+    fn test_tad_no_events_matches_original() {
         let now = Utc::now();
         let past = now - Duration::days(90);
         let config = DecayConfig::for_search();
-        let unified = apply_decay_unified(1.0, &past, &now, &config);
+        let tad = apply_tad(1.0, &past, &now, &[], &config);
         let original = apply_decay(1.0, &past, &now, None, None);
         assert!(
-            (unified - original).abs() < 0.001,
-            "unified={} original={}",
-            unified,
+            (tad - original).abs() < 0.001,
+            "tad={} original={}",
+            tad,
             original
         );
     }
@@ -229,7 +210,7 @@ mod tests {
             session_outcome: SessionOutcome::Success,
         }];
 
-        let standard = apply_decay_unified(1.0, &past, &now, &config);
+        let standard = apply_tad(1.0, &past, &now, &[], &config);
         let reinforced = apply_tad(1.0, &past, &now, &events, &config);
         assert!(
             reinforced > standard,
@@ -250,7 +231,7 @@ mod tests {
             session_outcome: SessionOutcome::Failed,
         }];
 
-        let standard = apply_decay_unified(1.0, &past, &now, &config);
+        let standard = apply_tad(1.0, &past, &now, &[], &config);
         let suppressed = apply_tad(1.0, &past, &now, &events, &config);
         assert!(
             suppressed < standard,
@@ -265,7 +246,7 @@ mod tests {
         let now = Utc::now();
         let past = now - Duration::days(90);
         let config = DecayConfig::for_search();
-        let standard = apply_decay_unified(1.0, &past, &now, &config);
+        let standard = apply_decay(1.0, &past, &now, None, None);
         let tad = apply_tad(1.0, &past, &now, &[], &config);
         assert!((tad - standard).abs() < 0.001);
     }

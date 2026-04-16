@@ -1109,7 +1109,7 @@ fn test_lapi_stop_phase_prefers_anti_patterns() {
 fn test_tad_reinforcement_changes_ranking() {
     use chrono::{Duration, Utc};
     use csr_engine::search::decay::{
-        apply_decay_unified, apply_tad, DecayConfig, RetrievalEvent, SessionOutcome,
+        apply_tad, DecayConfig, RetrievalEvent, SessionOutcome,
     };
 
     let now = Utc::now();
@@ -1117,7 +1117,7 @@ fn test_tad_reinforcement_changes_ranking() {
     let config = DecayConfig::for_search();
 
     // Baseline: no retrieval events
-    let baseline = apply_decay_unified(1.0, &memory_age, &now, &config);
+    let baseline = apply_tad(1.0, &memory_age, &now, &[], &config);
 
     // Successful retrieval: memory should be preserved longer
     let success_events = vec![RetrievalEvent {
@@ -1195,7 +1195,7 @@ fn test_tad_retrieval_events_storage() {
 #[test]
 fn test_decay_config_injection_vs_search() {
     use chrono::{Duration, Utc};
-    use csr_engine::search::decay::{apply_decay_unified, DecayConfig};
+    use csr_engine::search::decay::{apply_tad, DecayConfig};
 
     let now = Utc::now();
     let age_30_days = now - Duration::days(30);
@@ -1203,8 +1203,8 @@ fn test_decay_config_injection_vs_search() {
     let injection_config = DecayConfig::for_injection();
     let search_config = DecayConfig::for_search();
 
-    let injection_score = apply_decay_unified(1.0, &age_30_days, &now, &injection_config);
-    let search_score = apply_decay_unified(1.0, &age_30_days, &now, &search_config);
+    let injection_score = apply_tad(1.0, &age_30_days, &now, &[], &injection_config);
+    let search_score = apply_tad(1.0, &age_30_days, &now, &[], &search_config);
 
     // Injection decays faster (30-day half-life, 50% weight)
     // Search decays slower (90-day half-life, 30% weight)
