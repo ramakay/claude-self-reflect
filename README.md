@@ -217,11 +217,14 @@ npm uninstall -g claude-self-reflect  # if installed via npm
 
 </details>
 
-## Contributors
+<details>
+<summary>Contributors (v1–v7)</summary>
 
 - **[@TheGordon](https://github.com/TheGordon)** - Fixed timestamp parsing (#10)
 - **[@akamalov](https://github.com/akamalov)** - Ubuntu WSL insights
 - **[@kylesnowschwartz](https://github.com/kylesnowschwartz)** - Security review (#6)
+
+</details>
 
 ---
 
