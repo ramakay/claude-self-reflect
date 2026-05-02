@@ -201,8 +201,8 @@ async fn run_v3_extraction(engine: &Engine, transcript_path: &Path, cwd: &Path) 
 /// Write a brief session summary for the SwiftBar status plugin.
 /// Extracts the first user message + enrichment info as a 2-line summary.
 fn write_session_summary(engine: &Engine, input: &HookInput, cwd: &Path) {
-    let project = resolve_project_from_cwd(&cwd.to_string_lossy())
-        .unwrap_or_else(|| "unknown".to_string());
+    let project =
+        resolve_project_from_cwd(&cwd.to_string_lossy()).unwrap_or_else(|| "unknown".to_string());
 
     // Try to get a summary from the transcript's first user message
     let mut summary = String::new();
