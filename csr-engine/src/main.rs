@@ -1,0 +1,285 @@
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use tracing_subscriber::EnvFilter;
+
+use csr_engine::engine;
+
+#[derive(Parser, Debug)]
+#[command(name = "csr-engine", about = "Claude Self-Reflect Rust Engine")]
+struct Args {
+    /// SQLite database path
+    #[arg(long, default_value_os_t = default_db_path(), global = true)]
+    db_path: PathBuf,
+
+    /// Claude projects directory
+    #[arg(long, default_value_os_t = default_projects_dir(), global = true)]
+    projects_dir: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Import conversations then exit (or combine with --serve)
+    #[arg(long)]
+    import: bool,
+
+    /// Start MCP stdio server (default if no other flags)
+    #[arg(long)]
+    serve: bool,
+
+    /// Max conversations to import
+    #[arg(long)]
+    limit: Option<usize>,
+
+    /// Watch for new JSONL files and auto-import
+    #[arg(long)]
+    watch: bool,
+
+    /// Run benchmarks instead of MCP server
+    #[arg(long)]
+    bench: bool,
+
+    /// Backfill import_state and run heuristic enrichment for all conversations
+    #[arg(long)]
+    enrich: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// One-shot setup: import, register MCP, install hooks
+    Setup {
+        /// Anthropic API key for AI narrative enrichment (optional)
+        #[arg(long)]
+        anthropic_key: Option<String>,
+    },
+    /// Show system status (JSON by default, --compact for statusline)
+    Status {
+        /// One-line output for statusline integration
+        #[arg(long)]
+        compact: bool,
+    },
+    /// Handle Claude Code hook events
+    Hook {
+        /// Hook name: session-start, session-end, precompact, stop, post-tool-use, prompt-submit, install
+        name: String,
+
+        /// For install: auto-apply to settings.json
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Run the enrichment daemon (file watcher + Layer 2 + Layer 3)
+    Daemon {
+        /// Max conversations per AI narrative batch
+        #[arg(long, default_value_t = 10)]
+        batch_size: usize,
+
+        /// Minutes before forcing a batch submission
+        #[arg(long, default_value_t = 30)]
+        batch_time: u64,
+
+        /// Skip AI narrative generation (Layer 1+2 only, no API key needed)
+        #[arg(long)]
+        no_ai: bool,
+    },
+    /// Analyze code quality using AST patterns
+    Quality {
+        /// File path to analyze
+        path: PathBuf,
+    },
+    /// Run evaluation tests
+    Eval {
+        /// Run full evaluation (20 tests) instead of quick (5 tests)
+        #[arg(long)]
+        full: bool,
+    },
+    /// Backfill session stories from V3/heuristic data (zero cost)
+    BackfillStories {
+        /// Preview without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Generate a Haiku-curated session story (fire-and-forget from SessionEnd)
+    GenerateStory {
+        /// Path to the session transcript JSONL
+        #[arg(long)]
+        transcript: PathBuf,
+
+        /// Current working directory (for project resolution)
+        #[arg(long)]
+        cwd: String,
+    },
+}
+
+fn default_db_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude-self-reflect")
+        .join("csr-engine.db")
+}
+
+fn default_projects_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude")
+        .join("projects")
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let args = Args::parse();
+
+    // Handle subcommands that don't need Engine::new()
+    if let Some(Commands::Setup { anthropic_key }) = args.command {
+        return csr_engine::setup::handle(&args.db_path, &args.projects_dir, anthropic_key).await;
+    }
+
+    if let Some(Commands::Status { compact }) = args.command {
+        return csr_engine::status::handle(&args.db_path, &args.projects_dir, compact);
+    }
+
+    if let Some(Commands::Daemon {
+        batch_size,
+        batch_time,
+        no_ai,
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let config = csr_engine::daemon::DaemonConfig {
+            extraction_interval_secs: 30,
+            batch_size_trigger: batch_size,
+            batch_time_trigger_secs: batch_time * 60,
+            batch_poll_interval_secs: 60,
+        };
+        let daemon = csr_engine::daemon::Daemon::new(
+            eng.storage().clone(),
+            eng.embeddings().clone(),
+            eng.search().clone(),
+            eng.projects_dir().to_path_buf(),
+            eng.index_dir().to_path_buf(),
+            config,
+            !no_ai,
+        );
+        return daemon.run().await;
+    }
+
+    if let Some(Commands::Quality { ref path }) = args.command {
+        let report = csr_engine::extraction::quality::analyze_file(path)?;
+        print!("{}", report.format_text());
+        return Ok(());
+    }
+
+    if let Some(Commands::Eval { full }) = args.command {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let report = if full {
+            csr_engine::eval::run_full(
+                eng.storage(),
+                eng.embeddings(),
+                eng.search(),
+                eng.index_dir(),
+            )
+            .await
+        } else {
+            csr_engine::eval::run_quick(
+                eng.storage(),
+                eng.embeddings(),
+                eng.search(),
+                eng.index_dir(),
+            )
+            .await
+        };
+        print!("{}", report.format_text());
+        return Ok(());
+    }
+
+    if let Some(Commands::BackfillStories { dry_run }) = args.command {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        return csr_engine::summarizer::backfill_stories_cli(&eng, dry_run).await;
+    }
+
+    if let Some(Commands::GenerateStory {
+        ref transcript,
+        ref cwd,
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        return csr_engine::summarizer::generate_story_cli(&eng, transcript, cwd).await;
+    }
+
+    if let Some(Commands::Hook { ref name, apply }) = args.command {
+        if name == "install" {
+            return csr_engine::hooks::install::handle(apply);
+        }
+
+        // Other hooks need the engine
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        csr_engine::hooks::dispatch_hook(name, &eng).await?;
+        return Ok(());
+    }
+
+    // Ensure DB directory exists
+    if let Some(parent) = args.db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+
+    if args.import {
+        let count = eng.import_conversations(args.limit).await?;
+        tracing::info!(count, "conversations imported");
+    }
+
+    if args.enrich {
+        let (backfilled, enriched) = eng.backfill_and_enrich().await?;
+        eprintln!(
+            "CSR: backfilled {} import_state rows, enriched {} conversations",
+            backfilled, enriched
+        );
+    }
+
+    if args.bench {
+        tracing::info!("benchmark mode not yet implemented in main — use `cargo bench`");
+        return Ok(());
+    }
+
+    // Start file watcher if requested (runs as background task)
+    let _watcher_handle = if args.watch {
+        Some(eng.start_watcher())
+    } else {
+        None
+    };
+
+    // Start MCP stdio server if --serve or no explicit action
+    let should_serve = args.serve || (!args.import && !args.bench && !args.watch && !args.enrich);
+    if should_serve {
+        eng.serve_mcp().await?;
+    } else if args.watch {
+        // If watching (with or without import), keep the process alive
+        tracing::info!("watching for new conversations. Press Ctrl+C to stop.");
+        tokio::signal::ctrl_c().await?;
+    }
+
+    Ok(())
+}

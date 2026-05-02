@@ -1,8 +1,0 @@
-#!/usr/bin/env python3
-"""Executable entry point for claude-reflect MCP server."""
-
-import sys
-from claude_reflect.__main__ import main
-
-if __name__ == "__main__":
-    main()

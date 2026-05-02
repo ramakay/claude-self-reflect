@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --manifest-path csr-engine/Cargo.toml --locked
+      - name: Clippy
+        run: cargo clippy --manifest-path csr-engine/Cargo.toml --locked -- -D warnings
+
+  build:
+    needs: test
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            artifact: csr-engine-aarch64-apple-darwin.tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: csr-engine-x86_64-unknown-linux-gnu.tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            artifact: csr-engine-aarch64-unknown-linux-gnu.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --manifest-path csr-engine/Cargo.toml
+
+      - name: Package binary
+        run: |
+          cd csr-engine/target/release
+          tar -czvf ${{ matrix.artifact }} csr-engine
+          mv ${{ matrix.artifact }} ../../../
+
+      - name: Generate checksum
+        run: shasum -a 256 ${{ matrix.artifact }} >> checksums-${{ matrix.target }}.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ matrix.artifact }}
+            checksums-${{ matrix.target }}.txt
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: cat checksums-*.txt > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            checksums.txt
+          generate_release_notes: true
+
+  publish-npm:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org/
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,9 @@
+{
+  "target_filename": "architecture-diagram.png",
+  "status": "placeholder",
+  "reason": "PNG generation was attempted with the local imagegen tool, but the sandbox could not resolve openrouter.ai.",
+  "error": "getaddrinfo ENOTFOUND openrouter.ai",
+  "aspect_ratio": "16:9",
+  "prompt": "Wide 16:9 artistic architecture diagram, dark theme, clean modern product design. Render data flow left to right: SQLite cylinder labeled Storage, HNSW graph nodes labeled Vector Search, FastEmbed lightning bolt labeled Embeddings, Claude Code logo placeholder area labeled Claude Code. Soft glow effects, connecting arrows with gradient lines, isometric or refined flat design style, precise readable labels, premium technical diagram, no watermark.",
+  "text": "Storage | Vector Search | Embeddings | Claude Code"
+}

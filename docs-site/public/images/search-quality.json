@@ -1,0 +1,9 @@
+{
+  "target_filename": "search-quality.png",
+  "status": "placeholder",
+  "reason": "PNG generation was attempted with the local imagegen tool, but the sandbox could not resolve openrouter.ai.",
+  "error": "getaddrinfo ENOTFOUND openrouter.ai",
+  "aspect_ratio": "16:9",
+  "prompt": "Wide 16:9 scientific visualization of search quality improvement. Chaotic blurry search results on the left transforming into crystal-clear perfectly ranked results on the right. Quality meter jumping from low to high. Floating numeric transformation 0.074 to 0.691 and 9.3x improvement. Precision feel, blues and greens, subtle grid, refined data-science aesthetic, no logos, no watermark.",
+  "text": "0.074 -> 0.691 9.3x"
+}

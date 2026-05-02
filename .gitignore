@@ -36,6 +36,7 @@ docs/organization-log.json
 
 # Data and state
 data/
+!csr-engine/data/
 config/imported-files.json
 config-isolated/
 *.db
@@ -152,3 +153,24 @@ narrative_*.txt
 batch_requests*.jsonl
 batch_results*.jsonl
 .ralph_state.md
+
+# Local plans (private, not for repo)
+.plans/
+
+# Rust build artifacts
+csr-engine/target/
+
+# Claude Code local state (not for repo)
+.claude/RESEARCH_INDEX.md
+.claude/settings.json
+.claude/hooks/
+.claude/commands/
+.claude/slash-commands/
+.mcp.json
+
+# Legacy Python test/hook/example dirs (removed in v8)
+tests/
+hooks/
+examples/
+video/
+pytest.ini

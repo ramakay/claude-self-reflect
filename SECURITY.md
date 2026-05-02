@@ -2,101 +2,113 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 2.3.x   | :white_check_mark: |
-| 2.2.x   | :x:                |
-| < 2.2   | :x:                |
+| Version | Supported |
+| ------- | --------- |
+| 8.0.x   | Yes       |
+| < 8.0   | No        |
+
+## Security Model
+
+Claude Self-Reflect v8 runs as a single local Rust binary (`csr-engine`).
+There is no Docker service, Qdrant server, Python runtime, or hosted database in
+the default deployment.
+
+### Local-First Defaults
+
+- Conversation files are read from `~/.claude/projects/`.
+- CSR data is stored locally under `~/.claude-self-reflect/`.
+- Embeddings are generated locally with FastEmbed.
+- Search runs against a local SQLite database plus an in-memory HNSW index.
+- No telemetry is collected.
+
+### Optional Network Use
+
+The default install does not send conversation text to third-party APIs.
+Network use is limited to:
+
+- Installer downloads from GitHub Releases.
+- Optional AI narrative enrichment through Anthropic APIs, when explicitly
+  configured by the user.
+
+Do not enable optional AI enrichment unless the conversation data is appropriate
+to send to that provider.
+
+## Installer Integrity
+
+The npm postinstall path and shell installer download release assets over HTTPS
+from `github.com/ramakay/claude-self-reflect`. Binary release archives are
+verified against the release `checksums.txt` before installation.
+
+Users who need offline or custom binary management can set:
+
+```bash
+CSR_SKIP_BINARY_DOWNLOAD=1
+```
+
+Then install a trusted `csr-engine` binary manually into the desired install
+directory.
+
+## File Permissions
+
+Recommended permissions:
+
+```bash
+chmod 700 ~/.claude-self-reflect
+chmod 600 ~/.claude-self-reflect/*.db 2>/dev/null || true
+chmod 700 ~/.local/bin
+chmod 755 ~/.local/bin/csr-engine
+```
+
+For shared workstations, rely on OS user isolation. Do not place
+`~/.claude-self-reflect` or Claude transcript directories in a world-readable
+location.
+
+## Hook Safety
+
+CSR installs Claude Code hooks that run `csr-engine hook ...`.
+
+- Hooks use catch-all error handling and should not block Claude Code.
+- Session-start and predictive injection output must frame retrieved memories as
+  past context, not current instructions.
+- Hook config installation removes older Python CSR hook commands when applying
+  the Rust hook configuration.
+
+## API Key Handling
+
+Optional enrichment may require provider API keys. Store keys in user-owned
+configuration files or environment variables only.
+
+- Never commit API keys.
+- Rotate keys if they appear in transcripts, shell history, or logs.
+- Review provider privacy policies before enabling external enrichment.
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability, please **DO NOT** create a public issue. Instead:
+Do not create public GitHub issues for security vulnerabilities.
 
-1. Email the details to the maintainer through GitHub
-2. Include:
-   - Description of the vulnerability
-   - Steps to reproduce
-   - Potential impact
-   - Suggested fix (if any)
+Preferred reporting path:
 
-We aim to respond within 48 hours and will work with you to understand and address the issue promptly.
+1. Go to https://github.com/ramakay/claude-self-reflect/security/advisories
+2. Click "Report a vulnerability"
+3. Include reproduction steps, affected version, impact, and suggested fix when
+   available.
 
-## Security Measures
+Expected response:
 
-### Code Security
-- No hardcoded API keys or secrets
-- Environment variables for sensitive configuration
-- Regular dependency updates
-- Automated security scanning in CI/CD
+- Acknowledgment within 48 hours.
+- Initial assessment within 7 days.
+- Fix timeline estimate within 14 days.
 
-### Repository Security
-- Branch protection on `main`
-- Required PR reviews
-- Automated security checks must pass
-- No direct commits to main branch
+## Disclosure Policy
 
-### Data Security
-- Local embeddings by default (no data sent to cloud)
-- Optional cloud embeddings with explicit opt-in
-- No tracking or analytics
-- All data stored locally in Docker volumes
+- We follow coordinated disclosure.
+- Security fixes are released as patch versions.
+- Public disclosure happens after a fix is available.
+- Credit is given to security researchers with permission.
 
-### CI/CD Security
-- Secrets scanning with Gitleaks
-- Dependency vulnerability scanning
-- Docker image security scanning with Trivy
-- Code quality checks with Bandit
-- File permission validation
+## Security Updates
 
-## Best Practices for Contributors
-
-1. **Never commit secrets**: Use environment variables
-2. **Check dependencies**: Run `npm audit` and `pip-audit` before submitting PRs
-3. **Test locally**: Ensure all tests pass before pushing
-4. **Use .gitignore**: Don't commit generated files or local data
-5. **Review changes**: Double-check your commits for sensitive data
-
-## Recommended GitHub Settings
-
-For repository administrators:
-
-### Branch Protection Rules for `main`:
-- ✅ Require pull request reviews before merging
-- ✅ Dismiss stale pull request approvals when new commits are pushed
-- ✅ Require status checks to pass before merging:
-  - `python-test`
-  - `npm-package-test`
-  - `docker-build`
-  - `secrets-scan`
-  - `dependency-scan`
-- ✅ Require branches to be up to date before merging
-- ✅ Include administrators
-- ✅ Do not allow force pushes
-- ✅ Do not allow deletions
-
-### Security Settings:
-- ✅ Enable Dependabot security updates
-- ✅ Enable secret scanning
-- ✅ Enable push protection for secrets
-- ✅ Enable vulnerability alerts
-
-## Security Audit History
-
-- **v2.4.11**: Security update to address CVE-2025-7458:
-  - Updated all Docker base images from Python 3.11-slim to Python 3.12-slim
-  - Added explicit `apt-get upgrade` in all Dockerfiles for system package updates
-  - SQLite updated from vulnerable 3.40.1 to 3.50.1
-  - Applied to: importer, watcher, mcp-server, streaming-importer, importer-isolated
-- **v2.3.9**: Added gitleaks configuration to handle false positives and historical secrets
-- **v2.3.7**: Major security cleanup - removed 250+ internal files, secured .env permissions
-- **v2.3.3**: Migrated to local embeddings by default for privacy
-- **v2.0.0**: Complete rewrite with security-first design
-
-## Historical Security Notice
-
-During routine security scanning, some API keys were found in git history. These have been:
-- ✅ **Revoked** - All identified keys are no longer active
-- ✅ **Allowlisted** in `.gitleaks.toml` since they're already invalid
-- ✅ **Preserved in history** to avoid disrupting contributors
-
-No action is required from contributors. Your local clones remain safe.
+- Critical: released within 48 hours.
+- High: released within 7 days.
+- Medium: released within 30 days.
+- Low: included in the next regular release.

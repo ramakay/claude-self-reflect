@@ -1,1 +1,0 @@
-# Batch automation tests

@@ -1,56 +1,32 @@
 version: 2
 updates:
-  # NPM dependencies for claude-self-reflection
-  - package-ecosystem: "npm"
-    directory: "/claude-self-reflection"
+  # Rust dependencies
+  - package-ecosystem: "cargo"
+    directory: "/csr-engine"
     schedule:
       interval: "weekly"
       day: "monday"
       time: "08:00"
     open-pull-requests-limit: 5
-    reviewers:
-      - "yourusername"
     labels:
       - "dependencies"
-      - "npm"
+      - "rust"
     commit-message:
-      prefix: "deps(npm)"
-    ignore:
-      # Ignore major version updates for critical dependencies
-      - dependency-name: "@modelcontextprotocol/sdk"
-        update-types: ["version-update:semver-major"]
+      prefix: "deps(cargo)"
 
-  # Python dependencies for scripts
-  - package-ecosystem: "pip"
-    directory: "/scripts"
+  # npm installer shim
+  - package-ecosystem: "npm"
+    directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
       time: "08:00"
     open-pull-requests-limit: 3
-    reviewers:
-      - "yourusername"
     labels:
       - "dependencies"
-      - "python"
+      - "npm"
     commit-message:
-      prefix: "deps(python)"
-
-  # Docker base images
-  - package-ecosystem: "docker"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "tuesday"
-      time: "08:00"
-    open-pull-requests-limit: 2
-    reviewers:
-      - "yourusername"
-    labels:
-      - "dependencies"
-      - "docker"
-    commit-message:
-      prefix: "deps(docker)"
+      prefix: "deps(npm)"
 
   # GitHub Actions
   - package-ecosystem: "github-actions"
@@ -60,8 +36,6 @@ updates:
       day: "wednesday"
       time: "08:00"
     open-pull-requests-limit: 2
-    reviewers:
-      - "yourusername"
     labels:
       - "dependencies"
       - "github-actions"

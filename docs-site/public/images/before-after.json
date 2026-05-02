@@ -1,0 +1,8 @@
+{
+  "target_filename": "before-after.png",
+  "status": "placeholder",
+  "reason": "PNG generation was attempted with the local imagegen tool, but the sandbox could not resolve openrouter.ai.",
+  "error": "getaddrinfo ENOTFOUND openrouter.ai",
+  "aspect_ratio": "16:9",
+  "prompt": "Wide 16:9 split composition conceptual AI memory image. Left side: dim grey environment, isolated AI assistant figure looking confused, disconnected nodes, foggy unclear atmosphere, low contrast. Right side: bright illuminated connected neural network, AI assistant with clear glowing connections, confident posture, crisp structure. Dramatic lighting contrast between memory-less left and memory-enhanced right. Abstract, cinematic, premium tech style, no readable text, no logos, no watermark."
+}
