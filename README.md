@@ -23,7 +23,11 @@ Single 44MB binary. No databases. No containers. No API keys required.
 
 [Documentation](https://ramakay.github.io/claude-self-reflect/) | [Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
-<img src="docs-site/public/images/architecture-hero.png" alt="Claude Self-Reflect Architecture" width="100%" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/readme-hero-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="docs-site/public/images/readme-hero-light.png" />
+  <img src="docs-site/public/images/readme-hero-light.png" alt="Claude Self-Reflect Architecture — single binary, 12 MCP tools, 6 hooks, sub-millisecond search" width="100%" />
+</picture>
 
 </div>
 
