@@ -158,3 +158,4 @@ batch_results*.jsonl
 
 # Rust build artifacts
 csr-engine/target/
+.claude/RESEARCH_INDEX.md
