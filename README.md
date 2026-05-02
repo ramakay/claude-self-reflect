@@ -26,7 +26,24 @@ Single 44MB binary. No databases. No containers. No API keys required.
 [Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
 <a href="https://ramakay.github.io/claude-self-reflect/">
-  <img src="docs-site/public/images/readme-hero-light.png" alt="Claude Self-Reflect Architecture — single binary, 12 MCP tools, 6 hooks, sub-millisecond search" width="100%" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-01-hook-dark.png" />
+  <img src="docs-site/public/images/card-01-hook-light.png" alt="The Forgetting Problem — context retention drops below 20% after 10 sessions" width="100%" />
+</picture>
+</a>
+
+<a href="https://ramakay.github.io/claude-self-reflect/#/docs/architecture">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-02-arch-dark.png" />
+  <img src="docs-site/public/images/card-02-arch-light.png" alt="One Binary, 44MB — SQLite, HNSW, FastEmbed, AST, 6 hooks, 12 MCP tools" width="100%" />
+</picture>
+</a>
+
+<a href="https://ramakay.github.io/claude-self-reflect/#/docs/enrichment">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-03-pipeline-dark.png" />
+  <img src="docs-site/public/images/card-03-pipeline-light.png" alt="The Pipeline — 3 layers, quality score improves from 0.074 to 0.691" width="100%" />
+</picture>
 </a>
 
 </div>
@@ -94,8 +111,6 @@ After install, just ask Claude naturally:
 No special syntax. No commands. CSR finds relevant past context and injects it automatically.
 
 ## How It Works
-
-<img src="docs-site/public/images/how-it-works.png" alt="How Claude Self-Reflect works: conversations → csr-engine → enrichment → context injection" width="100%" />
 
 Everything runs locally in a single process. No network services, no containers.
 
