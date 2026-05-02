@@ -5,10 +5,17 @@
 <img src="docs-site/public/favicon.svg" alt="Claude Self-Reflect" width="80" height="80" />
 
 [![npm version](https://badge.fury.io/js/claude-self-reflect.svg)](https://www.npmjs.com/package/claude-self-reflect)
+[![npm downloads](https://img.shields.io/npm/dm/claude-self-reflect.svg)](https://www.npmjs.com/package/claude-self-reflect)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![GitHub CI](https://github.com/ramakay/claude-self-reflect/actions/workflows/ci.yml/badge.svg)](https://github.com/ramakay/claude-self-reflect/actions/workflows/ci.yml)
+
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-Compatible-6B4FBB)](https://github.com/anthropics/claude-code)
 [![MCP Protocol](https://img.shields.io/badge/MCP-Enabled-FF6B6B)](https://modelcontextprotocol.io/)
 [![Local First](https://img.shields.io/badge/Local%20First-Privacy-4A90E2)](https://github.com/ramakay/claude-self-reflect)
+
+[![GitHub stars](https://img.shields.io/github/stars/ramakay/claude-self-reflect.svg?style=social)](https://github.com/ramakay/claude-self-reflect/stargazers)
+[![GitHub issues](https://img.shields.io/github/issues/ramakay/claude-self-reflect.svg)](https://github.com/ramakay/claude-self-reflect/issues)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/ramakay/claude-self-reflect/pulls)
 
 **Claude forgets everything. This fixes that.**
 
@@ -17,6 +24,20 @@ Single 44MB binary. No databases. No containers. No API keys required.
 [Documentation](https://ramakay.github.io/claude-self-reflect/) | [Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
 </div>
+
+## Table of Contents
+
+- [Install](#install)
+- [What You'll Ask](#what-youll-ask)
+- [How It Works](#how-it-works)
+- [Performance](#performance)
+- [MCP Tools](#mcp-tools)
+- [Hooks](#hooks)
+- [AI Narratives](#ai-narratives-optional)
+- [CLI Reference](#cli-reference)
+- [Upgrading from v7.x](#upgrading-from-v7x)
+- [Troubleshooting](#troubleshooting)
+- [Contributors](#contributors)
 
 ## Install
 

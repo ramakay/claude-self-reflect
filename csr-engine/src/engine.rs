@@ -216,7 +216,7 @@ impl Engine {
             .await??;
 
             let mut idx = self.search.write().await;
-            for (chunk, embedding) in batch.iter().zip(embeddings.into_iter()) {
+            for (chunk, embedding) in batch.iter().zip(embeddings) {
                 self.storage.insert_chunk(chunk, &embedding)?;
                 idx.insert_chunk(chunk.id.clone(), embedding);
             }
