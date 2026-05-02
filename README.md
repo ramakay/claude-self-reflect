@@ -21,30 +21,73 @@
 
 Single 44MB binary. No databases. No containers. No API keys required.
 
-### [Start Here — Full Documentation](https://ramakay.github.io/claude-self-reflect/)
-
 [Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
+</div>
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### The Forgetting Problem
+
+Claude starts fresh every session. Solutions you found, architectures you designed, bugs you debugged — all gone.
+
+Context retention drops below **20% after 10 sessions**. CSR fixes this with a single binary that gives Claude perfect memory.
+
+</td>
+<td width="50%">
 <a href="https://ramakay.github.io/claude-self-reflect/">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-01-hook-dark.png" />
-  <img src="docs-site/public/images/card-01-hook-light.png" alt="The Forgetting Problem — context retention drops below 20% after 10 sessions" width="100%" />
+  <img src="docs-site/public/images/card-01-hook-light.png" alt="The Forgetting Problem" width="100%" />
 </picture>
 </a>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
 
+### One Binary. 44MB.
+
+Everything runs locally — SQLite storage, FastEmbed vectors (384-dim), HNSW search (<1ms), and AST analysis across 6 languages. No Docker, no database, no API keys.
+
+**6 hooks** fire across the session lifecycle. **12 MCP tools** for explicit search.
+
+</td>
+<td width="50%">
 <a href="https://ramakay.github.io/claude-self-reflect/#/docs/architecture">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-02-arch-dark.png" />
-  <img src="docs-site/public/images/card-02-arch-light.png" alt="One Binary, 44MB — SQLite, HNSW, FastEmbed, AST, 6 hooks, 12 MCP tools" width="100%" />
+  <img src="docs-site/public/images/card-02-arch-light.png" alt="Architecture — One Binary, 44MB" width="100%" />
 </picture>
 </a>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
 
+### The Pipeline
+
+Three layers progressively improve search quality from raw chunks to AI-enriched narratives — **9.3x improvement**.
+
+Quality scores: **0.074 → 0.345 → 0.691**. Higher quality context. Better decisions. Fewer tokens.
+
+</td>
+<td width="50%">
 <a href="https://ramakay.github.io/claude-self-reflect/#/docs/enrichment">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-03-pipeline-dark.png" />
-  <img src="docs-site/public/images/card-03-pipeline-light.png" alt="The Pipeline — 3 layers, quality score improves from 0.074 to 0.691" width="100%" />
+  <img src="docs-site/public/images/card-03-pipeline-light.png" alt="The Pipeline — 3 layers, 9.3x improvement" width="100%" />
 </picture>
 </a>
+</td>
+</tr>
+</table>
+
+<div align="center">
+
+### [Start Here — Full Documentation](https://ramakay.github.io/claude-self-reflect/)
 
 </div>
 
