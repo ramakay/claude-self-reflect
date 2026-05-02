@@ -158,4 +158,18 @@ batch_results*.jsonl
 
 # Rust build artifacts
 csr-engine/target/
+
+# Claude Code local state (not for repo)
 .claude/RESEARCH_INDEX.md
+.claude/settings.json
+.claude/hooks/
+.claude/commands/
+.claude/slash-commands/
+.mcp.json
+
+# Legacy Python test/hook/example dirs (removed in v8)
+tests/
+hooks/
+examples/
+video/
+pytest.ini
