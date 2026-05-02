@@ -93,13 +93,15 @@ Quality scores: **0.074 → 0.345 → 0.691**. Higher quality context. Better de
 
 ## Table of Contents
 
-- [Install](#install)
-- [What You'll Ask](#what-youll-ask)
-- [How It Works](#how-it-works)
-- [Performance](#performance)
-- [MCP Tools](#mcp-tools)
-- [Hooks](#hooks)
-- [AI Narratives](#ai-narratives-optional)
+- [The Problem](#the-forgetting-problem) — Why Claude needs memory
+- [The Architecture](#one-binary-44mb) — How CSR solves it
+- [The Pipeline](#the-pipeline) — Progressive enrichment (9.3x improvement)
+- [Install](#install) — One command setup
+- [What You'll Ask](#what-youll-ask) — Natural language, no syntax
+- [Performance](#performance) — Sub-millisecond search, 93ms startup
+- [MCP Tools](#mcp-tools) — 12 search tools
+- [Hooks](#hooks) — 6 session lifecycle hooks
+- [AI Narratives](#ai-narratives-optional) — Optional 9.3x quality boost
 - [CLI Reference](#cli-reference)
 - [Upgrading from v7.x](#upgrading-from-v7x)
 - [Troubleshooting](#troubleshooting)
