@@ -58,7 +58,10 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
         }
     }
 
-    // 4. TAD: Update session outcome — normal session end = "success"
+    // 4. Write last-session summary for SwiftBar status plugin
+    write_session_summary(engine, input, cwd);
+
+    // 5. TAD: Update session outcome — normal session end = "success"
     if let Some(ref session_id) = input.session_id {
         let _ = engine
             .storage()
@@ -193,4 +196,86 @@ async fn run_v3_extraction(engine: &Engine, transcript_path: &Path, cwd: &Path) 
     }
 
     Ok(())
+}
+
+/// Write a brief session summary for the SwiftBar status plugin.
+/// Extracts the first user message + enrichment info as a 2-line summary.
+fn write_session_summary(engine: &Engine, input: &HookInput, cwd: &Path) {
+    let project = resolve_project_from_cwd(&cwd.to_string_lossy())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Try to get a summary from the transcript's first user message
+    let mut summary = String::new();
+    if let Some(ref tp) = input.transcript_path {
+        let path = PathBuf::from(tp);
+        if path.exists() {
+            if let Ok(messages) = crate::import::parse_jsonl_messages(&path) {
+                // Find the first substantial user message
+                let first_user = messages.iter().find_map(|m| {
+                    let data = crate::extraction::get_message_data(m);
+                    let role = data.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                    if role == "user" {
+                        let content = crate::extraction::content_to_lower(&data);
+                        if content.len() > 15 {
+                            Some(content.chars().take(120).collect::<String>())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+                if let Some(msg) = first_user {
+                    summary = format!("[{}] {}", project, msg);
+                }
+            }
+        }
+    }
+
+    // Try enrichment for richer context
+    if let Some(ref tp) = input.transcript_path {
+        let conv_id = std::path::Path::new(tp)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if let Ok(Some(ref_id)) = engine
+            .storage()
+            .get_enrichment_reflection_id(&conv_id, "extracted_v3")
+        {
+            if let Ok(Some((content, _, _))) = engine.storage().get_reflection_by_id(&ref_id) {
+                // Extract Search Summary or User Request from V3
+                for header in &["## Search Summary", "## User Request"] {
+                    if let Some(pos) = content.find(header) {
+                        let after = &content[pos + header.len()..];
+                        let para: String = after
+                            .lines()
+                            .skip(1)
+                            .find(|l| !l.trim().is_empty())
+                            .unwrap_or("")
+                            .trim()
+                            .trim_matches('"')
+                            .chars()
+                            .take(200)
+                            .collect();
+                        if para.len() > 20 {
+                            summary = format!("[{}] {}", project, para);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if summary.is_empty() {
+        summary = format!("[{}] Session completed", project);
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let path = home
+            .join(".claude-self-reflect")
+            .join("last-session-summary.txt");
+        let _ = std::fs::write(&path, &summary);
+    }
 }

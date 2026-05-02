@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::time::Duration;
 
 use hnsw_rs::hnsw::Hnsw;
@@ -28,7 +28,10 @@ fn bench_embed_single(c: &mut Criterion) {
     group.bench_function("embed_single", |b| {
         b.iter(|| {
             let result = model
-                .embed(vec!["How do I fix the Docker memory issue?".to_string()], None)
+                .embed(
+                    vec!["How do I fix the Docker memory issue?".to_string()],
+                    None,
+                )
                 .unwrap();
             assert_eq!(result[0].len(), 384);
         });
@@ -77,27 +80,19 @@ fn bench_search_hnsw(c: &mut Criterion) {
         // Query vector (first vector — should find itself as top match)
         let query = &vectors[0];
 
-        group.bench_with_input(
-            BenchmarkId::new("search_top5", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    let results = index.search(query, 5, 100);
-                    assert!(!results.is_empty());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("search_top5", size), &size, |b, _| {
+            b.iter(|| {
+                let results = index.search(query, 5, 100);
+                assert!(!results.is_empty());
+            });
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("search_top20", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    let results = index.search(query, 20, 100);
-                    assert!(!results.is_empty());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("search_top20", size), &size, |b, _| {
+            b.iter(|| {
+                let results = index.search(query, 20, 100);
+                assert!(!results.is_empty());
+            });
+        });
     }
 
     group.finish();

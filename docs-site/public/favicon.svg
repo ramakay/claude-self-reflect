@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Claude Self-Reflect logo">
+  <rect width="64" height="64" rx="14" fill="#1a1a2e"/>
+  <!-- Left page — solid -->
+  <path d="M32 12 L10 20 L10 48 L32 54 Z" fill="none" stroke="#f4efe4" stroke-width="3.5" stroke-linejoin="round"/>
+  <!-- Right page — reflection, lighter -->
+  <path d="M32 12 L54 20 L54 48 L32 54 Z" fill="rgba(244,239,228,0.15)" stroke="#f4efe4" stroke-width="2.5" stroke-linejoin="round" opacity="0.45"/>
+  <!-- Left content lines -->
+  <line x1="15" y1="27" x2="28" y2="22" stroke="#f4efe4" stroke-width="2" opacity="0.4" stroke-linecap="round"/>
+  <line x1="15" y1="33" x2="28" y2="28" stroke="#f4efe4" stroke-width="2" opacity="0.28" stroke-linecap="round"/>
+  <line x1="15" y1="39" x2="28" y2="34" stroke="#f4efe4" stroke-width="2" opacity="0.18" stroke-linecap="round"/>
+  <!-- Spine -->
+  <line x1="32" y1="12" x2="32" y2="54" stroke="#6b5b95" stroke-width="3" stroke-linecap="round"/>
+  <!-- Spine glow dot -->
+  <circle cx="32" cy="33" r="4.5" fill="#6b5b95"/>
+  <circle cx="32" cy="33" r="2.5" fill="#f4efe4"/>
+</svg>

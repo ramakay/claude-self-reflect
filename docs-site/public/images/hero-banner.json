@@ -1,0 +1,9 @@
+{
+  "target_filename": "hero-banner.png",
+  "status": "placeholder",
+  "reason": "PNG generation was attempted with the local imagegen tool, but the sandbox could not resolve openrouter.ai.",
+  "error": "getaddrinfo ENOTFOUND openrouter.ai",
+  "aspect_ratio": "16:9",
+  "prompt": "Wide 16:9 hero banner for a premium AI developer tool. Dark gradient background from near-black to deep blue and deep purple. Neural network visualization with glowing nodes and connections forming a subtle brain and memory metaphor. Include crisp bold headline text: Claude forgets everything. This fixes that. Dramatic cinematic lighting, premium tech product feel, clean composition, high contrast, polished, no logos, no watermark.",
+  "text": "Claude forgets everything. This fixes that."
+}

@@ -2,267 +2,113 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 7.0.x   | :white_check_mark: |
-| 6.0.x   | :white_check_mark: |
-| < 6.0   | :x:                |
+| Version | Supported |
+| ------- | --------- |
+| 8.0.x   | Yes       |
+| < 8.0   | No        |
 
-## Deployment Security Models
+## Security Model
 
-Claude Self-Reflect supports two deployment modes with different security considerations:
+Claude Self-Reflect v8 runs as a single local Rust binary (`csr-engine`).
+There is no Docker service, Qdrant server, Python runtime, or hosted database in
+the default deployment.
 
-### Standalone Mode (Default)
+### Local-First Defaults
 
-**Description**: Single-user deployment on personal workstation or laptop.
+- Conversation files are read from `~/.claude/projects/`.
+- CSR data is stored locally under `~/.claude-self-reflect/`.
+- Embeddings are generated locally with FastEmbed.
+- Search runs against a local SQLite database plus an in-memory HNSW index.
+- No telemetry is collected.
 
-**Security Characteristics**:
-- No QDRANT_API_KEY required (unauthenticated Qdrant)
-- All data stays on localhost
-- Protected by system-level authentication (user login)
-- Suitable for personal use and development
+### Optional Network Use
 
-**When to Use**:
-- Personal development environment
-- Single-user workstation
-- Local testing and experimentation
-- No network exposure needed
+The default install does not send conversation text to third-party APIs.
+Network use is limited to:
 
-**Security Considerations**:
-- Qdrant accessible only from localhost (default: http://localhost:6333)
-- No authentication required for Qdrant operations
-- Docker containers run as non-root user (UID 1001)
-- File permissions restrict access to owner only
+- Installer downloads from GitHub Releases.
+- Optional AI narrative enrichment through Anthropic APIs, when explicitly
+  configured by the user.
 
-### Shared Mode (Multi-User)
+Do not enable optional AI enrichment unless the conversation data is appropriate
+to send to that provider.
 
-**Description**: Multi-user deployment on shared server or cloud instance.
+## Installer Integrity
 
-**Security Characteristics**:
-- QDRANT_API_KEY required (authenticated Qdrant)
-- Multiple users share the same Qdrant instance
-- API key protects against unauthorized access
-- Suitable for team deployments
+The npm postinstall path and shell installer download release assets over HTTPS
+from `github.com/ramakay/claude-self-reflect`. Binary release archives are
+verified against the release `checksums.txt` before installation.
 
-**When to Use**:
-- Shared development server
-- Team collaboration environment
-- Cloud-hosted deployment
-- Network-exposed Qdrant instance
+Users who need offline or custom binary management can set:
 
-**Security Requirements**:
-1. Set strong QDRANT_API_KEY in .env:
-   ```bash
-   QDRANT_API_KEY=your-secure-random-key-here
-   ```
+```bash
+CSR_SKIP_BINARY_DOWNLOAD=1
+```
 
-2. Configure Qdrant with authentication:
-   ```yaml
-   # config/qdrant-config.yaml
-   service:
-     api_key: ${QDRANT_API_KEY}
-   ```
+Then install a trusted `csr-engine` binary manually into the desired install
+directory.
 
-3. Use HTTPS/TLS for network traffic (if exposed)
+## File Permissions
 
-4. Implement network-level access controls (firewall, VPN)
+Recommended permissions:
 
-## Privacy & Data Security
+```bash
+chmod 700 ~/.claude-self-reflect
+chmod 600 ~/.claude-self-reflect/*.db 2>/dev/null || true
+chmod 700 ~/.local/bin
+chmod 755 ~/.local/bin/csr-engine
+```
 
-### Privacy & Data Exchange
+For shared workstations, rely on OS user isolation. Do not place
+`~/.claude-self-reflect` or Claude transcript directories in a world-readable
+location.
 
-| Mode | Data Storage | External API Calls | Data Sent | Search Quality |
-|------|--------------|-------------------|-----------|----------------|
-| **Local (Default)** | Your machine only | None | Nothing leaves your computer | Good - uses efficient local embeddings |
-| **Cloud (Opt-in)** | Your machine | Voyage AI | Conversation text for embedding generation | Better - uses state-of-the-art models |
-| **Batch Automation (Opt-in)** | Your machine | Anthropic Batch API | Narrative summaries only | Best - 9.3x better search quality |
+## Hook Safety
 
-**Note**: Cloud mode and batch automation send data to external APIs. Review privacy policies before enabling:
-- Voyage AI: https://www.voyageai.com/privacy
-- Anthropic: https://www.anthropic.com/privacy
+CSR installs Claude Code hooks that run `csr-engine hook ...`.
 
-### Data Protection
-- **Local by default**: Your conversations never leave your machine unless you explicitly enable cloud features
-- **No telemetry**: We don't track usage or collect any data
-- **Secure storage**: All data stored in Docker volumes with proper permissions
-- **API keys**: Stored in .env file with 600 permissions (read/write by owner only)
+- Hooks use catch-all error handling and should not block Claude Code.
+- Session-start and predictive injection output must frame retrieved memories as
+  past context, not current instructions.
+- Hook config installation removes older Python CSR hook commands when applying
+  the Rust hook configuration.
+
+## API Key Handling
+
+Optional enrichment may require provider API keys. Store keys in user-owned
+configuration files or environment variables only.
+
+- Never commit API keys.
+- Rotate keys if they appear in transcripts, shell history, or logs.
+- Review provider privacy policies before enabling external enrichment.
 
 ## Reporting a Vulnerability
 
-**IMPORTANT**: Do not create public GitHub issues for security vulnerabilities.
+Do not create public GitHub issues for security vulnerabilities.
 
-### How to Report
+Preferred reporting path:
 
-1. **GitHub Security Advisories** (preferred):
-   - Go to https://github.com/ramakay/claude-self-reflect/security/advisories
-   - Click "Report a vulnerability"
+1. Go to https://github.com/ramakay/claude-self-reflect/security/advisories
+2. Click "Report a vulnerability"
+3. Include reproduction steps, affected version, impact, and suggested fix when
+   available.
 
-2. **Include**:
-   - Description of the vulnerability
-   - Steps to reproduce
-   - Potential impact
-   - Suggested fix (if any)
+Expected response:
 
-3. **Expected Response**:
-   - Acknowledgment within 48 hours
-   - Initial assessment within 7 days
-   - Fix timeline estimate within 14 days
+- Acknowledgment within 48 hours.
+- Initial assessment within 7 days.
+- Fix timeline estimate within 14 days.
 
-### Disclosure Policy
+## Disclosure Policy
 
-- We follow coordinated disclosure
-- Security fixes released as patch versions
-- Public disclosure after fix is available
-- Credit given to security researchers (with permission)
-
-## Security Best Practices
-
-### Docker Security
-
-1. **Non-Root Users** (v7.0+):
-   - All containers run as appuser (UID 1001)
-   - No privileged operations required
-   - Prevents privilege escalation attacks
-
-2. **Volume Permissions**:
-   ```bash
-   # Correct ownership for Docker volumes
-   chown -R 1001:1001 ~/.claude-self-reflect
-   ```
-
-3. **Resource Limits**:
-   - Memory limits prevent DoS via resource exhaustion
-   - CPU limits prevent runaway processes
-   - See docker-compose.yaml for configuration
-
-### File System Security
-
-1. **State File Protection** (v7.0+):
-   - Atomic writes prevent corruption
-   - File locking (fcntl) prevents race conditions
-   - UTF-8 encoding enforced
-
-2. **Directory Permissions**:
-   ```bash
-   # Recommended permissions
-   chmod 700 ~/.claude-self-reflect
-   chmod 600 ~/.claude-self-reflect/config/*.json
-   ```
-
-### API Key Management
-
-1. **Environment Variables**:
-   - Never commit .env files to git
-   - Use .env.example as template
-   - Rotate API keys regularly
-
-2. **Batch Automation Keys** (v7.0+):
-   - ANTHROPIC_API_KEY: Required for batch features
-   - QDRANT_API_KEY: Required for shared mode only
-   - VOYAGE_KEY: Required only if using cloud embeddings
-
-3. **Key Rotation**:
-   ```bash
-   # Update .env file
-   vim ~/.claude-self-reflect/.env
-
-   # Restart services
-   docker compose down
-   docker compose --profile batch-automation up -d
-   ```
-
-### Network Security
-
-1. **Standalone Mode** (Default):
-   - Qdrant bound to localhost only
-   - No external network exposure
-   - Docker network isolation
-
-2. **Shared Mode**:
-   - Use HTTPS/TLS for Qdrant
-   - Implement firewall rules
-   - Consider VPN for access
-   - Enable Qdrant authentication
-
-3. **Port Configuration**:
-   ```yaml
-   # Standalone (default)
-   ports:
-     - "127.0.0.1:6333:6333"
-
-   # Shared (requires auth)
-   ports:
-     - "0.0.0.0:6333:6333"
-   environment:
-     - QDRANT_API_KEY=${QDRANT_API_KEY}
-   ```
-
-## Container Security Notice
-
-**Known Vulnerabilities**: Our Docker images are continuously monitored and may show vulnerabilities in base system libraries.
-
-- **Why they exist**: We use official Python Docker images based on Debian stable
-- **Actual risk is minimal** because:
-  - Most CVEs are in unused system libraries
-  - Security patches are backported by Debian
-  - Containers run as non-root users (UID 1001)
-  - Local-only tool with no network exposure by default
-- **What we're doing**: Regular updates, security monitoring, and evaluating alternative base images
-
-**For production environments**:
-```bash
-# Run containers with read-only root filesystem
-docker run --read-only --tmpfs /tmp claude-self-reflect
-```
-
-## Known Security Considerations
-
-### Qdrant Authentication (v7.0+)
-
-**Issue**: Standalone mode runs Qdrant without authentication.
-
-**Mitigation**:
-- Qdrant bound to localhost only (not network-exposed)
-- Docker network isolation prevents external access
-- System-level authentication (user login) protects access
-
-**Action Required**: None for standalone mode. For shared mode, enable QDRANT_API_KEY.
-
-### Batch Automation Data Transmission (v7.0+)
-
-**Issue**: Batch automation sends conversation summaries to Anthropic Batch API.
-
-**Mitigation**:
-- Feature disabled by default
-- Users must explicitly enable with ANTHROPIC_API_KEY
-- Data transmitted over HTTPS
-- Only narrative summaries sent (not full conversations)
-
-**Action Required**: Review privacy implications before enabling batch automation.
-
-## Security Audit History
-
-- v7.0.0 (2025-10-28): Security hardening (7 critical + 5 high priority fixes)
-- v3.3.1 (2025-09-14): GPT-5 comprehensive security review
-- v2.8.5 (2025-09-02): CVE-2025-58050 mitigation
-- v2.3.3 (2025-07-27): Command injection fixes
+- We follow coordinated disclosure.
+- Security fixes are released as patch versions.
+- Public disclosure happens after a fix is available.
+- Credit is given to security researchers with permission.
 
 ## Security Updates
 
-Security updates are released as patch versions (x.y.Z):
-
-- Critical: Released within 48 hours
-- High: Released within 7 days
-- Medium: Released within 30 days
-- Low: Included in next regular release
-
-## Contact
-
-For security inquiries:
-- GitHub Security Advisories (preferred)
-- GitHub Discussions (security-related)
-- Issue Tracker (for non-security bugs only)
-
-## License
-
-This security policy is part of the Claude Self-Reflect project and is licensed under the MIT License.
+- Critical: released within 48 hours.
+- High: released within 7 days.
+- Medium: released within 30 days.
+- Low: included in the next regular release.

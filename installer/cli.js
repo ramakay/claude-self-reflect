@@ -7,10 +7,11 @@
  * the `claude-self-reflect` npm command and proxies to the binary.
  */
 
-import { spawn, execSync } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { fileURLToPath } from 'url';
 
 const commands = {
   setup: 'Import conversations, register MCP server, install hooks',
@@ -21,14 +22,18 @@ const commands = {
 
 /** Find the csr-engine binary. Checks common install locations. */
 function findBinary() {
+  const installDir = process.env.CSR_INSTALL_DIR || join(homedir(), '.local', 'bin');
   const candidates = [
-    join(homedir(), '.local', 'bin', 'csr-engine'),
+    join(installDir, 'csr-engine'),
     '/usr/local/bin/csr-engine',
   ];
 
   // Also check PATH
   try {
-    const which = execSync('which csr-engine 2>/dev/null', { encoding: 'utf8' }).trim();
+    const which = execFileSync('which', ['csr-engine'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
     if (which) candidates.unshift(which);
   } catch {}
 
@@ -41,8 +46,18 @@ function findBinary() {
 function runEngine(args) {
   const binary = findBinary();
   if (!binary) {
-    console.error('csr-engine binary not found.');
-    console.error('Install it: curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh');
+    console.error('csr-engine binary not found. Attempting auto-download...');
+    try {
+      const postinstallPath = fileURLToPath(new URL('./postinstall.js', import.meta.url));
+      execFileSync(process.execPath, [postinstallPath], { stdio: 'inherit' });
+      const retryBinary = findBinary();
+      if (retryBinary) {
+        const child = spawn(retryBinary, args, { stdio: 'inherit' });
+        child.on('exit', (code) => process.exit(code || 0));
+        return;
+      }
+    } catch {}
+    console.error('Install manually: curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh');
     process.exit(1);
   }
 

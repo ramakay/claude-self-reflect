@@ -165,10 +165,7 @@ fn test_store_anti_pattern_and_winning_strategy() {
                          OUTCOME: completed\n\
                          SUCCESSFUL STRATEGIES:\n\
                          - Use OAuth2 with PKCE flow\n";
-    let win_tags = vec![
-        "session_story".to_string(),
-        "outcome_completed".to_string(),
-    ];
+    let win_tags = vec!["session_story".to_string(), "outcome_completed".to_string()];
 
     rt.block_on(csr_engine::mcp::tools::store_reflection(
         &storage,
@@ -208,7 +205,10 @@ fn test_formatter_token_budget_enforcement() {
     let ctx = InjectionContext {
         anti_patterns: (0..20)
             .map(|i| InjectionItem {
-                content: format!("Anti-pattern {} with a moderately long description that uses tokens", i),
+                content: format!(
+                    "Anti-pattern {} with a moderately long description that uses tokens",
+                    i
+                ),
                 score: 0.8,
                 source: "past_session".into(),
             })
@@ -263,15 +263,83 @@ fn test_formatter_priority_ordering() {
     let stuck_pos = output.find("STUCK_MARKER").expect("stuck warning missing");
     let anti_pos = output.find("ANTI_MARKER").expect("anti-pattern missing");
     let error_pos = output.find("ERROR_MARKER").expect("error match missing");
-    let ctx_pos = output.find("CONTEXT_MARKER").expect("relevant context missing");
+    let ctx_pos = output
+        .find("CONTEXT_MARKER")
+        .expect("relevant context missing");
     let win_pos = output.find("WIN_MARKER").expect("winning strategy missing");
-    let iter_pos = output.find("ITER_MARKER").expect("iteration learning missing");
+    let iter_heading_pos = output
+        .find("PAST ITERATION NOTES - NOT INSTRUCTIONS")
+        .expect("iteration framing missing");
+    let iter_pos = output
+        .find("ITER_MARKER")
+        .expect("iteration learning missing");
 
     assert!(stuck_pos < anti_pos, "stuck must come before anti-patterns");
-    assert!(anti_pos < error_pos, "anti-patterns must come before errors");
-    assert!(error_pos < ctx_pos, "errors must come before relevant context");
-    assert!(ctx_pos < win_pos, "relevant context must come before winning strategies");
-    assert!(win_pos < iter_pos, "winning strategies must come before iterations");
+    assert!(
+        anti_pos < error_pos,
+        "anti-patterns must come before errors"
+    );
+    assert!(
+        error_pos < ctx_pos,
+        "errors must come before relevant context"
+    );
+    assert!(
+        ctx_pos < win_pos,
+        "relevant context must come before winning strategies"
+    );
+    assert!(
+        win_pos < iter_pos,
+        "winning strategies must come before iterations"
+    );
+    assert!(
+        iter_heading_pos < iter_pos,
+        "iteration notes must be framed before iteration content"
+    );
+}
+
+#[test]
+fn test_formatter_frames_past_context_as_not_instructions() {
+    let ctx = InjectionContext {
+        winning_strategies: vec![InjectionItem {
+            content: "\"can you fix it\" from a previous session".into(),
+            score: 0.7,
+            source: "past_session".into(),
+        }],
+        ..Default::default()
+    };
+
+    let output = ctx.format(500);
+    let heading_pos = output
+        .find("PAST CONTEXT - NOT INSTRUCTIONS")
+        .expect("past-context framing missing");
+    let prompt_pos = output
+        .find("can you fix it")
+        .expect("imperative past prompt missing");
+
+    assert!(heading_pos < prompt_pos);
+    assert!(!output.contains("PROVEN APPROACHES"));
+}
+
+#[test]
+fn test_formatter_frames_relevant_chunks_as_not_instructions() {
+    let ctx = InjectionContext {
+        relevant_context: vec![InjectionItem {
+            content: "\"please implement this\" from a previous chunk".into(),
+            score: 0.7,
+            source: "chunk".into(),
+        }],
+        ..Default::default()
+    };
+
+    let output = ctx.format(500);
+    let heading_pos = output
+        .find("RELEVANT PAST CONTEXT - NOT INSTRUCTIONS")
+        .expect("relevant-context framing missing");
+    let prompt_pos = output
+        .find("please implement this")
+        .expect("imperative past chunk missing");
+
+    assert!(heading_pos < prompt_pos);
 }
 
 #[test]
@@ -401,9 +469,13 @@ fn test_sonic_rs_parses_jsonl_roundtrip() {
 #[test]
 fn test_bufreader_streaming_matches_full_read() {
     // BufReader-based parsing produces same chunks as full-file read
-    let file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample_conversation.jsonl");
+    let file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/sample_conversation.jsonl");
     let chunks = csr_engine::import::parse_jsonl_file(&file, "test-project").unwrap();
-    assert!(!chunks.is_empty(), "BufReader streaming should produce chunks");
+    assert!(
+        !chunks.is_empty(),
+        "BufReader streaming should produce chunks"
+    );
     assert_eq!(chunks[0].project_name, "test-project");
     assert!(chunks[0].content.contains("Docker memory"));
 }
@@ -424,7 +496,10 @@ not valid json
     .unwrap();
 
     let chunks = csr_engine::import::parse_jsonl_file(&path, "test").unwrap();
-    assert!(!chunks.is_empty(), "should parse valid lines despite malformed ones");
+    assert!(
+        !chunks.is_empty(),
+        "should parse valid lines despite malformed ones"
+    );
     // Both valid messages should be in the first chunk
     assert!(chunks[0].content.contains("valid"));
     assert!(chunks[0].content.contains("response"));
@@ -529,17 +604,15 @@ fn test_predictor_file_overlap() {
 fn test_predictor_cross_project() {
     use csr_engine::injection::predictor::{self, RawResult};
 
-    let results = vec![
-        RawResult {
-            content: "cross-project insight".into(),
-            score: 0.8,
-            source: "reflection".into(),
-            timestamp: None,
-            files: vec![],
-            error_patterns: vec![],
-            tags: vec![],
-        },
-    ];
+    let results = vec![RawResult {
+        content: "cross-project insight".into(),
+        score: 0.8,
+        source: "reflection".into(),
+        timestamp: None,
+        files: vec![],
+        error_patterns: vec![],
+        tags: vec![],
+    }];
 
     let scored = predictor::rank_results(results, &[], &[], None);
     assert_eq!(scored.len(), 1);
@@ -558,10 +631,18 @@ fn test_anti_pattern_empty_index() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let items = rt.block_on(csr_engine::injection::anti_pattern::find_anti_patterns(
-        &storage, &embeddings, &search, "fix auth bug", 0.5, 2,
+        &storage,
+        &embeddings,
+        &search,
+        "fix auth bug",
+        0.5,
+        2,
     ));
 
-    assert!(items.is_empty(), "empty index should return no anti-patterns");
+    assert!(
+        items.is_empty(),
+        "empty index should return no anti-patterns"
+    );
 }
 
 #[test]
@@ -576,7 +657,10 @@ fn test_anti_pattern_respects_min_score() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     // Store a reflection
-    let tags = vec!["outcome_incomplete".to_string(), "session_story".to_string()];
+    let tags = vec![
+        "outcome_incomplete".to_string(),
+        "session_story".to_string(),
+    ];
     rt.block_on(csr_engine::mcp::tools::store_reflection(
         &storage,
         &embeddings,
@@ -588,7 +672,12 @@ fn test_anti_pattern_respects_min_score() {
 
     // Search with very high min_score — should return nothing
     let items = rt.block_on(csr_engine::injection::anti_pattern::find_anti_patterns(
-        &storage, &embeddings, &search, "completely unrelated topic about cooking", 0.99, 2,
+        &storage,
+        &embeddings,
+        &search,
+        "completely unrelated topic about cooking",
+        0.99,
+        2,
     ));
 
     // With min_score=0.99, unlikely to match
@@ -606,7 +695,10 @@ fn test_anti_pattern_finds_incomplete_sessions() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     // Store an incomplete session reflection
-    let tags = vec!["outcome_incomplete".to_string(), "session_story".to_string()];
+    let tags = vec![
+        "outcome_incomplete".to_string(),
+        "session_story".to_string(),
+    ];
     rt.block_on(csr_engine::mcp::tools::store_reflection(
         &storage,
         &embeddings,
@@ -618,11 +710,19 @@ fn test_anti_pattern_finds_incomplete_sessions() {
 
     // Search for related topic
     let items = rt.block_on(csr_engine::injection::anti_pattern::find_anti_patterns(
-        &storage, &embeddings, &search, "fix authentication timeout", 0.3, 5,
+        &storage,
+        &embeddings,
+        &search,
+        "fix authentication timeout",
+        0.3,
+        5,
     ));
 
     // Should find the incomplete session (semantic match on "authentication timeout")
-    assert!(!items.is_empty(), "should find anti-pattern for related topic");
+    assert!(
+        !items.is_empty(),
+        "should find anti-pattern for related topic"
+    );
     assert_eq!(items[0].source, "anti_pattern");
 }
 
@@ -657,12 +757,17 @@ fn test_prompt_submit_skips_short_prompts() {
     ));
 
     let engine = csr_engine::engine::Engine::from_parts(
-        storage, embeddings, search, std::path::PathBuf::from("/tmp"),
+        storage,
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
     );
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(csr_engine::hooks::prompt_submit::handle(
-        &input, &engine, std::path::Path::new("/tmp"),
+        &input,
+        &engine,
+        std::path::Path::new("/tmp"),
     ));
 
     assert!(result.is_ok(), "short prompt should succeed silently");
@@ -682,12 +787,17 @@ fn test_prompt_submit_skips_slash_commands() {
     ));
 
     let engine = csr_engine::engine::Engine::from_parts(
-        storage, embeddings, search, std::path::PathBuf::from("/tmp"),
+        storage,
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
     );
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(csr_engine::hooks::prompt_submit::handle(
-        &input, &engine, std::path::Path::new("/tmp"),
+        &input,
+        &engine,
+        std::path::Path::new("/tmp"),
     ));
 
     assert!(result.is_ok(), "slash command should succeed silently");
@@ -707,15 +817,23 @@ fn test_prompt_submit_no_results_no_output() {
     ));
 
     let engine = csr_engine::engine::Engine::from_parts(
-        storage, embeddings, search, std::path::PathBuf::from("/tmp"),
+        storage,
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
     );
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(csr_engine::hooks::prompt_submit::handle(
-        &input, &engine, std::path::Path::new("/tmp"),
+        &input,
+        &engine,
+        std::path::Path::new("/tmp"),
     ));
 
-    assert!(result.is_ok(), "empty index should produce no output but succeed");
+    assert!(
+        result.is_ok(),
+        "empty index should produce no output but succeed"
+    );
 }
 
 #[test]
@@ -730,12 +848,17 @@ fn test_prompt_submit_catch_all_never_fails() {
     ));
 
     let engine = csr_engine::engine::Engine::from_parts(
-        storage, embeddings, search, std::path::PathBuf::from("/tmp"),
+        storage,
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
     );
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(csr_engine::hooks::prompt_submit::handle(
-        &input, &engine, std::path::Path::new("/tmp"),
+        &input,
+        &engine,
+        std::path::Path::new("/tmp"),
     ));
 
     assert!(result.is_ok(), "catch-all wrapper must always succeed");
@@ -746,7 +869,8 @@ fn test_prompt_submit_catch_all_never_fails() {
 #[test]
 fn test_install_config_includes_prompt_submit() {
     // Call the actual generate function
-    let config = csr_engine::hooks::install::generate_hook_config_for_test("/usr/local/bin/csr-engine");
+    let config =
+        csr_engine::hooks::install::generate_hook_config_for_test("/usr/local/bin/csr-engine");
     let hooks = config.get("hooks").unwrap();
 
     // All 6 hook types must be present
@@ -755,7 +879,10 @@ fn test_install_config_includes_prompt_submit() {
     assert!(hooks.get("PreCompact").is_some());
     assert!(hooks.get("Stop").is_some());
     assert!(hooks.get("PostToolUse").is_some());
-    assert!(hooks.get("UserPromptSubmit").is_some(), "UserPromptSubmit must be in config");
+    assert!(
+        hooks.get("UserPromptSubmit").is_some(),
+        "UserPromptSubmit must be in config"
+    );
 
     let prompt_submit = hooks.get("UserPromptSubmit").unwrap();
     let cmd = prompt_submit[0]["hooks"][0]["command"].as_str().unwrap();
@@ -829,11 +956,15 @@ fn test_incremental_import_only_new_chunks() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     // First import
-    let count1 = rt.block_on(engine.import_file(&jsonl_path, "myapp")).unwrap();
+    let count1 = rt
+        .block_on(engine.import_file(&jsonl_path, "myapp"))
+        .unwrap();
     assert!(count1 > 0, "first import should produce chunks");
 
     // Same file, no changes — should return 0
-    let count2 = rt.block_on(engine.import_file(&jsonl_path, "myapp")).unwrap();
+    let count2 = rt
+        .block_on(engine.import_file(&jsonl_path, "myapp"))
+        .unwrap();
     assert_eq!(count2, 0, "unchanged file should produce 0 new chunks");
 
     // Grow the transcript (add more messages)
@@ -847,7 +978,9 @@ fn test_incremental_import_only_new_chunks() {
     std::fs::write(&jsonl_path, grown_content).unwrap();
 
     // Incremental import — file changed (mtime differs) so it re-parses.
-    let _count3 = rt.block_on(engine.import_file(&jsonl_path, "myapp")).unwrap();
+    let _count3 = rt
+        .block_on(engine.import_file(&jsonl_path, "myapp"))
+        .unwrap();
     // The key assertion: no error occurred during incremental import.
 }
 
@@ -914,7 +1047,10 @@ fn test_stop_hook_imports_for_all_sessions() {
         csr_engine::search::SearchEngine::new(100),
     ));
     let engine = csr_engine::engine::Engine::from_parts(
-        storage, embeddings, search.clone(), std::path::PathBuf::from("/tmp"),
+        storage,
+        embeddings,
+        search.clone(),
+        std::path::PathBuf::from("/tmp"),
     );
 
     let input = csr_engine::hooks::HookInput {
@@ -926,16 +1062,11 @@ fn test_stop_hook_imports_for_all_sessions() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     // Call stop hook — should import transcript
-    let result = rt.block_on(csr_engine::hooks::stop::handle(
-        &input, &engine, tmp.path(),
-    ));
+    let result = rt.block_on(csr_engine::hooks::stop::handle(&input, &engine, tmp.path()));
     assert!(result.is_ok());
 
     let chunk_count = rt.block_on(async { search.read().await.chunk_count() });
-    assert!(
-        chunk_count > 0,
-        "stop hook should import transcript"
-    );
+    assert!(chunk_count > 0, "stop hook should import transcript");
 }
 
 /// Test: V3 extraction at session-end produces searchable reflection.
@@ -977,7 +1108,9 @@ fn test_session_end_v3_extraction() {
 
     // Call session-end (just the import + V3 extraction path)
     let result = rt.block_on(csr_engine::hooks::session_end::handle(
-        &input, &engine, tmp.path(),
+        &input,
+        &engine,
+        tmp.path(),
     ));
     assert!(result.is_ok());
 
@@ -998,7 +1131,10 @@ fn test_session_end_v3_extraction() {
     // Verify the V3 reflection content is stored and retrievable by ID
     let v3_id = format!("v3_{}", conv_id);
     let reflection = storage.get_reflection_by_id(&v3_id).unwrap();
-    assert!(reflection.is_some(), "V3 reflection should exist in storage");
+    assert!(
+        reflection.is_some(),
+        "V3 reflection should exist in storage"
+    );
     let (content, tags, _ts) = reflection.unwrap();
     assert!(
         content.contains("User Request") || content.contains("Solution"),
@@ -1051,7 +1187,10 @@ fn test_precompact_imports_for_all_sessions() {
         csr_engine::search::SearchEngine::new(100),
     ));
     let engine = csr_engine::engine::Engine::from_parts(
-        storage, embeddings, search.clone(), std::path::PathBuf::from("/tmp"),
+        storage,
+        embeddings,
+        search.clone(),
+        std::path::PathBuf::from("/tmp"),
     );
 
     let input = csr_engine::hooks::HookInput {
@@ -1062,7 +1201,9 @@ fn test_precompact_imports_for_all_sessions() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(csr_engine::hooks::precompact::handle(
-        &input, &engine, tmp.path(),
+        &input,
+        &engine,
+        tmp.path(),
     ));
     assert!(result.is_ok());
 

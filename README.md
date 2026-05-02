@@ -2,72 +2,69 @@
 
 <div align="center">
 
+<img src="docs-site/public/favicon.svg" alt="Claude Self-Reflect" width="80" height="80" />
+
 [![npm version](https://badge.fury.io/js/claude-self-reflect.svg)](https://www.npmjs.com/package/claude-self-reflect)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-Compatible-6B4FBB)](https://github.com/anthropics/claude-code)
 [![MCP Protocol](https://img.shields.io/badge/MCP-Enabled-FF6B6B)](https://modelcontextprotocol.io/)
 [![Local First](https://img.shields.io/badge/Local%20First-Privacy-4A90E2)](https://github.com/ramakay/claude-self-reflect)
 
-</div>
-
 **Claude forgets everything. This fixes that.**
 
-Single 44MB binary. No databases. No containers. No API keys required. Just install and search.
+Single 44MB binary. No databases. No containers. No API keys required.
 
-## Quick Install
+[Documentation](https://ramakay.github.io/claude-self-reflect/) | [Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
+
+</div>
+
+## Install
 
 ```bash
-# Download and install the binary
 curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
-
-# One-shot setup: imports conversations, registers MCP, installs hooks
-csr-engine setup
-
-# Restart Claude Code. Done.
 ```
 
+One command. Downloads the binary, runs setup, registers MCP server, installs 6 hooks. Restart Claude Code.
+
+| Platform | Support |
+|----------|---------|
+| macOS (Apple Silicon) | Prebuilt binary |
+| Linux x86_64 / WSL | Prebuilt binary |
+| Linux ARM64 | Prebuilt binary |
+| macOS (Intel) | Build from source |
+
 <details>
-<summary>Alternative: npm install</summary>
+<summary>Alternative: npm</summary>
 
 ```bash
 npm install -g claude-self-reflect
-# Then install the binary separately:
-curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
+```
+
+</details>
+
+<details>
+<summary>Build from source</summary>
+
+```bash
+git clone https://github.com/ramakay/claude-self-reflect.git
+cd claude-self-reflect/csr-engine
+cargo build --release
+cp target/release/csr-engine ~/.local/bin/
 csr-engine setup
 ```
 
 </details>
 
-## Before & After
+## What You'll Ask
 
-```
-You: "How did we fix that CPU usage bug?"
-Claude (without CSR): "I don't have access to previous conversations."
+After install, just ask Claude naturally:
 
-Claude (with CSR):    "Found it - we fixed the circular reference causing
-                       100% CPU in the server modularization. The fix was
-                       in store_reflection where dimension mismatch created
-                       separate local and cloud collections."
-```
+- *"How did we solve re-renders on this component?"*
+- *"What did we tell Joe about that commit?"*
+- *"What were our frustrations with this approach?"*
+- *"Where did we put the auth middleware config?"*
 
-```
-You: "What about that memory issue last week?"
-Claude (with CSR):    "The container was limited to 2GB but only using
-                       266MB. Issue only happened with MAX_QUEUE_SIZE=1000
-                       outside the container. With proper limits, memory
-                       stayed stable at 341MB."
-```
-
-## Performance
-
-| Metric | Value |
-|--------|-------|
-| **Cached startup** | 93ms |
-| **Search latency (p95)** | <1ms |
-| **Binary size** | 44MB |
-| **Import speed** | ~20 conversations/sec |
-| **Embedding** | 0.73ms/text (batch) |
-| **Conversations indexed** | 900+ tested |
+No special syntax. No commands. CSR finds relevant past context and injects it automatically.
 
 ## How It Works
 
@@ -83,10 +80,10 @@ Claude (with CSR):    "The container was limited to 2GB but only using
          |                               |
     [enrichment]                    [MCP search]
          |                               |
-  Layer 1: Heuristic              reflect_on_past()
-  Layer 2: V3 Extraction          search_by_concept()
-  Layer 3: AI Narrative*          get_recent_work()
-                                  ...12 tools total
+  Layer 1: Chunked text            reflect_on_past()
+  Layer 2: Tools + AST extracted   search_by_concept()
+  Layer 3: AI Narrative*           get_recent_work()
+                                   ...12 tools total
 ```
 
 Everything runs locally in a single process. No network services, no containers.
@@ -94,9 +91,20 @@ Everything runs locally in a single process. No network services, no containers.
 - **SQLite** stores chunks, embeddings, enrichment state
 - **FastEmbed** (all-MiniLM-L6-v2) generates 384-dim vectors locally
 - **HNSW** index provides sub-millisecond approximate nearest neighbor search
-- **3-layer enrichment** progressively improves searchability
+- **AST analysis** extracts functions, types, imports from code (Rust, Python, TS, JS, Go, TSX)
+- **3-layer enrichment** progressively improves search quality from 0.074 to 0.691
 
 *\*Layer 3 (AI Narratives) is optional and requires an Anthropic API key.*
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| **Cached startup** | 93ms |
+| **Search latency (p95)** | <1ms |
+| **Binary size** | 44MB |
+| **Import speed** | ~20 conversations/sec |
+| **Embedding** | 0.73ms/text (batch) |
 
 ## MCP Tools
 
@@ -119,40 +127,24 @@ Everything runs locally in a single process. No network services, no containers.
 
 ## Hooks
 
-6 Claude Code hooks for real-time intelligence:
+6 hooks fire at strategic moments during Claude Code sessions:
 
 | Hook | What it does |
 |------|-------------|
 | **SessionStart** | Surfaces relevant past context at conversation start |
-| **SessionEnd** | Stores session narrative for future retrieval |
-| **PreCompact** | Backs up state before context compaction |
-| **Stop** | Stores iteration learnings, detects stuck patterns |
+| **UserPromptSubmit** | Predicts and injects context before Claude responds |
 | **PostToolUse** | Tracks file edits with session-scoped dedup |
-| **UserPromptSubmit** | Predicts and injects relevant context |
+| **Stop** | Stores iteration learnings, detects stuck patterns |
+| **PreCompact** | Backs up state before context compaction |
+| **SessionEnd** | Stores session narrative for future retrieval |
 
-## Ralph Loop Memory
-
-Use the [ralph-wiggum plugin](https://github.com/anthropics/claude-code-plugins/tree/main/ralph-wiggum) for long tasks? CSR gives your Ralph loops **persistent memory across sessions and projects**.
-
-- **Automatic backup** before context compaction
-- **Anti-pattern injection** — "DON'T RETRY THESE" surfaces first
-- **Success pattern learning** — reuse what worked before
-- **Cross-project memory** — learn from ALL your projects
-
-```bash
-# Install hooks (run once)
-csr-engine hook install --apply
-```
+All hooks use catch-all error handling. They never block Claude Code.
 
 ## AI Narratives (Optional)
 
 Transform raw conversations into rich, searchable narratives with 9.3x better search quality. Requires an Anthropic API key.
 
 ```bash
-# Setup with API key
-csr-engine setup --anthropic-key=sk-ant-...
-
-# Run the enrichment daemon
 csr-engine daemon
 ```
 
@@ -174,35 +166,19 @@ csr-engine hook install --apply Install Claude Code hooks
 csr-engine eval                Quick eval (5 tests)
 csr-engine eval --full         Full eval (20 tests)
 csr-engine quality <file>      AST-based code quality analysis
-csr-engine --import            Import conversations
-csr-engine --enrich            Backfill enrichment pipeline
-csr-engine --watch             Watch for new conversations
 ```
-
-## Requirements
-
-- **macOS** (Apple Silicon) or **Linux** (x86_64)
-- **Claude Code** CLI
-- ~50MB disk for the binary + ~100MB for database
-
-No Docker. No Python. No API keys (unless you want AI narratives).
 
 ## Upgrading from v7.x
 
 v8.0 replaces the Python/Docker stack with a single Rust binary.
 
 ```bash
-# 1. Stop old services
+# Stop old services
 docker compose down 2>/dev/null
 claude mcp remove claude-self-reflect 2>/dev/null
 
-# 2. Install the new binary
+# Install v8
 curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
-
-# 3. Run setup (imports existing conversations)
-csr-engine setup
-
-# 4. Restart Claude Code
 ```
 
 Your conversation data (`~/.claude/projects/`) is untouched. The new engine re-imports from the same JSONL files.
@@ -211,11 +187,12 @@ Your conversation data (`~/.claude/projects/`) is untouched. The new engine re-i
 
 | Symptom | Fix |
 |---------|-----|
-| No search results | Run `csr-engine --import --enrich` |
+| No search results | Run `csr-engine setup` |
 | MCP tools not available | Run `csr-engine setup`, restart Claude Code |
 | "spawn ENOENT" in MCP | Ensure `csr-engine` is in PATH |
-| Status shows 0 conversations | Run `csr-engine status` to check import progress |
 | Slow first startup | Normal (~14s for index rebuild, subsequent: ~93ms) |
+
+Full troubleshooting guide: [Documentation](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
 <details>
 <summary>Uninstall</summary>
@@ -237,4 +214,4 @@ npm uninstall -g claude-self-reflect  # if installed via npm
 
 ---
 
-Built with care by [ramakay](https://github.com/ramakay) for the Claude community.
+[Documentation](https://ramakay.github.io/claude-self-reflect/) | [npm](https://www.npmjs.com/package/claude-self-reflect) | [Issues](https://github.com/ramakay/claude-self-reflect/issues) | MIT License

@@ -1,0 +1,9 @@
+{
+  "target_filename": "performance-visualization.png",
+  "status": "placeholder",
+  "reason": "PNG generation was attempted with the local imagegen tool, but the sandbox could not resolve openrouter.ai.",
+  "error": "getaddrinfo ENOTFOUND openrouter.ai",
+  "aspect_ratio": "16:9",
+  "prompt": "Wide 16:9 abstract speed and performance data visualization. Dark dashboard background with fast data streams, neon blue and cyan accents, floating latency numbers 0.82ms, 93ms, 153x, speedometer or gauge pinned near maximum, particle streaks suggesting fast local processing. Numbers should feel real and significant, precise dashboard aesthetic, clean premium visualization, no watermark.",
+  "text": "0.82ms 93ms 153x"
+}

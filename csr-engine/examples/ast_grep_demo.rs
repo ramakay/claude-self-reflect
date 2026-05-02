@@ -57,10 +57,7 @@ impl EventProcessor {
 
 fn main() {
     let mut processor = EventProcessor::new();
-    processor.register_handler(
-        "click",
-        Box::new(|payload| println!("Click: {}", payload)),
-    );
+    processor.register_handler("click", Box::new(|payload| println!("Click: {}", payload)));
     processor.start();
 
     let events = vec![("click", "button_1"), ("click", "button_2")];

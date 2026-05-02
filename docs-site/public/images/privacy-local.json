@@ -1,0 +1,8 @@
+{
+  "target_filename": "privacy-local.png",
+  "status": "placeholder",
+  "reason": "PNG generation was attempted with the local imagegen tool, but the sandbox could not resolve openrouter.ai.",
+  "error": "getaddrinfo ENOTFOUND openrouter.ai",
+  "aspect_ratio": "16:9",
+  "prompt": "Wide 16:9 local-first privacy metaphor. A glowing fortress and shield icon around a home computer/server, data flowing only inside a contained local boundary. Lock symbols integrated subtly, no cloud concept shown by an absent cloud or a small crossed-out cloud outside the boundary. Earthy trustworthy palette: deep blue, warm gold, restrained green. No data leaving the boundary. Premium modern illustration, clean dark background, no watermark."
+}
