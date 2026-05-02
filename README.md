@@ -80,15 +80,9 @@ Everything runs locally in a single process. No Docker, no database server, no A
 </picture>
 </a>
 
-Three layers progressively improve search quality from raw chunks to AI-enriched narratives.
+Three layers progressively improve search quality from raw chunks to AI-enriched narratives — **9.3x improvement**.
 
-| Layer | What | Quality Score |
-|-------|------|:---:|
-| Retrieve | Semantic recall | 0.074 |
-| Re-rank | Cross-encoder precision | 0.345 |
-| Re-write | LLM distillation | 0.691 |
-
-**9.3x improvement**. Higher quality context. Better decisions. Fewer tokens.
+Higher quality context. Better decisions. Fewer tokens.
 
 <br clear="both" />
 
