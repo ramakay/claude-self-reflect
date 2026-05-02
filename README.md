@@ -25,41 +25,6 @@ Single 44MB binary. No databases. No containers. No API keys required.
 
 </div>
 
-### The Forgetting Problem
-
-Claude starts fresh every session. Solutions you found, architectures you designed, bugs you debugged — all gone. Context retention drops below **20% after 10 sessions**.
-
-<a href="https://ramakay.github.io/claude-self-reflect/">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-01-hook-dark.png" />
-  <img src="docs-site/public/images/card-01-hook-light.png" alt="The Forgetting Problem" width="720" />
-</picture>
-</a>
-
-### One Binary. 44MB.
-
-Everything runs locally — SQLite, FastEmbed vectors (384-dim), HNSW search (<1ms), AST analysis across 6 languages. No Docker, no database, no API keys. **6 hooks** across the session lifecycle. **12 MCP tools** for search.
-
-<a href="https://ramakay.github.io/claude-self-reflect/#/docs/architecture">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-02-arch-dark.png" />
-  <img src="docs-site/public/images/card-02-arch-light.png" alt="Architecture — One Binary, 44MB" width="720" />
-</picture>
-</a>
-
-### The Pipeline
-
-Three layers progressively improve search quality — **9.3x improvement**. Quality scores: **0.074 → 0.345 → 0.691**. Higher quality context. Better decisions. Fewer tokens.
-
-<a href="https://ramakay.github.io/claude-self-reflect/#/docs/enrichment">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-03-pipeline-dark.png" />
-  <img src="docs-site/public/images/card-03-pipeline-light.png" alt="The Pipeline — 3 layers, 9.3x improvement" width="720" />
-</picture>
-</a>
-
-> **[Explore the full documentation →](https://ramakay.github.io/claude-self-reflect/)**
-
 ## Table of Contents
 
 - [The Problem](#the-forgetting-problem) — Why Claude needs memory
@@ -67,14 +32,74 @@ Three layers progressively improve search quality — **9.3x improvement**. Qual
 - [The Pipeline](#the-pipeline) — Progressive enrichment (9.3x improvement)
 - [Install](#install) — One command setup
 - [What You'll Ask](#what-youll-ask) — Natural language, no syntax
-- [Performance](#performance) — Sub-millisecond search, 93ms startup
-- [MCP Tools](#mcp-tools) — 12 search tools
-- [Hooks](#hooks) — 6 session lifecycle hooks
-- [AI Narratives](#ai-narratives-optional) — Optional 9.3x quality boost
-- [CLI Reference](#cli-reference)
-- [Upgrading from v7.x](#upgrading-from-v7x)
-- [Troubleshooting](#troubleshooting)
-- [Contributors](#contributors)
+- [Performance](#performance) | [MCP Tools](#mcp-tools) | [Hooks](#hooks) | [CLI](#cli-reference)
+- [AI Narratives](#ai-narratives-optional) | [Upgrading](#upgrading-from-v7x) | [Troubleshooting](#troubleshooting)
+
+---
+
+## The Forgetting Problem
+
+<a href="https://ramakay.github.io/claude-self-reflect/">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-01-hook-dark.png" />
+  <img align="right" src="docs-site/public/images/card-01-hook-light.png" alt="The Forgetting Problem" width="420" />
+</picture>
+</a>
+
+Claude starts fresh every session. Solutions you found, architectures you designed, bugs you debugged — all gone.
+
+Context retention drops below **20% after 10 sessions**. CSR fixes this with a single binary that gives Claude perfect memory.
+
+No special syntax. No commands. Install once, and past context appears automatically when you need it.
+
+<br clear="both" />
+
+---
+
+## One Binary. 44MB.
+
+<a href="https://ramakay.github.io/claude-self-reflect/#/docs/architecture">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-02-arch-dark.png" />
+  <img align="right" src="docs-site/public/images/card-02-arch-light.png" alt="Architecture — One Binary, 44MB" width="420" />
+</picture>
+</a>
+
+Everything runs locally in a single process. No Docker, no database server, no API keys required.
+
+- **SQLite** — storage for chunks, embeddings, enrichment state
+- **HNSW** — sub-millisecond vector search (<1ms p95)
+- **FastEmbed** — 384-dim local embeddings
+- **AST** — code-aware search across 6 languages
+
+**6 hooks** fire across the session lifecycle. **12 MCP tools** for explicit search.
+
+<br clear="both" />
+
+---
+
+## The Pipeline
+
+<a href="https://ramakay.github.io/claude-self-reflect/#/docs/enrichment">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-03-pipeline-dark.png" />
+  <img align="right" src="docs-site/public/images/card-03-pipeline-light.png" alt="The Pipeline — 3 layers, 9.3x improvement" width="420" />
+</picture>
+</a>
+
+Three layers progressively improve search quality from raw chunks to AI-enriched narratives.
+
+| Layer | What | Quality Score |
+|-------|------|:---:|
+| Retrieve | Semantic recall | 0.074 |
+| Re-rank | Cross-encoder precision | 0.345 |
+| Re-write | LLM distillation | 0.691 |
+
+**9.3x improvement**. Higher quality context. Better decisions. Fewer tokens.
+
+<br clear="both" />
+
+> **[Explore the full documentation →](https://ramakay.github.io/claude-self-reflect/)**
 
 ## Install
 
