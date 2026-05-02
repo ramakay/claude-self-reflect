@@ -95,23 +95,7 @@ No special syntax. No commands. CSR finds relevant past context and injects it a
 
 ## How It Works
 
-```
-~/.claude/projects/**/*.jsonl
-         |
-    [csr-engine import]
-         |
-    +---------+     +----------+     +-------+
-    | SQLite  | --> | FastEmbed| --> | HNSW  |
-    | (chunks)|     | (384-dim)|     | (ANN) |
-    +---------+     +----------+     +-------+
-         |                               |
-    [enrichment]                    [MCP search]
-         |                               |
-  Layer 1: Chunked text            reflect_on_past()
-  Layer 2: Tools + AST extracted   search_by_concept()
-  Layer 3: AI Narrative*           get_recent_work()
-                                   ...12 tools total
-```
+<img src="docs-site/public/images/how-it-works.png" alt="How Claude Self-Reflect works: conversations → csr-engine → enrichment → context injection" width="100%" />
 
 Everything runs locally in a single process. No network services, no containers.
 
