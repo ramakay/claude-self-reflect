@@ -21,7 +21,9 @@
 
 Single 44MB binary. No databases. No containers. No API keys required.
 
-[Documentation](https://ramakay.github.io/claude-self-reflect/) | [Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
+### [Start Here — Full Documentation](https://ramakay.github.io/claude-self-reflect/)
+
+[Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/readme-hero-dark.png" />
