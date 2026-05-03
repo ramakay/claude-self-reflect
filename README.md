@@ -12,12 +12,9 @@ Single 44MB binary. No databases. No containers. No API keys required.
 
 [Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
-> **v8.0 — Complete Rust Rewrite**
-> The entire Python/Docker/Qdrant stack has been replaced with a single Rust binary.
-> Sub-millisecond search, 93ms startup, 273 tests, zero external dependencies.
-> [Release notes](https://github.com/ramakay/claude-self-reflect/releases/tag/v8.0.5) | [Announcement](https://github.com/ramakay/claude-self-reflect/discussions/175)
+### **[v8.0 — Complete Rust Rewrite →](https://ramakay.github.io/claude-self-reflect/)**
 
-<img src="docs-site/public/images/csr-demo.gif" alt="CSR Demo — Setup, Search, and Hooks" width="800" />
+<img src="docs-site/public/images/csr-demo.gif" alt="CSR Demo" width="800" />
 
 </div>
 
