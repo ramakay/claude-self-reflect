@@ -1168,6 +1168,20 @@ export default function Landing() {
           <OneBinaryCard />
           <PipelineCard />
           <PrivacyCard />
+          <BentoCard className="card--demo" delay={700}>
+            <CardKicker number="—" label="SEE IT IN ACTION" />
+            <h2 className="type-hl-md">The Demo</h2>
+            <p className="type-dateline mt-2">Real queries, real results — from actual sessions</p>
+            <img
+              src="/claude-self-reflect/images/csr-demo.gif"
+              alt="CSR demo showing semantic search, cross-project search, and activity timeline"
+              className="demo-gif"
+              loading="lazy"
+              width={800}
+              height={448}
+              style={{ width: '100%', height: 'auto', borderRadius: 6, marginTop: 12 }}
+            />
+          </BentoCard>
           <InstallCard />
           <WhatYouAskCard />
           <ArchCard />
