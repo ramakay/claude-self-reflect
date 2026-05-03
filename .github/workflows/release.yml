@@ -97,5 +97,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          registry-url: https://registry.npmjs.org/
-      - run: npm publish --provenance --access public
+      - run: |
+          npm config set registry https://registry.npmjs.org/
+          npm publish --provenance --access public
