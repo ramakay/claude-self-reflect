@@ -43,6 +43,8 @@ pub struct HookInput {
     pub stop_hook_active: Option<bool>,
     /// User's prompt text for UserPromptSubmit hook
     pub prompt: Option<String>,
+    /// Hook event source (e.g. "startup", "resume", "compact", "clear") for SessionStart
+    pub source: Option<String>,
 }
 
 /// Read and parse JSON from stdin. Returns a default HookInput if stdin is empty or invalid.
@@ -73,10 +75,24 @@ pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: 
         return;
     }
 
+    // S-1 fix: validate transcript path is a .jsonl file.
+    // The .jsonl extension check prevents importing arbitrary files (e.g. /etc/passwd)
+    // via crafted hook JSON. Claude Code only produces .jsonl transcripts.
+    let Ok(canonical) = tp.canonicalize() else {
+        return;
+    };
+    if canonical.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        eprintln!(
+            "CSR: refusing non-JSONL transcript: {}",
+            canonical.display()
+        );
+        return;
+    }
+
     let cwd_str = cwd.to_string_lossy();
     let project = resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string());
 
-    match engine.import_file(&tp, &project).await {
+    match engine.import_file(&canonical, &project).await {
         Ok(0) => {} // no new content, silent
         Ok(n) => eprintln!("CSR: indexed {} new chunks from active session", n),
         Err(e) => eprintln!("CSR: import failed (non-fatal): {}", e),
