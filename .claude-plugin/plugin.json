@@ -1,0 +1,27 @@
+{
+  "name": "claude-self-reflect",
+  "description": "Persistent conversation memory with semantic search, session continuity detection, cross-project intelligence, and predictive context injection. Zero-dependency 45MB Rust binary with local embeddings — no API keys, no Docker, sub-millisecond search.",
+  "author": {
+    "name": "Rama Annaswamy",
+    "email": "rama@procsolve.io"
+  },
+  "version": "8.1.0",
+  "homepage": "https://github.com/ramakay/claude-self-reflect",
+  "keywords": [
+    "memory",
+    "conversation-history",
+    "semantic-search",
+    "session-continuity",
+    "context-injection",
+    "mcp-server",
+    "hooks",
+    "embeddings",
+    "local-first"
+  ],
+  "category": "productivity",
+  "license": "MIT",
+  "install": {
+    "command": "npx claude-self-reflect setup",
+    "postInstall": "csr-engine hook install --apply"
+  }
+}
