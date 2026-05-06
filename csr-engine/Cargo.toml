@@ -13,7 +13,7 @@ notify = "8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sonic-rs = "0.3"
+sonic-rs = "0.5"
 schemars = "1"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -25,10 +25,10 @@ dirs = "6"
 regex = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 async-trait = "0.1"
-sha2 = "0.10"
+sha2 = "0.11"
 fs2 = "0.4"
-ast-grep-core = { version = "0.40", features = ["tree-sitter"] }
-ast-grep-language = { version = "0.40", default-features = false, features = [
+ast-grep-core = { version = "0.42", features = ["tree-sitter"] }
+ast-grep-language = { version = "0.42", default-features = false, features = [
     "tree-sitter-python",
     "tree-sitter-typescript",
     "tree-sitter-rust",
@@ -37,7 +37,7 @@ ast-grep-language = { version = "0.40", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 
 [[bench]]
