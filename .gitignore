@@ -166,7 +166,7 @@ csr-engine/target/
 .claude/hooks/
 .claude/commands/
 .claude/slash-commands/
-.mcp.json
+# .mcp.json — tracked for plugin marketplace (not user-local)
 
 # Legacy Python test/hook/example dirs (removed in v8)
 tests/

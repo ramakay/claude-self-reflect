@@ -25,6 +25,8 @@ use crate::injection::anti_pattern;
 use crate::injection::formatter;
 use crate::injection::predictor::{self, RawResult};
 use crate::injection::{InjectionContext, InjectionItem};
+use crate::search::cross_project::resolve_project_from_cwd;
+use crate::temporal;
 
 /// Token budget for prompt-submit injection (larger than Stop hook's 300).
 const PROMPT_TOKEN_BUDGET: usize = 500;
@@ -48,6 +50,9 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     Ok(()) // Always succeed
 }
 
+/// Maximum age (in minutes) to apply continuity boost.
+const CONTINUITY_THRESHOLD_MINUTES: i64 = 2880;
+
 async fn handle_inner(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<()> {
     // Extract prompt from input
     let prompt = match input.prompt.as_deref() {
@@ -69,17 +74,31 @@ async fn handle_inner(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result
     let embeddings = engine.embeddings();
     let search = engine.search();
 
+    // Detect session continuity: find the most recent session in this project
+    let continued_session_id = detect_continued_session_id(engine, _cwd);
+
     // 1. Search for anti-patterns (highest priority)
+    // Anti-patterns use a modified query ("failed approach don't retry: ...") so keep separate embedding.
     let anti_patterns =
         anti_pattern::find_anti_patterns(storage, embeddings, search, prompt, 0.5, 2).await;
 
-    // 2. Search chunks (past conversations)
-    let chunk_results = search_chunks_for_prompt(engine, prompt, 5, 0.6).await;
+    // P-1 fix: embed prompt ONCE for chunk + reflection searches (saves ~5ms per prompt)
+    let query_vec = {
+        let q = prompt.to_string();
+        let emb = embeddings.clone();
+        match tokio::task::spawn_blocking(move || emb.embed_single(&q)).await {
+            Ok(Ok(v)) => v,
+            _ => return Ok(()), // Can't embed → nothing to inject
+        }
+    };
 
-    // 3. Search reflections (stored insights)
-    let reflection_results = search_reflections_for_prompt(engine, prompt, 3, 0.5).await;
+    // 2. Search chunks (past conversations) — reuse query_vec
+    let chunk_results = search_chunks_with_vec(engine, &query_vec, 5, 0.6).await;
 
-    // 4. Combine and score results
+    // 3. Search reflections (stored insights) — reuse query_vec
+    let reflection_results = search_reflections_with_vec(engine, &query_vec, 3, 0.5).await;
+
+    // 4. Combine and score results (with continuity boost for recent session)
     let current_files: Vec<String> = Vec::new();
     let current_errors: Vec<String> = Vec::new();
 
@@ -87,11 +106,12 @@ async fn handle_inner(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result
     raw_results.extend(chunk_results);
     raw_results.extend(reflection_results);
 
-    let scored = predictor::rank_results(
+    let scored = predictor::rank_results_with_continuity(
         raw_results,
         &current_files,
         &current_errors,
         Some(crate::injection::weights::HookPhase::PromptSubmit),
+        continued_session_id.as_deref(),
     );
 
     // 5. Build InjectionContext
@@ -129,11 +149,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result
             source: result.source.clone(),
         };
 
-        // Bug 1 fix: route chunks to relevant_context, reflections to winning_strategies
-        match result.source.as_str() {
-            "reflection" => ctx.winning_strategies.push(item),
-            _ => ctx.winning_strategies.push(item),
-        }
+        ctx.winning_strategies.push(item);
     }
 
     if ctx.is_empty() {
@@ -188,29 +204,35 @@ async fn handle_inner(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result
     Ok(())
 }
 
-/// Search chunks semantically for a given prompt.
-async fn search_chunks_for_prompt(
+/// Detect the most recent session's conversation_id if it ended recently.
+/// Returns `Some(conversation_id)` if within the continuity threshold.
+fn detect_continued_session_id(engine: &Engine, cwd: &Path) -> Option<String> {
+    let project = resolve_project_from_cwd(&cwd.to_string_lossy())?;
+    let session = engine.storage().get_most_recent_session(&project).ok()??;
+
+    let ts = temporal::parse_timestamp(&session.timestamp)?;
+    let age_minutes = (chrono::Utc::now() - ts).num_minutes();
+    // C-2 fix: reject future timestamps (clock skew) and sessions beyond threshold
+    if !(0..=CONTINUITY_THRESHOLD_MINUTES).contains(&age_minutes) {
+        return None;
+    }
+
+    Some(session.conversation_id)
+}
+
+/// Search chunks using a pre-computed embedding vector (P-1 optimization).
+async fn search_chunks_with_vec(
     engine: &Engine,
-    prompt: &str,
+    query_vec: &[f32],
     limit: usize,
     min_score: f32,
 ) -> Vec<RawResult> {
-    let embeddings = engine.embeddings();
     let search = engine.search();
     let storage = engine.storage();
 
-    let query_vec = {
-        let q = prompt.to_string();
-        let emb = embeddings.clone();
-        match tokio::task::spawn_blocking(move || emb.embed_single(&q)).await {
-            Ok(Ok(v)) => v,
-            _ => return Vec::new(),
-        }
-    };
-
     let results = {
         let idx = search.read().await;
-        idx.search_chunks(&query_vec, limit, min_score)
+        idx.search_chunks(query_vec, limit, min_score)
     };
 
     let mut raw_results = Vec::new();
@@ -225,6 +247,7 @@ async fn search_chunks_for_prompt(
                     files: extract_file_paths(&chunk.content),
                     error_patterns: vec![],
                     tags: vec![],
+                    conversation_id: Some(chunk.conversation_id),
                 });
             }
         }
@@ -233,29 +256,19 @@ async fn search_chunks_for_prompt(
     raw_results
 }
 
-/// Search reflections semantically for a given prompt.
-async fn search_reflections_for_prompt(
+/// Search reflections using a pre-computed embedding vector (P-1 optimization).
+async fn search_reflections_with_vec(
     engine: &Engine,
-    prompt: &str,
+    query_vec: &[f32],
     limit: usize,
     min_score: f32,
 ) -> Vec<RawResult> {
-    let embeddings = engine.embeddings();
     let search = engine.search();
     let storage = engine.storage();
 
-    let query_vec = {
-        let q = prompt.to_string();
-        let emb = embeddings.clone();
-        match tokio::task::spawn_blocking(move || emb.embed_single(&q)).await {
-            Ok(Ok(v)) => v,
-            _ => return Vec::new(),
-        }
-    };
-
     let results = {
         let idx = search.read().await;
-        idx.search_reflections(&query_vec, limit, min_score)
+        idx.search_reflections(query_vec, limit, min_score)
     };
 
     let mut raw_results = Vec::new();
@@ -277,6 +290,7 @@ async fn search_reflections_for_prompt(
                 files: extract_file_paths(&content),
                 error_patterns: extract_error_patterns(&content),
                 tags,
+                conversation_id: None,
             });
         }
     }

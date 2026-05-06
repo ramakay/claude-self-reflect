@@ -606,6 +606,13 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<SessionInfo> {
     })
 }
 
+/// Get the single most recent session for a project.
+/// Used by SessionStart for "CONTINUED FROM" detection and by PromptSubmit for recency boost.
+pub fn get_most_recent_session(conn: &Connection, project: &str) -> Result<Option<SessionInfo>> {
+    let mut sessions = get_recent_sessions(conn, 1, Some(project))?;
+    Ok(sessions.pop())
+}
+
 // ─── Import state queries ───
 
 /// Check if a file has been imported AND hasn't changed since.

@@ -3,9 +3,15 @@ pub mod watcher;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use uuid::Uuid;
+
+/// Regex to strip `<private>...</private>` content before storage.
+static PRIVATE_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?si)<private>.*?</private>").unwrap());
 
 /// A chunk of a conversation, ready for embedding and storage.
 #[derive(Debug, Clone)]
@@ -181,9 +187,9 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             }
         }
 
-        // Extract text content + tool context
+        // Extract text content + tool context (both stripped of private tags)
         let text = extract_message_text(&parsed);
-        let tool_context = extract_tool_context(&parsed);
+        let tool_context = strip_private_tags(&extract_tool_context(&parsed));
         let combined_text = if !text.is_empty() && !tool_context.is_empty() {
             format!("{}\n{}", text, tool_context)
         } else if !tool_context.is_empty() {
@@ -261,7 +267,14 @@ pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
 }
 
 /// Extract text content from a JSONL message entry.
+/// Strips `<private>...</private>` tagged content before returning.
 fn extract_message_text(msg: &serde_json::Value) -> String {
+    let raw = extract_message_text_raw(msg);
+    // Strip privacy-tagged content before storage/embedding
+    strip_private_tags(&raw)
+}
+
+fn extract_message_text_raw(msg: &serde_json::Value) -> String {
     // Try "message.content" array format (Claude's format)
     if let Some(content) = msg
         .get("message")
@@ -296,6 +309,25 @@ fn extract_message_text(msg: &serde_json::Value) -> String {
     }
 
     String::new()
+}
+
+/// Strip `<private>...</private>` tagged content from text (case-insensitive).
+/// S-3 fix: also handles unclosed `<private>` tags by redacting to end of input.
+fn strip_private_tags(text: &str) -> String {
+    // Case-insensitive fast-path check to avoid regex overhead
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("<private>") {
+        return text.to_string();
+    }
+    let result = PRIVATE_TAG_RE.replace_all(text, "[private]").to_string();
+    // Handle unclosed <private> tag: redact from opening tag to end of input
+    let result_lower = result.to_ascii_lowercase();
+    if let Some(pos) = result_lower.find("<private>") {
+        let mut truncated = result[..pos].to_string();
+        truncated.push_str("[private]");
+        return truncated;
+    }
+    result
 }
 
 /// Extract searchable context from tool_use blocks in a message.
@@ -461,5 +493,42 @@ mod tests {
             }
         });
         assert_eq!(extract_message_text(&msg), "Fix the chunking bug");
+    }
+
+    #[test]
+    fn test_strip_private_tags() {
+        assert_eq!(strip_private_tags("hello world"), "hello world");
+        assert_eq!(
+            strip_private_tags("before <private>secret key ABC123</private> after"),
+            "before [private] after"
+        );
+        assert_eq!(
+            strip_private_tags("no <private>one</private> and <private>two</private> tags"),
+            "no [private] and [private] tags"
+        );
+    }
+
+    #[test]
+    fn test_strip_private_unclosed_tag() {
+        // S-3 fix: unclosed <private> tag should redact to end of input
+        assert_eq!(
+            strip_private_tags("before <private>secret leaked here"),
+            "before [private]"
+        );
+    }
+
+    #[test]
+    fn test_extract_message_text_strips_private() {
+        let msg: serde_json::Value = serde_json::json!({
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "My API key is <private>sk-abc123</private> please use it"}
+                ]
+            }
+        });
+        let text = extract_message_text(&msg);
+        assert!(!text.contains("sk-abc123"));
+        assert!(text.contains("[private]"));
     }
 }

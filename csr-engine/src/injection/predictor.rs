@@ -24,6 +24,8 @@ pub enum Signal {
     RecencyBoost(f32),
     FileOverlap(f32),
     ErrorPatternMatch(f32),
+    /// Session continuity boost — result is from the immediately prior session.
+    ContinuityBoost(f32),
 }
 
 /// Raw result from HNSW search, before scoring.
@@ -40,6 +42,8 @@ pub struct RawResult {
     pub error_patterns: Vec<String>,
     /// Tags from storage (for phase boost scoring).
     pub tags: Vec<String>,
+    /// Conversation ID this result came from (for session continuity boost).
+    pub conversation_id: Option<String>,
 }
 
 /// Score and rank results for injection.
@@ -53,6 +57,18 @@ pub fn rank_results(
     current_errors: &[String],
     phase: Option<super::weights::HookPhase>,
 ) -> Vec<ScoredResult> {
+    rank_results_with_continuity(results, current_files, current_errors, phase, None)
+}
+
+/// Like `rank_results`, but with an optional session continuity boost.
+/// Results whose `conversation_id` matches `continued_session_id` get a 1.5x score multiplier.
+pub fn rank_results_with_continuity(
+    results: Vec<RawResult>,
+    current_files: &[String],
+    current_errors: &[String],
+    phase: Option<super::weights::HookPhase>,
+    continued_session_id: Option<&str>,
+) -> Vec<ScoredResult> {
     let weights = phase
         .map(super::weights::WeightProfile::for_phase)
         .unwrap_or(super::weights::WeightProfile::for_phase(
@@ -62,7 +78,18 @@ pub fn rank_results(
 
     let mut scored: Vec<ScoredResult> = results
         .into_iter()
-        .map(|r| score_result(r, current_files, current_errors, &weights, phase))
+        .map(|r| {
+            let is_continued = continued_session_id.is_some()
+                && r.conversation_id.as_deref() == continued_session_id;
+            let mut result = score_result(r, current_files, current_errors, &weights, phase);
+            if is_continued {
+                result
+                    .signals
+                    .push(Signal::ContinuityBoost(CONTINUITY_MULTIPLIER));
+                result.final_score *= CONTINUITY_MULTIPLIER;
+            }
+            result
+        })
         .collect();
 
     scored.sort_by(|a, b| {
@@ -73,6 +100,9 @@ pub fn rank_results(
 
     scored
 }
+
+/// Multiplier for results from the immediately prior session (within continuity threshold).
+const CONTINUITY_MULTIPLIER: f32 = 1.5;
 
 fn score_result(
     result: RawResult,
@@ -227,6 +257,7 @@ mod tests {
                 files: vec![],
                 error_patterns: vec![],
                 tags: vec![],
+                conversation_id: None,
             },
             RawResult {
                 content: "low match".into(),
@@ -236,6 +267,7 @@ mod tests {
                 files: vec![],
                 error_patterns: vec![],
                 tags: vec![],
+                conversation_id: None,
             },
         ];
 
@@ -259,6 +291,7 @@ mod tests {
                 files: vec![],
                 error_patterns: vec![],
                 tags: vec![],
+                conversation_id: None,
             },
             RawResult {
                 content: "old".into(),
@@ -268,6 +301,7 @@ mod tests {
                 files: vec![],
                 error_patterns: vec![],
                 tags: vec![],
+                conversation_id: None,
             },
         ];
 
@@ -290,6 +324,7 @@ mod tests {
                 files: vec!["src/auth.rs".into()],
                 error_patterns: vec![],
                 tags: vec![],
+                conversation_id: None,
             },
             RawResult {
                 content: "no overlap".into(),
@@ -299,6 +334,7 @@ mod tests {
                 files: vec!["src/other.rs".into()],
                 error_patterns: vec![],
                 tags: vec![],
+                conversation_id: None,
             },
         ];
 
@@ -319,6 +355,7 @@ mod tests {
                 files: vec![],
                 error_patterns: vec!["connection reset".into()],
                 tags: vec![],
+                conversation_id: None,
             },
             RawResult {
                 content: "no error match".into(),
@@ -328,6 +365,7 @@ mod tests {
                 files: vec![],
                 error_patterns: vec!["out of memory".into()],
                 tags: vec![],
+                conversation_id: None,
             },
         ];
 
@@ -383,5 +421,71 @@ mod tests {
     fn test_error_match_empty_inputs() {
         assert_eq!(compute_error_match(&[], &["error".into()]), 0.0);
         assert_eq!(compute_error_match(&["error".into()], &[]), 0.0);
+    }
+
+    #[test]
+    fn test_continuity_boost_promotes_recent_session() {
+        let results = vec![
+            RawResult {
+                content: "from continued session".into(),
+                score: 0.7,
+                source: "chunk".into(),
+                timestamp: None,
+                files: vec![],
+                error_patterns: vec![],
+                tags: vec![],
+                conversation_id: Some("session-abc".into()),
+            },
+            RawResult {
+                content: "from older session".into(),
+                score: 0.75,
+                source: "chunk".into(),
+                timestamp: None,
+                files: vec![],
+                error_patterns: vec![],
+                tags: vec![],
+                conversation_id: Some("session-xyz".into()),
+            },
+        ];
+
+        // Without continuity boost: "from older session" wins (higher raw score)
+        let scored_no_boost = rank_results(results.clone(), &[], &[], None);
+        assert_eq!(scored_no_boost[0].content, "from older session");
+
+        // With continuity boost: "from continued session" wins (1.5x multiplier)
+        let scored_with_boost =
+            rank_results_with_continuity(results, &[], &[], None, Some("session-abc"));
+        assert_eq!(scored_with_boost[0].content, "from continued session");
+        assert!(
+            scored_with_boost[0]
+                .signals
+                .iter()
+                .any(|s| matches!(s, Signal::ContinuityBoost(_))),
+            "should have ContinuityBoost signal"
+        );
+    }
+
+    #[test]
+    fn test_continuity_boost_no_match() {
+        let results = vec![RawResult {
+            content: "unrelated session".into(),
+            score: 0.7,
+            source: "chunk".into(),
+            timestamp: None,
+            files: vec![],
+            error_patterns: vec![],
+            tags: vec![],
+            conversation_id: Some("session-xyz".into()),
+        }];
+
+        let scored = rank_results_with_continuity(results, &[], &[], None, Some("session-abc"));
+        // No boost applied — conversation_id doesn't match
+        assert!(
+            !scored[0]
+                .signals
+                .iter()
+                .any(|s| matches!(s, Signal::ContinuityBoost(_))),
+            "should NOT have ContinuityBoost signal for non-matching session"
+        );
     }
 }
