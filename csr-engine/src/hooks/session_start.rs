@@ -374,13 +374,23 @@ async fn embed_query(
     tokio::task::spawn_blocking(move || emb.embed_single(&q)).await?
 }
 
+/// Sanitize a project name for safe use in filenames (S-1 defense-in-depth).
+/// Strips path separators and special characters to prevent directory traversal.
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .take(255)
+        .collect()
+}
+
 /// Read the rolling summary file written by the stop hook (C-3 fix).
 /// Returns the first non-empty line as a fallback context string.
 fn read_rolling_summary(project: &str) -> Option<String> {
     let home = dirs::home_dir()?;
+    let safe_name = sanitize_filename(project);
     let path = home
         .join(".claude-self-reflect")
-        .join(format!("rolling-summary-{}.txt", project));
+        .join(format!("rolling-summary-{}.txt", safe_name));
     let content = std::fs::read_to_string(&path).ok()?;
     let first_line = content.lines().find(|l| !l.trim().is_empty())?;
     if first_line.len() > 10 {
