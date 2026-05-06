@@ -606,7 +606,8 @@ fn load_skill_prompt() -> String {
 pub fn prompt_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
+    let result = hasher.finalize();
+    result.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 #[cfg(test)]
