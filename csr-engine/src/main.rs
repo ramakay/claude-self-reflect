@@ -52,11 +52,14 @@ enum Commands {
         #[arg(long)]
         anthropic_key: Option<String>,
     },
-    /// Show system status (JSON by default, --compact for statusline)
+    /// Show system status (JSON by default, --compact for statusline, --swiftbar for menu bar)
     Status {
         /// One-line output for statusline integration
         #[arg(long)]
         compact: bool,
+        /// SwiftBar-compatible output for macOS menu bar plugin
+        #[arg(long)]
+        swiftbar: bool,
     },
     /// Handle Claude Code hook events
     Hook {
@@ -140,8 +143,8 @@ async fn main() -> Result<()> {
         return csr_engine::setup::handle(&args.db_path, &args.projects_dir, anthropic_key).await;
     }
 
-    if let Some(Commands::Status { compact }) = args.command {
-        return csr_engine::status::handle(&args.db_path, &args.projects_dir, compact);
+    if let Some(Commands::Status { compact, swiftbar }) = args.command {
+        return csr_engine::status::handle(&args.db_path, &args.projects_dir, compact, swiftbar);
     }
 
     if let Some(Commands::Daemon {
