@@ -1,4 +1,5 @@
 pub mod completions;
+pub mod elicitation;
 pub mod resources;
 pub mod tasks;
 pub mod tools;
@@ -252,9 +253,19 @@ impl CsrServer {
     async fn store_reflection(
         &self,
         params: Parameters<StoreReflectionParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
         let tags = p.tags.unwrap_or_default();
+
+        // Elicitation: confirm before storing large reflections
+        if elicitation::needs_confirmation(&p.content)
+            && !elicitation::request_confirmation(&p.content, &context).await
+        {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Reflection storage declined by user.",
+            )]));
+        }
 
         let result = tools::store_reflection(
             &self.storage,
