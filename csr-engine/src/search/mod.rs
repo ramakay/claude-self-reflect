@@ -121,6 +121,29 @@ impl SearchEngine {
         }
     }
 
+    /// Check if a reflection ID exists in the index (non-blanked).
+    pub fn has_reflection(&self, id: &str) -> bool {
+        self.reflection_id_set.contains(id)
+    }
+
+    /// Blank reflection IDs in the map that are not present in the given DB ID set.
+    /// Returns the number of entries blanked. Marks index dirty if any were removed.
+    pub fn blank_orphan_reflections(&mut self, db_ids: &std::collections::HashSet<&str>) -> usize {
+        let mut blanked = 0;
+        for entry in &mut self.reflection_id_map {
+            if !entry.is_empty() && !db_ids.contains(entry.as_str()) {
+                self.reflection_id_set.remove(entry.as_str());
+                *entry = String::new();
+                blanked += 1;
+            }
+        }
+        if blanked > 0 {
+            self.active_reflection_count = self.active_reflection_count.saturating_sub(blanked);
+            self.dirty = true;
+        }
+        blanked
+    }
+
     /// Search chunk index. Returns results sorted by descending score.
     pub fn search_chunks(
         &self,
@@ -440,6 +463,9 @@ impl SearchEngine {
             .cloned()
             .collect();
 
+        // Use non-blank map count — orphans will be blanked by Engine::new reconciliation
+        let active_count = reflection_id_set.len();
+
         Some(Self {
             chunk_index: chunk_hnsw,
             reflection_index: refl_hnsw,
@@ -447,7 +473,7 @@ impl SearchEngine {
             reflection_id_map: manifest.reflection_id_map,
             chunk_id_set,
             reflection_id_set,
-            active_reflection_count: manifest.active_reflection_count,
+            active_reflection_count: active_count,
             dirty: false,
         })
     }

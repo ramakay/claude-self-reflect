@@ -75,7 +75,7 @@ cargo bench --bench spike_bench
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| rmcp | 0.15 | MCP protocol |
+| rmcp | 1.6 | MCP protocol (tool annotations, macros) |
 | fastembed | 5.9 | Local embeddings |
 | hnsw_rs | 0.3 | Vector search |
 | rusqlite | 0.38 | SQLite storage |
@@ -86,6 +86,8 @@ cargo bench --bench spike_bench
 ### Key Patterns
 
 - **rmcp tool params**: Use `Parameters<MyStruct>` pattern, NOT individual `#[tool(param)]`
+- **rmcp tool annotations**: All 12 tools have `annotations(read_only_hint, destructive_hint, idempotent_hint)` in macro
+- **rmcp 1.6 builders**: `ServerInfo::new(caps).with_instructions()`, `Implementation::new()`, `ReadResourceResult::new()`
 - **fastembed**: Requires `aarch64` Rust — no x86_64-apple-darwin ONNX binaries
 - **rusqlite 0.38**: No `ToSql` for `usize` — cast to `i64`
 - **Storage thread safety**: Wrap `Connection` in `std::sync::Mutex`

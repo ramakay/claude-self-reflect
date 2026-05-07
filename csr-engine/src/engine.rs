@@ -94,7 +94,40 @@ impl Engine {
                 reflections = reflection_count,
                 "search index loaded from cache"
             );
-            cached
+            // Reconcile HNSW cache with DB:
+            // 1. Blank orphan entries (deleted from DB since last dump)
+            // 2. Backfill missing entries (added to DB since last dump)
+            let mut search = cached;
+            if let Ok(db_ids) = storage.load_all_reflection_ids() {
+                let db_id_set: std::collections::HashSet<&str> =
+                    db_ids.iter().map(|s| s.as_str()).collect();
+                let blanked = search.blank_orphan_reflections(&db_id_set);
+                if blanked > 0 {
+                    tracing::info!(blanked, "blanked orphan reflection entries in HNSW cache");
+                }
+
+                // Backfill reflections that exist in DB but not in HNSW
+                let missing: Vec<&str> = db_id_set
+                    .iter()
+                    .filter(|id| !search.has_reflection(id))
+                    .copied()
+                    .collect();
+                if !missing.is_empty() {
+                    if let Ok(all_vecs) = storage.load_all_reflection_vectors() {
+                        let mut added = 0;
+                        for (id, vec) in &all_vecs {
+                            if missing.contains(&id.as_str()) {
+                                search.insert_reflection(id.clone(), vec.clone());
+                                added += 1;
+                            }
+                        }
+                        if added > 0 {
+                            tracing::info!(added, "backfilled missing reflections into HNSW cache");
+                        }
+                    }
+                }
+            }
+            search
         } else {
             // Cache miss — rebuild from SQLite vectors
             tracing::info!("building search index from stored vectors");

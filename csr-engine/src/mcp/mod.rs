@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
@@ -162,7 +161,6 @@ pub struct CsrServer {
     projects_dir: PathBuf,
     index_dir: PathBuf,
     db_path: String,
-    tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
@@ -188,7 +186,6 @@ impl CsrServer {
             projects_dir,
             index_dir,
             db_path,
-            tool_router: Self::tool_router(),
         }
     }
 
@@ -208,7 +205,13 @@ impl CsrServer {
 
     #[tool(
         name = "csr_reflect_on_past",
-        description = "Search past Claude conversations semantically to find relevant context. Use this tool when you need to recall previous discussions, find solutions to problems encountered before, or understand project history."
+        description = "Search past Claude conversations semantically to find relevant context. Use this tool when you need to recall previous discussions, find solutions to problems encountered before, or understand project history.",
+        annotations(
+            title = "Reflect on Past",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn reflect_on_past(
         &self,
@@ -234,7 +237,13 @@ impl CsrServer {
 
     #[tool(
         name = "store_reflection",
-        description = "Store an important insight or reflection for future reference. Use this to save key decisions, solutions, patterns, or warnings that should be remembered across sessions."
+        description = "Store an important insight or reflection for future reference. Use this to save key decisions, solutions, patterns, or warnings that should be remembered across sessions.",
+        annotations(
+            title = "Store Reflection",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
     )]
     async fn store_reflection(
         &self,
@@ -260,7 +269,13 @@ impl CsrServer {
 
     #[tool(
         name = "csr_quick_check",
-        description = "Quick check if a topic was discussed before. Returns count and top match only. Much faster than full search - use for existence checks."
+        description = "Quick check if a topic was discussed before. Returns count and top match only. Much faster than full search - use for existence checks.",
+        annotations(
+            title = "Quick Check",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn quick_check(
         &self,
@@ -285,7 +300,13 @@ impl CsrServer {
 
     #[tool(
         name = "csr_search_insights",
-        description = "Get aggregated insights and patterns from search results. Use when you want patterns or trends, analyzing topic evolution, understanding common themes."
+        description = "Get aggregated insights and patterns from search results. Use when you want patterns or trends, analyzing topic evolution, understanding common themes.",
+        annotations(
+            title = "Search Insights",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn search_insights(
         &self,
@@ -308,7 +329,13 @@ impl CsrServer {
 
     #[tool(
         name = "get_recent_work",
-        description = "Get recent work conversations to answer 'What did we work on last?' queries."
+        description = "Get recent work conversations to answer 'What did we work on last?' queries.",
+        annotations(
+            title = "Get Recent Work",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_recent_work(
         &self,
@@ -326,7 +353,13 @@ impl CsrServer {
 
     #[tool(
         name = "search_by_recency",
-        description = "Time-constrained semantic search for queries like 'docker issues last week'."
+        description = "Time-constrained semantic search for queries like 'docker issues last week'.",
+        annotations(
+            title = "Search by Recency",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn search_by_recency(
         &self,
@@ -355,7 +388,13 @@ impl CsrServer {
 
     #[tool(
         name = "get_timeline",
-        description = "Show activity timeline for a project or across all projects."
+        description = "Show activity timeline for a project or across all projects.",
+        annotations(
+            title = "Get Timeline",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_timeline(
         &self,
@@ -375,7 +414,13 @@ impl CsrServer {
 
     #[tool(
         name = "csr_search_by_file",
-        description = "Find all conversations that analyzed or modified a specific file. Perfect for code archaeology and understanding file evolution."
+        description = "Find all conversations that analyzed or modified a specific file. Perfect for code archaeology and understanding file evolution.",
+        annotations(
+            title = "Search by File",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn search_by_file(
         &self,
@@ -392,7 +437,13 @@ impl CsrServer {
 
     #[tool(
         name = "csr_search_by_concept",
-        description = "Search for conversations about specific development concepts or themes like 'security', 'testing', 'performance'."
+        description = "Search for conversations about specific development concepts or themes like 'security', 'testing', 'performance'.",
+        annotations(
+            title = "Search by Concept",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn search_by_concept(
         &self,
@@ -418,7 +469,13 @@ impl CsrServer {
 
     #[tool(
         name = "csr_get_more",
-        description = "Get additional search results for paginated exploration. Use after initial search when more context is needed."
+        description = "Get additional search results for paginated exploration. Use after initial search when more context is needed.",
+        annotations(
+            title = "Get More Results",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_more_results(
         &self,
@@ -448,7 +505,13 @@ impl CsrServer {
 
     #[tool(
         name = "get_full_conversation",
-        description = "Get the full JSONL conversation file path for a conversation ID. This allows reading complete conversations instead of truncated excerpts."
+        description = "Get the full JSONL conversation file path for a conversation ID. This allows reading complete conversations instead of truncated excerpts.",
+        annotations(
+            title = "Get Full Conversation",
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn get_full_conversation(
         &self,
@@ -465,7 +528,13 @@ impl CsrServer {
 
     #[tool(
         name = "get_session_learnings",
-        description = "Get all learnings from a specific session. Enables iteration-level memory across context resets."
+        description = "Get all learnings from a specific session. Enables iteration-level memory across context resets.",
+        annotations(
+            title = "Get Session Learnings",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_session_learnings(
         &self,
@@ -490,21 +559,19 @@ fn tool_result(result: anyhow::Result<String>) -> Result<CallToolResult, rmcp::E
 #[tool_handler]
 impl ServerHandler for CsrServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "Claude Self-Reflect: Search past conversations and store reflections with semantic search and time-based memory decay.".into(),
-            ),
-            capabilities: ServerCapabilities::builder()
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
                 .build(),
-            server_info: Implementation {
-                name: "csr-engine".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+        )
+        .with_instructions(
+            "Claude Self-Reflect: Search past conversations and store reflections with semantic search and time-based memory decay.",
+        )
+        .with_server_info(Implementation::new(
+            "csr-engine",
+            env!("CARGO_PKG_VERSION"),
+        ))
     }
 
     async fn list_resources(
@@ -512,16 +579,13 @@ impl ServerHandler for CsrServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, rmcp::ErrorData> {
-        let mut health = RawResource::new("status://system-health", "System Health");
-        health.description =
-            Some("Current system health: index stats, cache status, version".into());
-        health.mime_type = Some("application/json".into());
+        let health = RawResource::new("status://system-health", "System Health")
+            .with_description("Current system health: index stats, cache status, version")
+            .with_mime_type("application/json");
 
-        Ok(ListResourcesResult {
-            resources: vec![health.no_annotation()],
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListResourcesResult::with_all_items(vec![
+            health.no_annotation()
+        ]))
     }
 
     async fn read_resource(
@@ -538,9 +602,10 @@ impl ServerHandler for CsrServer {
                     &self.index_dir.to_string_lossy(),
                 )
                 .await;
-                Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::text(text, &request.uri)],
-                })
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    text,
+                    &request.uri,
+                )]))
             }
             _ => Err(rmcp::ErrorData::resource_not_found(
                 format!("Unknown resource: {}", request.uri),
