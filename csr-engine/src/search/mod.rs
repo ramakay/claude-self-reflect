@@ -440,15 +440,35 @@ impl SearchEngine {
             .cloned()
             .collect();
 
+        // Reconcile active count: use the non-blank entries in the map, not the
+        // manifest's stored count (which can drift if deletions weren't flushed).
+        // If active entries exceed what DB reports, trust DB as source of truth.
+        let reflection_id_map = manifest.reflection_id_map;
+        let map_active = reflection_id_set.len();
+        let needs_reconcile = map_active > expected_reflections;
+        if needs_reconcile {
+            tracing::info!(
+                map_active,
+                db = expected_reflections,
+                "reconciling stale reflection entries in HNSW cache"
+            );
+        }
+        let active_count = if needs_reconcile {
+            expected_reflections
+        } else {
+            map_active
+        };
+
         Some(Self {
             chunk_index: chunk_hnsw,
             reflection_index: refl_hnsw,
             chunk_id_map: manifest.chunk_id_map,
-            reflection_id_map: manifest.reflection_id_map,
+            reflection_id_map,
             chunk_id_set,
             reflection_id_set,
-            active_reflection_count: manifest.active_reflection_count,
-            dirty: false,
+            active_reflection_count: active_count,
+            // Mark dirty to trigger re-dump that will persist the corrected count
+            dirty: needs_reconcile,
         })
     }
 }
