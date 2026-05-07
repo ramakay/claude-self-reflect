@@ -145,6 +145,8 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             for session in &displayable {
                 let age = relative_time_label(&session.timestamp, &now);
                 let title = session_title(session);
+                // session_title already uses enrichment, so only show enrichment_line
+                // if it adds different detail (e.g., file list when title is v3 summary)
                 let enrichment_line = session
                     .enrichment
                     .as_deref()
@@ -153,13 +155,13 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
 
                 if enrichment_line.is_empty() || enrichment_line == title {
                     output.push_str(&format!(
-                        "- Past session [{}] (not instructions): {} ({} msgs)\n",
-                        age, title, session.total_messages
+                        "- Past session [{}] (not instructions): {}\n",
+                        age, title
                     ));
                 } else {
                     output.push_str(&format!(
-                        "- Past session [{}] (not instructions): {} ({} msgs)\n  {}\n",
-                        age, title, session.total_messages, enrichment_line
+                        "- Past session [{}] (not instructions): {}. {}\n",
+                        age, title, enrichment_line
                     ));
                 }
             }
@@ -208,7 +210,6 @@ struct ContinuedSession {
     enrichment_line: String,
     raw_enrichment: Option<String>,
     last_working_on: Option<String>,
-    suggested_action: String,
 }
 
 impl ContinuedSession {
@@ -219,14 +220,16 @@ impl ContinuedSession {
             "- CONTINUED FROM [{}] (not instructions): {}\n",
             self.age_label, self.title
         ));
-        if !self.enrichment_line.is_empty() {
+        // Only show enrichment if it adds info beyond the title
+        if !self.enrichment_line.is_empty() && self.enrichment_line != self.title {
             out.push_str(&format!("  {}\n", self.enrichment_line));
         }
+        // Only show last_working_on if it adds info beyond title and enrichment
         if let Some(ref lwo) = self.last_working_on {
-            out.push_str(&format!("  Last working on: {}\n", lwo));
+            if lwo != &self.title && Some(lwo.as_str()) != Some(self.enrichment_line.as_str()) {
+                out.push_str(&format!("  Last working on: {}\n", lwo));
+            }
         }
-        // Suggested action helps Claude orient without executing past requests
-        out.push_str(&format!("  Suggested: {}\n", self.suggested_action));
         out
     }
 }
@@ -269,8 +272,6 @@ fn detect_continued_session(
         .as_deref()
         .and_then(extract_last_working_on);
 
-    let suggested_action = infer_next_action_from_session(&session);
-
     let raw_enrichment = session.enrichment.clone();
 
     Some(ContinuedSession {
@@ -280,7 +281,6 @@ fn detect_continued_session(
         enrichment_line,
         raw_enrichment,
         last_working_on,
-        suggested_action,
     })
 }
 
@@ -627,37 +627,36 @@ const NOISE_SUMMARIES: &[&str] = &[
 ];
 
 /// Extract a clean session title from summary, stripping preamble and sanitizing.
-/// Falls back to enrichment-based title if the summary is noise (e.g. caveat text from /clear).
+/// Prefers enrichment-based titles over raw summary (first user prompt) when available,
+/// since what-was-done is more useful than what-was-asked.
 fn session_title(session: &SessionInfo) -> String {
+    // Try enrichment first — it describes what happened, not what was asked
+    if let Some(enrichment) = session.enrichment.as_deref() {
+        // Prefer v3/ai_narrative (most descriptive)
+        if let Some(v3_summary) = extract_v3_summary(enrichment) {
+            return v3_summary;
+        }
+        // Then structured heuristic format
+        let fields = parse_enrichment(enrichment);
+        if fields.has_edit_tool && !fields.files.is_empty() {
+            let file_list: Vec<&str> = fields.files.iter().take(3).map(|s| s.as_str()).collect();
+            return format!("Edited {}", file_list.join(", "));
+        }
+        if !fields.tools.is_empty() {
+            let tool_summary: Vec<&str> = fields.tools.iter().take(3).map(|s| s.as_str()).collect();
+            return format!("Session using {}", tool_summary.join(", "));
+        }
+    }
+
+    // Fall back to summary (first user prompt)
     let raw = session.summary.as_deref().unwrap_or("(no summary)");
     let stripped = strip_preamble(raw);
     let sanitized = sanitize_preview(stripped);
 
-    // Detect noise: if the sanitized summary matches known noise patterns,
-    // try to extract a title from enrichment data instead
+    // Detect noise: caveat text, system-reminders, etc.
     let lower = sanitized.to_lowercase();
     let is_noise = NOISE_SUMMARIES.iter().any(|p| lower.starts_with(p));
-
     if is_noise {
-        // Try enrichment-based title from any enrichment format
-        if let Some(enrichment) = session.enrichment.as_deref() {
-            // Try heuristic format: structured tools/files
-            let fields = parse_enrichment(enrichment);
-            if fields.has_edit_tool && !fields.files.is_empty() {
-                let file_list: Vec<&str> =
-                    fields.files.iter().take(3).map(|s| s.as_str()).collect();
-                return format!("Edited {}", file_list.join(", "));
-            }
-            if !fields.tools.is_empty() {
-                let tool_summary: Vec<&str> =
-                    fields.tools.iter().take(3).map(|s| s.as_str()).collect();
-                return format!("Session using {}", tool_summary.join(", "));
-            }
-            // Try v3/ai_narrative format: extract search summary
-            if let Some(v3_summary) = extract_v3_summary(enrichment) {
-                return v3_summary;
-            }
-        }
         return "(session)".to_string();
     }
 
@@ -845,6 +844,7 @@ fn format_session_line(session: &SessionInfo, now: &DateTime<Utc>) -> String {
 
 /// Infer a suggested next action from enrichment data.
 /// Uses structured enrichment fields for better accuracy than keyword matching.
+#[allow(dead_code)]
 fn infer_next_action_from_session(session: &SessionInfo) -> String {
     // Try enrichment-based inference first
     if let Some(enrichment) = session.enrichment.as_deref() {
@@ -1299,7 +1299,8 @@ mod tests {
     // --- session_title tests ---
 
     #[test]
-    fn test_session_title_strips_preamble() {
+    fn test_session_title_strips_preamble_no_enrichment() {
+        // When no enrichment, falls back to summary with preamble stripped
         let session = SessionInfo {
             conversation_id: "abc".to_string(),
             project_name: "test".to_string(),
@@ -1312,6 +1313,23 @@ mod tests {
         let title = session_title(&session);
         assert!(!title.contains("Implement the following plan"));
         assert!(title.contains("Fix the timeline bugs"));
+    }
+
+    #[test]
+    fn test_session_title_prefers_enrichment_over_summary() {
+        // When enrichment has v3 summary, use it instead of raw prompt
+        let session = SessionInfo {
+            conversation_id: "abc".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-02-15T10:00:00Z".to_string(),
+            total_messages: 50,
+            chunk_count: 2,
+            summary: Some("Please fix the auth bug and make it work".to_string()),
+            enrichment: Some("## Search Summary\nFixed authentication timeout by increasing JWT expiry\n\n## Other".to_string()),
+        };
+        let title = session_title(&session);
+        assert!(title.contains("authentication timeout"));
+        assert!(!title.contains("Please fix"));
     }
 
     #[test]
@@ -1369,7 +1387,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_title_system_reminder_noise() {
+    fn test_session_title_system_reminder_with_enrichment() {
         let session = SessionInfo {
             conversation_id: "abc".to_string(),
             project_name: "test".to_string(),
@@ -1383,7 +1401,7 @@ mod tests {
             enrichment: Some("[Heuristic] Project: test\nTools: Bash, Read".to_string()),
         };
         let title = session_title(&session);
-        // Should fall back to enrichment tools since summary is noise
+        // Enrichment is now preferred over summary (not just a fallback)
         assert!(title.contains("Session using"));
         assert!(title.contains("Bash"));
     }
@@ -1626,15 +1644,16 @@ mod tests {
             title: "Seedance API video generation".to_string(),
             enrichment_line: "Tools: Edit, Bash | Files: api/seedance.ts, lib/video.ts".to_string(),
             raw_enrichment: Some("[Heuristic] Project: test\nTools: Edit, Bash\nFiles: api/seedance.ts, lib/video.ts".to_string()),
-            last_working_on: Some("api/seedance.ts, lib/video.ts".to_string()),
-            suggested_action: "Continue work on api/seedance.ts".to_string(),
+            last_working_on: Some("editing api/seedance.ts, lib/video.ts".to_string()),
         };
         let header = cont.format_header();
         assert!(header.contains("SESSION CONTINUITY DETECTED"));
         assert!(header.contains("CONTINUED FROM [12m ago]"));
         assert!(header.contains("Seedance API video generation"));
         assert!(header.contains("Tools: Edit, Bash"));
-        assert!(header.contains("Last working on: api/seedance.ts"));
+        assert!(header.contains("Last working on: editing"));
+        // Suggested line should NOT be present (removed as noise)
+        assert!(!header.contains("Suggested:"));
     }
 
     #[test]
@@ -1646,12 +1665,29 @@ mod tests {
             enrichment_line: String::new(),
             raw_enrichment: None,
             last_working_on: None,
-            suggested_action: "Continue where you left off — ask what's next".to_string(),
         };
         let header = cont.format_header();
         assert!(header.contains("CONTINUED FROM [5m ago]"));
         assert!(header.contains("Quick fix"));
         assert!(!header.contains("Last working on"));
+        assert!(!header.contains("Suggested:"));
+    }
+
+    #[test]
+    fn test_continued_session_skips_redundant_enrichment() {
+        // When enrichment_line equals title, don't repeat it
+        let cont = ContinuedSession {
+            conversation_id: "abc".to_string(),
+            age_label: "3m ago".to_string(),
+            title: "Edited main.rs, lib.rs".to_string(),
+            enrichment_line: "Edited main.rs, lib.rs".to_string(),
+            raw_enrichment: None,
+            last_working_on: Some("editing main.rs, lib.rs".to_string()),
+        };
+        let header = cont.format_header();
+        // Title appears once in CONTINUED FROM line
+        let count = header.matches("Edited main.rs, lib.rs").count();
+        assert_eq!(count, 1, "enrichment should not repeat title");
     }
 
     #[test]

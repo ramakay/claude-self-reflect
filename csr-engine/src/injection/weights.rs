@@ -34,8 +34,8 @@ impl WeightProfile {
                 phase_boost: 0.40,
             },
             HookPhase::PromptSubmit => Self {
-                semantic: 0.40,
-                recency: 0.15,
+                semantic: 0.30,
+                recency: 0.25,
                 file_overlap: 0.20,
                 error_match: 0.10,
                 phase_boost: 0.15,
@@ -139,11 +139,19 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_submit_prefers_semantic() {
+    fn test_prompt_submit_balances_semantic_and_recency() {
         let w = WeightProfile::for_phase(HookPhase::PromptSubmit);
         assert!(
             w.semantic >= w.phase_boost,
-            "PromptSubmit should weight semantic match highest"
+            "PromptSubmit should weight semantic above phase_boost"
+        );
+        assert!(
+            w.recency >= w.phase_boost,
+            "PromptSubmit should weight recency above phase_boost"
+        );
+        assert!(
+            w.semantic + w.recency > 0.5,
+            "semantic + recency should dominate PromptSubmit scoring"
         );
     }
 

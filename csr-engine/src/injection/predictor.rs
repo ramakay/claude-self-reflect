@@ -3,7 +3,8 @@
 //! Raw semantic similarity alone isn't enough — recency, file overlap,
 //! and error pattern matching improve relevance for injection.
 //!
-//! Scoring formula: `final = semantic * 0.5 + recency * 0.2 + file_overlap * 0.2 + error_match * 0.1`
+//! Scoring formula: weighted combination via LAPI phase profiles (see weights.rs).
+//! Recency decay: 2^(-age/14) — 14-day half-life to suppress stale results.
 
 use std::collections::HashSet;
 
@@ -149,7 +150,9 @@ fn score_result(
 }
 
 /// Compute recency boost: 1.0 for today, decaying with age.
-/// Uses formula: 2^(-age_days / 30) — halves every 30 days.
+/// Uses formula: 2^(-age_days / 14) — halves every 14 days (steeper decay).
+/// Previous: 30-day half-life let 3-month-old results dominate on semantic alone.
+/// Now: 14d=0.5, 30d=0.23, 60d=0.05 — stale content gets crushed.
 fn compute_recency_boost(timestamp: Option<&str>) -> f32 {
     let ts = match timestamp {
         Some(ts) => ts,
@@ -164,8 +167,8 @@ fn compute_recency_boost(timestamp: Option<&str>) -> f32 {
     let now = chrono::Utc::now();
     let age_days = (now - parsed).num_days().max(0) as f64;
 
-    // 2^(-age/30): 1.0 today, 0.5 at 30 days, 0.25 at 60 days
-    (2.0_f64.powf(-age_days / 30.0)) as f32
+    // 2^(-age/14): 1.0 today, 0.5 at 14 days, 0.23 at 30 days, 0.05 at 60 days
+    (2.0_f64.powf(-age_days / 14.0)) as f32
 }
 
 /// Compute file overlap: fraction of current session files that appear in result.
@@ -280,7 +283,8 @@ mod tests {
     #[test]
     fn test_recency_boost() {
         let now = chrono::Utc::now().to_rfc3339();
-        let old = "2025-01-01T00:00:00Z".to_string();
+        // Use a timestamp ~60 days ago (clearly old, will have very low recency)
+        let old = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
 
         let results = vec![
             RawResult {
