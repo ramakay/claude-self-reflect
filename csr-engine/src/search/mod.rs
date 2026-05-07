@@ -121,6 +121,29 @@ impl SearchEngine {
         }
     }
 
+    /// Check if a reflection ID exists in the index (non-blanked).
+    pub fn has_reflection(&self, id: &str) -> bool {
+        self.reflection_id_set.contains(id)
+    }
+
+    /// Blank reflection IDs in the map that are not present in the given DB ID set.
+    /// Returns the number of entries blanked. Marks index dirty if any were removed.
+    pub fn blank_orphan_reflections(&mut self, db_ids: &std::collections::HashSet<&str>) -> usize {
+        let mut blanked = 0;
+        for entry in &mut self.reflection_id_map {
+            if !entry.is_empty() && !db_ids.contains(entry.as_str()) {
+                self.reflection_id_set.remove(entry.as_str());
+                *entry = String::new();
+                blanked += 1;
+            }
+        }
+        if blanked > 0 {
+            self.active_reflection_count = self.active_reflection_count.saturating_sub(blanked);
+            self.dirty = true;
+        }
+        blanked
+    }
+
     /// Search chunk index. Returns results sorted by descending score.
     pub fn search_chunks(
         &self,
@@ -440,35 +463,18 @@ impl SearchEngine {
             .cloned()
             .collect();
 
-        // Reconcile active count: use the non-blank entries in the map, not the
-        // manifest's stored count (which can drift if deletions weren't flushed).
-        // If active entries exceed what DB reports, trust DB as source of truth.
-        let reflection_id_map = manifest.reflection_id_map;
-        let map_active = reflection_id_set.len();
-        let needs_reconcile = map_active > expected_reflections;
-        if needs_reconcile {
-            tracing::info!(
-                map_active,
-                db = expected_reflections,
-                "reconciling stale reflection entries in HNSW cache"
-            );
-        }
-        let active_count = if needs_reconcile {
-            expected_reflections
-        } else {
-            map_active
-        };
+        // Use non-blank map count — orphans will be blanked by Engine::new reconciliation
+        let active_count = reflection_id_set.len();
 
         Some(Self {
             chunk_index: chunk_hnsw,
             reflection_index: refl_hnsw,
             chunk_id_map: manifest.chunk_id_map,
-            reflection_id_map,
+            reflection_id_map: manifest.reflection_id_map,
             chunk_id_set,
             reflection_id_set,
             active_reflection_count: active_count,
-            // Mark dirty to trigger re-dump that will persist the corrected count
-            dirty: needs_reconcile,
+            dirty: false,
         })
     }
 }

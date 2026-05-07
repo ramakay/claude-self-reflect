@@ -122,6 +122,13 @@ pub fn insert_reflection(
     Ok(())
 }
 
+pub fn load_all_reflection_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT reflection_id FROM reflection_embeddings")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    rows.collect::<std::result::Result<Vec<String>, _>>()
+        .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
 pub fn load_all_reflection_vectors(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> {
     let mut stmt = conn.prepare("SELECT reflection_id, embedding FROM reflection_embeddings")?;
     let rows = stmt.query_map([], |row| {
