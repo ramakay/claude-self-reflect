@@ -814,6 +814,24 @@ function KnowledgeGraphCard() {
   )
 }
 
+function WhatsNewCard() {
+  return (
+    <BentoCard className="card--whatsnew" delay={560} id="whats-new">
+      <CardKicker number="—" label="LATEST RELEASE" accent="purple" />
+      <h2 className="type-hl-sm">What's New in v8.2.0</h2>
+      <ul className="whatsnew-list">
+        <li>
+          <strong>Tool safety annotations</strong> — all 12 MCP tools declare read-only, idempotent, and destructive hints so Claude Code calls them with confidence
+        </li>
+        <li>
+          <strong>Index reconciliation</strong> — HNSW cache now reconciles against DB on startup, eliminating phantom search results from deleted reflections
+        </li>
+      </ul>
+      <a className="cite-link" href="https://github.com/ramakay/claude-self-reflect/releases/tag/v8.2.0" target="_blank" rel="noopener noreferrer">Full release notes →</a>
+    </BentoCard>
+  )
+}
+
 function HostedMemoryCard() {
   return (
     <BentoCard className="card--hosted" delay={960}>
@@ -1157,7 +1175,7 @@ export default function Landing() {
 
       <main className="landing-main">
         <p className="type-dateline landing-dateline" style={{ opacity: datelineVisible ? 1 : 0 }}>
-          Claude Self-Reflect / v8.0 / Rust Engine / Local Memory Archive
+          Claude Self-Reflect / v8.2 / Rust Engine / Local Memory Archive
         </p>
 
         <section className="bento-grid" aria-label="Claude Self-Reflect overview">
@@ -1185,6 +1203,7 @@ export default function Landing() {
           <InstallCard />
           <WhatYouAskCard />
           <ArchCard />
+          <WhatsNewCard />
           <div className="bento-section-header">
             <span />
             <h2>How others do it</h2>

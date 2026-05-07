@@ -656,9 +656,10 @@ body {
 .card--install { grid-column: 4 / -1; grid-row: 3; }
 .card--ask { grid-column: 1 / -1; grid-row: 4; }
 .card--arch { grid-column: 1 / -1; grid-row: 5; }
-.card--flatfile { grid-column: 1 / span 4; grid-row: 7; }
-.card--kgraph { grid-column: 5 / span 4; grid-row: 7; }
-.card--hosted { grid-column: 9 / span 4; grid-row: 7; }
+.card--whatsnew { grid-column: 1 / -1; grid-row: 6; }
+.card--flatfile { grid-column: 1 / span 4; grid-row: 8; }
+.card--kgraph { grid-column: 5 / span 4; grid-row: 8; }
+.card--hosted { grid-column: 9 / span 4; grid-row: 8; }
 
 /* AST card internals */
 .ast-layout {
@@ -1057,6 +1058,29 @@ body {
   background:
     radial-gradient(circle at 72% 38%, rgba(220,232,207,0.34), transparent 46%),
     rgba(255,255,255,0.76);
+}
+
+.card--whatsnew {
+  background:
+    radial-gradient(circle at 30% 50%, rgba(200,210,240,0.25), transparent 50%),
+    rgba(255,255,255,0.82);
+}
+.whatsnew-list {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.whatsnew-list li {
+  flex: 1 1 280px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-body);
+}
+.whatsnew-list strong {
+  color: var(--color-heading);
 }
 
 .card--install {
