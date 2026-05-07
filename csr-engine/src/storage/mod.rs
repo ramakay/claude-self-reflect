@@ -365,4 +365,21 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_retrieval_events_batch(&conn, memory_ids)
     }
+
+    // ─── Completion queries (v8.3.0) ───
+
+    pub fn list_project_names(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::list_project_names(&conn, prefix, limit)
+    }
+
+    pub fn list_file_paths(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::list_file_paths(&conn, prefix, limit)
+    }
+
+    pub fn list_session_ids(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::list_session_ids(&conn, prefix, limit)
+    }
 }

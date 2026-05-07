@@ -40,10 +40,12 @@ pub struct EnrichmentBreakdown {
 }
 
 /// Run status check — opens SQLite directly (no EmbeddingEngine needed).
-pub fn handle(db_path: &Path, projects_dir: &Path, compact: bool) -> Result<()> {
+pub fn handle(db_path: &Path, projects_dir: &Path, compact: bool, swiftbar: bool) -> Result<()> {
     let report = gather_status(db_path, projects_dir)?;
 
-    if compact {
+    if swiftbar {
+        print_swiftbar(&report);
+    } else if compact {
         print_compact(&report);
     } else {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -139,6 +141,151 @@ fn count_jsonl_files(projects_dir: &Path) -> usize {
         }
     }
     count
+}
+
+/// Print SwiftBar-compatible output for macOS menu bar.
+///
+/// SwiftBar format:
+/// - First line = menu bar title (always visible)
+/// - `---` = separator between title and dropdown
+/// - Subsequent lines = dropdown items
+/// - `| color=...` = styling
+/// - `| href=...` = clickable URL
+/// - `--` prefix = submenu item
+fn print_swiftbar(report: &StatusReport) {
+    // Menu bar title: health indicator + chunk count
+    let icon = if report.healthy { "🧠" } else { "⚠️" };
+    let focus = read_current_focus().unwrap_or_default();
+    if focus.is_empty() {
+        println!("{} {}c {}r", icon, report.chunks, report.reflections);
+    } else {
+        // Truncate focus to 30 chars for menu bar
+        let short: String = focus.chars().take(30).collect();
+        println!("{} {}", icon, short);
+    }
+
+    println!("---");
+
+    // Section: Index Stats
+    println!("Index | size=14 color=#888888");
+    println!("--Chunks: {} | font=Menlo", report.chunks);
+    println!("--Reflections: {} | font=Menlo", report.reflections);
+    println!("--Conversations: {} | font=Menlo", report.conversations);
+    println!("--Projects: {} | font=Menlo", report.projects);
+
+    // Section: Import Progress
+    let bar_filled = (report.import_percent / 10.0).round() as usize;
+    let bar_empty = 10_usize.saturating_sub(bar_filled);
+    let bar: String = "█".repeat(bar_filled) + &"░".repeat(bar_empty);
+    println!("---");
+    println!(
+        "Import: {} {:.0}% ({}/{}) | font=Menlo",
+        bar, report.import_percent, report.imported_files, report.total_jsonl_files
+    );
+
+    // Section: Enrichment
+    let total_enriched = report.enrichment.heuristic_completed
+        + report.enrichment.extracted_v3_completed
+        + report.enrichment.ai_narrative_completed;
+    if total_enriched > 0 {
+        println!("---");
+        println!("Enrichment | size=14 color=#888888");
+        println!(
+            "--Heuristic: {} | font=Menlo",
+            report.enrichment.heuristic_completed
+        );
+        println!(
+            "--V3 Extraction: {} | font=Menlo",
+            report.enrichment.extracted_v3_completed
+        );
+        println!(
+            "--AI Narrative: {} | font=Menlo",
+            report.enrichment.ai_narrative_completed
+        );
+        if report.enrichment.ai_narrative_processing > 0 {
+            println!(
+                "--Processing: {} | font=Menlo color=orange",
+                report.enrichment.ai_narrative_processing
+            );
+        }
+    }
+
+    // Section: Health
+    println!("---");
+    let health_label = if report.healthy {
+        "DB: healthy ✓ | color=green"
+    } else {
+        "DB: unhealthy ✗ | color=red"
+    };
+    println!("{}", health_label);
+    let db_mb = report.db_size_bytes as f64 / 1_048_576.0;
+    println!("Size: {:.1} MB | font=Menlo", db_mb);
+    if let Some(ref ts) = report.newest_chunk {
+        let age = format_age(ts);
+        println!("Latest: {} | font=Menlo", age);
+    }
+
+    // Section: Current Focus (from session_start hook)
+    if !focus.is_empty() {
+        println!("---");
+        println!("Focus: {} | font=Menlo", focus);
+    }
+
+    // Section: Quick Actions
+    println!("---");
+    println!("Refresh | refresh=true");
+    println!(
+        "Open DB in Terminal | bash=sqlite3 param1=\"{}\" terminal=true",
+        report.db_path
+    );
+}
+
+/// Read the current focus file written by session_start hook.
+/// Strips framing prefixes like "[project] SESSION CONTINUITY..." to extract clean focus.
+fn read_current_focus() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let path = home.join(".claude-self-reflect").join("current-focus.txt");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Strip "[project] " prefix if present
+    let clean = if let Some(pos) = trimmed.find("] ") {
+        &trimmed[pos + 2..]
+    } else {
+        trimmed
+    };
+    // Skip session framing noise
+    let skip_prefixes = [
+        "SESSION CONTINUITY",
+        "RECENT SESSIONS",
+        "CSR engine ready",
+        "CSR:",
+    ];
+    if skip_prefixes.iter().any(|p| clean.starts_with(p)) {
+        return None;
+    }
+    Some(clean.to_string())
+}
+
+/// Format a timestamp as a human-readable age string.
+fn format_age(timestamp: &str) -> String {
+    let ts = match crate::temporal::parse_timestamp(timestamp) {
+        Some(t) => t,
+        None => return timestamp.to_string(),
+    };
+    let age = chrono::Utc::now() - ts;
+    let mins = age.num_minutes();
+    if mins < 1 {
+        "just now".to_string()
+    } else if mins < 60 {
+        format!("{}m ago", mins)
+    } else if mins < 1440 {
+        format!("{}h ago", mins / 60)
+    } else {
+        format!("{}d ago", mins / 1440)
+    }
 }
 
 /// Print compact one-line status for statusline integration.

@@ -979,3 +979,65 @@ pub fn get_retrieval_events_batch(
     }
     Ok(map)
 }
+
+// ─── Completion queries (v8.3.0) ───
+
+/// Escape SQLite LIKE wildcards (`%` and `_`) in a prefix string.
+fn escape_like(prefix: &str) -> String {
+    prefix.replace('%', "\\%").replace('_', "\\_")
+}
+
+/// List distinct project names matching a prefix (for MCP completions).
+/// Returns up to `limit` results, sorted alphabetically.
+pub fn list_project_names(conn: &Connection, prefix: &str, limit: usize) -> Result<Vec<String>> {
+    let pattern = format!("{}%", escape_like(prefix));
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT project_name FROM chunks
+         WHERE project_name LIKE ?1 ESCAPE '\\'
+         ORDER BY project_name
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![pattern, limit as i64], |row| row.get(0))?;
+    rows.collect::<std::result::Result<Vec<String>, _>>()
+        .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+/// List distinct file paths from import_state matching a prefix.
+pub fn list_file_paths(conn: &Connection, prefix: &str, limit: usize) -> Result<Vec<String>> {
+    let pattern = format!("%{}%", escape_like(prefix));
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT file_path FROM import_state
+         WHERE file_path LIKE ?1 ESCAPE '\\'
+         ORDER BY file_path
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// List distinct session IDs from iteration_learnings matching a prefix.
+/// Returns empty vec if the table doesn't exist (created on first stop hook).
+pub fn list_session_ids(conn: &Connection, prefix: &str, limit: usize) -> Result<Vec<String>> {
+    let pattern = format!("{}%", escape_like(prefix));
+    let result = conn.prepare(
+        "SELECT DISTINCT session_id FROM iteration_learnings
+         WHERE session_id LIKE ?1 ESCAPE '\\'
+         ORDER BY session_id DESC
+         LIMIT ?2",
+    );
+    let mut stmt = match result {
+        Ok(s) => s,
+        Err(e) => {
+            // Only tolerate "no such table" — surface real SQL errors
+            if e.to_string().contains("no such table") {
+                return Ok(Vec::new());
+            }
+            return Err(anyhow::anyhow!("{}", e));
+        }
+    };
+    let rows = stmt.query_map(params![pattern, limit as i64], |row| row.get(0))?;
+    rows.collect::<std::result::Result<Vec<String>, _>>()
+        .map_err(|e| anyhow::anyhow!("{}", e))
+}

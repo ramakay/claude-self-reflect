@@ -34,6 +34,11 @@ const PROMPT_TOKEN_BUDGET: usize = 500;
 /// Minimum prompt length to trigger search (avoids noise from short prompts).
 const MIN_PROMPT_LENGTH: usize = 15;
 
+/// Maximum age (in days) for chunk results. Chunks older than this are filtered out.
+/// Reflections are exempt — they're intentionally stored for long-term recall.
+/// Prevents 3-month-old conversations from winning on semantic similarity alone.
+const MAX_CHUNK_AGE_DAYS: i64 = 21;
+
 /// Handle the prompt-submit hook.
 /// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code.
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
@@ -235,10 +240,21 @@ async fn search_chunks_with_vec(
         idx.search_chunks(query_vec, limit, min_score)
     };
 
+    let now = chrono::Utc::now();
     let mut raw_results = Vec::new();
     for result in &results {
         if let Ok(chunks) = storage.get_chunks_by_ids(std::slice::from_ref(&result.id)) {
             if let Some(chunk) = chunks.into_iter().next() {
+                // Hard age gate: skip chunks older than MAX_CHUNK_AGE_DAYS
+                // Prevents stale conversations from winning on semantic similarity alone
+                if let Some(ts) = crate::temporal::parse_timestamp(&chunk.timestamp) {
+                    let age_days = (now - ts).num_days();
+                    // Reject future-dated chunks (clock skew) and stale chunks
+                    if !(0..=MAX_CHUNK_AGE_DAYS).contains(&age_days) {
+                        continue;
+                    }
+                }
+
                 raw_results.push(RawResult {
                     content: formatter::truncate_item(&chunk.content, 300),
                     score: result.score,
@@ -431,6 +447,15 @@ mod tests {
     fn test_min_prompt_length() {
         assert!("short".len() < MIN_PROMPT_LENGTH);
         assert!("fix the authentication timeout bug".len() >= MIN_PROMPT_LENGTH);
+    }
+
+    #[test]
+    fn test_max_chunk_age_constant() {
+        // Verify the age gate is set to 21 days
+        assert_eq!(MAX_CHUNK_AGE_DAYS, 21);
+        // Reflections should NOT be gated (only chunks)
+        // This is enforced by the filter only being in search_chunks_with_vec,
+        // not in search_reflections_with_vec.
     }
 
     #[test]
