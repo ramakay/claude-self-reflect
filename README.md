@@ -160,22 +160,24 @@ No special syntax. No commands. CSR finds relevant past context and injects it a
 </details>
 
 <details>
-<summary><strong>MCP Tools</strong> — 12 tools available to Claude</summary>
+<summary><strong>MCP Tools</strong> — 12 annotated tools available to Claude</summary>
 
-| Tool | Description |
-|------|-------------|
-| `csr_reflect_on_past` | Semantic search across past conversations |
-| `store_reflection` | Store insights for future retrieval |
-| `csr_quick_check` | Fast existence check (count + top match) |
-| `search_by_recency` | Time-constrained search ("last week") |
-| `get_recent_work` | "What did we work on?" with session grouping |
-| `get_timeline` | Activity timeline with statistics |
-| `csr_search_by_file` | Find conversations that touched a file |
-| `csr_search_by_concept` | Theme-based search ("security", "testing") |
-| `csr_search_insights` | Aggregated patterns from search results |
-| `csr_get_more` | Paginate through additional results |
-| `get_full_conversation` | Retrieve complete JSONL conversation |
-| `get_session_learnings` | Iteration-level memory for Ralph loops |
+All tools include [MCP tool annotations](https://spec.modelcontextprotocol.io/specification/2025-11-05/server/tools/#annotations) so Claude Code understands their safety characteristics.
+
+| Tool | Description | Safety |
+|------|-------------|--------|
+| `csr_reflect_on_past` | Semantic search across past conversations | read-only |
+| `store_reflection` | Store insights for future retrieval | **writes** |
+| `csr_quick_check` | Fast existence check (count + top match) | read-only |
+| `search_by_recency` | Time-constrained search ("last week") | read-only |
+| `get_recent_work` | "What did we work on?" with session grouping | read-only |
+| `get_timeline` | Activity timeline with statistics | read-only |
+| `csr_search_by_file` | Find conversations that touched a file | read-only |
+| `csr_search_by_concept` | Theme-based search ("security", "testing") | read-only |
+| `csr_search_insights` | Aggregated patterns from search results | read-only |
+| `csr_get_more` | Paginate through additional results | read-only |
+| `get_full_conversation` | Retrieve complete JSONL conversation | read-only |
+| `get_session_learnings` | Iteration-level memory for Ralph loops | read-only |
 
 </details>
 
