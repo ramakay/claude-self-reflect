@@ -249,7 +249,8 @@ async fn search_chunks_with_vec(
                 // Prevents stale conversations from winning on semantic similarity alone
                 if let Some(ts) = crate::temporal::parse_timestamp(&chunk.timestamp) {
                     let age_days = (now - ts).num_days();
-                    if age_days > MAX_CHUNK_AGE_DAYS {
+                    // Reject future-dated chunks (clock skew) and stale chunks
+                    if !(0..=MAX_CHUNK_AGE_DAYS).contains(&age_days) {
                         continue;
                     }
                 }

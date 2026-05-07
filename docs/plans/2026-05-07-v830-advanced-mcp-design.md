@@ -73,7 +73,7 @@ Light implementation — confirmation flow only:
 
 Dual-transport architecture:
 
-```
+```text
 csr-engine              → stdio transport (default, for Claude Code)
 csr-engine serve        → HTTP transport on 127.0.0.1:3580 (for web clients)
 csr-engine serve --port → Custom port
@@ -90,7 +90,7 @@ New dependency: `axum = "0.8"` (or latest), `tower-http` for CORS/tracing
 
 ### CLI Changes
 
-```
+```bash
 csr-engine                     # MCP server (stdio) — unchanged
 csr-engine serve               # HTTP MCP server on :3580
 csr-engine serve --port 8080   # Custom port

@@ -11,10 +11,18 @@
 #
 # Refreshes every 30 seconds (per filename convention: .30s.)
 # Install: csr-engine hook install --apply (auto-copies to SwiftBar plugins dir)
-# Manual:  cp scripts/csr-status.30s.sh ~/Library/Application\ Support/SwiftBar/Plugins/
+# Manual:  cp scripts/csr-status.30s.sh "$HOME/Library/Application Support/SwiftBar/Plugins/"
 
 if command -v csr-engine &>/dev/null; then
-    csr-engine status --swiftbar 2>/dev/null
+    output=$(csr-engine status --swiftbar 2>/dev/null)
+    if [ $? -eq 0 ] && [ -n "$output" ]; then
+        echo "$output"
+    else
+        echo "🧠 CSR error"
+        echo "---"
+        echo "csr-engine status failed | color=orange"
+        echo "Refresh | refresh=true"
+    fi
 else
     echo "🧠 CSR offline"
     echo "---"

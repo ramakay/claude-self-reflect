@@ -235,7 +235,7 @@ fn print_swiftbar(report: &StatusReport) {
     println!("---");
     println!("Refresh | refresh=true");
     println!(
-        "Open DB in Terminal | bash=sqlite3 param1={} terminal=true",
+        "Open DB in Terminal | bash=sqlite3 param1=\"{}\" terminal=true",
         report.db_path
     );
 }
