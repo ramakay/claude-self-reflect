@@ -1,3 +1,4 @@
+pub mod completions;
 pub mod resources;
 pub mod tools;
 
@@ -563,6 +564,7 @@ impl ServerHandler for CsrServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                .enable_completions()
                 .build(),
         )
         .with_instructions(
@@ -572,6 +574,14 @@ impl ServerHandler for CsrServer {
             "csr-engine",
             env!("CARGO_PKG_VERSION"),
         ))
+    }
+
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, rmcp::ErrorData> {
+        completions::handle_complete(&request, &self.storage)
     }
 
     async fn list_resources(

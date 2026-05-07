@@ -816,7 +816,82 @@ fn test_heuristic_enrichment_with_fixture() {
     assert!(reflection.contains("test-project"));
 }
 
-// ─── Test 22: Search engine remove_reflection ───
+// ─── Test 22: Completions — project name prefix matching ───
+
+#[test]
+fn test_completions_project_name_prefix() {
+    let storage = Storage::open_memory().unwrap();
+
+    // Insert chunks with known project names
+    let chunk1 = ConversationChunk {
+        id: "chunk-comp-1".to_string(),
+        conversation_id: "conv-comp-1".to_string(),
+        project_name: "claude-self-reflect".to_string(),
+        timestamp: "2026-05-06T10:00:00Z".to_string(),
+        content: "test content".to_string(),
+        message_count: 5,
+        summary: None,
+    };
+    let chunk2 = ConversationChunk {
+        id: "chunk-comp-2".to_string(),
+        conversation_id: "conv-comp-2".to_string(),
+        project_name: "claude-code-hooks".to_string(),
+        timestamp: "2026-05-06T11:00:00Z".to_string(),
+        content: "other content".to_string(),
+        message_count: 3,
+        summary: None,
+    };
+    let chunk3 = ConversationChunk {
+        id: "chunk-comp-3".to_string(),
+        conversation_id: "conv-comp-3".to_string(),
+        project_name: "my-other-project".to_string(),
+        timestamp: "2026-05-06T12:00:00Z".to_string(),
+        content: "unrelated".to_string(),
+        message_count: 2,
+        summary: None,
+    };
+
+    let embedding = vec![0.1f32; 384];
+    storage.insert_chunk(&chunk1, &embedding).unwrap();
+    storage.insert_chunk(&chunk2, &embedding).unwrap();
+    storage.insert_chunk(&chunk3, &embedding).unwrap();
+
+    // Acceptance criterion: partial "clau" returns both claude-* projects
+    let results = storage.list_project_names("clau", 100).unwrap();
+    assert!(
+        results.contains(&"claude-self-reflect".to_string()),
+        "should contain claude-self-reflect, got: {:?}",
+        results
+    );
+    assert!(
+        results.contains(&"claude-code-hooks".to_string()),
+        "should contain claude-code-hooks"
+    );
+    assert!(
+        !results.contains(&"my-other-project".to_string()),
+        "should NOT contain my-other-project"
+    );
+
+    // Empty prefix returns all
+    let all = storage.list_project_names("", 100).unwrap();
+    assert_eq!(all.len(), 3);
+
+    // Non-matching prefix returns empty
+    let none = storage.list_project_names("xyz", 100).unwrap();
+    assert!(none.is_empty());
+}
+
+// ─── Test 23: Completions — session ID lookup ───
+
+#[test]
+fn test_completions_session_id_prefix() {
+    let storage = Storage::open_memory().unwrap();
+    // Session IDs are stored in iteration_learnings — no data means empty results
+    let results = storage.list_session_ids("abc", 100).unwrap();
+    assert!(results.is_empty());
+}
+
+// ─── Test 24: Search engine remove_reflection ───
 
 #[test]
 fn test_search_engine_remove_reflection() {
