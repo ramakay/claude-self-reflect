@@ -1,8 +1,12 @@
 //! MCP Elicitation — confirmation flow for store_reflection.
 //!
-//! When `store_reflection` receives content >500 chars, it asks the client
+//! When `store_reflection` receives content >2000 chars, it asks the client
 //! to confirm before storing. Uses rmcp's form-based elicitation with a
 //! simple { confirm: boolean } schema.
+//!
+//! Threshold is 2000 chars (not 500) to avoid annoying prompts on normal
+//! reflections. Only truly large content (paste accidents, verbose dumps)
+//! triggers the dialog.
 //!
 //! Graceful fallback: if the client doesn't support elicitation, proceeds
 //! without confirmation (the tool still works, just no guard rail).
@@ -14,7 +18,9 @@ use rmcp::service::RequestContext;
 use rmcp::RoleServer;
 
 /// Content length threshold that triggers confirmation.
-const CONFIRMATION_THRESHOLD: usize = 500;
+/// Set to 2000 to avoid noise on normal reflections — only fires for
+/// unusually large content (paste accidents, verbose log dumps).
+const CONFIRMATION_THRESHOLD: usize = 2000;
 
 /// Check if content should trigger a confirmation dialog.
 pub fn needs_confirmation(content: &str) -> bool {
@@ -64,16 +70,17 @@ mod tests {
     fn test_needs_confirmation_short() {
         assert!(!needs_confirmation("short content"));
         assert!(!needs_confirmation(&"a".repeat(500)));
+        assert!(!needs_confirmation(&"a".repeat(2000)));
     }
 
     #[test]
     fn test_needs_confirmation_long() {
-        assert!(needs_confirmation(&"a".repeat(501)));
-        assert!(needs_confirmation(&"a".repeat(1000)));
+        assert!(needs_confirmation(&"a".repeat(2001)));
+        assert!(needs_confirmation(&"a".repeat(5000)));
     }
 
     #[test]
     fn test_threshold_constant() {
-        assert_eq!(CONFIRMATION_THRESHOLD, 500);
+        assert_eq!(CONFIRMATION_THRESHOLD, 2000);
     }
 }
