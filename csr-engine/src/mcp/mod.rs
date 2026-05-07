@@ -1,5 +1,6 @@
 pub mod completions;
 pub mod resources;
+pub mod tasks;
 pub mod tools;
 
 use std::path::PathBuf;
@@ -162,6 +163,7 @@ pub struct CsrServer {
     projects_dir: PathBuf,
     index_dir: PathBuf,
     db_path: String,
+    task_manager: tasks::TaskManager,
 }
 
 #[tool_router]
@@ -187,6 +189,7 @@ impl CsrServer {
             projects_dir,
             index_dir,
             db_path,
+            task_manager: tasks::TaskManager::new(),
         }
     }
 
@@ -565,6 +568,7 @@ impl ServerHandler for CsrServer {
                 .enable_tools()
                 .enable_resources()
                 .enable_completions()
+                .enable_tasks()
                 .build(),
         )
         .with_instructions(
@@ -582,6 +586,82 @@ impl ServerHandler for CsrServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<CompleteResult, rmcp::ErrorData> {
         completions::handle_complete(&request, &self.storage)
+    }
+
+    async fn enqueue_task(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CreateTaskResult, rmcp::ErrorData> {
+        let tool_name = request.name.to_string();
+
+        if !tasks::is_taskable(&tool_name) {
+            return Err(rmcp::ErrorData::invalid_request(
+                format!("Tool '{}' does not support async task execution", tool_name),
+                None,
+            ));
+        }
+
+        // Clone what we need for the spawned task
+        let server = self.clone();
+        let ctx = context;
+
+        let task = self
+            .task_manager
+            .enqueue(&tool_name, async move {
+                // Delegate to the normal call_tool handler
+                server.call_tool(request, ctx).await
+            })
+            .await;
+
+        Ok(CreateTaskResult::new(task))
+    }
+
+    async fn list_tasks(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListTasksResult, rmcp::ErrorData> {
+        // Clean up expired tasks on each list call
+        self.task_manager.cleanup_expired().await;
+        let tasks = self.task_manager.list_tasks().await;
+        Ok(ListTasksResult::new(tasks))
+    }
+
+    async fn get_task_info(
+        &self,
+        request: GetTaskInfoParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, rmcp::ErrorData> {
+        let task = self
+            .task_manager
+            .get_task_info(&request.task_id)
+            .await
+            .ok_or_else(|| {
+                rmcp::ErrorData::invalid_request(
+                    format!("Task '{}' not found", request.task_id),
+                    None,
+                )
+            })?;
+        Ok(GetTaskResult { meta: None, task })
+    }
+
+    async fn get_task_result(
+        &self,
+        request: GetTaskResultParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskPayloadResult, rmcp::ErrorData> {
+        let value = self
+            .task_manager
+            .get_task_result(&request.task_id)
+            .await
+            .ok_or_else(|| {
+                rmcp::ErrorData::invalid_request(
+                    format!("Task '{}' not found or not completed", request.task_id),
+                    None,
+                )
+            })?;
+        Ok(GetTaskPayloadResult::new(value))
     }
 
     async fn list_resources(
