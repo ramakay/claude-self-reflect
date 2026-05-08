@@ -818,16 +818,25 @@ function WhatsNewCard() {
   return (
     <BentoCard className="card--whatsnew" delay={560} id="whats-new">
       <CardKicker number="—" label="LATEST RELEASE" accent="purple" />
-      <h2 className="type-hl-sm">What's New in v8.2.0</h2>
+      <h2 className="type-hl-sm">What's New in v8.3.0</h2>
       <ul className="whatsnew-list">
         <li>
-          <strong>Tool safety annotations</strong> — all 12 MCP tools declare read-only, idempotent, and destructive hints so Claude Code calls them with confidence
+          <strong>MCP completions</strong> — autocomplete for tool arguments: project names, file paths, time ranges, and more
         </li>
         <li>
-          <strong>Index reconciliation</strong> — HNSW cache now reconciles against DB on startup, eliminating phantom search results from deleted reflections
+          <strong>Async tasks</strong> — heavy search tools run non-blocking with progress polling and cancellation
+        </li>
+        <li>
+          <strong>Elicitation</strong> — confirmation dialog before storing large reflections (2000+ chars)
+        </li>
+        <li>
+          <strong>SwiftBar plugin</strong> — live macOS menu bar with index stats, enrichment progress, and current focus
+        </li>
+        <li>
+          <strong>Smarter injection</strong> — steeper recency decay and 21-day age gate eliminate stale context noise
         </li>
       </ul>
-      <a className="cite-link" href="https://github.com/ramakay/claude-self-reflect/releases/tag/v8.2.0" target="_blank" rel="noopener noreferrer">Full release notes →</a>
+      <a className="cite-link" href="https://github.com/ramakay/claude-self-reflect/releases/tag/v8.3.0" target="_blank" rel="noopener noreferrer">Full release notes →</a>
     </BentoCard>
   )
 }
