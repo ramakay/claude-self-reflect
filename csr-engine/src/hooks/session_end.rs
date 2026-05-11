@@ -12,7 +12,6 @@ use anyhow::Result;
 
 use super::HookInput;
 use crate::engine::Engine;
-use crate::mcp::tools;
 use crate::search::cross_project::resolve_project_from_cwd;
 
 /// Handle the session-end hook.
@@ -62,10 +61,14 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     write_session_summary(engine, input, cwd);
 
     // 5. TAD: Update session outcome — normal session end = "success"
+    //    Then compute retrieval stats rollup for outcome-scored injection (v9).
     if let Some(ref session_id) = input.session_id {
         let _ = engine
             .storage()
             .update_session_outcome(session_id, "success");
+        let _ = engine
+            .storage()
+            .update_retrieval_stats_for_session(session_id);
     }
 
     Ok(())
@@ -93,6 +96,7 @@ async fn try_v3_story_synthesis(engine: &Engine, conv_id: &str, project: &str) -
         None => return false,
     };
 
+    // Store with explicit story_id so enrichment link is correct (Codex M-5)
     let story_id = format!("story_{}", conv_id);
     let tags = vec![
         "session_story".to_string(),
@@ -100,17 +104,27 @@ async fn try_v3_story_synthesis(engine: &Engine, conv_id: &str, project: &str) -
         format!("conv_{}", conv_id),
     ];
 
-    if let Err(e) = tools::store_reflection(
-        engine.storage(),
-        engine.embeddings(),
-        engine.search(),
-        &story,
-        &tags,
-    )
-    .await
+    let emb = engine.embeddings().clone();
+    let story_for_embed = story.clone();
+    let embedding =
+        match tokio::task::spawn_blocking(move || emb.embed_single(&story_for_embed)).await {
+            Ok(Ok(v)) => v,
+            _ => {
+                eprintln!("CSR: V3 story embed failed (non-fatal)");
+                return false;
+            }
+        };
+
+    if let Err(e) = engine
+        .storage()
+        .insert_reflection(&story_id, &story, &tags, &embedding)
     {
         eprintln!("CSR: V3 story store failed (non-fatal): {}", e);
         return false;
+    }
+    {
+        let mut idx = engine.search().write().await;
+        idx.insert_reflection(story_id.clone(), embedding);
     }
 
     let _ = engine
@@ -174,8 +188,9 @@ async fn run_v3_extraction(engine: &Engine, transcript_path: &Path, cwd: &Path) 
             .get_enrichment_reflection_id(&conv_id, "heuristic")
         {
             let _ = engine.storage().delete_reflection(&old_id);
-            // Remove from search index too
-            // (insert_reflection with same slot handles dedup in HNSW)
+            // Remove from HNSW search index too (Codex M-6)
+            let mut idx = engine.search().write().await;
+            idx.remove_reflection(&old_id);
         }
 
         engine

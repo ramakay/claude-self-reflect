@@ -1,9 +1,12 @@
 //! Daemon module — background processing for progressive enrichment.
 //!
-//! Runs three background tasks:
+//! Runs four background tasks:
 //! 1. File watcher (existing) — auto-import new JSONL files
 //! 2. Extraction loop (Layer 2) — V3 extraction on imported conversations
 //! 3. Narrator loop (Layer 3) — AI batch narrative generation (if API key set)
+//! 4. Consolidation loop (Layer 4) — Dreamer v1 typed fact extraction from narratives
+
+pub mod consolidation;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -171,6 +174,18 @@ impl Daemon {
             None
         };
 
+        // Start consolidation loop (Layer 4 — Dreamer v1, always runs, free)
+        let consolidation_handle = {
+            let storage = self.storage.clone();
+            let embeddings = self.embeddings.clone();
+            let search = self.search.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                consolidation_loop(storage, embeddings, search, shutdown).await;
+            })
+        };
+        tracing::info!("consolidation loop started (Layer 4 — Dreamer v1)");
+
         // Wait for Ctrl+C
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down daemon gracefully");
@@ -184,6 +199,7 @@ impl Daemon {
         if let Some(h) = narrator_handle {
             let _ = tokio::time::timeout(timeout, h).await;
         }
+        let _ = tokio::time::timeout(timeout, consolidation_handle).await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
 
         // Flush HNSW index to disk before exit
@@ -415,9 +431,13 @@ async fn narrator_loop_inner(
             }
 
             // XML boundary tags separate system prompt from user data (D-4)
+            // Escape XML boundary tags in transcript to prevent prompt injection (Codex H-1)
+            let sanitized_summary = summary
+                .replace("</conversation_data>", "&lt;/conversation_data&gt;")
+                .replace("<conversation_data>", "&lt;conversation_data&gt;");
             let prompt = format!(
                 "{}\n\n---\n<conversation_data>\n{}\n</conversation_data>",
-                skill_prompt, summary
+                skill_prompt, sanitized_summary
             );
             requests.push(BatchRequest {
                 custom_id: conv_id.clone(),
@@ -429,16 +449,19 @@ async fn narrator_loop_inner(
             return Ok(());
         }
 
+        // Collect submitted IDs before requests is moved (Codex M-1)
+        let submitted_ids: Vec<String> = requests.iter().map(|r| r.custom_id.clone()).collect();
+
         // Submit batch
         let batch_id = client.create_batch(requests).await?;
         tracing::info!(batch_id = %batch_id, "batch submitted");
 
         // Store prompt hash for re-enrichment detection (D-11)
         let hash = prompt_hash(&skill_prompt);
-
-        // Mark conversations as processing
         for (conv_id, _) in &unenriched {
-            let _ = storage.set_batch_id(conv_id, &batch_id, &hash);
+            if submitted_ids.contains(conv_id) {
+                let _ = storage.set_batch_id(conv_id, &batch_id, &hash);
+            }
         }
 
         // Spawn batch polling as a separate task (D-7: non-blocking)
@@ -600,6 +623,100 @@ fn load_skill_prompt() -> String {
     }
 
     include_str!("../../data/SKILL_V2.md").to_string()
+}
+
+/// Layer 4 consolidation loop: extracts typed facts from V3/AI narratives (Dreamer v1).
+async fn consolidation_loop(
+    storage: Arc<Storage>,
+    embeddings: Arc<EmbeddingEngine>,
+    search: Arc<RwLock<SearchEngine>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    // Wait 120 seconds before first run — let extraction/narrator populate data first
+    let interval = tokio::time::Duration::from_secs(120);
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            tracing::info!("consolidation loop: shutdown signal received");
+            break;
+        }
+        if let Err(e) = run_consolidation(&storage, &embeddings, &search).await {
+            tracing::warn!(error = %e, "consolidation loop iteration failed (non-fatal)");
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Inner consolidation step: process unconsolidated conversations and store extracted facts.
+async fn run_consolidation(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+) -> Result<()> {
+    let unconsolidated = storage.get_unconsolidated_conversations(10)?;
+    if unconsolidated.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        count = unconsolidated.len(),
+        "consolidating conversations (Dreamer v1)"
+    );
+
+    for (conv_id, narrative_content) in &unconsolidated {
+        let facts = consolidation::extract_facts(narrative_content);
+        if facts.is_empty() {
+            // Mark as skipped (avoid reprocessing)
+            storage.mark_consolidated_skipped(conv_id)?;
+            continue;
+        }
+
+        // Look up project for cross-project scoping (Codex M-4)
+        let project_name = storage
+            .get_project_for_conversation(conv_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        // Store each fact as a tagged reflection with embedding (for HNSW search)
+        let mut stored_ids = Vec::new();
+        for (i, fact) in facts.iter().enumerate() {
+            let reflection_id = format!("fact_{}_{conv_id}_{i}", fact.fact_type);
+            let content = format!("[{}] {}", fact.fact_type, fact.content);
+            let mut tags = vec![
+                "consolidated_fact".to_string(),
+                format!("fact_type_{}", fact.fact_type),
+                format!("conv_{conv_id}"),
+            ];
+            if !project_name.is_empty() {
+                tags.push(format!("project_{project_name}"));
+            }
+
+            // Embed the fact content for searchability
+            let content_for_embed = content.clone();
+            let emb = embeddings.clone();
+            let embeddings_vec =
+                tokio::task::spawn_blocking(move || emb.embed(&[content_for_embed.as_str()]))
+                    .await??;
+
+            if let Some(embedding) = embeddings_vec.into_iter().next() {
+                storage.insert_reflection(&reflection_id, &content, &tags, &embedding)?;
+                let mut idx = search.write().await;
+                idx.insert_reflection(reflection_id.clone(), embedding);
+                stored_ids.push(reflection_id);
+            }
+        }
+
+        // Mark conversation as consolidated, linking to the first fact reflection
+        let link_id = stored_ids.first().cloned().unwrap_or_default();
+        storage.mark_consolidated(conv_id, &link_id)?;
+        tracing::debug!(
+            conv = %&conv_id[..8.min(conv_id.len())],
+            facts = facts.len(),
+            "Layer 4 consolidation complete"
+        );
+    }
+
+    Ok(())
 }
 
 /// Compute SHA-256 hash of prompt content (for re-enrichment detection).

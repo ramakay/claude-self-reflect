@@ -1113,6 +1113,7 @@ fn test_lapi_phase_aware_scoring() {
             error_patterns: vec![],
             tags: vec![],
             conversation_id: None,
+            memory_id: None,
         },
         RawResult {
             content: "session strategy for docker".into(),
@@ -1123,6 +1124,7 @@ fn test_lapi_phase_aware_scoring() {
             error_patterns: vec![],
             tags: vec!["outcome_completed".to_string()],
             conversation_id: None,
+            memory_id: None,
         },
     ];
 
@@ -1162,6 +1164,7 @@ fn test_lapi_stop_phase_prefers_anti_patterns() {
             error_patterns: vec![],
             tags: vec![],
             conversation_id: None,
+            memory_id: None,
         },
         RawResult {
             content: "failed approach for this problem".into(),
@@ -1172,6 +1175,7 @@ fn test_lapi_stop_phase_prefers_anti_patterns() {
             error_patterns: vec![],
             tags: vec![],
             conversation_id: None,
+            memory_id: None,
         },
     ];
 

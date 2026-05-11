@@ -19,7 +19,9 @@ impl Storage {
     /// Open (or create) the database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+        )?;
         migrations::run(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -233,6 +235,32 @@ impl Storage {
         queries::get_enrichment_reflection_id(&conn, conversation_id, enrichment_type)
     }
 
+    // ─── Consolidation queries (v9 Dreamer) ───
+
+    pub fn get_unconsolidated_conversations(&self, limit: usize) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_unconsolidated_conversations(&conn, limit)
+    }
+
+    pub fn mark_consolidated(&self, conversation_id: &str, reflection_id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_consolidated(&conn, conversation_id, reflection_id)
+    }
+
+    pub fn mark_consolidated_skipped(&self, conversation_id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_consolidated_skipped(&conn, conversation_id)
+    }
+
+    pub fn search_consolidated_facts(
+        &self,
+        project_name: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::search_consolidated_facts(&conn, project_name, limit)
+    }
+
     // ─── Story backfill queries ───
 
     pub fn get_conversations_missing_stories(&self) -> Result<Vec<(String, String, String)>> {
@@ -366,6 +394,21 @@ impl Storage {
         queries::get_retrieval_events_batch(&conn, memory_ids)
     }
 
+    // ─── Outcome scoring: retrieval stats ───
+
+    pub fn update_retrieval_stats_for_session(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::update_retrieval_stats_for_session(&conn, session_id)
+    }
+
+    pub fn get_outcome_stats_batch(
+        &self,
+        memory_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_outcome_stats_batch(&conn, memory_ids)
+    }
+
     // ─── Completion queries (v8.3.0) ───
 
     pub fn list_project_names(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
@@ -381,5 +424,57 @@ impl Storage {
     pub fn list_session_ids(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::list_session_ids(&conn, prefix, limit)
+    }
+
+    // ─── Code evolution queries (v9) ───
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_code_evolution(
+        &self,
+        session_id: &str,
+        project_name: &str,
+        file_path: &str,
+        language: &str,
+        tool_name: &str,
+        functions_added: &str,
+        functions_removed: &str,
+        types_added: &str,
+        types_removed: &str,
+        imports_added: &str,
+        imports_removed: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::insert_code_evolution(
+            &conn,
+            session_id,
+            project_name,
+            file_path,
+            language,
+            tool_name,
+            functions_added,
+            functions_removed,
+            types_added,
+            types_removed,
+            imports_added,
+            imports_removed,
+        )
+    }
+
+    pub fn get_recent_code_evolution(
+        &self,
+        file_path: &str,
+        project_name: &str,
+        limit: usize,
+    ) -> Result<Vec<queries::CodeEvolutionRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_recent_code_evolution(&conn, file_path, project_name, limit)
+    }
+
+    pub fn get_session_code_evolution(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<queries::SessionCodeEvolutionRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_session_code_evolution(&conn, session_id)
     }
 }
