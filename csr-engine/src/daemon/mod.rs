@@ -719,6 +719,59 @@ async fn run_consolidation(
     Ok(())
 }
 
+/// Spawn enrichment loops as background tokio tasks (for embedding in MCP server).
+/// Returns join handles that can be aborted on shutdown. Does NOT acquire the daemon lockfile
+/// (so the standalone `csr-engine daemon` can still run alongside if needed).
+pub fn spawn_enrichment_loops(
+    storage: Arc<Storage>,
+    embeddings: Arc<EmbeddingEngine>,
+    search: Arc<RwLock<SearchEngine>>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Layer 2: V3 extraction (free, runs every 60s — less aggressive than standalone daemon)
+    let ext_handle = {
+        let s = storage.clone();
+        let e = embeddings.clone();
+        let idx = search.clone();
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            extraction_loop(s, e, idx, 60, sd).await;
+        })
+    };
+
+    // Layer 3: AI narrative (only if API key set)
+    let narrator_handle = if AnthropicClient::from_env().is_some() {
+        let client = Arc::new(AnthropicClient::from_env().unwrap());
+        let s = storage.clone();
+        let e = embeddings.clone();
+        let idx = search.clone();
+        let sd = shutdown.clone();
+        Some(tokio::spawn(async move {
+            narrator_loop(s, e, idx, client, 10, 1800, 60, sd).await;
+        }))
+    } else {
+        None
+    };
+
+    // Layer 4: Dreamer consolidation (free, runs every 120s)
+    let consol_handle = {
+        let s = storage.clone();
+        let e = embeddings.clone();
+        let idx = search.clone();
+        let sd = shutdown;
+        tokio::spawn(async move {
+            consolidation_loop(s, e, idx, sd).await;
+        })
+    };
+
+    let mut handles = vec![ext_handle, consol_handle];
+    if let Some(h) = narrator_handle {
+        handles.push(h);
+    }
+    handles
+}
+
 /// Compute SHA-256 hash of prompt content (for re-enrichment detection).
 pub fn prompt_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
