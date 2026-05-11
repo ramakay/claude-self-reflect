@@ -19,19 +19,25 @@ pub fn extract_facts(narrative: &str) -> Vec<ConsolidatedFact> {
 
     for sentence in split_sentences(narrative) {
         let s = sentence.trim();
-        if s.len() < 10 {
+        if s.len() < 20 {
             continue;
-        } // Skip tiny fragments
+        } // Need enough substance to be a useful fact
+
+        // Skip V3 metadata noise — JSON blobs, signatures, field labels
+        if is_metadata_noise(s) {
+            continue;
+        }
+
         let lower = s.to_lowercase();
 
-        // Architectural decision detection
-        if lower.contains("decided")
-            || lower.contains("chose")
+        // Architectural decision detection — needs a subject doing the deciding
+        if (lower.contains("decided to")
+            || lower.contains("chose ")
             || lower.contains("switched to")
             || lower.contains("instead of")
             || lower.contains("migrated to")
-            || lower.contains("replaced")
-            || lower.contains("adopted")
+            || lower.contains("replaced ") && lower.contains(" with "))
+            || lower.contains("adopted ")
         {
             facts.push(ConsolidatedFact {
                 fact_type: "architectural_decision".into(),
@@ -41,14 +47,15 @@ pub fn extract_facts(narrative: &str) -> Vec<ConsolidatedFact> {
             continue;
         }
 
-        // Convention detection
-        if lower.contains("convention")
+        // Convention detection — tightened to require actionable phrasing
+        if lower.contains("convention:")
+            || lower.contains("convention established")
             || lower.contains("rule:")
-            || (lower.contains("must") && lower.contains("not"))
-            || (lower.contains("should") && lower.contains("not"))
-            || lower.contains("never ")
-            || lower.contains("always ")
-            || lower.contains("pattern:")
+            || (lower.contains("must") && lower.contains("not") && lower.len() > 30)
+            || (lower.contains("should") && lower.contains("not") && lower.len() > 30)
+            || (lower.contains("never ") && lower.contains(" when "))
+            || (lower.contains("always ") && lower.contains(" before "))
+            || (lower.contains("always ") && lower.contains(" after "))
             || lower.contains("standard:")
         {
             facts.push(ConsolidatedFact {
@@ -59,15 +66,16 @@ pub fn extract_facts(narrative: &str) -> Vec<ConsolidatedFact> {
             continue;
         }
 
-        // Bug pattern detection
-        if lower.contains("bug")
-            || lower.contains("recurring")
+        // Bug pattern detection — require enough context to be actionable
+        if (lower.contains("recurring")
+            && (lower.contains("bug") || lower.contains("error") || lower.contains("issue")))
             || lower.contains("keeps happening")
             || lower.contains("off-by-one")
-            || lower.contains("regression")
+            || (lower.contains("regression") && lower.len() > 30)
             || lower.contains("broke again")
-            || lower.contains("flaky")
+            || lower.contains("flaky test")
             || lower.contains("race condition")
+            || (lower.contains("error recovery") && lower.contains("handled") && lower.len() > 50)
         {
             facts.push(ConsolidatedFact {
                 fact_type: "bug_pattern".into(),
@@ -77,13 +85,10 @@ pub fn extract_facts(narrative: &str) -> Vec<ConsolidatedFact> {
             continue;
         }
 
-        // Preference detection
-        if lower.contains("prefer")
+        // Preference detection — user expressing a choice with reasoning
+        if (lower.contains("prefer") && (lower.contains("over") || lower.contains("instead")))
             || lower.contains("likes to")
-            || lower.contains("rather than")
-            || lower.contains("style:")
-            || lower.contains("favorite")
-            || lower.contains("approach:")
+            || (lower.contains("rather than") && lower.len() > 30)
         {
             facts.push(ConsolidatedFact {
                 fact_type: "preference".into(),
@@ -93,14 +98,67 @@ pub fn extract_facts(narrative: &str) -> Vec<ConsolidatedFact> {
         }
     }
 
-    // Dedup by content similarity (first 100 chars)
-    facts.dedup_by(|a, b| {
-        let a_prefix: String = a.content.chars().take(100).collect();
-        let b_prefix: String = b.content.chars().take(100).collect();
-        a_prefix == b_prefix
+    // Dedup using a set of prefixes (not just adjacent — catches non-adjacent duplicates)
+    let mut seen = std::collections::HashSet::new();
+    facts.retain(|f| {
+        let prefix: String = f.content.chars().take(80).collect();
+        seen.insert(prefix)
     });
 
     facts
+}
+
+/// Detect V3 metadata noise that should not become facts.
+fn is_metadata_noise(s: &str) -> bool {
+    let lower = s.to_lowercase();
+
+    // JSON-like content (signatures, structured data)
+    if s.contains('{') && s.contains('}') && (s.contains('"') || s.contains(':')) {
+        return true;
+    }
+
+    // V3 template field labels and structured output (anywhere in text, not just start)
+    if lower.contains("functions:")
+        || lower.contains("imports:")
+        || lower.contains("languages:")
+        || lower.contains("patterns:")
+        || lower.starts_with("pattern:")
+        || lower.starts_with("signature:")
+        || lower.starts_with("context:")
+        || lower.starts_with("status:")
+        || lower.starts_with("**context**")
+        || lower.starts_with("**error recovery**")
+        || lower.starts_with("modification:")
+        || lower.starts_with("expansion:")
+        || lower.starts_with("creation:")
+    {
+        return true;
+    }
+
+    // Comma-separated lists (function names, imports, file paths) — 3+ commas = list
+    let comma_count = s.chars().filter(|c| *c == ',').count();
+    if comma_count > 2 {
+        return true;
+    }
+
+    // Lines containing code-like content (import statements, file paths)
+    if lower.starts_with("import ") || lower.starts_with("from ") || lower.starts_with("use ") {
+        return true;
+    }
+
+    // Markdown headers and bullet-only lines
+    if s.starts_with('#') || (s.starts_with('-') && s.len() < 60) || s.starts_with("##") {
+        return true;
+    }
+
+    // Lines that are mostly field names (key: value pairs with short values)
+    let colon_count = s.chars().filter(|c| *c == ':').count();
+    let word_count = s.split_whitespace().count();
+    if colon_count > 0 && word_count < 6 {
+        return true;
+    }
+
+    false
 }
 
 /// Split text into sentences on `. `, `.\n`, or standalone `\n`.
@@ -209,12 +267,45 @@ mod tests {
 
     #[test]
     fn test_multiple_facts() {
-        let narrative = "User decided to use Redis for caching. Convention: all cache keys must be namespaced. Recurring regression in cache invalidation.";
+        let narrative = "User decided to use Redis for caching. Convention: all cache keys must be namespaced. Recurring regression in cache invalidation logic.";
         let facts = extract_facts(narrative);
         assert!(
             facts.len() >= 3,
             "should find 3+ facts, got {}: {:?}",
             facts.len(),
+            facts
+        );
+    }
+
+    #[test]
+    fn test_metadata_noise_filtered() {
+        // V3 signature JSON should not produce facts
+        let noise = r#"Signature: {"completion_status": "partial", "frameworks": ["nextjs"], "pattern_reusability": "medium"}"#;
+        let facts = extract_facts(noise);
+        assert!(
+            facts.is_empty(),
+            "JSON metadata should be filtered, got: {:?}",
+            facts
+        );
+
+        // Generic "Pattern:" label should not produce convention facts
+        let pattern_noise = "Pattern: New file creation\nPattern: Code expansion/feature addition";
+        let facts2 = extract_facts(pattern_noise);
+        assert!(
+            facts2.is_empty(),
+            "Pattern: labels should be filtered, got: {:?}",
+            facts2
+        );
+    }
+
+    #[test]
+    fn test_quality_over_quantity() {
+        // Short fragments below 20 chars should be skipped
+        let short = "Bug in auth. Fix it.";
+        let facts = extract_facts(short);
+        assert!(
+            facts.is_empty(),
+            "short fragments should be skipped, got: {:?}",
             facts
         );
     }
