@@ -17,83 +17,22 @@ pub struct ConsolidatedFact {
 pub fn extract_facts(narrative: &str) -> Vec<ConsolidatedFact> {
     let mut facts = Vec::new();
 
-    for sentence in split_sentences(narrative) {
-        let s = sentence.trim();
-        if s.len() < 20 {
+    for candidate in fact_candidates(narrative) {
+        let s = candidate.trim();
+        if word_count(s) < 4 {
             continue;
-        } // Need enough substance to be a useful fact
+        }
 
         // Skip V3 metadata noise — JSON blobs, signatures, field labels
         if is_metadata_noise(s) {
             continue;
         }
 
-        let lower = s.to_lowercase();
-
-        // Architectural decision detection — needs a subject doing the deciding
-        if (lower.contains("decided to")
-            || lower.contains("chose ")
-            || lower.contains("switched to")
-            || lower.contains("instead of")
-            || lower.contains("migrated to")
-            || lower.contains("replaced ") && lower.contains(" with "))
-            || lower.contains("adopted ")
-        {
+        if let Some((fact_type, confidence)) = classify_fact(s) {
             facts.push(ConsolidatedFact {
-                fact_type: "architectural_decision".into(),
+                fact_type: fact_type.into(),
                 content: s.to_string(),
-                confidence: 0.7,
-            });
-            continue;
-        }
-
-        // Convention detection — tightened to require actionable phrasing
-        if lower.contains("convention:")
-            || lower.contains("convention established")
-            || lower.contains("rule:")
-            || (lower.contains("must") && lower.contains("not") && lower.len() > 30)
-            || (lower.contains("should") && lower.contains("not") && lower.len() > 30)
-            || (lower.contains("never ") && lower.contains(" when "))
-            || (lower.contains("always ") && lower.contains(" before "))
-            || (lower.contains("always ") && lower.contains(" after "))
-            || lower.contains("standard:")
-        {
-            facts.push(ConsolidatedFact {
-                fact_type: "convention".into(),
-                content: s.to_string(),
-                confidence: 0.7,
-            });
-            continue;
-        }
-
-        // Bug pattern detection — require enough context to be actionable
-        if (lower.contains("recurring")
-            && (lower.contains("bug") || lower.contains("error") || lower.contains("issue")))
-            || lower.contains("keeps happening")
-            || lower.contains("off-by-one")
-            || (lower.contains("regression") && lower.len() > 30)
-            || lower.contains("broke again")
-            || lower.contains("flaky test")
-            || lower.contains("race condition")
-            || (lower.contains("error recovery") && lower.contains("handled") && lower.len() > 50)
-        {
-            facts.push(ConsolidatedFact {
-                fact_type: "bug_pattern".into(),
-                content: s.to_string(),
-                confidence: 0.6,
-            });
-            continue;
-        }
-
-        // Preference detection — user expressing a choice with reasoning
-        if (lower.contains("prefer") && (lower.contains("over") || lower.contains("instead")))
-            || lower.contains("likes to")
-            || (lower.contains("rather than") && lower.len() > 30)
-        {
-            facts.push(ConsolidatedFact {
-                fact_type: "preference".into(),
-                content: s.to_string(),
-                confidence: 0.5,
+                confidence,
             });
         }
     }
@@ -108,12 +47,179 @@ pub fn extract_facts(narrative: &str) -> Vec<ConsolidatedFact> {
     facts
 }
 
-/// Detect V3 metadata noise that should not become facts.
-fn is_metadata_noise(s: &str) -> bool {
+/// Extract sentence candidates only from prose-bearing parts of V3 narratives.
+fn fact_candidates(narrative: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut paragraph = String::new();
+    let mut in_code_context = false;
+
+    for raw_line in narrative.lines() {
+        let line = raw_line.trim();
+
+        if line == "---" {
+            flush_paragraph(&mut paragraph, &mut candidates);
+            break;
+        }
+
+        if line.starts_with("##") {
+            flush_paragraph(&mut paragraph, &mut candidates);
+            in_code_context = line.eq_ignore_ascii_case("## Code Context");
+            continue;
+        }
+
+        if in_code_context {
+            continue;
+        }
+
+        if line.is_empty() {
+            flush_paragraph(&mut paragraph, &mut candidates);
+            continue;
+        }
+
+        if is_structural_noise_line(line) {
+            flush_paragraph(&mut paragraph, &mut candidates);
+            continue;
+        }
+
+        let cleaned = clean_candidate_text(line);
+        if cleaned.is_empty() {
+            continue;
+        }
+
+        if !paragraph.is_empty() {
+            paragraph.push(' ');
+        }
+        paragraph.push_str(&cleaned);
+    }
+
+    flush_paragraph(&mut paragraph, &mut candidates);
+    candidates
+}
+
+fn flush_paragraph(paragraph: &mut String, candidates: &mut Vec<String>) {
+    if paragraph.trim().is_empty() {
+        paragraph.clear();
+        return;
+    }
+
+    let cleaned = clean_candidate_text(paragraph);
+    for sentence in split_sentences(&cleaned) {
+        let candidate = clean_candidate_text(sentence);
+        if !candidate.is_empty() {
+            candidates.push(candidate);
+        }
+    }
+    paragraph.clear();
+}
+
+fn clean_candidate_text(s: &str) -> String {
+    let mut text = s.trim().to_string();
+
+    loop {
+        let trimmed = text.trim_start();
+        let stripped = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("> "));
+        if let Some(rest) = stripped {
+            text = rest.trim_start().to_string();
+        } else {
+            text = trimmed.to_string();
+            break;
+        }
+    }
+
+    text = text
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .replace("\\n", " ")
+        .replace("\\\"", "\"");
+
+    collapse_whitespace(&text)
+}
+
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn classify_fact(s: &str) -> Option<(&'static str, f32)> {
     let lower = s.to_lowercase();
 
+    // Architectural decision detection — needs a subject doing the deciding
+    if contains_indicator(&lower, "decided to")
+        || contains_indicator(&lower, "chose")
+        || contains_indicator(&lower, "switched to")
+        || contains_indicator(&lower, "instead of")
+        || contains_indicator(&lower, "migrated to")
+        || (contains_indicator(&lower, "replaced") && contains_indicator(&lower, "with"))
+        || contains_indicator(&lower, "adopted")
+    {
+        return Some(("architectural_decision", 0.7));
+    }
+
+    // Convention detection — tightened to require actionable phrasing
+    if contains_indicator(&lower, "convention:")
+        || contains_indicator(&lower, "convention established")
+        || contains_indicator(&lower, "rule:")
+        || contains_indicator(&lower, "must not")
+        || contains_indicator(&lower, "should not")
+        || (contains_indicator(&lower, "never") && contains_indicator(&lower, "when"))
+        || (contains_indicator(&lower, "always") && contains_indicator(&lower, "before"))
+        || (contains_indicator(&lower, "always") && contains_indicator(&lower, "after"))
+        || contains_indicator(&lower, "standard:")
+    {
+        return Some(("convention", 0.7));
+    }
+
+    // Bug pattern detection — require enough context to be actionable
+    if (contains_indicator(&lower, "recurring")
+        && (contains_indicator(&lower, "bug")
+            || contains_indicator(&lower, "bugs")
+            || contains_indicator(&lower, "error")
+            || contains_indicator(&lower, "errors")
+            || contains_indicator(&lower, "issue")
+            || contains_indicator(&lower, "issues")))
+        || contains_indicator(&lower, "keeps happening")
+        || contains_indicator(&lower, "off-by-one")
+        || contains_indicator(&lower, "regression")
+        || contains_indicator(&lower, "broke again")
+        || contains_indicator(&lower, "flaky test")
+        || contains_indicator(&lower, "race condition")
+        || (contains_indicator(&lower, "error recovery")
+            && contains_indicator(&lower, "handled")
+            && word_count(s) >= 8)
+    {
+        return Some(("bug_pattern", 0.6));
+    }
+
+    // Preference detection — user expressing a choice with reasoning
+    if ((contains_indicator(&lower, "prefer")
+        || contains_indicator(&lower, "prefers")
+        || contains_indicator(&lower, "preferred"))
+        && (contains_indicator(&lower, "over") || contains_indicator(&lower, "instead")))
+        || contains_indicator(&lower, "likes to")
+        || contains_indicator(&lower, "rather than")
+    {
+        return Some(("preference", 0.5));
+    }
+
+    None
+}
+
+/// Detect V3 metadata noise that should not become facts.
+fn is_metadata_noise(s: &str) -> bool {
+    let trimmed = s.trim();
+    let lower = trimmed.to_lowercase();
+
+    if trimmed == "---" || trimmed.starts_with("##") || is_structural_noise_line(trimmed) {
+        return true;
+    }
+
     // JSON-like content (signatures, structured data)
-    if s.contains('{') && s.contains('}') && (s.contains('"') || s.contains(':')) {
+    if trimmed.contains('{')
+        && trimmed.contains('}')
+        && (trimmed.contains('"') || trimmed.contains(':'))
+    {
         return true;
     }
 
@@ -129,6 +235,7 @@ fn is_metadata_noise(s: &str) -> bool {
         || lower.starts_with("**context**")
         || lower.starts_with("**error recovery**")
         || lower.starts_with("modification:")
+        || lower.starts_with("deletion:")
         || lower.starts_with("expansion:")
         || lower.starts_with("creation:")
     {
@@ -136,7 +243,7 @@ fn is_metadata_noise(s: &str) -> bool {
     }
 
     // Comma-separated lists (function names, imports, file paths) — 3+ commas = list
-    let comma_count = s.chars().filter(|c| *c == ',').count();
+    let comma_count = trimmed.chars().filter(|c| *c == ',').count();
     if comma_count > 2 {
         return true;
     }
@@ -147,18 +254,55 @@ fn is_metadata_noise(s: &str) -> bool {
     }
 
     // Markdown headers and bullet-only lines
-    if s.starts_with('#') || (s.starts_with('-') && s.len() < 60) || s.starts_with("##") {
+    if trimmed.starts_with('#') || (trimmed.starts_with('-') && trimmed.len() < 60) {
         return true;
     }
 
     // Lines that are mostly field names (key: value pairs with short values)
-    let colon_count = s.chars().filter(|c| *c == ':').count();
-    let word_count = s.split_whitespace().count();
-    if colon_count > 0 && word_count < 6 {
+    let colon_count = trimmed.chars().filter(|c| *c == ':').count();
+    let words = word_count(trimmed);
+    if colon_count > 0 && words < 6 && !starts_with_fact_label(&lower) {
         return true;
     }
 
     false
+}
+
+fn is_structural_noise_line(line: &str) -> bool {
+    let lower = line.trim_start().to_lowercase();
+    lower.starts_with("pattern:")
+        || lower.starts_with("creation:")
+        || lower.starts_with("modification:")
+        || lower.starts_with("deletion:")
+        || lower.starts_with("expansion:")
+        || lower.starts_with("signature:")
+        || lower.starts_with("context:")
+        || lower.starts_with("status:")
+}
+
+fn starts_with_fact_label(lower: &str) -> bool {
+    lower.starts_with("convention:") || lower.starts_with("rule:") || lower.starts_with("standard:")
+}
+
+fn contains_indicator(lower: &str, indicator: &str) -> bool {
+    lower.match_indices(indicator).any(|(start, _)| {
+        let before = lower[..start].chars().next_back();
+        let after = lower[start + indicator.len()..].chars().next();
+        is_indicator_boundary(before) && is_indicator_boundary(after)
+    })
+}
+
+fn is_indicator_boundary(c: Option<char>) -> bool {
+    match c {
+        None => true,
+        Some(c) => !(c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '.' | '-')),
+    }
+}
+
+fn word_count(s: &str) -> usize {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .count()
 }
 
 /// Split text into sentences on `. `, `.\n`, or standalone `\n`.
@@ -299,8 +443,118 @@ mod tests {
     }
 
     #[test]
+    fn test_is_metadata_noise_real_v3_lines() {
+        assert!(is_metadata_noise(
+            "FUNCTIONS: cancel_task, cleanup_expired, complete, test_prompt_submit_prefers_semantic"
+        ));
+        assert!(is_metadata_noise(
+            "IMPORTS: import './globals.css';, import reportError from './error-boundary';"
+        ));
+        assert!(is_metadata_noise("LANGUAGES: TypeScript"));
+        assert!(is_metadata_noise("Pattern: New file creation"));
+        assert!(is_metadata_noise("creation: tasks.rs"));
+        assert!(is_metadata_noise("modification: mod.rs"));
+        assert!(is_metadata_noise("deletion: old_tasks.rs"));
+        assert!(is_metadata_noise(
+            r#"Signature: {"completion_status":"partial","frameworks":["nextjs"]}"#
+        ));
+    }
+
+    #[test]
+    fn test_complete_v3_code_context_does_not_extract_facts() {
+        let narrative = r#"
+## User Request
+"Run cleanup."
+
+## Solution Pattern
+creation: tasks.rs
+  New file creation
+modification: mod.rs
+
+## Code Context
+FUNCTIONS: cancel_task, cleanup_expired, complete, test_prompt_submit_prefers_semantic
+LANGUAGES: TypeScript
+IMPORTS: import './globals.css';, import reportError from './error-boundary';, import regression from './regression-helper';
+
+---
+Signature: {"completion_status":"partial","pattern_reusability":"medium"}
+"#;
+
+        let facts = extract_facts(narrative);
+        assert!(
+            facts.is_empty(),
+            "Code Context and signature metadata should not produce facts, got: {:?}",
+            facts
+        );
+    }
+
+    #[test]
+    fn test_function_names_with_prefer_do_not_create_preferences() {
+        let narrative =
+            "The test_prompt_submit_prefers_semantic helper changed over time in the test suite.";
+
+        let facts = extract_facts(narrative);
+        assert!(
+            !facts.iter().any(|f| f.fact_type == "preference"),
+            "embedded prefers in function names should not produce preference facts, got: {:?}",
+            facts
+        );
+    }
+
+    #[test]
+    fn test_import_paths_with_error_do_not_create_bug_patterns() {
+        let narrative =
+            "Import path './error-boundary' appeared during recurring cleanup work in the bundle.";
+
+        let facts = extract_facts(narrative);
+        assert!(
+            !facts.iter().any(|f| f.fact_type == "bug_pattern"),
+            "embedded error in import paths should not produce bug facts, got: {:?}",
+            facts
+        );
+    }
+
+    #[test]
+    fn test_genuine_prose_facts_still_extract_from_v3() {
+        let narrative = r#"
+## User Request
+"Convention established: handlers must not query the database directly. Recurring bug with off-by-one errors in pagination keeps happening."
+
+## Solution Pattern
+creation: storage.rs
+  We adopted a repository layer instead of direct SQL calls.
+
+## Code Context
+FUNCTIONS: test_prompt_submit_prefers_semantic, cleanup_expired, handle_error
+IMPORTS: import reportError from './error-boundary';
+
+---
+Signature: {"completion_status":"complete"}
+"#;
+
+        let facts = extract_facts(narrative);
+        assert!(
+            facts
+                .iter()
+                .any(|f| f.fact_type == "architectural_decision"),
+            "should detect architectural decision from prose, got: {:?}",
+            facts
+        );
+        assert!(
+            facts.iter().any(|f| f.fact_type == "convention"),
+            "should detect convention from prose, got: {:?}",
+            facts
+        );
+        assert!(
+            facts.iter().any(|f| f.fact_type == "bug_pattern"),
+            "should detect bug pattern from prose, got: {:?}",
+            facts
+        );
+    }
+
+    #[test]
     fn test_quality_over_quantity() {
-        // Short fragments below 20 chars should be skipped
+        // Short fragments below four words should be skipped
         let short = "Bug in auth. Fix it.";
         let facts = extract_facts(short);
         assert!(
