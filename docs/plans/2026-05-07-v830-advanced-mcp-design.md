@@ -73,7 +73,7 @@ Light implementation — confirmation flow only:
 
 Dual-transport architecture:
 
-```text
+```
 csr-engine              → stdio transport (default, for Claude Code)
 csr-engine serve        → HTTP transport on 127.0.0.1:3580 (for web clients)
 csr-engine serve --port → Custom port
