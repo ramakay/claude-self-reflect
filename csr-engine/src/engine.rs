@@ -436,8 +436,15 @@ impl Engine {
         watcher.spawn()
     }
 
-    /// Start the MCP server on stdio.
+    /// Start the MCP server on stdio with background enrichment loops.
     pub async fn serve_mcp(self) -> Result<()> {
+        // Spawn enrichment loops as background tasks (extraction, narrator, consolidation)
+        let enrichment_handles = crate::daemon::spawn_enrichment_loops(
+            self.storage.clone(),
+            self.embeddings.clone(),
+            self.search.clone(),
+        );
+
         let server = CsrServer::new(
             self.storage,
             self.embeddings,
@@ -447,6 +454,12 @@ impl Engine {
         );
         let service = server.serve(rmcp::transport::io::stdio()).await?;
         service.waiting().await?;
+
+        // Clean up enrichment loops on MCP server exit
+        for handle in enrichment_handles {
+            handle.abort();
+        }
+
         Ok(())
     }
 }

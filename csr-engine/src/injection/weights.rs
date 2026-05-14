@@ -74,6 +74,14 @@ pub fn compute_phase_boost(source: &str, tags: &[String], phase: HookPhase) -> f
             0.2
         }
         HookPhase::PromptSubmit => {
+            if source == "code_evolution" {
+                return 0.9; // v9: structural context is high-priority
+            }
+            if source == "consolidated_fact"
+                || tags.iter().any(|t| t.starts_with("consolidated_fact"))
+            {
+                return 0.85; // v9: conventions and decisions
+            }
             if source == "chunk" {
                 return 0.8;
             }

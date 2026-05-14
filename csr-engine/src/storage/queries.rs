@@ -1017,6 +1017,268 @@ pub fn list_file_paths(conn: &Connection, prefix: &str, limit: usize) -> Result<
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+// ─── Outcome scoring: retrieval stats rollup ───
+
+/// Compute retrieval stats rollup from events for a specific session.
+pub fn update_retrieval_stats_for_session(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO retrieval_stats (memory_id, success_count, failure_count, neutral_count, last_updated)
+         SELECT memory_id,
+                COALESCE(SUM(CASE WHEN session_outcome = 'success' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN session_outcome IN ('stuck', 'abandoned', 'failed') THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN session_outcome = 'neutral' THEN 1 ELSE 0 END), 0),
+                datetime('now')
+         FROM retrieval_events
+         WHERE memory_id IN (SELECT DISTINCT memory_id FROM retrieval_events WHERE session_id = ?1)
+         GROUP BY memory_id",
+        params![session_id],
+    )?;
+    Ok(())
+}
+
+/// Batch-fetch outcome stats for scoring. Returns HashMap<memory_id, (success_count, failure_count)>.
+/// Only returns entries with total events >= 3 (minimum signal gate).
+pub fn get_outcome_stats_batch(
+    conn: &Connection,
+    memory_ids: &[&str],
+) -> Result<HashMap<String, (i64, i64)>> {
+    let mut map = HashMap::new();
+    if memory_ids.is_empty() {
+        return Ok(map);
+    }
+    // Build IN clause
+    let placeholders: Vec<String> = memory_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect();
+    let sql = format!(
+        "SELECT memory_id, success_count, failure_count FROM retrieval_stats WHERE memory_id IN ({}) AND (success_count + failure_count) >= 3",
+        placeholders.join(",")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> = memory_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, s, f) = row?;
+        map.insert(id, (s, f));
+    }
+    Ok(map)
+}
+
+// ─── Code evolution queries (v9) ───
+
+/// A row from `get_recent_code_evolution`: (session_id, timestamp, functions_added, functions_removed, tool_name).
+pub type CodeEvolutionRow = (String, String, String, String, String);
+
+/// A row from `get_session_code_evolution`: (file_path, functions_added, functions_removed, types_added, types_removed, imports_added).
+pub type SessionCodeEvolutionRow = (String, String, String, String, String, String);
+
+/// Insert a code evolution record.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_code_evolution(
+    conn: &Connection,
+    session_id: &str,
+    project_name: &str,
+    file_path: &str,
+    language: &str,
+    tool_name: &str,
+    functions_added: &str,
+    functions_removed: &str,
+    types_added: &str,
+    types_removed: &str,
+    imports_added: &str,
+    imports_removed: &str,
+) -> Result<()> {
+    let id = format!(
+        "evo_{}_{}",
+        &uuid::Uuid::new_v4().to_string()[..8],
+        chrono::Utc::now().timestamp_millis()
+    );
+    conn.execute(
+        "INSERT INTO code_evolution (id, session_id, project_name, file_path, language, tool_name, functions_added, functions_removed, types_added, types_removed, imports_added, imports_removed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![id, session_id, project_name, file_path, language, tool_name, functions_added, functions_removed, types_added, types_removed, imports_added, imports_removed],
+    )?;
+    Ok(())
+}
+
+/// Get recent code evolution for a file (most recent N entries).
+/// Scoped by project_name to prevent cross-project leakage (Codex M-3).
+/// Returns (session_id, timestamp, functions_added, functions_removed, tool_name).
+pub fn get_recent_code_evolution(
+    conn: &Connection,
+    file_path: &str,
+    project_name: &str,
+    limit: usize,
+) -> Result<Vec<CodeEvolutionRow>> {
+    let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<CodeEvolutionRow> {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    };
+
+    if project_name.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, timestamp, functions_added, functions_removed, tool_name
+             FROM code_evolution WHERE file_path = ?1
+             ORDER BY timestamp DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![file_path, limit as i64], row_mapper)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, timestamp, functions_added, functions_removed, tool_name
+             FROM code_evolution WHERE file_path = ?1 AND project_name = ?2
+             ORDER BY timestamp DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![file_path, project_name, limit as i64], row_mapper)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
+
+/// Get code evolution summary across all files for a session.
+/// Returns (file_path, functions_added, functions_removed, types_added, types_removed, imports_added).
+pub fn get_session_code_evolution(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<SessionCodeEvolutionRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT file_path, functions_added, functions_removed, types_added, types_removed, imports_added
+         FROM code_evolution WHERE session_id = ?1
+         ORDER BY timestamp",
+    )?;
+    let rows = stmt.query_map(params![session_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+// ─── Consolidation queries (v9 Dreamer) ───
+
+/// Get conversations with V3 extraction or AI narrative but no consolidation.
+/// Returns (conversation_id, narrative_content) pairs for the Dreamer to process.
+pub fn get_unconsolidated_conversations(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<(String, String)>> {
+    // Find conversations that have completed V3 extraction or AI narrative
+    // but have no 'consolidated_fact' enrichment row yet.
+    // Prefer AI narrative (Layer 3) over V3 extraction (Layer 2) when both exist.
+    let mut stmt = conn.prepare(
+        "SELECT e.conversation_id, r.content
+         FROM enrichment_state e
+         INNER JOIN reflections r ON r.id = e.reflection_id
+         WHERE e.enrichment_type IN ('extracted_v3', 'ai_narrative')
+         AND e.status = 'completed'
+         AND e.conversation_id NOT IN (
+             SELECT conversation_id FROM enrichment_state
+             WHERE enrichment_type = 'consolidated_fact' AND status IN ('completed', 'skipped')
+         )
+         ORDER BY e.updated_at DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Mark a conversation as consolidated (with or without facts).
+pub fn mark_consolidated(
+    conn: &Connection,
+    conversation_id: &str,
+    reflection_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO enrichment_state (conversation_id, enrichment_type, status, reflection_id, updated_at)
+         VALUES (?1, 'consolidated_fact', 'completed', ?2, datetime('now'))
+         ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
+             status = 'completed', reflection_id = ?2, updated_at = datetime('now')",
+        params![conversation_id, reflection_id],
+    )?;
+    Ok(())
+}
+
+/// Mark a conversation as consolidated but skipped (no facts extracted).
+pub fn mark_consolidated_skipped(conn: &Connection, conversation_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO enrichment_state (conversation_id, enrichment_type, status, updated_at)
+         VALUES (?1, 'consolidated_fact', 'skipped', datetime('now'))
+         ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
+             status = 'skipped', updated_at = datetime('now')",
+        params![conversation_id],
+    )?;
+    Ok(())
+}
+
+/// Search consolidated facts by tag type, scoped by project (Codex M-4).
+/// Returns (content, fact_type). Filters by project_ tag to prevent cross-project leakage.
+pub fn search_consolidated_facts(
+    conn: &Connection,
+    project_name: &str,
+    limit: usize,
+) -> Result<Vec<(String, String)>> {
+    let extract_fact_type = |row: &rusqlite::Row| -> rusqlite::Result<(String, String)> {
+        let content: String = row.get(0)?;
+        let tags_str: String = row.get(1)?;
+        let fact_type = tags_str
+            .split("fact_type_")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or("unknown")
+            .to_string();
+        Ok((content, fact_type))
+    };
+
+    if project_name.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT content, tags FROM reflections
+             WHERE tags LIKE '%consolidated_fact%'
+             ORDER BY timestamp DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], extract_fact_type)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    } else {
+        // Filter by project_ tag embedded in the fact's tags array
+        let project_pattern = format!("%project_{}%", escape_like(project_name));
+        let mut stmt = conn.prepare(
+            "SELECT content, tags FROM reflections
+             WHERE tags LIKE '%consolidated_fact%'
+             AND tags LIKE ?1 ESCAPE '\\'
+             ORDER BY timestamp DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![project_pattern, limit as i64], extract_fact_type)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
+
 /// List distinct session IDs from iteration_learnings matching a prefix.
 /// Returns empty vec if the table doesn't exist (created on first stop hook).
 pub fn list_session_ids(conn: &Connection, prefix: &str, limit: usize) -> Result<Vec<String>> {

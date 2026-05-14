@@ -40,6 +40,29 @@ pub fn synthesize_story_from_v3(v3_content: &str, project: &str) -> Option<Strin
         }
     }
 
+    // Extract outcome from Signature section (after ---)
+    // Actual completion_status values: "success", "failed", "partial" (from signature.rs)
+    if let Some(sig_section) = extract_after_separator(v3_content, "---") {
+        if sig_section.contains("\"success\"") || sig_section.contains("\"complete\"") {
+            parts.push("Completed successfully".into());
+        } else if sig_section.contains("\"partial\"") {
+            parts.push("Partially completed".into());
+        } else if sig_section.contains("\"failed\"") {
+            parts.push("Failed — may need retry".into());
+        }
+        if sig_section.contains("\"error_recovery\":true") {
+            parts.push("Resolved errors during session".into());
+        }
+    }
+
+    // Extract active issues (unresolved)
+    if let Some(issues) = extract_section(v3_content, "## Active Issues") {
+        let issue_preview: String = issues.chars().take(100).collect();
+        if issue_preview.len() > 20 {
+            parts.push(format!("Unresolved: {}", issue_preview));
+        }
+    }
+
     if parts.is_empty() {
         // Fallback: try to extract anything meaningful from the raw content
         let first_line = v3_content
@@ -132,11 +155,28 @@ fn clean_request_text(raw: &str) -> String {
 }
 
 fn extract_files_from_solution(solution: &str) -> Vec<String> {
-    solution
-        .lines()
-        .filter(|l| l.starts_with("creation:") || l.starts_with("modification:"))
-        .filter_map(|l| l.split(':').nth(1).map(|f| f.trim().to_string()))
-        .collect()
+    // extract_section joins lines with spaces, so "modification: src/auth.rs" is intact
+    // but multi-line sections become one string. Find "TYPE: PATH" patterns.
+    let mut files = Vec::new();
+    for prefix in &["creation: ", "modification: "] {
+        let mut search_from = 0;
+        while let Some(pos) = solution[search_from..].find(prefix) {
+            let start = search_from + pos + prefix.len();
+            // Take the next whitespace-delimited token as the file path
+            let rest = &solution[start..];
+            let file: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+            if !file.is_empty() {
+                files.push(file);
+            }
+            search_from = start;
+        }
+    }
+    files
+}
+
+fn extract_after_separator(content: &str, sep: &str) -> Option<String> {
+    let pos = content.find(sep)?;
+    Some(content[pos + sep.len()..].to_string())
 }
 
 fn extract_heuristic_field<'a>(heuristic: &'a str, field: &str) -> Option<&'a str> {
@@ -192,6 +232,48 @@ mod tests {
         let heuristic = "[Heuristic] Project: test Messages: 10 Tools: Bash Had errors: yes";
         let story = synthesize_story_from_heuristic(heuristic, "test");
         assert!(story.contains("error investigation"));
+    }
+
+    #[test]
+    fn test_story_includes_outcome_and_error_recovery() {
+        let v3 = "## User Request\n\"Fix auth timeout bug\"\n\n## Solution Pattern\nmodification: src/auth.rs\n  In-place modification\n\n## Code Context\nLANGUAGES: Rust\n\n---\nSignature: {\"completion_status\":\"success\",\"error_recovery\":true}\nContext:\n## Error Recovery\n[Msg 5] Error: connection timeout\n  Fix: Increased timeout to 120s\n## Validation\n[Msg 10] Build: Success\n[Msg 12] Tests: Passed\n";
+        let story = synthesize_story_from_v3(v3, "myproj").unwrap();
+        assert!(
+            story.contains("auth") || story.contains("timeout"),
+            "should mention request: {}",
+            story
+        );
+        assert!(
+            story.contains("src/auth.rs"),
+            "should mention file: {}",
+            story
+        );
+        assert!(
+            story.contains("Completed successfully"),
+            "should include outcome: {}",
+            story
+        );
+        assert!(
+            story.contains("Resolved errors"),
+            "should mention error recovery: {}",
+            story
+        );
+    }
+
+    #[test]
+    fn test_story_includes_active_issues() {
+        let v3 = "## User Request\n\"Fix the bug\"\n\n## Active Issues\nTypeError: cannot read property 'id' of undefined in user.ts\n\n---\nSignature: {\"completion_status\":\"partial\"}\n";
+        let story = synthesize_story_from_v3(v3, "proj").unwrap();
+        assert!(
+            story.contains("Partially completed"),
+            "should show partial: {}",
+            story
+        );
+        assert!(
+            story.contains("Unresolved"),
+            "should mention active issues: {}",
+            story
+        );
     }
 
     #[test]

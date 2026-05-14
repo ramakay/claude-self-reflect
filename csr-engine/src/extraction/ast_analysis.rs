@@ -429,6 +429,122 @@ fn lang_display_name(lang: SupportLang) -> &'static str {
     }
 }
 
+// ─── AST Diffing (v9 code evolution tracking) ───
+
+/// Structural diff between two code versions.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AstDiff {
+    pub functions_added: Vec<String>,
+    pub functions_removed: Vec<String>,
+    pub types_added: Vec<String>,
+    pub types_removed: Vec<String>,
+    pub imports_added: Vec<String>,
+    pub imports_removed: Vec<String>,
+}
+
+impl AstDiff {
+    /// Returns true if nothing structural changed.
+    pub fn is_empty(&self) -> bool {
+        self.functions_added.is_empty()
+            && self.functions_removed.is_empty()
+            && self.types_added.is_empty()
+            && self.types_removed.is_empty()
+            && self.imports_added.is_empty()
+            && self.imports_removed.is_empty()
+    }
+}
+
+/// Compute structural diff between before and after code snippets.
+/// Uses the existing AST extraction to get symbols from each, then set-diffs.
+pub fn compute_ast_diff(before: &str, after: &str, language: &str) -> AstDiff {
+    let before_syms = std::panic::catch_unwind(|| extract_symbols_from_source(before, language))
+        .unwrap_or_default();
+    let after_syms = std::panic::catch_unwind(|| extract_symbols_from_source(after, language))
+        .unwrap_or_default();
+
+    AstDiff {
+        functions_added: set_diff(&after_syms.0, &before_syms.0),
+        functions_removed: set_diff(&before_syms.0, &after_syms.0),
+        types_added: set_diff(&after_syms.1, &before_syms.1),
+        types_removed: set_diff(&before_syms.1, &after_syms.1),
+        imports_added: set_diff(&after_syms.2, &before_syms.2),
+        imports_removed: set_diff(&before_syms.2, &after_syms.2),
+    }
+}
+
+/// Extract (functions, types, imports) from raw source code as BTreeSets.
+/// Reuses the existing `func_kinds`, `type_kinds`, `import_kinds`, and
+/// `extract_name_from_def` helpers already defined in this module.
+fn extract_symbols_from_source(
+    source: &str,
+    language: &str,
+) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+    let mut functions = BTreeSet::new();
+    let mut types = BTreeSet::new();
+    let mut imports = BTreeSet::new();
+
+    let lang = match language.to_lowercase().as_str() {
+        "rust" | "rs" => Some(SupportLang::Rust),
+        "python" | "py" => Some(SupportLang::Python),
+        "typescript" | "ts" | "tsx" => Some(SupportLang::TypeScript),
+        "javascript" | "js" | "jsx" => Some(SupportLang::JavaScript),
+        "go" => Some(SupportLang::Go),
+        _ => None,
+    };
+
+    let lang = match lang {
+        Some(l) => l,
+        None => return (functions, types, imports),
+    };
+
+    // Skip very short snippets (same threshold as analyze_code)
+    if source.len() < 10 {
+        return (functions, types, imports);
+    }
+
+    let grep = lang.ast_grep(source);
+    let root = grep.root();
+
+    // Extract functions using existing func_kinds helper
+    for kind in func_kinds(lang) {
+        let matcher = KindMatcher::new(kind, lang);
+        for node in root.find_all(&matcher) {
+            if let Some(name) = extract_name_from_def(&node, lang) {
+                functions.insert(name);
+            }
+        }
+    }
+
+    // Extract types using existing type_kinds helper
+    for kind in type_kinds(lang) {
+        let matcher = KindMatcher::new(kind, lang);
+        for node in root.find_all(&matcher) {
+            if let Some(name) = extract_name_from_def(&node, lang) {
+                types.insert(name);
+            }
+        }
+    }
+
+    // Extract imports using existing import_kinds helper
+    for kind in import_kinds(lang) {
+        let matcher = KindMatcher::new(kind, lang);
+        for node in root.find_all(&matcher) {
+            let text = node.text().to_string();
+            let truncated: String = text.chars().take(200).collect();
+            if !truncated.is_empty() {
+                imports.insert(truncated);
+            }
+        }
+    }
+
+    (functions, types, imports)
+}
+
+/// Set difference: elements in `a` but not in `b`.
+fn set_diff(a: &BTreeSet<String>, b: &BTreeSet<String>) -> Vec<String> {
+    a.difference(b).cloned().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,5 +817,106 @@ def dispatch_hook(name: str) -> None:
         // Over 10 chars is parsed
         let ctx = analyze_code("result = some_function(arg1, arg2)", SupportLang::Python);
         assert!(ctx.languages.contains("Python"));
+    }
+
+    // ─── AST diff tests ───
+
+    #[test]
+    fn test_ast_diff_detects_added_function() {
+        let before = "fn foo() {}";
+        let after = "fn foo() {}\nfn bar() {}";
+        let diff = compute_ast_diff(before, after, "rust");
+        assert!(
+            diff.functions_added.contains(&"bar".to_string()),
+            "should detect added function bar: {:?}",
+            diff.functions_added
+        );
+        assert!(
+            diff.functions_removed.is_empty(),
+            "nothing should be removed"
+        );
+    }
+
+    #[test]
+    fn test_ast_diff_detects_removed_function() {
+        let before = "fn foo() {}\nfn bar() {}";
+        let after = "fn foo() {}";
+        let diff = compute_ast_diff(before, after, "rust");
+        assert!(
+            diff.functions_removed.contains(&"bar".to_string()),
+            "should detect removed function bar: {:?}",
+            diff.functions_removed
+        );
+        assert!(diff.functions_added.is_empty(), "nothing should be added");
+    }
+
+    #[test]
+    fn test_ast_diff_empty_for_no_change() {
+        let code = "fn foo() {}";
+        let diff = compute_ast_diff(code, code, "rust");
+        assert!(diff.is_empty(), "no changes should produce empty diff");
+    }
+
+    #[test]
+    fn test_ast_diff_unknown_language() {
+        let diff = compute_ast_diff("foo", "bar", "unknown");
+        assert!(
+            diff.is_empty(),
+            "unknown language should produce empty diff"
+        );
+    }
+
+    #[test]
+    fn test_ast_diff_python() {
+        let before = "def foo():\n    pass";
+        let after = "def foo():\n    pass\ndef bar():\n    pass";
+        let diff = compute_ast_diff(before, after, "python");
+        assert!(
+            diff.functions_added.contains(&"bar".to_string()),
+            "should detect added Python function bar: {:?}",
+            diff.functions_added
+        );
+    }
+
+    #[test]
+    fn test_ast_diff_detects_type_changes() {
+        let before = "struct Foo {}";
+        let after = "struct Foo {}\nstruct Bar {}";
+        let diff = compute_ast_diff(before, after, "rust");
+        assert!(
+            diff.types_added.contains(&"Bar".to_string()),
+            "should detect added type Bar: {:?}",
+            diff.types_added
+        );
+    }
+
+    #[test]
+    fn test_ast_diff_detects_import_changes() {
+        let before = "use std::sync::Arc;";
+        let after = "use std::sync::Arc;\nuse std::sync::Mutex;";
+        let diff = compute_ast_diff(before, after, "rust");
+        assert!(
+            !diff.imports_added.is_empty(),
+            "should detect added import: {:?}",
+            diff.imports_added
+        );
+    }
+
+    #[test]
+    fn test_ast_diff_write_all_new() {
+        // Simulates a Write (before = empty, after = new file)
+        let before = "";
+        let after = "fn new_function() {}\nstruct NewType {}";
+        let diff = compute_ast_diff(before, after, "rust");
+        assert!(
+            diff.functions_added.contains(&"new_function".to_string()),
+            "should detect new_function: {:?}",
+            diff.functions_added
+        );
+        assert!(
+            diff.types_added.contains(&"NewType".to_string()),
+            "should detect NewType: {:?}",
+            diff.types_added
+        );
     }
 }

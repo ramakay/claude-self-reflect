@@ -16,6 +16,8 @@ pub struct ScoredResult {
     pub final_score: f32,
     pub source: String,
     pub signals: Vec<Signal>,
+    /// Stable storage ID for outcome tracking (carried from RawResult).
+    pub memory_id: Option<String>,
 }
 
 /// What contributed to a result's score.
@@ -45,6 +47,8 @@ pub struct RawResult {
     pub tags: Vec<String>,
     /// Conversation ID this result came from (for session continuity boost).
     pub conversation_id: Option<String>,
+    /// Stable storage ID (chunk_id or reflection_id) for outcome tracking.
+    pub memory_id: Option<String>,
 }
 
 /// Score and rank results for injection.
@@ -146,7 +150,21 @@ fn score_result(
         final_score,
         source: result.source,
         signals,
+        memory_id: result.memory_id,
     }
+}
+
+/// Post-scoring outcome multiplier (gated, bounded).
+/// Only applies when a memory has >= 3 non-neutral retrieval events.
+/// Positive outcomes boost score, negative outcomes penalize, bounded to +/-10%.
+pub fn apply_outcome_multiplier(base_score: f32, successes: i64, failures: i64) -> f32 {
+    let total = successes + failures;
+    if total < 3 {
+        return base_score; // Not enough signal — no change
+    }
+    let ratio = successes as f32 / total as f32; // 0.0 to 1.0
+    let delta = (ratio - 0.5) * 0.2; // -0.1 to +0.1
+    (base_score * (1.0 + delta)).clamp(0.05, 1.0)
 }
 
 /// Compute recency boost: 1.0 for today, decaying with age.
@@ -261,6 +279,7 @@ mod tests {
                 error_patterns: vec![],
                 tags: vec![],
                 conversation_id: None,
+                memory_id: None,
             },
             RawResult {
                 content: "low match".into(),
@@ -271,6 +290,7 @@ mod tests {
                 error_patterns: vec![],
                 tags: vec![],
                 conversation_id: None,
+                memory_id: None,
             },
         ];
 
@@ -296,6 +316,7 @@ mod tests {
                 error_patterns: vec![],
                 tags: vec![],
                 conversation_id: None,
+                memory_id: None,
             },
             RawResult {
                 content: "old".into(),
@@ -306,6 +327,7 @@ mod tests {
                 error_patterns: vec![],
                 tags: vec![],
                 conversation_id: None,
+                memory_id: None,
             },
         ];
 
@@ -329,6 +351,7 @@ mod tests {
                 error_patterns: vec![],
                 tags: vec![],
                 conversation_id: None,
+                memory_id: None,
             },
             RawResult {
                 content: "no overlap".into(),
@@ -339,6 +362,7 @@ mod tests {
                 error_patterns: vec![],
                 tags: vec![],
                 conversation_id: None,
+                memory_id: None,
             },
         ];
 
@@ -360,6 +384,7 @@ mod tests {
                 error_patterns: vec!["connection reset".into()],
                 tags: vec![],
                 conversation_id: None,
+                memory_id: None,
             },
             RawResult {
                 content: "no error match".into(),
@@ -370,6 +395,7 @@ mod tests {
                 error_patterns: vec!["out of memory".into()],
                 tags: vec![],
                 conversation_id: None,
+                memory_id: None,
             },
         ];
 
@@ -439,6 +465,7 @@ mod tests {
                 error_patterns: vec![],
                 tags: vec![],
                 conversation_id: Some("session-abc".into()),
+                memory_id: None,
             },
             RawResult {
                 content: "from older session".into(),
@@ -449,6 +476,7 @@ mod tests {
                 error_patterns: vec![],
                 tags: vec![],
                 conversation_id: Some("session-xyz".into()),
+                memory_id: None,
             },
         ];
 
@@ -470,6 +498,28 @@ mod tests {
     }
 
     #[test]
+    fn test_outcome_multiplier_boosts_successful_memories() {
+        let boosted = apply_outcome_multiplier(0.5, 5, 1);
+        assert!(boosted > 0.5, "score={boosted} should be > 0.5");
+        assert!(boosted < 0.7, "score={boosted} should be < 0.7");
+    }
+
+    #[test]
+    fn test_outcome_multiplier_penalizes_failed_memories() {
+        let penalized = apply_outcome_multiplier(0.5, 1, 5);
+        assert!(penalized < 0.5, "score={penalized} should be < 0.5");
+        assert!(penalized > 0.3, "score={penalized} should be > 0.3");
+    }
+
+    #[test]
+    fn test_outcome_multiplier_requires_minimum_events() {
+        let unchanged = apply_outcome_multiplier(0.5, 1, 0);
+        assert_eq!(unchanged, 0.5);
+        let unchanged2 = apply_outcome_multiplier(0.5, 2, 0);
+        assert_eq!(unchanged2, 0.5);
+    }
+
+    #[test]
     fn test_continuity_boost_no_match() {
         let results = vec![RawResult {
             content: "unrelated session".into(),
@@ -480,6 +530,7 @@ mod tests {
             error_patterns: vec![],
             tags: vec![],
             conversation_id: Some("session-xyz".into()),
+            memory_id: None,
         }];
 
         let scored = rank_results_with_continuity(results, &[], &[], None, Some("session-abc"));

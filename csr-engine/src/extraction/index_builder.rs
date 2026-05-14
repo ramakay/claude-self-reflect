@@ -26,28 +26,30 @@ pub fn build_search_index(
     let mut parts = Vec::new();
 
     // Extract user requests (exclude tool_result noise)
+    // Lowered threshold from 50→15 chars and increased limit from 2→4 to capture
+    // short precise prompts and later pivots that would otherwise disappear.
     let mut user_requests = Vec::new();
     for msg in messages {
         let msg_data = get_message_data(msg);
         if msg_data.get("role").and_then(|v| v.as_str()) != Some("user") {
             continue;
         }
-        let content = msg_data
-            .get("content")
-            .map(|v| serde_json::to_string(v).unwrap_or_default())
-            .unwrap_or_default();
-        if content.len() > 50
-            && !content.contains("tool_result")
-            && !content.contains("tool_use_id")
-            && !content.contains("<command-name>")
-            && !content.contains("Caveat:")
-            && !content.contains("<local-command")
+        let text = extract_user_text(&msg_data);
+        if text.len() < 15 {
+            continue;
+        }
+        if text.contains("tool_result")
+            || text.contains("tool_use_id")
+            || text.contains("<command-name>")
+            || text.contains("Caveat:")
+            || text.contains("<local-command")
         {
-            let truncated: String = content.chars().take(200).collect();
-            user_requests.push(truncated);
-            if user_requests.len() >= 2 {
-                break;
-            }
+            continue;
+        }
+        let truncated: String = text.chars().take(200).collect();
+        user_requests.push(truncated);
+        if user_requests.len() >= 4 {
+            break;
         }
     }
 
@@ -152,6 +154,19 @@ pub fn build_context_cache(
     parts.join("\n")
 }
 
+/// Extract user-visible text from a message, handling both string and array content formats.
+fn extract_user_text(msg_data: &Value) -> String {
+    match msg_data.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +220,56 @@ mod tests {
             "index should contain type name: {}",
             index
         );
+    }
+
+    #[test]
+    fn test_search_index_includes_short_user_requests() {
+        let messages = vec![
+            json!({"role": "user", "content": "fix the auth bug"}),
+            json!({"role": "assistant", "content": "Looking at auth..."}),
+            json!({"role": "user", "content": "also check the session timeout in Redis"}),
+        ];
+        let index = build_search_index(&messages, &[], &[], &CodeContext::default());
+        assert!(
+            index.contains("auth"),
+            "should include short request: {}",
+            index
+        );
+        assert!(
+            index.contains("session timeout") || index.contains("Redis"),
+            "should include second user request: {}",
+            index
+        );
+    }
+
+    #[test]
+    fn test_search_index_captures_up_to_four_requests() {
+        let messages = vec![
+            json!({"role": "user", "content": "first task: fix the login"}),
+            json!({"role": "user", "content": "second task: update the API"}),
+            json!({"role": "user", "content": "third task: add the tests"}),
+            json!({"role": "user", "content": "fourth task: deploy it"}),
+            json!({"role": "user", "content": "fifth task: should be excluded"}),
+        ];
+        let index = build_search_index(&messages, &[], &[], &CodeContext::default());
+        assert!(index.contains("first task"));
+        assert!(index.contains("fourth task"));
+        assert!(!index.contains("fifth task"));
+    }
+
+    #[test]
+    fn test_extract_user_text_string() {
+        let msg = json!({"role": "user", "content": "hello world"});
+        assert_eq!(super::extract_user_text(&msg), "hello world");
+    }
+
+    #[test]
+    fn test_extract_user_text_array() {
+        let msg = json!({"role": "user", "content": [
+            {"type": "text", "text": "fix the bug"},
+            {"type": "text", "text": "in auth.rs"}
+        ]});
+        assert_eq!(super::extract_user_text(&msg), "fix the bug in auth.rs");
     }
 
     #[test]

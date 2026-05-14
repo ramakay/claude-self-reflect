@@ -58,7 +58,7 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
 /// Maximum age (in minutes) to apply continuity boost.
 const CONTINUITY_THRESHOLD_MINUTES: i64 = 2880;
 
-async fn handle_inner(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<()> {
+async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
     // Extract prompt from input
     let prompt = match input.prompt.as_deref() {
         Some(p) if !p.is_empty() => p,
@@ -80,10 +80,16 @@ async fn handle_inner(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result
     let search = engine.search();
 
     // Detect session continuity: find the most recent session in this project
-    let continued_session_id = detect_continued_session_id(engine, _cwd);
+    let continued_session_id = detect_continued_session_id(engine, cwd);
+
+    // Resolve project early — used for all scoped searches including anti-patterns
+    let current_project =
+        crate::search::cross_project::resolve_project_from_cwd(&cwd.to_string_lossy())
+            .unwrap_or_default();
 
     // 1. Search for anti-patterns (highest priority)
     // Anti-patterns use a modified query ("failed approach don't retry: ...") so keep separate embedding.
+    // TODO: scope anti-patterns by project once outcome reflections carry project tags (Codex H-1)
     let anti_patterns =
         anti_pattern::find_anti_patterns(storage, embeddings, search, prompt, 0.5, 2).await;
 
@@ -97,21 +103,24 @@ async fn handle_inner(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result
         }
     };
 
-    // 2. Search chunks (past conversations) — reuse query_vec
-    let chunk_results = search_chunks_with_vec(engine, &query_vec, 5, 0.6).await;
+    // 2. Search chunks (past conversations) — scoped to current project
+    // Over-fetch to compensate for project filtering (Codex M-1 fix)
+    let chunk_results =
+        search_chunks_with_vec(engine, &query_vec, 15, 0.55, &current_project).await;
 
-    // 3. Search reflections (stored insights) — reuse query_vec
-    let reflection_results = search_reflections_with_vec(engine, &query_vec, 3, 0.5).await;
+    // 3. Search reflections (stored insights) — scoped to current project
+    let reflection_results =
+        search_reflections_with_vec(engine, &query_vec, 10, 0.45, &current_project).await;
 
     // 4. Combine and score results (with continuity boost for recent session)
-    let current_files: Vec<String> = Vec::new();
-    let current_errors: Vec<String> = Vec::new();
+    let current_files: Vec<String> = extract_file_paths_from_prompt(prompt);
+    let current_errors: Vec<String> = extract_error_patterns_from_prompt(prompt);
 
     let mut raw_results: Vec<RawResult> = Vec::new();
     raw_results.extend(chunk_results);
     raw_results.extend(reflection_results);
 
-    let scored = predictor::rank_results_with_continuity(
+    let mut scored = predictor::rank_results_with_continuity(
         raw_results,
         &current_files,
         &current_errors,
@@ -119,14 +128,72 @@ async fn handle_inner(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result
         continued_session_id.as_deref(),
     );
 
-    // 5. Build InjectionContext
+    // 4b. Apply outcome-scored multiplier (v9: learning from past injection effectiveness)
+    {
+        let memory_ids: Vec<&str> = scored
+            .iter()
+            .filter_map(|r| r.memory_id.as_deref())
+            .collect();
+        if let Ok(stats) = storage.get_outcome_stats_batch(&memory_ids) {
+            for result in &mut scored {
+                if let Some(ref mid) = result.memory_id {
+                    if let Some(&(successes, failures)) = stats.get(mid) {
+                        result.final_score = predictor::apply_outcome_multiplier(
+                            result.final_score,
+                            successes,
+                            failures,
+                        );
+                    }
+                }
+            }
+            // Re-sort after outcome adjustment
+            scored.sort_by(|a, b| {
+                b.final_score
+                    .partial_cmp(&a.final_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+    }
+
+    // 5. Session-aware review context (v9: code evolution + consolidated facts)
+    let mut review_items: Vec<InjectionItem> = Vec::new();
+
+    // 5a. Code evolution for files mentioned in prompt (scoped by project, Codex M-3)
+    for file in current_files.iter().take(3) {
+        if let Ok(evolutions) = storage.get_recent_code_evolution(file, &current_project, 3) {
+            if !evolutions.is_empty() {
+                let summary = format_evolution_summary(file, &evolutions);
+                review_items.push(InjectionItem {
+                    content: summary,
+                    score: 0.9,
+                    source: "code_evolution".into(),
+                });
+            }
+        }
+    }
+
+    // 5b. Consolidated facts (conventions, decisions) — scoped by project (Codex M-4)
+    if let Ok(facts) = storage.search_consolidated_facts(&current_project, 3) {
+        for (content, fact_type) in facts {
+            review_items.push(InjectionItem {
+                content: format!("[{}] {}", fact_type, content),
+                score: 0.85,
+                source: "consolidated_fact".into(),
+            });
+        }
+    }
+
+    // 6. Build InjectionContext
     let mut ctx = InjectionContext {
         anti_patterns,
+        relevant_context: review_items,
         ..Default::default()
     };
 
-    // Content-based dedup: skip items whose first 100 chars overlap with already-seen items
+    // Content-based dedup: skip items whose first 200 chars overlap with already-seen items
     let mut seen_prefixes: HashSet<String> = HashSet::new();
+    // Track which memory IDs were actually injected (for TAD logging accuracy)
+    let mut injected_memory_ids: Vec<(String, String)> = Vec::new(); // (id, source)
 
     // Distribute scored results into context categories.
     // Skip anti_patterns here — they're already loaded from find_anti_patterns() above.
@@ -146,6 +213,11 @@ async fn handle_inner(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result
         // Self-referential noise filter (Bug 4/5): skip content about CSR internals
         if is_self_referential_noise(&result.content) {
             continue;
+        }
+
+        // Track this item as actually injected
+        if let Some(ref id) = result.memory_id {
+            injected_memory_ids.push((id.clone(), result.source.clone()));
         }
 
         let item = InjectionItem {
@@ -168,18 +240,12 @@ async fn handle_inner(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result
         print!("{}", formatted);
     }
 
-    // TAD: Log retrieval events for adaptive decay tracking
+    // TAD: Log retrieval events only for actually-injected items (not filtered-out ones)
     if let Some(ref session_id) = input.session_id {
-        for result in scored.iter().take(5) {
-            let memory_id = format!("{:x}", {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                result.content.hash(&mut h);
-                h.finish()
-            });
+        for (memory_id, source) in &injected_memory_ids {
             let _ = engine.storage().log_retrieval_event(
-                &memory_id,
-                &result.source,
+                memory_id,
+                source,
                 "prompt_submit",
                 session_id,
             );
@@ -226,11 +292,13 @@ fn detect_continued_session_id(engine: &Engine, cwd: &Path) -> Option<String> {
 }
 
 /// Search chunks using a pre-computed embedding vector (P-1 optimization).
+/// Scoped to `project` — chunks from other projects are filtered out.
 async fn search_chunks_with_vec(
     engine: &Engine,
     query_vec: &[f32],
     limit: usize,
     min_score: f32,
+    project: &str,
 ) -> Vec<RawResult> {
     let search = engine.search();
     let storage = engine.storage();
@@ -245,6 +313,11 @@ async fn search_chunks_with_vec(
     for result in &results {
         if let Ok(chunks) = storage.get_chunks_by_ids(std::slice::from_ref(&result.id)) {
             if let Some(chunk) = chunks.into_iter().next() {
+                // Project scope filter: skip chunks from other projects
+                if !project.is_empty() && chunk.project_name != project {
+                    continue;
+                }
+
                 // Hard age gate: skip chunks older than MAX_CHUNK_AGE_DAYS
                 // Prevents stale conversations from winning on semantic similarity alone
                 if let Some(ts) = crate::temporal::parse_timestamp(&chunk.timestamp) {
@@ -264,6 +337,7 @@ async fn search_chunks_with_vec(
                     error_patterns: vec![],
                     tags: vec![],
                     conversation_id: Some(chunk.conversation_id),
+                    memory_id: Some(result.id.clone()),
                 });
             }
         }
@@ -273,11 +347,14 @@ async fn search_chunks_with_vec(
 }
 
 /// Search reflections using a pre-computed embedding vector (P-1 optimization).
+/// Scoped to `project` — reflections tagged for other projects are filtered out.
+/// Legacy reflections without project tags are allowed through.
 async fn search_reflections_with_vec(
     engine: &Engine,
     query_vec: &[f32],
     limit: usize,
     min_score: f32,
+    project: &str,
 ) -> Vec<RawResult> {
     let search = engine.search();
     let storage = engine.storage();
@@ -290,6 +367,16 @@ async fn search_reflections_with_vec(
     let mut raw_results = Vec::new();
     for result in &results {
         if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&result.id) {
+            // Project scope filter: skip reflections tagged for other projects.
+            // Legacy reflections without any project tag are allowed through.
+            if !project.is_empty() {
+                let project_tag = format!("project_{}", project);
+                let has_project_tags = tags.iter().any(|t| t.starts_with("project_"));
+                if has_project_tags && !tags.contains(&project_tag) {
+                    continue;
+                }
+            }
+
             let source = if tags
                 .iter()
                 .any(|t| t == "outcome_incomplete" || t == "outcome_abandoned")
@@ -307,6 +394,7 @@ async fn search_reflections_with_vec(
                 error_patterns: extract_error_patterns(&content),
                 tags,
                 conversation_id: None,
+                memory_id: Some(result.id.clone()),
             });
         }
     }
@@ -337,6 +425,40 @@ fn extract_file_paths(content: &str) -> Vec<String> {
     files
 }
 
+/// Format code evolution records into a concise review context string.
+fn format_evolution_summary(
+    file: &str,
+    evolutions: &[crate::storage::queries::CodeEvolutionRow],
+) -> String {
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    for (_, _, fa, fr, _) in evolutions {
+        if let Ok(fns) = serde_json::from_str::<Vec<String>>(fa) {
+            added.extend(fns);
+        }
+        if let Ok(fns) = serde_json::from_str::<Vec<String>>(fr) {
+            removed.extend(fns);
+        }
+    }
+    added.sort();
+    added.dedup();
+    removed.sort();
+    removed.dedup();
+
+    let mut parts = vec![format!("{}: ", file)];
+    if !added.is_empty() {
+        parts.push(format!("+{} fns ({})", added.len(), added.join(", ")));
+    }
+    if !removed.is_empty() {
+        if !added.is_empty() {
+            parts.push(", ".into());
+        }
+        parts.push(format!("-{} fns ({})", removed.len(), removed.join(", ")));
+    }
+    parts.push(format!(" across {} edits", evolutions.len()));
+    parts.concat()
+}
+
 /// Extract error-like patterns from content.
 fn extract_error_patterns(content: &str) -> Vec<String> {
     let mut patterns = Vec::new();
@@ -348,6 +470,51 @@ fn extract_error_patterns(content: &str) -> Vec<String> {
             || trimmed.starts_with("error:")
             || trimmed.starts_with("panicked at")
             || trimmed.contains("FAILED")
+        {
+            patterns.push(trimmed.to_string());
+        }
+    }
+    patterns
+}
+
+/// Extract file paths from the user's prompt text.
+/// Looks for path-like tokens with common code extensions.
+fn extract_file_paths_from_prompt(prompt: &str) -> Vec<String> {
+    let extensions = [
+        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".toml", ".json", ".yaml", ".yml", ".md",
+        ".css", ".html", ".go", ".java", ".c", ".h", ".cpp",
+    ];
+    let mut files = Vec::new();
+    for word in prompt.split_whitespace() {
+        // Strip common surrounding punctuation (quotes, backticks, parens)
+        let cleaned = word.trim_matches(|c: char| {
+            c == '`' || c == '"' || c == '\'' || c == '(' || c == ')' || c == ','
+        });
+        if cleaned.contains('/') || cleaned.contains('.') {
+            for ext in &extensions {
+                if cleaned.ends_with(ext) {
+                    files.push(cleaned.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    files.dedup();
+    files
+}
+
+/// Extract error-like patterns from the user's prompt text.
+fn extract_error_patterns_from_prompt(prompt: &str) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Error:")
+            || trimmed.starts_with("error[")
+            || trimmed.starts_with("error:")
+            || trimmed.starts_with("panicked at")
+            || trimmed.contains("FAILED")
+            || trimmed.contains("cannot find")
+            || trimmed.contains("not found")
         {
             patterns.push(trimmed.to_string());
         }
@@ -476,6 +643,26 @@ mod tests {
             "Test in hooks_integration module"
         ));
         assert!(is_self_referential_noise("proves the hook works correctly"));
+    }
+
+    #[test]
+    fn test_project_scope_reflection_filter_logic() {
+        // Reflections tagged for a different project should be filtered
+        let tags_other = vec!["project_anukriti".to_string(), "session_story".to_string()];
+        let project = "csr";
+        let project_tag = format!("project_{}", project);
+        let has_project_tags = tags_other.iter().any(|t| t.starts_with("project_"));
+        assert!(has_project_tags && !tags_other.contains(&project_tag));
+
+        // Legacy reflections without project tags should pass through
+        let tags_legacy = vec!["session_story".to_string()];
+        let has_project_tags_legacy = tags_legacy.iter().any(|t| t.starts_with("project_"));
+        assert!(!has_project_tags_legacy); // no filter applied
+
+        // Same-project reflections should pass
+        let tags_same = vec!["project_csr".to_string(), "session_story".to_string()];
+        let has_project_tags_same = tags_same.iter().any(|t| t.starts_with("project_"));
+        assert!(has_project_tags_same && tags_same.contains(&project_tag));
     }
 
     #[test]

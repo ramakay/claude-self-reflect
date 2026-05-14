@@ -91,6 +91,62 @@ pub fn run(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // Outcome scoring: retrieval stats rollup (v9)
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS retrieval_stats (
+            memory_id TEXT PRIMARY KEY,
+            success_count INTEGER DEFAULT 0,
+            failure_count INTEGER DEFAULT 0,
+            neutral_count INTEGER DEFAULT 0,
+            last_updated TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_retrieval_stats_updated
+            ON retrieval_stats(last_updated DESC);
+        ",
+    )?;
+
+    // Code evolution tracking (v9)
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS code_evolution (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            project_name TEXT DEFAULT '',
+            file_path TEXT NOT NULL,
+            language TEXT DEFAULT '',
+            timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+            tool_name TEXT DEFAULT '',
+            functions_added TEXT DEFAULT '[]',
+            functions_removed TEXT DEFAULT '[]',
+            types_added TEXT DEFAULT '[]',
+            types_removed TEXT DEFAULT '[]',
+            imports_added TEXT DEFAULT '[]',
+            imports_removed TEXT DEFAULT '[]'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_code_evolution_file ON code_evolution(file_path);
+        CREATE INDEX IF NOT EXISTS idx_code_evolution_session ON code_evolution(session_id, timestamp);
+        ",
+    )?;
+
+    // Migration: add project_name to code_evolution if missing (v9 cross-project fix)
+    {
+        let has_project_col: bool = conn
+            .prepare("SELECT project_name FROM code_evolution LIMIT 0")
+            .is_ok();
+        if !has_project_col {
+            let _ = conn.execute_batch(
+                "ALTER TABLE code_evolution ADD COLUMN project_name TEXT DEFAULT '';",
+            );
+        }
+        // Always try to create the index (safe with IF NOT EXISTS)
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_code_evolution_project ON code_evolution(project_name, file_path);",
+        );
+    }
+
     // Migration: add conversation_id to import_state if missing (for existing DBs)
     let has_conv_col: bool = conn
         .prepare("SELECT conversation_id FROM import_state LIMIT 0")

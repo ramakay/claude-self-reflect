@@ -521,6 +521,7 @@ fn test_predictor_semantic_only() {
             error_patterns: vec![],
             tags: vec![],
             conversation_id: None,
+            memory_id: None,
         },
         RawResult {
             content: "low".into(),
@@ -531,6 +532,7 @@ fn test_predictor_semantic_only() {
             error_patterns: vec![],
             tags: vec![],
             conversation_id: None,
+            memory_id: None,
         },
     ];
 
@@ -557,6 +559,7 @@ fn test_predictor_recency_boost() {
             error_patterns: vec![],
             tags: vec![],
             conversation_id: None,
+            memory_id: None,
         },
         RawResult {
             content: "old".into(),
@@ -567,6 +570,7 @@ fn test_predictor_recency_boost() {
             error_patterns: vec![],
             tags: vec![],
             conversation_id: None,
+            memory_id: None,
         },
     ];
 
@@ -588,6 +592,7 @@ fn test_predictor_file_overlap() {
             error_patterns: vec![],
             tags: vec![],
             conversation_id: None,
+            memory_id: None,
         },
         RawResult {
             content: "no overlap".into(),
@@ -598,6 +603,7 @@ fn test_predictor_file_overlap() {
             error_patterns: vec![],
             tags: vec![],
             conversation_id: None,
+            memory_id: None,
         },
     ];
 
@@ -619,6 +625,7 @@ fn test_predictor_cross_project() {
         error_patterns: vec![],
         tags: vec![],
         conversation_id: None,
+        memory_id: None,
     }];
 
     let scored = predictor::rank_results(results, &[], &[], None);
