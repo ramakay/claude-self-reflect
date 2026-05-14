@@ -59,11 +59,23 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         .storage()
         .get_reflections_by_tag(&story_tag, 10)
         .unwrap_or_default();
-    // Exact-match both tags to prevent prefix-project leaks and non-story results
+    // Exact-match both tags to prevent prefix-project leaks and non-story results.
+    // Skip the story for the continued session to prevent duplicate injection.
+    let continued_conv_tag = continued_session
+        .as_ref()
+        .map(|c| format!("conv_{}", c.conversation_id));
     let project_stories: Vec<_> = project_stories_owned
         .iter()
         .filter(|(_, _, tags, _)| {
             tags.iter().any(|t| t == "session_story") && tags.iter().any(|t| t == &story_tag)
+        })
+        .filter(|(_, _, tags, _)| {
+            // Deduplicate: skip story for session already shown in CONTINUED FROM
+            if let Some(ref cont_tag) = continued_conv_tag {
+                !tags.iter().any(|t| t == cont_tag)
+            } else {
+                true
+            }
         })
         .take(3)
         .collect();

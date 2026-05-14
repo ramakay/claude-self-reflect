@@ -294,25 +294,68 @@ async fn process_v3_extraction(
             result.search_index, sig_json, result.context_cache
         );
 
+        // Add project tag so project-scoped search can filter (Codex H-2 fix)
+        let project = storage
+            .get_project_for_conversation(conv_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string());
         let tags = vec![
             "narrative_extracted_v3".to_string(),
             format!("conv_{conv_id}"),
             format!("status_{}", result.signature.completion_status),
+            format!("project_{}", project),
         ];
 
         // Store the V3 reflection
         storage.insert_reflection(&reflection_id, &content, &tags, &embedding)?;
-        let mut idx = search.write().await;
-        idx.insert_reflection(reflection_id.clone(), embedding);
+        {
+            let mut idx = search.write().await;
+            idx.insert_reflection(reflection_id.clone(), embedding);
 
-        // Supersede Layer 1: delete heuristic reflection if it exists
-        if let Ok(Some(old_id)) = storage.get_enrichment_reflection_id(conv_id, "heuristic") {
-            let _ = storage.delete_reflection(&old_id);
-            idx.remove_reflection(&old_id);
-        }
+            // Supersede Layer 1: delete heuristic reflection if it exists
+            if let Ok(Some(old_id)) = storage.get_enrichment_reflection_id(conv_id, "heuristic") {
+                let _ = storage.delete_reflection(&old_id);
+                idx.remove_reflection(&old_id);
+            }
+        } // Write lock released before context_cache embed
 
         storage.mark_enrichment_completed(conv_id, "extracted_v3", &reflection_id)?;
         tracing::debug!(conv = %conv_id, "Layer 2 V3 extraction complete (supersedes Layer 1)");
+
+        // Persist context_cache as linked reflection for error recovery retrieval
+        if !result.context_cache.trim().is_empty() {
+            let cache_id = format!("v3_cache_{}", conv_id);
+            let project = storage
+                .get_project_for_conversation(conv_id)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "unknown".to_string());
+            let cache_tags = vec![
+                "context_cache".to_string(),
+                "error_recovery".to_string(),
+                format!("conv_{}", conv_id),
+                format!("project_{}", project),
+            ];
+            let cache_emb = embeddings.clone();
+            let cache_text = result.context_cache.clone();
+            if let Ok(Ok(cache_embedding)) =
+                tokio::task::spawn_blocking(move || cache_emb.embed(&[cache_text.as_str()])).await
+            {
+                if let Some(cache_vec) = cache_embedding.into_iter().next() {
+                    let _ = storage.insert_reflection(
+                        &cache_id,
+                        &result.context_cache,
+                        &cache_tags,
+                        &cache_vec,
+                    );
+                    {
+                        let mut idx = search.write().await;
+                        idx.insert_reflection(cache_id, cache_vec);
+                    }
+                }
+            }
+        }
     }
 
     Ok(())

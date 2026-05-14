@@ -168,13 +168,20 @@ async fn run_v3_extraction(engine: &Engine, transcript_path: &Path, cwd: &Path) 
         return Ok(());
     }
 
-    // Store search index as reflection (supersedes heuristic)
+    // Store rich V3 content: search_index + signature + context_cache
+    // (same format as daemon, so story synthesis can see Signature for outcome extraction)
     let reflection_id = format!("v3_{}", conv_id);
     let tags = vec![
         "narrative_v3".to_string(),
         format!("conv_{}", conv_id),
         format!("project_{}", project),
     ];
+
+    let sig_json = serde_json::to_string(&result.signature).unwrap_or_default();
+    let rich_content = format!(
+        "{}\n\n---\nSignature: {}\nContext:\n{}",
+        result.search_index, sig_json, result.context_cache
+    );
 
     let emb = engine.embeddings().clone();
     let search_idx = result.search_index.clone();
@@ -195,9 +202,11 @@ async fn run_v3_extraction(engine: &Engine, transcript_path: &Path, cwd: &Path) 
 
         engine
             .storage()
-            .insert_reflection(&reflection_id, &result.search_index, &tags, &vec)?;
-        let mut idx = engine.search().write().await;
-        idx.insert_reflection(reflection_id.clone(), vec);
+            .insert_reflection(&reflection_id, &rich_content, &tags, &vec)?;
+        {
+            let mut idx = engine.search().write().await;
+            idx.insert_reflection(reflection_id.clone(), vec);
+        } // Write lock released before context_cache embed
         engine
             .storage()
             .mark_enrichment_completed(&conv_id, "extracted_v3", &reflection_id)?;
@@ -208,6 +217,36 @@ async fn run_v3_extraction(engine: &Engine, transcript_path: &Path, cwd: &Path) 
             result.stats.patterns_found,
             result.stats.errors_found,
         );
+
+        // Persist context_cache as linked reflection for error recovery retrieval.
+        // This is CSR's competitive edge: debugging solutions become searchable.
+        if !result.context_cache.trim().is_empty() {
+            let cache_id = format!("v3_cache_{}", conv_id);
+            let cache_tags = vec![
+                "context_cache".to_string(),
+                "error_recovery".to_string(),
+                format!("conv_{}", conv_id),
+                format!("project_{}", project),
+            ];
+            let cache_emb = engine.embeddings().clone();
+            let cache_text = result.context_cache.clone();
+            if let Ok(Ok(cache_embedding)) =
+                tokio::task::spawn_blocking(move || cache_emb.embed(&[cache_text.as_str()])).await
+            {
+                if let Some(cache_vec) = cache_embedding.into_iter().next() {
+                    let _ = engine.storage().insert_reflection(
+                        &cache_id,
+                        &result.context_cache,
+                        &cache_tags,
+                        &cache_vec,
+                    );
+                    {
+                        let mut idx = engine.search().write().await;
+                        idx.insert_reflection(cache_id, cache_vec);
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
