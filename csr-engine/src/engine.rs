@@ -178,6 +178,9 @@ impl Engine {
             search
         };
 
+        // Clean stale numbered HNSW files from previous sessions (crash resilience)
+        crate::search::cleanup_stale_index_files(&index_dir);
+
         Ok(Self {
             storage,
             embeddings,
