@@ -314,17 +314,24 @@ impl SearchEngine {
             .lock_exclusive()
             .map_err(|e| anyhow::anyhow!("failed to acquire index lock for dump: {}", e))?;
 
-        // Dump HNSW graph + data files (skip empty indices — file_dump fails on empty)
+        // Dump HNSW graph + data files (skip empty indices — file_dump fails on empty).
+        // hnsw_rs may return a numbered basename (e.g. "chunks-7905") when mmap is active
+        // (after load_from_disk). We promote it to the canonical name so load_from_disk
+        // always finds "chunks.hnsw.data" / "reflections.hnsw.data".
         if !self.chunk_id_map.is_empty() {
-            self.chunk_index
+            let basename = self
+                .chunk_index
                 .file_dump(dir, "chunks")
                 .map_err(|e| anyhow::anyhow!("chunk index dump failed: {}", e))?;
+            promote_to_canonical(dir, &basename, "chunks");
         }
 
         if !self.reflection_id_map.is_empty() {
-            self.reflection_index
+            let basename = self
+                .reflection_index
                 .file_dump(dir, "reflections")
                 .map_err(|e| anyhow::anyhow!("reflection index dump failed: {}", e))?;
+            promote_to_canonical(dir, &basename, "reflections");
         }
 
         // Write manifest atomically (tmp + rename)
@@ -343,6 +350,11 @@ impl SearchEngine {
         let final_path = dir.join("manifest.json");
         std::fs::write(&tmp_path, &manifest_json)?;
         std::fs::rename(&tmp_path, &final_path)?;
+
+        // Clean stale numbered HNSW files from previous dumps.
+        // hnsw_rs creates numbered files (e.g. chunks-7905.hnsw.data) when mmap is active
+        // on the old files (after load_from_disk). These are orphaned after each new dump.
+        cleanup_stale_index_files(dir);
 
         // Lock is released when lock_file is dropped
         self.dirty = false;
@@ -476,5 +488,141 @@ impl SearchEngine {
             active_reflection_count: active_count,
             dirty: false,
         })
+    }
+}
+
+/// If `file_dump` returned a numbered basename (e.g. "chunks-7905"), rename its files
+/// to the canonical name (e.g. "chunks.hnsw.data") so `load_from_disk` can find them.
+/// This happens when the Hnsw was loaded via `load_hnsw` (mmap active → `overwrite=false`).
+fn promote_to_canonical(dir: &Path, returned_basename: &str, canonical: &str) {
+    if returned_basename == canonical {
+        return; // Already canonical, nothing to do
+    }
+    for ext in &[".hnsw.data", ".hnsw.graph"] {
+        let src = dir.join(format!("{}{}", returned_basename, ext));
+        let dst = dir.join(format!("{}{}", canonical, ext));
+        if src.exists() {
+            let _ = std::fs::rename(&src, &dst);
+        }
+    }
+}
+
+/// Remove stale numbered HNSW files from the index directory.
+/// hnsw_rs creates numbered files (e.g. `chunks-7905.hnsw.data`) when mmap is active.
+/// After `dump_to_disk` promotes them to canonical names, the numbered copies are gone.
+/// This function catches any stragglers from crashes, concurrent processes, or old sessions.
+///
+/// Called after every `dump_to_disk` and at engine startup.
+/// Must be called while holding `index.lock` (dump_to_disk) or at startup before serving.
+pub fn cleanup_stale_index_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Match pattern: chunks-NNN.hnsw.data/graph or reflections-NNN.hnsw.data/graph
+        // Keep: chunks.hnsw.data, reflections.hnsw.graph, manifest.json, index.lock
+        if (name.starts_with("chunks-") || name.starts_with("reflections-"))
+            && (name.ends_with(".hnsw.data") || name.ends_with(".hnsw.graph"))
+        {
+            let _ = std::fs::remove_file(entry.path());
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "cleaned stale numbered HNSW files");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cleanup_removes_numbered_keeps_base() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create stale numbered files
+        std::fs::write(dir.join("chunks-100.hnsw.data"), "old").unwrap();
+        std::fs::write(dir.join("chunks-100.hnsw.graph"), "old").unwrap();
+        std::fs::write(dir.join("chunks-200.hnsw.data"), "old").unwrap();
+        std::fs::write(dir.join("reflections-50.hnsw.data"), "old").unwrap();
+        std::fs::write(dir.join("reflections-50.hnsw.graph"), "old").unwrap();
+
+        // Create base files that should be kept
+        std::fs::write(dir.join("chunks.hnsw.data"), "current").unwrap();
+        std::fs::write(dir.join("chunks.hnsw.graph"), "current").unwrap();
+        std::fs::write(dir.join("reflections.hnsw.data"), "current").unwrap();
+        std::fs::write(dir.join("reflections.hnsw.graph"), "current").unwrap();
+        std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+        std::fs::write(dir.join("index.lock"), "").unwrap();
+
+        cleanup_stale_index_files(dir);
+
+        // Numbered files should be gone
+        assert!(!dir.join("chunks-100.hnsw.data").exists());
+        assert!(!dir.join("chunks-200.hnsw.data").exists());
+        assert!(!dir.join("reflections-50.hnsw.data").exists());
+
+        // Base files should remain
+        assert!(dir.join("chunks.hnsw.data").exists());
+        assert!(dir.join("chunks.hnsw.graph").exists());
+        assert!(dir.join("reflections.hnsw.data").exists());
+        assert!(dir.join("manifest.json").exists());
+        assert!(dir.join("index.lock").exists());
+    }
+
+    #[test]
+    fn test_promote_renames_numbered_to_canonical() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Simulate hnsw_rs creating numbered files
+        std::fs::write(dir.join("chunks-4567.hnsw.data"), "new_data").unwrap();
+        std::fs::write(dir.join("chunks-4567.hnsw.graph"), "new_graph").unwrap();
+        // Old canonical files exist
+        std::fs::write(dir.join("chunks.hnsw.data"), "old_data").unwrap();
+        std::fs::write(dir.join("chunks.hnsw.graph"), "old_graph").unwrap();
+
+        promote_to_canonical(dir, "chunks-4567", "chunks");
+
+        // Canonical files should have the new content
+        assert_eq!(
+            std::fs::read_to_string(dir.join("chunks.hnsw.data")).unwrap(),
+            "new_data"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("chunks.hnsw.graph")).unwrap(),
+            "new_graph"
+        );
+        // Numbered files should be gone (renamed)
+        assert!(!dir.join("chunks-4567.hnsw.data").exists());
+        assert!(!dir.join("chunks-4567.hnsw.graph").exists());
+    }
+
+    #[test]
+    fn test_promote_noop_when_already_canonical() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("chunks.hnsw.data"), "data").unwrap();
+
+        promote_to_canonical(dir, "chunks", "chunks"); // should not panic or corrupt
+        assert_eq!(
+            std::fs::read_to_string(dir.join("chunks.hnsw.data")).unwrap(),
+            "data"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_no_panic_on_empty_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        cleanup_stale_index_files(tmp.path()); // should not panic
+    }
+
+    #[test]
+    fn test_cleanup_no_panic_on_nonexistent_dir() {
+        cleanup_stale_index_files(Path::new("/nonexistent/path")); // should not panic
     }
 }
