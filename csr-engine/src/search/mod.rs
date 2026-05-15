@@ -323,7 +323,7 @@ impl SearchEngine {
                 .chunk_index
                 .file_dump(dir, "chunks")
                 .map_err(|e| anyhow::anyhow!("chunk index dump failed: {}", e))?;
-            promote_to_canonical(dir, &basename, "chunks");
+            promote_to_canonical(dir, &basename, "chunks")?;
         }
 
         if !self.reflection_id_map.is_empty() {
@@ -331,7 +331,7 @@ impl SearchEngine {
                 .reflection_index
                 .file_dump(dir, "reflections")
                 .map_err(|e| anyhow::anyhow!("reflection index dump failed: {}", e))?;
-            promote_to_canonical(dir, &basename, "reflections");
+            promote_to_canonical(dir, &basename, "reflections")?;
         }
 
         // Write manifest atomically (tmp + rename)
@@ -494,17 +494,25 @@ impl SearchEngine {
 /// If `file_dump` returned a numbered basename (e.g. "chunks-7905"), rename its files
 /// to the canonical name (e.g. "chunks.hnsw.data") so `load_from_disk` can find them.
 /// This happens when the Hnsw was loaded via `load_hnsw` (mmap active → `overwrite=false`).
-fn promote_to_canonical(dir: &Path, returned_basename: &str, canonical: &str) {
+fn promote_to_canonical(dir: &Path, returned_basename: &str, canonical: &str) -> Result<()> {
     if returned_basename == canonical {
-        return; // Already canonical, nothing to do
+        return Ok(()); // Already canonical, nothing to do
     }
     for ext in &[".hnsw.data", ".hnsw.graph"] {
         let src = dir.join(format!("{}{}", returned_basename, ext));
         let dst = dir.join(format!("{}{}", canonical, ext));
         if src.exists() {
-            let _ = std::fs::rename(&src, &dst);
+            std::fs::rename(&src, &dst).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to promote {} to {}: {}",
+                    src.display(),
+                    dst.display(),
+                    e
+                )
+            })?;
         }
     }
+    Ok(())
 }
 
 /// Remove stale numbered HNSW files from the index directory.

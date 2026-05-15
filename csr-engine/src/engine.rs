@@ -178,8 +178,19 @@ impl Engine {
             search
         };
 
-        // Clean stale numbered HNSW files from previous sessions (crash resilience)
-        crate::search::cleanup_stale_index_files(&index_dir);
+        // Clean stale numbered HNSW files from previous sessions (crash resilience).
+        // Acquire exclusive lock to avoid racing with concurrent dump_to_disk writers.
+        if let Ok(lock_file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(index_dir.join("index.lock"))
+        {
+            if fs2::FileExt::lock_exclusive(&lock_file).is_ok() {
+                crate::search::cleanup_stale_index_files(&index_dir);
+            }
+            // lock released on drop
+        }
 
         Ok(Self {
             storage,
