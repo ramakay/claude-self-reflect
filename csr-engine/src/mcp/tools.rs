@@ -123,7 +123,9 @@ pub async fn reflect_on_past(
             } else {
                 decayed_score
             };
-            let tag_prefix = if tags.iter().any(|t| t == "session_story") {
+            let tag_prefix = if tags.iter().any(|t| t == "session_episode") {
+                "[episode] "
+            } else if tags.iter().any(|t| t == "session_story") {
                 "[story] "
             } else if tags.iter().any(|t| t.starts_with("narrative_v3")) {
                 "[narrative] "
