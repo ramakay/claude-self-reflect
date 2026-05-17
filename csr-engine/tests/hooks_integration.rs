@@ -1227,3 +1227,41 @@ fn test_precompact_imports_for_all_sessions() {
         "precompact should import transcript before compaction"
     );
 }
+
+#[test]
+fn test_episode_struct_serialization() {
+    // Verify the Episode struct is accessible from integration tests and serializable
+    let episode = csr_engine::hooks::stop::Episode {
+        schema: "csr_episode_v1".into(),
+        session_id: "integration-test-123".into(),
+        project: "test-project".into(),
+        timestamp: "2026-05-17T00:00:00Z".into(),
+        request: "Integration test request".into(),
+        investigated: vec!["src/main.rs".into()],
+        completed: "Test completed successfully".into(),
+        next_steps: Some("Run more tests".into()),
+        blockers: None,
+        outcome: "success".into(),
+        error_signatures: vec![],
+        tools_used: vec!["Read".into(), "Edit".into()],
+        files_modified: vec!["src/main.rs".into()],
+        message_count: 15,
+        duration_minutes: 10,
+    };
+
+    // Verify JSON roundtrip
+    let json = serde_json::to_string(&episode).unwrap();
+    assert!(json.contains("csr_episode_v1"));
+    assert!(json.contains("integration-test-123"));
+
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["schema"], "csr_episode_v1");
+    assert_eq!(parsed["outcome"], "success");
+    assert_eq!(parsed["message_count"], 15);
+    assert_eq!(parsed["next_steps"], "Run more tests");
+
+    // Verify deserialization back to Episode
+    let roundtrip: csr_engine::hooks::stop::Episode = serde_json::from_str(&json).unwrap();
+    assert_eq!(roundtrip.session_id, "integration-test-123");
+    assert_eq!(roundtrip.tools_used.len(), 2);
+}
