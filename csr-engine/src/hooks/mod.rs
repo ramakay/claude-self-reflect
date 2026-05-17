@@ -10,6 +10,7 @@ pub mod install;
 pub mod post_tool_use;
 pub mod precompact;
 pub mod prompt_submit;
+pub mod session_briefing;
 pub mod session_end;
 pub mod session_start;
 pub mod stop;
@@ -128,6 +129,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
 
     let result = match hook_name {
         "session-start" => session_start::handle(&input, engine, &cwd).await,
+        "session-briefing" => session_briefing::handle(&input, engine, &cwd).await,
         "session-end" => session_end::handle(&input, engine, &cwd).await,
         "precompact" => precompact::handle(&input, engine, &cwd).await,
         "stop" => stop::handle(&input, engine, &cwd).await,

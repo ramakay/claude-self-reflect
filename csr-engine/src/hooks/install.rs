@@ -31,22 +31,6 @@ pub fn generate_hook_config_for_test(binary_path: &str) -> serde_json::Value {
 }
 
 /// Generate the hook configuration JSON.
-/// Agent hook prompt for SessionStart episode analysis.
-const AGENT_HOOK_PROMPT: &str = concat!(
-    "You are CSR Episode Analyst. Your job is to analyze recent coding session episodes and generate a brief, actionable summary.\n\n",
-    "STEP 1: Use the csr_reflect_on_past tool to search for recent episodes.\n",
-    "Search query: \"session_episode schema_v1\"\n",
-    "Limit: 5\n\n",
-    "STEP 2: Analyze the episode JSON objects returned. Look for:\n",
-    "- What was worked on recently (the 'request' and 'completed' fields)\n",
-    "- Patterns across sessions (repeated errors in 'error_signatures', same files in 'files_modified')\n",
-    "- Unfinished work ('next_steps' field, 'outcome' of 'partial' or 'interrupted')\n\n",
-    "STEP 3: Write a concise briefing (under 150 words) starting with '## Session Intelligence (CSR v9.2)'\n",
-    "Be specific — reference actual file names, error messages, and outcomes.\n",
-    "If no episodes found, say: 'No recent session episodes found — this is a fresh start.'\n",
-    "Do NOT make up information. Only report what the episodes contain."
-);
-
 fn generate_hook_config(binary_path: &str) -> serde_json::Value {
     serde_json::json!({
         "hooks": {
@@ -58,12 +42,11 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
                 {
                     "matcher": "startup|resume",
                     "hooks": [{
-                        "type": "agent",
-                        "prompt": AGENT_HOOK_PROMPT,
-                        "model": "claude-haiku-4-5-20251001",
-                        "timeout": 15,
+                        "type": "command",
+                        "command": format!("{} hook session-briefing", binary_path),
                         "async": true,
-                        "statusMessage": "CSR analyzing recent sessions..."
+                        "timeout": 150,
+                        "statusMessage": "CSR generating session briefing (async)..."
                     }]
                 }
             ],
@@ -285,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_hook_config_has_agent_hook() {
+    fn test_generate_hook_config_has_async_briefing_hook() {
         let config = generate_hook_config("/usr/local/bin/csr-engine");
         let hooks = config.get("hooks").unwrap();
 
@@ -293,35 +276,34 @@ mod tests {
         assert_eq!(
             session_start.len(),
             2,
-            "SessionStart should have command + agent hooks"
+            "SessionStart should have fast sync hook + async briefing hook"
         );
 
-        // First: existing command hook
-        let cmd_hook = &session_start[0];
-        assert_eq!(cmd_hook["hooks"][0]["type"].as_str().unwrap(), "command");
-        assert!(cmd_hook["hooks"][0]["command"]
+        // First: existing fast sync command hook
+        let fast_hook = &session_start[0];
+        assert_eq!(fast_hook["hooks"][0]["type"].as_str().unwrap(), "command");
+        assert!(fast_hook["hooks"][0]["command"]
             .as_str()
             .unwrap()
             .contains("session-start"));
         assert_eq!(
-            cmd_hook["matcher"].as_str().unwrap(),
+            fast_hook["matcher"].as_str().unwrap(),
             "startup|resume|compact"
         );
 
-        // Second: new agent hook
-        let agent_hook = &session_start[1];
-        assert_eq!(agent_hook["hooks"][0]["type"].as_str().unwrap(), "agent");
-        assert!(agent_hook["hooks"][0]["prompt"]
+        // Second: async command hook invoking claude -p for briefing
+        let briefing_hook = &session_start[1];
+        assert_eq!(
+            briefing_hook["hooks"][0]["type"].as_str().unwrap(),
+            "command"
+        );
+        assert!(briefing_hook["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("CSR Episode Analyst"));
-        assert_eq!(agent_hook["hooks"][0]["async"].as_bool().unwrap(), true);
-        assert_eq!(
-            agent_hook["hooks"][0]["model"].as_str().unwrap(),
-            "claude-haiku-4-5-20251001"
-        );
-        assert_eq!(agent_hook["hooks"][0]["timeout"].as_u64().unwrap(), 15);
-        // Agent hook only on startup|resume (not compact)
-        assert_eq!(agent_hook["matcher"].as_str().unwrap(), "startup|resume");
+            .contains("session-briefing"));
+        assert_eq!(briefing_hook["hooks"][0]["async"].as_bool().unwrap(), true);
+        assert_eq!(briefing_hook["hooks"][0]["timeout"].as_u64().unwrap(), 150);
+        // Briefing only on startup|resume (not compact — compact doesn't need fresh briefing)
+        assert_eq!(briefing_hook["matcher"].as_str().unwrap(), "startup|resume");
     }
 }
