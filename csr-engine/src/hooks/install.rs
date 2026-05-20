@@ -70,6 +70,66 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
     })
 }
 
+/// Returns true if a settings hook entry was registered by CSR — covers both
+/// command-type hooks (matched by command path) and agent-type hooks (matched by
+/// prompt content). Used by merge_hook_config to evict stale CSR entries before
+/// appending fresh ones. Agent hooks lack a `command` field so the command check
+/// alone misses them — a real bug we hit shipping v9.2 (stale agent hook left
+/// behind, kept firing ToolUseContext errors).
+fn is_csr_entry(entry: &serde_json::Value) -> bool {
+    let first_hook = entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .and_then(|arr| arr.first());
+
+    let is_csr_command = first_hook
+        .and_then(|h| h.get("command"))
+        .and_then(|c| c.as_str())
+        .is_some_and(|cmd| cmd.contains("csr-engine") || cmd.contains("claude-self-reflect"));
+
+    let is_csr_agent = first_hook
+        .and_then(|h| {
+            if h.get("type").and_then(|t| t.as_str()) == Some("agent") {
+                h.get("prompt").and_then(|p| p.as_str())
+            } else {
+                None
+            }
+        })
+        .is_some_and(|prompt| {
+            prompt.contains("CSR Episode Analyst") || prompt.contains("session_episode")
+        });
+
+    is_csr_command || is_csr_agent
+}
+
+/// Merge CSR hook config into existing settings JSON. Removes stale CSR entries,
+/// appends fresh ones. Preserves non-CSR hooks (GSD, Moshi, etc).
+fn merge_hook_config(
+    settings: &mut serde_json::Value,
+    config: &serde_json::Value,
+) -> anyhow::Result<()> {
+    if let Some(new_hooks) = config.get("hooks").and_then(|h| h.as_object()) {
+        let hooks_obj = settings
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("settings.json is not an object"))?
+            .entry("hooks")
+            .or_insert_with(|| serde_json::json!({}));
+
+        for (hook_type, entries) in new_hooks {
+            if let Some(existing_arr) = hooks_obj.get_mut(hook_type).and_then(|v| v.as_array_mut())
+            {
+                existing_arr.retain(|entry| !is_csr_entry(entry));
+                if let Some(new_arr) = entries.as_array() {
+                    existing_arr.extend(new_arr.iter().cloned());
+                }
+            } else {
+                hooks_obj[hook_type] = entries.clone();
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Apply hook config to ~/.claude/settings.json.
 /// Merges new hooks into existing config (does not clobber user hooks).
 /// Uses atomic write (write to .tmp then rename) and creates a .bak backup.
@@ -97,42 +157,7 @@ fn apply_to_settings(config: &serde_json::Value) -> Result<()> {
     };
 
     // Deep-merge hooks: add CSR hooks without clobbering existing user hooks
-    if let Some(new_hooks) = config.get("hooks").and_then(|h| h.as_object()) {
-        let hooks_obj = settings
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("settings.json is not an object"))?
-            .entry("hooks")
-            .or_insert_with(|| serde_json::json!({}));
-
-        for (hook_type, entries) in new_hooks {
-            // Merge CSR entries: remove existing CSR entries, then append new ones.
-            // Preserves entries from other tools under the same hook type.
-            if let Some(existing_arr) = hooks_obj.get_mut(hook_type).and_then(|v| v.as_array_mut())
-            {
-                // Remove existing CSR entries — both Rust ("csr-engine") and Python
-                // ("claude-self-reflect" hooks). Both live under the claude-self-reflect
-                // project path, so matching that catches legacy Python hooks too.
-                existing_arr.retain(|entry| {
-                    let is_csr = entry
-                        .get("hooks")
-                        .and_then(|h| h.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|h| h.get("command"))
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|cmd| {
-                            cmd.contains("csr-engine") || cmd.contains("claude-self-reflect")
-                        });
-                    !is_csr
-                });
-                // Append new CSR entries
-                if let Some(new_arr) = entries.as_array() {
-                    existing_arr.extend(new_arr.iter().cloned());
-                }
-            } else {
-                hooks_obj[hook_type] = entries.clone();
-            }
-        }
-    }
+    merge_hook_config(&mut settings, config)?;
 
     // Atomic write: write to temp file then rename
     let tmp_path = settings_path.with_extension("json.tmp");
@@ -174,34 +199,7 @@ mod tests {
         });
 
         let new_config = generate_hook_config("/usr/local/bin/csr-engine");
-
-        // Apply merge logic (same as apply_to_settings but inline)
-        if let Some(new_hooks) = new_config.get("hooks").and_then(|h| h.as_object()) {
-            let hooks_obj = settings.get_mut("hooks").unwrap();
-            for (hook_type, entries) in new_hooks {
-                if let Some(existing_arr) =
-                    hooks_obj.get_mut(hook_type).and_then(|v| v.as_array_mut())
-                {
-                    existing_arr.retain(|entry| {
-                        let is_csr = entry
-                            .get("hooks")
-                            .and_then(|h| h.as_array())
-                            .and_then(|arr| arr.first())
-                            .and_then(|h| h.get("command"))
-                            .and_then(|c| c.as_str())
-                            .is_some_and(|cmd| {
-                                cmd.contains("csr-engine") || cmd.contains("claude-self-reflect")
-                            });
-                        !is_csr
-                    });
-                    if let Some(new_arr) = entries.as_array() {
-                        existing_arr.extend(new_arr.iter().cloned());
-                    }
-                } else {
-                    hooks_obj[hook_type] = entries.clone();
-                }
-            }
-        }
+        merge_hook_config(&mut settings, &new_config).unwrap();
 
         // GSD hook should survive
         let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
@@ -305,5 +303,66 @@ mod tests {
         assert_eq!(briefing_hook["hooks"][0]["timeout"].as_u64().unwrap(), 150);
         // Briefing only on startup|resume (not compact — compact doesn't need fresh briefing)
         assert_eq!(briefing_hook["matcher"].as_str().unwrap(), "startup|resume");
+    }
+
+    /// Regression test for the v9.2 agent-hook leak.
+    ///
+    /// We initially shipped v9.2 with an `agent`-type SessionStart hook. Agent hooks
+    /// only work for tool events (PreToolUse/PostToolUse/PermissionRequest), so it
+    /// fired `ToolUseContext is required for agent hooks` on every session start.
+    ///
+    /// We replaced it with an async command hook, but the original install merge logic
+    /// matched CSR entries by `command` field only. Agent hooks have a `prompt` field
+    /// instead — so re-running `hook install --apply` left the broken agent hook in
+    /// settings.json alongside the new command hook. The error kept firing.
+    ///
+    /// This test verifies that agent hooks containing the CSR Episode Analyst prompt
+    /// are correctly identified as CSR-owned and evicted during merge.
+    #[test]
+    fn test_merge_removes_stale_csr_agent_hook() {
+        let mut settings: serde_json::Value = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "hooks": [{
+                            "type": "agent",
+                            "prompt": "You are CSR Episode Analyst. Search session_episode reflections...",
+                            "model": "claude-haiku-4-5-20251001",
+                            "async": true
+                        }],
+                        "matcher": "startup|resume"
+                    },
+                    {
+                        "hooks": [{"type": "command", "command": "node /Users/me/other-tool.js"}]
+                    }
+                ]
+            }
+        });
+
+        let new_config = generate_hook_config("/usr/local/bin/csr-engine");
+        merge_hook_config(&mut settings, &new_config).unwrap();
+
+        let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
+
+        // No stale agent hook should remain
+        let has_stale_agent = session_start.iter().any(|e| {
+            let h = &e["hooks"][0];
+            h["type"].as_str() == Some("agent")
+                && h["prompt"]
+                    .as_str()
+                    .is_some_and(|p| p.contains("CSR Episode Analyst"))
+        });
+        assert!(
+            !has_stale_agent,
+            "Stale CSR agent hook should be evicted during merge"
+        );
+
+        // Non-CSR command hook should survive
+        let has_other_tool = session_start.iter().any(|e| {
+            e["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("other-tool.js"))
+        });
+        assert!(has_other_tool, "Non-CSR hook should be preserved");
     }
 }
