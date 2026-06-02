@@ -28,7 +28,7 @@ async-trait = "0.1"
 sha2 = "0.11"
 fs2 = "0.4"
 ast-grep-core = { version = "0.42", features = ["tree-sitter"] }
-ast-grep-language = { version = "0.42", default-features = false, features = [
+ast-grep-language = { version = "0.43", default-features = false, features = [
     "tree-sitter-python",
     "tree-sitter-typescript",
     "tree-sitter-rust",
