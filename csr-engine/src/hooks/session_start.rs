@@ -12,6 +12,8 @@ use regex::Regex;
 
 use super::HookInput;
 use crate::engine::Engine;
+use crate::extraction::anchors::{verify_anchor, AnchorVerdict};
+use crate::hooks::stop::Episode;
 use crate::injection::anti_pattern;
 use crate::search::cross_project::resolve_project_from_cwd;
 use crate::storage::queries::SessionInfo;
@@ -206,6 +208,28 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                     "CSR: {} chunks, {} reflections indexed. No recent sessions for this project.",
                     chunk_count, reflection_count
                 ));
+            }
+        }
+    }
+
+    // Tier-0 continuity block from the latest episode (non-fatal)
+    if let Some(project) = resolve_project_from_cwd(&cwd.to_string_lossy()) {
+        let project_tag = format!("project_{}", project);
+        if let Ok(rows) = engine.storage().get_reflections_by_tag(&project_tag, 20) {
+            let latest = rows
+                .iter()
+                .filter(|(_, _, tags, _)| tags.iter().any(|t| t == "session_episode"))
+                .max_by(|a, b| a.3.cmp(&b.3));
+            if let Some((_, content, _, ts)) = latest {
+                if let Ok(ep) = serde_json::from_str::<Episode>(content) {
+                    let verdicts: Vec<(String, AnchorVerdict)> = ep
+                        .anchors
+                        .iter()
+                        .map(|a| (a.name.clone(), verify_anchor(a, cwd)))
+                        .collect();
+                    let age = relative_time_label(ts, &Utc::now());
+                    output.push_str(&format_tier0_block(&ep, &verdicts, &age));
+                }
             }
         }
     }
@@ -514,6 +538,48 @@ fn log_session_start_injection(
             .open(&log_path)
             .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
     }
+}
+
+/// Format the ≤200-token Tier-0 identity block. Pure function.
+pub fn format_tier0_block(
+    ep: &Episode,
+    anchor_verdicts: &[(String, AnchorVerdict)],
+    age: &str,
+) -> String {
+    let open_todos = ep.todos.iter().filter(|t| t.status != "completed").count();
+    let intact = anchor_verdicts
+        .iter()
+        .filter(|(_, v)| *v == AnchorVerdict::Intact)
+        .count();
+    let modified: Vec<&str> = anchor_verdicts
+        .iter()
+        .filter(|(_, v)| *v == AnchorVerdict::Modified)
+        .map(|(n, _)| n.as_str())
+        .take(3)
+        .collect();
+    let next = ep.next_steps.as_deref().unwrap_or("none recorded");
+
+    let mut out = format!(
+        "CSR CONTINUUM [{}]: {}\nLAST: {} (outcome={})\nNEXT: {} | TODOS: {} open\n",
+        age, ep.request, ep.completed, ep.outcome, next, open_todos
+    );
+    if !anchor_verdicts.is_empty() {
+        out.push_str(&format!(
+            "ANCHORS: {} intact, {} modified since checkpoint{}\n",
+            intact,
+            modified.len(),
+            if modified.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", modified.join(", "))
+            }
+        ));
+    }
+    out.push_str(&format!(
+        "Full state: csr_reflect_on_past(\"conv_{}\")\n",
+        ep.session_id
+    ));
+    out
 }
 
 /// Format a relative time label with hour-level granularity for same-day sessions.
@@ -970,6 +1036,55 @@ fn infer_next_action(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier0_block_formats_episode_state() {
+        use crate::extraction::anchors::AnchorVerdict;
+        use crate::hooks::stop::{Episode, TodoItem};
+        let ep = Episode {
+            schema: "v2".into(),
+            session_id: "abc-123".into(),
+            project: "proj".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            request: "Fix the auth middleware regression".into(),
+            investigated: vec![],
+            completed: "Fixed token validation, added regression test".into(),
+            next_steps: Some("Deploy to staging".into()),
+            blockers: None,
+            outcome: "partial".into(),
+            error_signatures: vec![],
+            tools_used: vec![],
+            files_modified: vec![],
+            message_count: 10,
+            duration_minutes: 0,
+            todos: vec![
+                TodoItem {
+                    content: "a".into(),
+                    status: "pending".into(),
+                },
+                TodoItem {
+                    content: "b".into(),
+                    status: "completed".into(),
+                },
+            ],
+            approved_plan: None,
+            prev_episode_id: None,
+            anchors: vec![],
+        };
+        let verdicts = vec![
+            ("validate_token".to_string(), AnchorVerdict::Modified),
+            ("refresh".to_string(), AnchorVerdict::Intact),
+        ];
+        let block = format_tier0_block(&ep, &verdicts, "2h ago");
+        assert!(block.starts_with("CSR CONTINUUM [2h ago]"));
+        assert!(block.contains("Fix the auth middleware regression"));
+        assert!(block.contains("outcome=partial"));
+        assert!(block.contains("NEXT: Deploy to staging"));
+        assert!(block.contains("TODOS: 1 open"));
+        assert!(block.contains("1 intact, 1 modified"));
+        assert!(block.contains("validate_token"));
+        assert!(block.contains(r#"csr_reflect_on_past("conv_abc-123")"#));
+    }
 
     // --- infer_next_action (keyword fallback) tests ---
 
