@@ -127,6 +127,32 @@ impl Engine {
                     }
                 }
             }
+
+            // Backfill chunks added to DB since the last dump (additive drift).
+            // Cheap ID probe first; only load the (large) vector set if something is
+            // actually missing. This is what lets a stale-but-additive cache load in
+            // ~ms instead of triggering a full HNSW rebuild (~tens of seconds).
+            if let Ok(db_chunk_ids) = storage.load_all_chunk_ids() {
+                let missing: std::collections::HashSet<&str> = db_chunk_ids
+                    .iter()
+                    .filter(|id| !search.has_chunk(id))
+                    .map(|s| s.as_str())
+                    .collect();
+                if !missing.is_empty() {
+                    if let Ok(all_vecs) = storage.load_all_chunk_vectors() {
+                        let mut added = 0;
+                        for (id, vec) in &all_vecs {
+                            if missing.contains(id.as_str()) {
+                                search.insert_chunk(id.clone(), vec.clone());
+                                added += 1;
+                            }
+                        }
+                        if added > 0 {
+                            tracing::info!(added, "backfilled missing chunks into HNSW cache");
+                        }
+                    }
+                }
+            }
             search
         } else {
             // Cache miss — rebuild from SQLite vectors

@@ -67,6 +67,11 @@ impl Storage {
         queries::insert_reflection(&conn, id, content, tags, embedding)
     }
 
+    pub fn load_all_chunk_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::load_all_chunk_ids(&conn)
+    }
+
     pub fn load_all_reflection_ids(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::load_all_reflection_ids(&conn)

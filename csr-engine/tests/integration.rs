@@ -1055,11 +1055,19 @@ fn test_hnsw_stale_index_detection() {
     }
     engine.dump_to_disk(&index_dir, 10, 0).unwrap();
 
-    // Try to load with expected_count=15 — should detect staleness
+    // DB grew since the dump (additive drift) — cache loads so Engine::new can
+    // incrementally backfill the new rows instead of doing a full rebuild.
     let result = SearchEngine::load_from_disk(&index_dir, 15, 0);
-    assert!(result.is_none(), "should reject stale cache");
+    assert!(
+        result.is_some(),
+        "additive drift should load the cache (backfill), not rebuild"
+    );
 
-    // Correct count should work
+    // DB shrank (rows deleted) — must reject so the rebuild drops orphan vectors.
+    let result = SearchEngine::load_from_disk(&index_dir, 5, 0);
+    assert!(result.is_none(), "deletion should reject the stale cache");
+
+    // Exact match should work
     let result = SearchEngine::load_from_disk(&index_dir, 10, 0);
     assert!(result.is_some(), "should accept matching cache");
 }

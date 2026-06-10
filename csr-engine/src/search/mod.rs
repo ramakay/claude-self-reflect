@@ -126,6 +126,11 @@ impl SearchEngine {
         self.reflection_id_set.contains(id)
     }
 
+    /// Check if a chunk ID is already present in the index.
+    pub fn has_chunk(&self, id: &str) -> bool {
+        self.chunk_id_set.contains(id)
+    }
+
     /// Blank reflection IDs in the map that are not present in the given DB ID set.
     /// Returns the number of entries blanked. Marks index dirty if any were removed.
     pub fn blank_orphan_reflections(&mut self, db_ids: &std::collections::HashSet<&str>) -> usize {
@@ -401,22 +406,40 @@ impl SearchEngine {
             return None;
         }
 
-        if manifest.chunk_embeddings_expected != expected_chunks {
+        // Staleness is asymmetric. Chunks and reflections normally only grow, so an
+        // ADDITIVE drift (db > cached) is cheap to reconcile: Engine::new loads this
+        // cache and incrementally inserts the few new rows (~ms) instead of rebuilding
+        // the whole HNSW (~tens of seconds). This avoids cache thrash when several
+        // csr-engine processes import transcripts concurrently.
+        //
+        // A NEGATIVE drift (db < cached) means rows were deleted, so the cache holds
+        // orphan vectors — fall back to a full rebuild for correctness.
+        if expected_chunks < manifest.chunk_embeddings_expected {
             tracing::info!(
                 cached = manifest.chunk_embeddings_expected,
                 db = expected_chunks,
-                "index cache stale (chunk count)"
+                "index cache stale (chunks removed) — rebuilding"
             );
             return None;
         }
-
-        if manifest.reflection_embeddings_expected != expected_reflections {
+        if expected_reflections < manifest.reflection_embeddings_expected {
             tracing::info!(
                 cached = manifest.reflection_embeddings_expected,
                 db = expected_reflections,
-                "index cache stale (reflection count)"
+                "index cache stale (reflections removed) — rebuilding"
             );
             return None;
+        }
+        if expected_chunks > manifest.chunk_embeddings_expected
+            || expected_reflections > manifest.reflection_embeddings_expected
+        {
+            tracing::info!(
+                cached_chunks = manifest.chunk_embeddings_expected,
+                db_chunks = expected_chunks,
+                cached_reflections = manifest.reflection_embeddings_expected,
+                db_reflections = expected_reflections,
+                "index cache behind DB — loading + incremental backfill"
+            );
         }
 
         // Load chunk index.
@@ -546,6 +569,37 @@ pub fn cleanup_stale_index_files(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_load_allows_additive_drift_rebuilds_on_deletion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("index.lock"), "").unwrap();
+
+        let mut engine = SearchEngine::new(100);
+        for i in 0..5 {
+            engine.insert_chunk(format!("c{i}"), vec![i as f32 / 5.0; 384]);
+        }
+        engine.insert_reflection("r0".into(), vec![0.5; 384]);
+        engine.dump_to_disk(dir, 5, 1).unwrap();
+
+        // Exact match → loads.
+        assert!(SearchEngine::load_from_disk(dir, 5, 1).is_some());
+        // Additive drift (DB grew since dump) → loads; Engine::new backfills the new rows.
+        assert!(
+            SearchEngine::load_from_disk(dir, 8, 3).is_some(),
+            "additive drift must load the cache, not rebuild"
+        );
+        // Negative drift (rows deleted) → None so the caller does a clean full rebuild.
+        assert!(
+            SearchEngine::load_from_disk(dir, 4, 1).is_none(),
+            "chunk deletion must force a rebuild"
+        );
+        assert!(
+            SearchEngine::load_from_disk(dir, 5, 0).is_none(),
+            "reflection deletion must force a rebuild"
+        );
+    }
 
     #[test]
     fn test_cleanup_removes_numbered_keeps_base() {
