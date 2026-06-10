@@ -252,6 +252,14 @@ async fn extraction_loop_inner(
     tracing::info!(count = unenriched.len(), "processing V3 extraction queue");
 
     for (conv_id, file_path) in &unenriched {
+        // Source JSONL may have been deleted or rotated out of ~/.claude/projects.
+        // Mark it permanently unavailable so it stops re-queuing every tick (retry storm).
+        if !Path::new(file_path).exists() {
+            tracing::debug!(conv = %conv_id, %file_path, "V3 source file missing; marking unavailable");
+            let _ =
+                storage.mark_enrichment_unavailable(conv_id, "extracted_v3", "source file missing");
+            continue;
+        }
         if let Err(e) =
             process_v3_extraction(storage, embeddings, search, conv_id, Path::new(file_path)).await
         {

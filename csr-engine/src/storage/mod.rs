@@ -197,6 +197,16 @@ impl Storage {
         queries::mark_enrichment_failed(&conn, conversation_id, enrichment_type, error)
     }
 
+    pub fn mark_enrichment_unavailable(
+        &self,
+        conversation_id: &str,
+        enrichment_type: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_enrichment_unavailable(&conn, conversation_id, enrichment_type, reason)
+    }
+
     pub fn get_unenriched_conversations(
         &self,
         enrichment_type: &str,

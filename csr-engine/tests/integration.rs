@@ -731,6 +731,53 @@ fn test_enrichment_failure_tracking() {
 }
 
 #[test]
+fn test_unavailable_enrichment_not_requeued() {
+    // Regression: missing source JSONL must stop re-queuing every daemon tick.
+    let storage = Storage::open_memory().unwrap();
+    let fake_emb: Vec<f32> = vec![0.0; 384];
+
+    // Two conversations, each with a chunk + import_state row so they qualify for the queue.
+    for conv in ["conv-missing", "conv-failed"] {
+        let chunk = ConversationChunk {
+            id: format!("{conv}-chunk"),
+            conversation_id: conv.into(),
+            project_name: "test".into(),
+            timestamp: "2026-01-15T10:00:00Z".into(),
+            content: "content".into(),
+            message_count: 1,
+            summary: None,
+        };
+        storage.insert_chunk(&chunk, &fake_emb).unwrap();
+        // mark_file_imported derives conversation_id from the file stem.
+        storage
+            .mark_file_imported(std::path::Path::new(&format!("/tmp/{conv}.jsonl")), 1)
+            .unwrap();
+    }
+
+    // Missing source → unavailable (permanent); transient → failed (retryable).
+    storage
+        .mark_enrichment_unavailable("conv-missing", "extracted_v3", "source file missing")
+        .unwrap();
+    storage
+        .mark_enrichment_failed("conv-failed", "extracted_v3", "transient io error")
+        .unwrap();
+
+    let queued = storage
+        .get_unenriched_conversations("extracted_v3", 10)
+        .unwrap();
+    let ids: Vec<&str> = queued.iter().map(|(id, _)| id.as_str()).collect();
+
+    assert!(
+        !ids.contains(&"conv-missing"),
+        "unavailable conversation must NOT be re-queued"
+    );
+    assert!(
+        ids.contains(&"conv-failed"),
+        "failed conversation should still be retried"
+    );
+}
+
+#[test]
 fn test_batch_id_tracking() {
     let storage = Storage::open_memory().unwrap();
 

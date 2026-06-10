@@ -432,6 +432,25 @@ pub fn mark_enrichment_failed(
     Ok(())
 }
 
+/// Mark enrichment as permanently unavailable (e.g. source JSONL deleted/rotated).
+/// Unlike `mark_enrichment_failed`, status `'unavailable'` is NOT re-queued by
+/// `get_unenriched_conversations`, so a missing source file stops the retry storm.
+pub fn mark_enrichment_unavailable(
+    conn: &Connection,
+    conversation_id: &str,
+    enrichment_type: &str,
+    reason: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO enrichment_state (conversation_id, enrichment_type, status, error_message, updated_at)
+         VALUES (?1, ?2, 'unavailable', ?3, datetime('now'))
+         ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
+             status = 'unavailable', error_message = ?3, updated_at = datetime('now')",
+        params![conversation_id, enrichment_type, reason],
+    )?;
+    Ok(())
+}
+
 /// Get conversations that need enrichment of a given type.
 /// Returns (conversation_id, file_path) pairs.
 pub fn get_unenriched_conversations(
