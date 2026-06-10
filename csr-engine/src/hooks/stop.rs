@@ -52,10 +52,8 @@ pub struct Episode {
     pub approved_plan: Option<String>,
     #[serde(default)]
     pub prev_episode_id: Option<String>,
-    // NOTE: placeholder type until Task 2 creates extraction::anchors::FunctionAnchor.
-    // Re-typed in Task 2. Always empty in Task 1 (anchor capture wired in Task 4).
     #[serde(default)]
-    pub anchors: Vec<serde_json::Value>,
+    pub anchors: Vec<crate::extraction::anchors::FunctionAnchor>,
 }
 
 /// Extract a structured episode from JSONL transcript lines.
@@ -275,6 +273,15 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
     }
 }
 
+/// Choose the most recent episode session that is not the current one.
+pub fn pick_prev_episode(candidates: &[(String, String)], current_session: &str) -> Option<String> {
+    candidates
+        .iter()
+        .filter(|(sid, _)| sid != current_session)
+        .max_by(|a, b| a.1.cmp(&b.1))
+        .map(|(sid, _)| sid.clone())
+}
+
 /// Generate tags for an episode reflection.
 pub fn episode_tags(episode: &Episode) -> Vec<String> {
     vec![
@@ -352,14 +359,52 @@ pub async fn extract_and_store_episode(
     let raw = std::fs::read_to_string(&tp)?;
     let lines: Vec<&str> = raw.lines().collect();
 
-    let episode = extract_episode(&lines, session_id, project_name);
+    let mut episode = extract_episode(&lines, session_id, project_name);
+
+    // AST anchors for modified files (cap 10 files; relative paths resolve to cwd)
+    for f in episode.files_modified.iter().take(10) {
+        let p = std::path::Path::new(f);
+        let path = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        };
+        episode
+            .anchors
+            .extend(crate::extraction::anchors::capture_file_anchors(&path));
+    }
+
+    // Chain link: most recent episode for this project, excluding this session
+    let project_tag = format!("project_{}", project_name);
+    if let Ok(existing) = engine.storage().get_reflections_by_tag(&project_tag, 50) {
+        let candidates: Vec<(String, String)> = existing
+            .iter()
+            .filter(|(_, _, tags, _)| tags.iter().any(|t| t == "session_episode"))
+            .filter_map(|(_, content, _, ts)| {
+                let v: serde_json::Value = serde_json::from_str(content).ok()?;
+                Some((v.get("session_id")?.as_str()?.to_string(), ts.clone()))
+            })
+            .collect();
+        episode.prev_episode_id = pick_prev_episode(&candidates, session_id);
+    }
+
     store_episode(engine, &episode).await?;
 
+    // Persist anchors for fast birth-time symbol join (non-fatal)
+    if let Err(e) =
+        engine
+            .storage()
+            .replace_session_anchors(session_id, project_name, &episode.anchors)
+    {
+        eprintln!("CSR: anchor persist error (non-fatal): {}", e);
+    }
+
     eprintln!(
-        "CSR: episode stored (outcome={}, msgs={}, tools={})",
+        "CSR: episode stored (outcome={}, msgs={}, tools={}, anchors={})",
         episode.outcome,
         episode.message_count,
-        episode.tools_used.len()
+        episode.tools_used.len(),
+        episode.anchors.len()
     );
 
     Ok(())
@@ -710,6 +755,25 @@ mod tests {
         let ep = extract_episode(&lines, "sess-1", "proj");
         assert_eq!(ep.todos.len(), 1);
         assert_eq!(ep.todos[0].content, "new");
+    }
+
+    #[test]
+    fn chain_link_finds_previous_episode_id() {
+        // Pure-logic test for the helper that picks prev episode from candidates:
+        // (session_id, timestamp) pairs, excluding the current session.
+        let candidates = vec![
+            ("sess-old".to_string(), "2026-06-09T10:00:00Z".to_string()),
+            (
+                "sess-current".to_string(),
+                "2026-06-10T09:00:00Z".to_string(),
+            ),
+            ("sess-mid".to_string(), "2026-06-10T08:00:00Z".to_string()),
+        ];
+        assert_eq!(
+            pick_prev_episode(&candidates, "sess-current"),
+            Some("sess-mid".to_string())
+        );
+        assert_eq!(pick_prev_episode(&[], "x"), None);
     }
 
     #[test]
