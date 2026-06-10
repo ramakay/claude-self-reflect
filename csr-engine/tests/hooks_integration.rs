@@ -1247,6 +1247,10 @@ fn test_episode_struct_serialization() {
         files_modified: vec!["src/main.rs".into()],
         message_count: 15,
         duration_minutes: 10,
+        todos: vec![],
+        approved_plan: None,
+        prev_episode_id: None,
+        anchors: vec![],
     };
 
     // Verify JSON roundtrip

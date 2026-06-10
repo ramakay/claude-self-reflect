@@ -19,6 +19,13 @@ use super::HookInput;
 use crate::engine::Engine;
 use crate::search::cross_project::resolve_project_from_cwd;
 
+/// A single todo item captured from the last TodoWrite call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: String,
+}
+
 /// A structured episode capturing what happened in a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {
@@ -37,6 +44,18 @@ pub struct Episode {
     pub files_modified: Vec<String>,
     pub message_count: usize,
     pub duration_minutes: u32,
+
+    // v2 working-state fields. `#[serde(default)]` keeps v1 episodes deserializable.
+    #[serde(default)]
+    pub todos: Vec<TodoItem>,
+    #[serde(default)]
+    pub approved_plan: Option<String>,
+    #[serde(default)]
+    pub prev_episode_id: Option<String>,
+    // NOTE: placeholder type until Task 2 creates extraction::anchors::FunctionAnchor.
+    // Re-typed in Task 2. Always empty in Task 1 (anchor capture wired in Task 4).
+    #[serde(default)]
+    pub anchors: Vec<serde_json::Value>,
 }
 
 /// Extract a structured episode from JSONL transcript lines.
@@ -52,6 +71,8 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
     let mut error_signatures = Vec::new();
     let mut next_steps: Option<String> = None;
     let mut message_count: usize = 0;
+    let mut todos: Vec<TodoItem> = Vec::new();
+    let mut approved_plan: Option<String> = None;
 
     // Tool names whose file_path inputs count as "investigated"
     let read_tools: HashSet<&str> = ["Read", "Glob", "Grep"].into_iter().collect();
@@ -93,6 +114,41 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
                         if block_type == "tool_use" {
                             if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
                                 tools_used.insert(name.to_string());
+
+                                if name == "TodoWrite" {
+                                    if let Some(items) = block
+                                        .get("input")
+                                        .and_then(|i| i.get("todos"))
+                                        .and_then(|t| t.as_array())
+                                    {
+                                        todos = items
+                                            .iter()
+                                            .filter_map(|t| {
+                                                Some(TodoItem {
+                                                    content: t
+                                                        .get("content")?
+                                                        .as_str()?
+                                                        .to_string(),
+                                                    status: t
+                                                        .get("status")
+                                                        .and_then(|s| s.as_str())
+                                                        .unwrap_or("pending")
+                                                        .to_string(),
+                                                })
+                                            })
+                                            .take(10)
+                                            .collect();
+                                    }
+                                }
+                                if name == "ExitPlanMode" {
+                                    if let Some(plan) = block
+                                        .get("input")
+                                        .and_then(|i| i.get("plan"))
+                                        .and_then(|p| p.as_str())
+                                    {
+                                        approved_plan = Some(truncate_str(plan, 1500).to_string());
+                                    }
+                                }
 
                                 if let Some(input) = block.get("input") {
                                     if let Some(fp) =
@@ -197,7 +253,7 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
     tools_used_vec.sort();
 
     Episode {
-        schema: "v1".to_string(),
+        schema: "v2".to_string(),
         session_id: session_id.to_string(),
         project: project.to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -212,6 +268,10 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
         files_modified: files_modified_vec,
         message_count,
         duration_minutes: 0, // Cannot reliably determine from transcript alone
+        todos,
+        approved_plan,
+        prev_episode_id: None,
+        anchors: Vec::new(),
     }
 }
 
@@ -219,7 +279,7 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
 pub fn episode_tags(episode: &Episode) -> Vec<String> {
     vec![
         "session_episode".to_string(),
-        "schema_v1".to_string(),
+        "schema_v2".to_string(),
         format!("project_{}", episode.project),
         format!("conv_{}", episode.session_id),
     ]
@@ -491,7 +551,7 @@ mod tests {
 
         let ep = extract_episode(&lines, "sess-123", "my-project");
 
-        assert_eq!(ep.schema, "v1");
+        assert_eq!(ep.schema, "v2");
         assert_eq!(ep.session_id, "sess-123");
         assert_eq!(ep.project, "my-project");
         assert!(ep.request.contains("fix the authentication bug"));
@@ -560,6 +620,10 @@ mod tests {
             files_modified: vec!["/src/main.rs".to_string()],
             message_count: 10,
             duration_minutes: 5,
+            todos: vec![],
+            approved_plan: None,
+            prev_episode_id: None,
+            anchors: vec![],
         };
 
         let json = serde_json::to_string(&ep).unwrap();
@@ -602,14 +666,60 @@ mod tests {
             files_modified: vec![],
             message_count: 0,
             duration_minutes: 0,
+            todos: vec![],
+            approved_plan: None,
+            prev_episode_id: None,
+            anchors: vec![],
         };
 
         let tags = episode_tags(&ep);
 
         assert_eq!(tags.len(), 4);
         assert!(tags.contains(&"session_episode".to_string()));
-        assert!(tags.contains(&"schema_v1".to_string()));
+        assert!(tags.contains(&"schema_v2".to_string()));
         assert!(tags.contains(&"project_cool-project".to_string()));
         assert!(tags.contains(&"conv_sess-abc".to_string()));
+    }
+
+    #[test]
+    fn episode_v2_extracts_todos_and_plan() {
+        let lines = vec![
+            r#"{"type":"user","message":{"content":"fix the auth bug"}}"#,
+            r###"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"## Plan\n1. Fix validate_token\n2. Add test"}}]}}"###,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"fix validate_token","status":"completed"},{"content":"add regression test","status":"pending"}]}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Fixed the validation."}]}}"#,
+        ];
+        let ep = extract_episode(&lines, "sess-1", "proj");
+        assert_eq!(ep.schema, "v2");
+        assert_eq!(ep.todos.len(), 2);
+        assert_eq!(ep.todos[1].content, "add regression test");
+        assert_eq!(ep.todos[1].status, "pending");
+        let plan = ep.approved_plan.expect("plan captured");
+        assert!(plan.contains("Fix validate_token"));
+        assert!(ep.prev_episode_id.is_none());
+        assert!(ep.anchors.is_empty());
+    }
+
+    #[test]
+    fn episode_v2_keeps_last_todowrite_only() {
+        let lines = vec![
+            r#"{"type":"user","message":{"content":"task"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"old","status":"pending"}]}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"new","status":"in_progress"}]}}]}}"#,
+        ];
+        let ep = extract_episode(&lines, "sess-1", "proj");
+        assert_eq!(ep.todos.len(), 1);
+        assert_eq!(ep.todos[0].content, "new");
+    }
+
+    #[test]
+    fn episode_v1_json_still_deserializes() {
+        let v1 = r#"{"schema":"v1","session_id":"s","project":"p","timestamp":"t",
+            "request":"r","investigated":[],"completed":"c","next_steps":null,
+            "blockers":null,"outcome":"partial","error_signatures":[],"tools_used":[],
+            "files_modified":[],"message_count":1,"duration_minutes":0}"#;
+        let ep: Episode = serde_json::from_str(v1).expect("v1 compat");
+        assert!(ep.todos.is_empty());
+        assert!(ep.approved_plan.is_none());
     }
 }
