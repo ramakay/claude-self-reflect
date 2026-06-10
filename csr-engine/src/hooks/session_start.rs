@@ -212,19 +212,27 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         }
     }
 
-    // Tier-0 continuity block from the latest episode (non-fatal)
+    // Tier-0 continuity block from the latest episode (non-fatal).
+    // Exact project-tag match avoids LIKE '%project_foo%' matching 'project_foobar'.
     if let Some(project) = resolve_project_from_cwd(&cwd.to_string_lossy()) {
         let project_tag = format!("project_{}", project);
-        if let Ok(rows) = engine.storage().get_reflections_by_tag(&project_tag, 20) {
+        if let Ok(rows) = engine.storage().get_reflections_by_tag(&project_tag, 50) {
             let latest = rows
                 .iter()
-                .filter(|(_, _, tags, _)| tags.iter().any(|t| t == "session_episode"))
+                .filter(|(_, _, tags, _)| {
+                    tags.iter().any(|t| t == "session_episode")
+                        && tags.iter().any(|t| t == &project_tag)
+                })
                 .max_by(|a, b| a.3.cmp(&b.3));
             if let Some((_, content, _, ts)) = latest {
                 if let Ok(ep) = serde_json::from_str::<Episode>(content) {
+                    // Cap anchor verification so a large episode never stalls startup
+                    // (catch-all hook must not block Claude Code).
+                    const MAX_TIER0_VERIFY: usize = 40;
                     let verdicts: Vec<(String, AnchorVerdict)> = ep
                         .anchors
                         .iter()
+                        .take(MAX_TIER0_VERIFY)
                         .map(|a| (a.name.clone(), verify_anchor(a, cwd)))
                         .collect();
                     let age = relative_time_label(ts, &Utc::now());
@@ -551,7 +559,12 @@ pub fn format_tier0_block(
         .iter()
         .filter(|(_, v)| *v == AnchorVerdict::Intact)
         .count();
-    let modified: Vec<&str> = anchor_verdicts
+    // True modified count (not capped); only the first 3 names are listed.
+    let modified_count = anchor_verdicts
+        .iter()
+        .filter(|(_, v)| *v == AnchorVerdict::Modified)
+        .count();
+    let modified_names: Vec<&str> = anchor_verdicts
         .iter()
         .filter(|(_, v)| *v == AnchorVerdict::Modified)
         .map(|(n, _)| n.as_str())
@@ -567,11 +580,11 @@ pub fn format_tier0_block(
         out.push_str(&format!(
             "ANCHORS: {} intact, {} modified since checkpoint{}\n",
             intact,
-            modified.len(),
-            if modified.is_empty() {
+            modified_count,
+            if modified_names.is_empty() {
                 String::new()
             } else {
-                format!(" ({})", modified.join(", "))
+                format!(" ({})", modified_names.join(", "))
             }
         ));
     }

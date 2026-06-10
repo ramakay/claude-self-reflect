@@ -374,12 +374,16 @@ pub async fn extract_and_store_episode(
             .extend(crate::extraction::anchors::capture_file_anchors(&path));
     }
 
-    // Chain link: most recent episode for this project, excluding this session
+    // Chain link: most recent episode for this project, excluding this session.
+    // Exact project-tag match avoids LIKE '%project_foo%' matching 'project_foobar'.
     let project_tag = format!("project_{}", project_name);
     if let Ok(existing) = engine.storage().get_reflections_by_tag(&project_tag, 50) {
         let candidates: Vec<(String, String)> = existing
             .iter()
-            .filter(|(_, _, tags, _)| tags.iter().any(|t| t == "session_episode"))
+            .filter(|(_, _, tags, _)| {
+                tags.iter().any(|t| t == "session_episode")
+                    && tags.iter().any(|t| t == &project_tag)
+            })
             .filter_map(|(_, content, _, ts)| {
                 let v: serde_json::Value = serde_json::from_str(content).ok()?;
                 Some((v.get("session_id")?.as_str()?.to_string(), ts.clone()))
