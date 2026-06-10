@@ -299,7 +299,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("session-briefing"));
-        assert_eq!(briefing_hook["hooks"][0]["async"].as_bool().unwrap(), true);
+        assert!(briefing_hook["hooks"][0]["async"].as_bool().unwrap());
         assert_eq!(briefing_hook["hooks"][0]["timeout"].as_u64().unwrap(), 150);
         // Briefing only on startup|resume (not compact — compact doesn't need fresh briefing)
         assert_eq!(briefing_hook["matcher"].as_str().unwrap(), "startup|resume");

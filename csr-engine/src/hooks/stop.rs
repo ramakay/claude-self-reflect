@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_extract_episode_from_transcript() {
-        let lines_owned = vec![
+        let lines_owned = [
             user_line("Please fix the authentication bug in the login handler"),
             assistant_tool_line(&[("Read", "/src/auth/login.rs")]),
             assistant_tool_line(&[("Grep", "/src/auth/mod.rs")]),
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_extract_episode_short_session() {
-        let lines_owned = vec![user_line("Hello")];
+        let lines_owned = [user_line("Hello")];
         let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
 
         let ep = extract_episode(&lines, "sess-short", "test-proj");
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_extract_episode_with_errors() {
-        let lines_owned = vec![
+        let lines_owned = [
             user_line("Build the project"),
             assistant_text_line("Let me try building..."),
             assistant_tool_line(&[("Read", "/Cargo.toml")]),

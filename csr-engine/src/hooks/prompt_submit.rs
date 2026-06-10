@@ -648,19 +648,19 @@ mod tests {
     #[test]
     fn test_project_scope_reflection_filter_logic() {
         // Reflections tagged for a different project should be filtered
-        let tags_other = vec!["project_anukriti".to_string(), "session_story".to_string()];
+        let tags_other = ["project_anukriti".to_string(), "session_story".to_string()];
         let project = "csr";
         let project_tag = format!("project_{}", project);
         let has_project_tags = tags_other.iter().any(|t| t.starts_with("project_"));
         assert!(has_project_tags && !tags_other.contains(&project_tag));
 
         // Legacy reflections without project tags should pass through
-        let tags_legacy = vec!["session_story".to_string()];
+        let tags_legacy = ["session_story".to_string()];
         let has_project_tags_legacy = tags_legacy.iter().any(|t| t.starts_with("project_"));
         assert!(!has_project_tags_legacy); // no filter applied
 
         // Same-project reflections should pass
-        let tags_same = vec!["project_csr".to_string(), "session_story".to_string()];
+        let tags_same = ["project_csr".to_string(), "session_story".to_string()];
         let has_project_tags_same = tags_same.iter().any(|t| t.starts_with("project_"));
         assert!(has_project_tags_same && tags_same.contains(&project_tag));
     }

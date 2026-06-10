@@ -158,8 +158,9 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // intentional regression guard on the const
     fn test_briefing_timeout_reasonable() {
         // claude -p has ~30s startup; allow generous async budget up to 3 min
-        assert!(BRIEFING_TIMEOUT_SECS >= 60 && BRIEFING_TIMEOUT_SECS <= 180);
+        assert!((60..=180).contains(&BRIEFING_TIMEOUT_SECS));
     }
 }

@@ -594,7 +594,7 @@ mod tests {
         std::fs::write(dir.join("chunks.hnsw.data"), "old_data").unwrap();
         std::fs::write(dir.join("chunks.hnsw.graph"), "old_graph").unwrap();
 
-        promote_to_canonical(dir, "chunks-4567", "chunks");
+        let _ = promote_to_canonical(dir, "chunks-4567", "chunks");
 
         // Canonical files should have the new content
         assert_eq!(
@@ -616,7 +616,7 @@ mod tests {
         let dir = tmp.path();
         std::fs::write(dir.join("chunks.hnsw.data"), "data").unwrap();
 
-        promote_to_canonical(dir, "chunks", "chunks"); // should not panic or corrupt
+        let _ = promote_to_canonical(dir, "chunks", "chunks"); // should not panic or corrupt
         assert_eq!(
             std::fs::read_to_string(dir.join("chunks.hnsw.data")).unwrap(),
             "data"
