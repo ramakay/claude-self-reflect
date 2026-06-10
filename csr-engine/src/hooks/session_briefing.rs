@@ -32,10 +32,11 @@ const BRIEFING_TIMEOUT_SECS: u64 = 120;
 const BRIEFING_PROMPT: &str = concat!(
     "You are CSR Episode Analyst. Generate a brief, actionable session briefing.\n\n",
     "STEP 1: Use the csr_reflect_on_past tool to search for recent episodes.\n",
-    "Query: \"session_episode schema_v1\"\n",
+    "Query: \"session_episode\"\n",
     "Limit: 5\n\n",
     "STEP 2: Each result is a JSON episode with fields: request, investigated, completed, ",
-    "next_steps, outcome, error_signatures, tools_used, files_modified.\n\n",
+    "next_steps, outcome, error_signatures, tools_used, files_modified, ",
+    "todos, approved_plan, prev_episode_id, anchors.\n\n",
     "STEP 3: Write a concise briefing (under 150 words). Start with '## Session Intelligence (CSR v9.2)'.\n",
     "Reference specific file names, error messages, and outcomes. Look for:\n",
     "- Recent work and outcomes\n",
