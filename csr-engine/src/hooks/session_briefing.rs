@@ -23,10 +23,15 @@ use crate::engine::Engine;
 use crate::search::cross_project::resolve_project_from_cwd;
 
 /// Max seconds to wait for `claude -p` to return a briefing.
-/// Generous because: (a) claude -p has ~30s startup cost loading MCP servers,
+/// Generous because: (a) claude -p base startup + Haiku reasoning take time,
 /// (b) Haiku must call csr_reflect_on_past and reason over results,
 /// (c) we run async so user never waits.
 const BRIEFING_TIMEOUT_SECS: u64 = 120;
+
+/// Skip generating a new briefing if one was produced for this project within
+/// this many minutes. Prevents a fresh `claude -p` spawn on every resume/compact
+/// when nothing has materially changed.
+const BRIEFING_DEBOUNCE_MINUTES: i64 = 30;
 
 /// Prompt sent to Haiku for episode analysis.
 const BRIEFING_PROMPT: &str = concat!(
@@ -58,6 +63,16 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
     let project = resolve_project_from_cwd(&cwd.to_string_lossy());
     let project_name = project.as_deref().unwrap_or("unknown");
 
+    // Debounce: skip if a briefing for this project was generated recently. Avoids
+    // spawning a fresh `claude -p` on every resume/compact within a working session.
+    if recent_briefing_exists(engine, project_name, BRIEFING_DEBOUNCE_MINUTES) {
+        tracing::debug!(
+            project = project_name,
+            "skipping briefing — generated recently"
+        );
+        return Ok(());
+    }
+
     // Shell out to claude -p with Haiku model.
     // Block on tokio's spawn_blocking since std::process::Command is sync.
     let briefing = tokio::task::spawn_blocking(invoke_haiku_briefing).await??;
@@ -76,12 +91,21 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
 /// Invoke `claude -p --model haiku-4-5 "<prompt>"` and capture stdout.
 /// Returns the briefing text, or an error if the invocation fails or times out.
 fn invoke_haiku_briefing() -> Result<String> {
+    // Restrict the subprocess to ONLY the csr-engine MCP server. Without this the
+    // nested `claude -p` loads every configured MCP server (~30s) just to call one
+    // tool. --strict-mcp-config + a one-server config keeps startup to csr-engine's
+    // own ~fast cache load.
+    let mcp_config_path = write_minimal_mcp_config()?;
+
     let mut child = Command::new("claude")
         .arg("-p")
         .arg("--model")
         .arg("claude-haiku-4-5-20251001")
         .arg("--output-format")
         .arg("text")
+        .arg("--strict-mcp-config")
+        .arg("--mcp-config")
+        .arg(&mcp_config_path)
         .arg("--dangerously-skip-permissions")
         .arg(BRIEFING_PROMPT)
         .stdout(Stdio::piped())
@@ -147,6 +171,47 @@ fn store_briefing(engine: &Engine, project: &str, briefing: &str) -> Result<()> 
     Ok(())
 }
 
+/// Write a minimal MCP config containing only the csr-engine server, used with
+/// `--strict-mcp-config` so the briefing subprocess doesn't load every other server.
+/// Points at the currently-running binary so the subprocess uses the same version.
+fn write_minimal_mcp_config() -> Result<std::path::PathBuf> {
+    let csr_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "csr-engine".to_string());
+    let config = serde_json::json!({
+        "mcpServers": {
+            "claude-self-reflect": { "command": csr_bin }
+        }
+    });
+    let dir = dirs::home_dir()
+        .map(|h| h.join(".claude-self-reflect"))
+        .ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join("briefing-mcp.json");
+    std::fs::write(&path, serde_json::to_string(&config)?)?;
+    Ok(path)
+}
+
+/// True if a `session_briefing` reflection for this project was stored within the
+/// last `within_minutes`. Reflection timestamps are stored as RFC3339.
+fn recent_briefing_exists(engine: &Engine, project: &str, within_minutes: i64) -> bool {
+    let project_tag = format!("project_{}", project);
+    let Ok(existing) = engine
+        .storage()
+        .get_reflections_by_tag("session_briefing", 50)
+    else {
+        return false;
+    };
+    let cutoff = chrono::Utc::now() - chrono::Duration::minutes(within_minutes);
+    existing.iter().any(|(_, _, tags, ts)| {
+        tags.iter().any(|t| t == &project_tag)
+            && chrono::DateTime::parse_from_rfc3339(ts)
+                .map(|t| t.with_timezone(&chrono::Utc) > cutoff)
+                .unwrap_or(false)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +228,25 @@ mod tests {
     fn test_briefing_timeout_reasonable() {
         // claude -p has ~30s startup; allow generous async budget up to 3 min
         assert!((60..=180).contains(&BRIEFING_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn test_minimal_mcp_config_has_only_csr() {
+        let path = write_minimal_mcp_config().unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let servers = v["mcpServers"].as_object().unwrap();
+        assert_eq!(
+            servers.len(),
+            1,
+            "strict config must list exactly one server"
+        );
+        assert!(servers.contains_key("claude-self-reflect"));
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)] // intentional regression guard on the const
+    fn test_debounce_window_reasonable() {
+        assert!((5..=120).contains(&BRIEFING_DEBOUNCE_MINUTES));
     }
 }
