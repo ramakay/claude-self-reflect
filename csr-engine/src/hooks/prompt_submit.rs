@@ -75,6 +75,20 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         return Ok(());
     }
 
+    // Symbol-overlap gate: prompt names an anchored function → one-line pointer
+    if let Some(project) = resolve_project_from_cwd(&cwd.to_string_lossy()) {
+        if let Ok(rows) = engine.storage().get_project_anchors(&project, 200) {
+            let names: Vec<(String, String)> =
+                rows.into_iter().map(|(sid, a)| (sid, a.name)).collect();
+            if let Some((sid, name)) = symbol_overlap(prompt, &names) {
+                println!(
+                    "CSR: `{}` was modified in a recent session — episode: csr_reflect_on_past(\"conv_{}\")",
+                    name, sid
+                );
+            }
+        }
+    }
+
     let storage = engine.storage();
     let embeddings = engine.embeddings();
     let search = engine.search();
@@ -580,9 +594,39 @@ fn is_self_referential_noise(content: &str) -> bool {
         .any(|pattern| lower.contains(&pattern.to_lowercase()))
 }
 
+/// Match prompt text against anchored symbol names.
+/// Names shorter than 6 chars are skipped (too collision-prone: main, init, run).
+pub fn symbol_overlap(
+    prompt: &str,
+    anchors: &[(String, String)], // (session_id, name) — name may be qualified (A::new)
+) -> Option<(String, String)> {
+    anchors
+        .iter()
+        .find(|(_, name)| {
+            // Match the bare segment: prompts say "validate_token", not "Auth::validate_token"
+            let bare = name.rsplit("::").next().unwrap_or(name);
+            bare.len() >= 6 && prompt.contains(bare)
+        })
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbol_overlap_detects_anchored_names() {
+        let anchors = vec![
+            ("s1".to_string(), "validate_token".to_string()),
+            ("s1".to_string(), "main".to_string()), // short/common — must be ignored
+        ];
+        assert_eq!(
+            symbol_overlap("the validate_token check is wrong", &anchors),
+            Some(("s1".to_string(), "validate_token".to_string()))
+        );
+        assert_eq!(symbol_overlap("main thing to do today", &anchors), None);
+        assert_eq!(symbol_overlap("unrelated prompt", &anchors), None);
+    }
 
     #[test]
     fn test_extract_file_paths() {
