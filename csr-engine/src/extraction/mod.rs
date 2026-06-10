@@ -3,6 +3,7 @@
 //! Produces a 500-token search index + 1000-token context cache per conversation.
 //! Pure computation, no IO.
 
+pub mod anchors;
 pub mod ast_analysis;
 pub mod errors;
 pub mod heuristic;

@@ -251,7 +251,7 @@ fn analyze_code_inner(source: &str, lang: SupportLang) -> CodeContext {
 }
 
 /// Get function definition kind names for a language.
-fn func_kinds(lang: SupportLang) -> &'static [&'static str] {
+pub(crate) fn func_kinds(lang: SupportLang) -> &'static [&'static str] {
     match lang {
         SupportLang::Rust => &["function_item"],
         SupportLang::Python => &["function_definition"],
@@ -296,7 +296,7 @@ fn import_kinds(lang: SupportLang) -> &'static [&'static str] {
 }
 
 /// Extract the name identifier from a definition node.
-fn extract_name_from_def<D: ast_grep_core::Doc>(
+pub(crate) fn extract_name_from_def<D: ast_grep_core::Doc>(
     node: &ast_grep_core::NodeMatch<'_, D>,
     _lang: SupportLang,
 ) -> Option<String> {
