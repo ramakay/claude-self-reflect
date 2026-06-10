@@ -128,6 +128,20 @@ pub fn run(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_code_evolution_file ON code_evolution(file_path);
         CREATE INDEX IF NOT EXISTS idx_code_evolution_session ON code_evolution(session_id, timestamp);
+
+        CREATE TABLE IF NOT EXISTS episode_anchors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            project    TEXT NOT NULL,
+            file       TEXT NOT NULL,
+            node_kind  TEXT NOT NULL,
+            name       TEXT NOT NULL,
+            body_hash  TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(session_id, file, name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_episode_anchors_project ON episode_anchors(project);
+        CREATE INDEX IF NOT EXISTS idx_episode_anchors_name ON episode_anchors(name);
         ",
     )?;
 

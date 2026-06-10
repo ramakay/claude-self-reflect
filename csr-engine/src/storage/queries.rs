@@ -524,6 +524,60 @@ pub fn delete_reflection(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Replace all episode anchors for a session (delete-then-insert upsert).
+pub fn replace_session_anchors(
+    conn: &Connection,
+    session_id: &str,
+    project: &str,
+    anchors: &[crate::extraction::anchors::FunctionAnchor],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM episode_anchors WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO episode_anchors (session_id, project, file, node_kind, name, body_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for a in anchors {
+        stmt.execute(params![
+            session_id,
+            project,
+            a.file,
+            a.node_kind,
+            a.name,
+            a.body_hash
+        ])?;
+    }
+    Ok(())
+}
+
+/// Most-recent-first anchors for a project: `(session_id, anchor)`.
+pub fn get_project_anchors(
+    conn: &Connection,
+    project: &str,
+    limit: i64,
+) -> Result<Vec<(String, crate::extraction::anchors::FunctionAnchor)>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, file, node_kind, name, body_hash
+         FROM episode_anchors WHERE project = ?1
+         ORDER BY created_at DESC, id DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![project, limit], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            crate::extraction::anchors::FunctionAnchor {
+                file: r.get(1)?,
+                node_kind: r.get(2)?,
+                name: r.get(3)?,
+                body_hash: r.get(4)?,
+            },
+        ))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// Get the reflection ID for a conversation's enrichment (for supersession).
 pub fn get_enrichment_reflection_id(
     conn: &Connection,

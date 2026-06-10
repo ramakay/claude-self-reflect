@@ -487,4 +487,54 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_session_code_evolution(&conn, session_id)
     }
+
+    // ─── Episode anchors (v9.3) ───
+
+    /// Replace all anchors for a session (delete-then-insert upsert).
+    pub fn replace_session_anchors(
+        &self,
+        session_id: &str,
+        project: &str,
+        anchors: &[crate::extraction::anchors::FunctionAnchor],
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::replace_session_anchors(&conn, session_id, project, anchors)
+    }
+
+    /// Most-recent-first anchors for a project: `(session_id, anchor)`.
+    pub fn get_project_anchors(
+        &self,
+        project: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, crate::extraction::anchors::FunctionAnchor)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_project_anchors(&conn, project, limit as i64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn episode_anchors_roundtrip() {
+        let storage = Storage::open_memory().unwrap();
+        let a = crate::extraction::anchors::FunctionAnchor {
+            file: "src/auth.rs".into(),
+            node_kind: "function_item".into(),
+            name: "validate_token".into(),
+            body_hash: "9f3a1c2e44b8d701".into(),
+        };
+        storage
+            .replace_session_anchors("sess-1", "proj", std::slice::from_ref(&a))
+            .unwrap();
+        // Upsert: replacing again must not duplicate
+        storage
+            .replace_session_anchors("sess-1", "proj", std::slice::from_ref(&a))
+            .unwrap();
+        let got = storage.get_project_anchors("proj", 100).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1.name, "validate_token");
+        assert_eq!(got[0].0, "sess-1"); // session_id comes back too
+    }
 }
