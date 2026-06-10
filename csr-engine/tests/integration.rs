@@ -1427,3 +1427,49 @@ fn test_tad_batch_retrieval_events() {
         csr_engine::search::decay::SessionOutcome::Success
     );
 }
+
+#[test]
+fn episode_v2_full_cycle_with_anchors() {
+    // Arrange: temp project with one Rust source file
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("auth.rs");
+    std::fs::write(&src, "fn validate_token(t: &str) -> bool { t.len() > 8 }\n").unwrap();
+
+    // Transcript that modified that file via Edit + left a todo
+    let transcript = [
+        r#"{"type":"user","message":{"content":"fix token validation"}}"#.to_string(),
+        format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Edit","input":{{"file_path":"{}"}}}}]}}}}"#,
+            src.display()
+        ),
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"add test","status":"pending"}]}}]}}"#.to_string(),
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done, fixed."}]}}"#.to_string(),
+    ];
+    let lines: Vec<&str> = transcript.iter().map(|s| s.as_str()).collect();
+
+    // Act: extract
+    let ep = csr_engine::hooks::stop::extract_episode(&lines, "it-sess", "it-proj");
+
+    // Assert v2 fields
+    assert_eq!(ep.schema, "v2");
+    assert_eq!(ep.todos.len(), 1);
+    assert_eq!(ep.files_modified.len(), 1);
+
+    // Anchor capture + graded verification
+    let anchors = csr_engine::extraction::anchors::capture_file_anchors(&src);
+    assert_eq!(anchors.len(), 1);
+    assert_eq!(anchors[0].name, "validate_token");
+    assert_eq!(
+        csr_engine::extraction::anchors::verify_anchor(&anchors[0], dir.path()),
+        csr_engine::extraction::anchors::AnchorVerdict::Intact
+    );
+    std::fs::write(
+        &src,
+        "fn validate_token(t: &str) -> bool { t.len() > 99 }\n",
+    )
+    .unwrap();
+    assert_eq!(
+        csr_engine::extraction::anchors::verify_anchor(&anchors[0], dir.path()),
+        csr_engine::extraction::anchors::AnchorVerdict::Modified
+    );
+}
