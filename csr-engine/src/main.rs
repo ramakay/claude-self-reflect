@@ -101,6 +101,18 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show aggregated telemetry: hook latencies, startup stats, enrichment health
+    Telemetry {
+        /// Window (e.g. "24h", "7d", "30m", "all"). Default: 24h.
+        #[arg(long)]
+        since: Option<String>,
+        /// Emit JSON instead of the text report
+        #[arg(long)]
+        json: bool,
+        /// Open the live multi-pane TUI dashboard (q to quit)
+        #[arg(long)]
+        tui: bool,
+    },
     /// Generate a Haiku-curated session story (fire-and-forget from SessionEnd)
     GenerateStory {
         /// Path to the session transcript JSONL
@@ -145,6 +157,10 @@ async fn main() -> Result<()> {
 
     if let Some(Commands::Status { compact, swiftbar }) = args.command {
         return csr_engine::status::handle(&args.db_path, &args.projects_dir, compact, swiftbar);
+    }
+
+    if let Some(Commands::Telemetry { since, json, tui }) = args.command {
+        return csr_engine::telemetry::handle(&args.db_path, &args.projects_dir, since, json, tui);
     }
 
     if let Some(Commands::Daemon {

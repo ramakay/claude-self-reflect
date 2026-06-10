@@ -14,4 +14,5 @@ pub mod setup;
 pub mod status;
 pub mod storage;
 pub mod summarizer;
+pub mod telemetry;
 pub mod temporal;

@@ -54,6 +54,12 @@ pub fn handle(db_path: &Path, projects_dir: &Path, compact: bool, swiftbar: bool
     Ok(())
 }
 
+/// Public wrapper for `gather_status` — used by the telemetry module to embed
+/// a fresh status snapshot in its report without re-implementing the gather logic.
+pub fn gather_status_public(db_path: &Path, projects_dir: &Path) -> Result<StatusReport> {
+    gather_status(db_path, projects_dir)
+}
+
 /// Gather status data from SQLite and disk.
 fn gather_status(db_path: &Path, projects_dir: &Path) -> Result<StatusReport> {
     // Count total JSONL files on disk
