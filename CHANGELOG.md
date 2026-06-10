@@ -5,6 +5,42 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.2.0] - 2026-06-10
+
+### 🚀 FEATURE: Episode Intelligence + Telemetry Dashboard
+
+#### Episode Intelligence
+- **Structured episode capture**: the Stop hook now extracts a `csr_episode_v1`
+  record (request / investigated / completed / next_steps / outcome /
+  error_signatures / files_modified / tools_used) from transcript heuristics —
+  no LLM call, runs in <10ms.
+- **Async agent hook at SessionStart**: a non-blocking Haiku agent hook reads
+  recent episodes via `csr_reflect_on_past` and emits a proactive session
+  briefing. First tool in the ecosystem to use Claude Code agent hooks.
+- **Episode-aware search**: session episodes render with an `[episode]` prefix
+  in MCP search results, distinguishing them from stories/narratives.
+- **Delete+insert GC**: each session keeps a single current episode; previous
+  versions are removed before insert to avoid search-index bloat.
+
+#### Telemetry Dashboard
+- **`csr-engine telemetry`**: new ops view aggregating `hook-timing.log` +
+  status into hook-latency percentiles (p50/p95/p99/max), startup
+  cached-vs-rebuilt timings, and enrichment health.
+- **`--since <24h|7d|30m|all>`**, **`--json`** for machine-readable output, and
+  **`--tui`** for a live ratatui dashboard.
+
+### 🐛 Fixes
+- **V3 extraction retry storm**: the enrichment daemon re-opened deleted/rotated
+  source JSONL files every tick and re-queued them forever (`v3_failed`
+  climbing in telemetry, repeated `opening JSONL file for extraction` WARNs).
+  Missing sources are now marked `unavailable` (a non-requeued terminal state).
+- **`.mcp.json`**: config now correctly nested under the `mcpServers` key.
+
+### 🔧 Internal
+- Version aligned across `package.json` and the `csr-engine` crate (→ 9.2.0);
+  the MCP server now reports the real release version via `binary_version`.
+- Zero clippy warnings restored across lib, tests, and examples.
+
 ## [7.1.9] - 2026-01-05
 
 ### 🚀 FEATURE: Cross-Project Iteration Memory
