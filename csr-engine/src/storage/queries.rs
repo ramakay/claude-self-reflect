@@ -27,6 +27,78 @@ pub fn insert_chunk_provenance(
     Ok(())
 }
 
+/// Upsert a derivation-ledger entry (Pillar 1). `times_reused` is preserved on
+/// conflict so a re-import never resets reuse counts.
+pub fn upsert_ledger_entry(conn: &Connection, e: &crate::ledger::LedgerEntry) -> Result<()> {
+    conn.execute(
+        "INSERT INTO derivation_ledger
+             (id, content, anchor, cost_bucket, inferability, confidence, times_reused, repo, branch, user)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(id) DO UPDATE SET
+             content=excluded.content, anchor=excluded.anchor,
+             cost_bucket=excluded.cost_bucket, inferability=excluded.inferability,
+             confidence=excluded.confidence",
+        rusqlite::params![
+            e.id,
+            e.content,
+            e.anchor,
+            e.cost_bucket.as_str(),
+            e.inferability,
+            e.confidence,
+            e.times_reused as i64,
+            e.scope.repo,
+            e.scope.branch,
+            e.scope.user,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Fetch ledger entries for an exact {repo, branch, user} scope, newest first.
+pub fn get_ledger_entries(
+    conn: &Connection,
+    scope: &crate::ledger::Scope,
+    limit: i64,
+) -> Result<Vec<crate::ledger::LedgerEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, content, anchor, cost_bucket, inferability, confidence, times_reused,
+                repo, branch, user
+         FROM derivation_ledger
+         WHERE repo = ?1 AND branch = ?2 AND user = ?3
+         ORDER BY created_at DESC, id DESC LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![scope.repo, scope.branch, scope.user, limit],
+        |r| {
+            Ok(crate::ledger::LedgerEntry {
+                id: r.get(0)?,
+                content: r.get(1)?,
+                anchor: r.get(2)?,
+                cost_bucket: crate::ledger::CostBucket::from_str_lossy(&r.get::<_, String>(3)?),
+                inferability: r.get(4)?,
+                confidence: r.get(5)?,
+                times_reused: r.get::<_, i64>(6)? as u32,
+                scope: crate::ledger::Scope {
+                    repo: r.get(7)?,
+                    branch: r.get(8)?,
+                    user: r.get(9)?,
+                },
+            })
+        },
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Increment the reuse counter for a ledger entry (governor signal, Pillar 4).
+pub fn increment_ledger_reuse(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE derivation_ledger SET times_reused = times_reused + 1 WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
 /// Fetch provenance for a chunk, if any. Unknown author tokens degrade to
 /// `ToolResult` (non-authoritative) rather than failing the read.
 pub fn get_chunk_provenance(conn: &Connection, chunk_id: &str) -> Result<Option<ChunkProvenance>> {

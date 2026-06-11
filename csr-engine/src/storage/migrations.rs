@@ -150,6 +150,21 @@ pub fn run(conn: &Connection) -> Result<()> {
             supersedes     TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_chunk_provenance_author ON chunk_provenance(author);
+
+        CREATE TABLE IF NOT EXISTS derivation_ledger (
+            id           TEXT PRIMARY KEY,
+            content      TEXT NOT NULL,
+            anchor       TEXT,
+            cost_bucket  TEXT NOT NULL,
+            inferability REAL NOT NULL,
+            confidence   REAL NOT NULL,
+            times_reused INTEGER NOT NULL DEFAULT 0,
+            repo         TEXT NOT NULL,
+            branch       TEXT NOT NULL,
+            user         TEXT NOT NULL,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_ledger_scope ON derivation_ledger(repo, branch, user);
         ",
     )?;
 

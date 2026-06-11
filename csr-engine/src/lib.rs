@@ -8,6 +8,7 @@ pub mod format;
 pub mod hooks;
 pub mod import;
 pub mod injection;
+pub mod ledger;
 pub mod mcp;
 pub mod provenance;
 pub mod search;

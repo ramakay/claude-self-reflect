@@ -68,6 +68,28 @@ impl Storage {
         queries::get_chunk_provenance(&conn, chunk_id)
     }
 
+    /// Upsert a derivation-ledger entry (Pillar 1).
+    pub fn upsert_ledger_entry(&self, entry: &crate::ledger::LedgerEntry) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::upsert_ledger_entry(&conn, entry)
+    }
+
+    /// Fetch ledger entries for an exact {repo, branch, user} scope.
+    pub fn get_ledger_entries(
+        &self,
+        scope: &crate::ledger::Scope,
+        limit: usize,
+    ) -> Result<Vec<crate::ledger::LedgerEntry>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_ledger_entries(&conn, scope, limit as i64)
+    }
+
+    /// Increment a ledger entry's reuse counter (governor signal, Pillar 4).
+    pub fn increment_ledger_reuse(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::increment_ledger_reuse(&conn, id)
+    }
+
     pub fn get_chunks_by_ids(&self, ids: &[String]) -> Result<Vec<ConversationChunk>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_chunks_by_ids(&conn, ids)
@@ -617,5 +639,45 @@ mod tests {
         assert_eq!(got.supersedes.as_deref(), Some("behavioral continuity"));
 
         assert!(storage.get_chunk_provenance("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn derivation_ledger_roundtrip_and_reuse() {
+        use crate::ledger::{CostBucket, LedgerEntry, Scope};
+        let storage = Storage::open_memory().unwrap();
+        let scope = Scope {
+            repo: "csr".into(),
+            branch: "main".into(),
+            user: "rama".into(),
+        };
+        let e = LedgerEntry {
+            id: "f1".into(),
+            content: "epistemic continuity supersedes behavioral".into(),
+            anchor: Some("validate_token".into()),
+            cost_bucket: CostBucket::Expensive,
+            inferability: 0.1,
+            confidence: 0.9,
+            times_reused: 0,
+            scope: scope.clone(),
+        };
+        storage.upsert_ledger_entry(&e).unwrap();
+        storage.upsert_ledger_entry(&e).unwrap(); // upsert: no dup
+
+        let got = storage.get_ledger_entries(&scope, 100).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].cost_bucket, CostBucket::Expensive);
+        assert_eq!(got[0].anchor.as_deref(), Some("validate_token"));
+
+        storage.increment_ledger_reuse("f1").unwrap();
+        let got = storage.get_ledger_entries(&scope, 100).unwrap();
+        assert_eq!(got[0].times_reused, 1);
+
+        // Scope isolation: a different scope sees nothing.
+        let other = Scope {
+            repo: "csr".into(),
+            branch: "feature".into(),
+            user: "rama".into(),
+        };
+        assert!(storage.get_ledger_entries(&other, 100).unwrap().is_empty());
     }
 }
