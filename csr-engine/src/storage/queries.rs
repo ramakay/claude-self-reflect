@@ -34,7 +34,7 @@ pub fn upsert_ledger_entry(conn: &Connection, e: &crate::ledger::LedgerEntry) ->
         "INSERT INTO derivation_ledger
              (id, content, anchor, cost_bucket, inferability, confidence, times_reused, repo, branch, user)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(id) DO UPDATE SET
+         ON CONFLICT(id, repo, branch, user) DO UPDATE SET
              content=excluded.content, anchor=excluded.anchor,
              cost_bucket=excluded.cost_bucket, inferability=excluded.inferability,
              confidence=excluded.confidence",

@@ -54,9 +54,11 @@ pub fn adjusted_score(c: &RankCandidate) -> f32 {
     if is_mechanic_text(&c.content) {
         s -= W_MECHANIC_PENALTY;
     }
-    // A non-user source asserting a correction/decision is claiming authority it
-    // doesn't have — the poisoning vector. Demote below honest content.
-    if author != Some(Speaker::User) && is_authority_claim(&c.content) {
+    // A tool_result asserting a correction/decision is claiming authority it
+    // doesn't have — the poisoning vector. Demote below honest content. Only a
+    // KNOWN tool_result is penalized: unknown/None provenance (reflections,
+    // episodes) is not treated as poison on an innocuous phrase match (Codex MEDIUM).
+    if author == Some(Speaker::ToolResult) && is_authority_claim(&c.content) {
         s -= W_POISON_PENALTY;
     }
     s
@@ -73,19 +75,31 @@ pub fn rerank(mut cands: Vec<RankCandidate>) -> Vec<RankCandidate> {
     cands
 }
 
-/// Tool-mechanic build-log text: `[Edit: ...]`, `[Bash: ...]`, `[Write: ...]`.
-/// These index *what was done mechanically*, not *what was meant*.
+/// Tool-mechanic markers: `[Edit: ...]`, `[Bash: ...]`, etc. These index *what
+/// was done mechanically*, not *what was meant*.
+const MECHANIC_MARKERS: &[&str] = &[
+    "[Edit:",
+    "[Bash:",
+    "[Write:",
+    "[Read:",
+    "[Tool:",
+    "[MultiEdit:",
+    "[Grep:",
+];
+
+/// A chunk is mechanic if it *leads* with a tool marker OR is mechanic-dominated
+/// (several markers anywhere). The importer concatenates prose before tool
+/// context, so a prefix-only check misses mixed chunks (Codex MEDIUM).
 fn is_mechanic_text(content: &str) -> bool {
     let t = content.trim_start();
-    const PREFIXES: &[&str] = &[
-        "[Edit:",
-        "[Bash:",
-        "[Write:",
-        "[Read:",
-        "[Tool:",
-        "[MultiEdit:",
-    ];
-    PREFIXES.iter().any(|p| t.starts_with(p))
+    if MECHANIC_MARKERS.iter().any(|p| t.starts_with(p)) {
+        return true;
+    }
+    let marker_count: usize = MECHANIC_MARKERS
+        .iter()
+        .map(|m| content.matches(m).count())
+        .sum();
+    marker_count >= 3
 }
 
 /// Content that asserts a correction or a decision — a claim to authority.
@@ -182,6 +196,32 @@ mod tests {
     }
 
     #[test]
+    fn mechanic_dominated_mixed_chunk_is_penalized() {
+        // Codex MEDIUM: prose first, then several tool calls — must still demote.
+        let mixed = RankCandidate {
+            id: "mixed".into(),
+            cosine: 0.8,
+            content: "Let me wire that up.\n[Edit: a.rs] [Bash: cargo test] [Edit: b.rs]".into(),
+            provenance: Some(ChunkProvenance {
+                author: Speaker::Assistant,
+                source_conv_id: "c".into(),
+                supersedes: None,
+            }),
+        };
+        let plain = RankCandidate {
+            id: "plain".into(),
+            cosine: 0.8,
+            content: "discussion of continuity design tradeoffs".into(),
+            provenance: Some(ChunkProvenance {
+                author: Speaker::Assistant,
+                source_conv_id: "c".into(),
+                supersedes: None,
+            }),
+        };
+        assert!(adjusted_score(&plain) > adjusted_score(&mixed));
+    }
+
+    #[test]
     fn tie_preserves_input_order() {
         let a = RankCandidate {
             id: "a".into(),
@@ -198,6 +238,19 @@ mod tests {
         let ranked = rerank(vec![a, b]);
         assert_eq!(ranked[0].id, "a");
         assert_eq!(ranked[1].id, "b");
+    }
+
+    #[test]
+    fn unknown_provenance_authority_claim_not_penalized() {
+        // Codex MEDIUM: reflections/episodes arrive with provenance=None. An
+        // innocuous "the real ..." phrase must NOT be demoted as poison.
+        let none = RankCandidate {
+            id: "ep".into(),
+            cosine: 0.5,
+            content: "the real fix was to bump the timeout".into(),
+            provenance: None,
+        };
+        assert_eq!(adjusted_score(&none), 0.5); // no penalty, no boost
     }
 
     #[test]

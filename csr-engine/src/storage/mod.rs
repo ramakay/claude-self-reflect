@@ -19,8 +19,10 @@ impl Storage {
     /// Open (or create) the database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // foreign_keys=ON is explicit, not build-flag-dependent (Codex MEDIUM):
+        // makes the declared chunk_provenance FK enforced deterministically.
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
         )?;
         migrations::run(&conn)?;
         Ok(Self {
@@ -31,6 +33,7 @@ impl Storage {
     /// Open an in-memory database (for tests).
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         migrations::run(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -679,5 +682,37 @@ mod tests {
             user: "rama".into(),
         };
         assert!(storage.get_ledger_entries(&other, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ledger_same_id_different_scope_no_crosstalk() {
+        // Codex HIGH: an id reused across scopes must NOT clobber the other scope.
+        use crate::ledger::{CostBucket, LedgerEntry, Scope};
+        let storage = Storage::open_memory().unwrap();
+        let mk = |branch: &str, content: &str| LedgerEntry {
+            id: "shared".into(),
+            content: content.into(),
+            anchor: None,
+            cost_bucket: CostBucket::Moderate,
+            inferability: 0.2,
+            confidence: 0.8,
+            times_reused: 0,
+            scope: Scope {
+                repo: "csr".into(),
+                branch: branch.into(),
+                user: "rama".into(),
+            },
+        };
+        let a = mk("main", "main-scope fact");
+        let b = mk("feature", "feature-scope fact");
+        storage.upsert_ledger_entry(&a).unwrap();
+        storage.upsert_ledger_entry(&b).unwrap();
+
+        let got_a = storage.get_ledger_entries(&a.scope, 100).unwrap();
+        let got_b = storage.get_ledger_entries(&b.scope, 100).unwrap();
+        assert_eq!(got_a.len(), 1, "main scope keeps its own row");
+        assert_eq!(got_a[0].content, "main-scope fact");
+        assert_eq!(got_b.len(), 1, "feature scope keeps its own row");
+        assert_eq!(got_b[0].content, "feature-scope fact");
     }
 }

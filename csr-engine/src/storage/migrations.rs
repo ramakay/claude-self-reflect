@@ -152,7 +152,7 @@ pub fn run(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_chunk_provenance_author ON chunk_provenance(author);
 
         CREATE TABLE IF NOT EXISTS derivation_ledger (
-            id           TEXT PRIMARY KEY,
+            id           TEXT NOT NULL,
             content      TEXT NOT NULL,
             anchor       TEXT,
             cost_bucket  TEXT NOT NULL,
@@ -162,7 +162,10 @@ pub fn run(conn: &Connection) -> Result<()> {
             repo         TEXT NOT NULL,
             branch       TEXT NOT NULL,
             user         TEXT NOT NULL,
-            created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+            -- Facts are scoped {repo,branch,user}; the same fact id in a different
+            -- scope is a distinct row, never a clobber (Codex HIGH).
+            PRIMARY KEY (id, repo, branch, user)
         );
         CREATE INDEX IF NOT EXISTS idx_ledger_scope ON derivation_ledger(repo, branch, user);
         ",
