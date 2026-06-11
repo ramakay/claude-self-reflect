@@ -423,6 +423,105 @@ pub async fn run_continuity(embeddings: &Arc<EmbeddingEngine>) -> EvalReport {
     }
 }
 
+/// Live north-star probe: run the **v9.3 rerank path against the REAL index** for
+/// the founding query and report where the true source conversation
+/// (`0bab445f`) lands vs a grep baseline (which finds it instantly at #1).
+///
+/// This is the honest instrument — unlike `run_continuity` (synthetic fixture),
+/// it measures production recall. It does NOT assert PASS/FAIL; it prints the
+/// real ranking so we can see whether CSR actually beats grep yet.
+pub async fn run_continuity_live(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<tokio::sync::RwLock<SearchEngine>>,
+) -> String {
+    const QUERY: &str = "the IIM / continuity vision — epistemic continuity, infinite session without infinite tokens";
+    const TARGET_CONV: &str = "0bab445f";
+    const TOP_N: usize = 20;
+
+    let query_vec = match embeddings.embed_single(QUERY) {
+        Ok(v) => v,
+        Err(e) => return format!("live probe embed error: {e}\n"),
+    };
+
+    let raw = search.read().await.search_chunks(&query_vec, TOP_N, 0.0);
+
+    // Build rerank candidates from real chunks: cosine + content + stored provenance.
+    let mut candidates = Vec::new();
+    let mut conv_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for r in &raw {
+        let chunk = storage
+            .get_chunks_by_ids(std::slice::from_ref(&r.id))
+            .ok()
+            .and_then(|v| v.into_iter().next());
+        let (content, conv) = match chunk {
+            Some(c) => (c.content, c.conversation_id),
+            None => (String::new(), String::new()),
+        };
+        conv_of.insert(r.id.clone(), conv);
+        candidates.push(RankCandidate {
+            content,
+            provenance: storage.get_chunk_provenance(&r.id).ok().flatten(),
+            id: r.id.clone(),
+            cosine: r.score,
+        });
+    }
+
+    let ranked = rerank(candidates);
+
+    // Where does the true source conversation land?
+    let target_rank = ranked
+        .iter()
+        .position(|c| {
+            conv_of
+                .get(&c.id)
+                .is_some_and(|cv| cv.contains(TARGET_CONV))
+        })
+        .map(|p| p + 1);
+    let with_prov = ranked.iter().filter(|c| c.provenance.is_some()).count();
+
+    let mut out = String::new();
+    out.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    out.push_str("CSR Continuity — LIVE north-star probe (real index)\n");
+    out.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
+    out.push_str(&format!("Query: {QUERY}\n"));
+    out.push_str(&format!(
+        "Indexed candidates: {} | with stored provenance: {}\n\n",
+        ranked.len(),
+        with_prov
+    ));
+    out.push_str("Top results after v9.3 rerank (conv — adj_score):\n");
+    for (i, c) in ranked.iter().take(8).enumerate() {
+        let conv = conv_of.get(&c.id).cloned().unwrap_or_default();
+        let conv_short = conv.split('-').next().unwrap_or(&conv);
+        let prov = match &c.provenance {
+            Some(p) => format!("author={:?}", p.author),
+            None => "no-prov".to_string(),
+        };
+        out.push_str(&format!(
+            "  {}. {:<10} cosine={:.3} {}\n",
+            i + 1,
+            conv_short,
+            c.cosine,
+            prov
+        ));
+    }
+    out.push('\n');
+    match target_rank {
+        Some(r) if r == 1 => out.push_str(&format!(
+            "VERDICT: founding decision (conv {TARGET_CONV}) ranks #1 — CSR ties/beats grep ✅\n"
+        )),
+        Some(r) => out.push_str(&format!(
+            "VERDICT: founding decision (conv {TARGET_CONV}) ranks #{r}; grep finds it #1 instantly — GREP STILL WINS ❌\n"
+        )),
+        None => out.push_str(&format!(
+            "VERDICT: founding decision (conv {TARGET_CONV}) NOT in top {TOP_N}; grep finds it #1 — GREP WINS ❌\n"
+        )),
+    }
+    out.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -97,6 +97,9 @@ enum Commands {
         /// Run the continuity gate (North Star: recall + provenance beats grep)
         #[arg(long)]
         continuity: bool,
+        /// Run the LIVE north-star probe against the real index (no fixture)
+        #[arg(long = "continuity-live")]
+        continuity_live: bool,
     },
     /// Backfill session stories from V3/heuristic data (zero cost)
     BackfillStories {
@@ -200,11 +203,26 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(Commands::Eval { full, continuity }) = args.command {
+    if let Some(Commands::Eval {
+        full,
+        continuity,
+        continuity_live,
+    }) = args.command
+    {
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        if continuity_live {
+            let out = csr_engine::eval::continuity::run_continuity_live(
+                eng.storage(),
+                eng.embeddings(),
+                eng.search(),
+            )
+            .await;
+            print!("{out}");
+            return Ok(());
+        }
         if continuity {
             let report = csr_engine::eval::continuity::run_continuity(eng.embeddings()).await;
             print!("{}", report.format_text());
