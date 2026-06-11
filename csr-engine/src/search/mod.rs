@@ -1,5 +1,6 @@
 pub mod cross_project;
 pub mod decay;
+pub mod rerank;
 
 use std::collections::HashSet;
 use std::path::Path;

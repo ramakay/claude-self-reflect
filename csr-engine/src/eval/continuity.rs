@@ -18,6 +18,7 @@ use super::{EvalReport, EvalResult};
 use crate::embeddings::EmbeddingEngine;
 use crate::import::ConversationChunk;
 use crate::provenance::{ChunkProvenance, Speaker};
+use crate::search::rerank::{rerank, RankCandidate};
 use crate::search::SearchEngine;
 use crate::storage::Storage;
 
@@ -386,14 +387,29 @@ pub async fn run_continuity(embeddings: &Arc<EmbeddingEngine>) -> EvalReport {
         Err(e) => return bail(format!("query embed error: {e}"), start),
     };
 
-    // Retrieval attaches the chunk's stored provenance to each hit.
-    let hits: Vec<ContinuityHit> = search
+    // Build candidates: cosine + stored provenance + content, then re-rank by
+    // provenance authority and meaning (not raw cosine).
+    let candidates: Vec<RankCandidate> = search
         .search_chunks(&query_vec, corpus.len(), 0.0)
         .into_iter()
-        .map(|r| ContinuityHit {
+        .map(|r| RankCandidate {
+            content: storage
+                .get_chunk_content(&r.id)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
             provenance: storage.get_chunk_provenance(&r.id).ok().flatten(),
             id: r.id,
-            score: r.score,
+            cosine: r.score,
+        })
+        .collect();
+
+    let hits: Vec<ContinuityHit> = rerank(candidates)
+        .into_iter()
+        .map(|c| ContinuityHit {
+            id: c.id,
+            score: c.cosine,
+            provenance: c.provenance,
         })
         .collect();
 
