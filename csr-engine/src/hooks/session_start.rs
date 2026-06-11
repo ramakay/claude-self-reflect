@@ -337,7 +337,29 @@ fn load_latest_briefing(engine: &Engine, project_name: &str) -> Option<String> {
     briefings
         .into_iter()
         .find(|(_, _, tags, _)| tags.iter().any(|t| t == &project_tag))
-        .map(|(_, content, _, _)| content)
+        .map(|(_, content, _, _)| strip_unrelated_asides(&content))
+}
+
+/// Drop sentences the briefing self-labeled "(unrelated)". Haiku is instructed
+/// to omit tangents, but defense-in-depth: an aside the generator already knows
+/// is irrelevant must never reach context. Splits on sentence boundaries and
+/// removes any sentence containing the "unrelated" marker, keeping the rest.
+fn strip_unrelated_asides(briefing: &str) -> String {
+    briefing
+        .lines()
+        .map(|line| {
+            if !line.to_lowercase().contains("unrelated") {
+                return line.to_string();
+            }
+            // Sentence-level strip so one tangent doesn't nuke a whole line.
+            let kept: Vec<&str> = line
+                .split_inclusive(['.', '!', '?'])
+                .filter(|s| !s.to_lowercase().contains("unrelated"))
+                .collect();
+            kept.join("").trim_end().to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn detect_continued_session(
@@ -1232,6 +1254,18 @@ mod tests {
         assert!(block.contains("1 intact, 1 modified"));
         assert!(block.contains("validate_token"));
         assert!(block.contains(r#"csr_reflect_on_past("conv_abc-123")"#));
+    }
+
+    #[test]
+    fn strip_unrelated_asides_removes_tangent_keeps_rest() {
+        // Round-9: briefing self-labeled a Tailscale aside "(unrelated)" but
+        // still injected it. The aside sentence must go; the rest must stay.
+        let briefing = "Earlier: search sub-target 6ms. Brief aside on Tailscale setup while traveling (unrelated). Next: release gating.";
+        let out = strip_unrelated_asides(briefing);
+        assert!(!out.to_lowercase().contains("unrelated"));
+        assert!(!out.contains("Tailscale"));
+        assert!(out.contains("search sub-target 6ms"));
+        assert!(out.contains("release gating"));
     }
 
     #[test]
