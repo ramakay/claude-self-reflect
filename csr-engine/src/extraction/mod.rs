@@ -22,6 +22,22 @@ pub use errors::ErrorContext;
 pub use patterns::EditPattern;
 pub use signature::ConversationSignature;
 
+/// True if `text` carries a closing success signal. Shared by the Stop-hook
+/// outcome classifier (decides failed vs partial when errors occurred) and the
+/// Tier-0 display, which reconciles stale episodes stored before this rule
+/// existed — so a `LAST: ...All 417 tests pass` line never shows `outcome=failed`.
+pub fn has_success_signal(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("complete")
+        || lower.contains("fixed")
+        || lower.contains("done")
+        || lower.contains("success")
+        || lower.contains("deployed")
+        || lower.contains("shipped")
+        || lower.contains("tests pass")
+        || lower.contains("all pass")
+}
+
 /// Full extraction result for a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionResult {

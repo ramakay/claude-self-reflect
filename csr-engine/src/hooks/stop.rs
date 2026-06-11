@@ -224,14 +224,7 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
         .map(|t| t.content.clone());
 
     // Determine outcome
-    let success_signal = {
-        let lower = completed.to_lowercase();
-        lower.contains("complete")
-            || lower.contains("fixed")
-            || lower.contains("done")
-            || lower.contains("success")
-            || lower.contains("deployed")
-    };
+    let success_signal = crate::extraction::has_success_signal(&completed);
     let outcome = if message_count < 3 {
         "interrupted".to_string()
     } else if !error_signatures.is_empty() {
@@ -458,6 +451,12 @@ fn write_rolling_summary(input: &HookInput, engine: &Engine, cwd: &Path) -> Resu
 
     let summary = if let Some(session) = sessions.first() {
         let title = session.summary.as_deref().unwrap_or("(active session)");
+        // Don't roll up a meta/probe or bare-question session ("what were we
+        // discussing recently?") — it would surface as a self-referential
+        // RECENT SESSIONS line. Same gate the live continuity paths use.
+        if !crate::extraction::provenance::is_substantive(title) || title.contains('?') {
+            return Ok(());
+        }
         let msg_count = session.total_messages;
         let enrichment_hint = session
             .enrichment

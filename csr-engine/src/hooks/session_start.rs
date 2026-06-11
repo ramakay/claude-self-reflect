@@ -496,9 +496,13 @@ fn read_rolling_summary(project: &str) -> Option<String> {
         .join(format!("rolling-summary-{}.txt", safe_name));
     let content = std::fs::read_to_string(&path).ok()?;
     let first_line = content.lines().find(|l| !l.trim().is_empty())?;
-    // Skip command-only/probe rolling summaries ("memory-feedback") — only
-    // surface a real work description as the last-resort continuity line.
-    if first_line.len() > 10 && crate::extraction::provenance::is_substantive(first_line) {
+    // Skip command-only/probe rolling summaries ("memory-feedback") and bare
+    // questions ("[Rolling] What were we discussing recently?") — only surface a
+    // real work description as the last-resort continuity line.
+    if first_line.len() > 10
+        && crate::extraction::provenance::is_substantive(first_line)
+        && !first_line.contains('?')
+    {
         Some(sanitize_preview(first_line))
     } else {
         None
@@ -624,9 +628,18 @@ pub fn format_tier0_block(
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "none recorded".into());
 
+    // Reconcile outcome for episodes stored before the recovered-outcome rule:
+    // a "failed" tag on a session whose LAST shows a closing success signal is a
+    // recovery → display "partial", never a self-contradicting "pass / failed".
+    let outcome = if ep.outcome == "failed" && crate::extraction::has_success_signal(&last) {
+        "partial"
+    } else {
+        ep.outcome.as_str()
+    };
+
     let mut out = format!(
         "CSR CONTINUUM [{}]: {}\nLAST: {} (outcome={})\nNEXT: {} | TODOS: {} open\n",
-        age, request, last, ep.outcome, next, open_todos
+        age, request, last, outcome, next, open_todos
     );
     if !anchor_verdicts.is_empty() {
         out.push_str(&format!(
@@ -1206,6 +1219,37 @@ mod tests {
         assert!(block.contains("1 intact, 1 modified"));
         assert!(block.contains("validate_token"));
         assert!(block.contains(r#"csr_reflect_on_past("conv_abc-123")"#));
+    }
+
+    #[test]
+    fn tier0_reconciles_failed_outcome_with_success_last() {
+        use crate::hooks::stop::Episode;
+        // Round-7: stale episode tagged "failed" but LAST shows success — the
+        // displayed outcome must not contradict the narrative ("pass / failed").
+        let ep = Episode {
+            schema: "v2".into(),
+            session_id: "efc-1".into(),
+            project: "proj".into(),
+            timestamp: "2026-06-04T12:00:00Z".into(),
+            request: "Enable a CSR telemetry feature".into(),
+            investigated: vec![],
+            completed: "Done. Binary is 46 MB. All 417 tests pass.".into(),
+            next_steps: None,
+            blockers: None,
+            outcome: "failed".into(),
+            error_signatures: vec![],
+            tools_used: vec![],
+            files_modified: vec![],
+            message_count: 30,
+            duration_minutes: 0,
+            todos: vec![],
+            approved_plan: None,
+            prev_episode_id: None,
+            anchors: vec![],
+        };
+        let block = format_tier0_block(&ep, &[], "1w ago");
+        assert!(block.contains("outcome=partial"));
+        assert!(!block.contains("outcome=failed"));
     }
 
     #[test]
