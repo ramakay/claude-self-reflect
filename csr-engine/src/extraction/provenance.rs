@@ -41,10 +41,11 @@ pub const AGENT_PROMPT_SIGNATURES: [&str; 2] = [
 /// - SessionStart continuity blocks (session_start.rs)
 /// - UserPromptSubmit context blocks (injection/formatter.rs)
 /// - agent prompts (AGENT_PROMPT_SIGNATURES, included via EMISSION_HEADERS)
-const EMISSION_HEADERS: [&str; 9] = [
+const EMISSION_HEADERS: [&str; 10] = [
     "CSR CONTINUUM [",
     "## Session Intelligence",
     "## CSR Memory Feedback",
+    "CSR Memory Feedback Probe",
     "SESSION CONTINUITY DETECTED",
     "RECENT SESSIONS - PAST CONTEXT",
     "RELEVANT PAST CONTEXT",
@@ -106,8 +107,17 @@ pub fn strip_plumbing(text: &str) -> String {
     out
 }
 
+/// Longest inline-code span kept verbatim. Short spans are identifiers —
+/// commit hashes, file names, function names — that genuine prose needs
+/// ("commit `4343b50`, deployed" must not become "commit , deployed").
+/// Long spans are quoted blocks-in-miniature and stay stripped.
+const INLINE_CODE_KEEP_LEN: usize = 24;
+
 /// Remove mentioned (quoted) text: fenced code blocks, inline backtick spans,
 /// and blockquote lines. What survives is prose the author actually wrote.
+/// Short inline-code spans keep their content (identifiers used by the prose)
+/// unless they contain a CSR emission field token — then they are mentions of
+/// our own format and are dropped.
 pub fn strip_quoted(text: &str) -> String {
     // Fenced blocks: drop odd-indexed segments between ``` markers.
     // An unclosed fence drops the tail (conservative: quoted until proven not).
@@ -117,10 +127,14 @@ pub fn strip_quoted(text: &str) -> String {
             fenceless.push_str(seg);
         }
     }
-    // Inline code: same scheme with single backticks.
+    // Inline code: same scheme with single backticks, keeping short
+    // identifier-like spans that carry no emission tokens.
     let mut unquoted = String::with_capacity(fenceless.len());
     for (i, seg) in fenceless.split('`').enumerate() {
-        if i % 2 == 0 {
+        let keep = i % 2 == 0
+            || (seg.len() <= INLINE_CODE_KEEP_LEN
+                && !EMISSION_FIELD_TOKENS.iter().any(|t| seg.contains(t)));
+        if keep {
             unquoted.push_str(seg);
         }
     }
@@ -272,6 +286,28 @@ mod tests {
         let out = extractable(text).expect("prose should survive");
         assert!(!out.contains("NEXT:"));
         assert!(out.contains("polluted boilerplate filtered"));
+    }
+
+    #[test]
+    fn quoted_keeps_short_identifier_spans() {
+        // Round-4 regression: "commit `4343b50`, deployed" rendered as
+        // "commit , deployed". Short identifier spans keep their content.
+        let out = strip_quoted("One-shot fix done — commit `4343b50`, deployed to `/usr/local`.");
+        assert!(out.contains("commit 4343b50, deployed"));
+        // ...but spans carrying emission tokens stay stripped regardless.
+        let out = strip_quoted("shows `NEXT: garbage` now");
+        assert!(!out.contains("NEXT:"));
+        // ...and long spans are mini quoted blocks, stripped.
+        let long = format!("see `{}` for details", "x".repeat(80));
+        assert!(!strip_quoted(&long).contains("xxx"));
+    }
+
+    #[test]
+    fn extractable_rejects_probe_command_text() {
+        // The /memory-feedback command body after plumbing-tag stripping.
+        let probe = "CSR Memory Feedback Probe You are reporting on the quality \
+                     of the memory context CSR injected into THIS session.";
+        assert_eq!(extractable(probe), None);
     }
 
     #[test]

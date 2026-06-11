@@ -67,7 +67,6 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
     let mut tools_used = HashSet::new();
     let mut completed = String::new();
     let mut error_signatures = Vec::new();
-    let mut next_steps: Option<String> = None;
     let mut message_count: usize = 0;
     let mut todos: Vec<TodoItem> = Vec::new();
     let mut approved_plan: Option<String> = None;
@@ -211,44 +210,43 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
                 }
             }
         }
-
-        // Extract next_steps from any message — scanning only provenance-cleaned
-        // text, so quoted injection output and command plumbing never match.
-        if let Some(content) = val.get("message").and_then(|m| m.get("content")) {
-            let raw = extract_text_from_content(content);
-            if let Some(text) = crate::extraction::provenance::extractable(&raw) {
-                let lower = text.to_lowercase();
-                for keyword in &["next step", "next:", "todo:", "remaining:"] {
-                    if let Some(pos) = lower.find(keyword) {
-                        let start = pos;
-                        let end = (pos + 200).min(text.len());
-                        let end = text.floor_char_boundary(end);
-                        let snippet = text[start..end].trim().to_string();
-                        if !snippet.is_empty() {
-                            next_steps = Some(snippet);
-                        }
-                    }
-                }
-            }
-        }
     }
 
+    // next_steps comes ONLY from structured TodoWrite state (first non-completed
+    // item). Keyword-snippet harvesting of free prose was the recurring
+    // self-pollution channel: in sessions about CSR itself, prose legitimately
+    // mentions "next:"/"todo:" while describing the extractor, and no content
+    // filter can tell that apart from a real next step. Structured todos are
+    // authored as tasks, so they can't be mentions.
+    let next_steps = todos
+        .iter()
+        .find(|t| t.status != "completed")
+        .map(|t| t.content.clone());
+
     // Determine outcome
-    let outcome = if message_count < 3 {
-        "interrupted".to_string()
-    } else if !error_signatures.is_empty() {
-        "failed".to_string()
-    } else {
+    let success_signal = {
         let lower = completed.to_lowercase();
-        if lower.contains("complete")
+        lower.contains("complete")
             || lower.contains("fixed")
             || lower.contains("done")
             || lower.contains("success")
-        {
-            "success".to_string()
-        } else {
+            || lower.contains("deployed")
+    };
+    let outcome = if message_count < 3 {
+        "interrupted".to_string()
+    } else if !error_signatures.is_empty() {
+        // Errors occurred, but a closing success signal means the session
+        // recovered — "partial", not "failed". A dev session that hits and
+        // fixes test failures should not be remembered as a failure.
+        if success_signal {
             "partial".to_string()
+        } else {
+            "failed".to_string()
         }
+    } else if success_signal {
+        "success".to_string()
+    } else {
+        "partial".to_string()
     };
 
     let mut investigated_vec: Vec<String> = investigated.into_iter().collect();
@@ -504,7 +502,7 @@ fn write_rolling_summary(input: &HookInput, engine: &Engine, cwd: &Path) -> Resu
 
 /// Extract text content from a Claude message content field.
 /// Handles both string content and array-of-blocks format.
-fn extract_text_from_content(content: &serde_json::Value) -> String {
+pub(crate) fn extract_text_from_content(content: &serde_json::Value) -> String {
     if let Some(s) = content.as_str() {
         return s.to_string();
     }
@@ -674,6 +672,50 @@ mod tests {
         let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
         let ep = extract_episode(&lines, "sess-meta", "proj");
         assert_eq!(ep.next_steps, None);
+    }
+
+    #[test]
+    fn test_next_steps_from_todos_not_prose() {
+        // Round-4 regression: prose ABOUT the extractor ("scans for next:/todo:
+        // keywords...") is genuine authored text — no content filter can tell
+        // it from a real next step. next_steps therefore comes only from
+        // structured TodoWrite state.
+        let prose = "episode extraction scans messages for \"next:\"/\"todo:\" keywords \
+                     and grabs a 200-char snippet — that boilerplate became the episode's \
+                     next_steps, overwriting real state.";
+        let lines_owned = [
+            user_line("explain the pollution bug"),
+            assistant_text_line(prose),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
+        let ep = extract_episode(&lines, "sess-prose", "proj");
+        assert_eq!(ep.next_steps, None);
+
+        // With TodoWrite state, the first non-completed item becomes next_steps.
+        let todo_line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"ship the fix","status":"completed"},{"content":"rerun the probe","status":"pending"}]}}]}}"#;
+        let lines_owned = [
+            user_line("explain the pollution bug"),
+            todo_line.to_string(),
+            assistant_text_line(prose),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
+        let ep = extract_episode(&lines, "sess-todo", "proj");
+        assert_eq!(ep.next_steps.as_deref(), Some("rerun the probe"));
+    }
+
+    #[test]
+    fn test_outcome_partial_when_errors_recovered() {
+        // Round-4 regression: a session that hits errors but closes with a
+        // success signal recovered — "partial", not the contradictory "failed".
+        let lines_owned = [
+            user_line("Build and deploy the fix"),
+            tool_result_line("error[E0308]: mismatched types"),
+            assistant_text_line("Fixed the type error; tests green, binary deployed."),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
+        let ep = extract_episode(&lines, "sess-recover", "proj");
+        assert_eq!(ep.outcome, "partial");
+        assert!(!ep.error_signatures.is_empty());
     }
 
     #[test]

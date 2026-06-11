@@ -53,7 +53,17 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
             .conversation_message_count(&conv_id)
             .unwrap_or(0);
 
-        if !has_story && message_count >= super::session_start::MIN_ENRICHED_MESSAGES {
+        // Meta sessions (probe runs, command-only invocations) get no story
+        // either — no user message survives provenance filtering, so there is
+        // no real work to narrate, only CSR examining itself.
+        let is_meta_session = crate::import::parse_jsonl_messages(Path::new(tp))
+            .map(|msgs| !has_real_user_request(&msgs))
+            .unwrap_or(false);
+
+        if !has_story
+            && !is_meta_session
+            && message_count >= super::session_start::MIN_ENRICHED_MESSAGES
+        {
             // Try V3 synthesis first (zero-cost, instant)
             let synthesized = try_v3_story_synthesis(engine, &conv_id, &project).await;
 
@@ -80,6 +90,25 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     }
 
     Ok(())
+}
+
+/// True if any user message carries a genuine request after provenance
+/// filtering. Probe runs and command-only sessions have none — every user
+/// message is command plumbing or CSR's own emitted format quoted back.
+fn has_real_user_request(messages: &[serde_json::Value]) -> bool {
+    messages.iter().any(|m| {
+        // Match on the outer transcript `type`: Claude Code writes "user"
+        // (get_message_data's role injection only maps the legacy "human").
+        let msg_type = m.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if msg_type != "user" && msg_type != "human" {
+            return false;
+        }
+        let data = crate::extraction::get_message_data(m);
+        let text = crate::hooks::stop::extract_text_from_content(
+            data.get("content").unwrap_or(&serde_json::Value::Null),
+        );
+        crate::extraction::provenance::extractable(&text).is_some()
+    })
 }
 
 /// Try to synthesize a story locally from existing V3 extraction data.
@@ -339,5 +368,37 @@ fn write_session_summary(engine: &Engine, input: &HookInput, cwd: &Path) {
             .join(".claude-self-reflect")
             .join("last-session-summary.txt");
         let _ = std::fs::write(&path, &summary);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn test_probe_session_has_no_real_request() {
+        // A /memory-feedback run: command plumbing + the probe prompt text.
+        let messages = vec![
+            msg(
+                r#"{"type":"user","message":{"content":"<command-message>memory-feedback</command-message>\n<command-name>/memory-feedback</command-name>\nCSR Memory Feedback Probe\nYou are reporting on the quality of the memory context CSR injected"}}"#,
+            ),
+            msg(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Report written."}]}}"#,
+            ),
+        ];
+        assert!(!has_real_user_request(&messages));
+    }
+
+    #[test]
+    fn test_real_session_has_request() {
+        let messages = vec![
+            msg(r#"{"type":"user","message":{"content":"fix the briefing staleness bug"}}"#),
+            msg(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"On it."}]}}"#),
+        ];
+        assert!(has_real_user_request(&messages));
     }
 }
