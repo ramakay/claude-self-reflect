@@ -117,6 +117,27 @@ pub fn list_jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
 ///
 /// Extracts conversation summary from `{"type":"summary"}` lines when available.
 /// Falls back to the first user message for timeline display.
+/// Prompt signatures of CSR's own agent subprocesses. A transcript whose first
+/// user message contains one of these (within the leading window) is CSR talking
+/// to itself — exclude it from import so it never enters the search index.
+const CSR_AGENT_PROMPT_SIGNATURES: [&str; 2] = [
+    "You are CSR Episode Analyst",
+    "You are summarizing a coding session",
+];
+
+/// True if the first user message is a CSR agent prompt (briefing analyst or
+/// compaction summarizer). Tests only the leading window so a normal session that
+/// later quotes the prompt is not misclassified.
+fn is_csr_agent_prompt(first_user_message: &str) -> bool {
+    // A CSR agent prompt IS the first user message — it begins with the signature.
+    // starts_with (not contains) avoids dropping a real session that merely quotes
+    // the prompt later in its opening message.
+    let trimmed = first_user_message.trim_start();
+    CSR_AGENT_PROMPT_SIGNATURES
+        .iter()
+        .any(|sig| trimmed.starts_with(sig))
+}
+
 pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<ConversationChunk>> {
     let conversation_id = path
         .file_stem()
@@ -204,6 +225,18 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
 
     if messages.is_empty() {
         return Ok(Vec::new());
+    }
+
+    // Skip CSR's own agent-subprocess transcripts (the session-briefing analyst,
+    // the compaction summarizer). Their FIRST user message IS the agent prompt, so
+    // importing them pollutes the search index with CSR talking to itself — which
+    // then feeds back into the next briefing. A normal user session never opens with
+    // these strings; quoting them later in a session (e.g. via hook-injected context)
+    // is fine because we only test the first user message.
+    if let Some(ref fm) = first_user_message {
+        if is_csr_agent_prompt(fm) {
+            return Ok(Vec::new());
+        }
     }
 
     // Use last_timestamp for ordering (shows "last active" not "started at")
@@ -418,6 +451,24 @@ mod tests {
             normalize_project_name("/Users/name/.claude/projects/-Users-name-projects-foo"),
             "foo"
         );
+    }
+
+    #[test]
+    fn test_is_csr_agent_prompt_skips_self_transcripts() {
+        assert!(is_csr_agent_prompt(
+            "You are CSR Episode Analyst. Generate a brief, actionable session briefing."
+        ));
+        assert!(is_csr_agent_prompt(
+            "You are summarizing a coding session for future context restoration"
+        ));
+        // Real user work is never misclassified.
+        assert!(!is_csr_agent_prompt(
+            "Fix the V3 retry storm in csr-engine/src/daemon/mod.rs"
+        ));
+        // Merely quoting the prompt far into the message is not a meta-transcript
+        // (only the leading window is tested).
+        let quoted = format!("{}You are CSR Episode Analyst", "x".repeat(300));
+        assert!(!is_csr_agent_prompt(&quoted));
     }
 
     #[test]

@@ -377,6 +377,50 @@ pub fn get_reflections_by_tag(
     Ok(results)
 }
 
+/// Like `get_reflections_by_tag` but requires BOTH tags to be present. Used by the
+/// session-briefing hook to fetch a project's recent episodes directly
+/// (`project_<name>` AND `session_episode`) so the LIMIT applies AFTER both filters
+/// — a project can't be starved by its own non-episode reflections crowding a
+/// pre-filter window. Caller should still exact-match the project tag (LIKE can
+/// substring-match `project_foo` inside `project_foo-bar`).
+pub fn get_reflections_by_two_tags(
+    conn: &Connection,
+    tag_a: &str,
+    tag_b: &str,
+    limit: usize,
+) -> Result<Vec<ReflectionRow>> {
+    // Escape backslash FIRST (it's the ESCAPE char), then LIKE wildcards. Wrap the
+    // tag in quotes so the pattern matches a whole JSON-array element — otherwise
+    // `session_episode` would substring-match a tag like `not_session_episode`.
+    let esc = |t: &str| {
+        t.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    };
+    let pat_a = format!("%\"{}\"%", esc(tag_a));
+    let pat_b = format!("%\"{}\"%", esc(tag_b));
+    let mut stmt = conn.prepare(
+        "SELECT id, content, tags, timestamp FROM reflections
+         WHERE tags LIKE ?1 ESCAPE '\\' AND tags LIKE ?2 ESCAPE '\\'
+         ORDER BY timestamp DESC LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![pat_a, pat_b, limit as i64], |row| {
+        let id: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let tags_json: String = row.get(2)?;
+        let timestamp: String = row.get(3)?;
+        Ok((id, content, tags_json, timestamp))
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        let (id, content, tags_json, timestamp) = row?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        results.push((id, content, tags, timestamp));
+    }
+    Ok(results)
+}
+
 /// Helper: map a row to ConversationChunk.
 /// Expects columns: id, conversation_id, project_name, timestamp, content, message_count, summary
 fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {

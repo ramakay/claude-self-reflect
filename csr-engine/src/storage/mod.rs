@@ -171,6 +171,16 @@ impl Storage {
         queries::get_reflections_by_tag(&conn, tag, limit)
     }
 
+    pub fn get_reflections_by_two_tags(
+        &self,
+        tag_a: &str,
+        tag_b: &str,
+        limit: usize,
+    ) -> Result<Vec<queries::ReflectionRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_reflections_by_two_tags(&conn, tag_a, tag_b, limit)
+    }
+
     // ─── Enrichment state ───
 
     pub fn is_conversation_enriched(

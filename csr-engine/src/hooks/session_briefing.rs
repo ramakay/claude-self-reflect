@@ -24,7 +24,7 @@ use crate::search::cross_project::resolve_project_from_cwd;
 
 /// Max seconds to wait for `claude -p` to return a briefing.
 /// Generous because: (a) claude -p base startup + Haiku reasoning take time,
-/// (b) Haiku must call csr_reflect_on_past and reason over results,
+/// (b) Haiku reasons over the injected episodes to synthesize the briefing,
 /// (c) we run async so user never waits.
 const BRIEFING_TIMEOUT_SECS: u64 = 120;
 
@@ -33,22 +33,31 @@ const BRIEFING_TIMEOUT_SECS: u64 = 120;
 /// when nothing has materially changed.
 const BRIEFING_DEBOUNCE_MINUTES: i64 = 30;
 
-/// Prompt sent to Haiku for episode analysis.
-const BRIEFING_PROMPT: &str = concat!(
-    "You are CSR Episode Analyst. Generate a brief, actionable session briefing.\n\n",
-    "STEP 1: Use the csr_reflect_on_past tool to search for recent episodes.\n",
-    "Query: \"session_episode\"\n",
-    "Limit: 5\n\n",
-    "STEP 2: Each result is a JSON episode with fields: request, investigated, completed, ",
-    "next_steps, outcome, error_signatures, tools_used, files_modified, ",
-    "todos, approved_plan, prev_episode_id, anchors.\n\n",
-    "STEP 3: Write a concise briefing (under 150 words). Start with '## Session Intelligence (CSR v9.2)'.\n",
+/// Most recent episodes to feed Haiku. Newest-first; enough to spot cross-session
+/// patterns without bloating the prompt.
+const MAX_EPISODES_IN_BRIEFING: usize = 6;
+
+/// Per-episode char cap when injecting into the prompt. Episodes are JSON; the
+/// lead fields (request/investigated/completed/next_steps/outcome) dominate.
+const MAX_EPISODE_CHARS: usize = 700;
+
+/// Instruction prepended to the injected episodes. Haiku summarizes the episodes
+/// it is GIVEN — it does NOT search for them. Searching the tag name semantically
+/// returns past briefing runs (which contain the words "session_episode"), not
+/// episodes, and self-reinforces a false "no episodes found" verdict. The Rust
+/// hook loads real episodes by tag and embeds them below.
+const BRIEFING_INSTRUCTION: &str = concat!(
+    "You are CSR Episode Analyst. Below are the most recent structured session ",
+    "episodes for THIS project, newest first, as JSON. Each has fields: request, ",
+    "investigated, completed, next_steps, outcome, error_signatures, tools_used, ",
+    "files_modified, todos, approved_plan, prev_episode_id, anchors.\n\n",
+    "Write a concise briefing (under 150 words). Start with '## Session Intelligence (CSR v9.2)'.\n",
     "Reference specific file names, error messages, and outcomes. Look for:\n",
     "- Recent work and outcomes\n",
     "- Patterns (repeated errors, same files across sessions)\n",
     "- Unfinished work (next_steps, partial/interrupted outcomes)\n\n",
-    "If no episodes found, output exactly: 'No recent session episodes found — fresh start.'\n",
-    "Do not fabricate information. Only report what the episodes contain."
+    "Only report what the episodes contain. Do not fabricate information.\n\n",
+    "=== RECENT EPISODES ===\n"
 );
 
 /// Handle the session-briefing hook. Always returns Ok(()).
@@ -73,9 +82,24 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
         return Ok(());
     }
 
+    // Load recent structured episodes for THIS project directly by tag. Do NOT
+    // ask Haiku to semantic-search the tag name — that returns past briefing runs
+    // (their prompt text contains "session_episode"), not episodes, and loops on a
+    // false "fresh start" verdict. Feed Haiku the real episodes instead.
+    let episodes = recent_episodes_for_project(engine, project_name);
+    if episodes.is_empty() {
+        tracing::debug!(
+            project = project_name,
+            "no episodes for project — skipping briefing"
+        );
+        return Ok(());
+    }
+
+    let prompt = format!("{}{}", BRIEFING_INSTRUCTION, episodes);
+
     // Shell out to claude -p with Haiku model.
     // Block on tokio's spawn_blocking since std::process::Command is sync.
-    let briefing = tokio::task::spawn_blocking(invoke_haiku_briefing).await??;
+    let briefing = tokio::task::spawn_blocking(move || invoke_haiku_briefing(&prompt)).await??;
 
     if briefing.trim().is_empty() {
         eprintln!("CSR: session-briefing returned empty output");
@@ -90,11 +114,12 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
 
 /// Invoke `claude -p --model haiku-4-5 "<prompt>"` and capture stdout.
 /// Returns the briefing text, or an error if the invocation fails or times out.
-fn invoke_haiku_briefing() -> Result<String> {
-    // Restrict the subprocess to ONLY the csr-engine MCP server. Without this the
-    // nested `claude -p` loads every configured MCP server (~30s) just to call one
-    // tool. --strict-mcp-config + a one-server config keeps startup to csr-engine's
-    // own ~fast cache load.
+///
+/// The episodes are embedded in `prompt`, so Haiku needs NO tools. We pass an
+/// empty MCP config with `--strict-mcp-config` so the subprocess loads ZERO MCP
+/// servers (not even csr-engine) — fastest possible `claude -p` startup and no
+/// recursive csr-engine spawn.
+fn invoke_haiku_briefing(prompt: &str) -> Result<String> {
     let mcp_config_path = write_minimal_mcp_config()?;
 
     let mut child = Command::new("claude")
@@ -106,8 +131,11 @@ fn invoke_haiku_briefing() -> Result<String> {
         .arg("--strict-mcp-config")
         .arg("--mcp-config")
         .arg(&mcp_config_path)
-        .arg("--dangerously-skip-permissions")
-        .arg(BRIEFING_PROMPT)
+        // No --dangerously-skip-permissions: episodes are session-derived text and
+        // the empty MCP config means zero tools, so this is a pure text summary.
+        // Skipping permissions would only widen the blast radius if an episode
+        // contained adversarial content. Print mode won't prompt interactively.
+        .arg(prompt)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -171,19 +199,12 @@ fn store_briefing(engine: &Engine, project: &str, briefing: &str) -> Result<()> 
     Ok(())
 }
 
-/// Write a minimal MCP config containing only the csr-engine server, used with
-/// `--strict-mcp-config` so the briefing subprocess doesn't load every other server.
-/// Points at the currently-running binary so the subprocess uses the same version.
+/// Write an EMPTY MCP config, used with `--strict-mcp-config` so the briefing
+/// subprocess loads ZERO MCP servers. Episodes are injected into the prompt, so
+/// Haiku needs no tools — this avoids loading any MCP server (including a recursive
+/// csr-engine) and gives the fastest possible `claude -p` startup.
 fn write_minimal_mcp_config() -> Result<std::path::PathBuf> {
-    let csr_bin = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| "csr-engine".to_string());
-    let config = serde_json::json!({
-        "mcpServers": {
-            "claude-self-reflect": { "command": csr_bin }
-        }
-    });
+    let config = serde_json::json!({ "mcpServers": {} });
     let dir = dirs::home_dir()
         .map(|h| h.join(".claude-self-reflect"))
         .ok_or_else(|| anyhow::anyhow!("no home dir"))?;
@@ -191,6 +212,92 @@ fn write_minimal_mcp_config() -> Result<std::path::PathBuf> {
     let path = dir.join("briefing-mcp.json");
     std::fs::write(&path, serde_json::to_string(&config)?)?;
     Ok(path)
+}
+
+/// Load the most recent `session_episode` reflections for `project` and format
+/// them (newest first, capped) for injection into the briefing prompt. Returns an
+/// empty string if none exist — the caller skips the briefing entirely.
+fn recent_episodes_for_project(engine: &Engine, project: &str) -> String {
+    let project_tag = format!("project_{}", project);
+    // Fetch by BOTH tags so the LIMIT applies after filtering — a busy project
+    // can't be starved by its own non-episode reflections crowding a pre-filter
+    // window. Over-fetch (2x) to absorb prefix-collision rows the exact match below
+    // drops (LIKE can match project_foo inside project_foo-bar).
+    // Over-fetch candidates so leftover meta-episodes (pre-cleanup) or rare
+    // project substring-collisions in the newest slice can't crowd out the 6 real
+    // episodes we want. The two-tag query already matches exact JSON elements; this
+    // window is filtered down to MAX_EPISODES_IN_BRIEFING below.
+    const CANDIDATE_WINDOW: usize = 48;
+    let rows = match engine.storage().get_reflections_by_two_tags(
+        &project_tag,
+        "session_episode",
+        CANDIDATE_WINDOW,
+    ) {
+        Ok(rows) => rows,
+        Err(e) => {
+            // Distinguish a real DB error from "no episodes" — both return empty,
+            // but only this path is an operational problem worth surfacing.
+            tracing::warn!(project, error = %e, "failed to load episodes for briefing");
+            return String::new();
+        }
+    };
+
+    let mut out = String::new();
+    let mut n = 0;
+    for (_, content, tags, _) in &rows {
+        if n >= MAX_EPISODES_IN_BRIEFING {
+            break;
+        }
+        // Exact project match (LIKE query can substring-match project_foo-bar).
+        if !tags.iter().any(|t| t == &project_tag) {
+            continue;
+        }
+        // Skip meta-episodes: transcripts of CSR's own agent subprocesses (the
+        // briefing analyst, the compaction summarizer). Historically these leaked
+        // into the episode store; the recursive-hook guard now prevents new ones,
+        // but old rows remain — filter them so the briefing never summarizes itself.
+        if is_meta_episode(content) {
+            continue;
+        }
+        n += 1;
+        if content.len() > MAX_EPISODE_CHARS {
+            let end = content.floor_char_boundary(MAX_EPISODE_CHARS);
+            // Mark the cut so Haiku treats it as an excerpt, not malformed JSON.
+            out.push_str(&format!(
+                "\n[Episode {}]\n{}…[truncated]\n",
+                n,
+                &content[..end]
+            ));
+        } else {
+            out.push_str(&format!("\n[Episode {}]\n{}\n", n, content));
+        }
+    }
+    out
+}
+
+/// Known prompt signatures of CSR's own agent subprocesses. An episode whose
+/// `request` begins with one of these is a transcript of CSR talking to itself, not
+/// real user work — exclude it from briefings.
+const META_EPISODE_SIGNATURES: [&str; 2] = [
+    "You are CSR Episode Analyst",
+    "You are summarizing a coding session",
+];
+
+/// True if an episode's content is a CSR-internal agent transcript (briefing
+/// analyst or compaction summarizer) rather than real user work. Checks ONLY the
+/// `request` field (the first user message) so a real episode that merely quotes a
+/// signature elsewhere (e.g. in `completed`) is not misclassified.
+fn is_meta_episode(content: &str) -> bool {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(req) = v.get("request").and_then(|r| r.as_str()) {
+            return META_EPISODE_SIGNATURES.iter().any(|sig| req.contains(sig));
+        }
+    }
+    // Fallback for non-JSON content: scan only the leading window.
+    let head_end = content.floor_char_boundary(400);
+    META_EPISODE_SIGNATURES
+        .iter()
+        .any(|sig| content[..head_end].contains(sig))
 }
 
 /// True if a `session_briefing` reflection for this project was stored within the
@@ -217,10 +324,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_briefing_prompt_contains_required_steps() {
-        assert!(BRIEFING_PROMPT.contains("csr_reflect_on_past"));
-        assert!(BRIEFING_PROMPT.contains("session_episode"));
-        assert!(BRIEFING_PROMPT.contains("Session Intelligence"));
+    fn test_briefing_instruction_summarizes_not_searches() {
+        // The instruction must NOT tell Haiku to search — episodes are injected.
+        // Searching the tag name semantically returns past briefing runs, not
+        // episodes, and self-reinforces a false "no episodes found" verdict.
+        assert!(!BRIEFING_INSTRUCTION.contains("csr_reflect_on_past"));
+        assert!(BRIEFING_INSTRUCTION.contains("Session Intelligence"));
+        assert!(BRIEFING_INSTRUCTION.contains("Below are the most recent"));
     }
 
     #[test]
@@ -231,22 +341,33 @@ mod tests {
     }
 
     #[test]
-    fn test_minimal_mcp_config_has_only_csr() {
+    fn test_minimal_mcp_config_is_empty() {
         let path = write_minimal_mcp_config().unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let servers = v["mcpServers"].as_object().unwrap();
         assert_eq!(
             servers.len(),
-            1,
-            "strict config must list exactly one server"
+            0,
+            "briefing needs no tools — config must load zero MCP servers"
         );
-        assert!(servers.contains_key("claude-self-reflect"));
     }
 
     #[test]
     #[allow(clippy::assertions_on_constants)] // intentional regression guard on the const
     fn test_debounce_window_reasonable() {
         assert!((5..=120).contains(&BRIEFING_DEBOUNCE_MINUTES));
+    }
+
+    #[test]
+    fn test_is_meta_episode_filters_self_transcripts() {
+        let analyst =
+            r#"{"schema":"v2","request":"You are CSR Episode Analyst. Generate a brief"}"#;
+        let summarizer =
+            r#"{"schema":"v2","request":"You are summarizing a coding session for future"}"#;
+        let real = r#"{"schema":"v2","request":"Fix the V3 retry storm in the daemon"}"#;
+        assert!(is_meta_episode(analyst));
+        assert!(is_meta_episode(summarizer));
+        assert!(!is_meta_episode(real));
     }
 }
