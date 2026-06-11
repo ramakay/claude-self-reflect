@@ -296,6 +296,7 @@ mod tests {
                 content: "hello".into(),
                 message_count: 1,
                 summary: None,
+                author: crate::provenance::Speaker::User,
             },
             ConversationChunk {
                 id: "2".into(),
@@ -305,6 +306,7 @@ mod tests {
                 content: "world".into(),
                 message_count: 1,
                 summary: None,
+                author: crate::provenance::Speaker::User,
             },
             ConversationChunk {
                 id: "3".into(),
@@ -314,6 +316,7 @@ mod tests {
                 content: "other".into(),
                 message_count: 1,
                 summary: None,
+                author: crate::provenance::Speaker::User,
             },
         ];
 
@@ -401,6 +404,7 @@ mod tests {
                 content: "with Z".into(),
                 message_count: 1,
                 summary: None,
+                author: crate::provenance::Speaker::User,
             },
             ConversationChunk {
                 id: "2".into(),
@@ -410,6 +414,7 @@ mod tests {
                 content: "without Z".into(),
                 message_count: 1,
                 summary: None,
+                author: crate::provenance::Speaker::User,
             },
         ];
 

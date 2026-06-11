@@ -25,6 +25,9 @@ pub struct ConversationChunk {
     /// Human-readable summary from JSONL `{"type":"summary"}` line, or first user message.
     /// Used for timeline display instead of raw tool-heavy content.
     pub summary: Option<String>,
+    /// Highest-authority speaker among this chunk's messages (User > Assistant >
+    /// ToolResult). Drives provenance-aware recall; defaults to ToolResult.
+    pub author: crate::provenance::Speaker,
 }
 
 /// Namespace UUID for deterministic chunk IDs (UUIDv5).
@@ -140,6 +143,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     let file = fs::File::open(path).context("opening JSONL file")?;
     let reader = BufReader::new(file);
     let mut messages: Vec<String> = Vec::new();
+    let mut authors: Vec<crate::provenance::Speaker> = Vec::new();
     let mut first_timestamp: Option<String> = None;
     let mut last_timestamp: Option<String> = None;
     let mut summary: Option<String> = None;
@@ -212,6 +216,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
         };
         if !combined_text.is_empty() {
             messages.push(combined_text);
+            authors.push(classify_message_author(&parsed));
         }
     }
 
@@ -244,7 +249,11 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     let chunk_size = 50;
     let mut chunks = Vec::new();
 
-    for (i, chunk_msgs) in messages.chunks(chunk_size).enumerate() {
+    for (i, (chunk_msgs, chunk_authors)) in messages
+        .chunks(chunk_size)
+        .zip(authors.chunks(chunk_size))
+        .enumerate()
+    {
         let combined = chunk_msgs.join("\n\n");
         let chunk_id = generate_chunk_id(&conversation_id, i);
 
@@ -256,6 +265,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             content: combined,
             message_count: chunk_msgs.len(),
             summary: chunk_summary.clone(),
+            author: chunk_author(chunk_authors),
         });
     }
 
@@ -293,6 +303,38 @@ pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
 
 /// Extract text content from a JSONL message entry.
 /// Strips `<private>...</private>` tagged content before returning.
+/// Classify who authored a JSONL message. Critical for poisoning defense
+/// (§Q6.2): Claude Code delivers `tool_result` blocks inside `type:"user"`
+/// messages, so role alone is not enough — only genuine user prose counts as
+/// authoritative `User`.
+pub(crate) fn classify_message_author(msg: &serde_json::Value) -> crate::provenance::Speaker {
+    use crate::provenance::Speaker;
+    let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if msg_type == "assistant" {
+        return Speaker::Assistant;
+    }
+    // user / human: genuine text → User; otherwise (tool_result-only / empty) →
+    // non-authoritative ToolResult.
+    if extract_message_text_raw(msg).trim().is_empty() {
+        Speaker::ToolResult
+    } else {
+        Speaker::User
+    }
+}
+
+/// Aggregate the author of a multi-message chunk: highest authority present,
+/// User > Assistant > ToolResult. Empty → ToolResult (non-authoritative).
+pub(crate) fn chunk_author(authors: &[crate::provenance::Speaker]) -> crate::provenance::Speaker {
+    use crate::provenance::Speaker;
+    if authors.contains(&Speaker::User) {
+        Speaker::User
+    } else if authors.contains(&Speaker::Assistant) {
+        Speaker::Assistant
+    } else {
+        Speaker::ToolResult
+    }
+}
+
 fn extract_message_text(msg: &serde_json::Value) -> String {
     let raw = extract_message_text_raw(msg);
     // Strip privacy-tagged content before storage/embedding
@@ -426,6 +468,45 @@ fn generate_chunk_id(conversation_id: &str, chunk_index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provenance::Speaker;
+
+    #[test]
+    fn classify_assistant_message() {
+        let msg = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "I'll fix it."}]}
+        });
+        assert_eq!(classify_message_author(&msg), Speaker::Assistant);
+    }
+
+    #[test]
+    fn classify_genuine_user_prose() {
+        let msg = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "text", "text": "adopt epistemic continuity"}]}
+        });
+        assert_eq!(classify_message_author(&msg), Speaker::User);
+    }
+
+    #[test]
+    fn classify_tool_result_in_user_message_is_not_user() {
+        // Claude Code delivers tool_result as a user-type message — it must NOT
+        // be treated as authoritative user content (poisoning defense §Q6.2).
+        let msg = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "content": "exit 0\n332 passed"}]}
+        });
+        assert_eq!(classify_message_author(&msg), Speaker::ToolResult);
+    }
+
+    #[test]
+    fn chunk_author_prefers_user_then_assistant() {
+        use Speaker::*;
+        assert_eq!(chunk_author(&[ToolResult, Assistant, User]), User);
+        assert_eq!(chunk_author(&[ToolResult, Assistant]), Assistant);
+        assert_eq!(chunk_author(&[ToolResult, ToolResult]), ToolResult);
+        assert_eq!(chunk_author(&[]), ToolResult);
+    }
 
     #[test]
     fn test_normalize_project_name() {

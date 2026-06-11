@@ -471,6 +471,10 @@ fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
         content: row.get(4)?,
         message_count: row.get::<_, i64>(5)? as usize,
         summary: row.get(6)?,
+        // Author is stored separately in chunk_provenance, not the chunks table;
+        // reconstructed chunks default to non-authoritative. Live recall reads
+        // provenance explicitly via get_chunk_provenance.
+        author: crate::provenance::Speaker::ToolResult,
     })
 }
 

@@ -595,6 +595,7 @@ mod tests {
             content: "the vision".into(),
             message_count: 1,
             summary: None,
+            author: Speaker::User,
         };
         storage.insert_chunk(&chunk, &[0.0; 384]).unwrap();
 

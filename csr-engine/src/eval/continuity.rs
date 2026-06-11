@@ -345,6 +345,7 @@ fn index_corpus(
             content: doc.text.clone(),
             message_count: 1,
             summary: None,
+            author: doc.author,
         };
         storage.insert_chunk(&chunk, &vec)?;
         storage.insert_chunk_provenance(

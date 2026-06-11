@@ -291,6 +291,19 @@ impl Engine {
             let mut idx = self.search.write().await;
             for (chunk, embedding) in batch.iter().zip(embeddings) {
                 self.storage.insert_chunk(chunk, &embedding)?;
+                // Persist provenance: who authored this chunk + its source conv.
+                // Supersession detection is deferred (None) — recall still gains
+                // from author-authority weighting. Non-fatal on error.
+                if let Err(e) = self.storage.insert_chunk_provenance(
+                    &chunk.id,
+                    &crate::provenance::ChunkProvenance {
+                        author: chunk.author,
+                        source_conv_id: chunk.conversation_id.clone(),
+                        supersedes: None,
+                    },
+                ) {
+                    eprintln!("CSR: chunk provenance persist error (non-fatal): {e}");
+                }
                 idx.insert_chunk(chunk.id.clone(), embedding);
             }
         }

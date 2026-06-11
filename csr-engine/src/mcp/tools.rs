@@ -142,6 +142,9 @@ pub async fn reflect_on_past(
                     content: format!("{}{}", tag_prefix, content),
                     message_count: 0,
                     summary: None,
+                    // Reflections/episodes are derived narratives, not raw
+                    // user-authored chunks — no authority boost.
+                    author: crate::provenance::Speaker::ToolResult,
                 },
             });
         }
@@ -187,12 +190,26 @@ pub async fn reflect_on_past(
         }
     }
 
-    // Sort merged results by score and take top N
-    enriched.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Provenance-aware re-rank (v9.3): authority + meaning layered on the decayed
+    // score. User-authored content is boosted, tool-mechanic build-log and
+    // non-user authority claims are demoted — so a founding decision out-ranks the
+    // [Edit:]/[Bash:] chunks that used to bury it. Falls back to score order when
+    // no provenance/meaning signal differs.
+    let candidates: Vec<crate::search::rerank::RankCandidate> = enriched
+        .iter()
+        .map(|e| crate::search::rerank::RankCandidate {
+            id: e.chunk.id.clone(),
+            cosine: e.score,
+            content: e.chunk.content.clone(),
+            provenance: storage.get_chunk_provenance(&e.chunk.id).ok().flatten(),
+        })
+        .collect();
+    let order: Vec<String> = crate::search::rerank::rerank(candidates)
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    let rank_of = |id: &str| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
+    enriched.sort_by_key(|e| rank_of(&e.chunk.id));
     enriched.truncate(limit);
 
     Ok(format::format_search_results(
