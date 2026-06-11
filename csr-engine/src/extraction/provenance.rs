@@ -161,6 +161,21 @@ pub fn is_csr_emission(text: &str) -> bool {
         >= 2
 }
 
+/// True if `text` is a substantive description of real work — it survives
+/// provenance filtering AND carries actual prose (alphabetic content, not a
+/// bare timestamp/number/path like "20260611-122252"). Used to pick a real
+/// continuity anchor over command-only or telemetry-only sessions.
+pub fn is_substantive(text: &str) -> bool {
+    match extractable(text) {
+        Some(clean) => {
+            let alpha = clean.chars().filter(|c| c.is_alphabetic()).count();
+            // Needs real words, not just a token or two of metadata.
+            alpha >= 6 && clean.split_whitespace().count() >= 2
+        }
+        None => false,
+    }
+}
+
 /// Full provenance pipeline for episode/story extraction candidates:
 /// strip plumbing → strip mentions → reject CSR emissions → reject empties.
 /// Returns the cleaned text safe to carry forward as session content.
@@ -308,6 +323,22 @@ mod tests {
         let probe = "CSR Memory Feedback Probe You are reporting on the quality \
                      of the memory context CSR injected into THIS session.";
         assert_eq!(extractable(probe), None);
+    }
+
+    #[test]
+    fn substantive_rejects_metadata_and_keeps_prose() {
+        // Round-6: bare timestamp request and command-only rolling summary.
+        assert!(!is_substantive("20260611-122252"));
+        assert!(!is_substantive("memory-feedback"));
+        assert!(!is_substantive(""));
+        assert!(!is_substantive(
+            "<command-message>memory-feedback</command-message>"
+        ));
+        // Real work descriptions pass.
+        assert!(is_substantive("fix the auth bug in login.rs"));
+        assert!(is_substantive(
+            "Refactored self-reference filtering into provenance"
+        ));
     }
 
     #[test]

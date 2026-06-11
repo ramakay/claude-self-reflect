@@ -82,6 +82,11 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         // Drop stories synthesized from CSR self-sessions (probe runs) stored
         // before the session_end meta gate landed — they echo our own output.
         .filter(|(_, content, _, _)| !crate::extraction::provenance::is_csr_emission(content))
+        // Drop stories that lead with a bare question instead of narrating work
+        // ("what were we discussing recently?", "typng...why? csr-engine"). A
+        // work story is declarative; a question-led one is a mis-anchored
+        // console-paste/recall session with nothing forward to inject.
+        .filter(|(_, content, _, _)| !story_leads_with_question(content))
         .take(3)
         .collect();
 
@@ -159,6 +164,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             .iter()
             .filter(|s| is_displayable(s))
             .filter(|s| !is_meta_session(s))
+            .filter(|s| !is_weak_continuity_anchor(s))
             .filter(|s| Some(s.conversation_id.as_str()) != continued_cid)
             .take(max_display)
             .collect();
@@ -226,6 +232,18 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                 .filter(|(_, _, tags, _)| {
                     tags.iter().any(|t| t == "session_episode")
                         && tags.iter().any(|t| t == &project_tag)
+                })
+                // Anchor Tier-0 on the latest episode that describes real work:
+                // skip probe/command/telemetry episodes (request meta or a bare
+                // timestamp like "20260611-122252") and bare-question openers
+                // ("what were we discussing recently?") — neither carries state.
+                .filter(|(_, content, _, _)| {
+                    serde_json::from_str::<Episode>(content)
+                        .map(|ep| {
+                            crate::extraction::provenance::is_substantive(&ep.request)
+                                && !ep.request.contains('?')
+                        })
+                        .unwrap_or(false)
                 })
                 .max_by(|a, b| a.3.cmp(&b.3));
             if let Some((_, content, _, ts)) = latest {
@@ -334,6 +352,12 @@ fn detect_continued_session(
     // Never continue from a CSR self-session (probe run, command-only): it is
     // not real work and re-injecting it is the self-pollution class itself.
     if is_meta_session(&session) {
+        return None;
+    }
+
+    // Never anchor continuity on a bare unanswered question — it describes no
+    // forward state, so the CONTINUED FROM line would just echo a question back.
+    if is_weak_continuity_anchor(&session) {
         return None;
     }
 
@@ -472,7 +496,9 @@ fn read_rolling_summary(project: &str) -> Option<String> {
         .join(format!("rolling-summary-{}.txt", safe_name));
     let content = std::fs::read_to_string(&path).ok()?;
     let first_line = content.lines().find(|l| !l.trim().is_empty())?;
-    if first_line.len() > 10 {
+    // Skip command-only/probe rolling summaries ("memory-feedback") — only
+    // surface a real work description as the last-resort continuity line.
+    if first_line.len() > 10 && crate::extraction::provenance::is_substantive(first_line) {
         Some(sanitize_preview(first_line))
     } else {
         None
@@ -581,15 +607,20 @@ pub fn format_tier0_block(
         .take(3)
         .collect();
     // Defense in depth: episodes stored before provenance-filtered extraction
-    // may carry CSR's own output in any field — clean again at display time.
+    // may carry CSR's own output in any field — clean again at display time,
+    // and compact to one line so a long `completed` can't dump paragraphs.
     use crate::extraction::provenance::extractable;
-    let request = extractable(&ep.request).unwrap_or_else(|| "(command-only session)".into());
-    let last = extractable(&ep.completed).unwrap_or_else(|| "(filtered: CSR meta)".into());
+    let request = extractable(&ep.request)
+        .map(|s| compact_preview(&s, 80))
+        .unwrap_or_else(|| "(command-only session)".into());
+    let last = extractable(&ep.completed)
+        .map(|s| compact_preview(&s, 120))
+        .unwrap_or_else(|| "(filtered: CSR meta)".into());
     let next = ep
         .next_steps
         .as_deref()
         .and_then(extractable)
-        .map(|n| strip_next_prefix(&n).to_string())
+        .map(|n| compact_preview(strip_next_prefix(&n), 80))
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "none recorded".into());
 
@@ -669,6 +700,19 @@ fn compact_preview(content: &str, max_chars: usize) -> String {
     }
     let boundary = clean.floor_char_boundary(max_chars);
     format!("{}...", &clean[..boundary])
+}
+
+/// True if a session story leads with a question rather than narrating work.
+/// A useful story is declarative ("Fixed the auth bug…"); one whose first
+/// non-empty line is interrogative was synthesized from a recall/console-paste
+/// session and carries no forward state worth injecting as continuity.
+fn story_leads_with_question(content: &str) -> bool {
+    content
+        .lines()
+        .map(sanitize_preview)
+        .find(|l| !l.trim().is_empty())
+        .map(|first| first.contains('?'))
+        .unwrap_or(false)
 }
 
 fn format_past_session_story(age: &str, content: &str) -> String {
@@ -790,6 +834,20 @@ fn is_meta_session(session: &SessionInfo) -> bool {
         Some(s) if !s.trim().is_empty() => crate::extraction::provenance::extractable(s).is_none(),
         _ => false,
     }
+}
+
+/// True if a session is a weak continuity anchor: the title we'd actually show
+/// is a question, not a description of work. A title is interrogative when the
+/// session's only summary is a bare prompt ("what were we discussing recently?")
+/// OR its V3 enrichment leads with a "## User Request" that is itself a question
+/// (the request is echoed as the title). Either way, CONTINUED FROM / Past
+/// session would just echo a question back — no forward state. Decided on the
+/// rendered title, so it tracks whatever `session_title` chooses; declarative
+/// work titles ("Edited foo.rs", "Fixed auth bug") never contain '?'.
+fn is_weak_continuity_anchor(session: &SessionInfo) -> bool {
+    // Interrogative anywhere: real probes trail the '?' with fragments
+    // ("...produces this why? csr-engine"), so end-anchoring misses them.
+    session_title(session).contains('?')
 }
 
 fn session_title(session: &SessionInfo) -> String {
@@ -1542,6 +1600,104 @@ mod tests {
             enrichment: Some("Edited src/main.rs".to_string()),
         };
         assert!(!is_meta_session(&session));
+    }
+
+    #[test]
+    fn test_story_leads_with_question_filtered() {
+        // Round-6 regression: story-path "Past session" lines led with the raw
+        // opening question + log noise instead of narrating work.
+        assert!(story_leads_with_question(
+            "What were we discussing recently?\nFixed some things."
+        ));
+        assert!(story_leads_with_question(
+            "typng this on console produces this why? csr-engine\nCSR startup: 92ms"
+        ));
+        // A declarative work story is kept.
+        assert!(!story_leads_with_question(
+            "Fixed self-pollution across injection paths. Added provenance module."
+        ));
+    }
+
+    #[test]
+    fn test_weak_anchor_recall_question_no_work_title() {
+        // Round-6 regression: "What were we discussing recently?" is a real
+        // prompt (passes provenance) but a bare question with no work title.
+        let session = SessionInfo {
+            conversation_id: "recall".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-06-11T10:00:00Z".to_string(),
+            total_messages: 30,
+            chunk_count: 5,
+            summary: Some("What were we discussing recently?".to_string()),
+            enrichment: None,
+        };
+        assert!(is_weak_continuity_anchor(&session));
+    }
+
+    #[test]
+    fn test_weak_anchor_typo_debug_question() {
+        let session = SessionInfo {
+            conversation_id: "typo".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-06-11T10:00:00Z".to_string(),
+            total_messages: 8,
+            chunk_count: 2,
+            summary: Some("typng this on console produces this why? csr-engine".to_string()),
+            enrichment: None,
+        };
+        assert!(is_weak_continuity_anchor(&session));
+    }
+
+    #[test]
+    fn test_strong_anchor_imperative_prompt() {
+        // Imperative work request is a fine anchor even without enrichment.
+        let session = SessionInfo {
+            conversation_id: "work".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-06-11T10:00:00Z".to_string(),
+            total_messages: 30,
+            chunk_count: 5,
+            summary: Some("fix the auth bug in login.rs".to_string()),
+            enrichment: None,
+        };
+        assert!(!is_weak_continuity_anchor(&session));
+    }
+
+    #[test]
+    fn test_weak_anchor_v3_user_request_is_question() {
+        // The fc16f91d bug: V3 enrichment exists, but its "## User Request" is
+        // the user's opening question, which session_title echoes as the title.
+        // Enrichment-present must not imply work-titled.
+        let session = SessionInfo {
+            conversation_id: "v3q".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-06-11T10:00:00Z".to_string(),
+            total_messages: 30,
+            chunk_count: 8,
+            summary: Some("What were we discussing recently?".to_string()),
+            enrichment: Some(
+                "## User Request\nWhat were we discussing recently?\n\n## Search Summary\nstuff"
+                    .to_string(),
+            ),
+        };
+        assert!(is_weak_continuity_anchor(&session));
+    }
+
+    #[test]
+    fn test_strong_anchor_question_but_has_work_title() {
+        // A question opener but enrichment shows real edits → work title, keep.
+        let session = SessionInfo {
+            conversation_id: "qwork".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-06-11T10:00:00Z".to_string(),
+            total_messages: 30,
+            chunk_count: 5,
+            summary: Some("why is the build failing?".to_string()),
+            enrichment: Some(
+                "[Heuristic] Project: test\nTools: Edit, Read\nFiles: main.rs, lib.rs".to_string(),
+            ),
+        };
+        assert!(!is_weak_continuity_anchor(&session));
     }
 
     #[test]
