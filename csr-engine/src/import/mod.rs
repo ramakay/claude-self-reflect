@@ -117,23 +117,15 @@ pub fn list_jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
 ///
 /// Extracts conversation summary from `{"type":"summary"}` lines when available.
 /// Falls back to the first user message for timeline display.
-/// Prompt signatures of CSR's own agent subprocesses. A transcript whose first
-/// user message contains one of these (within the leading window) is CSR talking
-/// to itself — exclude it from import so it never enters the search index.
-const CSR_AGENT_PROMPT_SIGNATURES: [&str; 2] = [
-    "You are CSR Episode Analyst",
-    "You are summarizing a coding session",
-];
-
 /// True if the first user message is a CSR agent prompt (briefing analyst or
-/// compaction summarizer). Tests only the leading window so a normal session that
-/// later quotes the prompt is not misclassified.
+/// compaction summarizer) — exclude the whole transcript from import so CSR
+/// talking to itself never enters the search index. Signatures live in
+/// `extraction::provenance` (single registry). Deliberately starts_with, not
+/// contains: import-skip drops a whole conversation, so only transcripts that
+/// ARE an agent prompt qualify — not real sessions that merely quote one.
 fn is_csr_agent_prompt(first_user_message: &str) -> bool {
-    // A CSR agent prompt IS the first user message — it begins with the signature.
-    // starts_with (not contains) avoids dropping a real session that merely quotes
-    // the prompt later in its opening message.
     let trimmed = first_user_message.trim_start();
-    CSR_AGENT_PROMPT_SIGNATURES
+    crate::extraction::provenance::AGENT_PROMPT_SIGNATURES
         .iter()
         .any(|sig| trimmed.starts_with(sig))
 }

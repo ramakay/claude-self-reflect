@@ -570,17 +570,22 @@ pub fn format_tier0_block(
         .map(|(n, _)| n.as_str())
         .take(3)
         .collect();
-    // Defense in depth: episodes stored before the extraction-side guard may
-    // carry CSR's own injection boilerplate as next_steps — don't re-inject it.
+    // Defense in depth: episodes stored before provenance-filtered extraction
+    // may carry CSR's own output in any field — clean again at display time.
+    use crate::extraction::provenance::extractable;
+    let request = extractable(&ep.request).unwrap_or_else(|| "(command-only session)".into());
+    let last = extractable(&ep.completed).unwrap_or_else(|| "(filtered: CSR meta)".into());
     let next = ep
         .next_steps
         .as_deref()
-        .filter(|n| !crate::hooks::stop::is_injection_meta_text(n))
-        .unwrap_or("none recorded");
+        .and_then(extractable)
+        .map(|n| strip_next_prefix(&n).to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "none recorded".into());
 
     let mut out = format!(
         "CSR CONTINUUM [{}]: {}\nLAST: {} (outcome={})\nNEXT: {} | TODOS: {} open\n",
-        age, ep.request, ep.completed, ep.outcome, next, open_todos
+        age, request, last, ep.outcome, next, open_todos
     );
     if !anchor_verdicts.is_empty() {
         out.push_str(&format!(
@@ -599,6 +604,20 @@ pub fn format_tier0_block(
         ep.session_id
     ));
     out
+}
+
+/// Strip a leading "next…:" token from extracted next_steps. The extractor's
+/// snippet starts at the keyword it matched, so without this the Tier-0 line
+/// reads "NEXT: next: …" doubled.
+fn strip_next_prefix(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_lowercase();
+    for prefix in ["next steps:", "next step:", "next:"] {
+        if lower.starts_with(prefix) {
+            return trimmed[prefix.len()..].trim_start();
+        }
+    }
+    trimmed
 }
 
 /// Format a relative time label with hour-level granularity for same-day sessions.
@@ -1141,6 +1160,43 @@ mod tests {
         let block = format_tier0_block(&ep, &[], "2m ago");
         assert!(block.contains("NEXT: none recorded"));
         assert!(!block.contains("Do NOT count"));
+    }
+
+    #[test]
+    fn tier0_block_cleans_legacy_polluted_fields() {
+        use crate::hooks::stop::Episode;
+        // Round-3 regression: request was a raw caveat wrapper, LAST quoted
+        // injected tokens, NEXT doubled its own prefix.
+        let ep = Episode {
+            schema: "v2".into(),
+            session_id: "abc-789".into(),
+            project: "proj".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            request: "<local-command-caveat>Caveat: The messages below were generated".into(),
+            investigated: vec![],
+            completed: "`NEXT: none recorded` — polluted boilerplate filtered, \
+                        including episodes already in the DB."
+                .into(),
+            next_steps: Some("next: redeploy the binary and rerun the probe".into()),
+            blockers: None,
+            outcome: "success".into(),
+            error_signatures: vec![],
+            tools_used: vec![],
+            files_modified: vec![],
+            message_count: 5,
+            duration_minutes: 0,
+            todos: vec![],
+            approved_plan: None,
+            prev_episode_id: None,
+            anchors: vec![],
+        };
+        let block = format_tier0_block(&ep, &[], "1m ago");
+        assert!(block.contains("CSR CONTINUUM [1m ago]: (command-only session)"));
+        assert!(block.contains("LAST: — polluted boilerplate filtered"));
+        assert!(!block.contains("Caveat"));
+        // Prefix deduped: "NEXT: next: redeploy" must not appear
+        assert!(block.contains("NEXT: redeploy the binary"));
+        assert!(!block.contains("NEXT: next:"));
     }
 
     // --- infer_next_action (keyword fallback) tests ---

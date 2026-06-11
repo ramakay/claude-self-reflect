@@ -574,7 +574,13 @@ fn log_injection_detail(
 
 /// Check if content is self-referential noise about CSR internals.
 /// Prevents the tool's own development history from polluting its output (Bug 4/5).
+/// CSR's own emitted blocks (probe reports, CONTINUUM/briefing echoes) are
+/// detected structurally via `extraction::provenance`; the pattern list below
+/// covers dev-history vocabulary that isn't an emission format.
 fn is_self_referential_noise(content: &str) -> bool {
+    if crate::extraction::provenance::is_csr_emission(content) {
+        return true;
+    }
     const NOISE_PATTERNS: &[&str] = &[
         "session_start_hook",
         "session_end_hook",

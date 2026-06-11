@@ -9,6 +9,7 @@ pub mod errors;
 pub mod heuristic;
 pub mod index_builder;
 pub mod patterns;
+pub mod provenance;
 pub mod quality;
 pub mod scoring;
 pub mod signature;

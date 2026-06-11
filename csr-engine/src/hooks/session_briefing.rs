@@ -278,29 +278,22 @@ fn recent_episodes_for_project(engine: &Engine, project: &str) -> String {
     out
 }
 
-/// Known prompt signatures of CSR's own agent subprocesses. An episode whose
-/// `request` begins with one of these is a transcript of CSR talking to itself, not
-/// real user work — exclude it from briefings.
-const META_EPISODE_SIGNATURES: [&str; 2] = [
-    "You are CSR Episode Analyst",
-    "You are summarizing a coding session",
-];
-
-/// True if an episode's content is a CSR-internal agent transcript (briefing
-/// analyst or compaction summarizer) rather than real user work. Checks ONLY the
-/// `request` field (the first user message) so a real episode that merely quotes a
-/// signature elsewhere (e.g. in `completed`) is not misclassified.
+/// True if an episode's content is CSR talking to itself (agent transcript,
+/// pasted probe report, command-only session) rather than real user work.
+/// Checks ONLY the `request` field (the first user message) so a real episode
+/// that merely quotes CSR output elsewhere (e.g. in `completed`) is not
+/// misclassified. Detection lives in `extraction::provenance` — the single
+/// registry of CSR's emission formats and transcript plumbing.
 fn is_meta_episode(content: &str) -> bool {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
         if let Some(req) = v.get("request").and_then(|r| r.as_str()) {
-            return META_EPISODE_SIGNATURES.iter().any(|sig| req.contains(sig));
+            // No genuine user request survives provenance filtering → meta.
+            return crate::extraction::provenance::extractable(req).is_none();
         }
     }
     // Fallback for non-JSON content: scan only the leading window.
     let head_end = content.floor_char_boundary(400);
-    META_EPISODE_SIGNATURES
-        .iter()
-        .any(|sig| content[..head_end].contains(sig))
+    crate::extraction::provenance::is_csr_emission(&content[..head_end])
 }
 
 /// True if a `session_briefing` reflection for this project was stored within the

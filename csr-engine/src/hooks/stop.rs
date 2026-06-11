@@ -56,31 +56,6 @@ pub struct Episode {
     pub anchors: Vec<crate::extraction::anchors::FunctionAnchor>,
 }
 
-/// Markers from CSR's own injection format. A session that quotes an injected
-/// block (the /memory-feedback probe, a pasted Tier-0 CONTINUUM block) contains
-/// several of these at once; genuine prose — even about CSR development — rarely
-/// contains more than one. Threshold of 2 keeps real next-steps like
-/// "next: fix the TODOS: counter" extractable.
-const INJECTION_META_MARKERS: [&str; 7] = [
-    "CSR CONTINUUM",
-    "Session Intelligence (CSR",
-    "NOT INSTRUCTIONS",
-    "Do NOT count",
-    "PAST CONTEXT",
-    "TODOS:",
-    "ANCHORS:",
-];
-
-/// True if `text` looks like CSR's own injection boilerplate rather than
-/// session content worth carrying forward.
-pub(crate) fn is_injection_meta_text(text: &str) -> bool {
-    INJECTION_META_MARKERS
-        .iter()
-        .filter(|m| text.contains(*m))
-        .count()
-        >= 2
-}
-
 /// Extract a structured episode from JSONL transcript lines.
 ///
 /// Pure function — no I/O, no engine access. Parses each line as JSON and
@@ -117,12 +92,14 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
         let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
         message_count += 1;
 
-        // Extract request from first user message
+        // Extract request from the first user message that survives provenance
+        // filtering — command wrappers, caveats, and pasted CSR output are
+        // plumbing, not the user's request (see extraction::provenance).
         if (msg_type == "user" || msg_type == "human") && request.is_empty() {
             if let Some(content) = val.get("message").and_then(|m| m.get("content")) {
                 let text = extract_text_from_content(content);
-                if !text.is_empty() {
-                    request = truncate_str(&text, 200).to_string();
+                if let Some(cleaned) = crate::extraction::provenance::extractable(&text) {
+                    request = truncate_str(&cleaned, 200).to_string();
                 }
             }
         }
@@ -188,12 +165,16 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
                             }
                         }
 
-                        // Track last assistant text for `completed`
+                        // Track last assistant text for `completed`. Provenance
+                        // filtering strips quoted/mentioned text first, so an
+                        // assistant message quoting CSR's own injected blocks
+                        // contributes only its genuine prose (or nothing).
                         if block_type == "text" {
                             if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                let trimmed = text.trim();
-                                if !trimmed.is_empty() {
-                                    completed = truncate_str(trimmed, 300).to_string();
+                                if let Some(cleaned) =
+                                    crate::extraction::provenance::extractable(text)
+                                {
+                                    completed = truncate_str(&cleaned, 300).to_string();
                                 }
                             }
                         }
@@ -201,9 +182,8 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
                 }
                 // Also handle plain string content
                 if let Some(text) = content.as_str() {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        completed = truncate_str(trimmed, 300).to_string();
+                    if let Some(cleaned) = crate::extraction::provenance::extractable(text) {
+                        completed = truncate_str(&cleaned, 300).to_string();
                     }
                 }
             }
@@ -232,18 +212,21 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
             }
         }
 
-        // Extract next_steps from any message
+        // Extract next_steps from any message — scanning only provenance-cleaned
+        // text, so quoted injection output and command plumbing never match.
         if let Some(content) = val.get("message").and_then(|m| m.get("content")) {
-            let text = extract_text_from_content(content);
-            let lower = text.to_lowercase();
-            for keyword in &["next step", "next:", "todo:", "remaining:"] {
-                if let Some(pos) = lower.find(keyword) {
-                    let start = pos;
-                    let end = (pos + 200).min(text.len());
-                    let end = text.floor_char_boundary(end);
-                    let snippet = text[start..end].trim().to_string();
-                    if !snippet.is_empty() && !is_injection_meta_text(&snippet) {
-                        next_steps = Some(snippet);
+            let raw = extract_text_from_content(content);
+            if let Some(text) = crate::extraction::provenance::extractable(&raw) {
+                let lower = text.to_lowercase();
+                for keyword in &["next step", "next:", "todo:", "remaining:"] {
+                    if let Some(pos) = lower.find(keyword) {
+                        let start = pos;
+                        let end = (pos + 200).min(text.len());
+                        let end = text.floor_char_boundary(end);
+                        let snippet = text[start..end].trim().to_string();
+                        if !snippet.is_empty() {
+                            next_steps = Some(snippet);
+                        }
                     }
                 }
             }
@@ -694,19 +677,38 @@ mod tests {
     }
 
     #[test]
-    fn test_is_injection_meta_text() {
-        // Quoted injection boilerplate: multiple markers at once
-        assert!(is_injection_meta_text(
-            "NEXT:/TODOS:/ANCHORS: lines - Do NOT count CLAUDE.md"
-        ));
-        assert!(is_injection_meta_text(
-            "CSR CONTINUUM [2m ago]: ... | TODOS: 0 open"
-        ));
-        // Genuine next-step prose, even about CSR itself: at most one marker
-        assert!(!is_injection_meta_text(
-            "next: fix the TODOS: counter display in the statusline"
-        ));
-        assert!(!is_injection_meta_text("next step: deploy to production"));
+    fn test_request_skips_command_plumbing_and_probe_paste() {
+        // Round-3 regression: caveat wrapper and pasted probe report must not
+        // become the episode request — the first REAL user message should.
+        let lines_owned = [
+            user_line(
+                "<local-command-caveat>Caveat: The messages below were generated by the \
+                 user while running local commands. DO NOT respond</local-command-caveat>",
+            ),
+            user_line("## CSR Memory Feedback — 2026-06-10 — noise: CSR CONTINUUM garbled"),
+            user_line("now fix the briefing staleness issue"),
+            assistant_text_line("Looking into the staleness issue and the debounce window."),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
+        let ep = extract_episode(&lines, "sess-plumb", "proj");
+        assert_eq!(ep.request, "now fix the briefing staleness issue");
+    }
+
+    #[test]
+    fn test_completed_keeps_prose_drops_quoted_injection_tokens() {
+        // Round-3 regression: assistant summary quoting `NEXT: none recorded`
+        // in backticks polluted LAST. Quoted tokens go; prose stays.
+        let lines_owned = [
+            user_line("verify the continuum filter"),
+            assistant_text_line(
+                "`NEXT: none recorded` — polluted boilerplate filtered, \
+                 including episodes already in the DB.",
+            ),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
+        let ep = extract_episode(&lines, "sess-quote", "proj");
+        assert!(!ep.completed.contains("NEXT:"));
+        assert!(ep.completed.contains("polluted boilerplate filtered"));
     }
 
     #[test]
