@@ -802,11 +802,15 @@ fn get_session_reflection_preview(engine: &Engine, session: &SessionInfo) -> Opt
 }
 
 /// Check if a session has enough content to be worth displaying.
-/// Threshold: >= 6 messages (codex R-1) OR has enrichment data.
+/// Threshold: >= 6 messages (codex R-1), or >= 3 with enrichment data. Enrichment
+/// alone is not enough: every session gets heuristic enrichment, including
+/// single-exchange test invocations (`claude -p "say exactly: ..."`), and surfacing
+/// those as "past sessions" injects the test harness back into real sessions.
+pub(crate) const MIN_ENRICHED_MESSAGES: usize = 3;
+
 fn is_displayable(session: &SessionInfo) -> bool {
-    let has_enrichment = session.enrichment.is_some();
-    if has_enrichment {
-        return true;
+    if session.enrichment.is_some() {
+        return session.total_messages >= MIN_ENRICHED_MESSAGES;
     }
     if session.total_messages < 6 {
         return false;
@@ -1459,6 +1463,24 @@ mod tests {
             enrichment: Some("[Heuristic] Project: test\nTools: Edit".to_string()),
         };
         assert!(is_displayable(&session));
+    }
+
+    #[test]
+    fn test_is_displayable_enriched_micro_session_filtered() {
+        // A single prompt/reply exchange (e.g. a manual `claude -p "say exactly: ..."`
+        // test invocation) gets heuristic enrichment like any session, but injecting
+        // it as a "past session" is self-referential noise — enrichment alone must
+        // not rescue a session below the micro threshold.
+        let session = SessionInfo {
+            conversation_id: "abc".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-02-15T10:00:00Z".to_string(),
+            total_messages: 2,
+            chunk_count: 1,
+            summary: None,
+            enrichment: Some("[Heuristic] Project: test\nTools: ".to_string()),
+        };
+        assert!(!is_displayable(&session));
     }
 
     // --- session_title tests ---

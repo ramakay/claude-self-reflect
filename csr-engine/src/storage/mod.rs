@@ -181,6 +181,11 @@ impl Storage {
         queries::get_reflections_by_two_tags(&conn, tag_a, tag_b, limit)
     }
 
+    pub fn conversation_message_count(&self, conversation_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::conversation_message_count(&conn, conversation_id)
+    }
+
     // ─── Enrichment state ───
 
     pub fn is_conversation_enriched(
@@ -288,9 +293,12 @@ impl Storage {
 
     // ─── Story backfill queries ───
 
-    pub fn get_conversations_missing_stories(&self) -> Result<Vec<(String, String, String)>> {
+    pub fn get_conversations_missing_stories(
+        &self,
+        min_messages: usize,
+    ) -> Result<Vec<(String, String, String)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::get_conversations_missing_stories(&conn)
+        queries::get_conversations_missing_stories(&conn, min_messages)
     }
 
     pub fn get_project_for_conversation(&self, conversation_id: &str) -> Result<Option<String>> {

@@ -835,6 +835,7 @@ pub fn get_conversations_needing_heuristic(conn: &Connection) -> Result<Vec<(Str
 /// Returns (conversation_id, enrichment_type, reflection_id) for each candidate.
 pub fn get_conversations_missing_stories(
     conn: &Connection,
+    min_messages: usize,
 ) -> Result<Vec<(String, String, String)>> {
     let mut stmt = conn.prepare(
         "SELECT e.conversation_id, e.enrichment_type, e.reflection_id
@@ -845,9 +846,14 @@ pub fn get_conversations_missing_stories(
                SELECT conversation_id FROM enrichment_state
                WHERE enrichment_type = 'session_story' AND status = 'completed'
            )
+           AND e.conversation_id IN (
+               SELECT conversation_id FROM chunks
+               GROUP BY conversation_id
+               HAVING SUM(message_count) >= ?1
+           )
          ORDER BY e.updated_at DESC",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![min_messages as i64], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -878,6 +884,17 @@ pub fn get_project_for_conversation(
 // ─── Status queries (for csr-engine status) ───
 
 /// Count distinct conversations in the database.
+/// Total messages across a conversation's imported chunks. Returns 0 when the
+/// conversation has no chunks.
+pub fn conversation_message_count(conn: &Connection, conversation_id: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(message_count), 0) FROM chunks WHERE conversation_id = ?1",
+        params![conversation_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
 pub fn count_conversations(conn: &Connection) -> Result<usize> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(DISTINCT conversation_id) FROM chunks",

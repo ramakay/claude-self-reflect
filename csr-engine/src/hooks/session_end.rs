@@ -45,7 +45,15 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
             .is_conversation_enriched(&conv_id, "session_story")
             .unwrap_or(false);
 
-        if !has_story {
+        // Micro sessions (single prompt/reply, e.g. a manual `claude -p` test
+        // invocation) get no story: a story would resurface them as "past sessions"
+        // at SessionStart, injecting the test harness back into real sessions.
+        let message_count = engine
+            .storage()
+            .conversation_message_count(&conv_id)
+            .unwrap_or(0);
+
+        if !has_story && message_count >= super::session_start::MIN_ENRICHED_MESSAGES {
             // Try V3 synthesis first (zero-cost, instant)
             let synthesized = try_v3_story_synthesis(engine, &conv_id, &project).await;
 

@@ -428,7 +428,9 @@ pub fn spawn_detached_story_generation(transcript: &str, cwd: &str) {
 /// Backfill stories for all conversations that have V3/heuristic enrichment but no story.
 /// Tier 1: V3 → synthesize locally (free). Tier 2: Heuristic → template (free).
 pub async fn backfill_stories_cli(engine: &Engine, dry_run: bool) -> anyhow::Result<()> {
-    let candidates = engine.storage().get_conversations_missing_stories()?;
+    let candidates = engine
+        .storage()
+        .get_conversations_missing_stories(crate::hooks::session_start::MIN_ENRICHED_MESSAGES)?;
     eprintln!("CSR: {} conversations missing stories", candidates.len());
 
     let mut tier1 = 0usize;
