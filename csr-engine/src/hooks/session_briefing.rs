@@ -124,6 +124,10 @@ fn invoke_haiku_briefing(prompt: &str) -> Result<String> {
 
     let mut child = Command::new("claude")
         .arg("-p")
+        // The prompt MUST precede --mcp-config: that flag is variadic in the
+        // claude CLI and consumes any trailing positional arg as another config
+        // file path, failing with ENAMETOOLONG on the episode text.
+        .arg(prompt)
         .arg("--model")
         .arg("claude-haiku-4-5-20251001")
         .arg("--output-format")
@@ -135,7 +139,6 @@ fn invoke_haiku_briefing(prompt: &str) -> Result<String> {
         // the empty MCP config means zero tools, so this is a pure text summary.
         // Skipping permissions would only widen the blast radius if an episode
         // contained adversarial content. Print mode won't prompt interactively.
-        .arg(prompt)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
