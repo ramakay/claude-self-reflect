@@ -56,7 +56,10 @@ const BRIEFING_INSTRUCTION: &str = concat!(
     "- Recent work and outcomes\n",
     "- Patterns (repeated errors, same files across sessions)\n",
     "- Unfinished work (next_steps, partial/interrupted outcomes)\n\n",
-    "Only report what the episodes contain. Do not fabricate information.\n\n",
+    "Only report what the episodes contain. Do not fabricate information.\n",
+    "Each episode is prefixed with its age (e.g. '2h ago'). Refer to timing ",
+    "using those ages. Do NOT cite absolute calendar dates: the JSON timestamps ",
+    "are UTC and will read as the wrong day in the user's timezone.\n\n",
     "=== RECENT EPISODES ===\n"
 );
 
@@ -247,7 +250,7 @@ fn recent_episodes_for_project(engine: &Engine, project: &str) -> String {
 
     let mut out = String::new();
     let mut n = 0;
-    for (_, content, tags, _) in &rows {
+    for (_, content, tags, ts) in &rows {
         if n >= MAX_EPISODES_IN_BRIEFING {
             break;
         }
@@ -263,16 +266,22 @@ fn recent_episodes_for_project(engine: &Engine, project: &str) -> String {
             continue;
         }
         n += 1;
+        // Relative age (e.g. "2h ago") so Haiku reports timing without citing the
+        // raw UTC timestamp, which reads as a future date in the user's timezone.
+        let age = crate::temporal::parse_timestamp(ts)
+            .map(|t| crate::temporal::format_relative_time(&t))
+            .unwrap_or_else(|| "recently".to_string());
         if content.len() > MAX_EPISODE_CHARS {
             let end = content.floor_char_boundary(MAX_EPISODE_CHARS);
             // Mark the cut so Haiku treats it as an excerpt, not malformed JSON.
             out.push_str(&format!(
-                "\n[Episode {}]\n{}…[truncated]\n",
+                "\n[Episode {} — {}]\n{}…[truncated]\n",
                 n,
+                age,
                 &content[..end]
             ));
         } else {
-            out.push_str(&format!("\n[Episode {}]\n{}\n", n, content));
+            out.push_str(&format!("\n[Episode {} — {}]\n{}\n", n, age, content));
         }
     }
     out

@@ -79,6 +79,9 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                 true
             }
         })
+        // Drop stories synthesized from CSR self-sessions (probe runs) stored
+        // before the session_end meta gate landed — they echo our own output.
+        .filter(|(_, content, _, _)| !crate::extraction::provenance::is_csr_emission(content))
         .take(3)
         .collect();
 
@@ -155,6 +158,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         let displayable: Vec<&SessionInfo> = sessions
             .iter()
             .filter(|s| is_displayable(s))
+            .filter(|s| !is_meta_session(s))
             .filter(|s| Some(s.conversation_id.as_str()) != continued_cid)
             .take(max_display)
             .collect();
@@ -324,6 +328,12 @@ fn detect_continued_session(
 
     // Must be displayable (has enough content to be meaningful)
     if !is_displayable(&session) {
+        return None;
+    }
+
+    // Never continue from a CSR self-session (probe run, command-only): it is
+    // not real work and re-injecting it is the self-pollution class itself.
+    if is_meta_session(&session) {
         return None;
     }
 
@@ -770,6 +780,18 @@ const NOISE_SUMMARIES: &[&str] = &[
 /// Extract a clean session title from summary, stripping preamble and sanitizing.
 /// Prefers enrichment-based titles over raw summary (first user prompt) when available,
 /// since what-was-done is more useful than what-was-asked.
+/// True if a session is CSR examining itself (a /memory-feedback probe run, a
+/// command-only invocation) rather than real user work. Decided by the first
+/// user prompt (`summary`): if no genuine request survives provenance filtering,
+/// the session is meta and must not surface as CONTINUED FROM or RECENT SESSIONS.
+/// A session with no summary is left to the other display gates (can't classify).
+fn is_meta_session(session: &SessionInfo) -> bool {
+    match session.summary.as_deref() {
+        Some(s) if !s.trim().is_empty() => crate::extraction::provenance::extractable(s).is_none(),
+        _ => false,
+    }
+}
+
 fn session_title(session: &SessionInfo) -> String {
     // Try enrichment first — it describes what happened, not what was asked
     if let Some(enrichment) = session.enrichment.as_deref() {
@@ -1473,6 +1495,54 @@ mod tests {
     }
 
     // --- is_displayable tests (threshold=6 or has enrichment) ---
+
+    #[test]
+    fn test_is_meta_session_probe_run() {
+        // Round-5 regression: a /memory-feedback probe run must not surface as
+        // CONTINUED FROM or RECENT SESSIONS. Its summary is the probe command.
+        let session = SessionInfo {
+            conversation_id: "probe".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-06-10T10:00:00Z".to_string(),
+            total_messages: 8,
+            chunk_count: 2,
+            summary: Some(
+                "<command-message>memory-feedback</command-message> CSR Memory Feedback \
+                 Probe You are reporting on the quality of the memory context"
+                    .to_string(),
+            ),
+            enrichment: None,
+        };
+        assert!(is_meta_session(&session));
+    }
+
+    #[test]
+    fn test_is_meta_session_real_work_is_not_meta() {
+        let session = SessionInfo {
+            conversation_id: "real".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-06-10T10:00:00Z".to_string(),
+            total_messages: 30,
+            chunk_count: 5,
+            summary: Some("fix the briefing staleness bug in session_briefing.rs".to_string()),
+            enrichment: None,
+        };
+        assert!(!is_meta_session(&session));
+    }
+
+    #[test]
+    fn test_is_meta_session_no_summary_not_meta() {
+        let session = SessionInfo {
+            conversation_id: "nosum".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-06-10T10:00:00Z".to_string(),
+            total_messages: 30,
+            chunk_count: 5,
+            summary: None,
+            enrichment: Some("Edited src/main.rs".to_string()),
+        };
+        assert!(!is_meta_session(&session));
+    }
 
     #[test]
     fn test_is_displayable_good_session() {
