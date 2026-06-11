@@ -508,7 +508,7 @@ pub async fn run_continuity_live(
     }
     out.push('\n');
     match target_rank {
-        Some(r) if r == 1 => out.push_str(&format!(
+        Some(1) => out.push_str(&format!(
             "VERDICT: founding decision (conv {TARGET_CONV}) ranks #1 — CSR ties/beats grep ✅\n"
         )),
         Some(r) => out.push_str(&format!(
