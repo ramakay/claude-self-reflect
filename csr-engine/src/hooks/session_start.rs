@@ -660,8 +660,7 @@ pub fn format_tier0_block(
         .as_deref()
         .and_then(extractable)
         .map(|n| compact_preview(strip_next_prefix(&n), 80))
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "none recorded".into());
+        .filter(|n| !n.is_empty());
 
     // Reconcile outcome for episodes stored before the recovered-outcome rule:
     // a "failed" tag on a session whose LAST shows a closing success signal is a
@@ -673,9 +672,18 @@ pub fn format_tier0_block(
     };
 
     let mut out = format!(
-        "CSR CONTINUUM [{}]: {}\nLAST: {} (outcome={})\nNEXT: {} | TODOS: {} open\n",
-        age, request, last, outcome, next, open_todos
+        "CSR CONTINUUM [{}]: {}\nLAST: {} (outcome={})\n",
+        age, request, last, outcome
     );
+    // Only emit the NEXT/TODOS line when it carries signal — a real next step or
+    // open todos. "NEXT: none recorded | TODOS: 0 open" is pure filler.
+    if next.is_some() || open_todos > 0 {
+        out.push_str(&format!(
+            "NEXT: {} | TODOS: {} open\n",
+            next.as_deref().unwrap_or("none recorded"),
+            open_todos
+        ));
+    }
     if !anchor_verdicts.is_empty() {
         out.push_str(&format!(
             "ANCHORS: {} intact, {} modified since checkpoint{}\n",
@@ -1269,6 +1277,38 @@ mod tests {
     }
 
     #[test]
+    fn tier0_suppresses_zero_signal_next_line() {
+        use crate::hooks::stop::Episode;
+        // Round-10: "NEXT: none recorded | TODOS: 0 open" is pure filler. With
+        // no next step and no open todos, the line must not render at all.
+        let ep = Episode {
+            schema: "v2".into(),
+            session_id: "z-1".into(),
+            project: "proj".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            request: "Fix the parser".into(),
+            investigated: vec![],
+            completed: "Parser fixed.".into(),
+            next_steps: None,
+            blockers: None,
+            outcome: "success".into(),
+            error_signatures: vec![],
+            tools_used: vec![],
+            files_modified: vec![],
+            message_count: 10,
+            duration_minutes: 0,
+            todos: vec![],
+            approved_plan: None,
+            prev_episode_id: None,
+            anchors: vec![],
+        };
+        let block = format_tier0_block(&ep, &[], "2h ago");
+        assert!(block.contains("LAST: Parser fixed."));
+        assert!(!block.contains("NEXT:"));
+        assert!(!block.contains("TODOS:"));
+    }
+
+    #[test]
     fn tier0_reconciles_failed_outcome_with_success_last() {
         use crate::hooks::stop::Episode;
         // Round-7: stale episode tagged "failed" but LAST shows success — the
@@ -1329,7 +1369,9 @@ mod tests {
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2m ago");
-        assert!(block.contains("NEXT: none recorded"));
+        // Meta next_steps filtered to empty + no open todos → NEXT line suppressed
+        // entirely (zero-signal). The boilerplate must never re-inject.
+        assert!(!block.contains("NEXT:"));
         assert!(!block.contains("Do NOT count"));
     }
 
