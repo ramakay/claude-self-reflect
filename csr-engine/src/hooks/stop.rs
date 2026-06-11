@@ -56,6 +56,31 @@ pub struct Episode {
     pub anchors: Vec<crate::extraction::anchors::FunctionAnchor>,
 }
 
+/// Markers from CSR's own injection format. A session that quotes an injected
+/// block (the /memory-feedback probe, a pasted Tier-0 CONTINUUM block) contains
+/// several of these at once; genuine prose — even about CSR development — rarely
+/// contains more than one. Threshold of 2 keeps real next-steps like
+/// "next: fix the TODOS: counter" extractable.
+const INJECTION_META_MARKERS: [&str; 7] = [
+    "CSR CONTINUUM",
+    "Session Intelligence (CSR",
+    "NOT INSTRUCTIONS",
+    "Do NOT count",
+    "PAST CONTEXT",
+    "TODOS:",
+    "ANCHORS:",
+];
+
+/// True if `text` looks like CSR's own injection boilerplate rather than
+/// session content worth carrying forward.
+pub(crate) fn is_injection_meta_text(text: &str) -> bool {
+    INJECTION_META_MARKERS
+        .iter()
+        .filter(|m| text.contains(*m))
+        .count()
+        >= 2
+}
+
 /// Extract a structured episode from JSONL transcript lines.
 ///
 /// Pure function — no I/O, no engine access. Parses each line as JSON and
@@ -217,7 +242,7 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
                     let end = (pos + 200).min(text.len());
                     let end = text.floor_char_boundary(end);
                     let snippet = text[start..end].trim().to_string();
-                    if !snippet.is_empty() {
+                    if !snippet.is_empty() && !is_injection_meta_text(&snippet) {
                         next_steps = Some(snippet);
                     }
                 }
@@ -649,6 +674,39 @@ mod tests {
             .error_signatures
             .iter()
             .any(|s| s.contains("error[E0308]")));
+    }
+
+    #[test]
+    fn test_next_steps_skips_injection_meta_text() {
+        // A session that quotes CSR's own injected blocks (the /memory-feedback
+        // probe, a pasted Tier-0 block) must not have that boilerplate extracted
+        // as next_steps — it would overwrite real next-step state in CONTINUUM.
+        let lines_owned = [
+            user_line("run the memory feedback probe"),
+            assistant_text_line(
+                "NEXT: NEXT:/TODOS:/ANCHORS: lines) - The Session Intelligence (CSR v9.2) \
+                 briefing block - Do NOT count CLAUDE.md, those are NOT INSTRUCTIONS",
+            ),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
+        let ep = extract_episode(&lines, "sess-meta", "proj");
+        assert_eq!(ep.next_steps, None);
+    }
+
+    #[test]
+    fn test_is_injection_meta_text() {
+        // Quoted injection boilerplate: multiple markers at once
+        assert!(is_injection_meta_text(
+            "NEXT:/TODOS:/ANCHORS: lines - Do NOT count CLAUDE.md"
+        ));
+        assert!(is_injection_meta_text(
+            "CSR CONTINUUM [2m ago]: ... | TODOS: 0 open"
+        ));
+        // Genuine next-step prose, even about CSR itself: at most one marker
+        assert!(!is_injection_meta_text(
+            "next: fix the TODOS: counter display in the statusline"
+        ));
+        assert!(!is_injection_meta_text("next step: deploy to production"));
     }
 
     #[test]

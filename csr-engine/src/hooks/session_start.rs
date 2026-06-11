@@ -570,7 +570,13 @@ pub fn format_tier0_block(
         .map(|(n, _)| n.as_str())
         .take(3)
         .collect();
-    let next = ep.next_steps.as_deref().unwrap_or("none recorded");
+    // Defense in depth: episodes stored before the extraction-side guard may
+    // carry CSR's own injection boilerplate as next_steps — don't re-inject it.
+    let next = ep
+        .next_steps
+        .as_deref()
+        .filter(|n| !crate::hooks::stop::is_injection_meta_text(n))
+        .unwrap_or("none recorded");
 
     let mut out = format!(
         "CSR CONTINUUM [{}]: {}\nLAST: {} (outcome={})\nNEXT: {} | TODOS: {} open\n",
@@ -1101,6 +1107,40 @@ mod tests {
         assert!(block.contains("1 intact, 1 modified"));
         assert!(block.contains("validate_token"));
         assert!(block.contains(r#"csr_reflect_on_past("conv_abc-123")"#));
+    }
+
+    #[test]
+    fn tier0_block_filters_meta_next_steps() {
+        use crate::hooks::stop::Episode;
+        // Episodes stored before the extraction-side guard can carry injection
+        // boilerplate as next_steps — the formatter must not re-inject it.
+        let ep = Episode {
+            schema: "v2".into(),
+            session_id: "abc-456".into(),
+            project: "proj".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            request: "run the memory feedback probe".into(),
+            investigated: vec![],
+            completed: "Feedback copied to clipboard".into(),
+            next_steps: Some(
+                "NEXT: NEXT:/TODOS:/ANCHORS: lines) - briefing block - Do NOT count CLAUDE.md"
+                    .into(),
+            ),
+            blockers: None,
+            outcome: "success".into(),
+            error_signatures: vec![],
+            tools_used: vec![],
+            files_modified: vec![],
+            message_count: 5,
+            duration_minutes: 0,
+            todos: vec![],
+            approved_plan: None,
+            prev_episode_id: None,
+            anchors: vec![],
+        };
+        let block = format_tier0_block(&ep, &[], "2m ago");
+        assert!(block.contains("NEXT: none recorded"));
+        assert!(!block.contains("Do NOT count"));
     }
 
     // --- infer_next_action (keyword fallback) tests ---
