@@ -49,6 +49,25 @@ impl Storage {
         queries::load_all_chunk_vectors(&conn)
     }
 
+    /// Upsert provenance (author, source conv, supersession) for a chunk.
+    pub fn insert_chunk_provenance(
+        &self,
+        chunk_id: &str,
+        prov: &crate::provenance::ChunkProvenance,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::insert_chunk_provenance(&conn, chunk_id, prov)
+    }
+
+    /// Fetch provenance for a chunk, if recorded.
+    pub fn get_chunk_provenance(
+        &self,
+        chunk_id: &str,
+    ) -> Result<Option<crate::provenance::ChunkProvenance>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_provenance(&conn, chunk_id)
+    }
+
     pub fn get_chunks_by_ids(&self, ids: &[String]) -> Result<Vec<ConversationChunk>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_chunks_by_ids(&conn, ids)
@@ -559,5 +578,43 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].1.name, "validate_token");
         assert_eq!(got[0].0, "sess-1"); // session_id comes back too
+    }
+
+    #[test]
+    fn chunk_provenance_roundtrip() {
+        use crate::import::ConversationChunk;
+        use crate::provenance::{ChunkProvenance, Speaker};
+        let storage = Storage::open_memory().unwrap();
+
+        // Provenance references a chunk row (FK enforced).
+        let chunk = ConversationChunk {
+            id: "chunk-1".into(),
+            conversation_id: "0bab445f".into(),
+            project_name: "proj".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            content: "the vision".into(),
+            message_count: 1,
+            summary: None,
+        };
+        storage.insert_chunk(&chunk, &[0.0; 384]).unwrap();
+
+        let p = ChunkProvenance {
+            author: Speaker::User,
+            source_conv_id: "0bab445f".into(),
+            supersedes: Some("behavioral continuity".into()),
+        };
+        storage.insert_chunk_provenance("chunk-1", &p).unwrap();
+        // Upsert: inserting again must not duplicate or error.
+        storage.insert_chunk_provenance("chunk-1", &p).unwrap();
+
+        let got = storage
+            .get_chunk_provenance("chunk-1")
+            .unwrap()
+            .expect("provenance present");
+        assert_eq!(got.author, Speaker::User);
+        assert_eq!(got.source_conv_id, "0bab445f");
+        assert_eq!(got.supersedes.as_deref(), Some("behavioral continuity"));
+
+        assert!(storage.get_chunk_provenance("missing").unwrap().is_none());
     }
 }

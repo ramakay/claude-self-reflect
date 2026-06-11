@@ -142,6 +142,14 @@ pub fn run(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_episode_anchors_project ON episode_anchors(project);
         CREATE INDEX IF NOT EXISTS idx_episode_anchors_name ON episode_anchors(name);
+
+        CREATE TABLE IF NOT EXISTS chunk_provenance (
+            chunk_id       TEXT PRIMARY KEY REFERENCES chunks(id),
+            author         TEXT NOT NULL,
+            source_conv_id TEXT NOT NULL,
+            supersedes     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_provenance_author ON chunk_provenance(author);
         ",
     )?;
 

@@ -6,6 +6,45 @@ use chrono;
 use rusqlite::{params, Connection};
 
 use crate::import::ConversationChunk;
+use crate::provenance::{ChunkProvenance, Speaker};
+
+/// Upsert provenance for a chunk (who authored it, source conv, supersession).
+pub fn insert_chunk_provenance(
+    conn: &Connection,
+    chunk_id: &str,
+    prov: &ChunkProvenance,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO chunk_provenance (chunk_id, author, source_conv_id, supersedes)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            chunk_id,
+            prov.author.as_str(),
+            prov.source_conv_id,
+            prov.supersedes,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Fetch provenance for a chunk, if any. Unknown author tokens degrade to
+/// `ToolResult` (non-authoritative) rather than failing the read.
+pub fn get_chunk_provenance(conn: &Connection, chunk_id: &str) -> Result<Option<ChunkProvenance>> {
+    let mut stmt = conn.prepare(
+        "SELECT author, source_conv_id, supersedes FROM chunk_provenance WHERE chunk_id = ?1",
+    )?;
+    let mut rows = stmt.query(params![chunk_id])?;
+    if let Some(row) = rows.next()? {
+        let author_str: String = row.get(0)?;
+        Ok(Some(ChunkProvenance {
+            author: author_str.parse().unwrap_or(Speaker::ToolResult),
+            source_conv_id: row.get(1)?,
+            supersedes: row.get(2)?,
+        }))
+    } else {
+        Ok(None)
+    }
+}
 
 /// A reflection row: (id, content, tags, timestamp).
 pub type ReflectionRow = (String, String, Vec<String>, String);
