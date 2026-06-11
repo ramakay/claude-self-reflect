@@ -94,6 +94,9 @@ enum Commands {
         /// Run full evaluation (20 tests) instead of quick (5 tests)
         #[arg(long)]
         full: bool,
+        /// Run the continuity gate (North Star: recall + provenance beats grep)
+        #[arg(long)]
+        continuity: bool,
     },
     /// Backfill session stories from V3/heuristic data (zero cost)
     BackfillStories {
@@ -197,11 +200,16 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(Commands::Eval { full }) = args.command {
+    if let Some(Commands::Eval { full, continuity }) = args.command {
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        if continuity {
+            let report = csr_engine::eval::continuity::run_continuity(eng.embeddings()).await;
+            print!("{}", report.format_text());
+            return Ok(());
+        }
         let report = if full {
             csr_engine::eval::run_full(
                 eng.storage(),
