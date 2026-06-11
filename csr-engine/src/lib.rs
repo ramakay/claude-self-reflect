@@ -5,6 +5,7 @@ pub mod engine;
 pub mod eval;
 pub mod extraction;
 pub mod format;
+pub mod governor;
 pub mod hooks;
 pub mod import;
 pub mod injection;
