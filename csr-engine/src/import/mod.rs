@@ -204,16 +204,18 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             }
         }
 
-        // Extract text content + tool context (both stripped of private tags)
+        // Extract text content + tool context + tool RESULTS (all stripped of private tags).
+        // tool_result blocks carry the substance of research conversations — fetched docs,
+        // file contents, and subagent reports. Without them, ~90% of a session's content is
+        // invisible to search and recall collapses to the opening user prompt.
         let text = extract_message_text(&parsed);
         let tool_context = strip_private_tags(&extract_tool_context(&parsed));
-        let combined_text = if !text.is_empty() && !tool_context.is_empty() {
-            format!("{}\n{}", text, tool_context)
-        } else if !tool_context.is_empty() {
-            tool_context
-        } else {
-            text
-        };
+        let tool_results = strip_private_tags(&extract_tool_results(&parsed));
+        let combined_text = [text, tool_context, tool_results]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
         if !combined_text.is_empty() {
             messages.push(combined_text);
             authors.push(classify_message_author(&parsed));
@@ -245,31 +247,171 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     // Priority: JSONL summary > first user message > None
     let chunk_summary = summary.or(first_user_message);
 
-    // Chunk into groups of 50 messages
-    let chunk_size = 50;
-    let mut chunks = Vec::new();
+    // Chunk by character budget, NOT a fixed message count. The embedding model
+    // (all-MiniLM-L6-v2) truncates input at ~256 tokens, so a chunk larger than
+    // ~900 chars only embeds its head — the rest is unsearchable. Sizing each chunk
+    // under that window means the whole conversation actually lands in vector space.
+    let mut chunks: Vec<ConversationChunk> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_authors: Vec<crate::provenance::Speaker> = Vec::new();
+    let mut buf_msgs = 0usize;
 
-    for (i, (chunk_msgs, chunk_authors)) in messages
-        .chunks(chunk_size)
-        .zip(authors.chunks(chunk_size))
-        .enumerate()
-    {
-        let combined = chunk_msgs.join("\n\n");
-        let chunk_id = generate_chunk_id(&conversation_id, i);
+    for (msg, author) in messages.iter().zip(authors.iter()) {
+        // A single message larger than the budget is hard-split into multiple chunks
+        // so its tail (e.g. the end of a long report) is embedded too.
+        if msg.len() > CHUNK_CHAR_BUDGET {
+            if !buf.is_empty() {
+                push_chunk(
+                    &mut chunks,
+                    &conversation_id,
+                    project_name,
+                    &timestamp,
+                    std::mem::take(&mut buf),
+                    buf_msgs,
+                    &chunk_summary,
+                    chunk_author(&buf_authors),
+                );
+                buf_authors.clear();
+                buf_msgs = 0;
+            }
+            let mut start = 0;
+            while start < msg.len() {
+                let mut end = (start + CHUNK_CHAR_BUDGET).min(msg.len());
+                end = msg.floor_char_boundary(end);
+                if end <= start {
+                    end = msg.len();
+                }
+                push_chunk(
+                    &mut chunks,
+                    &conversation_id,
+                    project_name,
+                    &timestamp,
+                    msg[start..end].to_string(),
+                    1,
+                    &chunk_summary,
+                    *author,
+                );
+                start = end;
+            }
+            continue;
+        }
 
-        chunks.push(ConversationChunk {
-            id: chunk_id,
-            conversation_id: conversation_id.clone(),
-            project_name: project_name.to_string(),
-            timestamp: timestamp.clone(),
-            content: combined,
-            message_count: chunk_msgs.len(),
-            summary: chunk_summary.clone(),
-            author: chunk_author(chunk_authors),
-        });
+        // Flush before exceeding the budget, then start a fresh chunk.
+        if !buf.is_empty() && buf.len() + msg.len() + 2 > CHUNK_CHAR_BUDGET {
+            push_chunk(
+                &mut chunks,
+                &conversation_id,
+                project_name,
+                &timestamp,
+                std::mem::take(&mut buf),
+                buf_msgs,
+                &chunk_summary,
+                chunk_author(&buf_authors),
+            );
+            buf_authors.clear();
+            buf_msgs = 0;
+        }
+        if !buf.is_empty() {
+            buf.push_str("\n\n");
+        }
+        buf.push_str(msg);
+        buf_authors.push(*author);
+        buf_msgs += 1;
+    }
+    if !buf.is_empty() {
+        push_chunk(
+            &mut chunks,
+            &conversation_id,
+            project_name,
+            &timestamp,
+            buf,
+            buf_msgs,
+            &chunk_summary,
+            chunk_author(&buf_authors),
+        );
     }
 
     Ok(chunks)
+}
+
+/// Character budget per chunk. Kept under the embedding model's ~256-token window
+/// (all-MiniLM-L6-v2) so each chunk embeds in full rather than head-truncated.
+const CHUNK_CHAR_BUDGET: usize = 900;
+
+/// Per-tool_result character cap. Bounds giant logs while preserving enough of a
+/// fetched doc / subagent report for the size-based chunker to slice and embed.
+const MAX_TOOL_RESULT_CHARS: usize = 4000;
+
+/// Push one finished chunk, assigning a deterministic sequential id.
+#[allow(clippy::too_many_arguments)]
+fn push_chunk(
+    chunks: &mut Vec<ConversationChunk>,
+    conversation_id: &str,
+    project_name: &str,
+    timestamp: &str,
+    content: String,
+    message_count: usize,
+    summary: &Option<String>,
+    author: crate::provenance::Speaker,
+) {
+    let i = chunks.len();
+    chunks.push(ConversationChunk {
+        id: generate_chunk_id(conversation_id, i),
+        conversation_id: conversation_id.to_string(),
+        project_name: project_name.to_string(),
+        timestamp: timestamp.to_string(),
+        content,
+        message_count,
+        summary: summary.clone(),
+        author,
+    });
+}
+
+/// Extract searchable text from tool_result blocks (WebFetch/Read/Bash/Task/Agent
+/// outputs). This is where research substance and subagent reports live; without it
+/// recall collapses to the opening user prompt. Capped per result to bound logs.
+fn extract_tool_results(msg: &serde_json::Value) -> String {
+    let content = match msg
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        Some(c) => c,
+        None => return String::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for item in content {
+        if item.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+            continue;
+        }
+        let body = match item.get("content") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|b| {
+                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        b.get("text").and_then(|t| t.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let capped = if body.len() > MAX_TOOL_RESULT_CHARS {
+            let end = body.floor_char_boundary(MAX_TOOL_RESULT_CHARS);
+            &body[..end]
+        } else {
+            body
+        };
+        out.push(capped.to_string());
+    }
+    out.join("\n")
 }
 
 /// Parse a JSONL file into raw serde_json::Value messages (for extraction module).
