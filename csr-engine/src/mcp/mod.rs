@@ -153,6 +153,20 @@ pub struct GetSessionLearningsParams {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CodeGraphParams {
+    /// Symbol name to query (function/type), e.g. 'dispatch_hook'
+    pub symbol: Option<String>,
+    /// File path to anchor the query when no symbol is given
+    pub file: Option<String>,
+    /// Query mode: 'neighbors' (default), 'callers', or 'callees'
+    pub mode: Option<String>,
+    /// Traversal depth (currently 1-hop; reserved)
+    pub depth: Option<u32>,
+    /// Maximum number of results (default: 20)
+    pub limit: Option<u32>,
+}
+
 // ─── MCP Server ───
 
 /// The MCP server that exposes CSR search/reflection tools.
@@ -559,6 +573,38 @@ impl CsrServer {
         let limit = p.limit.unwrap_or(50);
 
         let result = tools::get_session_learnings(&self.storage, &p.session_id, limit);
+        tool_result(result)
+    }
+
+    // ─── Code property graph (1) ───
+
+    #[tool(
+        name = "csr_code_graph",
+        description = "Query the conversation-provenance code graph: who calls a symbol (callers), what it calls (callees), or its 1-hop neighbors. Each result carries the conversation that last changed it. Modes: neighbors|callers|callees.",
+        annotations(
+            title = "Code Graph",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn code_graph(
+        &self,
+        params: Parameters<CodeGraphParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+        let mode = p.mode.as_deref().unwrap_or("neighbors");
+        let limit = p.limit.unwrap_or(20) as usize;
+
+        let result = tools::code_graph(
+            &self.storage,
+            p.symbol.as_deref(),
+            p.file.as_deref(),
+            mode,
+            limit,
+        )
+        .await;
+
         tool_result(result)
     }
 }

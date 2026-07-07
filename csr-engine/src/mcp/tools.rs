@@ -398,15 +398,96 @@ pub async fn get_timeline(
     Ok(format::format_timeline(&groups, &time_desc))
 }
 
-/// File-based search using FTS5.
+/// File ledger (§8b) — deterministic, immutable per-file dossier built from the
+/// code graph + code_evolution. FTS5 is only a secondary fallback when the file
+/// has no graph/evolution history.
 pub async fn search_by_file(
     storage: &Arc<Storage>,
     file_path: &str,
     limit: usize,
     project: Option<&str>,
 ) -> Result<String> {
+    let (effective_project, _) = cross_project::normalize_project_scope(project);
+    let proj = effective_project.unwrap_or_default();
+
+    let ledger = storage.code_file_ledger(&proj, file_path)?;
+    if !ledger.symbols.is_empty() || !ledger.timeline.is_empty() {
+        return Ok(format::format_file_ledger(&ledger));
+    }
+
+    // Secondary enrichment: fall back to FTS5 over chunk content.
     let chunks = storage.fts5_search(file_path, limit, project)?;
     Ok(format::format_file_results(&chunks, file_path))
+}
+
+/// Code-graph query: neighbors | callers | callees (no transitive impact in v1).
+pub async fn code_graph(
+    storage: &Arc<Storage>,
+    symbol: Option<&str>,
+    file: Option<&str>,
+    mode: &str,
+    limit: usize,
+) -> Result<String> {
+    let project = cross_project::resolve_current_project().unwrap_or_default();
+    let target_label = symbol.or(file).unwrap_or("").to_string();
+
+    match mode {
+        "callers" => {
+            let name = match symbol {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(format::format_code_graph(mode, &target_label, &[], &[])),
+            };
+            let nodes = storage.code_query_callers(name, &project, limit)?;
+            Ok(format::format_code_graph(mode, &target_label, &nodes, &[]))
+        }
+        "callees" => {
+            let node_id = match resolve_node_id(storage, symbol, file, &project)? {
+                Some(id) => id,
+                None => return Ok(format::format_code_graph(mode, &target_label, &[], &[])),
+            };
+            let nodes = storage.code_query_callees(&node_id, limit)?;
+            Ok(format::format_code_graph(mode, &target_label, &nodes, &[]))
+        }
+        _ => {
+            // Default: neighbors (1-hop, both directions).
+            let node_id = match resolve_node_id(storage, symbol, file, &project)? {
+                Some(id) => id,
+                None => {
+                    return Ok(format::format_code_graph(
+                        "neighbors",
+                        &target_label,
+                        &[],
+                        &[],
+                    ))
+                }
+            };
+            let neighbors = storage.code_query_neighbors(&node_id, None, limit)?;
+            Ok(format::format_code_graph(
+                "neighbors",
+                &target_label,
+                &[],
+                &neighbors,
+            ))
+        }
+    }
+}
+
+/// Resolve a symbol/file to a single best node id (highest rank).
+fn resolve_node_id(
+    storage: &Arc<Storage>,
+    symbol: Option<&str>,
+    file: Option<&str>,
+    project: &str,
+) -> Result<Option<String>> {
+    if let Some(s) = symbol.filter(|s| !s.is_empty()) {
+        let nodes = storage.code_nodes_by_name(s, project, 1)?;
+        return Ok(nodes.into_iter().next().map(|n| n.id));
+    }
+    if let Some(f) = file.filter(|f| !f.is_empty()) {
+        let ledger = storage.code_file_ledger(project, f)?;
+        return Ok(ledger.symbols.into_iter().next().map(|n| n.id));
+    }
+    Ok(None)
 }
 
 /// Concept search — semantic search with concept-specific label.

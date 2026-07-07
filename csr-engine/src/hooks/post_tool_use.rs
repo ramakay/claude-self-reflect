@@ -25,8 +25,95 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
             if let Err(e) = track_code_evolution(input, engine).await {
                 eprintln!("CSR: code evolution tracking error (non-fatal): {}", e);
             }
+            // v9.4 liveness path: re-extract the touched file into the code graph
+            // so callers/callees/ledger reflect the edit immediately.
+            if let Err(e) = update_code_graph(input, engine) {
+                eprintln!("CSR: code graph update error (non-fatal): {}", e);
+            }
         }
     }
+
+    Ok(())
+}
+
+/// Conversation id for provenance: transcript filename stem, else session id.
+fn conv_id_for(input: &HookInput) -> String {
+    if let Some(ref tp) = input.transcript_path {
+        if let Some(stem) = std::path::Path::new(tp).file_stem() {
+            let s = stem.to_string_lossy().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    input.session_id.clone().unwrap_or_default()
+}
+
+/// Maximum file size we will re-parse into the code graph (256KB).
+const MAX_GRAPH_FILE_BYTES: u64 = 256 * 1024;
+
+/// Re-extract the edited file into the code graph (v9.4 liveness path).
+/// Reads the on-disk file (post-edit), upserts nodes, replaces this file's edges,
+/// marks file state, then re-resolves + re-ranks the project.
+fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
+    let tool_input = input
+        .tool_input
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no tool_input"))?;
+    let file_path = tool_input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("no file_path in tool_input"))?;
+
+    let lang = match crate::extraction::ast_analysis::lang_from_path_str(file_path) {
+        Some(l) => l,
+        None => return Ok(()), // unsupported language — skip
+    };
+
+    let meta = std::fs::metadata(file_path);
+    if let Ok(m) = &meta {
+        if m.len() > MAX_GRAPH_FILE_BYTES {
+            return Ok(());
+        }
+    }
+    let source = match std::fs::read_to_string(file_path) {
+        Ok(s) => s,
+        Err(_) => return Ok(()), // file gone/unreadable — skip silently
+    };
+
+    let project = crate::search::cross_project::resolve_current_project().unwrap_or_default();
+    let session_id = input.session_id.clone().unwrap_or_default();
+    let conv_id = conv_id_for(input);
+
+    let fragment = crate::extraction::codegraph::extract_graph_fragment(
+        &source,
+        lang,
+        file_path,
+        &project,
+        &project,
+        &conv_id,
+        &session_id,
+    );
+
+    let storage = engine.storage();
+    for node in &fragment.nodes {
+        storage.upsert_code_node(node)?;
+    }
+    storage.replace_code_file_edges(&project, file_path, &fragment.edges)?;
+
+    let content_hash = crate::extraction::anchors::hash_normalized(&source);
+    storage.upsert_code_file_state(&project, file_path, &content_hash, false)?;
+
+    // Re-resolve + re-rank so the live graph is queryable right after the edit.
+    let _ = storage.resolve_code_edges(&project)?;
+    let _ = storage.compute_code_rank(&project)?;
+
+    eprintln!(
+        "CSR: code graph updated for {} ({} nodes, {} edges)",
+        file_path,
+        fragment.nodes.len(),
+        fragment.edges.len()
+    );
 
     Ok(())
 }

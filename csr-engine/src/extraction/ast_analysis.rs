@@ -266,7 +266,7 @@ pub(crate) fn func_kinds(lang: SupportLang) -> &'static [&'static str] {
 }
 
 /// Get type definition kind names for a language.
-fn type_kinds(lang: SupportLang) -> &'static [&'static str] {
+pub(crate) fn type_kinds(lang: SupportLang) -> &'static [&'static str] {
     match lang {
         SupportLang::Rust => &["struct_item", "enum_item", "trait_item", "type_item"],
         SupportLang::Python => &["class_definition"],
@@ -283,7 +283,7 @@ fn type_kinds(lang: SupportLang) -> &'static [&'static str] {
 }
 
 /// Get import kind names for a language.
-fn import_kinds(lang: SupportLang) -> &'static [&'static str] {
+pub(crate) fn import_kinds(lang: SupportLang) -> &'static [&'static str] {
     match lang {
         SupportLang::Rust => &["use_declaration"],
         SupportLang::Python => &["import_statement", "import_from_statement"],

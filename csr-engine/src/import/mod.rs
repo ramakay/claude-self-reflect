@@ -1,3 +1,4 @@
+pub mod backfill;
 pub mod watcher;
 
 use std::fs;

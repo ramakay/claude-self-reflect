@@ -549,3 +549,128 @@ fn relative_time_str(timestamp: &str) -> String {
         "unknown".into()
     }
 }
+
+// ─── v9.4 code property graph formatters ───
+
+/// Format a file ledger (§8b): deterministic, immutable per-file dossier.
+pub fn format_file_ledger(ledger: &crate::storage::codegraph::FileLedger) -> String {
+    use std::fmt::Write as _;
+
+    if ledger.symbols.is_empty() && ledger.timeline.is_empty() {
+        return format!(
+            "<file_ledger file='{}'><message>No graph or evolution history for {}</message></file_ledger>",
+            xml_escape(&ledger.file),
+            xml_escape(&ledger.file)
+        );
+    }
+
+    let mut out = String::new();
+    let _ = writeln!(out, "<file_ledger file='{}'>", xml_escape(&ledger.file));
+
+    // Symbols now (with conversation provenance).
+    out.push_str("  <symbols_now>\n");
+    for s in &ledger.symbols {
+        let _ = writeln!(
+            out,
+            "    <symbol kind='{}' name='{}' first_conv='{}' last_conv='{}' body_hash='{}'/>",
+            xml_escape(&s.kind),
+            xml_escape(&s.name),
+            xml_escape(&s.first_conv_id),
+            xml_escape(&s.last_conv_id),
+            xml_escape(&s.body_hash),
+        );
+    }
+    out.push_str("  </symbols_now>\n");
+
+    // Timeline (code_evolution).
+    out.push_str("  <timeline>\n");
+    for t in &ledger.timeline {
+        let added = parse_json_names(&t.functions_added);
+        let removed = parse_json_names(&t.functions_removed);
+        let rel = relative_time_str(&t.timestamp);
+        let _ = writeln!(
+            out,
+            "    <change time='{}' session='{}' tool='{}' fns_added='{}' fns_removed='{}'/>",
+            rel,
+            xml_escape(&t.session_id),
+            xml_escape(&t.tool_name),
+            xml_escape(&added.join(",")),
+            xml_escape(&removed.join(",")),
+        );
+    }
+    out.push_str("  </timeline>\n");
+
+    // Callers (who depends on this file).
+    out.push_str("  <callers>\n");
+    for (name, file) in &ledger.callers {
+        let _ = writeln!(
+            out,
+            "    <caller name='{}' file='{}'/>",
+            xml_escape(name),
+            xml_escape(file),
+        );
+    }
+    out.push_str("  </callers>\n");
+
+    out.push_str("</file_ledger>");
+    out
+}
+
+/// Format a code-graph query result (neighbors | callers | callees).
+pub fn format_code_graph(
+    mode: &str,
+    target: &str,
+    nodes: &[crate::storage::codegraph::NodeRow],
+    neighbors: &[crate::storage::codegraph::NeighborEdge],
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "<code_graph mode='{}' target='{}'>",
+        xml_escape(mode),
+        xml_escape(target)
+    );
+
+    if mode == "neighbors" {
+        if neighbors.is_empty() {
+            out.push_str("  <message>No neighbors found</message>\n");
+        }
+        for ne in neighbors {
+            let _ = writeln!(
+                out,
+                "  <edge dir='{}' kind='{}' resolved='{}' name='{}' node_kind='{}' file='{}' last_conv='{}'/>",
+                xml_escape(&ne.direction),
+                xml_escape(&ne.edge_kind),
+                ne.resolved,
+                xml_escape(&ne.node.name),
+                xml_escape(&ne.node.kind),
+                xml_escape(&ne.node.file),
+                xml_escape(&ne.node.last_conv_id),
+            );
+        }
+    } else {
+        if nodes.is_empty() {
+            let _ = writeln!(out, "  <message>No {} found</message>", xml_escape(mode));
+        }
+        for n in nodes {
+            let _ = writeln!(
+                out,
+                "  <node name='{}' kind='{}' file='{}' last_conv='{}'/>",
+                xml_escape(&n.name),
+                xml_escape(&n.kind),
+                xml_escape(&n.file),
+                xml_escape(&n.last_conv_id),
+            );
+        }
+    }
+
+    out.push_str("</code_graph>");
+    out
+}
+
+/// Parse a JSON string array of names; empty vec on any error.
+fn parse_json_names(json: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(json).unwrap_or_default()
+}

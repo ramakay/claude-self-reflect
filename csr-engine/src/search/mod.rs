@@ -1,3 +1,4 @@
+pub mod code_rank;
 pub mod cross_project;
 pub mod decay;
 pub mod rerank;

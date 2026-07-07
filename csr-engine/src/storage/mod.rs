@@ -1,3 +1,4 @@
+pub mod codegraph;
 pub mod migrations;
 pub mod queries;
 
@@ -576,6 +577,103 @@ impl Storage {
     ) -> Result<Vec<(String, crate::extraction::anchors::FunctionAnchor)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_project_anchors(&conn, project, limit as i64)
+    }
+
+    // ─── Code property graph (v9.4) ───
+
+    pub fn upsert_code_node(&self, node: &codegraph::NodeRow) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::upsert_node(&conn, node)
+    }
+
+    pub fn replace_code_file_edges(
+        &self,
+        project: &str,
+        src_file: &str,
+        edges: &[codegraph::EdgeRow],
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::replace_file_edges(&conn, project, src_file, edges)
+    }
+
+    pub fn upsert_code_file_state(
+        &self,
+        project: &str,
+        file: &str,
+        content_hash: &str,
+        dirty: bool,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::upsert_file_state(&conn, project, file, content_hash, dirty)
+    }
+
+    pub fn mark_code_file_dirty(&self, project: &str, file: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::mark_file_dirty(&conn, project, file)
+    }
+
+    /// Re-resolve placeholder edges for a project (two-pass name resolution).
+    pub fn resolve_code_edges(
+        &self,
+        project: &str,
+    ) -> Result<crate::extraction::resolver::ResolveStats> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        crate::extraction::resolver::resolve_edges(&conn, project)
+    }
+
+    /// Recompute degree ranks for a project.
+    pub fn compute_code_rank(&self, project: &str) -> Result<crate::search::code_rank::RankStats> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        crate::search::code_rank::compute_code_rank(&conn, project)
+    }
+
+    pub fn code_file_ledger(&self, project: &str, file: &str) -> Result<codegraph::FileLedger> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::file_ledger(&conn, project, file)
+    }
+
+    pub fn code_query_callers(
+        &self,
+        name_or_id: &str,
+        project: &str,
+        limit: usize,
+    ) -> Result<Vec<codegraph::NodeRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::query_callers(&conn, name_or_id, project, limit)
+    }
+
+    pub fn code_query_callees(
+        &self,
+        node_id: &str,
+        limit: usize,
+    ) -> Result<Vec<codegraph::NodeRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::query_callees(&conn, node_id, limit)
+    }
+
+    pub fn code_query_neighbors(
+        &self,
+        node_id: &str,
+        kind_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<codegraph::NeighborEdge>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::query_neighbors(&conn, node_id, kind_filter, limit)
+    }
+
+    pub fn code_nodes_by_name(
+        &self,
+        name: &str,
+        project: &str,
+        limit: usize,
+    ) -> Result<Vec<codegraph::NodeRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::nodes_by_name(&conn, name, project, limit)
+    }
+
+    pub fn code_get_node_rank(&self, id: &str) -> Result<Option<(f64, i64, i64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::get_node_rank(&conn, id)
     }
 }
 

@@ -171,6 +171,86 @@ pub fn run(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // Code property graph (v9.4) — conversation-provenance code graph.
+    // Additive + non-breaking: episode_anchors keeps writing; the graph reads code_nodes.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS code_nodes (
+            id          TEXT PRIMARY KEY,          -- sha1(repo|file|kind|name)
+            repo        TEXT NOT NULL DEFAULT '',
+            project     TEXT NOT NULL DEFAULT '',
+            file        TEXT NOT NULL,
+            lang        TEXT NOT NULL DEFAULT '',
+            kind        TEXT NOT NULL,             -- function|type|method|import|module
+            name        TEXT NOT NULL,
+            fqname      TEXT NOT NULL DEFAULT '',
+            body_hash   TEXT NOT NULL DEFAULT '',
+            span_start  INTEGER NOT NULL DEFAULT 0,
+            span_end    INTEGER NOT NULL DEFAULT 0,
+            first_conv_id   TEXT NOT NULL DEFAULT '',
+            last_conv_id    TEXT NOT NULL DEFAULT '',
+            last_session_id TEXT NOT NULL DEFAULT '',
+            last_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_code_nodes_name ON code_nodes(name);
+        CREATE INDEX IF NOT EXISTS idx_code_nodes_file ON code_nodes(project, file);
+        CREATE INDEX IF NOT EXISTS idx_code_nodes_repo ON code_nodes(repo);
+
+        CREATE TABLE IF NOT EXISTS code_edges (
+            src_id      TEXT NOT NULL,
+            dst_id      TEXT NOT NULL,
+            kind        TEXT NOT NULL,             -- calls|imports|references|defines|implements|supersedes
+            src_file    TEXT NOT NULL DEFAULT '',  -- file the edge was extracted from (per-file replace)
+            resolved    INTEGER NOT NULL DEFAULT 0,
+            weight      REAL NOT NULL DEFAULT 1.0,
+            conv_id     TEXT NOT NULL DEFAULT '',
+            session_id  TEXT NOT NULL DEFAULT '',
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (src_id, dst_id, kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_code_edges_src  ON code_edges(src_id, kind);
+        CREATE INDEX IF NOT EXISTS idx_code_edges_dst  ON code_edges(dst_id, kind);
+        -- idx_code_edges_file created after the src_file ALTER guard below (old tables lack the column).
+
+        -- Per-file extraction state — drives dirty-flag + lazy recompute (Codex #3).
+        CREATE TABLE IF NOT EXISTS code_graph_file_state (
+            project      TEXT NOT NULL,
+            file         TEXT NOT NULL,
+            mtime        TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL DEFAULT '',
+            dirty        INTEGER NOT NULL DEFAULT 1,
+            extracted_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (project, file)
+        );
+        CREATE INDEX IF NOT EXISTS idx_code_graph_file_dirty ON code_graph_file_state(dirty);
+
+        CREATE TABLE IF NOT EXISTS code_node_rank (
+            node_id     TEXT PRIMARY KEY REFERENCES code_nodes(id),
+            rank        REAL NOT NULL DEFAULT 0.0,
+            in_degree   INTEGER NOT NULL DEFAULT 0,
+            out_degree  INTEGER NOT NULL DEFAULT 0,
+            computed_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_code_node_rank_rank ON code_node_rank(rank DESC);
+        ",
+    )?;
+
+    // Migration: add src_file to code_edges if missing (v9.4 — table may predate the column)
+    {
+        let has_src_file: bool = conn
+            .prepare("SELECT src_file FROM code_edges LIMIT 0")
+            .is_ok();
+        if !has_src_file {
+            let _ = conn.execute_batch(
+                "ALTER TABLE code_edges ADD COLUMN src_file TEXT NOT NULL DEFAULT '';",
+            );
+        }
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_code_edges_file ON code_edges(src_file);",
+        );
+    }
+
     // Migration: add project_name to code_evolution if missing (v9 cross-project fix)
     {
         let has_project_col: bool = conn

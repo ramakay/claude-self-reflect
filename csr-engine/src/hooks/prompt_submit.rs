@@ -197,6 +197,17 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         }
     }
 
+    // 5c. Code graph slice (v9.4) — capped relevant_context item within the
+    // existing PROMPT_TOKEN_BUDGET (Codex #5: no separate budget). Surfaces the
+    // 1-hop neighborhood of files/symbols named in the prompt, with provenance.
+    for slice in build_graph_slices(storage, prompt, &current_files, &current_project) {
+        review_items.push(InjectionItem {
+            content: slice,
+            score: 0.88,
+            source: "code_graph".into(),
+        });
+    }
+
     // 6. Build InjectionContext
     let mut ctx = InjectionContext {
         anti_patterns,
@@ -471,6 +482,72 @@ fn format_evolution_summary(
     }
     parts.push(format!(" across {} edits", evolutions.len()));
     parts.concat()
+}
+
+/// Build compact code-graph slices for files/symbols named in the prompt.
+/// Returns at most 2 short lines, each carrying last-change provenance.
+fn build_graph_slices(
+    storage: &crate::storage::Storage,
+    prompt: &str,
+    current_files: &[String],
+    project: &str,
+) -> Vec<String> {
+    let mut slices = Vec::new();
+
+    // File-anchored slice: symbols + callers of files named in the prompt.
+    for file in current_files.iter().take(1) {
+        if let Ok(ledger) = storage.code_file_ledger(project, file) {
+            if !ledger.symbols.is_empty() {
+                let syms: Vec<String> = ledger
+                    .symbols
+                    .iter()
+                    .take(5)
+                    .map(|s| s.name.clone())
+                    .collect();
+                let callers: Vec<String> = ledger
+                    .callers
+                    .iter()
+                    .take(4)
+                    .map(|(n, _)| n.clone())
+                    .collect();
+                let mut line = format!("{} — symbols: {}", file, syms.join(", "));
+                if !callers.is_empty() {
+                    line.push_str(&format!(" · callers: {}", callers.join(", ")));
+                }
+                slices.push(formatter::truncate_item(&line, 280));
+            }
+        }
+    }
+
+    // Symbol-anchored slice: callees of a symbol named in the prompt.
+    for word in prompt.split_whitespace() {
+        let token: String = word
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if token.len() < 6 {
+            continue;
+        }
+        if let Ok(nodes) = storage.code_nodes_by_name(&token, project, 1) {
+            if let Some(node) = nodes.into_iter().next() {
+                if let Ok(callees) = storage.code_query_callees(&node.id, 6) {
+                    if !callees.is_empty() {
+                        let names: Vec<String> = callees.iter().map(|c| c.name.clone()).collect();
+                        let line = format!(
+                            "{} calls → {} (last changed {})",
+                            node.name,
+                            names.join(", "),
+                            node.last_conv_id
+                        );
+                        slices.push(formatter::truncate_item(&line, 280));
+                        break; // one symbol slice is enough for the budget
+                    }
+                }
+            }
+        }
+    }
+
+    slices
 }
 
 /// Extract error-like patterns from content.

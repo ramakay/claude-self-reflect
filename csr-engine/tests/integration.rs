@@ -1501,3 +1501,116 @@ fn episode_v2_full_cycle_with_anchors() {
         csr_engine::extraction::anchors::AnchorVerdict::Modified
     );
 }
+
+// ─── v9.4 code property graph: LIVE round-trip (gate) ───
+
+mod codegraph_roundtrip {
+    use csr_engine::extraction::codegraph as cg;
+    use csr_engine::storage::Storage;
+
+    const PROJECT: &str = "proj";
+    const REPO: &str = "proj";
+    const FILE: &str = "src/demo.rs";
+
+    /// Mirror the post_tool_use liveness path: extract → upsert → replace edges →
+    /// resolve → rank. Also record a code_evolution row so the ledger timeline
+    /// reflects the edit (as the real hook does).
+    fn simulate_edit(storage: &Storage, source: &str, conv_id: &str, session_id: &str) {
+        let frag =
+            cg::extract_graph_fragment_for_file(source, FILE, REPO, PROJECT, conv_id, session_id);
+        for node in &frag.nodes {
+            storage.upsert_code_node(node).unwrap();
+        }
+        storage
+            .replace_code_file_edges(PROJECT, FILE, &frag.edges)
+            .unwrap();
+        storage
+            .insert_code_evolution(
+                session_id,
+                PROJECT,
+                FILE,
+                "rust",
+                "Edit",
+                "[\"foo\"]",
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+            )
+            .unwrap();
+        storage.resolve_code_edges(PROJECT).unwrap();
+        storage.compute_code_rank(PROJECT).unwrap();
+    }
+
+    #[test]
+    fn live_roundtrip_holds_history_across_edits() {
+        let storage = Storage::open_memory().unwrap();
+
+        // (b) First edit: foo calls bar; both defined in the file.
+        let v1 = "fn foo() {\n    bar();\n}\nfn bar() {}\n";
+        simulate_edit(&storage, v1, "conv_1", "sess_1");
+
+        // (d) foo and bar appear as nodes.
+        let foo_id = cg::node_id(REPO, FILE, "function", "foo");
+        let bar_id = cg::node_id(REPO, FILE, "function", "bar");
+        let ledger = storage.code_file_ledger(PROJECT, FILE).unwrap();
+        let names: Vec<&str> = ledger.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"foo"), "foo node present: {names:?}");
+        assert!(names.contains(&"bar"), "bar node present: {names:?}");
+
+        // calls edge foo -> bar exists (resolved).
+        let callees = storage.code_query_callees(&foo_id, 10).unwrap();
+        assert!(
+            callees.iter().any(|c| c.id == bar_id),
+            "calls edge foo -> bar must exist: {:?}",
+            callees.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        let callers = storage.code_query_callers("bar", PROJECT, 10).unwrap();
+        assert!(
+            callers.iter().any(|c| c.name == "foo"),
+            "bar's callers must include foo"
+        );
+
+        // file_ledger holds the conv_1 provenance.
+        let foo_sym = ledger.symbols.iter().find(|s| s.name == "foo").unwrap();
+        assert_eq!(foo_sym.first_conv_id, "conv_1", "history held: first conv");
+        assert_eq!(foo_sym.last_conv_id, "conv_1");
+        let h1 = foo_sym.body_hash.clone();
+
+        // (e) Second edit changes foo's BODY (still calls bar) under conv_2.
+        let v2 = "fn foo() {\n    let x = 42;\n    bar();\n}\nfn bar() {}\n";
+        simulate_edit(&storage, v2, "conv_2", "sess_2");
+
+        let ledger2 = storage.code_file_ledger(PROJECT, FILE).unwrap();
+        let foo2 = ledger2.symbols.iter().find(|s| s.name == "foo").unwrap();
+
+        // New state: body hash changed, last conv advanced to conv_2.
+        assert_ne!(foo2.body_hash, h1, "new body recorded");
+        assert_eq!(foo2.last_conv_id, "conv_2", "new state: last conv");
+        // Prior conv still in history: first_conv_id immutable across edits.
+        assert_eq!(
+            foo2.first_conv_id, "conv_1",
+            "immutable history holds across edits"
+        );
+        // Timeline shows BOTH edits.
+        assert_eq!(ledger2.timeline.len(), 2, "both edits in timeline");
+
+        // The graph still resolves foo -> bar after the second edit (liveness).
+        let callees2 = storage.code_query_callees(&foo_id, 10).unwrap();
+        assert!(
+            callees2.iter().any(|c| c.id == bar_id),
+            "foo -> bar still live"
+        );
+
+        // Print the load-bearing assertions proving history is held.
+        println!(
+            "ROUNDTRIP PROOF: foo first_conv={} last_conv={} body_changed={} timeline_entries={} foo->bar_resolved={}",
+            foo2.first_conv_id,
+            foo2.last_conv_id,
+            foo2.body_hash != h1,
+            ledger2.timeline.len(),
+            callees2.iter().any(|c| c.id == bar_id),
+        );
+    }
+}

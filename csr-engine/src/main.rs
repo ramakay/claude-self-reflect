@@ -107,6 +107,11 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Code-graph operations (v9.4 conversation-provenance graph)
+    Codegraph {
+        #[command(subcommand)]
+        action: CodegraphAction,
+    },
     /// Show aggregated telemetry: hook latencies, startup stats, enrichment health
     Telemetry {
         /// Window (e.g. "24h", "7d", "30m", "all"). Default: 24h.
@@ -128,6 +133,16 @@ enum Commands {
         /// Current working directory (for project resolution)
         #[arg(long)]
         cwd: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CodegraphAction {
+    /// Reconstruct the code graph from all existing conversation JSONL history.
+    Backfill {
+        /// Parse + count what would be written, but make no changes.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -255,6 +270,20 @@ async fn main() -> Result<()> {
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
         return csr_engine::summarizer::backfill_stories_cli(&eng, dry_run).await;
+    }
+
+    if let Some(Commands::Codegraph {
+        action: CodegraphAction::Backfill { dry_run },
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats =
+            csr_engine::import::backfill::backfill_code_graph(&eng, &args.projects_dir, dry_run)?;
+        print!("{}", stats.format_text(dry_run));
+        return Ok(());
     }
 
     if let Some(Commands::GenerateStory {

@@ -5,12 +5,14 @@
 
 pub mod anchors;
 pub mod ast_analysis;
+pub mod codegraph;
 pub mod errors;
 pub mod heuristic;
 pub mod index_builder;
 pub mod patterns;
 pub mod provenance;
 pub mod quality;
+pub mod resolver;
 pub mod scoring;
 pub mod signature;
 pub mod story;

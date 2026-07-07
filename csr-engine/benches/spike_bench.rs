@@ -165,6 +165,7 @@ fn bench_sqlite_operations(c: &mut Criterion) {
                 content: format!("Benchmark chunk {} content about Docker and Rust.", i),
                 message_count: 10,
                 summary: None,
+                author: csr_engine::provenance::Speaker::User,
             };
             (chunk, vec)
         })
