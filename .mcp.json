@@ -1,8 +1,3 @@
 {
-  "mcpServers": {
-    "claude-self-reflect": {
-      "command": "csr-engine",
-      "description": "Conversation memory with semantic search, session continuity, and predictive injection. 12 MCP tools + 6 hooks for automatic context enrichment."
-    }
-  }
+  "mcpServers": {}
 }
