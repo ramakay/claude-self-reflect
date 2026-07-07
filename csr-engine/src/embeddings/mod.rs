@@ -5,29 +5,38 @@ use std::sync::Mutex;
 use anyhow::Result;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-/// Wraps fastembed for 384-dim all-MiniLM-L6-v2 embeddings.
+/// Wraps fastembed for local ONNX embeddings (default: 384-dim all-MiniLM-L6-v2).
 /// Thread-safe via Mutex (TextEmbedding::embed requires &mut self).
 pub struct EmbeddingEngine {
     model: Mutex<TextEmbedding>,
+    dim: usize,
 }
 
 impl EmbeddingEngine {
-    /// Initialize the embedding model (downloads ~30MB on first run).
+    /// Initialize the default embedding model (downloads ~30MB on first run).
     pub fn new() -> Result<Self> {
+        Self::new_with_model(EmbeddingModel::AllMiniLML6V2)
+    }
+
+    /// Initialize a specific fastembed model. Used by the retrieval benchmark
+    /// to compare candidate models against the default.
+    pub fn new_with_model(embedding_model: EmbeddingModel) -> Result<Self> {
         let cache_dir = cache::cache_dir();
         std::fs::create_dir_all(&cache_dir)?;
 
-        let options = InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+        let dim = TextEmbedding::get_model_info(&embedding_model)?.dim;
+        let options = InitOptions::new(embedding_model)
             .with_cache_dir(cache_dir)
             .with_show_download_progress(true);
 
         let model = TextEmbedding::try_new(options)?;
         Ok(Self {
             model: Mutex::new(model),
+            dim,
         })
     }
 
-    /// Embed a batch of texts. Returns one 384-dim vector per input.
+    /// Embed a batch of texts. Returns one vector per input.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let docs: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
         let mut model = self
@@ -47,7 +56,12 @@ impl EmbeddingEngine {
             .ok_or_else(|| anyhow::anyhow!("embedding returned empty result"))
     }
 
-    /// Returns the embedding dimension (384 for all-MiniLM-L6-v2).
+    /// Embedding dimension of the loaded model instance.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Returns the embedding dimension of the default model (384 for all-MiniLM-L6-v2).
     pub fn dimension() -> usize {
         384
     }

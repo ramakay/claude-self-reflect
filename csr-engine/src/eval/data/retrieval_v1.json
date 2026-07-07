@@ -1,0 +1,1087 @@
+{
+ "version": 1,
+ "documents": [
+  {
+   "id": "a01",
+   "topic": "auth",
+   "text": "Fixed the token refresh race in src/auth/refresh.ts: when two open tabs both hit /api/token/refresh at the same moment, the rotating refresh token got consumed twice and the second tab received 401 invalid_grant, kicking the user out. Implemented a single-flight mutex around refreshAccessToken() plus a 30-second reuse grace window on the previous refresh token, stored in the refresh_tokens table with a superseded_at column. Verified with a Playwright test spawning two contexts sharing storageState."
+  },
+  {
+   "id": "a02",
+   "topic": "auth",
+   "text": "Resolved intermittent 'jwt expired' errors that only reproduced on a handful of machines minutes after sign-in. Root cause was client/server clock skew of up to 90 seconds on laptops with broken NTP. Set clockTolerance: 60 in the jsonwebtoken 9.0.2 verify() options in src/middleware/verifyToken.ts and bumped access token TTL from 5m to 15m. Added a Datadog monitor on the auth.token_expired_early metric."
+  },
+  {
+   "id": "a03",
+   "topic": "auth",
+   "text": "Decision record: migrated JWT signing from HS256 shared secret to RS256 with a JWKS endpoint at /.well-known/jwks.json. Chose asymmetric keys because the shared HMAC secret had to be copied into four microservices, and any one of them could mint tokens. Switched from jsonwebtoken to jose 5.2 for JWKS support, with key rotation every 30 days via src/auth/keys/rotate.ts."
+  },
+  {
+   "id": "a04",
+   "topic": "auth",
+   "text": "Fixed the bug where logging out on one device left every other device's session alive. Added a token_version integer column to the users table; the global sign-out endpoint POST /auth/logout-all increments it, and src/auth/session.ts rejects any JWT whose ver claim is stale. Existing access tokens die within their 15-minute TTL, refresh tokens die immediately. Migration 20260218_add_token_version.sql backfilled version 1."
+  },
+  {
+   "id": "a05",
+   "topic": "auth",
+   "text": "Fixed OAuth callback losing the user's session: the session cookie was set with SameSite=Strict, so when Google redirected back to /auth/callback the browser withheld the cookie and the server saw an anonymous request, bouncing users to the login page. Changed to SameSite=Lax in src/config/session.ts (express-session 1.18.0) and kept Strict only for the csrf_token cookie."
+  },
+  {
+   "id": "a06",
+   "topic": "auth",
+   "text": "Closed a session fixation hole flagged in the pentest report: we were reusing the pre-login session ID after successful authentication. Now src/routes/login.ts calls req.session.regenerate() before writing user.id into the session, and copies over the cart_id key explicitly. Also shortened the anonymous session TTL from 30 days to 24 hours in the connect-redis store config."
+  },
+  {
+   "id": "a07",
+   "topic": "auth",
+   "text": "Session summary: debugged why app.example.com set a cookie that api.example.com never received. The Set-Cookie header lacked a Domain attribute, so it defaulted host-only. Set domain: '.example.com' and secure: true in src/config/session.ts, and added app.set('trust proxy', 1) so express-session recognizes HTTPS behind the ALB. Cookies now flow across both subdomains."
+  },
+  {
+   "id": "a08",
+   "topic": "auth",
+   "text": "Fixed 'invalid_state' failures in the OAuth login flow that happened when users opened the sign-in page in two windows: each window wrote its own state value into the single session.oauthState slot, so whichever window finished second failed validation. Rewrote src/auth/oauth/state.ts to keep a Map of up to five pending states keyed by nonce, each with a 10-minute expiry, and validate the callback against the map instead of a single slot."
+  },
+  {
+   "id": "a09",
+   "topic": "auth",
+   "text": "Decision record: adopted Authorization Code flow with PKCE for the SPA instead of the implicit flow. Implicit flow exposes tokens in the URL fragment and cannot use refresh tokens safely; PKCE with S256 code challenge closes the authorization-code interception vector. Implemented with oauth4webapi 2.10 in src/auth/pkce.ts, storing the code_verifier in sessionStorage rather than localStorage."
+  },
+  {
+   "id": "a10",
+   "topic": "auth",
+   "text": "Spent an hour on Google OAuth returning Error 400: redirect_uri_mismatch. The Cloud Console entry had https://app.example.com/auth/callback/ with a trailing slash while the app sent it without, and staging was registered as http instead of https. Wrote up the exact console configuration steps, including the authorized origins list, in docs/auth/google-setup.md so nobody trips on this again."
+  },
+  {
+   "id": "a11",
+   "topic": "db",
+   "text": "Eliminated the recurring 'SQLITE_BUSY: database is locked' errors when the MCP server and the enrichment daemon touched the store concurrently. Enabled write-ahead logging with PRAGMA journal_mode=WAL and set PRAGMA busy_timeout=5000 at connection open in src/storage/db.rs, so readers no longer block on the writer. Also wrapped the rusqlite Connection in a std::sync::Mutex per the thread-safety pattern."
+  },
+  {
+   "id": "a12",
+   "topic": "db",
+   "text": "The nightly enrichment daemon held a single write transaction for 40+ seconds while inserting narratives, starving every other writer. Restructured import_batch() in src/enrichment/writer.rs to commit in chunks of 500 rows and switched to BEGIN IMMEDIATE so lock acquisition fails fast instead of upgrading mid-transaction. Peak write-lock hold time dropped from 40s to under 300ms."
+  },
+  {
+   "id": "a13",
+   "topic": "db",
+   "text": "Decision record: chose SQLite (rusqlite 0.38) over Postgres for csr-engine's local storage. Rationale: the tool is local-first and must install with zero running services — requiring a Postgres server or Docker container contradicts the single-binary goal. Accepted single-writer semantics as the tradeoff and mitigated with WAL mode. Revisit only if we ever ship a multi-user hosted mode."
+  },
+  {
+   "id": "a14",
+   "topic": "db",
+   "text": "Fixed the activity feed endpoint that took 3.2s at p95: EXPLAIN ANALYZE showed a sequential scan over 41M rows in the events table. Added a partial composite index with CREATE INDEX CONCURRENTLY idx_events_user_created ON events (user_id, created_at DESC) WHERE deleted_at IS NULL. p95 dropped to 38ms. Used CONCURRENTLY to avoid locking writes during the 11-minute build."
+  },
+  {
+   "id": "a15",
+   "topic": "db",
+   "text": "Resolved the outage where the API threw 'FATAL: remaining connection slots are reserved for non-replication superuser connections' during traffic spikes. Each of 12 pods opened its own pool of 25, blowing past max_connections=100. Deployed PgBouncer in transaction pooling mode in front of Postgres and capped the app pool at max: 20 in knexfile.js. Added an alert at 80% of connection slots."
+  },
+  {
+   "id": "a16",
+   "topic": "db",
+   "text": "Session summary: profiled the projects dashboard and found a classic N+1 — Prisma fired one query per project to fetch its owner, 200+ round trips per page load. Replaced the loop with a single findMany({ include: { owner: true } }) in src/api/projects/list.ts and added a dataloader for the comment counts. Page query count went from 214 to 3."
+  },
+  {
+   "id": "a17",
+   "topic": "db",
+   "text": "Deploy broke when the Knex migration adding a NOT NULL column to the 60M-row orders table timed out and left the schema half-applied, throwing 'column \"region\" of relation \"orders\" already exists' on retry. Fix: split into three migrations — add the column nullable, backfill in 10k-row batches via 20260301_backfill_region.js, then ALTER COLUMN SET NOT NULL. Also set statement_timeout to 5s for DDL."
+  },
+  {
+   "id": "a18",
+   "topic": "db",
+   "text": "Decision record: adopted the refinery 0.8 crate for csr-engine schema migrations instead of diesel_migrations. Refinery embeds plain SQL files via embed_migrations!() with no ORM buy-in, works directly with our existing rusqlite connection, and keeps migrations reviewable as raw SQL in csr-engine/migrations/. Diesel would have pulled in its whole schema DSL for a feature we don't want."
+  },
+  {
+   "id": "a19",
+   "topic": "db",
+   "text": "Fixed the recurring 'deadlock detected' (Postgres error 40P01) between the payout job and the refund worker: both updated the same accounts rows but in opposite orders. Standardized both code paths to lock rows with SELECT ... ORDER BY id FOR UPDATE before mutating, in src/jobs/payouts.ts and src/jobs/refunds.ts. Zero deadlocks in the two weeks since; the pg_locks dashboard confirms."
+  },
+  {
+   "id": "a20",
+   "topic": "db",
+   "text": "Recovered from 'database disk image is malformed' after a power loss while the SQLite file lived on an SMB network share. Salvaged data with sqlite3 broken.db '.recover' piped into a fresh database, losing only the last partial transaction. Then blocked network paths in the config validator (src/storage/paths.rs) and added PRAGMA integrity_check on startup with a warning banner if it fails."
+  },
+  {
+   "id": "a21",
+   "topic": "git",
+   "text": "Recovered two commits I accidentally dropped during an interactive rebase where a squash line got fat-fingered into a drop. Found the orphaned SHAs with git reflog (entry HEAD@{7}, commit 9f3ab21), verified with git show, and restored them via git cherry-pick 9f3ab21 4c07de8 onto the rebased branch. Note for next time: git rebase --abort works only mid-rebase; after completion, reflog is the escape hatch."
+  },
+  {
+   "id": "a22",
+   "topic": "git",
+   "text": "Killed the recurring rebase pain where package-lock.json conflicted on every single commit replayed. Enabled git config rerere.enabled true so resolved hunks replay automatically, and added package-lock.json merge=binary to .gitattributes — on conflict we now take either side wholesale and run npm install to regenerate. A 14-commit rebase that used to take 30 minutes of clicking now takes two."
+  },
+  {
+   "id": "a23",
+   "topic": "git",
+   "text": "Restored main after a teammate ran git push --force from a stale local branch and wiped three merged PRs. GitHub's reflog isn't exposed, but the Events API (GET /repos/{owner}/{repo}/events) still listed the pre-push head SHA e41d99c; a CI runner's cached clone also had it. Force-pushed e41d99c back to main, then diffed against the offender's branch to confirm nothing else was lost."
+  },
+  {
+   "id": "a24",
+   "topic": "git",
+   "text": "Decision record: after the main-branch clobbering incident, enabled branch protection on main and release/* (require PR, no force pushes, no deletions) and made git push --force-with-lease the only sanctioned overwrite for feature branches, enforced by a wrapper alias in scripts/git-safe-push.sh. Plain --force is now rejected by the pre-push hook."
+  },
+  {
+   "id": "a25",
+   "topic": "git",
+   "text": "Untangled the lost-work scare in the vendor/parser submodule: a fix was committed inside the submodule on a detached HEAD and never pushed, so teammates' checkouts pointed at a gitlink SHA that didn't exist upstream, failing with 'fatal: reference is not a tree'. Pushed the dangling commit from the machine that had it, then set git config push.recurseSubmodules on-demand so the superproject push carries submodule commits along."
+  },
+  {
+   "id": "a26",
+   "topic": "git",
+   "text": "Fixed CI failing with 'fatal: no submodule mapping found in .gitmodules for path vendor/tree-sitter'. Someone had deleted the .gitmodules entry but left the gitlink object in the index. Ran git rm --cached vendor/tree-sitter and committed, then added a lint step (scripts/check-gitlinks.sh) that fails the build if a gitlink exists without a matching .gitmodules entry."
+  },
+  {
+   "id": "a27",
+   "topic": "git",
+   "text": "Decision record: dropped the git submodule for the docs-site Hugo theme and vendored it with git subtree add --prefix docs-site/themes/doks --squash instead. Rationale: every contributor forgot git clone --recurse-submodules, producing empty-theme broken builds, and Dependabot can't update submodule pins. Subtree keeps the theme in-tree with normal clones; upstream syncs happen quarterly via git subtree pull."
+  },
+  {
+   "id": "a28",
+   "topic": "git",
+   "text": "Tracked down the 6x slowdown in HNSW index construction to commit b7e2f10 using git bisect run with an automated check: scripts/bisect_bench.sh builds csr-engine, runs cargo bench --bench spike_bench, and exits 1 if insert throughput drops below 8k vectors/sec. Bisect converged in 9 steps across 400 commits. The culprit was an ef_construction bump from 100 to 400 hidden inside an unrelated refactor of src/search/hnsw.rs."
+  },
+  {
+   "id": "a29",
+   "topic": "git",
+   "text": "While hunting the commit that made tests/hooks_integration.rs flaky, git bisect kept landing on revisions that didn't even compile because of a transient rmcp API break. Learned the exit-125 convention: the bisect script now runs cargo build first and exits 125 on failure so bisect treats the commit as untestable, equivalent to git bisect skip. With that, the flake traced cleanly to the Stop-hook timeout change in commit 3d9c4aa."
+  },
+  {
+   "id": "a30",
+   "topic": "git",
+   "text": "Ended the line-ending churn where Windows contributors' PRs showed every line of a file as modified. Root cause: mixed core.autocrlf settings and no repo-level policy. Added .gitattributes with '* text=auto eol=lf' plus explicit binary markers for .png and .onnx files, then ran git add --renormalize . in a dedicated commit so the blame noise happened exactly once."
+  },
+  {
+   "id": "b01",
+   "topic": "docker",
+   "text": "Debugged the api-gateway container getting killed roughly every six hours in production compose. dmesg on the host showed 'Memory cgroup out of memory: Killed process (node)' because mem_limit was 512m but the Node heap default assumed 1.5GB. Fixed by setting NODE_OPTIONS=--max-old-space-size=384 in docker-compose.prod.yml and raising mem_limit to 768m. Container has stayed up for 3 days since."
+  },
+  {
+   "id": "b02",
+   "topic": "docker",
+   "text": "Image builds for the frontend were failing at the 'RUN npm run build' step with exit code 137 — the webpack production build in the builder stage was exceeding Docker Desktop's 2GB VM allocation. Bumped the Docker Desktop memory to 6GB and added GENERATE_SOURCEMAP=false in frontend/Dockerfile to cut peak usage. Build now completes in 4m12s instead of dying at the terser pass."
+  },
+  {
+   "id": "b03",
+   "topic": "docker",
+   "text": "The postgres:16-alpine container in docker-compose.yml kept restart-looping under load; logs showed 'server process was terminated by signal 9'. Root cause: shared_buffers was set to 2GB via POSTGRES_INITDB_ARGS while the container had a 1g deploy.resources.limits.memory cap. Lowered shared_buffers to 256MB and raised the container limit to 2g. Also added a healthcheck with pg_isready so dependents wait properly."
+  },
+  {
+   "id": "b04",
+   "topic": "docker",
+   "text": "Spent the session on the cross-compile failure: 'docker buildx build --platform linux/arm64' kept dying mid-way with 'qemu: uncaught target signal 11 (Segmentation fault)' during cargo build in csr-engine/Dockerfile. QEMU user-mode emulation couldn't handle the rustc LTO pass. Switched to cross-compiling natively with cargo's aarch64-unknown-linux-gnu target in the amd64 builder stage and copying the binary into an arm64 runtime stage. arm64 images now build in 6 minutes instead of timing out."
+  },
+  {
+   "id": "b05",
+   "topic": "docker",
+   "text": "Investigated why every CI image build took 11 minutes even for doc-only changes. The Dockerfile had 'COPY . .' before 'RUN cargo fetch', so any file change invalidated the dependency layer. Reordered to copy Cargo.toml and Cargo.lock first, run cargo fetch, then copy the source tree; also added a .dockerignore excluding target/ and docs-site/. Warm builds dropped to 90 seconds."
+  },
+  {
+   "id": "b06",
+   "topic": "docker",
+   "text": "Fixed the permission problem where the app couldn't write uploads: the named volume app_data was created owned by root, but the container runs as uid 1000 (appuser). Resolved in docker-compose.yml by adding 'user: \"1000:1000\"' and an init step 'chown -R 1000:1000 /var/lib/app/data' in the entrypoint script docker/entrypoint.sh. Verified writes succeed with 'docker compose exec app touch /var/lib/app/data/probe'."
+  },
+  {
+   "id": "b07",
+   "topic": "docker",
+   "text": "Deploy to the new Graviton box failed immediately: 'docker run' returned 'exec /usr/local/bin/csr-engine: exec format error' and 'OCI runtime create failed'. The image pushed to registry was amd64-only because CI ran plain 'docker build' without buildx. Fixed by publishing a multi-arch manifest with 'docker buildx build --platform linux/amd64,linux/arm64 --push' so the arm64 host pulls the matching variant. Confirmed with 'docker manifest inspect ghcr.io/ramakay/csr-engine:v8.0.1'."
+  },
+  {
+   "id": "b08",
+   "topic": "docker",
+   "text": "The worker service raced the database on startup and crashed with 'connection refused' to postgres:5432 even though depends_on was set. Decision: depends_on alone only waits for container start, not readiness, so we standardized on 'depends_on: { db: { condition: service_healthy } }' plus a pg_isready healthcheck across all compose files instead of adding wait-for-it.sh scripts. Documented the pattern in docs/plans/compose-startup-order.md."
+  },
+  {
+   "id": "b09",
+   "topic": "docker",
+   "text": "Decision record: moving the runtime base image from alpine:3.20 to debian:12-slim. musl's DNS resolver was ignoring the search domain in Kubernetes and getaddrinfo intermittently returned EAI_AGAIN for internal service names; alpine also broke fastembed's prebuilt ONNX runtime. Image grows from 18MB to 84MB, which we accepted for correctness. All Dockerfiles under docker/ updated in one PR."
+  },
+  {
+   "id": "b10",
+   "topic": "docker",
+   "text": "The build host ran out of disk ('no space left on device' during docker build) because 140GB of dangling images and stale build cache had accumulated. Ran 'docker system prune -af --volumes' after snapshotting, reclaiming 127GB, then added a nightly systemd timer running 'docker builder prune -af --keep-storage 20GB' so it doesn't recur. Also capped json-file log driver at max-size 10m in /etc/docker/daemon.json."
+  },
+  {
+   "id": "b11",
+   "topic": "cicd",
+   "text": "Tracked down the intermittent red builds on main: integration tests bind a hardcoded port 8432, and since we enabled matrix parallelism two jobs on the same self-hosted runner collide, one failing with 'EADDRINUSE: address already in use'. Fixed by having the test harness in tests/helpers/server.rs bind port 0 and read the assigned port, removing the hardcoded value. Twenty consecutive green runs since."
+  },
+  {
+   "id": "b12",
+   "topic": "cicd",
+   "text": "The date-formatting tests passed locally but failed in GitHub Actions with 'assertion failed: expected 2026-07-06, got 2026-07-07'. Runners are UTC while dev machines are PST, and get_timeline tests used Local::now(). Pinned TZ=America/Los_Angeles in the workflow env and refactored the timeline code to accept an injected clock. Flake eliminated."
+  },
+  {
+   "id": "b13",
+   "topic": "cicd",
+   "text": "CI jobs were randomly failing during 'cargo fetch' and npm install with 'error sending request: operation timed out' against crates.io and the npm registry — roughly 1 in 8 runs. Added retry wrappers (CARGO_NET_RETRY=10, 'npm install --fetch-retries=5') and a vendored fallback via 'cargo vendor' checked into the release branch. Also enabled the job-level 'timeout-minutes: 20' so hangs fail fast instead of eating the 6-hour default."
+  },
+  {
+   "id": "b14",
+   "topic": "cicd",
+   "text": "Discovered why Rust CI never got faster: the actions/cache key in .github/workflows/ci.yml was hashing '**/Cargo.toml' which changes every version bump, so the cache missed on nearly every run and target/ was rebuilt from scratch. Changed the key to hash Cargo.lock with a restore-keys prefix fallback, and split registry cache from target cache. Cache hit rate went from 7% to 92%, cutting the test job from 14m to 5m."
+  },
+  {
+   "id": "b15",
+   "topic": "cicd",
+   "text": "Decision: stop caching node_modules directly in GitHub Actions. Restoring node_modules across runner image updates caused 'sharp: Command failed' native binding errors because prebuilt binaries didn't match the new libc. We now cache ~/.npm and always run 'npm ci' fresh; slightly slower (adds ~40s) but deterministic. Updated .github/workflows/installer-test.yml and documented the rationale inline."
+  },
+  {
+   "id": "b16",
+   "topic": "cicd",
+   "text": "Pushing tag v8.1.0 produced no release build. Cause: the tag was created by the version-bump workflow using the default GITHUB_TOKEN, and GitHub deliberately does not fire workflow triggers from events created with GITHUB_TOKEN, so the on: push: tags: 'v*' trigger in .github/workflows/release.yml never ran. Fixed by creating the tag with a fine-grained PAT stored as RELEASE_PAT. Re-tagged and the release pipeline ran end to end."
+  },
+  {
+   "id": "b17",
+   "topic": "cicd",
+   "text": "Implemented artifact signing for the release pipeline. Each csr-engine binary tarball is now signed with cosign keyless signing using the workflow's OIDC identity ('cosign sign-blob --yes' with id-token: write permission), and the .sig plus certificate are uploaded next to the asset in the GitHub release. scripts/install.sh gained a 'cosign verify-blob --certificate-identity-regexp' step before extracting. No private keys to rotate since it's all Fulcio/Rekor backed."
+  },
+  {
+   "id": "b18",
+   "topic": "cicd",
+   "text": "The matrix build was green on ubuntu-latest and macos-14 but the windows-2022 leg failed in the packaging step with 'The system cannot find the path specified' — scripts/package.sh built paths with forward slashes and invoked bash-only heredocs. Rewrote packaging as a cross-platform cargo xtask (xtask/src/package.rs) using std::path::PathBuf, and set 'shell: bash' explicitly for the remaining script steps. Full matrix green."
+  },
+  {
+   "id": "b19",
+   "topic": "cicd",
+   "text": "Decision record on fork PR security: the eval-benchmark job needs the OPENROUTER_API_KEY secret, but secrets are not exposed to pull_request runs from forks, so fork PRs always showed a failing check. Rather than switch to pull_request_target (risk of executing untrusted code with secrets), we split the workflow: forks run the secret-free unit suite, and a maintainer applies the 'safe-to-bench' label to trigger the benchmark via workflow_dispatch on the merge commit. Implemented in .github/workflows/bench-gate.yml."
+  },
+  {
+   "id": "b20",
+   "topic": "cicd",
+   "text": "The v8.0.2 release published assets but installs failed 404. The upload step in .github/workflows/release.yml used 'asset_name: csr-engine-${{ matrix.target }}.tar.gz' while install.sh downloads 'csr-engine-${VERSION}-${TARGET}.tar.gz' — the version segment was missing from the uploaded filename. Fixed the asset_name template, deleted and re-uploaded the v8.0.2 assets with 'gh release upload --clobber', and added a post-release smoke job that actually runs install.sh against the fresh release."
+  },
+  {
+   "id": "b21",
+   "topic": "deploy",
+   "text": "Chased the 502s that appeared for ~30 seconds after every deploy of the api service behind nginx. nginx kept reusing pooled upstream connections to the old process, logging 'upstream prematurely closed connection while reading response header'. Fixed in /etc/nginx/conf.d/api.conf: added 'proxy_next_upstream error timeout http_502', keepalive 32 on the upstream block, and made the deploy script drain via SIGTERM with a 15s grace period before the old process exits. Zero 502s across the last five deploys."
+  },
+  {
+   "id": "b22",
+   "topic": "deploy",
+   "text": "Users reported failures uploading conversation exports over ~1MB; nginx was returning '413 Request Entity Too Large' before the request ever reached the backend. Set 'client_max_body_size 50m;' in the server block of /etc/nginx/sites-available/csr-api and also raised the Express json body limit to match. Reloaded with 'nginx -t && systemctl reload nginx'."
+  },
+  {
+   "id": "b23",
+   "topic": "deploy",
+   "text": "Live dashboard sessions were disconnecting instantly through the proxy while working fine hitting the app port directly. nginx defaults to HTTP/1.0 for upstreams and strips the Upgrade handshake. Added to the /ws/ location in /etc/nginx/conf.d/dashboard.conf: 'proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection \"upgrade\";' plus 'proxy_read_timeout 3600s' so idle sockets aren't reaped after 60s. Persistent connections now stay up for hours."
+  },
+  {
+   "id": "b24",
+   "topic": "deploy",
+   "text": "Cert expiry incident: certbot renew had been failing for 60 days with 'Timeout during connect (likely firewall problem)' on the HTTP-01 challenge — the new security group only allowed 443, so Let's Encrypt couldn't reach /.well-known/acme-challenge/ on port 80. Opened port 80 in the sg-0f3a2 ingress rules, ran 'certbot renew --force-renewal', and added a weekly 'certbot renew --dry-run' check that alerts to Slack on failure."
+  },
+  {
+   "id": "b25",
+   "topic": "deploy",
+   "text": "Decision: issue certificates via the DNS-01 challenge with a wildcard instead of per-host HTTP-01. We kept adding subdomains (api., docs., grafana.) and each needed its own cert plus an open port 80 path, which conflicts with hosts that aren't publicly reachable. Now acme.sh with the Cloudflare API token issues *.selfreflect.dev, and internal-only hosts get certs without any inbound exposure. Renewal runs from a single systemd timer on the bastion."
+  },
+  {
+   "id": "b26",
+   "topic": "deploy",
+   "text": "Root domain outage after DNS migration: we had created a CNAME at the zone apex selfreflect.dev pointing to the load balancer, which violates RFC 1034 — the registrar's resolver dropped the MX and TXT records and mail bounced with 'DNS lookup failure'. Replaced the apex CNAME with the provider's ALIAS/ANAME flattening record, kept www as a normal CNAME, and re-verified SPF/DKIM. Lowered TTL to 300 during the change and restored to 3600 after."
+  },
+  {
+   "id": "b27",
+   "topic": "deploy",
+   "text": "csr-daemon.service was crash-looping on the prod box: 'systemctl status' showed 'status=203/EXEC' then, after fixing the ExecStart path to /usr/local/bin/csr-engine, it failed with 'EnvironmentFile /etc/csr/daemon.env not found'. Created the env file from the template, marked it EnvironmentFile=-/etc/csr/daemon.env (dash prefix so absence is non-fatal), and set Restart=on-failure with RestartSec=5 and StartLimitBurst=3 so a bad config can't hot-loop the CPU. Unit stable since."
+  },
+  {
+   "id": "b28",
+   "topic": "deploy",
+   "text": "Migrated the nightly re-index job from a root crontab entry to a systemd timer pair (csr-reindex.service + csr-reindex.timer with OnCalendar=03:30, Persistent=true). Rationale: cron gave us no logs and silently skipped runs when the box was rebooting at 3am; Persistent=true catches up missed runs and journalctl -u csr-reindex gives full output. Removed the crontab line and documented the units in deploy/systemd/README."
+  },
+  {
+   "id": "b29",
+   "topic": "deploy",
+   "text": "The t3.medium prod instance hit 100% disk and the app started failing writes with ENOSPC. 'du -xh /var | sort -h' showed 22GB of /var/log/journal — journald had no size cap. Set SystemMaxUse=1G and MaxRetentionSec=14day in /etc/systemd/journald.conf, ran 'journalctl --vacuum-size=1G', and enabled logrotate for the app's access logs. Freed 24GB; added a CloudWatch disk alarm at 80% so we hear about it next time."
+  },
+  {
+   "id": "b30",
+   "topic": "deploy",
+   "text": "Investigated why p95 latency doubled every weekday at 14:00 UTC despite low CPU in our own metrics. CloudWatch showed CPUSteal spiking to 40% on the burstable t3.large once CPU credits drained during the daily import surge. Decision: moved the instance to c6i.large (fixed-performance) rather than enabling T3 unlimited, since unlimited's overage billing was projected higher than the on-demand delta. Latency flat since the resize."
+  },
+  {
+   "id": "c01",
+   "topic": "rust",
+   "text": "Fixed a borrow checker error in csr-engine/src/import/parser.rs where ImportPipeline::process_batch failed with \"cannot borrow `*self` as mutable more than once at a time\" (E0499) because it called self.tokenize_chunk() while iterating self.pending_chunks.iter_mut(). Resolved by taking the queue out with std::mem::take(&mut self.pending_chunks), processing the owned Vec, then reassigning. Also extracted tokenize_chunk into a free function taking only the fields it needs. cargo test passes, no clones added on the hot path."
+  },
+  {
+   "id": "c02",
+   "topic": "rust",
+   "text": "Borrow conflict in csr-engine/src/search/ranker.rs: Ranker::rerank hit E0502 \"cannot borrow `self.candidates` as immutable because it is also borrowed as mutable\" when reading scores while mutating the same Vec in place. Fixed by first collecting (index, new_score) pairs into a scratch Vec<(usize, f32)>, then applying them in a second pass. Considered split_at_mut but the access pattern wasn't contiguous, so the two-pass approach was cleaner."
+  },
+  {
+   "id": "c03",
+   "topic": "rust",
+   "text": "Lifetime error resolved in csr-engine/src/hooks/session_start.rs: format_context_banner returned a &str borrowed from a locally built String, causing E0597 \"borrowed value does not live long enough\". Changed the signature from fn format_context_banner(&self) -> &str to return an owned String, and updated the SessionStart hook caller to match. The extra allocation is negligible since the hook runs once per session."
+  },
+  {
+   "id": "c04",
+   "topic": "rust",
+   "text": "The csr-engine daemon subcommand panicked with \"Cannot start a runtime from within a runtime. This happens because a function (like `block_on`) attempted to block the current thread while the thread is being used to drive asynchronous tasks.\" Root cause: the enrichment loop called Runtime::block_on inside a tokio 1.40 async task to run fastembed inference. Fixed by moving the embedding call into tokio::task::spawn_blocking and awaiting the JoinHandle. Daemon now runs the 3-layer enrichment pipeline without panics."
+  },
+  {
+   "id": "c05",
+   "topic": "rust",
+   "text": "Compile failure in csr-engine/src/mcp/tools.rs: the reflect_on_past handler errored with \"future cannot be sent between threads safely\" / \"`std::sync::MutexGuard<'_, EmbeddingEngine>` held across an await point\". We were locking the engine mutex, then awaiting storage.fetch_metadata() while still holding the guard. Fix: compute the embedding inside a narrow block so the guard drops before the .await, i.e. let vec = { engine.lock().unwrap().embed(&query)? }; then await afterwards. Also enabled clippy::await_holding_lock to catch regressions."
+  },
+  {
+   "id": "c06",
+   "topic": "rust",
+   "text": "Decision record: how to share the FastEmbed model across worker threads given that EmbeddingEngine::embed takes &mut self. Chose Arc<std::sync::Mutex<EmbeddingEngine>> held in AppState (csr-engine/src/state.rs) rather than tokio::sync::Mutex or a per-thread model copy. Rationale: embed is a short CPU-bound call with no await inside the critical section, std mutex is cheaper, and a second model instance would double the ~90MB ONNX memory footprint. Documented the pattern in CLAUDE.md under Key Patterns."
+  },
+  {
+   "id": "c07",
+   "topic": "rust",
+   "text": "SQLite thread-safety fix: passing rusqlite 0.38 Connection into an axum-style shared state failed with \"`Connection` cannot be shared between threads safely\" because Connection is Send but not Sync. Wrapped it as Mutex<Connection> inside Storage (csr-engine/src/storage/mod.rs). Evaluated r2d2_sqlite pooling and rejected it — the MCP server is effectively single-writer and WAL mode plus one connection is enough. Also note rusqlite 0.38 has no ToSql impl for usize; all counts are cast to i64 before binding."
+  },
+  {
+   "id": "c08",
+   "topic": "rust",
+   "text": "Clippy cleanup session on csr-engine/src/enrichment/pipeline.rs: cargo clippy -- -D warnings flagged clippy::too_many_arguments on Pipeline::enrich_session (8 params) and clippy::needless_pass_by_value on the summary String. Introduced an EnrichConfig struct with builder-style defaults and changed the summary param to &str. Also silenced a legitimate clippy::large_enum_variant on EnrichmentResult by boxing the Narrative variant. Zero warnings after the pass; fmt and clippy both green."
+  },
+  {
+   "id": "c09",
+   "topic": "rust",
+   "text": "Build investigation: cargo build --release for csr-engine failed on an Intel Mac with \"ld: library not found for -lonnxruntime\" because fastembed 5.9 pulls ort, which ships no prebuilt ONNX Runtime binaries for x86_64-apple-darwin. Decision: officially require aarch64 (Apple Silicon or arm64 Linux) instead of vendoring a custom ort build. Added an arch guard to scripts/install.sh that aborts with a clear message on x86_64 Macs, and noted the constraint in CLAUDE.md."
+  },
+  {
+   "id": "c10",
+   "topic": "mcp",
+   "text": "Dependency conflict fixed: tool structs in csr-engine/src/mcp/tools.rs failed to compile with \"the trait bound `SearchParams: schemars::JsonSchema` is not satisfied\" even though we derived JsonSchema. Cause: rmcp 1.6 generates schemas against schemars v1, but another dependency dragged schemars 0.8 into the tree and our derive resolved to the old crate. Fixed Cargo.toml to pin schemars = \"1\" explicitly and removed the transitive 0.8 via a cargo update -p. Rule recorded: schemars must stay on v1 for rmcp compatibility."
+  },
+  {
+   "id": "c11",
+   "topic": "mcp",
+   "text": "Migrated all 12 MCP tools in csr-engine/src/mcp/tools.rs from individual #[tool(param)] attributes to the rmcp Parameters<T> pattern, e.g. async fn reflect_on_past(&self, Parameters(params): Parameters<ReflectParams>). This eliminated the intermittent \"invalid type: map, expected a string\" deserialization error when Claude Code sent nested argument objects, because rmcp now deserializes the whole params struct at once. Each params struct derives Deserialize + JsonSchema with doc comments becoming field descriptions."
+  },
+  {
+   "id": "c12",
+   "topic": "mcp",
+   "text": "Added rmcp 1.6 tool annotations to every tool macro in csr-engine/src/mcp/tools.rs: annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true) for the ten search/read tools, and read_only_hint = false for store_reflection and get_session_learnings writes. This lets Claude Code auto-approve the read-only tools without permission prompts. Verified via the MCP inspector that tools/list now carries the annotations block for all 12 entries."
+  },
+  {
+   "id": "c13",
+   "topic": "mcp",
+   "text": "Debugged the MCP handshake failure where Claude Code logged \"Unexpected token 'L', \\\"Loading em\\\"... is not valid JSON\" and the server never completed initialize. Root cause: a println!(\"Loading embedding model...\") in main() wrote to stdout, which is the JSON-RPC stdio transport channel, corrupting the frame stream. Fix: route all logging through tracing_subscriber with a stderr writer (.with_writer(std::io::stderr)) and delete every stdout print. Golden rule added: stdout belongs exclusively to the protocol."
+  },
+  {
+   "id": "c14",
+   "topic": "mcp",
+   "text": "Fixed server registration: claude mcp add self-reflect ~/bin/csr-engine produced a server stuck in \"failed — Connection closed\" state because Claude Code does not expand the tilde when spawning the command. Re-registered with the absolute path /Users/rama/bin/csr-engine and it connected immediately. This is the origin of the PATH RULE in CLAUDE.md: always use /Users/username/... never ~/... in MCP registration commands."
+  },
+  {
+   "id": "c15",
+   "topic": "mcp",
+   "text": "Runtime tool-call bug: invoking search_by_recency without a time_range argument returned \"Tool execution failed: missing field `time_range` at line 1 column 42\" from serde_json. The field was declared as String instead of Option<String> in RecencyParams. Fixed by making optional fields Option<T> with #[serde(default)] and documenting the default (\"7d\") in the schema doc comment so the model knows it can omit it. Added a regression test in csr-engine/tests/integration/tool_schemas.rs."
+  },
+  {
+   "id": "c16",
+   "topic": "mcp",
+   "text": "Decision record on registration scope: csr-engine setup now registers the MCP server at user scope (written to ~/.claude.json) rather than project scope (.mcp.json per repo). Rationale: the whole point of the memory system is cross-project recall, and per-project registration meant new repos silently had no memory until manually configured. Trade-off accepted: the server appears in every session, so we kept startup under 200ms. project-scope remains available via csr-engine setup --project for teams that want isolation."
+  },
+  {
+   "id": "c17",
+   "topic": "mcp",
+   "text": "Upgraded rmcp 1.4 to 1.6 in csr-engine. Breaking changes hit: ServerInfo construction failed with E0061 \"this function takes 1 argument but 3 arguments were supplied\" — the new API is ServerInfo::new(capabilities).with_instructions(...) instead of the old struct literal, and Implementation::new() replaces Implementation::from_build_env(). Also updated ReadResourceResult::new() in the resources handler. All 52 unit tests pass after the mechanical migration; no behavior changes."
+  },
+  {
+   "id": "c18",
+   "topic": "mcp",
+   "text": "Fixed slow server startup: Claude Code reported \"MCP server self-reflect failed to start: request timed out after 30000ms\" because main() eagerly constructed EmbeddingEngine, and the ONNX session build plus mmap took ~45s on a cold cache. Moved model construction behind a OnceCell (get_or_try_init) in csr-engine/src/embeddings/mod.rs so the initialize handshake completes in ~80ms and the model loads lazily on the first search call. First query pays the warmup; every session start is now instant."
+  },
+  {
+   "id": "c19",
+   "topic": "embeddings",
+   "text": "Resolved model download failures behind the corporate proxy: fastembed 5.9 fetches sentence-transformers/all-MiniLM-L6-v2 from Hugging Face at first run, and imports died with \"error sending request for url (https://huggingface.co/...): connection closed before message completed\". Fix: honor HF_HUB_CACHE, pre-seed the model directory during csr-engine setup, and add a --offline flag that fails fast with instructions instead of hanging. Cached model lives under ~/.claude-self-reflect/models/."
+  },
+  {
+   "id": "c20",
+   "topic": "embeddings",
+   "text": "Wrote the vector migration in csr-engine/src/storage/migrate.rs for the model switch from all-mpnet-base-v2 (768-dim) to all-MiniLM-L6-v2 (384-dim). Old rows tripped the guard \"assertion failed: vec.len() == 384\" at HNSW insert time. migrate_v7_vectors re-embeds every chunk from the raw text column in batches of 64, writes new BLOBs, and bumps schema_version to 8; there is no lossy down-projection. Migration of 48k chunks took 6m40s on an M2."
+  },
+  {
+   "id": "c21",
+   "topic": "embeddings",
+   "text": "Fixed an import crash where mostly-empty JSONL messages (tool results with only whitespace) produced zero-length embeddings and the index insert panicked with \"dimension mismatch: expected 384, got 0\". Added a guard in csr-engine/src/import/embedder.rs that skips chunks under 8 meaningful characters and logs them at debug level, plus a unit test embed_skips_blank_chunks. 312 junk chunks are now filtered on a full re-import instead of aborting it."
+  },
+  {
+   "id": "c22",
+   "topic": "embeddings",
+   "text": "Recall tuning session on csr-engine/src/search/hnsw.rs: with hnsw_rs 0.3 defaults (ef_search=64) the eval harness showed recall@10 of 0.81. Sweeping ef_search over {64, 128, 200, 400} gave 0.81 / 0.92 / 0.97 / 0.98 with p95 latency 0.4ms / 0.6ms / 0.9ms / 1.7ms. Settled on ef_search=200 with M=16 and ef_construction=400 as the shipped defaults — 0.97 recall@10 while staying under the 1ms p95 budget from CLAUDE.md."
+  },
+  {
+   "id": "c23",
+   "topic": "embeddings",
+   "text": "Decision: stop persisting the HNSW graph to disk. hnsw_rs 0.3 file_dump/file_load worked, but a crash mid-dump left a truncated .hnsw.graph file that failed to load with a bincode EOF error and required manual deletion. New approach in csr-engine/src/search/persistence.rs: SQLite remains the source of truth for vectors, and the graph is rebuilt at startup (1.8s for 50k points) whenever the stored xxhash checksum of the vector table doesn't match. Simpler, and corruption is now self-healing."
+  },
+  {
+   "id": "c24",
+   "topic": "embeddings",
+   "text": "Evaluated scalar int8 quantization of stored vectors to cut memory: 4x smaller (588MB to 147MB for 400k vectors) but recall@10 dropped from 0.97 to 0.93 on the full eval set, and rescoring with f32 originals would have re-added most of the RAM. Decision: keep f32 vectors in memory and reject vector quantization for now — typical users have <100k chunks, so the memory pressure isn't real yet. Left the branch quantize-spike unmerged with the benchmark results in docs/plans/quantization-spike.md."
+  },
+  {
+   "id": "c25",
+   "topic": "embeddings",
+   "text": "Switched inference to the int8-quantized ONNX weights: fastembed's model_optimized.onnx replaced with model_quantized.onnx for all-MiniLM-L6-v2. Embedding throughput went from 410 to 870 chunks/sec on CPU (2.1x), and eval quality was unchanged within noise (MRR 0.884 vs 0.881 on the 20-query suite). This quantizes the model weights only — stored vectors stay f32. Selection happens via QuantizationMode::Static in csr-engine/src/embeddings/model.rs."
+  },
+  {
+   "id": "c26",
+   "topic": "embeddings",
+   "text": "Eval harness bug found and fixed: csr-engine eval --full showed MRR stuck at 0.61 because we built the HNSW index with DistDot while embeddings were not L2-normalized, so magnitude dominated similarity. Fix in csr-engine/src/import/embedder.rs: normalize every vector to unit length right after inference (normalize_l2), making dot product equivalent to cosine. MRR jumped to 0.88 and the top hit for 14 of 20 eval queries changed. Added an assert that vector norms are within 1e-3 of 1.0 at insert."
+  },
+  {
+   "id": "c27",
+   "topic": "embeddings",
+   "text": "Fixed the startup failure \"Failed to load model: invalid protobuf: unexpected EOF while parsing message\" from the ort runtime — a partially downloaded model.onnx left in the cache after a killed setup run. csr-engine/src/embeddings/model.rs now stores the expected SHA-256 alongside the model, verifies it before creating the ONNX session, and on mismatch deletes the file and re-downloads once before giving up. Also downloads to model.onnx.partial and renames atomically so interrupted fetches never poison the cache."
+  },
+  {
+   "id": "c28",
+   "topic": "embeddings",
+   "text": "Import throughput work: full re-import of 92k chunks took 14 minutes with embed batch size 32. Raising the fastembed batch to 256 OOM-killed the process on a 8GB machine (ONNX intermediate tensors spiked past 6GB). Landed on batch_size=64 with two parallel batches via rayon in csr-engine/src/import/embedder.rs, bringing the same import to 3m10s with peak RSS of 1.9GB. Batch size is overridable with csr-engine setup --embed-batch."
+  },
+  {
+   "id": "c29",
+   "topic": "embeddings",
+   "text": "Long-input handling implemented in csr-engine/src/import/chunker.rs: MiniLM's tokenizer silently truncates at 512 tokens, so long assistant turns lost everything past roughly the first two paragraphs and recall on long design discussions was terrible. chunk_message now splits oversized messages into windows of 480 tokens with a 50-token overlap, each stored as its own vector pointing at the same message_id. Eval recall on the three long-conversation test cases went from 1/3 to 3/3."
+  },
+  {
+   "id": "c30",
+   "topic": "embeddings",
+   "text": "Handled deletions despite hnsw_rs 0.3 having no remove API: when a conversation JSONL disappears or a chunk is superseded, we flag the row deleted=1 in SQLite and add its point id to an in-memory tombstone HashSet checked in the search post-filter (csr-engine/src/search/hnsw.rs). Once tombstones exceed 10% of points, the daemon triggers a full index rebuild from live rows. Chose this over ef_search over-fetching alone because heavy re-imports were previously returning stale chunks."
+  },
+  {
+   "id": "d01",
+   "topic": "frontend",
+   "text": "Fixed the runaway re-render in the analytics app: typing in SearchBar caused the entire Dashboard tree to re-render on each character. Root cause was the FilterContext provider in src/components/Dashboard.tsx creating a fresh value object ({query, setQuery, filters}) on every render, invalidating all consumers. Wrapped the context value in useMemo keyed on [query, filters] and profiled with React DevTools to confirm only SearchBar and ResultsList update now. Commit landed as fix/dashboard-context-memo."
+  },
+  {
+   "id": "d02",
+   "topic": "frontend",
+   "text": "Session summary: optimized ProductTable performance. Clicking a column header to sort re-rendered all 400 ProductRow components because we passed inline arrow functions (onSelect={() => ...}) and an unstable columns array as props. Wrapped ProductRow in React.memo, hoisted the columns definition to module scope, and converted handlers to useCallback in src/components/ProductTable.tsx. Render time for a sort dropped from ~180ms to ~12ms in the React Profiler."
+  },
+  {
+   "id": "d03",
+   "topic": "frontend",
+   "text": "Resolved the Next.js 14 hydration error 'Text content does not match server-rendered HTML' in src/components/Header.tsx. The LastUpdated badge rendered new Date().toLocaleTimeString(), so the server (UTC) and the browser (local) produced different strings. Fix: moved the timestamp into a ClientOnly wrapper that renders after mount via useEffect, with suppressHydrationWarning on the span as a belt-and-braces measure."
+  },
+  {
+   "id": "d04",
+   "topic": "frontend",
+   "text": "Error+resolution note: intermittent hydration mismatch 'Prop `id` did not match. Server: \"tt-483\" Client: \"tt-291\"' traced to src/components/Tooltip.tsx generating element IDs with Math.random() at render time. Replaced the ad-hoc generator with React 18's useId hook so server and client agree deterministically. Also audited AccordionItem.tsx for the same pattern and migrated it."
+  },
+  {
+   "id": "d05",
+   "topic": "frontend",
+   "text": "Fixed the layout bug where long conversation titles pushed the main content area off-screen. In src/components/Sidebar.tsx the flex child containing the title list refused to shrink because flexbox defaults min-width to auto for flex items. Adding min-width: 0 to the .sidebar-list flex child in sidebar.module.css lets text-overflow: ellipsis kick in and the layout no longer overflows horizontally."
+  },
+  {
+   "id": "d06",
+   "topic": "frontend",
+   "text": "Debugged why the sticky top navigation in src/components/AppShell.tsx scrolled away with the page despite position: sticky; top: 0. An ancestor div introduced for a fade animation had overflow-x: hidden in app-shell.css, which creates a new scroll container and silently disables sticky positioning. Removed the overflow rule and achieved the fade with a clip-path instead; the nav now pins correctly on all pages."
+  },
+  {
+   "id": "d07",
+   "topic": "frontend",
+   "text": "How-to captured: the '@/' import alias worked in the dev server but Vitest failed with 'Cannot find module @/lib/api'. The alias was defined only in tsconfig.json paths, which Vite/Vitest don't read. Added resolve.alias = { '@': path.resolve(__dirname, './src') } to vite.config.ts and pointed vitest.config.ts at the same file via mergeConfig, so both the bundler and the test runner resolve identically."
+  },
+  {
+   "id": "d08",
+   "topic": "frontend",
+   "text": "Decision record: main.js had grown to 2.4MB gzipped, so we restructured the webpack 5 build. Chose route-level dynamic import() for the admin and reports pages plus optimization.splitChunks with cacheGroups separating vendor (react, d3) from app code, over the alternative of migrating to esbuild now. Also set moment to alias moment/min/moment.min.js. Initial bundle is down to 610KB; migration to Vite deferred to Q3."
+  },
+  {
+   "id": "d09",
+   "topic": "performance",
+   "text": "Hunted down the p95 latency regression on GET /api/search: p95 was 910ms while p50 stayed at 60ms. Tracing with OpenTelemetry showed the SearchService.enrich_results() call in api/services/search.py issuing one SELECT per result row — a classic N+1 against the tags table. Replaced it with a single selectinload eager load in SQLAlchemy 2.0 and added an index on tags.result_id. p95 is now 42ms in the load test."
+  },
+  {
+   "id": "d10",
+   "topic": "performance",
+   "text": "Fixed slow first-call latency on the csr_reflect_on_past MCP tool: each invocation took ~3.2s because EmbeddingEngine::new() in csr-engine/src/embeddings.rs reloaded the FastEmbed ONNX model from disk per request. Wrapped the engine in a OnceLock<Mutex<EmbeddingEngine>> initialized at server startup, so the model loads once. Tool latency dropped to 18ms p95 per cargo bench spike_bench."
+  },
+  {
+   "id": "d11",
+   "topic": "performance",
+   "text": "Resolved the Node.js memory leak in the realtime service: RSS climbed from 300MB to 2GB over 48 hours with many long-lived connections. Heap snapshots in Chrome DevTools showed thousands of retained closures — ws/WebSocketHandler in src/realtime/handler.ts registered a 'message' listener on the shared EventBus per connection but never removed it on close. Added bus.off(...) in the disconnect path and a MaxListenersExceededWarning alert; memory is flat after soak testing."
+  },
+  {
+   "id": "d12",
+   "topic": "performance",
+   "text": "Error+resolution: the import worker was OOM-killed nightly (exit code 137). memory_profiler showed the culprit was an unbounded @lru_cache on normalize_project_path() in worker/importer.py, which cached every unique JSONL path across millions of records. Set maxsize=4096 and added a cache_clear() between project batches. Peak RSS fell from 11GB to 900MB and the nightly import finishes cleanly."
+  },
+  {
+   "id": "d13",
+   "topic": "performance",
+   "text": "Profiling session: generated a flamegraph with cargo flamegraph on the import path and found 61% of CPU time inside serde_json::from_str deserializing conversation JSONL in csr-engine/src/import/parser.rs. Swapped the hot path to sonic-rs 0.3 with borrowed deserialization and skipped unused fields with a trimmed struct. Import throughput went from 9k to 41k lines/sec; kept serde_json only for config parsing."
+  },
+  {
+   "id": "d14",
+   "topic": "performance",
+   "text": "Used py-spy record --format flamegraph against the ETL job and discovered re.compile being invoked inside the per-row loop of transform_rows() in etl/clean.py — pattern compilation was 38% of the profile. Hoisted the six regexes to module-level constants and precompiled them. The job now processes the 20M-row dataset in 14 minutes instead of 52."
+  },
+  {
+   "id": "d15",
+   "topic": "performance",
+   "text": "Decision record: benchmarked embedding batch sizes for the FastEmbed all-MiniLM-L6-v2 pipeline at 8, 16, 32, 64, and 128. Throughput plateaued after 32 (2,100 chunks/sec) while peak memory jumped from 1.1GB at 32 to 3.4GB at 128, and 64+ occasionally starved the MCP server thread. Settled on EMBED_BATCH_SIZE=32 as the default in csr-engine/src/config.rs, overridable via env var."
+  },
+  {
+   "id": "d16",
+   "topic": "performance",
+   "text": "Tuned bulk persistence in the SQLite storage layer: inserting chunks one row at a time did ~350 rows/sec. Tested wrapping N inserts per transaction with a prepared statement in csr-engine/src/storage/writer.rs — 100, 500, 2000, 10000. Chose 500 rows per transaction (21k rows/sec) because 2000+ gave under 8% more throughput while holding the write lock long enough to make csr_quick_check reads stall. Also enabled PRAGMA journal_mode=WAL."
+  },
+  {
+   "id": "d17",
+   "topic": "testing",
+   "text": "Fixed the flaky test_billing_cycle_boundaries in tests/test_invoices.py that failed only in GitHub Actions. It built expected dates with datetime.now() and compared against invoice rows computed in UTC — CI runs in UTC so it passed there at some hours and failed at others; locally (PST) it was worse. Froze the clock with freezegun 1.4 to 2026-03-15T00:00:00Z and switched all assertions to timezone-aware datetime.now(timezone.utc)."
+  },
+  {
+   "id": "d18",
+   "topic": "testing",
+   "text": "Root-caused a flaky suite: test_feature_flags.py passed alone but failed when the whole suite ran with pytest -p no:randomly disabled. FlagRegistry in app/flags.py is a module-level singleton, and test_admin_overrides mutated it without teardown, so later tests inherited stale flag state — a test-order dependency. Added an autouse fixture that snapshots and restores FlagRegistry._flags, and turned pytest-randomly back on to keep us honest."
+  },
+  {
+   "id": "d19",
+   "topic": "testing",
+   "text": "Error+resolution: integration tests flaked with 'EADDRINUSE: address already in use :::4001' about 1 in 10 CI runs. Both api.spec.ts and webhooks.spec.ts booted Fastify on the hardcoded port 4001, and Jest's maxWorkers=4 let them collide. Changed the test harness in tests/helpers/server.ts to listen on port 0 and read server.address().port, passing the ephemeral port to supertest. No collisions in 200 consecutive runs."
+  },
+  {
+   "id": "d20",
+   "topic": "testing",
+   "text": "How-to note: the debounce test for useAutosave hung for the real 30s delay. Solution was jest.useFakeTimers({doNotFake: ['performance']}) in tests/hooks/useAutosave.test.tsx, then advancing with await act(async () => { jest.advanceTimersByTime(30000) }) so pending promises flush. Gotcha recorded: fake timers must be installed before renderHook, and userEvent.setup needs advanceTimers: jest.advanceTimersByTime or clicks stall."
+  },
+  {
+   "id": "d21",
+   "topic": "testing",
+   "text": "Decision record: for repository-layer integration tests we evaluated an in-memory SQLite stand-in versus real Postgres via Testcontainers. SQLite silently diverged on JSONB operators and ON CONFLICT behavior we rely on, so we adopted testcontainers-python 4.x with a postgres:16-alpine container started once per session in tests/conftest.py, schema applied by alembic upgrade head. Suite cost is +9s startup, accepted for fidelity; unit tests keep using fakes."
+  },
+  {
+   "id": "d22",
+   "topic": "testing",
+   "text": "Implemented per-test isolation for the integration DB: instead of TRUNCATE-ing 40 tables between tests (which took 700ms each), each test now runs inside a SAVEPOINT-wrapped transaction that rolls back in teardown. Done via a db_session fixture in tests/conftest.py using SQLAlchemy's join_transaction_mode='create_savepoint' so code under test can commit freely. Suite time dropped from 6m10s to 1m40s and tests no longer see each other's rows."
+  },
+  {
+   "id": "d23",
+   "topic": "testing",
+   "text": "Property-based testing win: added a Hypothesis 6.x test with st.text() over slugify() in utils/text.py and it immediately shrank to a failing case — the input '\\u0300' (a lone combining accent) produced an empty slug, which downstream turned into the route /posts// and a 500. Fixed slugify to fall back to a short hash when normalization strips everything, and pinned the regression as an explicit @example."
+  },
+  {
+   "id": "d24",
+   "topic": "dev-environment",
+   "text": "Resolved the 'unable to get local issuer certificate' (UNABLE_TO_VERIFY_LEAF_SIGNATURE) failures when npm install ran on the office network. The corporate Zscaler proxy re-signs TLS, so Node rejected the chain. Fix: exported the Zscaler root cert to ~/certs/zscaler-root.pem and set NODE_EXTRA_CA_CERTS to it in ~/.zshrc, plus cafile in ~/.npmrc for npm itself. Explicitly rejected the strict-ssl=false workaround."
+  },
+  {
+   "id": "d25",
+   "topic": "dev-environment",
+   "text": "Debugged why the Rust CLI's update check timed out on the corporate network while curl worked fine: reqwest 0.12 was built with default features minus 'system-proxy' semantics we assumed, and our HTTPS_PROXY was only set in the fish shell, not in the launchd environment the app inherited. Fixed by enabling ProxyConfig::from_env in src/http.rs, honoring HTTPS_PROXY/NO_PROXY, and documenting launchctl setenv HTTPS_PROXY for GUI-launched processes."
+  },
+  {
+   "id": "d26",
+   "topic": "dev-environment",
+   "text": "Bugfix: staging credentials leaked into local dev because of dotenv precedence. dotenv-flow loads .env, then .env.local, then .env.development — but our custom loader in config/env.js called dotenv.config() twice and dotenv never overrides existing process.env keys, so whichever file loaded first won and DATABASE_URL pointed at staging. Replaced the hand-rolled loader with dotenv-flow 4.1 defaults and added a startup assertion that NODE_ENV=development implies a localhost DATABASE_URL."
+  },
+  {
+   "id": "d27",
+   "topic": "dev-environment",
+   "text": "Session summary: the pre-commit hook had become a 90-second wall because .git/hooks/pre-commit ran 'cargo clippy --all-targets --all-features' on the whole workspace for every commit. Rewrote it to run cargo fmt --check plus clippy only on packages containing staged .rs files (derived from git diff --cached --name-only), with a full-workspace clippy left to CI. Hook time is now ~6s and nobody reaches for --no-verify anymore."
+  },
+  {
+   "id": "d28",
+   "topic": "dev-environment",
+   "text": "Fixed the husky/lint-staged misconfiguration in the web repo: committing a one-line change reformatted hundreds of files because the lint-staged entry in package.json was '*.{ts,tsx}': 'prettier --write .' — the trailing dot made Prettier process the entire project instead of the staged file list lint-staged appends. Removed the '.', added eslint --fix --max-warnings=0 to the same glob, and upgraded husky to v9's .husky/pre-commit format."
+  },
+  {
+   "id": "d29",
+   "topic": "dev-environment",
+   "text": "Error+resolution: rust-analyzer in VS Code kept dying with 'server cancelled the request' and every #[derive] site showed 'proc macro `Serialize` not expanded'. Cause was two-fold: proc-macro expansion was disabled after a nightly mismatch, and check-on-save spawned a second full cargo check fighting the terminal build for the target dir. Fixed in .vscode/settings.json: rust-analyzer.procMacro.enable: true, rust-analyzer.cargo.targetDir: true (separate RA target dir), and rust-analyzer.check.command: 'clippy'. Memory settled around 3GB and macro errors cleared."
+  },
+  {
+   "id": "d30",
+   "topic": "dev-environment",
+   "text": "Fixed phantom type errors that appeared only in the editor: VS Code bundled TypeScript 5.3 while the repo used typescript 5.6 with the new config option, so tsserver flagged 'Unknown compiler option noUncheckedSideEffectImports' even though tsc built cleanly. Set 'typescript.tsdk': 'node_modules/typescript/lib' in .vscode/settings.json, committed it, and had everyone run 'TypeScript: Select TypeScript Version → Use Workspace Version'. Editor and CLI diagnostics now match."
+  }
+ ],
+ "queries": [
+  {
+   "id": "qa01",
+   "text": "A user reported that signing out on their laptop didn't end their phone's session — how did we make sign-out apply everywhere?",
+   "relevant": [
+    "a04"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qa02",
+   "text": "People with the app open in two tabs kept getting bounced to the login screen whenever their credentials renewed in the background. What was our fix for that?",
+   "relevant": [
+    "a01"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qa03",
+   "text": "Some users on certain laptops were told their login had lapsed almost immediately after signing in. What turned out to be the cause and the remedy?",
+   "relevant": [
+    "a02"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qa04",
+   "text": "Why did we stop tracking the documentation site's theme as a nested repository, and what did we switch to?",
+   "relevant": [
+    "a27"
+   ],
+   "category": "decision-recall"
+  },
+  {
+   "id": "qa05",
+   "text": "Users coming back from the Google consent screen looked logged out on our callback page — what cookie attribute change sorted that out?",
+   "relevant": [
+    "a05"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qa06",
+   "text": "The third-party sign-in flow errored out for anyone who had started logging in from two browser windows at once. What was going wrong there?",
+   "relevant": [
+    "a08"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qa07",
+   "text": "The engine and its background worker kept tripping over each other with a locked-datastore error — which connection settings did we turn on to fix it?",
+   "relevant": [
+    "a11"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qa08",
+   "text": "The overnight narrative job used to monopolize writes for close to a minute. How did we restructure its inserts?",
+   "relevant": [
+    "a12"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qa09",
+   "text": "What was our reasoning for not requiring any running database service in the storage layer?",
+   "relevant": [
+    "a13"
+   ],
+   "category": "decision-recall"
+  },
+  {
+   "id": "qa10",
+   "text": "The feed endpoint was crawling because Postgres read the entire table for every request — what did we do to speed it up?",
+   "relevant": [
+    "a14"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qa11",
+   "text": "During peak traffic the API suddenly couldn't get any more database connections and requests started dying. What infrastructure did we put in place afterwards?",
+   "relevant": [
+    "a15"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qa12",
+   "text": "What's the safe procedure we settled on for introducing a mandatory field to a huge table without taking down a deploy?",
+   "relevant": [
+    "a17"
+   ],
+   "category": "howto-recall"
+  },
+  {
+   "id": "qa13",
+   "text": "I mangled a local history cleanup once and some work vanished — what were the steps we used to get those changes back?",
+   "relevant": [
+    "a21"
+   ],
+   "category": "howto-recall"
+  },
+  {
+   "id": "qa14",
+   "text": "Where did we write down the console configuration steps for setting up Google sign-in credentials?",
+   "relevant": [
+    "a10"
+   ],
+   "category": "location-recall"
+  },
+  {
+   "id": "qa15",
+   "text": "How did we automate finding which change made building the vector index several times slower?",
+   "relevant": [
+    "a28"
+   ],
+   "category": "howto-recall"
+  },
+  {
+   "id": "qb01",
+   "text": "when we first deployed to the new arm server the container refused to even start — some architecture mismatch. how did we sort that out?",
+   "relevant": [
+    "b07"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qb02",
+   "text": "why did the arm64 image build keep dying halfway through compiling, and what approach did we settle on?",
+   "relevant": [
+    "b04"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qb03",
+   "text": "remind me why we abandoned the tiny base image for the containers — there was some name resolution weirdness?",
+   "relevant": [
+    "b09"
+   ],
+   "category": "decision-recall"
+  },
+  {
+   "id": "qb04",
+   "text": "the frontend bundling step used to get killed while building the image — what turned out to be the reason?",
+   "relevant": [
+    "b02"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qb05",
+   "text": "our database container kept getting terminated under memory pressure a while back — what was misconfigured?",
+   "relevant": [
+    "b03"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qb06",
+   "text": "which files did we change to fix the app not being able to write into its mounted data directory?",
+   "relevant": [
+    "b06"
+   ],
+   "category": "location-recall"
+  },
+  {
+   "id": "qb07",
+   "text": "tests would randomly fail only when two runners executed simultaneously — what was clashing?",
+   "relevant": [
+    "b11"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qb08",
+   "text": "we had that annoying 1-in-8 failure where pipelines couldn't download dependencies — what mitigations did we put in?",
+   "relevant": [
+    "b13"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qb09",
+   "text": "what did we decide about how JS dependencies get cached between workflow runs, and why?",
+   "relevant": [
+    "b15"
+   ],
+   "category": "decision-recall"
+  },
+  {
+   "id": "qb10",
+   "text": "the rust pipeline was rebuilding everything from zero on every run even though caching was enabled — what was wrong with it?",
+   "relevant": [
+    "b14"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qb11",
+   "text": "how do we cryptographically attest the binaries we ship, and how does the installer check them?",
+   "relevant": [
+    "b17"
+   ],
+   "category": "howto-recall"
+  },
+  {
+   "id": "qb12",
+   "text": "we cut a version tag once and nothing happened — no publish job at all. what was the gotcha?",
+   "relevant": [
+    "b16"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qb13",
+   "text": "right after each rollout the site briefly threw gateway errors — what was the root cause behind the proxy?",
+   "relevant": [
+    "b21"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qb14",
+   "text": "how did we make the realtime dashboard connections survive going through the reverse proxy instead of dropping immediately?",
+   "relevant": [
+    "b23"
+   ],
+   "category": "howto-recall"
+  },
+  {
+   "id": "qb15",
+   "text": "what was the reasoning for switching how our TLS certificates get validated and issued?",
+   "relevant": [
+    "b25"
+   ],
+   "category": "decision-recall"
+  },
+  {
+   "id": "qc01",
+   "text": "The importer's batch processing needed two mutable handles into the same struct and rustc refused — what trick did we use to get past that?",
+   "relevant": [
+    "c01"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qc02",
+   "text": "The background enrichment process kept dying with a panic about a nested async executor — what caused it and what was the fix?",
+   "relevant": [
+    "c04"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qc03",
+   "text": "What approach did we settle on so multiple threads could use the single local inference model, given it needs exclusive mutable access?",
+   "relevant": [
+    "c06"
+   ],
+   "category": "decision-recall"
+  },
+  {
+   "id": "qc04",
+   "text": "One of our tool handlers stopped compiling with a complaint that its async body wasn't thread-safe — what was actually going on?",
+   "relevant": [
+    "c05"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qc05",
+   "text": "What did we do about the lint complaining that the enrichment function's parameter list was way too long?",
+   "relevant": [
+    "c08"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qc06",
+   "text": "Where does the code live that re-encodes the old wider vectors after we swapped to the smaller model?",
+   "relevant": [
+    "c20"
+   ],
+   "category": "location-recall"
+  },
+  {
+   "id": "qc07",
+   "text": "Claude Code showed garbled JSON parse failures every time it tried to connect to our server — what turned out to be polluting the pipe?",
+   "relevant": [
+    "c13"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qc08",
+   "text": "The client kept giving up on our server because it took ages to become ready — how did we make boot fast again?",
+   "relevant": [
+    "c18"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qc09",
+   "text": "Why did we lock the schema-generation crate to one specific major version in the manifest?",
+   "relevant": [
+    "c10"
+   ],
+   "category": "decision-recall"
+  },
+  {
+   "id": "qc10",
+   "text": "Did we end up registering the memory server once for the whole machine or separately per repository, and what was the reasoning?",
+   "relevant": [
+    "c16"
+   ],
+   "category": "decision-recall"
+  },
+  {
+   "id": "qc11",
+   "text": "Which index-time or query-time parameter did we sweep to push the top-10 hit rate up, and what value did we ship?",
+   "relevant": [
+    "c22"
+   ],
+   "category": "howto-recall"
+  },
+  {
+   "id": "qc12",
+   "text": "We experimented with compressing the stored vectors to shrink RAM usage — what happened and did we keep it?",
+   "relevant": [
+    "c24"
+   ],
+   "category": "decision-recall"
+  },
+  {
+   "id": "qc13",
+   "text": "The engine refused to start because the model file was unreadable with some serialization complaint — how did we make that recover on its own?",
+   "relevant": [
+    "c27"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qc14",
+   "text": "Which module is responsible for splitting transcripts that exceed the model's input window before they get vectorized?",
+   "relevant": [
+    "c29"
+   ],
+   "category": "location-recall"
+  },
+  {
+   "id": "qc15",
+   "text": "How do we deal with conversations that get removed, since the graph library offers no way to drop entries?",
+   "relevant": [
+    "c30"
+   ],
+   "category": "howto-recall"
+  },
+  {
+   "id": "qd01",
+   "text": "Which component was making the whole page redraw on every keystroke, and what did we do about it?",
+   "relevant": [
+    "d01"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qd02",
+   "text": "We had that SSR warning where the browser markup disagreed with what the server sent because of a clock/time display — how was it resolved?",
+   "relevant": [
+    "d03"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qd03",
+   "text": "The pinned navbar stopped staying at the top when scrolling — which ancestor style turned out to be the culprit?",
+   "relevant": [
+    "d06"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qd04",
+   "text": "What approach did we agree on for shrinking that huge initial JavaScript payload, and what did we decide to postpone?",
+   "relevant": [
+    "d08"
+   ],
+   "category": "decision-recall"
+  },
+  {
+   "id": "qd05",
+   "text": "How did I get the '@' path shorthand imports to resolve in the test runner when they already worked in dev?",
+   "relevant": [
+    "d07"
+   ],
+   "category": "howto-recall"
+  },
+  {
+   "id": "qd06",
+   "text": "What was behind the tail latency blowup on the search API where the median looked fine but slow requests were near a second?",
+   "relevant": [
+    "d09"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qd07",
+   "text": "The realtime server's RAM kept creeping up over a couple of days with lots of open connections — what was never getting cleaned up?",
+   "relevant": [
+    "d11"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qd08",
+   "text": "When we profiled the ingest code with a flame chart, where in the codebase was most of the CPU going during JSON handling?",
+   "relevant": [
+    "d13"
+   ],
+   "category": "location-recall"
+  },
+  {
+   "id": "qd09",
+   "text": "What chunk-count did we land on for feeding text into the vector model, and what was the tradeoff?",
+   "relevant": [
+    "d15"
+   ],
+   "category": "decision-recall"
+  },
+  {
+   "id": "qd10",
+   "text": "There was a test that only broke on the CI runners depending on the hour of day — something about clocks and regions. How did we make it deterministic?",
+   "relevant": [
+    "d17"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qd11",
+   "text": "How did we fast-forward the clock in the autosave delay test so it didn't actually wait half a minute?",
+   "relevant": [
+    "d20"
+   ],
+   "category": "howto-recall"
+  },
+  {
+   "id": "qd12",
+   "text": "For the tests that hit a real database, did we end up using a lightweight embedded DB or spinning up the real thing, and why?",
+   "relevant": [
+    "d21"
+   ],
+   "category": "decision-recall"
+  },
+  {
+   "id": "qd13",
+   "text": "Generative/randomized testing surfaced a weird string that broke our URL-friendly-name helper — what was the input and the fix?",
+   "relevant": [
+    "d23"
+   ],
+   "category": "bugfix-recall"
+  },
+  {
+   "id": "qd14",
+   "text": "Installing packages at the office kept failing with TLS trust errors because of the traffic-inspecting middlebox — what was the fix without turning verification off?",
+   "relevant": [
+    "d24"
+   ],
+   "category": "error-recall"
+  },
+  {
+   "id": "qd15",
+   "text": "Which config file did we edit to stop the Rust language server from crashing and complaining it couldn't expand derives?",
+   "relevant": [
+    "d29"
+   ],
+   "category": "location-recall"
+  }
+ ]
+}

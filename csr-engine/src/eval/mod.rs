@@ -2,6 +2,9 @@
 //!
 //! Quick mode: 5 core tests (<30s)
 //! Full mode: 20 tests (~2 min)
+//! Benchmark mode: labeled retrieval benchmark for model comparison
+
+pub mod benchmark;
 
 use std::path::Path;
 use std::sync::Arc;

@@ -94,6 +94,15 @@ enum Commands {
         /// Run full evaluation (20 tests) instead of quick (5 tests)
         #[arg(long)]
         full: bool,
+
+        /// Run the labeled retrieval benchmark instead of health tests
+        #[arg(long)]
+        benchmark: bool,
+
+        /// Comma-separated embedding models to benchmark
+        /// (minilm-l6, minilm-l12, bge-small, bge-base, arctic-xs, e5-small, jina-code)
+        #[arg(long, default_value = "minilm-l6")]
+        models: String,
     },
     /// Backfill session stories from V3/heuristic data (zero cost)
     BackfillStories {
@@ -181,7 +190,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(Commands::Eval { full }) = args.command {
+    if let Some(Commands::Eval {
+        full,
+        benchmark,
+        ref models,
+    }) = args.command
+    {
+        if benchmark {
+            let report = csr_engine::eval::benchmark::run(models)?;
+            print!("{report}");
+            return Ok(());
+        }
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }

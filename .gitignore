@@ -36,6 +36,7 @@ docs/organization-log.json
 
 # Data and state
 data/
+!csr-engine/src/eval/data/
 !csr-engine/data/
 config/imported-files.json
 config-isolated/
