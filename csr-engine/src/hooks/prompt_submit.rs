@@ -570,19 +570,10 @@ fn episode_for_conversation(
 
 /// Log the best sub-threshold episode candidate for threshold tuning.
 fn log_episode_near_miss(score: f32, session_id: &str) {
-    if let Some(home) = dirs::home_dir() {
-        let log_path = home.join(".claude-self-reflect").join("hook-timing.log");
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let line = format!(
-            "{} CSR prompt-submit episode near-miss: score={:.3} (min={}) conv={}\n",
-            ts, score, EPISODE_CORRELATION_MIN, session_id
-        );
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
-    }
+    crate::telemetry::append_timing_line(&format!(
+        "CSR prompt-submit episode near-miss: score={:.3} (min={}) conv={}",
+        score, EPISODE_CORRELATION_MIN, session_id
+    ));
 }
 
 fn detect_continued_session_id(engine: &Engine, cwd: &Path) -> Option<String> {
@@ -911,31 +902,21 @@ fn log_injection_detail(
     stdout_bytes: usize,
     scored: &[predictor::ScoredResult],
 ) {
-    if let Some(home) = dirs::home_dir() {
-        let log_path = home.join(".claude-self-reflect").join("hook-timing.log");
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let query_preview: String = query.chars().take(80).collect();
-        let top_scores: Vec<String> = scored
-            .iter()
-            .take(3)
-            .map(|s| format!("{:.3}/{}", s.final_score, s.source))
-            .collect();
-        let line = format!(
-            "{} CSR {} inject: query=\"{}\" items={} anti={} stdout={}B top=[{}]\n",
-            ts,
-            hook,
-            query_preview,
-            total_items,
-            anti_count,
-            stdout_bytes,
-            top_scores.join(", "),
-        );
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
-    }
+    let query_preview: String = query.chars().take(80).collect();
+    let top_scores: Vec<String> = scored
+        .iter()
+        .take(3)
+        .map(|s| format!("{:.3}/{}", s.final_score, s.source))
+        .collect();
+    crate::telemetry::append_timing_line(&format!(
+        "CSR {} inject: query=\"{}\" items={} anti={} stdout={}B top=[{}]",
+        hook,
+        query_preview,
+        total_items,
+        anti_count,
+        stdout_bytes,
+        top_scores.join(", "),
+    ));
 }
 
 /// Check if content is self-referential noise about CSR internals.

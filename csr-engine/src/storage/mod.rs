@@ -426,6 +426,60 @@ impl Storage {
         Ok(result == "ok")
     }
 
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_meta(&conn, key)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::set_meta(&conn, key, value)
+    }
+
+    /// Integrity check with an app-level cache. SQLite recomputes
+    /// `PRAGMA integrity_check` from scratch on every call — ~10s of CPU on a
+    /// multi-GB DB (it walks every btree, including FTS5) — so the result is
+    /// persisted in `meta` and reused.
+    ///
+    /// - Cache younger than `ttl_hours`: cached verdict, no recompute.
+    /// - Cache stale: recomputes only when `refresh_if_stale` is true (daemon
+    ///   ticks and `status --deep`); other callers keep serving the stale
+    ///   verdict so a statusline poll never eats the 10s hit.
+    /// - No cache yet: computes once and stores (fresh installs are small/fast).
+    pub fn integrity_check_cached(&self, ttl_hours: i64, refresh_if_stale: bool) -> Result<bool> {
+        let cached = self.get_meta("integrity_ok")?;
+        let checked_at = self
+            .get_meta("integrity_checked_at")?
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc));
+
+        if let (Some(ok), Some(ts)) = (&cached, checked_at) {
+            let age = chrono::Utc::now().signed_duration_since(ts);
+            let fresh = age < chrono::Duration::hours(ttl_hours) && age.num_seconds() >= 0;
+            if fresh || !refresh_if_stale {
+                return Ok(ok == "1");
+            }
+        }
+
+        let ok = self.integrity_check()?;
+        self.set_meta("integrity_ok", if ok { "1" } else { "0" })?;
+        self.set_meta("integrity_checked_at", &chrono::Utc::now().to_rfc3339())?;
+        Ok(ok)
+    }
+
+    /// Attempt a WAL checkpoint+truncate. Long-lived MCP readers can hold the
+    /// WAL open indefinitely, letting it grow to hundreds of MB; a periodic
+    /// TRUNCATE attempt from the daemon reclaims it whenever readers allow.
+    /// Best-effort: returns Ok(false) when readers blocked the truncate.
+    pub fn checkpoint_wal(&self) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let (busy, _log, _ckpt): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        Ok(busy == 0)
+    }
+
     // ─── Import state ───
 
     pub fn is_file_imported(&self, path: &Path) -> Result<bool> {
@@ -812,5 +866,64 @@ mod tests {
         assert_eq!(got_a[0].content, "main-scope fact");
         assert_eq!(got_b.len(), 1, "feature scope keeps its own row");
         assert_eq!(got_b[0].content, "feature-scope fact");
+    }
+
+    #[test]
+    fn meta_kv_roundtrip() {
+        let storage = Storage::open_memory().unwrap();
+        assert_eq!(storage.get_meta("missing").unwrap(), None);
+        storage.set_meta("k", "v1").unwrap();
+        assert_eq!(storage.get_meta("k").unwrap().as_deref(), Some("v1"));
+        storage.set_meta("k", "v2").unwrap();
+        assert_eq!(storage.get_meta("k").unwrap().as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn integrity_cached_no_cache_computes_and_stores() {
+        let storage = Storage::open_memory().unwrap();
+        assert!(storage.integrity_check_cached(24, false).unwrap());
+        assert_eq!(
+            storage.get_meta("integrity_ok").unwrap().as_deref(),
+            Some("1")
+        );
+        assert!(storage.get_meta("integrity_checked_at").unwrap().is_some());
+    }
+
+    #[test]
+    fn integrity_cached_fresh_serves_cache_without_recompute() {
+        let storage = Storage::open_memory().unwrap();
+        // Plant a fresh-but-wrong verdict: if the cache is honored, we get the
+        // planted value back instead of the real (healthy) recompute.
+        storage.set_meta("integrity_ok", "0").unwrap();
+        storage
+            .set_meta("integrity_checked_at", &chrono::Utc::now().to_rfc3339())
+            .unwrap();
+        assert!(!storage.integrity_check_cached(24, true).unwrap());
+        assert!(!storage.integrity_check_cached(24, false).unwrap());
+    }
+
+    #[test]
+    fn integrity_cached_stale_behavior_depends_on_refresh_flag() {
+        let storage = Storage::open_memory().unwrap();
+        let stale = chrono::Utc::now() - chrono::Duration::hours(48);
+        storage.set_meta("integrity_ok", "0").unwrap();
+        storage
+            .set_meta("integrity_checked_at", &stale.to_rfc3339())
+            .unwrap();
+        // Stale + no refresh: keep serving the stale verdict (statusline path).
+        assert!(!storage.integrity_check_cached(24, false).unwrap());
+        // Stale + refresh: recompute (daemon path) and update the cache.
+        assert!(storage.integrity_check_cached(24, true).unwrap());
+        assert_eq!(
+            storage.get_meta("integrity_ok").unwrap().as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn checkpoint_wal_is_safe_on_memory_db() {
+        let storage = Storage::open_memory().unwrap();
+        // In-memory DBs have no WAL — the pragma must not error.
+        let _ = storage.checkpoint_wal();
     }
 }

@@ -60,6 +60,9 @@ enum Commands {
         /// SwiftBar-compatible output for macOS menu bar plugin
         #[arg(long)]
         swiftbar: bool,
+        /// Force a fresh full integrity check (slow on large DBs; otherwise cached)
+        #[arg(long)]
+        deep: bool,
     },
     /// Handle Claude Code hook events
     Hook {
@@ -176,8 +179,19 @@ async fn main() -> Result<()> {
         return csr_engine::setup::handle(&args.db_path, &args.projects_dir, anthropic_key).await;
     }
 
-    if let Some(Commands::Status { compact, swiftbar }) = args.command {
-        return csr_engine::status::handle(&args.db_path, &args.projects_dir, compact, swiftbar);
+    if let Some(Commands::Status {
+        compact,
+        swiftbar,
+        deep,
+    }) = args.command
+    {
+        return csr_engine::status::handle(
+            &args.db_path,
+            &args.projects_dir,
+            compact,
+            swiftbar,
+            deep,
+        );
     }
 
     if let Some(Commands::Telemetry { since, json, tui }) = args.command {

@@ -14,16 +14,7 @@ use crate::storage::Storage;
 
 /// Append a timing line to ~/.claude-self-reflect/hook-timing.log.
 fn log_timing(line: &str) {
-    if let Some(home) = dirs::home_dir() {
-        let log_path = home.join(".claude-self-reflect").join("hook-timing.log");
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let entry = format!("{} {}\n", ts, line);
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()));
-    }
+    crate::telemetry::append_timing_line(line);
 }
 
 /// Orchestrates all subsystems: storage, embeddings, search, import, and MCP.
@@ -265,6 +256,10 @@ impl Engine {
 
         let chunks = import::parse_jsonl_file(file_path, project_name)?;
         if chunks.is_empty() {
+            // Record the skip (agent transcripts, empty conversations) so the
+            // watcher doesn't re-parse the file every pass and import_percent
+            // counts it as processed instead of silently under-reporting.
+            self.storage.mark_file_imported(file_path, 0)?;
             return Ok(0);
         }
 

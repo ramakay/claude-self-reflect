@@ -1114,6 +1114,25 @@ pub fn count_reflection_embeddings(conn: &Connection) -> Result<usize> {
     Ok(count as usize)
 }
 
+// ─── Meta KV ───
+
+pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+    let mut rows = stmt.query([key])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        [key, value],
+    )?;
+    Ok(())
+}
+
 // ─── TAD: Retrieval Event Tracking ───
 
 /// Log a retrieval event (memory was surfaced during a hook).

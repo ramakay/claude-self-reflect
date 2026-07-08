@@ -176,16 +176,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     eprintln!("{}", timing_line);
 
     // Append to timing log file for post-session analysis
-    if let Some(home) = dirs::home_dir() {
-        let log_path = home.join(".claude-self-reflect").join("hook-timing.log");
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let line = format!("{} {}\n", ts, timing_line);
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
-    }
+    crate::telemetry::append_timing_line(&timing_line);
 
     result
 }

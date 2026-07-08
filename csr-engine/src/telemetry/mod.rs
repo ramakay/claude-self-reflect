@@ -95,6 +95,36 @@ pub fn default_log_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude-self-reflect").join("hook-timing.log"))
 }
 
+/// The previous log generation kept after rotation: `hook-timing.log.1`.
+pub fn rotated_log_path() -> Option<PathBuf> {
+    default_log_path().map(|p| p.with_extension("log.1"))
+}
+
+/// Rotate at 10MB — one generation is kept so telemetry windows survive rotation.
+const MAX_TIMING_LOG_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Append one timestamped line to hook-timing.log, rotating first if oversized.
+/// The single write path for all timing/diagnostic log producers. Best-effort:
+/// concurrent rotation races lose a rename harmlessly, IO errors are swallowed
+/// (logging must never fail a hook).
+pub fn append_timing_line(line: &str) {
+    let Some(log_path) = default_log_path() else {
+        return;
+    };
+    if let (Ok(md), Some(old)) = (std::fs::metadata(&log_path), rotated_log_path()) {
+        if md.len() >= MAX_TIMING_LOG_BYTES {
+            let _ = std::fs::rename(&log_path, &old);
+        }
+    }
+    let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let entry = format!("{} {}\n", ts, line);
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()));
+}
+
 /// CLI entry point.
 pub fn handle(
     db_path: &Path,
@@ -125,7 +155,15 @@ pub fn handle(
 pub fn collect(db_path: &Path, projects_dir: &Path, window: Window) -> Result<Telemetry> {
     let status = crate::status::gather_status_public(db_path, projects_dir)?;
     let log_path = default_log_path().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    let (entries, scanned) = parser::read_log(&log_path, window.cutoff())?;
+    // Read the rotated generation first (older lines) so a rotation mid-window
+    // doesn't truncate the report.
+    let (mut entries, mut scanned) = match rotated_log_path().filter(|p| p.exists()) {
+        Some(old) => parser::read_log(&old, window.cutoff())?,
+        None => (Vec::new(), 0),
+    };
+    let (current, cur_scanned) = parser::read_log(&log_path, window.cutoff())?;
+    entries.extend(current);
+    scanned += cur_scanned;
     let report = aggregator::aggregate(&entries);
 
     Ok(Telemetry {

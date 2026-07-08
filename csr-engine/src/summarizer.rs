@@ -507,24 +507,15 @@ pub async fn backfill_stories_cli(engine: &Engine, dry_run: bool) -> anyhow::Res
 
 /// Log story generation events to hook-timing.log for diagnostics.
 fn log_story_event(project: &str, conv_id: &str, event: &str) {
-    if let Some(home) = dirs::home_dir() {
-        let log_path = home.join(".claude-self-reflect").join("hook-timing.log");
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let cid_short = if conv_id.len() > 8 {
-            &conv_id[..8]
-        } else {
-            conv_id
-        };
-        let line = format!(
-            "{} CSR story [{}] conv={}: {}\n",
-            ts, project, cid_short, event
-        );
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
-    }
+    let cid_short = if conv_id.len() > 8 {
+        &conv_id[..8]
+    } else {
+        conv_id
+    };
+    crate::telemetry::append_timing_line(&format!(
+        "CSR story [{}] conv={}: {}",
+        project, cid_short, event
+    ));
 }
 
 #[cfg(test)]

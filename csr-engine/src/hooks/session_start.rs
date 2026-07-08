@@ -604,28 +604,22 @@ fn log_session_start_injection(
     story_count: usize,
     session_count: usize,
 ) {
-    if let Some(home) = dirs::home_dir() {
-        let log_path = home.join(".claude-self-reflect").join("hook-timing.log");
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let preview: String = output
-            .lines()
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" | ")
-            .chars()
-            .take(200)
-            .collect();
-        let line =
-            format!(
-            "{} CSR session-start inject [{}]: stories={} sessions={} stdout={}B preview=\"{}\"\n",
-            ts, project, story_count, session_count, output.len(), preview,
-        );
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
-    }
+    let preview: String = output
+        .lines()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" | ")
+        .chars()
+        .take(200)
+        .collect();
+    crate::telemetry::append_timing_line(&format!(
+        "CSR session-start inject [{}]: stories={} sessions={} stdout={}B preview=\"{}\"",
+        project,
+        story_count,
+        session_count,
+        output.len(),
+        preview,
+    ));
 }
 
 /// How many episodes SessionStart surfaces: the newest anchors the CONTINUUM
