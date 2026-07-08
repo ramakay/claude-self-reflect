@@ -41,8 +41,11 @@ pub const AGENT_PROMPT_SIGNATURES: [&str; 2] = [
 /// - SessionStart continuity blocks (session_start.rs)
 /// - UserPromptSubmit context blocks (injection/formatter.rs)
 /// - agent prompts (AGENT_PROMPT_SIGNATURES, included via EMISSION_HEADERS)
-const EMISSION_HEADERS: [&str; 10] = [
+const EMISSION_HEADERS: [&str; 13] = [
+    "CSR ENDLESS MEMORY ACTIVE",
     "CSR CONTINUUM [",
+    "CSR PICKUP —",
+    "EPISODE INDEX —",
     "## Session Intelligence",
     "## CSR Memory Feedback",
     "CSR Memory Feedback Probe",

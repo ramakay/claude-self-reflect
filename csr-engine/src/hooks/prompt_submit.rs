@@ -34,6 +34,16 @@ const PROMPT_TOKEN_BUDGET: usize = 500;
 /// Minimum prompt length to trigger search (avoids noise from short prompts).
 const MIN_PROMPT_LENGTH: usize = 15;
 
+/// Minimum cosine similarity between the prompt and a session's best
+/// reflection for the Route B episode-correlation pickup to fire. Calibrated
+/// live 2026-07-07: a genuine redundant re-ask of the round-5 session scored
+/// 0.46 against that session's v3 reflection — raw episode JSON scores far
+/// lower, which is why correlation matches on *any* reflection and maps its
+/// conv tag to the episode. Conservative bias: a silent miss costs one manual
+/// lookup; a pickup on every prompt trains the model to ignore the channel.
+/// Near-misses are logged to hook-timing.log for tuning.
+const EPISODE_CORRELATION_MIN: f32 = 0.45;
+
 /// Maximum age (in days) for chunk results. Chunks older than this are filtered out.
 /// Reflections are exempt — they're intentionally stored for long-term recall.
 /// Prevents 3-month-old conversations from winning on semantic similarity alone.
@@ -64,6 +74,24 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         Some(p) if !p.is_empty() => p,
         _ => return Ok(()), // No prompt → silent exit
     };
+
+    // Route A pickup: "continue"-class prompts are shorter than
+    // MIN_PROMPT_LENGTH and carry zero searchable signal — yet they are the
+    // one case where memory IS the task. No content to correlate, so recency
+    // picks the episode. Emit it imperatively, adjacent to the prompt (the
+    // position the model reliably reads), instead of silently skipping. Live
+    // failure 2026-07-07: the previous session advertised "just say continue"
+    // and this hook dropped that exact prompt.
+    if is_continuation_prompt(prompt) {
+        if let Some((ep, age)) = crate::hooks::session_start::latest_tier0_episode(engine, cwd) {
+            emit_pickup(
+                &ep,
+                &age,
+                "the user asked to continue; the episode below is the work being resumed.",
+            );
+        }
+        return Ok(());
+    }
 
     // Fast-path: skip short prompts
     if prompt.len() < MIN_PROMPT_LENGTH {
@@ -116,6 +144,52 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             _ => return Ok(()), // Can't embed → nothing to inject
         }
     };
+
+    // Route A′ pickup: state-recall prompts ("what were we working on",
+    // "where did we leave off") are continuation-intent even when long
+    // enough to embed — recency picks the episode, same as the literal
+    // "continue" route. Checked semantically against STATE_RECALL_PROBES so
+    // rephrasings route identically; falls through to Route B when the
+    // prompt is a content question about specific past work.
+    let recall_sim = state_recall_similarity(embeddings, &query_vec).await;
+    if std::env::var("CSR_DEBUG_CORRELATE").is_ok() {
+        eprintln!("CSR state-recall similarity: {:.3}", recall_sim);
+    }
+    if recall_sim >= STATE_RECALL_MIN {
+        if let Some((ep, age)) = crate::hooks::session_start::latest_tier0_episode(engine, cwd) {
+            emit_pickup(
+                &ep,
+                &age,
+                "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity).",
+            );
+            return Ok(());
+        }
+    }
+
+    // Route B pickup: episode correlation. A content prompt may be re-asking
+    // an already-solved problem or retelling past context from lossy human
+    // memory — if it semantically matches a stored episode, surface that
+    // episode with its retrieval handle, framed as prior art to verify (the
+    // episode may be stale or the resemblance coincidental — never asserted
+    // as the answer).
+    if let Some((ep, age, score)) = correlate_episode(
+        engine,
+        &query_vec,
+        &current_project,
+        input.session_id.as_deref(),
+    )
+    .await
+    {
+        emit_pickup(
+            &ep,
+            &age,
+            &format!(
+                "this prompt matches a past episode (similarity {:.2}); \
+                 the work may already exist — verify against it before re-deriving.",
+                score
+            ),
+        );
+    }
 
     // 2. Search chunks (past conversations) — scoped to current project
     // Over-fetch to compensate for project filtering (Codex M-1 fix)
@@ -186,16 +260,10 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         }
     }
 
-    // 5b. Consolidated facts (conventions, decisions) — scoped by project (Codex M-4)
-    if let Ok(facts) = storage.search_consolidated_facts(&current_project, 3) {
-        for (content, fact_type) in facts {
-            review_items.push(InjectionItem {
-                content: format!("[{}] {}", fact_type, content),
-                score: 0.85,
-                source: "consolidated_fact".into(),
-            });
-        }
-    }
+    // 5b (removed 2026-07-07): consolidated-fact lines. In practice they
+    // rendered as empty pattern labels ("[convention] Pattern: New file
+    // creation") — zero-signal lines that train the model to skim the whole
+    // injection. The facts remain queryable via MCP; they just don't auto-inject.
 
     // 5c. Code graph slice (v9.4) — capped relevant_context item within the
     // existing PROMPT_TOKEN_BUDGET (Codex #5: no separate budget). Surfaces the
@@ -302,6 +370,258 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
 
 /// Detect the most recent session's conversation_id if it ended recently.
 /// Returns `Some(conversation_id)` if within the continuity threshold.
+/// A continuation prompt: the user is asking to resume prior work, so memory
+/// IS the task. Matched tightly — a short prompt that opens with a
+/// continuation phrase — so a longer prompt that merely contains "continue"
+/// ("the tests continue to fail") is never hijacked into a pickup.
+fn is_continuation_prompt(prompt: &str) -> bool {
+    let p = prompt
+        .trim()
+        .trim_end_matches(['.', '!', '…', '?'])
+        .trim_end()
+        .to_lowercase();
+    if p.len() > 60 {
+        return false;
+    }
+    const PHRASES: [&str; 7] = [
+        "continue",
+        "resume",
+        "carry on",
+        "keep going",
+        "pick up where we left off",
+        "continue where we left off",
+        "where were we",
+    ];
+    PHRASES
+        .iter()
+        .any(|ph| p == *ph || p.starts_with(&format!("{ph} ")))
+}
+
+/// Emit the CSR PICKUP block: reason line, Tier-0 episode state, resume
+/// imperative. Shared by the continuation (Route A) and episode-correlation
+/// (Route B) paths so every pickup shape lands on identical output.
+fn emit_pickup(ep: &crate::hooks::stop::Episode, age: &str, reason: &str) {
+    println!("CSR PICKUP — {}", reason);
+    print!(
+        "{}",
+        crate::hooks::session_start::format_tier0_block(ep, &[], age)
+    );
+    println!("Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything.");
+}
+
+/// Canonical state-recall intent probes for Route A′. A prompt that embeds
+/// close to any of these is asking "what is the state of our work" — a
+/// continuation-intent question that recency must answer, not similarity.
+/// Route B structurally cannot serve it: the prior session's narrative
+/// rarely shares the question's words, so the only reflections clearing the
+/// raw gate are stale copies of the SAME question (measured 2026-07-08: the
+/// prior session's reflections never entered the top-50 while a 25-day-old
+/// prompt-echo anchored at 0.56). Probes, not keywords, so rephrasings and
+/// overexplained retellings route the same way.
+const STATE_RECALL_PROBES: &[&str] = &[
+    "what were we working on last, what should we do next",
+    "where did we leave off in the previous session, what is the current status of our work",
+    "pick up where we left off and continue the work from last time",
+];
+
+/// Minimum cosine between the prompt and the closest state-recall probe for
+/// Route A′ to fire. Calibrated live 2026-07-08 against the real model:
+/// recall phrasings scored 0.60–1.00 ("where did we leave off" 0.601,
+/// "What did we work on today, whats next?" 0.782); mixed recall+content
+/// scored 0.45 ("did we finish the sessionstart work?" — correctly Route B,
+/// it names the work); pure content questions scored ≤0.07. 0.55 splits the
+/// 0.45↔0.60 gap.
+const STATE_RECALL_MIN: f32 = 0.55;
+
+/// Plain cosine similarity; 0.0 when either vector has zero norm.
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
+/// Max cosine between the prompt vector and the state-recall probes.
+async fn state_recall_similarity(
+    embeddings: &std::sync::Arc<crate::embeddings::EmbeddingEngine>,
+    query_vec: &[f32],
+) -> f32 {
+    let emb = embeddings.clone();
+    let probe_vecs = tokio::task::spawn_blocking(move || {
+        STATE_RECALL_PROBES
+            .iter()
+            .filter_map(|p| emb.embed_single(p).ok())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    probe_vecs
+        .iter()
+        .map(|p| cosine_sim(query_vec, p))
+        .fold(0.0, f32::max)
+}
+
+/// Search floor for episode correlation — well below the firing threshold so
+/// near-misses are visible in hook-timing.log for threshold tuning.
+const EPISODE_CORRELATION_FLOOR: f32 = 0.30;
+
+/// Half-life (days) for recency weighting in episode correlation ranking.
+/// Meta-prompts ("what were we working on") embed closest to past copies of
+/// the same question, so raw cosine alone anchors stale state — measured
+/// 2026-07-08: a 3-week-old prompt-echo reflection (0.56) outranked the
+/// 2-hour-old prior session (0.46). Ordering uses raw × 0.5^(age/half_life);
+/// eligibility still gates on the RAW score so old work stays resumable.
+const EPISODE_RECENCY_HALF_LIFE_DAYS: f32 = 7.0;
+
+/// Recency-weighted ranking score. Raw score decides *whether* a candidate
+/// may anchor (EPISODE_CORRELATION_MIN); this decides *which* one wins.
+fn effective_episode_score(raw: f32, age_days: f32) -> f32 {
+    raw * 0.5_f32.powf(age_days.max(0.0) / EPISODE_RECENCY_HALF_LIFE_DAYS)
+}
+
+/// Pick the winning candidate from (raw_score, age_days) pairs: highest
+/// effective (recency-weighted) score among those whose raw score clears
+/// EPISODE_CORRELATION_MIN. Returns the index into `candidates`.
+fn pick_episode(candidates: &[(f32, f32)]) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, (raw, _))| *raw >= EPISODE_CORRELATION_MIN)
+        .max_by(|(_, a), (_, b)| {
+            effective_episode_score(a.0, a.1).total_cmp(&effective_episode_score(b.0, b.1))
+        })
+        .map(|(i, _)| i)
+}
+
+/// Best stored episode whose *session* semantically matches the prompt.
+///
+/// Raw episode JSON embeds poorly (measured 2026-07-07: a genuine re-ask
+/// scored 0.46 against the session's v3 reflection but the episode blob never
+/// entered the top 20). So correlation matches on ANY reflection above the
+/// threshold, then follows its `conv_<id>` tag to that session's episode.
+/// Episode eligibility mirrors the Tier-0 anchor (project-scoped, carries
+/// state); the current session's own episode is skipped — resurfacing the
+/// session to itself is noise, not memory. The best sub-threshold candidate
+/// is logged as a near-miss, not returned.
+async fn correlate_episode(
+    engine: &Engine,
+    query_vec: &[f32],
+    project: &str,
+    current_session: Option<&str>,
+) -> Option<(crate::hooks::stop::Episode, String, f32)> {
+    let results = {
+        let idx = engine.search().read().await;
+        idx.search_reflections(query_vec, 50, EPISODE_CORRELATION_FLOOR)
+    };
+    let project_tag = format!("project_{}", project);
+    let now = chrono::Utc::now();
+    let mut seen_convs: HashSet<String> = HashSet::new();
+    // Collect every eligible candidate, then rank recency-weighted — raw
+    // score order alone anchored a 3-week-old prompt-echo over the session
+    // that ended two hours earlier (see EPISODE_RECENCY_HALF_LIFE_DAYS).
+    let mut eligible: Vec<(f32, f32, crate::hooks::stop::Episode, String)> = Vec::new();
+    let debug = std::env::var("CSR_DEBUG_CORRELATE").is_ok();
+    for r in &results {
+        let Ok(Some((_, tags, _))) = engine.storage().get_reflection_by_id(&r.id) else {
+            continue;
+        };
+        if debug {
+            eprintln!(
+                "CSR correlate raw hit: score={:.3} id={} tags={:?}",
+                r.score, r.id, tags
+            );
+        }
+        // Project scope: reflections tagged for another project never correlate;
+        // legacy reflections without project tags pass (same rule as listing).
+        if !project.is_empty()
+            && tags.iter().any(|t| t.starts_with("project_"))
+            && !tags.contains(&project_tag)
+        {
+            continue;
+        }
+        let Some(conv_id) = tags.iter().find_map(|t| t.strip_prefix("conv_")) else {
+            continue;
+        };
+        if Some(conv_id) == current_session || !seen_convs.insert(conv_id.to_string()) {
+            continue;
+        }
+        let Some((ep, ts)) = episode_for_conversation(engine, conv_id) else {
+            continue;
+        };
+        if !crate::hooks::session_start::episode_carries_state(&ep) {
+            continue;
+        }
+        // Unparseable timestamps rank as infinitely old (effective score 0)
+        // but stay raw-gate eligible, so they can still win when alone.
+        let age_days = crate::temporal::parse_timestamp(&ts)
+            .map(|t| ((now - t).num_minutes() as f32 / 1440.0).max(0.0))
+            .unwrap_or(f32::INFINITY);
+        let age = crate::hooks::session_start::relative_time_label(&ts, &now);
+        if std::env::var("CSR_DEBUG_CORRELATE").is_ok() {
+            eprintln!(
+                "CSR correlate candidate: raw={:.3} age_days={:.2} conv={}",
+                r.score, age_days, ep.session_id
+            );
+        }
+        eligible.push((r.score, age_days, ep, age));
+    }
+    let scores: Vec<(f32, f32)> = eligible.iter().map(|e| (e.0, e.1)).collect();
+    match pick_episode(&scores) {
+        Some(i) => {
+            let (raw, _, ep, age) = eligible.swap_remove(i);
+            Some((ep, age, raw))
+        }
+        None => {
+            // `results` arrive score-desc, so the first eligible is the best raw.
+            if let Some((raw, _, ep, _)) = eligible.first() {
+                log_episode_near_miss(*raw, &ep.session_id);
+            }
+            None
+        }
+    }
+}
+
+/// Load the stored episode for a conversation via its `conv_<id>` tag.
+/// Returns the episode plus its reflection timestamp.
+fn episode_for_conversation(
+    engine: &Engine,
+    conv_id: &str,
+) -> Option<(crate::hooks::stop::Episode, String)> {
+    let conv_tag = format!("conv_{}", conv_id);
+    let rows = engine
+        .storage()
+        .get_reflections_by_tag(&conv_tag, 10)
+        .ok()?;
+    rows.into_iter()
+        .filter(|(_, _, tags, _)| tags.iter().any(|t| t == "session_episode"))
+        .find_map(|(_, content, _, ts)| {
+            serde_json::from_str::<crate::hooks::stop::Episode>(&content)
+                .ok()
+                .map(|ep| (ep, ts))
+        })
+}
+
+/// Log the best sub-threshold episode candidate for threshold tuning.
+fn log_episode_near_miss(score: f32, session_id: &str) {
+    if let Some(home) = dirs::home_dir() {
+        let log_path = home.join(".claude-self-reflect").join("hook-timing.log");
+        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let line = format!(
+            "{} CSR prompt-submit episode near-miss: score={:.3} (min={}) conv={}\n",
+            ts, score, EPISODE_CORRELATION_MIN, session_id
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    }
+}
+
 fn detect_continued_session_id(engine: &Engine, cwd: &Path) -> Option<String> {
     let project = resolve_project_from_cwd(&cwd.to_string_lossy())?;
     let session = engine.storage().get_most_recent_session(&project).ok()??;
@@ -400,6 +720,12 @@ async fn search_reflections_with_vec(
                 if has_project_tags && !tags.contains(&project_tag) {
                     continue;
                 }
+            }
+
+            // Episode reflections are structured JSON surfaced via the Tier-0
+            // CONTINUUM / pickup paths — never dump the raw blob as a context line.
+            if tags.iter().any(|t| t == "session_episode") {
+                continue;
             }
 
             let source = if tags
@@ -697,6 +1023,58 @@ pub fn symbol_overlap(
 mod tests {
     use super::*;
 
+    // --- state-recall routing (Route A′) ---
+
+    #[test]
+    fn cosine_sim_identical_is_one() {
+        let v = vec![0.6, 0.8, 0.0];
+        assert!((cosine_sim(&v, &v) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_sim_orthogonal_is_zero() {
+        assert!(cosine_sim(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_sim_zero_vector_is_zero() {
+        assert_eq!(cosine_sim(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+    }
+
+    // --- episode recency ranking (Route B stale-anchor fix) ---
+
+    #[test]
+    fn fresh_episode_outranks_stale_higher_score() {
+        // Live failure 2026-07-08: a 3-week-old prompt-echo reflection (0.56)
+        // beat the 2-hour-old prior session (0.46), so PICKUP anchored stale
+        // state. Candidates are (raw_score, age_days).
+        let cands = vec![(0.56, 21.0), (0.46, 0.1)];
+        assert_eq!(pick_episode(&cands), Some(1));
+    }
+
+    #[test]
+    fn stale_episode_still_reachable_when_only_match() {
+        // Old work must stay resumable — recency weights the ordering, it
+        // does not gate eligibility.
+        assert_eq!(pick_episode(&[(0.56, 21.0)]), Some(0));
+    }
+
+    #[test]
+    fn below_min_similarity_never_anchors() {
+        assert_eq!(pick_episode(&[(0.44, 0.1)]), None);
+        assert_eq!(pick_episode(&[]), None);
+    }
+
+    #[test]
+    fn zero_age_effective_score_is_raw() {
+        assert!((effective_episode_score(0.5, 0.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn equal_age_preserves_score_order() {
+        assert_eq!(pick_episode(&[(0.46, 1.0), (0.56, 1.0)]), Some(1));
+    }
+
     #[test]
     fn symbol_overlap_detects_anchored_names() {
         let anchors = vec![
@@ -807,5 +1185,26 @@ mod tests {
         assert!(!is_self_referential_noise(
             "This proves the approach works for authentication"
         ));
+    }
+
+    // --- is_continuation_prompt boundaries (Route A classifier) ---
+    // Route A only handles no-signal prompts recency-style; content prompts
+    // are covered by Route B semantic correlation, so these asserts test the
+    // boundary (hijack prevention), not the phrase list.
+
+    #[test]
+    fn continuation_prompt_boundaries() {
+        // Bare and lightly decorated forms fire.
+        assert!(is_continuation_prompt("continue"));
+        assert!(is_continuation_prompt("  Resume.  "));
+        assert!(is_continuation_prompt("continue with the rerank work"));
+        // Contains the verb but doesn't open with it — never hijacked.
+        assert!(!is_continuation_prompt("the tests continue to fail on CI"));
+        // Opens with the verb but is a long, self-scoped instruction (>60 chars).
+        assert!(!is_continuation_prompt(
+            "continue refactoring the session_start module and then rewrite the anchor verification logic"
+        ));
+        assert!(!is_continuation_prompt("fix the auth bug"));
+        assert!(!is_continuation_prompt("/continue"));
     }
 }

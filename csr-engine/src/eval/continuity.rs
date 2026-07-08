@@ -402,6 +402,8 @@ pub async fn run_continuity(embeddings: &Arc<EmbeddingEngine>) -> EvalReport {
             provenance: storage.get_chunk_provenance(&r.id).ok().flatten(),
             id: r.id,
             cosine: r.score,
+            // Fixture corpus has no timeline — primacy stays inert here.
+            timestamp: None,
         })
         .collect();
 
@@ -437,7 +439,10 @@ pub async fn run_continuity_live(
 ) -> String {
     const QUERY: &str = "the IIM / continuity vision — epistemic continuity, infinite session without infinite tokens";
     const TARGET_CONV: &str = "0bab445f";
-    const TOP_N: usize = 20;
+    // 50, not 20: every session that discusses this eval adds fresher echo
+    // chunks; a small pool lets them squeeze the founding chunk out of the
+    // candidate set entirely, which no rerank can recover from.
+    const TOP_N: usize = 50;
 
     let query_vec = match embeddings.embed_single(QUERY) {
         Ok(v) => v,
@@ -454,9 +459,9 @@ pub async fn run_continuity_live(
             .get_chunks_by_ids(std::slice::from_ref(&r.id))
             .ok()
             .and_then(|v| v.into_iter().next());
-        let (content, conv) = match chunk {
-            Some(c) => (c.content, c.conversation_id),
-            None => (String::new(), String::new()),
+        let (content, conv, timestamp) = match chunk {
+            Some(c) => (c.content, c.conversation_id, Some(c.timestamp)),
+            None => (String::new(), String::new(), None),
         };
         conv_of.insert(r.id.clone(), conv);
         candidates.push(RankCandidate {
@@ -464,6 +469,7 @@ pub async fn run_continuity_live(
             provenance: storage.get_chunk_provenance(&r.id).ok().flatten(),
             id: r.id.clone(),
             cosine: r.score,
+            timestamp,
         });
     }
 
@@ -491,20 +497,36 @@ pub async fn run_continuity_live(
         with_prov
     ));
     out.push_str("Top results after v9.3 rerank (conv — adj_score):\n");
-    for (i, c) in ranked.iter().take(8).enumerate() {
+    let describe = |i: usize, c: &crate::search::rerank::RankCandidate| {
         let conv = conv_of.get(&c.id).cloned().unwrap_or_default();
-        let conv_short = conv.split('-').next().unwrap_or(&conv);
+        let conv_short = conv.split('-').next().unwrap_or(&conv).to_string();
         let prov = match &c.provenance {
             Some(p) => format!("author={:?}", p.author),
             None => "no-prov".to_string(),
         };
-        out.push_str(&format!(
-            "  {}. {:<10} cosine={:.3} {}\n",
+        let scaffold = if crate::search::rerank::is_scaffold_text(&c.content) {
+            " scaffold"
+        } else {
+            ""
+        };
+        format!(
+            "  {}. {:<10} cosine={:.3} {}{}\n",
             i + 1,
             conv_short,
             c.cosine,
-            prov
-        ));
+            prov,
+            scaffold
+        )
+    };
+    for (i, c) in ranked.iter().take(12).enumerate() {
+        out.push_str(&describe(i, c));
+    }
+    // Always show where the founding chunk landed, even outside the top list.
+    if let Some(pos) = target_rank {
+        if pos > 12 {
+            out.push_str("  ...\n");
+            out.push_str(&describe(pos - 1, &ranked[pos - 1]));
+        }
     }
     out.push('\n');
     match target_rank {

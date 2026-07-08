@@ -14,6 +14,93 @@ use crate::search::SearchEngine;
 use crate::storage::Storage;
 use crate::temporal;
 
+/// Extract a conversation UUID from a query that is (or contains) a
+/// `conv_<uuid>` retrieval handle, or that is a bare UUID. Injection blocks
+/// hand out `csr_reflect_on_past("conv_<id>")` handles — those must resolve
+/// by exact tag, never by embedding (a UUID embeds as noise and returns
+/// unrelated cross-project hits; measured live 2026-07-08).
+fn extract_conv_id(query: &str) -> Option<&str> {
+    if let Some(pos) = query.find("conv_") {
+        if let Some(candidate) = query.get(pos + 5..pos + 5 + 36) {
+            if is_uuid(candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    let trimmed = query.trim();
+    if is_uuid(trimmed) {
+        return Some(trimmed);
+    }
+    None
+}
+
+/// Strict 8-4-4-4-12 hex UUID shape check.
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+/// Exact-tag lookup for a `conv_<uuid>` retrieval handle: every reflection
+/// tagged to that conversation (episode, learnings, narratives), newest
+/// first, score pinned to 1.0 — an exact handle is not a similarity guess.
+/// Returns None when the tag matches nothing so the caller can fall through
+/// to semantic search.
+fn lookup_by_conv_tag(
+    storage: &Arc<Storage>,
+    conv_id: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Option<String>> {
+    let start = Instant::now();
+    let rows = storage.get_reflections_by_tag(&format!("conv_{}", conv_id), limit)?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let enriched: Vec<EnrichedResult> = rows
+        .into_iter()
+        .map(|(id, content, tags, timestamp)| {
+            let project_name = tags
+                .iter()
+                .find(|t| t.starts_with("project_"))
+                .map(|t| t.trim_start_matches("project_").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let tag_prefix = if tags.iter().any(|t| t == "session_episode") {
+                "[episode] "
+            } else if tags.iter().any(|t| t == "session_story") {
+                "[story] "
+            } else if tags.iter().any(|t| t.starts_with("narrative_v3")) {
+                "[narrative] "
+            } else {
+                "[reflection] "
+            };
+            EnrichedResult {
+                score: 1.0,
+                chunk: crate::import::ConversationChunk {
+                    id,
+                    conversation_id: conv_id.to_string(),
+                    project_name,
+                    timestamp,
+                    content: format!("{}{}", tag_prefix, content),
+                    message_count: 0,
+                    summary: None,
+                    author: crate::provenance::Speaker::ToolResult,
+                },
+            }
+        })
+        .collect();
+    let search_ms = start.elapsed().as_millis() as u64;
+    Ok(Some(format::format_search_results(
+        &enriched,
+        query,
+        "conv-tag exact",
+        search_ms,
+        0,
+    )))
+}
+
 /// Full semantic search with rich XML results.
 pub async fn reflect_on_past(
     storage: &Arc<Storage>,
@@ -24,6 +111,15 @@ pub async fn reflect_on_past(
     min_score: f32,
     project: Option<&str>,
 ) -> Result<String> {
+    // Retrieval-handle fast path: `conv_<uuid>` (or a bare UUID) resolves by
+    // exact tag. Falls through to semantic search only when the tag matches
+    // nothing, so a stale handle still gets a best-effort answer.
+    if let Some(conv_id) = extract_conv_id(query) {
+        if let Some(result) = lookup_by_conv_tag(storage, conv_id, query, limit.max(5))? {
+            return Ok(result);
+        }
+    }
+
     let (effective_project, scope_label) = cross_project::normalize_project_scope(project);
 
     let embed_start = Instant::now();
@@ -202,6 +298,7 @@ pub async fn reflect_on_past(
             cosine: e.score,
             content: e.chunk.content.clone(),
             provenance: storage.get_chunk_provenance(&e.chunk.id).ok().flatten(),
+            timestamp: Some(e.chunk.timestamp.clone()),
         })
         .collect();
     let order: Vec<String> = crate::search::rerank::rerank(candidates)
@@ -667,4 +764,45 @@ fn enrich_results(
                 })
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- exact conv-tag lookup (episode-index handle fix) ---
+    // Live failure 2026-07-08: csr_reflect_on_past("conv_0b68eace-…") went
+    // through semantic embedding and returned unrelated cross-project noise.
+    // A conv handle must resolve by tag, never by embedding.
+
+    #[test]
+    fn conv_handle_extracts_uuid() {
+        assert_eq!(
+            extract_conv_id("conv_0b68eace-3e21-4841-9567-58d038cd89d7"),
+            Some("0b68eace-3e21-4841-9567-58d038cd89d7")
+        );
+    }
+
+    #[test]
+    fn bare_uuid_extracts() {
+        assert_eq!(
+            extract_conv_id("0b68eace-3e21-4841-9567-58d038cd89d7"),
+            Some("0b68eace-3e21-4841-9567-58d038cd89d7")
+        );
+    }
+
+    #[test]
+    fn conv_handle_inside_sentence_extracts() {
+        assert_eq!(
+            extract_conv_id("full state: conv_0b68eace-3e21-4841-9567-58d038cd89d7 please"),
+            Some("0b68eace-3e21-4841-9567-58d038cd89d7")
+        );
+    }
+
+    #[test]
+    fn plain_text_does_not_extract() {
+        assert_eq!(extract_conv_id("that docker issue we fixed"), None);
+        assert_eq!(extract_conv_id("convention for naming conversations"), None);
+        assert_eq!(extract_conv_id("conv_not-a-real-uuid"), None);
+    }
 }
