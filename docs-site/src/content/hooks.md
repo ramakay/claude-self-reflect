@@ -14,20 +14,33 @@ This is what separates CSR from passive memory tools. **Context finds you.**
 
 ## SessionStart — Past Context Injection
 
-Fires when you start a conversation. Searches your entire history, surfaces relevant past work, checks for anti-patterns from incomplete sessions.
+Fires when you start a conversation. Injects three things:
+
+- **CONTINUUM** — last session's state: what was asked, where it ended (LAST), what's next (NEXT), and how many code anchors are still intact
+- **EPISODE INDEX** — recent sessions as a pickup menu, newest first, each with its outcome and a one-call lookup
+- **Anti-patterns** from incomplete past sessions
 
 What Claude sees:
 ```
-[4d ago] We need to release this next version... (102 msgs)
-[1w ago] Please see sessions-handoff.md... (34 msgs)
-[2w ago] what did we discuss last session (111 msgs)
-
-For deeper context, use csr_reflect_on_past("topic").
+CSR CONTINUUM [2h ago]: fix the import chunking bug
+LAST: Fix verified — coverage went from ~1% to full transcripts (outcome=success)
+EPISODE INDEX — earlier threads, newest first:
+- [1d ago] release prep v9.2 — gated on go (outcome=partial) → csr_reflect_on_past("conv_...")
+- [3d ago] hook injection audit (outcome=success) → csr_reflect_on_past("conv_...")
 ```
 
 ## UserPromptSubmit — Predictive Injection
 
-Fires every prompt. Multi-signal scoring:
+Fires every prompt. Routes first, then scores.
+
+**Intent routing (v9.2)** — a semantic classifier (exemplar embeddings over the same local MiniLM model, no extra model shipped) detects two intents:
+
+| Route | Intent | Threshold | Action |
+|-------|--------|-----------|--------|
+| A | Continue / StateRecall ("pick up where we left off", "what were we doing?") | 0.60 / 0.55 | Inject the matching episode's state directly |
+| B | Topic correlation | recency-weighted, 7-day half-life | Match prompt to a past episode; surface it as a pickup pointer |
+
+Everything else falls through to multi-signal scoring:
 
 | Signal | Weight |
 |--------|--------|

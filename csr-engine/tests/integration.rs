@@ -60,6 +60,7 @@ fn test_storage_insert_and_retrieve() {
         content: "Docker memory issue discussion".into(),
         message_count: 4,
         summary: None,
+        author: csr_engine::provenance::Speaker::ToolResult,
     };
 
     // Fake 384-dim embedding
@@ -92,6 +93,7 @@ fn test_project_filtering() {
                 content: format!("Content from {} chunk {}", project, j),
                 message_count: 2,
                 summary: None,
+                author: csr_engine::provenance::Speaker::ToolResult,
             };
             storage.insert_chunk(&chunk, &fake_emb).unwrap();
         }
@@ -130,6 +132,7 @@ fn test_time_range_filtering() {
             content: format!("Content at {}", ts),
             message_count: 1,
             summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
         };
         storage.insert_chunk(&chunk, &fake_emb).unwrap();
     }
@@ -162,6 +165,7 @@ fn test_fts5_search() {
             content: "We modified docker-compose.yaml to fix the memory limit".into(),
             message_count: 2,
             summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
         },
         ConversationChunk {
             id: "fts-2".into(),
@@ -171,6 +175,7 @@ fn test_fts5_search() {
             content: "Authentication was added using JWT tokens in auth.rs".into(),
             message_count: 2,
             summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
         },
     ];
 
@@ -367,6 +372,7 @@ fn test_format_search_results_structure() {
             content: "Docker memory fix applied".into(),
             message_count: 4,
             summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
         },
     }];
 
@@ -395,6 +401,7 @@ fn test_format_quick_check_structure() {
             content: "JWT authentication setup".into(),
             message_count: 2,
             summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
         },
     }];
 
@@ -427,6 +434,7 @@ fn test_xml_escaping_in_output() {
             content: "Content with <script>alert('xss')</script> & \"quotes\"".into(),
             message_count: 1,
             summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
         },
     }];
 
@@ -524,6 +532,7 @@ fn test_recent_chunks() {
             content: format!("Content {}", i),
             message_count: 1,
             summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
         };
         storage.insert_chunk(&chunk, &fake_emb).unwrap();
     }
@@ -548,6 +557,7 @@ fn test_timeline_grouping() {
             content: "morning".into(),
             message_count: 1,
             summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
         },
         ConversationChunk {
             id: "tl-2".into(),
@@ -557,6 +567,7 @@ fn test_timeline_grouping() {
             content: "afternoon".into(),
             message_count: 1,
             summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
         },
         ConversationChunk {
             id: "tl-3".into(),
@@ -566,6 +577,7 @@ fn test_timeline_grouping() {
             content: "next day".into(),
             message_count: 1,
             summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
         },
     ];
 
@@ -601,6 +613,7 @@ fn test_full_pipeline_storage_search_format() {
             content: content.to_string(),
             message_count: 2,
             summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
         };
 
         let mut embedding = vec![0.0f32; 384];
@@ -654,6 +667,7 @@ fn test_vector_storage_roundtrip() {
         content: "test content".into(),
         message_count: 1,
         summary: None,
+        author: csr_engine::provenance::Speaker::ToolResult,
     };
 
     // Create a specific vector
@@ -728,6 +742,54 @@ fn test_enrichment_failure_tracking() {
     assert!(!storage
         .is_conversation_enriched("conv-1", "ai_narrative")
         .unwrap());
+}
+
+#[test]
+fn test_unavailable_enrichment_not_requeued() {
+    // Regression: missing source JSONL must stop re-queuing every daemon tick.
+    let storage = Storage::open_memory().unwrap();
+    let fake_emb: Vec<f32> = vec![0.0; 384];
+
+    // Two conversations, each with a chunk + import_state row so they qualify for the queue.
+    for conv in ["conv-missing", "conv-failed"] {
+        let chunk = ConversationChunk {
+            id: format!("{conv}-chunk"),
+            conversation_id: conv.into(),
+            project_name: "test".into(),
+            timestamp: "2026-01-15T10:00:00Z".into(),
+            content: "content".into(),
+            message_count: 1,
+            summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
+        };
+        storage.insert_chunk(&chunk, &fake_emb).unwrap();
+        // mark_file_imported derives conversation_id from the file stem.
+        storage
+            .mark_file_imported(std::path::Path::new(&format!("/tmp/{conv}.jsonl")), 1)
+            .unwrap();
+    }
+
+    // Missing source → unavailable (permanent); transient → failed (retryable).
+    storage
+        .mark_enrichment_unavailable("conv-missing", "extracted_v3", "source file missing")
+        .unwrap();
+    storage
+        .mark_enrichment_failed("conv-failed", "extracted_v3", "transient io error")
+        .unwrap();
+
+    let queued = storage
+        .get_unenriched_conversations("extracted_v3", 10)
+        .unwrap();
+    let ids: Vec<&str> = queued.iter().map(|(id, _)| id.as_str()).collect();
+
+    assert!(
+        !ids.contains(&"conv-missing"),
+        "unavailable conversation must NOT be re-queued"
+    );
+    assert!(
+        ids.contains(&"conv-failed"),
+        "failed conversation should still be retried"
+    );
 }
 
 #[test]
@@ -831,6 +893,7 @@ fn test_completions_project_name_prefix() {
         content: "test content".to_string(),
         message_count: 5,
         summary: None,
+        author: csr_engine::provenance::Speaker::ToolResult,
     };
     let chunk2 = ConversationChunk {
         id: "chunk-comp-2".to_string(),
@@ -840,6 +903,7 @@ fn test_completions_project_name_prefix() {
         content: "other content".to_string(),
         message_count: 3,
         summary: None,
+        author: csr_engine::provenance::Speaker::ToolResult,
     };
     let chunk3 = ConversationChunk {
         id: "chunk-comp-3".to_string(),
@@ -849,6 +913,7 @@ fn test_completions_project_name_prefix() {
         content: "unrelated".to_string(),
         message_count: 2,
         summary: None,
+        author: csr_engine::provenance::Speaker::ToolResult,
     };
 
     let embedding = vec![0.1f32; 384];
@@ -1008,11 +1073,19 @@ fn test_hnsw_stale_index_detection() {
     }
     engine.dump_to_disk(&index_dir, 10, 0).unwrap();
 
-    // Try to load with expected_count=15 — should detect staleness
+    // DB grew since the dump (additive drift) — cache loads so Engine::new can
+    // incrementally backfill the new rows instead of doing a full rebuild.
     let result = SearchEngine::load_from_disk(&index_dir, 15, 0);
-    assert!(result.is_none(), "should reject stale cache");
+    assert!(
+        result.is_some(),
+        "additive drift should load the cache (backfill), not rebuild"
+    );
 
-    // Correct count should work
+    // DB shrank (rows deleted) — must reject so the rebuild drops orphan vectors.
+    let result = SearchEngine::load_from_disk(&index_dir, 5, 0);
+    assert!(result.is_none(), "deletion should reject the stale cache");
+
+    // Exact match should work
     let result = SearchEngine::load_from_disk(&index_dir, 10, 0);
     assert!(result.is_some(), "should accept matching cache");
 }
@@ -1335,6 +1408,7 @@ fn test_get_chunk_content() {
         content: "This is the chunk content for testing retrieval".into(),
         message_count: 5,
         summary: Some("Test summary".into()),
+        author: csr_engine::provenance::Speaker::ToolResult,
     };
     storage.insert_chunk(&chunk, &fake_emb).unwrap();
 
@@ -1359,6 +1433,7 @@ fn test_tad_batch_retrieval_events() {
         content: "test content".into(),
         message_count: 1,
         summary: None,
+        author: csr_engine::provenance::Speaker::ToolResult,
     };
     storage.insert_chunk(&chunk, &[0.1; 384]).unwrap();
     storage
@@ -1379,4 +1454,163 @@ fn test_tad_batch_retrieval_events() {
         chunk_events[0].session_outcome,
         csr_engine::search::decay::SessionOutcome::Success
     );
+}
+
+#[test]
+fn episode_v2_full_cycle_with_anchors() {
+    // Arrange: temp project with one Rust source file
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("auth.rs");
+    std::fs::write(&src, "fn validate_token(t: &str) -> bool { t.len() > 8 }\n").unwrap();
+
+    // Transcript that modified that file via Edit + left a todo
+    let transcript = [
+        r#"{"type":"user","message":{"content":"fix token validation"}}"#.to_string(),
+        format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Edit","input":{{"file_path":"{}"}}}}]}}}}"#,
+            src.display()
+        ),
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"add test","status":"pending"}]}}]}}"#.to_string(),
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done, fixed."}]}}"#.to_string(),
+    ];
+    let lines: Vec<&str> = transcript.iter().map(|s| s.as_str()).collect();
+
+    // Act: extract
+    let ep = csr_engine::hooks::stop::extract_episode(&lines, "it-sess", "it-proj");
+
+    // Assert v2 fields
+    assert_eq!(ep.schema, "v2");
+    assert_eq!(ep.todos.len(), 1);
+    assert_eq!(ep.files_modified.len(), 1);
+
+    // Anchor capture + graded verification
+    let anchors = csr_engine::extraction::anchors::capture_file_anchors(&src);
+    assert_eq!(anchors.len(), 1);
+    assert_eq!(anchors[0].name, "validate_token");
+    assert_eq!(
+        csr_engine::extraction::anchors::verify_anchor(&anchors[0], dir.path()),
+        csr_engine::extraction::anchors::AnchorVerdict::Intact
+    );
+    std::fs::write(
+        &src,
+        "fn validate_token(t: &str) -> bool { t.len() > 99 }\n",
+    )
+    .unwrap();
+    assert_eq!(
+        csr_engine::extraction::anchors::verify_anchor(&anchors[0], dir.path()),
+        csr_engine::extraction::anchors::AnchorVerdict::Modified
+    );
+}
+
+// ─── v9.4 code property graph: LIVE round-trip (gate) ───
+
+mod codegraph_roundtrip {
+    use csr_engine::extraction::codegraph as cg;
+    use csr_engine::storage::Storage;
+
+    const PROJECT: &str = "proj";
+    const REPO: &str = "proj";
+    const FILE: &str = "src/demo.rs";
+
+    /// Mirror the post_tool_use liveness path: extract → upsert → replace edges →
+    /// resolve → rank. Also record a code_evolution row so the ledger timeline
+    /// reflects the edit (as the real hook does).
+    fn simulate_edit(storage: &Storage, source: &str, conv_id: &str, session_id: &str) {
+        let frag =
+            cg::extract_graph_fragment_for_file(source, FILE, REPO, PROJECT, conv_id, session_id);
+        for node in &frag.nodes {
+            storage.upsert_code_node(node).unwrap();
+        }
+        storage
+            .replace_code_file_edges(PROJECT, FILE, &frag.edges)
+            .unwrap();
+        storage
+            .insert_code_evolution(
+                session_id,
+                PROJECT,
+                FILE,
+                "rust",
+                "Edit",
+                "[\"foo\"]",
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+            )
+            .unwrap();
+        storage.resolve_code_edges(PROJECT).unwrap();
+        storage.compute_code_rank(PROJECT).unwrap();
+    }
+
+    #[test]
+    fn live_roundtrip_holds_history_across_edits() {
+        let storage = Storage::open_memory().unwrap();
+
+        // (b) First edit: foo calls bar; both defined in the file.
+        let v1 = "fn foo() {\n    bar();\n}\nfn bar() {}\n";
+        simulate_edit(&storage, v1, "conv_1", "sess_1");
+
+        // (d) foo and bar appear as nodes.
+        let foo_id = cg::node_id(REPO, FILE, "function", "foo");
+        let bar_id = cg::node_id(REPO, FILE, "function", "bar");
+        let ledger = storage.code_file_ledger(PROJECT, FILE).unwrap();
+        let names: Vec<&str> = ledger.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"foo"), "foo node present: {names:?}");
+        assert!(names.contains(&"bar"), "bar node present: {names:?}");
+
+        // calls edge foo -> bar exists (resolved).
+        let callees = storage.code_query_callees(&foo_id, 10).unwrap();
+        assert!(
+            callees.iter().any(|c| c.id == bar_id),
+            "calls edge foo -> bar must exist: {:?}",
+            callees.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        let callers = storage.code_query_callers("bar", PROJECT, 10).unwrap();
+        assert!(
+            callers.iter().any(|c| c.name == "foo"),
+            "bar's callers must include foo"
+        );
+
+        // file_ledger holds the conv_1 provenance.
+        let foo_sym = ledger.symbols.iter().find(|s| s.name == "foo").unwrap();
+        assert_eq!(foo_sym.first_conv_id, "conv_1", "history held: first conv");
+        assert_eq!(foo_sym.last_conv_id, "conv_1");
+        let h1 = foo_sym.body_hash.clone();
+
+        // (e) Second edit changes foo's BODY (still calls bar) under conv_2.
+        let v2 = "fn foo() {\n    let x = 42;\n    bar();\n}\nfn bar() {}\n";
+        simulate_edit(&storage, v2, "conv_2", "sess_2");
+
+        let ledger2 = storage.code_file_ledger(PROJECT, FILE).unwrap();
+        let foo2 = ledger2.symbols.iter().find(|s| s.name == "foo").unwrap();
+
+        // New state: body hash changed, last conv advanced to conv_2.
+        assert_ne!(foo2.body_hash, h1, "new body recorded");
+        assert_eq!(foo2.last_conv_id, "conv_2", "new state: last conv");
+        // Prior conv still in history: first_conv_id immutable across edits.
+        assert_eq!(
+            foo2.first_conv_id, "conv_1",
+            "immutable history holds across edits"
+        );
+        // Timeline shows BOTH edits.
+        assert_eq!(ledger2.timeline.len(), 2, "both edits in timeline");
+
+        // The graph still resolves foo -> bar after the second edit (liveness).
+        let callees2 = storage.code_query_callees(&foo_id, 10).unwrap();
+        assert!(
+            callees2.iter().any(|c| c.id == bar_id),
+            "foo -> bar still live"
+        );
+
+        // Print the load-bearing assertions proving history is held.
+        println!(
+            "ROUNDTRIP PROOF: foo first_conv={} last_conv={} body_changed={} timeline_entries={} foo->bar_resolved={}",
+            foo2.first_conv_id,
+            foo2.last_conv_id,
+            foo2.body_hash != h1,
+            ledger2.timeline.len(),
+            callees2.iter().any(|c| c.id == bar_id),
+        );
+    }
 }

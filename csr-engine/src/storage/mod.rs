@@ -1,3 +1,4 @@
+pub mod codegraph;
 pub mod migrations;
 pub mod queries;
 
@@ -19,8 +20,10 @@ impl Storage {
     /// Open (or create) the database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // foreign_keys=ON is explicit, not build-flag-dependent (Codex MEDIUM):
+        // makes the declared chunk_provenance FK enforced deterministically.
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
         )?;
         migrations::run(&conn)?;
         Ok(Self {
@@ -31,6 +34,7 @@ impl Storage {
     /// Open an in-memory database (for tests).
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         migrations::run(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -49,6 +53,47 @@ impl Storage {
         queries::load_all_chunk_vectors(&conn)
     }
 
+    /// Upsert provenance (author, source conv, supersession) for a chunk.
+    pub fn insert_chunk_provenance(
+        &self,
+        chunk_id: &str,
+        prov: &crate::provenance::ChunkProvenance,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::insert_chunk_provenance(&conn, chunk_id, prov)
+    }
+
+    /// Fetch provenance for a chunk, if recorded.
+    pub fn get_chunk_provenance(
+        &self,
+        chunk_id: &str,
+    ) -> Result<Option<crate::provenance::ChunkProvenance>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_provenance(&conn, chunk_id)
+    }
+
+    /// Upsert a derivation-ledger entry (Pillar 1).
+    pub fn upsert_ledger_entry(&self, entry: &crate::ledger::LedgerEntry) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::upsert_ledger_entry(&conn, entry)
+    }
+
+    /// Fetch ledger entries for an exact {repo, branch, user} scope.
+    pub fn get_ledger_entries(
+        &self,
+        scope: &crate::ledger::Scope,
+        limit: usize,
+    ) -> Result<Vec<crate::ledger::LedgerEntry>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_ledger_entries(&conn, scope, limit as i64)
+    }
+
+    /// Increment a ledger entry's reuse counter (governor signal, Pillar 4).
+    pub fn increment_ledger_reuse(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::increment_ledger_reuse(&conn, id)
+    }
+
     pub fn get_chunks_by_ids(&self, ids: &[String]) -> Result<Vec<ConversationChunk>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_chunks_by_ids(&conn, ids)
@@ -65,6 +110,11 @@ impl Storage {
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::insert_reflection(&conn, id, content, tags, embedding)
+    }
+
+    pub fn load_all_chunk_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::load_all_chunk_ids(&conn)
     }
 
     pub fn load_all_reflection_ids(&self) -> Result<Vec<String>> {
@@ -166,6 +216,21 @@ impl Storage {
         queries::get_reflections_by_tag(&conn, tag, limit)
     }
 
+    pub fn get_reflections_by_two_tags(
+        &self,
+        tag_a: &str,
+        tag_b: &str,
+        limit: usize,
+    ) -> Result<Vec<queries::ReflectionRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_reflections_by_two_tags(&conn, tag_a, tag_b, limit)
+    }
+
+    pub fn conversation_message_count(&self, conversation_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::conversation_message_count(&conn, conversation_id)
+    }
+
     // ─── Enrichment state ───
 
     pub fn is_conversation_enriched(
@@ -195,6 +260,16 @@ impl Storage {
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::mark_enrichment_failed(&conn, conversation_id, enrichment_type, error)
+    }
+
+    pub fn mark_enrichment_unavailable(
+        &self,
+        conversation_id: &str,
+        enrichment_type: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_enrichment_unavailable(&conn, conversation_id, enrichment_type, reason)
     }
 
     pub fn get_unenriched_conversations(
@@ -263,9 +338,12 @@ impl Storage {
 
     // ─── Story backfill queries ───
 
-    pub fn get_conversations_missing_stories(&self) -> Result<Vec<(String, String, String)>> {
+    pub fn get_conversations_missing_stories(
+        &self,
+        min_messages: usize,
+    ) -> Result<Vec<(String, String, String)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::get_conversations_missing_stories(&conn)
+        queries::get_conversations_missing_stories(&conn, min_messages)
     }
 
     pub fn get_project_for_conversation(&self, conversation_id: &str) -> Result<Option<String>> {
@@ -346,6 +424,60 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         Ok(result == "ok")
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_meta(&conn, key)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::set_meta(&conn, key, value)
+    }
+
+    /// Integrity check with an app-level cache. SQLite recomputes
+    /// `PRAGMA integrity_check` from scratch on every call — ~10s of CPU on a
+    /// multi-GB DB (it walks every btree, including FTS5) — so the result is
+    /// persisted in `meta` and reused.
+    ///
+    /// - Cache younger than `ttl_hours`: cached verdict, no recompute.
+    /// - Cache stale: recomputes only when `refresh_if_stale` is true (daemon
+    ///   ticks and `status --deep`); other callers keep serving the stale
+    ///   verdict so a statusline poll never eats the 10s hit.
+    /// - No cache yet: computes once and stores (fresh installs are small/fast).
+    pub fn integrity_check_cached(&self, ttl_hours: i64, refresh_if_stale: bool) -> Result<bool> {
+        let cached = self.get_meta("integrity_ok")?;
+        let checked_at = self
+            .get_meta("integrity_checked_at")?
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc));
+
+        if let (Some(ok), Some(ts)) = (&cached, checked_at) {
+            let age = chrono::Utc::now().signed_duration_since(ts);
+            let fresh = age < chrono::Duration::hours(ttl_hours) && age.num_seconds() >= 0;
+            if fresh || !refresh_if_stale {
+                return Ok(ok == "1");
+            }
+        }
+
+        let ok = self.integrity_check()?;
+        self.set_meta("integrity_ok", if ok { "1" } else { "0" })?;
+        self.set_meta("integrity_checked_at", &chrono::Utc::now().to_rfc3339())?;
+        Ok(ok)
+    }
+
+    /// Attempt a WAL checkpoint+truncate. Long-lived MCP readers can hold the
+    /// WAL open indefinitely, letting it grow to hundreds of MB; a periodic
+    /// TRUNCATE attempt from the daemon reclaims it whenever readers allow.
+    /// Best-effort: returns Ok(false) when readers blocked the truncate.
+    pub fn checkpoint_wal(&self) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let (busy, _log, _ckpt): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        Ok(busy == 0)
     }
 
     // ─── Import state ───
@@ -476,5 +608,322 @@ impl Storage {
     ) -> Result<Vec<queries::SessionCodeEvolutionRow>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_session_code_evolution(&conn, session_id)
+    }
+
+    // ─── Episode anchors (v9.3) ───
+
+    /// Replace all anchors for a session (delete-then-insert upsert).
+    pub fn replace_session_anchors(
+        &self,
+        session_id: &str,
+        project: &str,
+        anchors: &[crate::extraction::anchors::FunctionAnchor],
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::replace_session_anchors(&conn, session_id, project, anchors)
+    }
+
+    /// Most-recent-first anchors for a project: `(session_id, anchor)`.
+    pub fn get_project_anchors(
+        &self,
+        project: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, crate::extraction::anchors::FunctionAnchor)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_project_anchors(&conn, project, limit as i64)
+    }
+
+    // ─── Code property graph (v9.4) ───
+
+    pub fn upsert_code_node(&self, node: &codegraph::NodeRow) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::upsert_node(&conn, node)
+    }
+
+    pub fn replace_code_file_edges(
+        &self,
+        project: &str,
+        src_file: &str,
+        edges: &[codegraph::EdgeRow],
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::replace_file_edges(&conn, project, src_file, edges)
+    }
+
+    pub fn upsert_code_file_state(
+        &self,
+        project: &str,
+        file: &str,
+        content_hash: &str,
+        dirty: bool,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::upsert_file_state(&conn, project, file, content_hash, dirty)
+    }
+
+    pub fn mark_code_file_dirty(&self, project: &str, file: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::mark_file_dirty(&conn, project, file)
+    }
+
+    /// Re-resolve placeholder edges for a project (two-pass name resolution).
+    pub fn resolve_code_edges(
+        &self,
+        project: &str,
+    ) -> Result<crate::extraction::resolver::ResolveStats> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        crate::extraction::resolver::resolve_edges(&conn, project)
+    }
+
+    /// Recompute degree ranks for a project.
+    pub fn compute_code_rank(&self, project: &str) -> Result<crate::search::code_rank::RankStats> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        crate::search::code_rank::compute_code_rank(&conn, project)
+    }
+
+    pub fn code_file_ledger(&self, project: &str, file: &str) -> Result<codegraph::FileLedger> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::file_ledger(&conn, project, file)
+    }
+
+    pub fn code_query_callers(
+        &self,
+        name_or_id: &str,
+        project: &str,
+        limit: usize,
+    ) -> Result<Vec<codegraph::NodeRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::query_callers(&conn, name_or_id, project, limit)
+    }
+
+    pub fn code_query_callees(
+        &self,
+        node_id: &str,
+        limit: usize,
+    ) -> Result<Vec<codegraph::NodeRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::query_callees(&conn, node_id, limit)
+    }
+
+    pub fn code_query_neighbors(
+        &self,
+        node_id: &str,
+        kind_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<codegraph::NeighborEdge>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::query_neighbors(&conn, node_id, kind_filter, limit)
+    }
+
+    pub fn code_nodes_by_name(
+        &self,
+        name: &str,
+        project: &str,
+        limit: usize,
+    ) -> Result<Vec<codegraph::NodeRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::nodes_by_name(&conn, name, project, limit)
+    }
+
+    pub fn code_get_node_rank(&self, id: &str) -> Result<Option<(f64, i64, i64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::get_node_rank(&conn, id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn episode_anchors_roundtrip() {
+        let storage = Storage::open_memory().unwrap();
+        let a = crate::extraction::anchors::FunctionAnchor {
+            file: "src/auth.rs".into(),
+            node_kind: "function_item".into(),
+            name: "validate_token".into(),
+            body_hash: "9f3a1c2e44b8d701".into(),
+        };
+        storage
+            .replace_session_anchors("sess-1", "proj", std::slice::from_ref(&a))
+            .unwrap();
+        // Upsert: replacing again must not duplicate
+        storage
+            .replace_session_anchors("sess-1", "proj", std::slice::from_ref(&a))
+            .unwrap();
+        let got = storage.get_project_anchors("proj", 100).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1.name, "validate_token");
+        assert_eq!(got[0].0, "sess-1"); // session_id comes back too
+    }
+
+    #[test]
+    fn chunk_provenance_roundtrip() {
+        use crate::import::ConversationChunk;
+        use crate::provenance::{ChunkProvenance, Speaker};
+        let storage = Storage::open_memory().unwrap();
+
+        // Provenance references a chunk row (FK enforced).
+        let chunk = ConversationChunk {
+            id: "chunk-1".into(),
+            conversation_id: "0bab445f".into(),
+            project_name: "proj".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            content: "the vision".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+        };
+        storage.insert_chunk(&chunk, &[0.0; 384]).unwrap();
+
+        let p = ChunkProvenance {
+            author: Speaker::User,
+            source_conv_id: "0bab445f".into(),
+            supersedes: Some("behavioral continuity".into()),
+        };
+        storage.insert_chunk_provenance("chunk-1", &p).unwrap();
+        // Upsert: inserting again must not duplicate or error.
+        storage.insert_chunk_provenance("chunk-1", &p).unwrap();
+
+        let got = storage
+            .get_chunk_provenance("chunk-1")
+            .unwrap()
+            .expect("provenance present");
+        assert_eq!(got.author, Speaker::User);
+        assert_eq!(got.source_conv_id, "0bab445f");
+        assert_eq!(got.supersedes.as_deref(), Some("behavioral continuity"));
+
+        assert!(storage.get_chunk_provenance("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn derivation_ledger_roundtrip_and_reuse() {
+        use crate::ledger::{CostBucket, LedgerEntry, Scope};
+        let storage = Storage::open_memory().unwrap();
+        let scope = Scope {
+            repo: "csr".into(),
+            branch: "main".into(),
+            user: "rama".into(),
+        };
+        let e = LedgerEntry {
+            id: "f1".into(),
+            content: "epistemic continuity supersedes behavioral".into(),
+            anchor: Some("validate_token".into()),
+            cost_bucket: CostBucket::Expensive,
+            inferability: 0.1,
+            confidence: 0.9,
+            times_reused: 0,
+            scope: scope.clone(),
+        };
+        storage.upsert_ledger_entry(&e).unwrap();
+        storage.upsert_ledger_entry(&e).unwrap(); // upsert: no dup
+
+        let got = storage.get_ledger_entries(&scope, 100).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].cost_bucket, CostBucket::Expensive);
+        assert_eq!(got[0].anchor.as_deref(), Some("validate_token"));
+
+        storage.increment_ledger_reuse("f1").unwrap();
+        let got = storage.get_ledger_entries(&scope, 100).unwrap();
+        assert_eq!(got[0].times_reused, 1);
+
+        // Scope isolation: a different scope sees nothing.
+        let other = Scope {
+            repo: "csr".into(),
+            branch: "feature".into(),
+            user: "rama".into(),
+        };
+        assert!(storage.get_ledger_entries(&other, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ledger_same_id_different_scope_no_crosstalk() {
+        // Codex HIGH: an id reused across scopes must NOT clobber the other scope.
+        use crate::ledger::{CostBucket, LedgerEntry, Scope};
+        let storage = Storage::open_memory().unwrap();
+        let mk = |branch: &str, content: &str| LedgerEntry {
+            id: "shared".into(),
+            content: content.into(),
+            anchor: None,
+            cost_bucket: CostBucket::Moderate,
+            inferability: 0.2,
+            confidence: 0.8,
+            times_reused: 0,
+            scope: Scope {
+                repo: "csr".into(),
+                branch: branch.into(),
+                user: "rama".into(),
+            },
+        };
+        let a = mk("main", "main-scope fact");
+        let b = mk("feature", "feature-scope fact");
+        storage.upsert_ledger_entry(&a).unwrap();
+        storage.upsert_ledger_entry(&b).unwrap();
+
+        let got_a = storage.get_ledger_entries(&a.scope, 100).unwrap();
+        let got_b = storage.get_ledger_entries(&b.scope, 100).unwrap();
+        assert_eq!(got_a.len(), 1, "main scope keeps its own row");
+        assert_eq!(got_a[0].content, "main-scope fact");
+        assert_eq!(got_b.len(), 1, "feature scope keeps its own row");
+        assert_eq!(got_b[0].content, "feature-scope fact");
+    }
+
+    #[test]
+    fn meta_kv_roundtrip() {
+        let storage = Storage::open_memory().unwrap();
+        assert_eq!(storage.get_meta("missing").unwrap(), None);
+        storage.set_meta("k", "v1").unwrap();
+        assert_eq!(storage.get_meta("k").unwrap().as_deref(), Some("v1"));
+        storage.set_meta("k", "v2").unwrap();
+        assert_eq!(storage.get_meta("k").unwrap().as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn integrity_cached_no_cache_computes_and_stores() {
+        let storage = Storage::open_memory().unwrap();
+        assert!(storage.integrity_check_cached(24, false).unwrap());
+        assert_eq!(
+            storage.get_meta("integrity_ok").unwrap().as_deref(),
+            Some("1")
+        );
+        assert!(storage.get_meta("integrity_checked_at").unwrap().is_some());
+    }
+
+    #[test]
+    fn integrity_cached_fresh_serves_cache_without_recompute() {
+        let storage = Storage::open_memory().unwrap();
+        // Plant a fresh-but-wrong verdict: if the cache is honored, we get the
+        // planted value back instead of the real (healthy) recompute.
+        storage.set_meta("integrity_ok", "0").unwrap();
+        storage
+            .set_meta("integrity_checked_at", &chrono::Utc::now().to_rfc3339())
+            .unwrap();
+        assert!(!storage.integrity_check_cached(24, true).unwrap());
+        assert!(!storage.integrity_check_cached(24, false).unwrap());
+    }
+
+    #[test]
+    fn integrity_cached_stale_behavior_depends_on_refresh_flag() {
+        let storage = Storage::open_memory().unwrap();
+        let stale = chrono::Utc::now() - chrono::Duration::hours(48);
+        storage.set_meta("integrity_ok", "0").unwrap();
+        storage
+            .set_meta("integrity_checked_at", &stale.to_rfc3339())
+            .unwrap();
+        // Stale + no refresh: keep serving the stale verdict (statusline path).
+        assert!(!storage.integrity_check_cached(24, false).unwrap());
+        // Stale + refresh: recompute (daemon path) and update the cache.
+        assert!(storage.integrity_check_cached(24, true).unwrap());
+        assert_eq!(
+            storage.get_meta("integrity_ok").unwrap().as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn checkpoint_wal_is_safe_on_memory_db() {
+        let storage = Storage::open_memory().unwrap();
+        // In-memory DBs have no WAL — the pragma must not error.
+        let _ = storage.checkpoint_wal();
     }
 }

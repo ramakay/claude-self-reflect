@@ -2,6 +2,10 @@
 //!
 //! Quick mode: 5 core tests (<30s)
 //! Full mode: 20 tests (~2 min)
+//! Continuity mode: the North Star gate — CSR must recall its own vision with
+//! provenance, beating a grep baseline (`csr-engine eval --continuity`).
+
+pub mod continuity;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,7 +27,7 @@ pub struct EvalResult {
 }
 
 impl EvalResult {
-    fn pass(name: &str, category: &str, duration_ms: f64, detail: String) -> Self {
+    pub(crate) fn pass(name: &str, category: &str, duration_ms: f64, detail: String) -> Self {
         Self {
             name: name.to_string(),
             category: category.to_string(),
@@ -33,7 +37,7 @@ impl EvalResult {
         }
     }
 
-    fn fail(name: &str, category: &str, duration_ms: f64, detail: String) -> Self {
+    pub(crate) fn fail(name: &str, category: &str, duration_ms: f64, detail: String) -> Self {
         Self {
             name: name.to_string(),
             category: category.to_string(),

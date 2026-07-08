@@ -7,9 +7,11 @@
 //! 4. Exits with code 0 (never blocks the session)
 
 pub mod install;
+pub mod intent;
 pub mod post_tool_use;
 pub mod precompact;
 pub mod prompt_submit;
+pub mod session_briefing;
 pub mod session_end;
 pub mod session_start;
 pub mod stop;
@@ -101,6 +103,18 @@ pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: 
 
 /// Main hook dispatcher. Parses stdin, routes to handler.
 pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
+    // Recursive-hook guard. The session-briefing hook spawns a nested `claude -p`
+    // with CSR_DISABLE_RECURSIVE_HOOKS=1 in its env. That nested session inherits
+    // the user's hook config and would otherwise fire CSR hooks — most damagingly
+    // the Stop hook, which would store the analyst transcript as a `session_episode`
+    // ("You are CSR Episode Analyst..."). Those meta-episodes then dominate the
+    // episode store and feed back into the next briefing. Skip ALL hooks in any
+    // process descended from the briefing subprocess. (The var propagates to the
+    // nested `claude -p` and on to the `csr-engine hook ...` it spawns.)
+    if std::env::var("CSR_DISABLE_RECURSIVE_HOOKS").as_deref() == Ok("1") {
+        return Ok(());
+    }
+
     let t0 = std::time::Instant::now();
     let input = read_stdin_json();
     let t_stdin = t0.elapsed();
@@ -128,6 +142,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
 
     let result = match hook_name {
         "session-start" => session_start::handle(&input, engine, &cwd).await,
+        "session-briefing" => session_briefing::handle(&input, engine, &cwd).await,
         "session-end" => session_end::handle(&input, engine, &cwd).await,
         "precompact" => precompact::handle(&input, engine, &cwd).await,
         "stop" => stop::handle(&input, engine, &cwd).await,
@@ -161,16 +176,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     eprintln!("{}", timing_line);
 
     // Append to timing log file for post-session analysis
-    if let Some(home) = dirs::home_dir() {
-        let log_path = home.join(".claude-self-reflect").join("hook-timing.log");
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let line = format!("{} {}\n", ts, timing_line);
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
-    }
+    crate::telemetry::append_timing_line(&timing_line);
 
     result
 }

@@ -24,6 +24,13 @@ Three search strategies merged:
 | 3 months | 0.85x |
 | 1 year | 0.68x |
 
+### Provenance Re-Ranking (v9.2)
+
+After decay and TAD, results are re-ranked by provenance:
+- **Scaffold demotion** — assistant proposals/plans rank below what was actually decided and done
+- **Primacy boost** — the conversation where a thing originated outranks later mentions
+- **Supersession** — chunks marked superseded by later work rank lower
+
 ### TAD (Temporal Attention Decay)
 
 Tracks what you've retrieved before:

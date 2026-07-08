@@ -6,6 +6,117 @@ use chrono;
 use rusqlite::{params, Connection};
 
 use crate::import::ConversationChunk;
+use crate::provenance::{ChunkProvenance, Speaker};
+
+/// Upsert provenance for a chunk (who authored it, source conv, supersession).
+pub fn insert_chunk_provenance(
+    conn: &Connection,
+    chunk_id: &str,
+    prov: &ChunkProvenance,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO chunk_provenance (chunk_id, author, source_conv_id, supersedes)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            chunk_id,
+            prov.author.as_str(),
+            prov.source_conv_id,
+            prov.supersedes,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Upsert a derivation-ledger entry (Pillar 1). `times_reused` is preserved on
+/// conflict so a re-import never resets reuse counts.
+pub fn upsert_ledger_entry(conn: &Connection, e: &crate::ledger::LedgerEntry) -> Result<()> {
+    conn.execute(
+        "INSERT INTO derivation_ledger
+             (id, content, anchor, cost_bucket, inferability, confidence, times_reused, repo, branch, user)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(id, repo, branch, user) DO UPDATE SET
+             content=excluded.content, anchor=excluded.anchor,
+             cost_bucket=excluded.cost_bucket, inferability=excluded.inferability,
+             confidence=excluded.confidence",
+        rusqlite::params![
+            e.id,
+            e.content,
+            e.anchor,
+            e.cost_bucket.as_str(),
+            e.inferability,
+            e.confidence,
+            e.times_reused as i64,
+            e.scope.repo,
+            e.scope.branch,
+            e.scope.user,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Fetch ledger entries for an exact {repo, branch, user} scope, newest first.
+pub fn get_ledger_entries(
+    conn: &Connection,
+    scope: &crate::ledger::Scope,
+    limit: i64,
+) -> Result<Vec<crate::ledger::LedgerEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, content, anchor, cost_bucket, inferability, confidence, times_reused,
+                repo, branch, user
+         FROM derivation_ledger
+         WHERE repo = ?1 AND branch = ?2 AND user = ?3
+         ORDER BY created_at DESC, id DESC LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![scope.repo, scope.branch, scope.user, limit],
+        |r| {
+            Ok(crate::ledger::LedgerEntry {
+                id: r.get(0)?,
+                content: r.get(1)?,
+                anchor: r.get(2)?,
+                cost_bucket: crate::ledger::CostBucket::from_str_lossy(&r.get::<_, String>(3)?),
+                inferability: r.get(4)?,
+                confidence: r.get(5)?,
+                times_reused: r.get::<_, i64>(6)? as u32,
+                scope: crate::ledger::Scope {
+                    repo: r.get(7)?,
+                    branch: r.get(8)?,
+                    user: r.get(9)?,
+                },
+            })
+        },
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Increment the reuse counter for a ledger entry (governor signal, Pillar 4).
+pub fn increment_ledger_reuse(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE derivation_ledger SET times_reused = times_reused + 1 WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+/// Fetch provenance for a chunk, if any. Unknown author tokens degrade to
+/// `ToolResult` (non-authoritative) rather than failing the read.
+pub fn get_chunk_provenance(conn: &Connection, chunk_id: &str) -> Result<Option<ChunkProvenance>> {
+    let mut stmt = conn.prepare(
+        "SELECT author, source_conv_id, supersedes FROM chunk_provenance WHERE chunk_id = ?1",
+    )?;
+    let mut rows = stmt.query(params![chunk_id])?;
+    if let Some(row) = rows.next()? {
+        let author_str: String = row.get(0)?;
+        Ok(Some(ChunkProvenance {
+            author: author_str.parse().unwrap_or(Speaker::ToolResult),
+            source_conv_id: row.get(1)?,
+            supersedes: row.get(2)?,
+        }))
+    } else {
+        Ok(None)
+    }
+}
 
 /// A reflection row: (id, content, tags, timestamp).
 pub type ReflectionRow = (String, String, Vec<String>, String);
@@ -124,6 +235,14 @@ pub fn insert_reflection(
 
 pub fn load_all_reflection_ids(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT reflection_id FROM reflection_embeddings")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    rows.collect::<std::result::Result<Vec<String>, _>>()
+        .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+/// Load just the chunk IDs (no vectors) — cheap probe for incremental backfill.
+pub fn load_all_chunk_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT chunk_id FROM chunk_embeddings")?;
     let rows = stmt.query_map([], |row| row.get(0))?;
     rows.collect::<std::result::Result<Vec<String>, _>>()
         .map_err(|e| anyhow::anyhow!("{}", e))
@@ -369,6 +488,50 @@ pub fn get_reflections_by_tag(
     Ok(results)
 }
 
+/// Like `get_reflections_by_tag` but requires BOTH tags to be present. Used by the
+/// session-briefing hook to fetch a project's recent episodes directly
+/// (`project_<name>` AND `session_episode`) so the LIMIT applies AFTER both filters
+/// — a project can't be starved by its own non-episode reflections crowding a
+/// pre-filter window. Caller should still exact-match the project tag (LIKE can
+/// substring-match `project_foo` inside `project_foo-bar`).
+pub fn get_reflections_by_two_tags(
+    conn: &Connection,
+    tag_a: &str,
+    tag_b: &str,
+    limit: usize,
+) -> Result<Vec<ReflectionRow>> {
+    // Escape backslash FIRST (it's the ESCAPE char), then LIKE wildcards. Wrap the
+    // tag in quotes so the pattern matches a whole JSON-array element — otherwise
+    // `session_episode` would substring-match a tag like `not_session_episode`.
+    let esc = |t: &str| {
+        t.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    };
+    let pat_a = format!("%\"{}\"%", esc(tag_a));
+    let pat_b = format!("%\"{}\"%", esc(tag_b));
+    let mut stmt = conn.prepare(
+        "SELECT id, content, tags, timestamp FROM reflections
+         WHERE tags LIKE ?1 ESCAPE '\\' AND tags LIKE ?2 ESCAPE '\\'
+         ORDER BY timestamp DESC LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![pat_a, pat_b, limit as i64], |row| {
+        let id: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let tags_json: String = row.get(2)?;
+        let timestamp: String = row.get(3)?;
+        Ok((id, content, tags_json, timestamp))
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        let (id, content, tags_json, timestamp) = row?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        results.push((id, content, tags, timestamp));
+    }
+    Ok(results)
+}
+
 /// Helper: map a row to ConversationChunk.
 /// Expects columns: id, conversation_id, project_name, timestamp, content, message_count, summary
 fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
@@ -380,6 +543,10 @@ fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
         content: row.get(4)?,
         message_count: row.get::<_, i64>(5)? as usize,
         summary: row.get(6)?,
+        // Author is stored separately in chunk_provenance, not the chunks table;
+        // reconstructed chunks default to non-authoritative. Live recall reads
+        // provenance explicitly via get_chunk_provenance.
+        author: crate::provenance::Speaker::ToolResult,
     })
 }
 
@@ -428,6 +595,25 @@ pub fn mark_enrichment_failed(
          ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
              status = 'failed', error_message = ?3, updated_at = datetime('now')",
         params![conversation_id, enrichment_type, error],
+    )?;
+    Ok(())
+}
+
+/// Mark enrichment as permanently unavailable (e.g. source JSONL deleted/rotated).
+/// Unlike `mark_enrichment_failed`, status `'unavailable'` is NOT re-queued by
+/// `get_unenriched_conversations`, so a missing source file stops the retry storm.
+pub fn mark_enrichment_unavailable(
+    conn: &Connection,
+    conversation_id: &str,
+    enrichment_type: &str,
+    reason: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO enrichment_state (conversation_id, enrichment_type, status, error_message, updated_at)
+         VALUES (?1, ?2, 'unavailable', ?3, datetime('now'))
+         ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
+             status = 'unavailable', error_message = ?3, updated_at = datetime('now')",
+        params![conversation_id, enrichment_type, reason],
     )?;
     Ok(())
 }
@@ -503,6 +689,60 @@ pub fn delete_reflection(conn: &Connection, id: &str) -> Result<()> {
     )?;
     conn.execute("DELETE FROM reflections WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+/// Replace all episode anchors for a session (delete-then-insert upsert).
+pub fn replace_session_anchors(
+    conn: &Connection,
+    session_id: &str,
+    project: &str,
+    anchors: &[crate::extraction::anchors::FunctionAnchor],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM episode_anchors WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO episode_anchors (session_id, project, file, node_kind, name, body_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for a in anchors {
+        stmt.execute(params![
+            session_id,
+            project,
+            a.file,
+            a.node_kind,
+            a.name,
+            a.body_hash
+        ])?;
+    }
+    Ok(())
+}
+
+/// Most-recent-first anchors for a project: `(session_id, anchor)`.
+pub fn get_project_anchors(
+    conn: &Connection,
+    project: &str,
+    limit: i64,
+) -> Result<Vec<(String, crate::extraction::anchors::FunctionAnchor)>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, file, node_kind, name, body_hash
+         FROM episode_anchors WHERE project = ?1
+         ORDER BY created_at DESC, id DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![project, limit], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            crate::extraction::anchors::FunctionAnchor {
+                file: r.get(1)?,
+                node_kind: r.get(2)?,
+                name: r.get(3)?,
+                body_hash: r.get(4)?,
+            },
+        ))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 /// Get the reflection ID for a conversation's enrichment (for supersession).
@@ -710,6 +950,7 @@ pub fn get_conversations_needing_heuristic(conn: &Connection) -> Result<Vec<(Str
 /// Returns (conversation_id, enrichment_type, reflection_id) for each candidate.
 pub fn get_conversations_missing_stories(
     conn: &Connection,
+    min_messages: usize,
 ) -> Result<Vec<(String, String, String)>> {
     let mut stmt = conn.prepare(
         "SELECT e.conversation_id, e.enrichment_type, e.reflection_id
@@ -720,9 +961,14 @@ pub fn get_conversations_missing_stories(
                SELECT conversation_id FROM enrichment_state
                WHERE enrichment_type = 'session_story' AND status = 'completed'
            )
+           AND e.conversation_id IN (
+               SELECT conversation_id FROM chunks
+               GROUP BY conversation_id
+               HAVING SUM(message_count) >= ?1
+           )
          ORDER BY e.updated_at DESC",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![min_messages as i64], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -753,6 +999,17 @@ pub fn get_project_for_conversation(
 // ─── Status queries (for csr-engine status) ───
 
 /// Count distinct conversations in the database.
+/// Total messages across a conversation's imported chunks. Returns 0 when the
+/// conversation has no chunks.
+pub fn conversation_message_count(conn: &Connection, conversation_id: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(message_count), 0) FROM chunks WHERE conversation_id = ?1",
+        params![conversation_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
 pub fn count_conversations(conn: &Connection) -> Result<usize> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(DISTINCT conversation_id) FROM chunks",
@@ -855,6 +1112,25 @@ pub fn count_reflection_embeddings(conn: &Connection) -> Result<usize> {
         row.get(0)
     })?;
     Ok(count as usize)
+}
+
+// ─── Meta KV ───
+
+pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+    let mut rows = stmt.query([key])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        [key, value],
+    )?;
+    Ok(())
 }
 
 // ─── TAD: Retrieval Event Tracking ───

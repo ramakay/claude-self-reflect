@@ -186,6 +186,39 @@ impl Daemon {
         };
         tracing::info!("consolidation loop started (Layer 4 — Dreamer v1)");
 
+        // Maintenance loop: hourly, refreshes the cached integrity verdict
+        // (24h TTL — the daemon absorbs the ~10s full check so status calls
+        // never do) and attempts a WAL checkpoint+truncate (long-lived MCP
+        // readers let the WAL grow unbounded otherwise).
+        let maintenance_handle = {
+            let storage = self.storage.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    for _ in 0..360 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    let s = storage.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        match s.integrity_check_cached(24, true) {
+                            Ok(ok) => tracing::debug!(healthy = ok, "integrity verdict refreshed"),
+                            Err(e) => tracing::warn!("integrity refresh failed: {e}"),
+                        }
+                        match s.checkpoint_wal() {
+                            Ok(true) => tracing::debug!("WAL checkpoint+truncate succeeded"),
+                            Ok(false) => tracing::debug!("WAL checkpoint blocked by readers"),
+                            Err(e) => tracing::warn!("WAL checkpoint failed: {e}"),
+                        }
+                    })
+                    .await;
+                }
+            })
+        };
+        tracing::info!("maintenance loop started (integrity cache + WAL checkpoint)");
+
         // Wait for Ctrl+C
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down daemon gracefully");
@@ -200,6 +233,7 @@ impl Daemon {
             let _ = tokio::time::timeout(timeout, h).await;
         }
         let _ = tokio::time::timeout(timeout, consolidation_handle).await;
+        let _ = tokio::time::timeout(timeout, maintenance_handle).await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
 
         // Flush HNSW index to disk before exit
@@ -252,6 +286,14 @@ async fn extraction_loop_inner(
     tracing::info!(count = unenriched.len(), "processing V3 extraction queue");
 
     for (conv_id, file_path) in &unenriched {
+        // Source JSONL may have been deleted or rotated out of ~/.claude/projects.
+        // Mark it permanently unavailable so it stops re-queuing every tick (retry storm).
+        if !Path::new(file_path).exists() {
+            tracing::debug!(conv = %conv_id, %file_path, "V3 source file missing; marking unavailable");
+            let _ =
+                storage.mark_enrichment_unavailable(conv_id, "extracted_v3", "source file missing");
+            continue;
+        }
         if let Err(e) =
             process_v3_extraction(storage, embeddings, search, conv_id, Path::new(file_path)).await
         {

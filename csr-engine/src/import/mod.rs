@@ -1,3 +1,4 @@
+pub mod backfill;
 pub mod watcher;
 
 use std::fs;
@@ -25,6 +26,9 @@ pub struct ConversationChunk {
     /// Human-readable summary from JSONL `{"type":"summary"}` line, or first user message.
     /// Used for timeline display instead of raw tool-heavy content.
     pub summary: Option<String>,
+    /// Highest-authority speaker among this chunk's messages (User > Assistant >
+    /// ToolResult). Drives provenance-aware recall; defaults to ToolResult.
+    pub author: crate::provenance::Speaker,
 }
 
 /// Namespace UUID for deterministic chunk IDs (UUIDv5).
@@ -117,6 +121,19 @@ pub fn list_jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
 ///
 /// Extracts conversation summary from `{"type":"summary"}` lines when available.
 /// Falls back to the first user message for timeline display.
+/// True if the first user message is a CSR agent prompt (briefing analyst or
+/// compaction summarizer) — exclude the whole transcript from import so CSR
+/// talking to itself never enters the search index. Signatures live in
+/// `extraction::provenance` (single registry). Deliberately starts_with, not
+/// contains: import-skip drops a whole conversation, so only transcripts that
+/// ARE an agent prompt qualify — not real sessions that merely quote one.
+fn is_csr_agent_prompt(first_user_message: &str) -> bool {
+    let trimmed = first_user_message.trim_start();
+    crate::extraction::provenance::AGENT_PROMPT_SIGNATURES
+        .iter()
+        .any(|sig| trimmed.starts_with(sig))
+}
+
 pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<ConversationChunk>> {
     let conversation_id = path
         .file_stem()
@@ -127,6 +144,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     let file = fs::File::open(path).context("opening JSONL file")?;
     let reader = BufReader::new(file);
     let mut messages: Vec<String> = Vec::new();
+    let mut authors: Vec<crate::provenance::Speaker> = Vec::new();
     let mut first_timestamp: Option<String> = None;
     let mut last_timestamp: Option<String> = None;
     let mut summary: Option<String> = None;
@@ -187,23 +205,38 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             }
         }
 
-        // Extract text content + tool context (both stripped of private tags)
+        // Extract text content + tool context + tool RESULTS (all stripped of private tags).
+        // tool_result blocks carry the substance of research conversations — fetched docs,
+        // file contents, and subagent reports. Without them, ~90% of a session's content is
+        // invisible to search and recall collapses to the opening user prompt.
         let text = extract_message_text(&parsed);
         let tool_context = strip_private_tags(&extract_tool_context(&parsed));
-        let combined_text = if !text.is_empty() && !tool_context.is_empty() {
-            format!("{}\n{}", text, tool_context)
-        } else if !tool_context.is_empty() {
-            tool_context
-        } else {
-            text
-        };
+        let tool_results = strip_private_tags(&extract_tool_results(&parsed));
+        let combined_text = [text, tool_context, tool_results]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
         if !combined_text.is_empty() {
             messages.push(combined_text);
+            authors.push(classify_message_author(&parsed));
         }
     }
 
     if messages.is_empty() {
         return Ok(Vec::new());
+    }
+
+    // Skip CSR's own agent-subprocess transcripts (the session-briefing analyst,
+    // the compaction summarizer). Their FIRST user message IS the agent prompt, so
+    // importing them pollutes the search index with CSR talking to itself — which
+    // then feeds back into the next briefing. A normal user session never opens with
+    // these strings; quoting them later in a session (e.g. via hook-injected context)
+    // is fine because we only test the first user message.
+    if let Some(ref fm) = first_user_message {
+        if is_csr_agent_prompt(fm) {
+            return Ok(Vec::new());
+        }
     }
 
     // Use last_timestamp for ordering (shows "last active" not "started at")
@@ -215,26 +248,171 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     // Priority: JSONL summary > first user message > None
     let chunk_summary = summary.or(first_user_message);
 
-    // Chunk into groups of 50 messages
-    let chunk_size = 50;
-    let mut chunks = Vec::new();
+    // Chunk by character budget, NOT a fixed message count. The embedding model
+    // (all-MiniLM-L6-v2) truncates input at ~256 tokens, so a chunk larger than
+    // ~900 chars only embeds its head — the rest is unsearchable. Sizing each chunk
+    // under that window means the whole conversation actually lands in vector space.
+    let mut chunks: Vec<ConversationChunk> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_authors: Vec<crate::provenance::Speaker> = Vec::new();
+    let mut buf_msgs = 0usize;
 
-    for (i, chunk_msgs) in messages.chunks(chunk_size).enumerate() {
-        let combined = chunk_msgs.join("\n\n");
-        let chunk_id = generate_chunk_id(&conversation_id, i);
+    for (msg, author) in messages.iter().zip(authors.iter()) {
+        // A single message larger than the budget is hard-split into multiple chunks
+        // so its tail (e.g. the end of a long report) is embedded too.
+        if msg.len() > CHUNK_CHAR_BUDGET {
+            if !buf.is_empty() {
+                push_chunk(
+                    &mut chunks,
+                    &conversation_id,
+                    project_name,
+                    &timestamp,
+                    std::mem::take(&mut buf),
+                    buf_msgs,
+                    &chunk_summary,
+                    chunk_author(&buf_authors),
+                );
+                buf_authors.clear();
+                buf_msgs = 0;
+            }
+            let mut start = 0;
+            while start < msg.len() {
+                let mut end = (start + CHUNK_CHAR_BUDGET).min(msg.len());
+                end = msg.floor_char_boundary(end);
+                if end <= start {
+                    end = msg.len();
+                }
+                push_chunk(
+                    &mut chunks,
+                    &conversation_id,
+                    project_name,
+                    &timestamp,
+                    msg[start..end].to_string(),
+                    1,
+                    &chunk_summary,
+                    *author,
+                );
+                start = end;
+            }
+            continue;
+        }
 
-        chunks.push(ConversationChunk {
-            id: chunk_id,
-            conversation_id: conversation_id.clone(),
-            project_name: project_name.to_string(),
-            timestamp: timestamp.clone(),
-            content: combined,
-            message_count: chunk_msgs.len(),
-            summary: chunk_summary.clone(),
-        });
+        // Flush before exceeding the budget, then start a fresh chunk.
+        if !buf.is_empty() && buf.len() + msg.len() + 2 > CHUNK_CHAR_BUDGET {
+            push_chunk(
+                &mut chunks,
+                &conversation_id,
+                project_name,
+                &timestamp,
+                std::mem::take(&mut buf),
+                buf_msgs,
+                &chunk_summary,
+                chunk_author(&buf_authors),
+            );
+            buf_authors.clear();
+            buf_msgs = 0;
+        }
+        if !buf.is_empty() {
+            buf.push_str("\n\n");
+        }
+        buf.push_str(msg);
+        buf_authors.push(*author);
+        buf_msgs += 1;
+    }
+    if !buf.is_empty() {
+        push_chunk(
+            &mut chunks,
+            &conversation_id,
+            project_name,
+            &timestamp,
+            buf,
+            buf_msgs,
+            &chunk_summary,
+            chunk_author(&buf_authors),
+        );
     }
 
     Ok(chunks)
+}
+
+/// Character budget per chunk. Kept under the embedding model's ~256-token window
+/// (all-MiniLM-L6-v2) so each chunk embeds in full rather than head-truncated.
+const CHUNK_CHAR_BUDGET: usize = 900;
+
+/// Per-tool_result character cap. Bounds giant logs while preserving enough of a
+/// fetched doc / subagent report for the size-based chunker to slice and embed.
+const MAX_TOOL_RESULT_CHARS: usize = 4000;
+
+/// Push one finished chunk, assigning a deterministic sequential id.
+#[allow(clippy::too_many_arguments)]
+fn push_chunk(
+    chunks: &mut Vec<ConversationChunk>,
+    conversation_id: &str,
+    project_name: &str,
+    timestamp: &str,
+    content: String,
+    message_count: usize,
+    summary: &Option<String>,
+    author: crate::provenance::Speaker,
+) {
+    let i = chunks.len();
+    chunks.push(ConversationChunk {
+        id: generate_chunk_id(conversation_id, i),
+        conversation_id: conversation_id.to_string(),
+        project_name: project_name.to_string(),
+        timestamp: timestamp.to_string(),
+        content,
+        message_count,
+        summary: summary.clone(),
+        author,
+    });
+}
+
+/// Extract searchable text from tool_result blocks (WebFetch/Read/Bash/Task/Agent
+/// outputs). This is where research substance and subagent reports live; without it
+/// recall collapses to the opening user prompt. Capped per result to bound logs.
+fn extract_tool_results(msg: &serde_json::Value) -> String {
+    let content = match msg
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        Some(c) => c,
+        None => return String::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for item in content {
+        if item.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+            continue;
+        }
+        let body = match item.get("content") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|b| {
+                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        b.get("text").and_then(|t| t.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let capped = if body.len() > MAX_TOOL_RESULT_CHARS {
+            let end = body.floor_char_boundary(MAX_TOOL_RESULT_CHARS);
+            &body[..end]
+        } else {
+            body
+        };
+        out.push(capped.to_string());
+    }
+    out.join("\n")
 }
 
 /// Parse a JSONL file into raw serde_json::Value messages (for extraction module).
@@ -268,6 +446,38 @@ pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
 
 /// Extract text content from a JSONL message entry.
 /// Strips `<private>...</private>` tagged content before returning.
+/// Classify who authored a JSONL message. Critical for poisoning defense
+/// (§Q6.2): Claude Code delivers `tool_result` blocks inside `type:"user"`
+/// messages, so role alone is not enough — only genuine user prose counts as
+/// authoritative `User`.
+pub(crate) fn classify_message_author(msg: &serde_json::Value) -> crate::provenance::Speaker {
+    use crate::provenance::Speaker;
+    let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if msg_type == "assistant" {
+        return Speaker::Assistant;
+    }
+    // user / human: genuine text → User; otherwise (tool_result-only / empty) →
+    // non-authoritative ToolResult.
+    if extract_message_text_raw(msg).trim().is_empty() {
+        Speaker::ToolResult
+    } else {
+        Speaker::User
+    }
+}
+
+/// Aggregate the author of a multi-message chunk: highest authority present,
+/// User > Assistant > ToolResult. Empty → ToolResult (non-authoritative).
+pub(crate) fn chunk_author(authors: &[crate::provenance::Speaker]) -> crate::provenance::Speaker {
+    use crate::provenance::Speaker;
+    if authors.contains(&Speaker::User) {
+        Speaker::User
+    } else if authors.contains(&Speaker::Assistant) {
+        Speaker::Assistant
+    } else {
+        Speaker::ToolResult
+    }
+}
+
 fn extract_message_text(msg: &serde_json::Value) -> String {
     let raw = extract_message_text_raw(msg);
     // Strip privacy-tagged content before storage/embedding
@@ -401,6 +611,45 @@ fn generate_chunk_id(conversation_id: &str, chunk_index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provenance::Speaker;
+
+    #[test]
+    fn classify_assistant_message() {
+        let msg = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "I'll fix it."}]}
+        });
+        assert_eq!(classify_message_author(&msg), Speaker::Assistant);
+    }
+
+    #[test]
+    fn classify_genuine_user_prose() {
+        let msg = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "text", "text": "adopt epistemic continuity"}]}
+        });
+        assert_eq!(classify_message_author(&msg), Speaker::User);
+    }
+
+    #[test]
+    fn classify_tool_result_in_user_message_is_not_user() {
+        // Claude Code delivers tool_result as a user-type message — it must NOT
+        // be treated as authoritative user content (poisoning defense §Q6.2).
+        let msg = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "content": "exit 0\n332 passed"}]}
+        });
+        assert_eq!(classify_message_author(&msg), Speaker::ToolResult);
+    }
+
+    #[test]
+    fn chunk_author_prefers_user_then_assistant() {
+        use Speaker::*;
+        assert_eq!(chunk_author(&[ToolResult, Assistant, User]), User);
+        assert_eq!(chunk_author(&[ToolResult, Assistant]), Assistant);
+        assert_eq!(chunk_author(&[ToolResult, ToolResult]), ToolResult);
+        assert_eq!(chunk_author(&[]), ToolResult);
+    }
 
     #[test]
     fn test_normalize_project_name() {
@@ -418,6 +667,24 @@ mod tests {
             normalize_project_name("/Users/name/.claude/projects/-Users-name-projects-foo"),
             "foo"
         );
+    }
+
+    #[test]
+    fn test_is_csr_agent_prompt_skips_self_transcripts() {
+        assert!(is_csr_agent_prompt(
+            "You are CSR Episode Analyst. Generate a brief, actionable session briefing."
+        ));
+        assert!(is_csr_agent_prompt(
+            "You are summarizing a coding session for future context restoration"
+        ));
+        // Real user work is never misclassified.
+        assert!(!is_csr_agent_prompt(
+            "Fix the V3 retry storm in csr-engine/src/daemon/mod.rs"
+        ));
+        // Merely quoting the prompt far into the message is not a meta-transcript
+        // (only the leading window is tested).
+        let quoted = format!("{}You are CSR Episode Analyst", "x".repeat(300));
+        assert!(!is_csr_agent_prompt(&quoted));
     }
 
     #[test]

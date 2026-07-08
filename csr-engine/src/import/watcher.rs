@@ -173,6 +173,9 @@ impl FileWatcher {
 
         let chunks = import::parse_jsonl_file(file_path, &project_name)?;
         if chunks.is_empty() {
+            // Record the skip so this file isn't re-parsed every watcher pass
+            // and import_percent counts it as processed.
+            self.storage.mark_file_imported(file_path, 0)?;
             return Ok(());
         }
 

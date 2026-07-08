@@ -251,7 +251,7 @@ fn analyze_code_inner(source: &str, lang: SupportLang) -> CodeContext {
 }
 
 /// Get function definition kind names for a language.
-fn func_kinds(lang: SupportLang) -> &'static [&'static str] {
+pub(crate) fn func_kinds(lang: SupportLang) -> &'static [&'static str] {
     match lang {
         SupportLang::Rust => &["function_item"],
         SupportLang::Python => &["function_definition"],
@@ -266,7 +266,7 @@ fn func_kinds(lang: SupportLang) -> &'static [&'static str] {
 }
 
 /// Get type definition kind names for a language.
-fn type_kinds(lang: SupportLang) -> &'static [&'static str] {
+pub(crate) fn type_kinds(lang: SupportLang) -> &'static [&'static str] {
     match lang {
         SupportLang::Rust => &["struct_item", "enum_item", "trait_item", "type_item"],
         SupportLang::Python => &["class_definition"],
@@ -283,7 +283,7 @@ fn type_kinds(lang: SupportLang) -> &'static [&'static str] {
 }
 
 /// Get import kind names for a language.
-fn import_kinds(lang: SupportLang) -> &'static [&'static str] {
+pub(crate) fn import_kinds(lang: SupportLang) -> &'static [&'static str] {
     match lang {
         SupportLang::Rust => &["use_declaration"],
         SupportLang::Python => &["import_statement", "import_from_statement"],
@@ -296,7 +296,7 @@ fn import_kinds(lang: SupportLang) -> &'static [&'static str] {
 }
 
 /// Extract the name identifier from a definition node.
-fn extract_name_from_def<D: ast_grep_core::Doc>(
+pub(crate) fn extract_name_from_def<D: ast_grep_core::Doc>(
     node: &ast_grep_core::NodeMatch<'_, D>,
     _lang: SupportLang,
 ) -> Option<String> {

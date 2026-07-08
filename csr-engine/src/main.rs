@@ -60,6 +60,9 @@ enum Commands {
         /// SwiftBar-compatible output for macOS menu bar plugin
         #[arg(long)]
         swiftbar: bool,
+        /// Force a fresh full integrity check (slow on large DBs; otherwise cached)
+        #[arg(long)]
+        deep: bool,
     },
     /// Handle Claude Code hook events
     Hook {
@@ -94,12 +97,35 @@ enum Commands {
         /// Run full evaluation (20 tests) instead of quick (5 tests)
         #[arg(long)]
         full: bool,
+        /// Run the continuity gate (North Star: recall + provenance beats grep)
+        #[arg(long)]
+        continuity: bool,
+        /// Run the LIVE north-star probe against the real index (no fixture)
+        #[arg(long = "continuity-live")]
+        continuity_live: bool,
     },
     /// Backfill session stories from V3/heuristic data (zero cost)
     BackfillStories {
         /// Preview without writing
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Code-graph operations (v9.4 conversation-provenance graph)
+    Codegraph {
+        #[command(subcommand)]
+        action: CodegraphAction,
+    },
+    /// Show aggregated telemetry: hook latencies, startup stats, enrichment health
+    Telemetry {
+        /// Window (e.g. "24h", "7d", "30m", "all"). Default: 24h.
+        #[arg(long)]
+        since: Option<String>,
+        /// Emit JSON instead of the text report
+        #[arg(long)]
+        json: bool,
+        /// Open the live multi-pane TUI dashboard (q to quit)
+        #[arg(long)]
+        tui: bool,
     },
     /// Generate a Haiku-curated session story (fire-and-forget from SessionEnd)
     GenerateStory {
@@ -110,6 +136,16 @@ enum Commands {
         /// Current working directory (for project resolution)
         #[arg(long)]
         cwd: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CodegraphAction {
+    /// Reconstruct the code graph from all existing conversation JSONL history.
+    Backfill {
+        /// Parse + count what would be written, but make no changes.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -143,8 +179,23 @@ async fn main() -> Result<()> {
         return csr_engine::setup::handle(&args.db_path, &args.projects_dir, anthropic_key).await;
     }
 
-    if let Some(Commands::Status { compact, swiftbar }) = args.command {
-        return csr_engine::status::handle(&args.db_path, &args.projects_dir, compact, swiftbar);
+    if let Some(Commands::Status {
+        compact,
+        swiftbar,
+        deep,
+    }) = args.command
+    {
+        return csr_engine::status::handle(
+            &args.db_path,
+            &args.projects_dir,
+            compact,
+            swiftbar,
+            deep,
+        );
+    }
+
+    if let Some(Commands::Telemetry { since, json, tui }) = args.command {
+        return csr_engine::telemetry::handle(&args.db_path, &args.projects_dir, since, json, tui);
     }
 
     if let Some(Commands::Daemon {
@@ -181,11 +232,31 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(Commands::Eval { full }) = args.command {
+    if let Some(Commands::Eval {
+        full,
+        continuity,
+        continuity_live,
+    }) = args.command
+    {
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        if continuity_live {
+            let out = csr_engine::eval::continuity::run_continuity_live(
+                eng.storage(),
+                eng.embeddings(),
+                eng.search(),
+            )
+            .await;
+            print!("{out}");
+            return Ok(());
+        }
+        if continuity {
+            let report = csr_engine::eval::continuity::run_continuity(eng.embeddings()).await;
+            print!("{}", report.format_text());
+            return Ok(());
+        }
         let report = if full {
             csr_engine::eval::run_full(
                 eng.storage(),
@@ -213,6 +284,20 @@ async fn main() -> Result<()> {
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
         return csr_engine::summarizer::backfill_stories_cli(&eng, dry_run).await;
+    }
+
+    if let Some(Commands::Codegraph {
+        action: CodegraphAction::Backfill { dry_run },
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats =
+            csr_engine::import::backfill::backfill_code_graph(&eng, &args.projects_dir, dry_run)?;
+        print!("{}", stats.format_text(dry_run));
+        return Ok(());
     }
 
     if let Some(Commands::GenerateStory {

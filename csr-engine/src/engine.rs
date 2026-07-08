@@ -14,16 +14,7 @@ use crate::storage::Storage;
 
 /// Append a timing line to ~/.claude-self-reflect/hook-timing.log.
 fn log_timing(line: &str) {
-    if let Some(home) = dirs::home_dir() {
-        let log_path = home.join(".claude-self-reflect").join("hook-timing.log");
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let entry = format!("{} {}\n", ts, line);
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()));
-    }
+    crate::telemetry::append_timing_line(line);
 }
 
 /// Orchestrates all subsystems: storage, embeddings, search, import, and MCP.
@@ -123,6 +114,32 @@ impl Engine {
                         }
                         if added > 0 {
                             tracing::info!(added, "backfilled missing reflections into HNSW cache");
+                        }
+                    }
+                }
+            }
+
+            // Backfill chunks added to DB since the last dump (additive drift).
+            // Cheap ID probe first; only load the (large) vector set if something is
+            // actually missing. This is what lets a stale-but-additive cache load in
+            // ~ms instead of triggering a full HNSW rebuild (~tens of seconds).
+            if let Ok(db_chunk_ids) = storage.load_all_chunk_ids() {
+                let missing: std::collections::HashSet<&str> = db_chunk_ids
+                    .iter()
+                    .filter(|id| !search.has_chunk(id))
+                    .map(|s| s.as_str())
+                    .collect();
+                if !missing.is_empty() {
+                    if let Ok(all_vecs) = storage.load_all_chunk_vectors() {
+                        let mut added = 0;
+                        for (id, vec) in &all_vecs {
+                            if missing.contains(id.as_str()) {
+                                search.insert_chunk(id.clone(), vec.clone());
+                                added += 1;
+                            }
+                        }
+                        if added > 0 {
+                            tracing::info!(added, "backfilled missing chunks into HNSW cache");
                         }
                     }
                 }
@@ -239,6 +256,10 @@ impl Engine {
 
         let chunks = import::parse_jsonl_file(file_path, project_name)?;
         if chunks.is_empty() {
+            // Record the skip (agent transcripts, empty conversations) so the
+            // watcher doesn't re-parse the file every pass and import_percent
+            // counts it as processed instead of silently under-reporting.
+            self.storage.mark_file_imported(file_path, 0)?;
             return Ok(0);
         }
 
@@ -265,6 +286,19 @@ impl Engine {
             let mut idx = self.search.write().await;
             for (chunk, embedding) in batch.iter().zip(embeddings) {
                 self.storage.insert_chunk(chunk, &embedding)?;
+                // Persist provenance: who authored this chunk + its source conv.
+                // Supersession detection is deferred (None) — recall still gains
+                // from author-authority weighting. Non-fatal on error.
+                if let Err(e) = self.storage.insert_chunk_provenance(
+                    &chunk.id,
+                    &crate::provenance::ChunkProvenance {
+                        author: chunk.author,
+                        source_conv_id: chunk.conversation_id.clone(),
+                        supersedes: None,
+                    },
+                ) {
+                    eprintln!("CSR: chunk provenance persist error (non-fatal): {e}");
+                }
                 idx.insert_chunk(chunk.id.clone(), embedding);
             }
         }

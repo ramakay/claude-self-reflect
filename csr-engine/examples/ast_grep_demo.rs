@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 /// A sample struct to verify AST extraction picks up type definitions.
 pub struct EventProcessor {
+    #[allow(clippy::type_complexity)] // fixture: deliberate complex type for AST extraction tests
     handlers: HashMap<String, Box<dyn Fn(&str)>>,
     event_count: usize,
     is_running: bool,
@@ -14,6 +15,7 @@ pub struct EventProcessor {
 
 impl EventProcessor {
     /// Constructor — AST analysis should extract this as a function definition.
+    #[allow(clippy::new_without_default)] // fixture: kept as a plain `new` for AST extraction tests
     pub fn new() -> Self {
         Self {
             handlers: HashMap::new(),

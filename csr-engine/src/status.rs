@@ -40,8 +40,16 @@ pub struct EnrichmentBreakdown {
 }
 
 /// Run status check — opens SQLite directly (no EmbeddingEngine needed).
-pub fn handle(db_path: &Path, projects_dir: &Path, compact: bool, swiftbar: bool) -> Result<()> {
-    let report = gather_status(db_path, projects_dir)?;
+/// `deep` forces a fresh `PRAGMA integrity_check` (~10s on multi-GB DBs);
+/// otherwise the cached verdict is served.
+pub fn handle(
+    db_path: &Path,
+    projects_dir: &Path,
+    compact: bool,
+    swiftbar: bool,
+    deep: bool,
+) -> Result<()> {
+    let report = gather_status(db_path, projects_dir, deep)?;
 
     if swiftbar {
         print_swiftbar(&report);
@@ -54,8 +62,14 @@ pub fn handle(db_path: &Path, projects_dir: &Path, compact: bool, swiftbar: bool
     Ok(())
 }
 
+/// Public wrapper for `gather_status` — used by the telemetry module to embed
+/// a fresh status snapshot in its report without re-implementing the gather logic.
+pub fn gather_status_public(db_path: &Path, projects_dir: &Path) -> Result<StatusReport> {
+    gather_status(db_path, projects_dir, false)
+}
+
 /// Gather status data from SQLite and disk.
-fn gather_status(db_path: &Path, projects_dir: &Path) -> Result<StatusReport> {
+fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<StatusReport> {
     // Count total JSONL files on disk
     let total_jsonl = count_jsonl_files(projects_dir);
 
@@ -86,7 +100,15 @@ fn gather_status(db_path: &Path, projects_dir: &Path) -> Result<StatusReport> {
     let imported_files = storage.count_imported_files().unwrap_or(0);
     let newest_chunk = storage.get_newest_chunk_timestamp().unwrap_or(None);
     let db_size_bytes = storage.get_db_size().unwrap_or(0);
-    let healthy = storage.integrity_check().unwrap_or(false);
+    // Cached verdict (24h TTL, refreshed by the daemon or --deep). A full
+    // integrity_check costs ~10s of CPU on a multi-GB DB — must never run on
+    // the statusline path.
+    // ttl=0 + refresh forces a fresh check (and stores it); otherwise serve cache.
+    let healthy = if deep {
+        storage.integrity_check_cached(0, true).unwrap_or(false)
+    } else {
+        storage.integrity_check_cached(24, false).unwrap_or(false)
+    };
 
     let import_percent = if total_jsonl > 0 {
         (imported_files as f64 / total_jsonl as f64 * 100.0).min(100.0)
@@ -317,6 +339,7 @@ mod tests {
         let report = gather_status(
             Path::new("/tmp/nonexistent-csr-test.db"),
             Path::new("/tmp/nonexistent-projects"),
+            false,
         )
         .unwrap();
         assert_eq!(report.conversations, 0);
@@ -354,7 +377,7 @@ mod tests {
         // Create the database first (status is read-only, won't create it)
         let _storage = Storage::open(&db_path).unwrap();
 
-        let report = gather_status(&db_path, &projects_dir).unwrap();
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
         assert_eq!(report.conversations, 0);
         assert_eq!(report.chunks, 0);
         assert!(report.healthy); // empty DB passes integrity check

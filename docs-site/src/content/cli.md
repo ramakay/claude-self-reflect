@@ -33,8 +33,18 @@ csr-engine daemon --batch-size 10 --no-ai
 
 ### eval
 ```bash
-csr-engine eval        # Quick (5 tests)
-csr-engine eval --full # Full (20 tests, 6 categories)
+csr-engine eval                   # Quick (5 tests)
+csr-engine eval --full            # Full (20 tests, 6 categories)
+csr-engine eval --continuity-live # Live continuity probe vs the real index
+```
+
+### telemetry
+Ops dashboard: hook latency percentiles, startup timings, enrichment health.
+```bash
+csr-engine telemetry              # Text report
+csr-engine telemetry --since 7d   # Window: 30m|24h|7d|all
+csr-engine telemetry --json       # Machine-readable
+csr-engine telemetry --tui        # Live ratatui dashboard
 ```
 
 ### quality
