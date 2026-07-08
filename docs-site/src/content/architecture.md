@@ -38,7 +38,7 @@ Hierarchical Navigable Small World graph for approximate nearest neighbor search
 | Operation | Latency |
 |-----------|---------|
 | Search (p95) | < 1ms |
-| Cached startup | 93ms |
+| Cached startup | ~150ms (p50, 54K-chunk index) |
 | Cold startup | ~14s (rebuild from SQLite) |
 
 Staleness detection via `IndexManifest` — rebuilds only when DB has new data.

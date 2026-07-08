@@ -12,10 +12,11 @@ Single 44MB binary. No databases. No containers. No API keys required.
 
 [Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
-> **v8.0 — Complete Rust Rewrite**
-> The entire Python/Docker/Qdrant stack has been replaced with a single Rust binary.
-> Sub-millisecond search, 93ms startup, 273 tests, zero external dependencies.
-> [Release notes](https://github.com/ramakay/claude-self-reflect/releases/tag/v8.0.5) | [Announcement](https://github.com/ramakay/claude-self-reflect/discussions/175)
+> **v9.2 — Episode Intelligence**
+> Sessions end as structured episodes; new sessions open with a CONTINUUM of where you left off.
+> Provenance re-ranking, semantic intent routing, code graph, full-transcript recall, telemetry dashboard.
+> Sub-millisecond search, ~150ms cached startup, 570+ tests, zero external dependencies.
+> [Release notes](https://github.com/ramakay/claude-self-reflect/releases/tag/v9.2.0) | [Announcement](https://github.com/ramakay/claude-self-reflect/discussions/175)
 
 <img src="docs-site/public/images/csr-demo.gif" alt="CSR Demo — Setup, Search, and Hooks" width="800" />
 
@@ -147,11 +148,11 @@ No special syntax. No commands. CSR finds relevant past context and injects it a
 </details>
 
 <details>
-<summary><strong>Performance</strong> — sub-millisecond search, 93ms startup</summary>
+<summary><strong>Performance</strong> — sub-millisecond search, ~150ms cached startup</summary>
 
 | Metric | Value |
 |--------|-------|
-| **Cached startup** | 93ms |
+| **Cached startup** | ~150ms (p50, 54K-chunk index) |
 | **Search latency (p95)** | <1ms |
 | **Binary size** | 44MB |
 | **Import speed** | ~20 conversations/sec |
@@ -253,7 +254,7 @@ Your conversation data (`~/.claude/projects/`) is untouched. The new engine re-i
 | No search results | Run `csr-engine setup` |
 | MCP tools not available | Run `csr-engine setup`, restart Claude Code |
 | "spawn ENOENT" in MCP | Ensure `csr-engine` is in PATH |
-| Slow first startup | Normal (~14s for index rebuild, subsequent: ~93ms) |
+| Slow first startup | Normal (~14s for index rebuild, subsequent: ~150ms) |
 
 Full guide: [Documentation](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 

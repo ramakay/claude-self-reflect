@@ -818,25 +818,28 @@ function WhatsNewCard() {
   return (
     <BentoCard className="card--whatsnew" delay={560} id="whats-new">
       <CardKicker number="—" label="LATEST RELEASE" accent="purple" />
-      <h2 className="type-hl-sm">What's New in v8.3.0</h2>
+      <h2 className="type-hl-sm">What's New in v9.2.0</h2>
       <ul className="whatsnew-list">
         <li>
-          <strong>MCP completions</strong> — autocomplete for tool arguments: project names, file paths, time ranges, and more
+          <strong>Episode intelligence</strong> — every session ends as a structured episode; SessionStart opens with a CONTINUUM block and a pickup menu of recent threads
         </li>
         <li>
-          <strong>Async tasks</strong> — heavy search tools run non-blocking with progress polling and cancellation
+          <strong>Intent routing</strong> — "pick up where we left off" is detected semantically (exemplar embeddings, zero new models) and answered from episode state
         </li>
         <li>
-          <strong>Elicitation</strong> — confirmation dialog before storing large reflections (2000+ chars)
+          <strong>Provenance re-ranking</strong> — recall favors what was decided and done over what was merely proposed; CSR now beats grep on its own founding-conversation benchmark
         </li>
         <li>
-          <strong>SwiftBar plugin</strong> — live macOS menu bar with index stats, enrichment progress, and current focus
+          <strong>Code graph</strong> — <code>csr_code_graph</code> links functions to the conversations that shaped them via AST anchors
         </li>
         <li>
-          <strong>Smarter injection</strong> — steeper recency decay and 21-day age gate eliminate stale context noise
+          <strong>Full-transcript recall</strong> — tool results are embedded with size-based chunking; coverage went from ~1% of each conversation to effectively all of it
+        </li>
+        <li>
+          <strong>Telemetry dashboard</strong> — <code>csr-engine telemetry</code> with hook latency percentiles, startup stats, and a live TUI
         </li>
       </ul>
-      <a className="cite-link" href="https://github.com/ramakay/claude-self-reflect/releases/tag/v8.3.0" target="_blank" rel="noopener noreferrer">Full release notes →</a>
+      <a className="cite-link" href="https://github.com/ramakay/claude-self-reflect/releases/tag/v9.2.0" target="_blank" rel="noopener noreferrer">Full release notes →</a>
     </BentoCard>
   )
 }

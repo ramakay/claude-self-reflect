@@ -6,7 +6,7 @@ Single Rust binary (`csr-engine`). No Python, no Docker, no Qdrant.
 
 ```
 csr-engine (44MB)
-  ├── MCP server (rmcp, 12 tools)
+  ├── MCP server (rmcp, 13 tools)
   ├── Embeddings (FastEmbed, 384-dim, local)
   ├── Search (HNSW, <1ms p95)
   ├── Storage (SQLite)
@@ -29,7 +29,7 @@ csr-engine eval --full         # Full eval (20 tests, ~200ms)
 csr-engine quality <file>      # AST code quality analysis
 ```
 
-## MCP Tools (12 total)
+## MCP Tools (13 total)
 
 ```
 csr_reflect_on_past   — Semantic search across past conversations
@@ -44,6 +44,7 @@ csr_search_insights   — Aggregated patterns
 csr_get_more          — Paginate results
 get_full_conversation — Complete JSONL retrieval
 get_session_learnings — Iteration memory for Ralph loops
+csr_code_graph        — Which conversations shaped a function/file (AST anchors)
 ```
 
 ## Critical Rules
@@ -86,13 +87,15 @@ cargo bench --bench spike_bench
 ### Key Patterns
 
 - **rmcp tool params**: Use `Parameters<MyStruct>` pattern, NOT individual `#[tool(param)]`
-- **rmcp tool annotations**: All 12 tools have `annotations(read_only_hint, destructive_hint, idempotent_hint)` in macro
+- **rmcp tool annotations**: All 13 tools have `annotations(read_only_hint, destructive_hint, idempotent_hint)` in macro
 - **rmcp 1.6 builders**: `ServerInfo::new(caps).with_instructions()`, `Implementation::new()`, `ReadResourceResult::new()`
 - **fastembed**: Requires `aarch64` Rust — no x86_64-apple-darwin ONNX binaries
 - **rusqlite 0.38**: No `ToSql` for `usize` — cast to `i64`
 - **Storage thread safety**: Wrap `Connection` in `std::sync::Mutex`
 - **EmbeddingEngine**: `embed` requires `&mut self`, wrap in `Mutex`
 - **Hooks**: All use catch-all wrappers — never block Claude Code
+- **System sqlite3 (macOS)**: cannot load fts5 — CLI inspection silently skips `chunks_fts` (integrity checks look ~10x faster than the bundled engine's). Use `csr-engine status --deep` or Homebrew sqlite3.
+- **integrity_check**: never call raw `PRAGMA integrity_check` on the hot path — ~10s CPU on multi-GB DBs; use `Storage::integrity_check_cached` (meta-table cache, daemon refreshes)
 
 ## Hooks
 
