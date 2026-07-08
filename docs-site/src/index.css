@@ -657,6 +657,7 @@ body {
 .card--ask { grid-column: 1 / -1; grid-row: 4; }
 .card--arch { grid-column: 1 / -1; grid-row: 5; }
 .card--whatsnew { grid-column: 1 / -1; grid-row: 6; }
+.card--demo { grid-column: 1 / -1; grid-row: 7; }
 .card--flatfile { grid-column: 1 / span 4; grid-row: 8; }
 .card--kgraph { grid-column: 5 / span 4; grid-row: 8; }
 .card--hosted { grid-column: 9 / span 4; grid-row: 8; }
@@ -2383,7 +2384,8 @@ body {
   }
 
   .card--ask,
-  .card--arch {
+  .card--arch,
+  .card--demo {
     grid-column: 1 / -1;
     grid-row: auto;
   }
