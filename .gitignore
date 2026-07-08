@@ -175,3 +175,6 @@ csr-engine/target/
 /examples/
 /video/
 pytest.ini
+
+# Local release runbook (not for OSS)
+RELEASE.local.md

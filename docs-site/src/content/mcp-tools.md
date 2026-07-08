@@ -2,7 +2,7 @@
 title: MCP Tools Reference
 ---
 
-12 tools available to Claude automatically via MCP.
+13 tools available to Claude automatically via MCP.
 
 ## Search Tools
 
@@ -34,6 +34,9 @@ Aggregated patterns from search results.
 ### csr_get_more
 Pagination for additional results.
 
+### csr_code_graph
+Conversation-provenance code graph. Query which conversations touched a function or file — AST anchors link code symbols to the sessions that shaped them.
+
 ## Activity Tools
 
 ### get_recent_work
@@ -62,4 +65,5 @@ Store insights for future retrieval. Embedded and indexed immediately.
 | Recent activity | `get_recent_work` |
 | File-specific search | `csr_search_by_file` |
 | Cross-project concepts | `csr_search_by_concept` |
+| Which sessions shaped this function | `csr_code_graph` |
 | Save a decision | `store_reflection` |

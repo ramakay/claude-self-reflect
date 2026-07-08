@@ -70,7 +70,7 @@ Everything runs locally in a single process. No Docker, no database server, no A
 - **FastEmbed** — 384-dim local embeddings
 - **AST** — code-aware search across 6 languages
 
-**6 hooks** fire across the session lifecycle. **12 MCP tools** for explicit search.
+**6 hooks** fire across the session lifecycle. **13 MCP tools** for explicit search — including `csr_code_graph`, linking code symbols to the conversations that shaped them.
 
 <br clear="both" />
 

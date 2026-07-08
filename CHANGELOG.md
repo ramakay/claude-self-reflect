@@ -5,7 +5,7 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [9.2.0] - 2026-06-10
+## [9.2.0] - 2026-07-07
 
 ### 🚀 FEATURE: Episode Intelligence + Telemetry Dashboard
 
@@ -36,10 +36,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Missing sources are now marked `unavailable` (a non-requeued terminal state).
 - **`.mcp.json`**: config now correctly nested under the `mcpServers` key.
 
+#### Continuity Engine
+- **Provenance indexing**: every chunk carries speaker attribution, source
+  conversation, and supersession state — assistant scaffold text is demoted so
+  recall favors what was actually decided, not what was proposed.
+- **Provenance + meaning re-ranking**: scaffold demotion + primacy boost in the
+  search pipeline. Continuity gate harness (`eval --continuity-live`) probes
+  the real index, not fixtures — CSR now beats grep on the founding-conversation
+  benchmark.
+- **Derivation Ledger**: tracks which injected context was derived from where,
+  with knapsack-style token-budget injection.
+- **Injection Governor**: reuse tracking, anti-flap budget, and holdout logic to
+  keep repeated injections from thrashing.
+
+#### Episode Pickup + Intent Routing
+- **Episode index at SessionStart**: recent episodes rendered as a pickup menu
+  (newest first, outcome-tagged) with one-call `csr_reflect_on_past` lookups.
+- **CONTINUUM block**: last-session state (LAST / NEXT / anchors) injected at
+  SessionStart so "what were we doing?" needs zero re-derivation.
+- **Semantic intent classifier** for UserPromptSubmit Route A: K-intent
+  classification via exemplar embeddings over the existing MiniLM model — no
+  new model shipped. Continue ≥ 0.60, StateRecall ≥ 0.55; probe cache in
+  `~/.claude-self-reflect/intent_probes.json`.
+- **Recency-weighted episode correlation** (Route B) with a 7-day half-life.
+
+#### Conversation-Provenance Code Graph
+- **`csr_code_graph`** (13th MCP tool): query which conversations touched which
+  functions/files — AST anchors link code symbols to the sessions that shaped
+  them.
+
+### 🐛 Fixes (since 2026-06-10)
+- **Import was blind to 99% of each conversation**: `tool_result` content was
+  dropped and chunking was fixed at 50 messages regardless of size. Now embeds
+  tool results with size-based chunking — recall coverage went from ~1% to
+  effectively full transcripts.
+- **Injection quality pass**: meta-session gating, weak-anchor suppression,
+  self-referential noise filtering, micro-session story exclusion, and
+  zero-signal NEXT/TODOS suppression — SessionStart injection now reads as
+  history, not noise.
+- **Episode self-pollution**: recursive hook guard (`CSR_DISABLE_RECURSIVE_HOOKS`
+  now honored) + agent-prompt import skip; CSR no longer indexes its own
+  briefing agents.
+
 ### 🔧 Internal
 - Version aligned across `package.json` and the `csr-engine` crate (→ 9.2.0);
   the MCP server now reports the real release version via `binary_version`.
 - Zero clippy warnings restored across lib, tests, and examples.
+- Test suite at release: 467 lib + 42 hooks + 57 integration, zero failures.
 
 ## [7.1.9] - 2026-01-05
 

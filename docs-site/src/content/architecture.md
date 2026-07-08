@@ -49,7 +49,7 @@ Single database at `~/.claude-self-reflect/csr-engine.db`. Thread-safe via `Mute
 Stores: conversation chunks, vector embeddings, reflections (stored insights), enrichment state, retrieval events (for TAD scoring), import deduplication state.
 
 ### MCP Server (`src/mcp/`)
-Built on rmcp 0.15. Exposes 12 tools via Model Context Protocol. Runs as stdio server — Claude Code starts it on demand. No HTTP, no ports, no long-running daemon.
+Built on rmcp. Exposes 13 tools via Model Context Protocol. Runs as stdio server — Claude Code starts it on demand. No HTTP, no ports, no long-running daemon.
 
 ### Enrichment Pipeline (`src/extraction/`)
 Three-layer progressive enrichment. Each layer supersedes the previous in the search index:
@@ -87,6 +87,14 @@ source code → language detect → tree-sitter parse → AST → extract nodes 
 | TSX | `.tsx` | tree-sitter-tsx |
 
 AST parsing is wrapped in `catch_unwind` for robustness — malformed code won't crash the engine.
+
+### Continuity Engine (`src/provenance.rs`, `src/ledger/`, `src/governor/`)
+Provenance-aware retrieval added in v9.2. Every chunk carries speaker attribution, source conversation, and supersession state. The re-ranker demotes assistant scaffold text (proposals, plans) and boosts primary sources (decisions, outcomes), so recall favors what actually happened. A Derivation Ledger tracks where injected context came from, and an Injection Governor applies reuse tracking and an anti-flap budget so repeated prompts don't thrash the same context in and out.
+
+Verified live: `csr-engine eval --continuity-live` probes the real index (not fixtures) against a grep baseline.
+
+### Code Graph (`src/storage/codegraph.rs`)
+Conversation-provenance code graph. AST anchors (function-level, body-hashed) link code symbols to the sessions that created or modified them. Queried via the `csr_code_graph` MCP tool.
 
 ### Injection Engine (`src/injection/`)
 Token-budgeted context injection for hooks. Multi-signal scoring model:
