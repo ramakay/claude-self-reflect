@@ -19,7 +19,7 @@ CSR is a single 44MB binary. SQLite, HNSW search, FastEmbed embeddings, MCP serv
 | **Install** | `curl \| sh` (one command) | npm + Docker + Python + DB |
 | **Dependencies** | None | Docker, Python, vector DB, Node.js |
 | **Processes** | 1 (on-demand) | 3-5 background services |
-| **Startup** | 93ms (cached) | Seconds to minutes |
+| **Startup** | ~150ms (cached) | Seconds to minutes |
 | **Search** | <1ms (HNSW) | 10-100ms typical |
 
 ### Active Injection, Not Passive Search
