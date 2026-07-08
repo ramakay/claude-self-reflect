@@ -7,6 +7,7 @@
 //! 4. Exits with code 0 (never blocks the session)
 
 pub mod install;
+pub mod intent;
 pub mod post_tool_use;
 pub mod precompact;
 pub mod prompt_submit;

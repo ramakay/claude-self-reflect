@@ -168,9 +168,10 @@ csr-engine/target/
 .claude/slash-commands/
 # .mcp.json — tracked for plugin marketplace (not user-local)
 
-# Legacy Python test/hook/example dirs (removed in v8)
-tests/
-hooks/
-examples/
-video/
+# Legacy Python test/hook/example dirs (removed in v8) — root-anchored so
+# csr-engine/tests/ and csr-engine/src/hooks/ stay trackable
+/tests/
+/hooks/
+/examples/
+/video/
 pytest.ini

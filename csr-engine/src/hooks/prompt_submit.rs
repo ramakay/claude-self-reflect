@@ -93,13 +93,64 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         return Ok(());
     }
 
-    // Fast-path: skip short prompts
-    if prompt.len() < MIN_PROMPT_LENGTH {
+    // Fast-path: skip slash commands
+    if prompt.starts_with('/') {
         return Ok(());
     }
 
-    // Fast-path: skip slash commands
-    if prompt.starts_with('/') {
+    // Bare acknowledgments ("ok", "y") carry no intent signal worth an
+    // embedding pass.
+    if prompt.trim().len() < 3 {
+        return Ok(());
+    }
+
+    let embeddings = engine.embeddings();
+
+    // P-1 fix: embed prompt ONCE — reused by intent classification, chunk
+    // and reflection searches. Short prompts are embedded too: "keep at it"
+    // is under MIN_PROMPT_LENGTH yet is exactly the continuation case where
+    // memory IS the task — the literal list above only catches stock phrasings.
+    let query_vec = {
+        let q = prompt.to_string();
+        let emb = embeddings.clone();
+        match tokio::task::spawn_blocking(move || emb.embed_single(&q)).await {
+            Ok(Ok(v)) => v,
+            _ => return Ok(()), // Can't embed → nothing to inject
+        }
+    };
+
+    // Route A (semantic): nearest-prototype intent classification over the
+    // same embedding space. The literal phrase match above catches exact
+    // continuations for free; this catches rephrasings ("keep at it",
+    // "where did we leave off") and replaces the single-intent
+    // STATE_RECALL_PROBES check. Falls through to Route B when the prompt
+    // is a content question about specific past work.
+    if let Some(probes) = crate::hooks::intent::ProbeSet::load_or_build(embeddings).await {
+        if std::env::var("CSR_DEBUG_CORRELATE").is_ok() {
+            for (i, s) in probes.scores(&query_vec) {
+                eprintln!("CSR intent score: {i:?} {s:.3}");
+            }
+        }
+        if let Some((intent, _score)) = probes.classify(&query_vec) {
+            if let Some((ep, age)) = crate::hooks::session_start::latest_tier0_episode(engine, cwd)
+            {
+                let reason = match intent {
+                    crate::hooks::intent::Intent::Continue => {
+                        "the user asked to continue; the episode below is the work being resumed."
+                    }
+                    crate::hooks::intent::Intent::StateRecall => {
+                        "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity)."
+                    }
+                };
+                emit_pickup(&ep, &age, reason);
+                return Ok(());
+            }
+        }
+    }
+
+    // Below MIN_PROMPT_LENGTH there is no searchable content beyond intent —
+    // and intent abstained above. Stop before content search.
+    if prompt.len() < MIN_PROMPT_LENGTH {
         return Ok(());
     }
 
@@ -118,7 +169,6 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     }
 
     let storage = engine.storage();
-    let embeddings = engine.embeddings();
     let search = engine.search();
 
     // Detect session continuity: find the most recent session in this project
@@ -134,37 +184,6 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // TODO: scope anti-patterns by project once outcome reflections carry project tags (Codex H-1)
     let anti_patterns =
         anti_pattern::find_anti_patterns(storage, embeddings, search, prompt, 0.5, 2).await;
-
-    // P-1 fix: embed prompt ONCE for chunk + reflection searches (saves ~5ms per prompt)
-    let query_vec = {
-        let q = prompt.to_string();
-        let emb = embeddings.clone();
-        match tokio::task::spawn_blocking(move || emb.embed_single(&q)).await {
-            Ok(Ok(v)) => v,
-            _ => return Ok(()), // Can't embed → nothing to inject
-        }
-    };
-
-    // Route A′ pickup: state-recall prompts ("what were we working on",
-    // "where did we leave off") are continuation-intent even when long
-    // enough to embed — recency picks the episode, same as the literal
-    // "continue" route. Checked semantically against STATE_RECALL_PROBES so
-    // rephrasings route identically; falls through to Route B when the
-    // prompt is a content question about specific past work.
-    let recall_sim = state_recall_similarity(embeddings, &query_vec).await;
-    if std::env::var("CSR_DEBUG_CORRELATE").is_ok() {
-        eprintln!("CSR state-recall similarity: {:.3}", recall_sim);
-    }
-    if recall_sim >= STATE_RECALL_MIN {
-        if let Some((ep, age)) = crate::hooks::session_start::latest_tier0_episode(engine, cwd) {
-            emit_pickup(
-                &ep,
-                &age,
-                "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity).",
-            );
-            return Ok(());
-        }
-    }
 
     // Route B pickup: episode correlation. A content prompt may be re-asking
     // an already-solved problem or retelling past context from lossy human
@@ -407,62 +426,6 @@ fn emit_pickup(ep: &crate::hooks::stop::Episode, age: &str, reason: &str) {
         crate::hooks::session_start::format_tier0_block(ep, &[], age)
     );
     println!("Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything.");
-}
-
-/// Canonical state-recall intent probes for Route A′. A prompt that embeds
-/// close to any of these is asking "what is the state of our work" — a
-/// continuation-intent question that recency must answer, not similarity.
-/// Route B structurally cannot serve it: the prior session's narrative
-/// rarely shares the question's words, so the only reflections clearing the
-/// raw gate are stale copies of the SAME question (measured 2026-07-08: the
-/// prior session's reflections never entered the top-50 while a 25-day-old
-/// prompt-echo anchored at 0.56). Probes, not keywords, so rephrasings and
-/// overexplained retellings route the same way.
-const STATE_RECALL_PROBES: &[&str] = &[
-    "what were we working on last, what should we do next",
-    "where did we leave off in the previous session, what is the current status of our work",
-    "pick up where we left off and continue the work from last time",
-];
-
-/// Minimum cosine between the prompt and the closest state-recall probe for
-/// Route A′ to fire. Calibrated live 2026-07-08 against the real model:
-/// recall phrasings scored 0.60–1.00 ("where did we leave off" 0.601,
-/// "What did we work on today, whats next?" 0.782); mixed recall+content
-/// scored 0.45 ("did we finish the sessionstart work?" — correctly Route B,
-/// it names the work); pure content questions scored ≤0.07. 0.55 splits the
-/// 0.45↔0.60 gap.
-const STATE_RECALL_MIN: f32 = 0.55;
-
-/// Plain cosine similarity; 0.0 when either vector has zero norm.
-fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na * nb)
-    }
-}
-
-/// Max cosine between the prompt vector and the state-recall probes.
-async fn state_recall_similarity(
-    embeddings: &std::sync::Arc<crate::embeddings::EmbeddingEngine>,
-    query_vec: &[f32],
-) -> f32 {
-    let emb = embeddings.clone();
-    let probe_vecs = tokio::task::spawn_blocking(move || {
-        STATE_RECALL_PROBES
-            .iter()
-            .filter_map(|p| emb.embed_single(p).ok())
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default();
-    probe_vecs
-        .iter()
-        .map(|p| cosine_sim(query_vec, p))
-        .fold(0.0, f32::max)
 }
 
 /// Search floor for episode correlation — well below the firing threshold so
@@ -1022,24 +985,6 @@ pub fn symbol_overlap(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- state-recall routing (Route A′) ---
-
-    #[test]
-    fn cosine_sim_identical_is_one() {
-        let v = vec![0.6, 0.8, 0.0];
-        assert!((cosine_sim(&v, &v) - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_sim_orthogonal_is_zero() {
-        assert!(cosine_sim(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_sim_zero_vector_is_zero() {
-        assert_eq!(cosine_sim(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
-    }
 
     // --- episode recency ranking (Route B stale-anchor fix) ---
 
