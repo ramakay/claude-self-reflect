@@ -13,6 +13,15 @@ updates:
       - "rust"
     commit-message:
       prefix: "deps(cargo)"
+    ignore:
+      # rmcp 1.7 breaks Content/RawResource API — migration deferred (#203)
+      - dependency-name: "rmcp"
+        versions: [">=1.7"]
+      # ast-grep 0.43 breaks Language trait API — migration deferred (#207/#208)
+      - dependency-name: "ast-grep-core"
+        versions: [">=0.43"]
+      - dependency-name: "ast-grep-language"
+        versions: [">=0.43"]
 
   # npm installer shim
   - package-ecosystem: "npm"
