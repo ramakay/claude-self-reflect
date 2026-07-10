@@ -9,7 +9,7 @@ description = "Claude Self-Reflect: Rust MCP server with embedded vector search"
 rmcp = { version = "~1.6", features = ["server", "transport-io", "macros", "elicitation"] }
 fastembed = "5.9"
 hnsw_rs = "0.3"
-rusqlite = { version = "0.38", features = ["bundled", "vtab"] }
+rusqlite = { version = "0.40", features = ["bundled", "vtab"] }
 notify = "8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
