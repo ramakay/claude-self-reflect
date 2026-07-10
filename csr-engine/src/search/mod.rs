@@ -12,6 +12,7 @@ use hnsw_rs::api::AnnT;
 use hnsw_rs::hnsw::Hnsw;
 use hnsw_rs::hnswio::HnswIo;
 use hnsw_rs::prelude::DistCosine;
+use hnsw_rs::prelude::Distance;
 use serde::{Deserialize, Serialize};
 
 /// A search result with score and ID.
@@ -41,6 +42,11 @@ const MAX_NB_CONNECTION: usize = 16; // M
 const EF_CONSTRUCTION: usize = 200;
 const EF_SEARCH: usize = 100;
 const MAX_LAYER: usize = 16;
+
+// Below this many points, bypass HNSW and scan exactly. HNSW is approximate and
+// has misbehaved on near-empty indexes (CI: 1-point search returned no neighbours);
+// exact cosine over ≤256 384-dim vectors is well under a millisecond anyway.
+const EXACT_SCAN_THRESHOLD: usize = 256;
 
 const MANIFEST_VERSION: u32 = 1;
 
@@ -197,6 +203,9 @@ impl SearchEngine {
         limit: usize,
         min_score: f32,
     ) -> Vec<SearchResult> {
+        if id_map.len() <= EXACT_SCAN_THRESHOLD {
+            return Self::exact_scan(index, id_map, query_vec, limit, min_score, None);
+        }
         let neighbours = index.search(query_vec, limit, EF_SEARCH);
 
         let mut results: Vec<SearchResult> = neighbours
@@ -215,6 +224,50 @@ impl SearchEngine {
             })
             .collect();
 
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit);
+        results
+    }
+
+    /// Exact cosine scan over every point in the index. Used below
+    /// EXACT_SCAN_THRESHOLD where HNSW's approximation isn't worth its
+    /// nondeterminism and an exhaustive pass is effectively free.
+    fn exact_scan(
+        index: &Hnsw<'static, f32, DistCosine>,
+        id_map: &[String],
+        query_vec: &[f32],
+        limit: usize,
+        min_score: f32,
+        allowed_ids: Option<&HashSet<String>>,
+    ) -> Vec<SearchResult> {
+        let mut results: Vec<SearchResult> = index
+            .get_point_indexation()
+            .into_iter()
+            .filter_map(|point| {
+                let d_id = point.get_origin_id();
+                if d_id >= id_map.len() || id_map[d_id].is_empty() {
+                    return None;
+                }
+                if let Some(allowed) = allowed_ids {
+                    if !allowed.contains(&id_map[d_id]) {
+                        return None;
+                    }
+                }
+                let score = 1.0 - DistCosine {}.eval(point.get_v(), query_vec);
+                if score >= min_score {
+                    Some(SearchResult {
+                        id: id_map[d_id].clone(),
+                        score,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -248,6 +301,16 @@ impl SearchEngine {
     ) -> Vec<SearchResult> {
         if self.chunk_id_map.is_empty() || allowed_ids.is_empty() {
             return Vec::new();
+        }
+        if self.chunk_id_map.len() <= EXACT_SCAN_THRESHOLD {
+            return Self::exact_scan(
+                &self.chunk_index,
+                &self.chunk_id_map,
+                query_vec,
+                limit,
+                min_score,
+                Some(allowed_ids),
+            );
         }
 
         // Adaptive over-fetch: start at 5x, escalate to full index if sparse
@@ -571,6 +634,51 @@ pub fn cleanup_stale_index_files(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_index_search_never_empty() {
+        // Regression: CI flake in test_session_end_v3_extraction — HNSW search on a
+        // 1-point index intermittently returned no neighbours. Same degenerate case
+        // hits fresh installs: first reflection stored, first search finds nothing.
+        for i in 0..500 {
+            let mut engine = SearchEngine::new(100);
+            let v: Vec<f32> = (0..384)
+                .map(|j| (((i * 384 + j) as f32) * 0.01).sin())
+                .collect();
+            engine.insert_reflection(format!("r{i}"), v.clone());
+            let results = engine.search_reflections(&v, 5, 0.1);
+            assert!(
+                !results.is_empty(),
+                "iteration {i}: self-query on 1-point reflection index returned empty"
+            );
+            let mut engine2 = SearchEngine::new(100);
+            engine2.insert_chunk(format!("c{i}"), v.clone());
+            let results2 = engine2.search_chunks(&v, 5, 0.1);
+            assert!(
+                !results2.is_empty(),
+                "iteration {i}: self-query on 1-point chunk index returned empty"
+            );
+        }
+    }
+
+    #[test]
+    fn tiny_index_exact_scan_skips_blanked_and_respects_threshold() {
+        let mut engine = SearchEngine::new(100);
+        let a: Vec<f32> = (0..384).map(|j| (j as f32 * 0.01).sin()).collect();
+        let b: Vec<f32> = (0..384).map(|j| (j as f32 * 0.01).cos()).collect();
+        engine.insert_reflection("keep".into(), a.clone());
+        engine.insert_reflection("gone".into(), b.clone());
+        engine.remove_reflection("gone");
+
+        let results = engine.search_reflections(&a, 5, 0.1);
+        assert!(results.iter().any(|r| r.id == "keep"));
+        assert!(
+            !results.iter().any(|r| r.id.is_empty() || r.id == "gone"),
+            "blanked entries must not surface in exact-scan path"
+        );
+        // Impossible threshold → empty, threshold still respected on exact path.
+        assert!(engine.search_reflections(&a, 5, 1.01).is_empty());
+    }
 
     #[test]
     fn test_load_allows_additive_drift_rebuilds_on_deletion() {
