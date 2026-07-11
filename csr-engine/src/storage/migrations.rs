@@ -299,7 +299,19 @@ pub fn run(conn: &Connection) -> Result<()> {
     // Engine metadata KV — caches expensive computed state (e.g. integrity_check
     // results, which cost ~10s on multi-GB DBs and must not run per status call).
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS narrative_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            call_site TEXT NOT NULL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            success INTEGER NOT NULL DEFAULT 1
+         );",
     )?;
 
     Ok(())

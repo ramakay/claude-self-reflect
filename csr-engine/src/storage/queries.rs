@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use chrono;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::import::ConversationChunk;
 use crate::provenance::{ChunkProvenance, Speaker};
@@ -1133,6 +1133,81 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+// ─── Narrative usage accounting ───
+
+pub struct NarrativeUsageRow {
+    pub call_site: String, // "briefing" | "story"
+    pub model: String,     // resolved model id or "unknown"
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub duration_ms: i64,
+    pub success: bool,
+}
+
+#[derive(Default, serde::Serialize)]
+pub struct NarrativeUsageSummary {
+    pub calls_today: i64,
+    pub tokens_today: i64, // input + output, today
+    pub calls_total: i64,
+    pub tokens_total: i64,
+    pub last_model: Option<String>,
+}
+
+pub fn record_narrative_usage(conn: &Connection, row: &NarrativeUsageRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO narrative_usage
+         (call_site, model, input_tokens, output_tokens, cache_read_tokens,
+          cache_creation_tokens, duration_ms, success)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            row.call_site,
+            row.model,
+            row.input_tokens,
+            row.output_tokens,
+            row.cache_read_tokens,
+            row.cache_creation_tokens,
+            row.duration_ms,
+            row.success as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn narrative_usage_summary(conn: &Connection) -> Result<NarrativeUsageSummary> {
+    let (calls_total, tokens_total, calls_today, tokens_today) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(input_tokens + output_tokens), 0),
+                COALESCE(SUM(CASE WHEN ts >= date('now') THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN ts >= date('now') THEN input_tokens + output_tokens ELSE 0 END), 0)
+         FROM narrative_usage",
+        [],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        },
+    )?;
+    let last_model = conn
+        .query_row(
+            "SELECT model FROM narrative_usage ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(NarrativeUsageSummary {
+        calls_today,
+        tokens_today,
+        calls_total,
+        tokens_total,
+        last_model,
+    })
+}
+
 // ─── TAD: Retrieval Event Tracking ───
 
 /// Log a retrieval event (memory was surfaced during a hook).
@@ -1578,4 +1653,48 @@ pub fn list_session_ids(conn: &Connection, prefix: &str, limit: usize) -> Result
     let rows = stmt.query_map(params![pattern, limit as i64], |row| row.get(0))?;
     rows.collect::<std::result::Result<Vec<String>, _>>()
         .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::migrations;
+
+    fn mem() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrations::run(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_narrative_usage_record_and_summary() {
+        let conn = mem();
+        let row = NarrativeUsageRow {
+            call_site: "briefing".into(),
+            model: "claude-haiku-4-5".into(),
+            input_tokens: 1500,
+            output_tokens: 300,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            duration_ms: 4200,
+            success: true,
+        };
+        record_narrative_usage(&conn, &row).unwrap();
+        record_narrative_usage(&conn, &row).unwrap();
+
+        let s = narrative_usage_summary(&conn).unwrap();
+        assert_eq!(s.calls_total, 2);
+        assert_eq!(s.tokens_total, 3600);
+        assert_eq!(s.calls_today, 2); // rows stamped 'now' are today
+        assert_eq!(s.tokens_today, 3600);
+        assert_eq!(s.last_model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn test_narrative_usage_summary_empty() {
+        let conn = mem();
+        let s = narrative_usage_summary(&conn).unwrap();
+        assert_eq!(s.calls_total, 0);
+        assert_eq!(s.last_model, None);
+    }
 }
