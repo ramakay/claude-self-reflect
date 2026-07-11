@@ -213,6 +213,12 @@ csr-engine daemon
 | Token compression | 100% | 18% (82% reduction) |
 | Cost per conversation | - | ~$0.012 (Batch API) |
 
+> **Token transparency:** Optional AI narratives (session briefings + story extraction) run
+> `claude -p` against your existing Claude subscription — smallest available model, capped
+> prompts, debounced, and skipped entirely when nothing changed. Every call is counted:
+> `csr-engine status` shows calls and tokens spent today. Disable anytime with
+> `CSR_NO_AI_NARRATIVES=1`; pin a model with `CSR_NARRATIVE_MODEL=<model>`.
+
 </details>
 
 <details>
