@@ -78,6 +78,11 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
     let project = resolve_project_from_cwd(&cwd.to_string_lossy());
     let project_name = project.as_deref().unwrap_or("unknown");
 
+    if crate::narrative::narratives_disabled() {
+        tracing::debug!("AI narratives disabled via CSR_NO_AI_NARRATIVES — skipping briefing");
+        return Ok(());
+    }
+
     // Debounce: skip if a briefing for this project was generated recently. Avoids
     // spawning a fresh `claude -p` on every resume/compact within a working session.
     if recent_briefing_exists(engine, project_name, BRIEFING_DEBOUNCE_MINUTES) {
@@ -103,77 +108,114 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
 
     let prompt = format!("{}{}", BRIEFING_INSTRUCTION, episodes);
 
-    // Shell out to claude -p with Haiku model.
+    // Shell out to claude -p, walking the narrative model chain on model-not-found.
     // Block on tokio's spawn_blocking since std::process::Command is sync.
-    let briefing = tokio::task::spawn_blocking(move || invoke_haiku_briefing(&prompt)).await??;
+    let started = std::time::Instant::now();
+    let parsed = tokio::task::spawn_blocking(move || invoke_narrative_briefing(&prompt)).await??;
+    let duration_ms = started.elapsed().as_millis() as i64;
 
-    if briefing.trim().is_empty() {
+    // Accounting is best-effort: a failed insert must never fail the hook.
+    let _ = engine
+        .storage()
+        .record_narrative_usage(&crate::storage::NarrativeUsageRow {
+            call_site: "briefing".into(),
+            model: parsed.model.clone(),
+            input_tokens: parsed.input_tokens,
+            output_tokens: parsed.output_tokens,
+            cache_read_tokens: parsed.cache_read_tokens,
+            cache_creation_tokens: parsed.cache_creation_tokens,
+            duration_ms,
+            success: true,
+        });
+
+    if parsed.text.trim().is_empty() {
         eprintln!("CSR: session-briefing returned empty output");
         return Ok(());
     }
 
     // Store briefing as a tagged reflection — replace any prior briefing for this project
-    store_briefing(engine, project_name, &briefing)?;
+    store_briefing(engine, project_name, &parsed.text)?;
 
     Ok(())
 }
 
-/// Invoke `claude -p --model haiku-4-5 "<prompt>"` and capture stdout.
-/// Returns the briefing text, or an error if the invocation fails or times out.
+/// Invoke `claude -p` with JSON output, walking the narrative model candidate
+/// chain on model-not-found. Returns the parsed narrative, or an error if the
+/// invocation fails or times out.
 ///
 /// The episodes are embedded in `prompt`, so Haiku needs NO tools. We pass an
 /// empty MCP config with `--strict-mcp-config` so the subprocess loads ZERO MCP
 /// servers (not even csr-engine) — fastest possible `claude -p` startup and no
 /// recursive csr-engine spawn.
-fn invoke_haiku_briefing(prompt: &str) -> Result<String> {
+fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNarrative> {
     let mcp_config_path = write_minimal_mcp_config()?;
+    let mut last_err: Option<anyhow::Error> = None;
 
-    let mut child = Command::new("claude")
-        .arg("-p")
-        // The prompt MUST precede --mcp-config: that flag is variadic in the
-        // claude CLI and consumes any trailing positional arg as another config
-        // file path, failing with ENAMETOOLONG on the episode text.
-        .arg(prompt)
-        .arg("--model")
-        .arg("claude-haiku-4-5-20251001")
-        .arg("--output-format")
-        .arg("text")
-        .arg("--strict-mcp-config")
-        .arg("--mcp-config")
-        .arg(&mcp_config_path)
-        // No --dangerously-skip-permissions: episodes are session-derived text and
-        // the empty MCP config means zero tools, so this is a pure text summary.
-        // Skipping permissions would only widen the blast radius if an episode
-        // contained adversarial content. Print mode won't prompt interactively.
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .env("CSR_DISABLE_RECURSIVE_HOOKS", "1") // signal to nested csr-engine to skip hooks
-        .spawn()?;
+    for candidate in crate::narrative::model_candidates() {
+        let mut cmd = Command::new("claude");
+        cmd.arg("-p")
+            // The prompt MUST precede --mcp-config: that flag is variadic in the
+            // claude CLI and consumes any trailing positional arg as another config
+            // file path, failing with ENAMETOOLONG on the episode text.
+            .arg(prompt);
+        if let Some(model) = &candidate {
+            cmd.arg("--model").arg(model);
+        }
+        cmd.arg("--output-format")
+            .arg("json")
+            .arg("--strict-mcp-config")
+            .arg("--mcp-config")
+            .arg(&mcp_config_path)
+            // No --dangerously-skip-permissions: episodes are session-derived text and
+            // the empty MCP config means zero tools, so this is a pure text summary.
+            // Skipping permissions would only widen the blast radius if an episode
+            // contained adversarial content. Print mode won't prompt interactively.
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .env("CSR_DISABLE_RECURSIVE_HOOKS", "1"); // signal to nested csr-engine to skip hooks
 
-    // Manual timeout: poll for completion up to BRIEFING_TIMEOUT_SECS.
-    let timeout = Duration::from_secs(BRIEFING_TIMEOUT_SECS);
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait()? {
-            Some(_status) => break,
-            None => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    anyhow::bail!("claude -p timed out after {}s", BRIEFING_TIMEOUT_SECS);
+        let mut child = cmd.spawn()?;
+
+        // Manual timeout: poll for completion up to BRIEFING_TIMEOUT_SECS.
+        let timeout = Duration::from_secs(BRIEFING_TIMEOUT_SECS);
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait()? {
+                Some(_status) => break,
+                None => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        anyhow::bail!("claude -p timed out after {}s", BRIEFING_TIMEOUT_SECS);
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
                 }
-                std::thread::sleep(Duration::from_millis(200));
             }
+        }
+
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if crate::narrative::is_model_not_found(&stderr) {
+                tracing::warn!(model = ?candidate, "narrative model unavailable — trying next candidate");
+                last_err = Some(anyhow::anyhow!("model unavailable: {}", stderr));
+                continue; // walk the chain ONLY on model-not-found
+            }
+            anyhow::bail!("claude -p failed: {}", stderr);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        match crate::narrative::parse_claude_json(&stdout) {
+            Some(parsed) => return Ok(parsed),
+            None if crate::narrative::is_model_not_found(&stdout) => {
+                last_err = Some(anyhow::anyhow!("model unavailable (json error result)"));
+                continue;
+            }
+            None => anyhow::bail!("claude -p returned unparseable/error JSON"),
         }
     }
 
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("claude -p failed: {}", stderr);
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no narrative model candidates succeeded")))
 }
 
 /// Store briefing as a tagged reflection. Replaces any previous briefing
@@ -377,5 +419,17 @@ mod tests {
         assert!(is_meta_episode(analyst));
         assert!(is_meta_episode(summarizer));
         assert!(!is_meta_episode(real));
+    }
+
+    #[test]
+    fn test_narratives_disabled_gate_is_callable() {
+        // Regression guard: handle_inner calls crate::narrative::narratives_disabled()
+        // as its opt-out gate. We don't mutate CSR_NO_AI_NARRATIVES here (that env var
+        // is also touched by narrative.rs's own tests in the same --lib test binary,
+        // and cargo test runs tests in parallel by default — mutating shared process
+        // env from two test modules is a real race). Just prove the gate function is
+        // reachable and returns a bool without disabling narratives process-wide for
+        // every other test in this binary.
+        let _ = crate::narrative::narratives_disabled();
     }
 }
