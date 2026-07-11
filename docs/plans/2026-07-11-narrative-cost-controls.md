@@ -49,7 +49,10 @@ echo "hi" | claude --model no-such-model-zz9 -p - --output-format json; echo "ex
 ```
 Expected: non-zero exit and/or a JSON body with `is_error: true`; note the exact stderr/JSON error wording.
 
-RESEARCH: Record the wording here. Task 3's `is_model_not_found()` matches lowercase substrings `"model"` + (`"not found"` | `"invalid"` | `"unknown"`); extend that list if the real wording differs.
+RESEARCH: Recorded 2026-07-11. `echo "hi" | claude --model no-such-model-zz9 -p - --output-format json` exits non-zero (`exit=1`) and returns a JSON body with `"is_error":true`, `"api_error_status":404`, `"terminal_reason":"api_error"`, and `"result"`:
+> "There's an issue with the selected model (no-such-model-zz9). It may not exist or you may not have access to it. Run --model to pick a different model."
+
+This does **not** contain "not found", "invalid", or "unknown" — only the bare word "model". The plan's assumed substring list (`"model"` + one of `"not found"`/`"invalid"`/`"unknown"`) would MISS this real wording. Task 3's `is_model_not_found()` must instead match lowercase `"model"` + (`"issue with the selected model"` | `"may not exist"` | `"not found"` | `"invalid"` | `"unknown"`), or more robustly: prefer keying off `is_error == true && api_error_status == 404` combined with the word `"model"` appearing in `result`, since the prose wording is not contractually stable.
 
 - [ ] **Step 3: Confirm the `haiku` alias resolves**
 
