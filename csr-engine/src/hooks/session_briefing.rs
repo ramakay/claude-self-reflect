@@ -1,5 +1,6 @@
-//! Session briefing hook — shells out to `claude -p --model haiku` to generate
-//! a proactive briefing from recent session episodes.
+//! Session briefing hook — shells out to `claude -p`, walking a model chain
+//! (env override → haiku alias → CLI default) to generate a proactive
+//! briefing from recent session episodes.
 //!
 //! Runs async at SessionStart (non-blocking). Output is stored as a tagged
 //! reflection (`session_briefing` tag) that the next UserPromptSubmit hook
@@ -106,6 +107,28 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
         return Ok(());
     }
 
+    // Content-hash cache: if the episode window is byte-identical to the one
+    // that produced the last successful briefing, a new Haiku call would emit
+    // the same briefing — skip it entirely. Debounce (above) catches rapid
+    // resumes; this catches "resumed hours later but nothing new happened".
+    let hash_key = format!("briefing_input_hash:{}", project_name);
+    let episode_digest = format!("{:016x}", crate::narrative::fnv1a_64(episodes.as_bytes()));
+    if engine
+        .storage()
+        .get_meta(&hash_key)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(episode_digest.as_str())
+        && briefing_exists(engine, project_name)
+    {
+        tracing::debug!(
+            project = project_name,
+            "episodes unchanged since last briefing — skipping claude -p"
+        );
+        return Ok(());
+    }
+
     let prompt = format!("{}{}", BRIEFING_INSTRUCTION, episodes);
 
     // Shell out to claude -p, walking the narrative model chain on model-not-found.
@@ -135,6 +158,7 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
 
     // Store briefing as a tagged reflection — replace any prior briefing for this project
     store_briefing(engine, project_name, &parsed.text)?;
+    let _ = engine.storage().set_meta(&hash_key, &episode_digest);
 
     Ok(())
 }
@@ -369,6 +393,23 @@ fn recent_briefing_exists(engine: &Engine, project: &str, within_minutes: i64) -
     })
 }
 
+/// True if ANY `session_briefing` reflection exists for this project, regardless
+/// of age. Used by the content-hash skip-gate: if the user deleted reflections
+/// (so no briefing exists at all), we must regenerate even when the episode
+/// digest matches a stale stored hash.
+fn briefing_exists(engine: &Engine, project: &str) -> bool {
+    let project_tag = format!("project_{}", project);
+    let Ok(existing) = engine
+        .storage()
+        .get_reflections_by_tag("session_briefing", 50)
+    else {
+        return false;
+    };
+    existing
+        .iter()
+        .any(|(_, _, tags, _)| tags.iter().any(|t| t == &project_tag))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,13 +464,25 @@ mod tests {
 
     #[test]
     fn test_narratives_disabled_gate_is_callable() {
-        // Regression guard: handle_inner calls crate::narrative::narratives_disabled()
-        // as its opt-out gate. We don't mutate CSR_NO_AI_NARRATIVES here (that env var
-        // is also touched by narrative.rs's own tests in the same --lib test binary,
-        // and cargo test runs tests in parallel by default — mutating shared process
-        // env from two test modules is a real race). Just prove the gate function is
-        // reachable and returns a bool without disabling narratives process-wide for
-        // every other test in this binary.
+        // Callability smoke test: proves crate::narrative::narratives_disabled() is
+        // reachable and returns a bool. Does NOT exercise handle_inner's actual gate
+        // logic — we don't mutate CSR_NO_AI_NARRATIVES here (that env var is also
+        // touched by narrative.rs's own tests in the same --lib test binary, and cargo
+        // test runs tests in parallel by default — mutating shared process env from
+        // two test modules is a real race). Just prove the gate function is reachable
+        // and returns a bool without disabling narratives process-wide for every other
+        // test in this binary.
         let _ = crate::narrative::narratives_disabled();
+    }
+
+    #[test]
+    fn test_briefing_hash_key_roundtrip() {
+        // Digest must be stable and hex-encoded — it is persisted in the meta table.
+        let digest = format!("{:016x}", crate::narrative::fnv1a_64(b"episode window"));
+        assert_eq!(digest.len(), 16);
+        assert_eq!(
+            digest,
+            format!("{:016x}", crate::narrative::fnv1a_64(b"episode window"))
+        );
     }
 }
