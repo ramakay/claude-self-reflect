@@ -771,6 +771,64 @@ fn format_evolution_summary(
     parts.concat()
 }
 
+/// Exploration-intent injection: file pointers from the correlated episode.
+/// Payload over prose — each line is a path the agent can open immediately,
+/// and the footer is a ready-to-run recall call (agents obey literal calls,
+/// not "consider using" advice).
+///
+/// Not yet wired to a caller — the exploration-intent routing that invokes
+/// this belongs to a follow-up task; this fn ships pure + fully tested first.
+#[allow(dead_code)]
+pub(crate) fn format_code_map(ep: &crate::hooks::stop::Episode, age: &str) -> Option<String> {
+    let files: Vec<&String> = ep
+        .files_modified
+        .iter()
+        .filter(|f| !f.trim().is_empty())
+        .take(5)
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "CSR CODE MAP — prompt matches feature work from conv_{} ({}):\n",
+        ep.session_id, age
+    );
+    for f in &files {
+        // Path-suffix match: anchor.file may be absolute while files_modified
+        // entries are relative (or vice versa), depending on the extraction caller.
+        let anchor_count = ep
+            .anchors
+            .iter()
+            .filter(|a| a.file.ends_with(f.as_str()) || f.ends_with(a.file.as_str()))
+            .count();
+        let mut line = format!("  {}", f);
+        if anchor_count > 0 {
+            line.push_str(&format!(
+                " ({} anchor{})",
+                anchor_count,
+                if anchor_count == 1 { "" } else { "s" }
+            ));
+        }
+        // outcome is a plain String on Episode — use directly, no Option fallback.
+        line.push_str(&format!(" (outcome={})", ep.outcome));
+        // Char-boundary-safe truncate (paths are usually ASCII, but stay correct).
+        if line.len() > 120 {
+            let mut end = 120;
+            while end > 0 && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "Read these before mapping; full thread: csr_reflect_on_past(\"conv_{}\")\n",
+        ep.session_id
+    ));
+    Some(out)
+}
+
 /// Build compact code-graph slices for files/symbols named in the prompt.
 /// Returns at most 2 short lines, each carrying last-change provenance.
 fn build_graph_slices(
@@ -1139,5 +1197,65 @@ mod tests {
         ));
         assert!(!is_continuation_prompt("fix the auth bug"));
         assert!(!is_continuation_prompt("/continue"));
+    }
+
+    // --- format_code_map (Feature B, exploration-intent injection) ---
+
+    fn code_map_episode() -> crate::hooks::stop::Episode {
+        crate::hooks::stop::Episode {
+            schema: "csr_episode_v1".into(),
+            session_id: "abc123".into(),
+            project: "test-project".into(),
+            timestamp: "2026-05-17T00:00:00Z".into(),
+            request: "test request".into(),
+            investigated: vec![],
+            completed: "done".into(),
+            next_steps: None,
+            blockers: None,
+            outcome: "partial".into(),
+            error_signatures: vec![],
+            tools_used: vec![],
+            files_modified: vec![
+                "src/radio/RadioSheet.swift".into(),
+                "src/radio/ChannelRing.swift".into(),
+            ],
+            message_count: 10,
+            duration_minutes: 5,
+            todos: vec![],
+            approved_plan: None,
+            prev_episode_id: None,
+            anchors: vec![crate::extraction::anchors::FunctionAnchor {
+                file: "src/radio/RadioSheet.swift".into(),
+                node_kind: "file".into(),
+                name: "RadioSheet.swift".into(),
+                body_hash: "h".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn code_map_lists_files_with_anchor_counts_and_lookup() {
+        let out = format_code_map(&code_map_episode(), "2d ago").unwrap();
+        assert!(out.starts_with("CSR CODE MAP"));
+        assert!(out.contains("src/radio/RadioSheet.swift"));
+        assert!(out.contains("1 anchor"));
+        assert!(out.contains("outcome=partial"));
+        assert!(out.contains("csr_reflect_on_past(\"conv_abc123\")"));
+        assert!(out.contains("Read these before mapping"));
+    }
+
+    #[test]
+    fn code_map_none_when_no_files() {
+        let mut ep = code_map_episode();
+        ep.files_modified.clear();
+        assert!(format_code_map(&ep, "2d ago").is_none());
+    }
+
+    #[test]
+    fn code_map_caps_at_five_files() {
+        let mut ep = code_map_episode();
+        ep.files_modified = (0..9).map(|i| format!("src/file_{i}.swift")).collect();
+        let out = format_code_map(&ep, "1h ago").unwrap();
+        assert_eq!(out.matches("src/file_").count(), 5);
     }
 }
