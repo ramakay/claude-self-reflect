@@ -142,8 +142,29 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                         "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity).",
                     ),
                     crate::hooks::intent::Intent::Explore => {
-                        // Wired to CODE MAP emission in the codegraph-pickup plan Task 4.
-                        // Until then, explore prompts keep today's behavior (fall through).
+                        // Exploration prompt: the user is asking WHERE code lives. The
+                        // topic-matched episode (not the latest one) knows which files past
+                        // work touched — hand those over instead of letting the agent
+                        // re-map the codebase from scratch.
+                        let current_project =
+                            crate::search::cross_project::resolve_project_from_cwd(
+                                &cwd.to_string_lossy(),
+                            )
+                            .unwrap_or_default();
+                        if let Some((ep, age, _score)) = correlate_episode(
+                            engine,
+                            &query_vec,
+                            &current_project,
+                            input.session_id.as_deref(),
+                        )
+                        .await
+                        {
+                            if let Some(map) = format_code_map(&ep, &age) {
+                                println!("{}", map);
+                                return Ok(());
+                            }
+                        }
+                        // No correlated episode or no files — normal flow continues below.
                         None
                     }
                 };
@@ -789,10 +810,6 @@ fn path_suffix_match(a: &str, b: &str) -> bool {
 /// Payload over prose — each line is a path the agent can open immediately,
 /// and the footer is a ready-to-run recall call (agents obey literal calls,
 /// not "consider using" advice).
-///
-/// Not yet wired to a caller — the exploration-intent routing that invokes
-/// this belongs to a follow-up task; this fn ships pure + fully tested first.
-#[allow(dead_code)]
 pub(crate) fn format_code_map(ep: &crate::hooks::stop::Episode, age: &str) -> Option<String> {
     let files: Vec<&String> = ep
         .files_modified

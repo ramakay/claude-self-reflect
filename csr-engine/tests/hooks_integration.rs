@@ -878,6 +878,42 @@ fn test_prompt_submit_catch_all_never_fails() {
     assert!(result.is_ok(), "catch-all wrapper must always succeed");
 }
 
+#[test]
+fn test_explore_prompt_never_fails() {
+    // Same Engine::from_parts scaffold as test_prompt_submit_catch_all_never_fails.
+    // Prompt: exploration intent — empty index is fine; correlate finds nothing
+    // and the hook must still return Ok (stdout covered by format_code_map unit tests).
+    let input = csr_engine::hooks::HookInput {
+        prompt: Some("where is the code for the radio bottom sheet feature".to_string()),
+        ..Default::default()
+    };
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage,
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(csr_engine::hooks::prompt_submit::handle(
+        &input,
+        &engine,
+        std::path::Path::new("/tmp"),
+    ));
+
+    assert!(
+        result.is_ok(),
+        "explore-intent prompt_submit must never fail"
+    );
+}
+
 // ─── Install Config (Updated for 6 Hook Types) ───
 
 #[test]
