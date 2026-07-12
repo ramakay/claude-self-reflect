@@ -1742,4 +1742,26 @@ mod tests {
         assert_eq!(s.calls_total, 1);
         assert_eq!(s.calls_today, 1);
     }
+
+    #[test]
+    fn test_narrative_usage_failed_call_still_counts() {
+        let conn = mem();
+        let row = NarrativeUsageRow {
+            call_site: "story".into(),
+            model: "unknown".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            duration_ms: 150,
+            success: false,
+        };
+        record_narrative_usage(&conn, &row).unwrap();
+
+        let s = narrative_usage_summary(&conn).unwrap();
+        // Failed/attempted calls still count as calls — "calls" means attempts, not successes.
+        assert_eq!(s.calls_total, 1);
+        assert_eq!(s.calls_today, 1);
+        assert_eq!(s.tokens_total, 0);
+    }
 }

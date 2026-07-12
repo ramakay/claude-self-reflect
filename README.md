@@ -215,7 +215,7 @@ csr-engine daemon
 
 > **Token transparency:** Optional AI narratives (session briefings + story extraction) run
 > `claude -p` against your existing Claude subscription — smallest available model, capped
-> prompts, debounced, and skipped entirely when nothing changed. Every call is counted:
+> prompts, debounced, and skipped entirely when nothing changed. Every call — including failures and timeouts — is counted:
 > `csr-engine status` shows calls and tokens spent today; cache read/creation tokens (often
 > the majority of real usage) are tracked separately in the status JSON (`cache_tokens_today` /
 > `cache_tokens_total`). Disable anytime with

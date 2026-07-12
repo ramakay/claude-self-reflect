@@ -106,6 +106,7 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
             let mut child = match cmd
                 .args(["-p", "-", "--output-format", "json"])
                 .stdout(Stdio::piped())
+                // Piped intentionally — required for model-not-found detection on the failure path; do not revert to null().
                 .stderr(Stdio::piped())
                 .stdin(Stdio::piped())
                 .spawn()
@@ -378,7 +379,24 @@ async fn generate_and_store(
             text
         }
         None => {
-            log_story_event(project, conv_id, "skip:haiku_unavailable_or_timeout");
+            if crate::narrative::narratives_disabled() {
+                log_story_event(project, conv_id, "skip:narratives_disabled");
+            } else {
+                let _ =
+                    engine
+                        .storage()
+                        .record_narrative_usage(&crate::storage::NarrativeUsageRow {
+                            call_site: "story".into(),
+                            model: "unknown".into(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            duration_ms: 0,
+                            success: false,
+                        });
+                log_story_event(project, conv_id, "skip:haiku_unavailable_or_timeout");
+            }
             return Ok(());
         }
     };
@@ -433,6 +451,9 @@ fn acquire_lock_with_timeout(file: &std::fs::File, timeout: Duration) -> bool {
 /// Spawn a detached `csr-engine generate-story` process. Returns immediately.
 /// The child process outlives the caller — safe for SessionEnd.
 pub fn spawn_detached_story_generation(transcript: &str, cwd: &str) {
+    if crate::narrative::narratives_disabled() {
+        return;
+    }
     let project = resolve_project_from_cwd(cwd).unwrap_or_else(|| "unknown".to_string());
     let conv_id = std::path::Path::new(transcript)
         .file_stem()

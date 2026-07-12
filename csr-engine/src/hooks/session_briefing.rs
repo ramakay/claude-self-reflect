@@ -136,8 +136,27 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
     // Shell out to claude -p, walking the narrative model chain on model-not-found.
     // Block on tokio's spawn_blocking since std::process::Command is sync.
     let started = std::time::Instant::now();
-    let parsed = tokio::task::spawn_blocking(move || invoke_narrative_briefing(&prompt)).await??;
+    let result = tokio::task::spawn_blocking(move || invoke_narrative_briefing(&prompt)).await?;
     let duration_ms = started.elapsed().as_millis() as i64;
+    let parsed = match result {
+        Ok(p) => p,
+        Err(e) => {
+            // Best-effort: a failed insert must never mask the original error.
+            let _ = engine
+                .storage()
+                .record_narrative_usage(&crate::storage::NarrativeUsageRow {
+                    call_site: "briefing".into(),
+                    model: "unknown".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    duration_ms,
+                    success: false,
+                });
+            return Err(e);
+        }
+    };
 
     // Accounting is best-effort: a failed insert must never fail the hook.
     let _ = engine
