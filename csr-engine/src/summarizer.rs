@@ -139,7 +139,10 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
             }
             Ok(Some(output)) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                if crate::narrative::is_model_not_found(&stderr) {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                if crate::narrative::is_model_not_found(&stderr)
+                    || crate::narrative::is_model_not_found(&stdout)
+                {
                     continue; // next candidate
                 }
                 return None; // real failure — don't burn the chain on rate limits

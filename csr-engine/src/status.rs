@@ -46,6 +46,8 @@ pub struct NarrativeStatus {
     pub tokens_today: i64,
     pub calls_total: i64,
     pub tokens_total: i64,
+    pub cache_tokens_today: i64,
+    pub cache_tokens_total: i64,
     pub last_model: Option<String>,
     pub disabled: bool,
 }
@@ -177,6 +179,8 @@ fn gather_narratives(storage: &Storage) -> NarrativeStatus {
         tokens_today: summary.tokens_today,
         calls_total: summary.calls_total,
         tokens_total: summary.tokens_total,
+        cache_tokens_today: summary.cache_tokens_today,
+        cache_tokens_total: summary.cache_tokens_total,
         last_model: summary.last_model,
         disabled,
     }
@@ -390,6 +394,8 @@ mod tests {
             tokens_today: 12_400,
             calls_total: 120,
             tokens_total: 480_000,
+            cache_tokens_today: 0,
+            cache_tokens_total: 0,
             last_model: Some("claude-haiku-4-5".into()),
             disabled: false,
         });

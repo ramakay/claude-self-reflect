@@ -98,8 +98,8 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
     // ask Haiku to semantic-search the tag name — that returns past briefing runs
     // (their prompt text contains "session_episode"), not episodes, and loops on a
     // false "fresh start" verdict. Feed Haiku the real episodes instead.
-    let episodes = recent_episodes_for_project(engine, project_name);
-    if episodes.is_empty() {
+    let window = recent_episodes_for_project(engine, project_name);
+    if window.rendered.is_empty() {
         tracing::debug!(
             project = project_name,
             "no episodes for project — skipping briefing"
@@ -111,8 +111,10 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
     // that produced the last successful briefing, a new Haiku call would emit
     // the same briefing — skip it entirely. Debounce (above) catches rapid
     // resumes; this catches "resumed hours later but nothing new happened".
+    // Digest is over stable (ts, content) pairs — NOT the rendered prompt, which
+    // embeds relative ages ("2h ago") that change with wall-clock time.
     let hash_key = format!("briefing_input_hash:{}", project_name);
-    let episode_digest = format!("{:016x}", crate::narrative::fnv1a_64(episodes.as_bytes()));
+    let episode_digest = stable_episode_digest(&window.stable_entries);
     if engine
         .storage()
         .get_meta(&hash_key)
@@ -129,7 +131,7 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
         return Ok(());
     }
 
-    let prompt = format!("{}{}", BRIEFING_INSTRUCTION, episodes);
+    let prompt = format!("{}{}", BRIEFING_INSTRUCTION, window.rendered);
 
     // Shell out to claude -p, walking the narrative model chain on model-not-found.
     // Block on tokio's spawn_blocking since std::process::Command is sync.
@@ -220,9 +222,15 @@ fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNar
         let output = child.wait_with_output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            if crate::narrative::is_model_not_found(&stderr) {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            if crate::narrative::is_model_not_found(&stderr)
+                || crate::narrative::is_model_not_found(&stdout)
+            {
                 tracing::warn!(model = ?candidate, "narrative model unavailable — trying next candidate");
-                last_err = Some(anyhow::anyhow!("model unavailable: {}", stderr));
+                last_err = Some(anyhow::anyhow!(
+                    "model unavailable: {}",
+                    if stderr.is_empty() { &stdout } else { &stderr }
+                ));
                 continue; // walk the chain ONLY on model-not-found
             }
             anyhow::bail!("claude -p failed: {}", stderr);
@@ -289,10 +297,38 @@ fn write_minimal_mcp_config() -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
+/// Prompt-ready episode window plus stable (time-independent) precursors for
+/// the content-hash skip-gate.
+struct EpisodeWindow {
+    /// Prompt-ready text with relative ages — fed to claude -p.
+    rendered: String,
+    /// (timestamp, content) pairs for included episodes, BEFORE age formatting —
+    /// used only for the stable digest.
+    stable_entries: Vec<(String, String)>,
+}
+
+/// Digest of the stable (time-independent) precursor of an episode window:
+/// (timestamp, content) pairs, BEFORE relative-age rendering. Two calls to
+/// `recent_episodes_for_project` at different wall-clock times over the SAME
+/// underlying episodes must yield the SAME digest here, even though the
+/// *rendered* prompt text differs (different "Xh ago" strings). This is what
+/// makes the briefing skip-gate actually skip across a debounce-window-sized
+/// gap instead of re-triggering `claude -p` on every call.
+fn stable_episode_digest(entries: &[(String, String)]) -> String {
+    let mut stable = String::new();
+    for (ts, content) in entries {
+        stable.push_str(ts);
+        stable.push('\n');
+        stable.push_str(content);
+        stable.push('\n');
+    }
+    format!("{:016x}", crate::narrative::fnv1a_64(stable.as_bytes()))
+}
+
 /// Load the most recent `session_episode` reflections for `project` and format
 /// them (newest first, capped) for injection into the briefing prompt. Returns an
-/// empty string if none exist — the caller skips the briefing entirely.
-fn recent_episodes_for_project(engine: &Engine, project: &str) -> String {
+/// empty window if none exist — the caller skips the briefing entirely.
+fn recent_episodes_for_project(engine: &Engine, project: &str) -> EpisodeWindow {
     let project_tag = format!("project_{}", project);
     // Fetch by BOTH tags so the LIMIT applies after filtering — a busy project
     // can't be starved by its own non-episode reflections crowding a pre-filter
@@ -313,11 +349,15 @@ fn recent_episodes_for_project(engine: &Engine, project: &str) -> String {
             // Distinguish a real DB error from "no episodes" — both return empty,
             // but only this path is an operational problem worth surfacing.
             tracing::warn!(project, error = %e, "failed to load episodes for briefing");
-            return String::new();
+            return EpisodeWindow {
+                rendered: String::new(),
+                stable_entries: Vec::new(),
+            };
         }
     };
 
     let mut out = String::new();
+    let mut stable_entries = Vec::new();
     let mut n = 0;
     for (_, content, tags, ts) in &rows {
         if n >= MAX_EPISODES_IN_BRIEFING {
@@ -335,6 +375,10 @@ fn recent_episodes_for_project(engine: &Engine, project: &str) -> String {
             continue;
         }
         n += 1;
+        // Stable precursor BEFORE age formatting — used for the skip-gate digest.
+        // Full untruncated content: truncation is time-independent, but full content
+        // is simpler and strictly safer for uniqueness.
+        stable_entries.push((ts.clone(), content.clone()));
         // Relative age (e.g. "2h ago") so Haiku reports timing without citing the
         // raw UTC timestamp, which reads as a future date in the user's timezone.
         let age = crate::temporal::parse_timestamp(ts)
@@ -353,7 +397,10 @@ fn recent_episodes_for_project(engine: &Engine, project: &str) -> String {
             out.push_str(&format!("\n[Episode {} — {}]\n{}\n", n, age, content));
         }
     }
-    out
+    EpisodeWindow {
+        rendered: out,
+        stable_entries,
+    }
 }
 
 /// True if an episode's content is CSR talking to itself (agent transcript,
@@ -484,5 +531,36 @@ mod tests {
             digest,
             format!("{:016x}", crate::narrative::fnv1a_64(b"episode window"))
         );
+    }
+
+    #[test]
+    fn test_stable_episode_digest_ignores_relative_age() {
+        let entries = vec![(
+            "2026-07-10T10:00:00Z".to_string(),
+            r#"{"request":"fix bug"}"#.to_string(),
+        )];
+        let digest_a = stable_episode_digest(&entries);
+        let digest_b = stable_episode_digest(&entries);
+        assert_eq!(digest_a, digest_b, "stable digest must be deterministic");
+
+        // Simulate the OLD (buggy) approach: hashing the rendered text, which
+        // embeds a relative age that changes with wall-clock time even when
+        // the underlying episode window is identical.
+        let rendered_2h_ago = format!("\n[Episode 1 — 2h ago]\n{}\n", entries[0].1);
+        let rendered_3h_ago = format!("\n[Episode 1 — 3h ago]\n{}\n", entries[0].1);
+        let old_digest_1 = format!(
+            "{:016x}",
+            crate::narrative::fnv1a_64(rendered_2h_ago.as_bytes())
+        );
+        let old_digest_2 = format!(
+            "{:016x}",
+            crate::narrative::fnv1a_64(rendered_3h_ago.as_bytes())
+        );
+        assert_ne!(
+            old_digest_1, old_digest_2,
+            "sanity: old rendered-text hashing DOES change with age — this is the bug"
+        );
+        // The new stable digest does not depend on age at all.
+        assert_eq!(digest_a, digest_b);
     }
 }

@@ -1149,9 +1149,11 @@ pub struct NarrativeUsageRow {
 #[derive(Default, serde::Serialize)]
 pub struct NarrativeUsageSummary {
     pub calls_today: i64,
-    pub tokens_today: i64, // input + output, today
+    pub tokens_today: i64, // input + output, today (fresh tokens only)
     pub calls_total: i64,
     pub tokens_total: i64,
+    pub cache_tokens_today: i64, // cache_read + cache_creation, today
+    pub cache_tokens_total: i64, // cache_read + cache_creation, all time
     pub last_model: Option<String>,
 }
 
@@ -1176,11 +1178,20 @@ pub fn record_narrative_usage(conn: &Connection, row: &NarrativeUsageRow) -> Res
 }
 
 pub fn narrative_usage_summary(conn: &Connection) -> Result<NarrativeUsageSummary> {
-    let (calls_total, tokens_total, calls_today, tokens_today) = conn.query_row(
+    let (
+        calls_total,
+        tokens_total,
+        cache_tokens_total,
+        calls_today,
+        tokens_today,
+        cache_tokens_today,
+    ) = conn.query_row(
         "SELECT COUNT(*),
                 COALESCE(SUM(input_tokens + output_tokens), 0),
+                COALESCE(SUM(cache_read_tokens + cache_creation_tokens), 0),
                 COALESCE(SUM(CASE WHEN ts >= date('now') THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN ts >= date('now') THEN input_tokens + output_tokens ELSE 0 END), 0)
+                COALESCE(SUM(CASE WHEN ts >= date('now') THEN input_tokens + output_tokens ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN ts >= date('now') THEN cache_read_tokens + cache_creation_tokens ELSE 0 END), 0)
          FROM narrative_usage",
         [],
         |r| {
@@ -1189,6 +1200,8 @@ pub fn narrative_usage_summary(conn: &Connection) -> Result<NarrativeUsageSummar
                 r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
             ))
         },
     )?;
@@ -1204,6 +1217,8 @@ pub fn narrative_usage_summary(conn: &Connection) -> Result<NarrativeUsageSummar
         tokens_today,
         calls_total,
         tokens_total,
+        cache_tokens_today,
+        cache_tokens_total,
         last_model,
     })
 }
@@ -1687,6 +1702,8 @@ mod tests {
         assert_eq!(s.tokens_total, 3600);
         assert_eq!(s.calls_today, 2); // rows stamped 'now' are today
         assert_eq!(s.tokens_today, 3600);
+        assert_eq!(s.cache_tokens_total, 0);
+        assert_eq!(s.cache_tokens_today, 0);
         assert_eq!(s.last_model.as_deref(), Some("claude-haiku-4-5"));
     }
 
@@ -1695,6 +1712,34 @@ mod tests {
         let conn = mem();
         let s = narrative_usage_summary(&conn).unwrap();
         assert_eq!(s.calls_total, 0);
+        assert_eq!(s.cache_tokens_total, 0);
+        assert_eq!(s.cache_tokens_today, 0);
         assert_eq!(s.last_model, None);
+    }
+
+    #[test]
+    fn test_narrative_usage_summary_cache_tokens() {
+        let conn = mem();
+        let row = NarrativeUsageRow {
+            call_site: "briefing".into(),
+            model: "claude-haiku-4-5".into(),
+            input_tokens: 100,
+            output_tokens: 57,
+            cache_read_tokens: 5000,
+            cache_creation_tokens: 1200,
+            duration_ms: 4200,
+            success: true,
+        };
+        record_narrative_usage(&conn, &row).unwrap();
+
+        let s = narrative_usage_summary(&conn).unwrap();
+        // Fresh tokens only (input + output) — cache must not be folded in.
+        assert_eq!(s.tokens_total, 157);
+        assert_eq!(s.tokens_today, 157);
+        // Cache read + creation tracked separately.
+        assert_eq!(s.cache_tokens_total, 6200);
+        assert_eq!(s.cache_tokens_today, 6200);
+        assert_eq!(s.calls_total, 1);
+        assert_eq!(s.calls_today, 1);
     }
 }
