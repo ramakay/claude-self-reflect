@@ -134,16 +134,23 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         if let Some((intent, _score)) = probes.classify(&query_vec) {
             if let Some((ep, age)) = crate::hooks::session_start::latest_tier0_episode(engine, cwd)
             {
-                let reason = match intent {
-                    crate::hooks::intent::Intent::Continue => {
-                        "the user asked to continue; the episode below is the work being resumed."
-                    }
-                    crate::hooks::intent::Intent::StateRecall => {
-                        "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity)."
+                let reason: Option<&str> = match intent {
+                    crate::hooks::intent::Intent::Continue => Some(
+                        "the user asked to continue; the episode below is the work being resumed.",
+                    ),
+                    crate::hooks::intent::Intent::StateRecall => Some(
+                        "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity).",
+                    ),
+                    crate::hooks::intent::Intent::Explore => {
+                        // Wired to CODE MAP emission in the codegraph-pickup plan Task 4.
+                        // Until then, explore prompts keep today's behavior (fall through).
+                        None
                     }
                 };
-                emit_pickup(&ep, &age, reason);
-                return Ok(());
+                if let Some(reason) = reason {
+                    emit_pickup(&ep, &age, reason);
+                    return Ok(());
+                }
             }
         }
     }
