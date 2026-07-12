@@ -880,9 +880,13 @@ fn test_prompt_submit_catch_all_never_fails() {
 
 #[test]
 fn test_explore_prompt_never_fails() {
-    // Same Engine::from_parts scaffold as test_prompt_submit_catch_all_never_fails.
-    // Prompt: exploration intent — empty index is fine; correlate finds nothing
-    // and the hook must still return Ok (stdout covered by format_code_map unit tests).
+    // Seeds an episode so `latest_tier0_episode` returns Some and the
+    // intent-classify match block (including the Explore arm: correlate_episode
+    // + format_code_map + println + early return) is actually reachable. Whether
+    // `probes.classify` selects Explore for this prompt depends on the real
+    // embedding model, so this test cannot assert CODE MAP emission — it
+    // asserts the reachable path never panics/errors. Emission content is
+    // covered by format_code_map's own unit tests elsewhere in the crate.
     let input = csr_engine::hooks::HookInput {
         prompt: Some("where is the code for the radio bottom sheet feature".to_string()),
         ..Default::default()
@@ -901,7 +905,34 @@ fn test_explore_prompt_never_fails() {
         std::path::PathBuf::from("/tmp"),
     );
 
+    // project must be "tmp": handle receives cwd `/tmp`, and
+    // resolve_project_from_cwd falls back to the last path component.
+    let episode = csr_engine::hooks::stop::Episode {
+        schema: "csr_episode_v1".into(),
+        session_id: "explore-fixture-session".into(),
+        project: "tmp".into(),
+        timestamp: "2026-07-11T12:00:00Z".into(),
+        request: "Investigate where the radio bottom sheet feature code lives".into(),
+        investigated: vec![],
+        completed: "Located and reviewed the radio bottom sheet implementation".into(),
+        next_steps: None,
+        blockers: None,
+        outcome: "success".into(),
+        error_signatures: vec![],
+        tools_used: vec![],
+        files_modified: vec!["src/radio/RadioSheet.swift".into()],
+        message_count: 0,
+        duration_minutes: 0,
+        todos: vec![],
+        approved_plan: None,
+        prev_episode_id: None,
+        anchors: vec![],
+    };
+
     let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(csr_engine::hooks::stop::store_episode(&engine, &episode))
+        .expect("store_episode seed must succeed");
+
     let result = rt.block_on(csr_engine::hooks::prompt_submit::handle(
         &input,
         &engine,
