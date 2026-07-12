@@ -33,11 +33,18 @@ const HAIKU_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSCRIPT_SAMPLE_MSGS: usize = 20;
 const TRANSCRIPT_CHAR_CAP: usize = 30_000;
 
-/// Call `claude --model haiku -p` to generate a curated session story.
-/// Returns None if claude CLI is unavailable, times out, or fails.
-pub async fn generate_session_story(context: &StoryContext) -> Option<String> {
+/// Call `claude -p` (model chain: env override → haiku alias → CLI default)
+/// to generate a curated session story.
+/// Returns None if narratives are disabled, claude CLI is unavailable, times out, or fails.
+pub async fn generate_session_story(
+    context: &StoryContext,
+) -> Option<(String, crate::narrative::ParsedNarrative)> {
+    if crate::narrative::narratives_disabled() {
+        return None;
+    }
     let prompt = build_prompt(context);
-    call_claude_headless(&prompt).await
+    let parsed = call_claude_headless(&prompt).await?;
+    Some((parsed.text.clone(), parsed))
 }
 
 /// Build the Haiku prompt from assembled DB context.
@@ -85,44 +92,66 @@ fn build_prompt(ctx: &StoryContext) -> String {
     prompt
 }
 
-/// Invoke `claude --model haiku -p` with prompt piped via stdin (avoids OS arg length limits).
-async fn call_claude_headless(prompt: &str) -> Option<String> {
+/// Invoke `claude -p` (model chain: env override → haiku alias → CLI default)
+/// with prompt piped via stdin (avoids OS arg length limits).
+async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNarrative> {
     use tokio::io::AsyncWriteExt;
 
-    let result = tokio::time::timeout(HAIKU_TIMEOUT, async {
-        let mut child = match tokio::process::Command::new("claude")
-            .args(["--model", "haiku", "-p", "-"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .stdin(Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => return None, // claude CLI not found
-        };
-
-        // Write prompt to stdin then close it
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(prompt.as_bytes()).await;
-            drop(stdin);
-        }
-
-        child.wait_with_output().await.ok()
-    })
-    .await;
-
-    match result {
-        Ok(Some(output)) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if text.is_empty() {
-                None
-            } else {
-                // Cap at 1000 chars — stories should be concise
-                Some(text.chars().take(1000).collect())
+    for candidate in crate::narrative::model_candidates() {
+        let attempt = tokio::time::timeout(HAIKU_TIMEOUT, async {
+            let mut cmd = tokio::process::Command::new("claude");
+            if let Some(model) = &candidate {
+                cmd.args(["--model", model]);
             }
+            let mut child = match cmd
+                .args(["-p", "-", "--output-format", "json"])
+                .stdout(Stdio::piped())
+                // Piped intentionally — required for model-not-found detection on the failure path; do not revert to null().
+                .stderr(Stdio::piped())
+                .stdin(Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(_) => return None, // claude CLI not found — no point walking the chain
+            };
+
+            // Write prompt to stdin then close it
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(prompt.as_bytes()).await;
+                drop(stdin);
+            }
+
+            child.wait_with_output().await.ok()
+        })
+        .await;
+
+        match attempt {
+            Ok(Some(output)) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                match crate::narrative::parse_claude_json(&stdout) {
+                    Some(mut parsed) => {
+                        // Cap at 1000 chars — stories should be concise
+                        parsed.text = parsed.text.chars().take(1000).collect();
+                        return Some(parsed);
+                    }
+                    None if crate::narrative::is_model_not_found(&stdout) => continue,
+                    None => return None,
+                }
+            }
+            Ok(Some(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                if crate::narrative::is_model_not_found(&stderr)
+                    || crate::narrative::is_model_not_found(&stdout)
+                {
+                    continue; // next candidate
+                }
+                return None; // real failure — don't burn the chain on rate limits
+            }
+            _ => return None, // timeout or spawn failure
         }
-        _ => None,
     }
+    None
 }
 
 /// Sample a transcript: first N + last N messages, capped at char_cap.
@@ -334,9 +363,40 @@ async fn generate_and_store(
     let ctx = build_story_context(engine, cwd, messages).await;
 
     let story = match generate_session_story(&ctx).await {
-        Some(s) => s,
+        Some((text, parsed)) => {
+            let _ = engine
+                .storage()
+                .record_narrative_usage(&crate::storage::NarrativeUsageRow {
+                    call_site: "story".into(),
+                    model: parsed.model.clone(),
+                    input_tokens: parsed.input_tokens,
+                    output_tokens: parsed.output_tokens,
+                    cache_read_tokens: parsed.cache_read_tokens,
+                    cache_creation_tokens: parsed.cache_creation_tokens,
+                    duration_ms: 0, // HAIKU_TIMEOUT bounds it; wall-clock not tracked on this path
+                    success: true,
+                });
+            text
+        }
         None => {
-            log_story_event(project, conv_id, "skip:haiku_unavailable_or_timeout");
+            if crate::narrative::narratives_disabled() {
+                log_story_event(project, conv_id, "skip:narratives_disabled");
+            } else {
+                let _ =
+                    engine
+                        .storage()
+                        .record_narrative_usage(&crate::storage::NarrativeUsageRow {
+                            call_site: "story".into(),
+                            model: "unknown".into(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            duration_ms: 0,
+                            success: false,
+                        });
+                log_story_event(project, conv_id, "skip:haiku_unavailable_or_timeout");
+            }
             return Ok(());
         }
     };
@@ -391,6 +451,9 @@ fn acquire_lock_with_timeout(file: &std::fs::File, timeout: Duration) -> bool {
 /// Spawn a detached `csr-engine generate-story` process. Returns immediately.
 /// The child process outlives the caller — safe for SessionEnd.
 pub fn spawn_detached_story_generation(transcript: &str, cwd: &str) {
+    if crate::narrative::narratives_disabled() {
+        return;
+    }
     let project = resolve_project_from_cwd(cwd).unwrap_or_else(|| "unknown".to_string());
     let conv_id = std::path::Path::new(transcript)
         .file_stem()

@@ -132,18 +132,72 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             }
         }
         if let Some((intent, _score)) = probes.classify(&query_vec) {
-            if let Some((ep, age)) = crate::hooks::session_start::latest_tier0_episode(engine, cwd)
-            {
-                let reason = match intent {
-                    crate::hooks::intent::Intent::Continue => {
-                        "the user asked to continue; the episode below is the work being resumed."
+            match intent {
+                crate::hooks::intent::Intent::Continue => {
+                    if let Some((ep, age)) =
+                        crate::hooks::session_start::latest_tier0_episode(engine, cwd)
+                    {
+                        emit_pickup(
+                            &ep,
+                            &age,
+                            "the user asked to continue; the episode below is the work being resumed.",
+                        );
+                        return Ok(());
                     }
-                    crate::hooks::intent::Intent::StateRecall => {
-                        "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity)."
+                }
+                crate::hooks::intent::Intent::StateRecall => {
+                    if let Some((ep, age)) =
+                        crate::hooks::session_start::latest_tier0_episode(engine, cwd)
+                    {
+                        emit_pickup(
+                            &ep,
+                            &age,
+                            "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity).",
+                        );
+                        return Ok(());
                     }
-                };
-                emit_pickup(&ep, &age, reason);
-                return Ok(());
+                }
+                crate::hooks::intent::Intent::Explore => {
+                    // Exploration prompt: the user is asking WHERE code lives. The
+                    // topic-matched episode (not the latest one) knows which files past
+                    // work touched — hand those over instead of letting the agent
+                    // re-map the codebase from scratch. Deliberately independent of
+                    // the Tier-0 gate above: latest_tier0_episode fetches only the
+                    // most recent 50 project-tagged reflections and requires
+                    // episode_carries_state, so a project can have zero usable
+                    // Tier-0 anchor (legacy tag data, or the matching episode pushed
+                    // outside that 50-row window) while correlate_episode — which runs
+                    // its own semantic search over reflections rather than reusing the
+                    // Tier-0 fetch — still finds a topic-matched episode. Gating
+                    // Explore on Tier-0 presence silently dropped the CODE MAP in
+                    // exactly that case; this arm no longer depends on it.
+                    //
+                    // No integration test for the Tier-0-absent / correlate-present
+                    // divergence: both paths call episode_carries_state, so a weak
+                    // episode fails both. Real divergence is only via the tag/recency
+                    // window (latest_tier0_episode's get_reflections_by_tag(..., 50)
+                    // vs correlate_episode's independent semantic search), which
+                    // needs 51+ project-tagged seeds and is not clean to construct
+                    // here without heavy fixtures.
+                    let current_project = crate::search::cross_project::resolve_project_from_cwd(
+                        &cwd.to_string_lossy(),
+                    )
+                    .unwrap_or_default();
+                    if let Some((ep, age, _score)) = correlate_episode(
+                        engine,
+                        &query_vec,
+                        &current_project,
+                        input.session_id.as_deref(),
+                    )
+                    .await
+                    {
+                        if let Some(map) = format_code_map(&ep, &age) {
+                            println!("{}", map);
+                            return Ok(());
+                        }
+                    }
+                    // No correlated episode or no files — normal flow continues below.
+                }
             }
         }
     }
@@ -764,6 +818,78 @@ fn format_evolution_summary(
     parts.concat()
 }
 
+/// True when `short` is a path-suffix of `long` (or they're equal), with
+/// the match required to land on a path-segment boundary. Prevents basename
+/// substring collisions such as "Ring.swift" spuriously matching
+/// ".../ChannelRing.swift" — those are different files that merely share a
+/// suffix of characters, not a suffix of path segments.
+fn path_suffix_match(a: &str, b: &str) -> bool {
+    let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    if short.is_empty() {
+        return false;
+    }
+    long == short
+        || (long.ends_with(short) && long.as_bytes()[long.len() - short.len() - 1] == b'/')
+}
+
+/// Exploration-intent injection: file pointers from the correlated episode.
+/// Payload over prose — each line is a path the agent can open immediately,
+/// and the footer is a ready-to-run recall call (agents obey literal calls,
+/// not "consider using" advice).
+pub(crate) fn format_code_map(ep: &crate::hooks::stop::Episode, age: &str) -> Option<String> {
+    let files: Vec<&String> = ep
+        .files_modified
+        .iter()
+        .filter(|f| !f.trim().is_empty())
+        .take(5)
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "CSR CODE MAP — prompt matches feature work from conv_{} ({}):\n",
+        ep.session_id, age
+    );
+    for f in &files {
+        // Path-suffix match: anchor.file may be absolute while files_modified
+        // entries are relative (or vice versa), depending on the extraction caller.
+        // The suffix must land on a path-segment boundary — otherwise a
+        // basename substring collision (e.g. "Ring.swift" vs
+        // ".../ChannelRing.swift") would inflate the anchor count for an
+        // unrelated file.
+        let anchor_count = ep
+            .anchors
+            .iter()
+            .filter(|a| path_suffix_match(&a.file, f))
+            .count();
+        let mut line = format!("  {}", f);
+        if anchor_count > 0 {
+            line.push_str(&format!(
+                " ({} anchor{})",
+                anchor_count,
+                if anchor_count == 1 { "" } else { "s" }
+            ));
+        }
+        // outcome is a plain String on Episode — use directly, no Option fallback.
+        line.push_str(&format!(" (outcome={})", ep.outcome));
+        // Char-boundary-safe truncate (paths are usually ASCII, but stay correct).
+        if line.len() > 120 {
+            let mut end = 120;
+            while end > 0 && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "Read these before mapping; full thread: csr_reflect_on_past(\"conv_{}\")\n",
+        ep.session_id
+    ));
+    Some(out)
+}
+
 /// Build compact code-graph slices for files/symbols named in the prompt.
 /// Returns at most 2 short lines, each carrying last-change provenance.
 fn build_graph_slices(
@@ -1132,5 +1258,107 @@ mod tests {
         ));
         assert!(!is_continuation_prompt("fix the auth bug"));
         assert!(!is_continuation_prompt("/continue"));
+    }
+
+    // --- format_code_map (Feature B, exploration-intent injection) ---
+
+    fn code_map_episode() -> crate::hooks::stop::Episode {
+        crate::hooks::stop::Episode {
+            schema: "csr_episode_v1".into(),
+            session_id: "abc123".into(),
+            project: "test-project".into(),
+            timestamp: "2026-05-17T00:00:00Z".into(),
+            request: "test request".into(),
+            investigated: vec![],
+            completed: "done".into(),
+            next_steps: None,
+            blockers: None,
+            outcome: "partial".into(),
+            error_signatures: vec![],
+            tools_used: vec![],
+            files_modified: vec![
+                "src/radio/RadioSheet.swift".into(),
+                "src/radio/ChannelRing.swift".into(),
+            ],
+            message_count: 10,
+            duration_minutes: 5,
+            todos: vec![],
+            approved_plan: None,
+            prev_episode_id: None,
+            anchors: vec![crate::extraction::anchors::FunctionAnchor {
+                file: "src/radio/RadioSheet.swift".into(),
+                node_kind: "file".into(),
+                name: "RadioSheet.swift".into(),
+                body_hash: "h".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn code_map_lists_files_with_anchor_counts_and_lookup() {
+        let out = format_code_map(&code_map_episode(), "2d ago").unwrap();
+        assert!(out.starts_with("CSR CODE MAP"));
+        assert!(out.contains("src/radio/RadioSheet.swift"));
+        assert!(out.contains("1 anchor"));
+        assert!(out.contains("outcome=partial"));
+        assert!(out.contains("csr_reflect_on_past(\"conv_abc123\")"));
+        assert!(out.contains("Read these before mapping"));
+    }
+
+    #[test]
+    fn code_map_none_when_no_files() {
+        let mut ep = code_map_episode();
+        ep.files_modified.clear();
+        assert!(format_code_map(&ep, "2d ago").is_none());
+    }
+
+    #[test]
+    fn code_map_caps_at_five_files() {
+        let mut ep = code_map_episode();
+        ep.files_modified = (0..9).map(|i| format!("src/file_{i}.swift")).collect();
+        let out = format_code_map(&ep, "1h ago").unwrap();
+        assert_eq!(out.matches("src/file_").count(), 5);
+    }
+
+    #[test]
+    fn code_map_anchor_count_respects_path_segment_boundary() {
+        // "Ring.swift" must NOT match the anchor for ".../ChannelRing.swift" —
+        // that's a basename substring collision, not the same file.
+        // "RadioSheet.swift" (relative, no dir) must still match the anchor's
+        // "src/radio/RadioSheet.swift" (absolute-ish) — that's a genuine
+        // path-segment-boundary suffix match across abs/rel styles.
+        let mut ep = code_map_episode();
+        ep.files_modified = vec!["Ring.swift".into(), "RadioSheet.swift".into()];
+        ep.anchors = vec![
+            crate::extraction::anchors::FunctionAnchor {
+                file: "src/radio/ChannelRing.swift".into(),
+                node_kind: "file".into(),
+                name: "ChannelRing.swift".into(),
+                body_hash: "h1".into(),
+            },
+            crate::extraction::anchors::FunctionAnchor {
+                file: "src/radio/RadioSheet.swift".into(),
+                node_kind: "file".into(),
+                name: "RadioSheet.swift".into(),
+                body_hash: "h2".into(),
+            },
+        ];
+        let out = format_code_map(&ep, "2d ago").unwrap();
+        let ring_line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("Ring.swift"))
+            .expect("Ring.swift line present");
+        assert!(
+            !ring_line.contains("anchor"),
+            "basename substring collision must not count: {ring_line}"
+        );
+        let sheet_line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("RadioSheet.swift"))
+            .expect("RadioSheet.swift line present");
+        assert!(
+            sheet_line.contains("1 anchor"),
+            "boundary match across abs/rel paths must still count: {sheet_line}"
+        );
     }
 }

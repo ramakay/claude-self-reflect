@@ -5,6 +5,49 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.3.0] - 2026-07-11
+
+### 🚀 FEATURE: Narrative Cost Controls
+
+- **Token accounting**: every AI-narrative `claude -p` call (session briefing +
+  story extraction) — including failures and timeouts — records model, token
+  usage (input/output/cache), duration, and success into a new
+  `narrative_usage` table. Surfaced in `csr-engine status` JSON
+  (`narratives` block incl. separate cache-token totals) and the compact
+  statusline (`AI 3c/12.4k tok today` / `AI off`).
+- **Model resilience**: the hardcoded dated Haiku model ID is gone. Calls walk
+  a fallback chain — `CSR_NARRATIVE_MODEL` env override → `haiku` alias → CLI
+  default — advancing only on model-not-found (detection matches the real CLI
+  404 wording, captured by live probe and pinned by fixture).
+- **Kill switch**: `CSR_NO_AI_NARRATIVES=1` disables all AI-narrative calls,
+  gated before any spawn work; skips log a distinct `skip:narratives_disabled`.
+- **Briefing content-hash cache**: identical episode windows skip the
+  `claude -p` call entirely (FNV-1a digest over stable episode content, not
+  rendered text) — a resume with no new episodes costs zero tokens.
+- **Docs disclosure**: README states exactly when tokens are spent, how they
+  are counted, and how to opt out.
+
+### 🚀 FEATURE: Codegraph Pickup (Explore Intent + File-Level Anchors)
+
+- **Explore intent**: the prompt-submit classifier gains a third intent for
+  code-location prompts ("where is X", "which files implement Y"). On a hit,
+  CSR injects a **CODE MAP** block — up to 5 file pointers from the
+  topic-matched past episode (with anchor counts and outcome) plus a
+  ready-to-run `csr_reflect_on_past` call — instead of letting the agent
+  re-map the codebase from scratch.
+- **File-level fallback anchors**: languages ast-grep can't parse (Swift, C#,
+  …) now get file-level sentinel anchors (whole-file content hash), so episode
+  ANCHORS drift tracking and the symbol-overlap gate work in any language.
+- CODE MAP emission is independent of the Tier-0 recency gate — a correlated
+  episode is enough.
+
+### Fixed
+- Model-404 error JSON is detected on stdout (where the CLI actually emits it
+  on non-zero exit), not just stderr — the fallback chain now fires in the
+  real failure mode.
+- Anchor counting uses path-segment-boundary suffix matching (`Ring.swift` no
+  longer counts anchors from `ChannelRing.swift`).
+
 ## [9.2.0] - 2026-07-07
 
 ### 🚀 FEATURE: Episode Intelligence + Telemetry Dashboard

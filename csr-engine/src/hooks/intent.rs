@@ -26,6 +26,8 @@ pub enum Intent {
     Continue,
     /// "what were we working on" — asking for the state of recent work.
     StateRecall,
+    /// "where is X", "which files implement Y" — asking for code location, not state.
+    Explore,
 }
 
 /// Exemplar sentences per intent. Editing this table is the whole tuning
@@ -70,6 +72,23 @@ const INTENT_EXEMPLARS: &[(Intent, &[&str])] = &[
             "summarize the current state of our work",
         ],
     ),
+    (
+        Intent::Explore,
+        &[
+            "where is the code for this feature",
+            "which files implement the bottom sheet",
+            "map the radio code surface",
+            "how does the player handle channel switching",
+            "find the implementation of the ring navigation",
+            "what code handles authentication here",
+            "show me where lyrics rendering lives",
+            "which module owns the audio pipeline",
+            "locate the code that draws the underline animation",
+            "where do we handle haptic feedback",
+            "what files would I touch to change the now playing screen",
+            "walk me through how this feature works in the code",
+        ],
+    ),
 ];
 
 /// Per-intent abstain thresholds (max cosine against that intent's
@@ -82,10 +101,13 @@ const INTENT_EXEMPLARS: &[(Intent, &[&str])] = &[
 ///   recall+content 0.468 ("what did we just discuss in csr to fix" —
 ///   correctly abstains: it names the work, Route B correlation serves it);
 ///   negatives ≤0.275. 0.55 splits the 0.468↔0.608 gap.
+/// - Explore shares StateRecall's 0.55 floor; synthetic-only calibration
+///   (no live probe data yet).
 fn threshold(intent: Intent) -> f32 {
     match intent {
         Intent::Continue => 0.60,
         Intent::StateRecall => 0.55,
+        Intent::Explore => 0.55,
     }
 }
 
@@ -187,10 +209,13 @@ impl ProbeSet {
     }
 
     /// Classify a prompt vector: per-intent max cosine, argmax across
-    /// intents, fire only above that intent's threshold. Both current
-    /// intents route to the same recency pickup, so no inter-intent margin
-    /// is enforced — adjacent scores are fine as long as the winner clears
-    /// its gate. Returns the winning intent and its score, or None (abstain).
+    /// intents, fire only above that intent's threshold. NOTE: intents no
+    /// longer route identically — Continue/StateRecall emit the recency
+    /// pickup while Explore emits the semantic CODE MAP — so adjacent
+    /// scores across that boundary DO change which injection the user gets.
+    /// No inter-intent margin is enforced yet; deferred to live calibration
+    /// (watch CSR_DEBUG_CORRELATE for Explore-vs-StateRecall boundary flips).
+    /// Returns the winning intent and its score, or None (abstain).
     pub fn classify(&self, query_vec: &[f32]) -> Option<(Intent, f32)> {
         self.scores(query_vec)
             .into_iter()
@@ -239,6 +264,7 @@ mod tests {
                 Intent::StateRecall,
                 vec![unit(0.0, 1.0, 0.0), unit(0.1, 1.0, 0.0)],
             ),
+            (Intent::Explore, vec![unit(0.0, 0.0, 1.0)]),
         ])
     }
 
@@ -256,11 +282,13 @@ mod tests {
     #[test]
     fn classify_abstains_below_threshold() {
         let probes = synthetic_probes();
-        // Orthogonal to both intents → max cosine ~0 → abstain.
-        assert!(probes.classify(&unit(0.0, 0.0, 1.0)).is_none());
-        // Between the two but under both gates (cos 45° ≈ 0.707 > gates —
-        // use a vector far enough from both instead).
-        assert!(probes.classify(&unit(0.3, 0.3, 1.0)).is_none());
+        // Negative on all three synthetic axes (Continue +x, StateRecall +y,
+        // Explore +z) → negative cosine against every intent → abstain.
+        assert!(probes.classify(&unit(-1.0, -1.0, -1.0)).is_none());
+        // Mild positive on +x/+y but still under Continue (0.60) and
+        // StateRecall (0.55); negative on +z so Explore is also under 0.55.
+        // cos(+x) = cos(+y) ≈ 0.348, cos(+z) ≈ -0.870.
+        assert!(probes.classify(&unit(0.4, 0.4, -1.0)).is_none());
     }
 
     #[test]
@@ -305,6 +333,18 @@ mod tests {
     #[test]
     fn thresholds_ordered_continue_stricter() {
         assert!(threshold(Intent::Continue) > threshold(Intent::StateRecall));
+    }
+
+    #[test]
+    fn classify_selects_explore_above_threshold() {
+        let probes = synthetic_probes(); // now includes (Explore, +z)
+        let got = probes.classify(&[0.0, 0.0, 1.0]);
+        assert_eq!(got.map(|(i, _)| i), Some(Intent::Explore));
+    }
+
+    #[test]
+    fn explore_threshold_matches_staterecall() {
+        assert_eq!(threshold(Intent::Explore), threshold(Intent::StateRecall));
     }
 
     #[test]

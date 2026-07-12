@@ -101,7 +101,21 @@ pub fn capture_file_anchors(path: &Path) -> Vec<FunctionAnchor> {
         return Vec::new();
     }
     let Some(lang) = lang_from_path_str(&path.to_string_lossy()) else {
-        return Vec::new();
+        // Unsupported language: emit one file-level sentinel so episodes can
+        // still track whole-file drift (Swift, C#, etc.).
+        let Ok(source) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        return vec![FunctionAnchor {
+            file: path.to_string_lossy().to_string(),
+            node_kind: "file".to_string(),
+            name,
+            body_hash: hash_normalized(&source),
+        }];
     };
     let Ok(source) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -234,11 +248,34 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_language_yields_no_anchors() {
+    fn unsupported_language_yields_file_level_anchor() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("notes.txt");
-        fs::write(&path, "not code").unwrap();
-        assert!(capture_file_anchors(&path).is_empty());
+        let path = dir.path().join("RadioSheet.swift");
+        std::fs::write(&path, "class RadioSheet { func show() {} }").unwrap();
+        let anchors = capture_file_anchors(&path);
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].node_kind, "file");
+        assert_eq!(anchors[0].name, "RadioSheet.swift");
+        assert!(!anchors[0].body_hash.is_empty());
+    }
+
+    #[test]
+    fn file_level_anchor_verifies_intact_then_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Player.swift");
+        std::fs::write(&path, "struct Player {}").unwrap();
+        let anchor = capture_file_anchors(&path).remove(0);
+        assert_eq!(verify_anchor(&anchor, dir.path()), AnchorVerdict::Intact);
+        std::fs::write(&path, "struct Player { var ring: Bool }").unwrap();
+        assert_eq!(verify_anchor(&anchor, dir.path()), AnchorVerdict::Modified);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(verify_anchor(&anchor, dir.path()), AnchorVerdict::Broken);
+    }
+
+    #[test]
+    fn missing_file_still_yields_no_anchors() {
+        let anchors = capture_file_anchors(std::path::Path::new("/nonexistent/thing.swift"));
+        assert!(anchors.is_empty());
     }
 
     #[test]

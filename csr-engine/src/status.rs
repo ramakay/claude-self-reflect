@@ -22,6 +22,7 @@ pub struct StatusReport {
     pub total_jsonl_files: usize,
     pub import_percent: f64,
     pub enrichment: EnrichmentBreakdown,
+    pub narratives: NarrativeStatus,
     pub newest_chunk: Option<String>,
     pub db_size_bytes: u64,
     pub db_path: String,
@@ -37,6 +38,18 @@ pub struct EnrichmentBreakdown {
     pub ai_narrative_completed: usize,
     pub ai_narrative_failed: usize,
     pub ai_narrative_processing: usize,
+}
+
+#[derive(Serialize, Default)]
+pub struct NarrativeStatus {
+    pub calls_today: i64,
+    pub tokens_today: i64,
+    pub calls_total: i64,
+    pub tokens_total: i64,
+    pub cache_tokens_today: i64,
+    pub cache_tokens_total: i64,
+    pub last_model: Option<String>,
+    pub disabled: bool,
 }
 
 /// Run status check — opens SQLite directly (no EmbeddingEngine needed).
@@ -84,6 +97,10 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             total_jsonl_files: total_jsonl,
             import_percent: 0.0,
             enrichment: EnrichmentBreakdown::default(),
+            narratives: NarrativeStatus {
+                disabled: crate::narrative::narratives_disabled(),
+                ..Default::default()
+            },
             newest_chunk: None,
             db_size_bytes: 0,
             db_path: db_path.to_string_lossy().to_string(),
@@ -92,6 +109,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     }
 
     let storage = Storage::open(db_path)?;
+    let narratives = gather_narratives(&storage);
 
     let conversations = storage.count_conversations().unwrap_or(0);
     let projects = storage.count_projects().unwrap_or(0);
@@ -142,11 +160,45 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         total_jsonl_files: total_jsonl,
         import_percent,
         enrichment,
+        narratives,
         newest_chunk,
         db_size_bytes,
         db_path: db_path.to_string_lossy().to_string(),
         healthy,
     })
+}
+
+/// Aggregate narrative_usage via the existing Storage helper. Tolerates the
+/// table not existing (pre-migration DBs): status opens SQLite directly via
+/// Storage::open and must never fail on schema gaps.
+fn gather_narratives(storage: &Storage) -> NarrativeStatus {
+    let disabled = crate::narrative::narratives_disabled();
+    let summary = storage.narrative_usage_summary().unwrap_or_default();
+    NarrativeStatus {
+        calls_today: summary.calls_today,
+        tokens_today: summary.tokens_today,
+        calls_total: summary.calls_total,
+        tokens_total: summary.tokens_total,
+        cache_tokens_today: summary.cache_tokens_today,
+        cache_tokens_total: summary.cache_tokens_total,
+        last_model: summary.last_model,
+        disabled,
+    }
+}
+
+fn format_narrative_segment(n: &NarrativeStatus) -> String {
+    if n.disabled {
+        return "AI off".to_string();
+    }
+    if n.calls_today == 0 {
+        return "AI 0c today".to_string();
+    }
+    let tok = if n.tokens_today >= 1000 {
+        format!("{:.1}k", n.tokens_today as f64 / 1000.0)
+    } else {
+        n.tokens_today.to_string()
+    };
+    format!("AI {}c/{} tok today", n.calls_today, tok)
 }
 
 /// Count total JSONL files across all project directories.
@@ -320,19 +372,44 @@ fn print_compact(report: &StatusReport) {
     let health = if report.healthy { "ok" } else { "!!" };
 
     print!(
-        "[{} {:.0}%] [{}] {}c {}r | {}p",
+        "[{} {:.0}%] [{}] {}c {}r | {}p | {}",
         bar,
         report.import_percent,
         health,
         report.conversations,
         report.reflections,
         report.projects,
+        format_narrative_segment(&report.narratives),
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compact_includes_narratives() {
+        let s = format_narrative_segment(&NarrativeStatus {
+            calls_today: 3,
+            tokens_today: 12_400,
+            calls_total: 120,
+            tokens_total: 480_000,
+            cache_tokens_today: 0,
+            cache_tokens_total: 0,
+            last_model: Some("claude-haiku-4-5".into()),
+            disabled: false,
+        });
+        assert_eq!(s, "AI 3c/12.4k tok today");
+
+        let off = format_narrative_segment(&NarrativeStatus {
+            disabled: true,
+            ..Default::default()
+        });
+        assert_eq!(off, "AI off");
+
+        let idle = format_narrative_segment(&NarrativeStatus::default());
+        assert_eq!(idle, "AI 0c today");
+    }
 
     #[test]
     fn test_status_nonexistent_db() {
@@ -358,6 +435,7 @@ mod tests {
             total_jsonl_files: 1000,
             import_percent: 90.9,
             enrichment: EnrichmentBreakdown::default(),
+            narratives: NarrativeStatus::default(),
             newest_chunk: None,
             db_size_bytes: 100_000_000,
             db_path: "/tmp/test.db".to_string(),

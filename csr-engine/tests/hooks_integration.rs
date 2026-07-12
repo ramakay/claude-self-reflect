@@ -878,6 +878,75 @@ fn test_prompt_submit_catch_all_never_fails() {
     assert!(result.is_ok(), "catch-all wrapper must always succeed");
 }
 
+#[test]
+fn test_explore_prompt_never_fails() {
+    // Seeds an episode so `correlate_episode` has a project-matched,
+    // state-carrying candidate — the Explore arm (correlate_episode +
+    // format_code_map + println + early return) runs independent of the
+    // tier-0 gate since fd13068, but without a seeded episode correlation
+    // would always miss and the arm's emission path would be dead. Whether
+    // `probes.classify` selects Explore for this prompt depends on the real
+    // embedding model, so this test cannot assert CODE MAP emission — it
+    // asserts the reachable path never panics/errors. Emission content is
+    // covered by format_code_map's own unit tests elsewhere in the crate.
+    let input = csr_engine::hooks::HookInput {
+        prompt: Some("where is the code for the radio bottom sheet feature".to_string()),
+        ..Default::default()
+    };
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage,
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
+    );
+
+    // project must be "tmp": handle receives cwd `/tmp`, and
+    // resolve_project_from_cwd falls back to the last path component.
+    let episode = csr_engine::hooks::stop::Episode {
+        schema: "csr_episode_v1".into(),
+        session_id: "explore-fixture-session".into(),
+        project: "tmp".into(),
+        timestamp: "2026-07-11T12:00:00Z".into(),
+        request: "Investigate where the radio bottom sheet feature code lives".into(),
+        investigated: vec![],
+        completed: "Located and reviewed the radio bottom sheet implementation".into(),
+        next_steps: None,
+        blockers: None,
+        outcome: "success".into(),
+        error_signatures: vec![],
+        tools_used: vec![],
+        files_modified: vec!["src/radio/RadioSheet.swift".into()],
+        message_count: 0,
+        duration_minutes: 0,
+        todos: vec![],
+        approved_plan: None,
+        prev_episode_id: None,
+        anchors: vec![],
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(csr_engine::hooks::stop::store_episode(&engine, &episode))
+        .expect("store_episode seed must succeed");
+
+    let result = rt.block_on(csr_engine::hooks::prompt_submit::handle(
+        &input,
+        &engine,
+        std::path::Path::new("/tmp"),
+    ));
+
+    assert!(
+        result.is_ok(),
+        "explore-intent prompt_submit must never fail"
+    );
+}
+
 // ─── Install Config (Updated for 6 Hook Types) ───
 
 #[test]
