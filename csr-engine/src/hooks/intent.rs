@@ -209,10 +209,13 @@ impl ProbeSet {
     }
 
     /// Classify a prompt vector: per-intent max cosine, argmax across
-    /// intents, fire only above that intent's threshold. Both current
-    /// intents route to the same recency pickup, so no inter-intent margin
-    /// is enforced — adjacent scores are fine as long as the winner clears
-    /// its gate. Returns the winning intent and its score, or None (abstain).
+    /// intents, fire only above that intent's threshold. NOTE: intents no
+    /// longer route identically — Continue/StateRecall emit the recency
+    /// pickup while Explore emits the semantic CODE MAP — so adjacent
+    /// scores across that boundary DO change which injection the user gets.
+    /// No inter-intent margin is enforced yet; deferred to live calibration
+    /// (watch CSR_DEBUG_CORRELATE for Explore-vs-StateRecall boundary flips).
+    /// Returns the winning intent and its score, or None (abstain).
     pub fn classify(&self, query_vec: &[f32]) -> Option<(Intent, f32)> {
         self.scores(query_vec)
             .into_iter()

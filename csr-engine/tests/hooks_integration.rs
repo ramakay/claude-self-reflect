@@ -880,9 +880,11 @@ fn test_prompt_submit_catch_all_never_fails() {
 
 #[test]
 fn test_explore_prompt_never_fails() {
-    // Seeds an episode so `latest_tier0_episode` returns Some and the
-    // intent-classify match block (including the Explore arm: correlate_episode
-    // + format_code_map + println + early return) is actually reachable. Whether
+    // Seeds an episode so `correlate_episode` has a project-matched,
+    // state-carrying candidate — the Explore arm (correlate_episode +
+    // format_code_map + println + early return) runs independent of the
+    // tier-0 gate since fd13068, but without a seeded episode correlation
+    // would always miss and the arm's emission path would be dead. Whether
     // `probes.classify` selects Explore for this prompt depends on the real
     // embedding model, so this test cannot assert CODE MAP emission — it
     // asserts the reachable path never panics/errors. Emission content is
