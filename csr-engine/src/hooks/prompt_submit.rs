@@ -132,45 +132,71 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             }
         }
         if let Some((intent, _score)) = probes.classify(&query_vec) {
-            if let Some((ep, age)) = crate::hooks::session_start::latest_tier0_episode(engine, cwd)
-            {
-                let reason: Option<&str> = match intent {
-                    crate::hooks::intent::Intent::Continue => Some(
-                        "the user asked to continue; the episode below is the work being resumed.",
-                    ),
-                    crate::hooks::intent::Intent::StateRecall => Some(
-                        "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity).",
-                    ),
-                    crate::hooks::intent::Intent::Explore => {
-                        // Exploration prompt: the user is asking WHERE code lives. The
-                        // topic-matched episode (not the latest one) knows which files past
-                        // work touched — hand those over instead of letting the agent
-                        // re-map the codebase from scratch.
-                        let current_project =
-                            crate::search::cross_project::resolve_project_from_cwd(
-                                &cwd.to_string_lossy(),
-                            )
-                            .unwrap_or_default();
-                        if let Some((ep, age, _score)) = correlate_episode(
-                            engine,
-                            &query_vec,
-                            &current_project,
-                            input.session_id.as_deref(),
-                        )
-                        .await
-                        {
-                            if let Some(map) = format_code_map(&ep, &age) {
-                                println!("{}", map);
-                                return Ok(());
-                            }
-                        }
-                        // No correlated episode or no files — normal flow continues below.
-                        None
+            match intent {
+                crate::hooks::intent::Intent::Continue => {
+                    if let Some((ep, age)) =
+                        crate::hooks::session_start::latest_tier0_episode(engine, cwd)
+                    {
+                        emit_pickup(
+                            &ep,
+                            &age,
+                            "the user asked to continue; the episode below is the work being resumed.",
+                        );
+                        return Ok(());
                     }
-                };
-                if let Some(reason) = reason {
-                    emit_pickup(&ep, &age, reason);
-                    return Ok(());
+                }
+                crate::hooks::intent::Intent::StateRecall => {
+                    if let Some((ep, age)) =
+                        crate::hooks::session_start::latest_tier0_episode(engine, cwd)
+                    {
+                        emit_pickup(
+                            &ep,
+                            &age,
+                            "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity).",
+                        );
+                        return Ok(());
+                    }
+                }
+                crate::hooks::intent::Intent::Explore => {
+                    // Exploration prompt: the user is asking WHERE code lives. The
+                    // topic-matched episode (not the latest one) knows which files past
+                    // work touched — hand those over instead of letting the agent
+                    // re-map the codebase from scratch. Deliberately independent of
+                    // the Tier-0 gate above: latest_tier0_episode fetches only the
+                    // most recent 50 project-tagged reflections and requires
+                    // episode_carries_state, so a project can have zero usable
+                    // Tier-0 anchor (legacy tag data, or the matching episode pushed
+                    // outside that 50-row window) while correlate_episode — which runs
+                    // its own semantic search over reflections rather than reusing the
+                    // Tier-0 fetch — still finds a topic-matched episode. Gating
+                    // Explore on Tier-0 presence silently dropped the CODE MAP in
+                    // exactly that case; this arm no longer depends on it.
+                    //
+                    // No integration test for the Tier-0-absent / correlate-present
+                    // divergence: both paths call episode_carries_state, so a weak
+                    // episode fails both. Real divergence is only via the tag/recency
+                    // window (latest_tier0_episode's get_reflections_by_tag(..., 50)
+                    // vs correlate_episode's independent semantic search), which
+                    // needs 51+ project-tagged seeds and is not clean to construct
+                    // here without heavy fixtures.
+                    let current_project = crate::search::cross_project::resolve_project_from_cwd(
+                        &cwd.to_string_lossy(),
+                    )
+                    .unwrap_or_default();
+                    if let Some((ep, age, _score)) = correlate_episode(
+                        engine,
+                        &query_vec,
+                        &current_project,
+                        input.session_id.as_deref(),
+                    )
+                    .await
+                    {
+                        if let Some(map) = format_code_map(&ep, &age) {
+                            println!("{}", map);
+                            return Ok(());
+                        }
+                    }
+                    // No correlated episode or no files — normal flow continues below.
                 }
             }
         }
