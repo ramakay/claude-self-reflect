@@ -771,6 +771,20 @@ fn format_evolution_summary(
     parts.concat()
 }
 
+/// True when `short` is a path-suffix of `long` (or they're equal), with
+/// the match required to land on a path-segment boundary. Prevents basename
+/// substring collisions such as "Ring.swift" spuriously matching
+/// ".../ChannelRing.swift" — those are different files that merely share a
+/// suffix of characters, not a suffix of path segments.
+fn path_suffix_match(a: &str, b: &str) -> bool {
+    let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    if short.is_empty() {
+        return false;
+    }
+    long == short
+        || (long.ends_with(short) && long.as_bytes()[long.len() - short.len() - 1] == b'/')
+}
+
 /// Exploration-intent injection: file pointers from the correlated episode.
 /// Payload over prose — each line is a path the agent can open immediately,
 /// and the footer is a ready-to-run recall call (agents obey literal calls,
@@ -796,10 +810,14 @@ pub(crate) fn format_code_map(ep: &crate::hooks::stop::Episode, age: &str) -> Op
     for f in &files {
         // Path-suffix match: anchor.file may be absolute while files_modified
         // entries are relative (or vice versa), depending on the extraction caller.
+        // The suffix must land on a path-segment boundary — otherwise a
+        // basename substring collision (e.g. "Ring.swift" vs
+        // ".../ChannelRing.swift") would inflate the anchor count for an
+        // unrelated file.
         let anchor_count = ep
             .anchors
             .iter()
-            .filter(|a| a.file.ends_with(f.as_str()) || f.ends_with(a.file.as_str()))
+            .filter(|a| path_suffix_match(&a.file, f))
             .count();
         let mut line = format!("  {}", f);
         if anchor_count > 0 {
@@ -1257,5 +1275,47 @@ mod tests {
         ep.files_modified = (0..9).map(|i| format!("src/file_{i}.swift")).collect();
         let out = format_code_map(&ep, "1h ago").unwrap();
         assert_eq!(out.matches("src/file_").count(), 5);
+    }
+
+    #[test]
+    fn code_map_anchor_count_respects_path_segment_boundary() {
+        // "Ring.swift" must NOT match the anchor for ".../ChannelRing.swift" —
+        // that's a basename substring collision, not the same file.
+        // "RadioSheet.swift" (relative, no dir) must still match the anchor's
+        // "src/radio/RadioSheet.swift" (absolute-ish) — that's a genuine
+        // path-segment-boundary suffix match across abs/rel styles.
+        let mut ep = code_map_episode();
+        ep.files_modified = vec!["Ring.swift".into(), "RadioSheet.swift".into()];
+        ep.anchors = vec![
+            crate::extraction::anchors::FunctionAnchor {
+                file: "src/radio/ChannelRing.swift".into(),
+                node_kind: "file".into(),
+                name: "ChannelRing.swift".into(),
+                body_hash: "h1".into(),
+            },
+            crate::extraction::anchors::FunctionAnchor {
+                file: "src/radio/RadioSheet.swift".into(),
+                node_kind: "file".into(),
+                name: "RadioSheet.swift".into(),
+                body_hash: "h2".into(),
+            },
+        ];
+        let out = format_code_map(&ep, "2d ago").unwrap();
+        let ring_line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("Ring.swift"))
+            .expect("Ring.swift line present");
+        assert!(
+            !ring_line.contains("anchor"),
+            "basename substring collision must not count: {ring_line}"
+        );
+        let sheet_line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("RadioSheet.swift"))
+            .expect("RadioSheet.swift line present");
+        assert!(
+            sheet_line.contains("1 anchor"),
+            "boundary match across abs/rel paths must still count: {sheet_line}"
+        );
     }
 }
