@@ -1,6 +1,6 @@
 [package]
 name = "csr-engine"
-version = "9.2.0"
+version = "9.3.0"
 edition = "2021"
 description = "Claude Self-Reflect: Rust MCP server with embedded vector search"
 
