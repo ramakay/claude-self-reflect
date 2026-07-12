@@ -2,6 +2,8 @@ pub mod codegraph;
 pub mod migrations;
 pub mod queries;
 
+pub use queries::{NarrativeUsageRow, NarrativeUsageSummary};
+
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -434,6 +436,16 @@ impl Storage {
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::set_meta(&conn, key, value)
+    }
+
+    pub fn record_narrative_usage(&self, row: &NarrativeUsageRow) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::record_narrative_usage(&conn, row)
+    }
+
+    pub fn narrative_usage_summary(&self) -> Result<NarrativeUsageSummary> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::narrative_usage_summary(&conn)
     }
 
     /// Integrity check with an app-level cache. SQLite recomputes

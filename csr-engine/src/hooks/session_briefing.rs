@@ -1,5 +1,6 @@
-//! Session briefing hook — shells out to `claude -p --model haiku` to generate
-//! a proactive briefing from recent session episodes.
+//! Session briefing hook — shells out to `claude -p`, walking a model chain
+//! (env override → haiku alias → CLI default) to generate a proactive
+//! briefing from recent session episodes.
 //!
 //! Runs async at SessionStart (non-blocking). Output is stored as a tagged
 //! reflection (`session_briefing` tag) that the next UserPromptSubmit hook
@@ -78,6 +79,11 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
     let project = resolve_project_from_cwd(&cwd.to_string_lossy());
     let project_name = project.as_deref().unwrap_or("unknown");
 
+    if crate::narrative::narratives_disabled() {
+        tracing::debug!("AI narratives disabled via CSR_NO_AI_NARRATIVES — skipping briefing");
+        return Ok(());
+    }
+
     // Debounce: skip if a briefing for this project was generated recently. Avoids
     // spawning a fresh `claude -p` on every resume/compact within a working session.
     if recent_briefing_exists(engine, project_name, BRIEFING_DEBOUNCE_MINUTES) {
@@ -92,8 +98,8 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
     // ask Haiku to semantic-search the tag name — that returns past briefing runs
     // (their prompt text contains "session_episode"), not episodes, and loops on a
     // false "fresh start" verdict. Feed Haiku the real episodes instead.
-    let episodes = recent_episodes_for_project(engine, project_name);
-    if episodes.is_empty() {
+    let window = recent_episodes_for_project(engine, project_name);
+    if window.rendered.is_empty() {
         tracing::debug!(
             project = project_name,
             "no episodes for project — skipping briefing"
@@ -101,79 +107,166 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
         return Ok(());
     }
 
-    let prompt = format!("{}{}", BRIEFING_INSTRUCTION, episodes);
+    // Content-hash cache: if the episode window is byte-identical to the one
+    // that produced the last successful briefing, a new Haiku call would emit
+    // the same briefing — skip it entirely. Debounce (above) catches rapid
+    // resumes; this catches "resumed hours later but nothing new happened".
+    // Digest is over stable (ts, content) pairs — NOT the rendered prompt, which
+    // embeds relative ages ("2h ago") that change with wall-clock time.
+    let hash_key = format!("briefing_input_hash:{}", project_name);
+    let episode_digest = stable_episode_digest(&window.stable_entries);
+    if engine
+        .storage()
+        .get_meta(&hash_key)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(episode_digest.as_str())
+        && briefing_exists(engine, project_name)
+    {
+        tracing::debug!(
+            project = project_name,
+            "episodes unchanged since last briefing — skipping claude -p"
+        );
+        return Ok(());
+    }
 
-    // Shell out to claude -p with Haiku model.
+    let prompt = format!("{}{}", BRIEFING_INSTRUCTION, window.rendered);
+
+    // Shell out to claude -p, walking the narrative model chain on model-not-found.
     // Block on tokio's spawn_blocking since std::process::Command is sync.
-    let briefing = tokio::task::spawn_blocking(move || invoke_haiku_briefing(&prompt)).await??;
+    let started = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || invoke_narrative_briefing(&prompt)).await?;
+    let duration_ms = started.elapsed().as_millis() as i64;
+    let parsed = match result {
+        Ok(p) => p,
+        Err(e) => {
+            // Best-effort: a failed insert must never mask the original error.
+            let _ = engine
+                .storage()
+                .record_narrative_usage(&crate::storage::NarrativeUsageRow {
+                    call_site: "briefing".into(),
+                    model: "unknown".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    duration_ms,
+                    success: false,
+                });
+            return Err(e);
+        }
+    };
 
-    if briefing.trim().is_empty() {
+    // Accounting is best-effort: a failed insert must never fail the hook.
+    let _ = engine
+        .storage()
+        .record_narrative_usage(&crate::storage::NarrativeUsageRow {
+            call_site: "briefing".into(),
+            model: parsed.model.clone(),
+            input_tokens: parsed.input_tokens,
+            output_tokens: parsed.output_tokens,
+            cache_read_tokens: parsed.cache_read_tokens,
+            cache_creation_tokens: parsed.cache_creation_tokens,
+            duration_ms,
+            success: true,
+        });
+
+    if parsed.text.trim().is_empty() {
         eprintln!("CSR: session-briefing returned empty output");
         return Ok(());
     }
 
     // Store briefing as a tagged reflection — replace any prior briefing for this project
-    store_briefing(engine, project_name, &briefing)?;
+    store_briefing(engine, project_name, &parsed.text)?;
+    let _ = engine.storage().set_meta(&hash_key, &episode_digest);
 
     Ok(())
 }
 
-/// Invoke `claude -p --model haiku-4-5 "<prompt>"` and capture stdout.
-/// Returns the briefing text, or an error if the invocation fails or times out.
+/// Invoke `claude -p` with JSON output, walking the narrative model candidate
+/// chain on model-not-found. Returns the parsed narrative, or an error if the
+/// invocation fails or times out.
 ///
 /// The episodes are embedded in `prompt`, so Haiku needs NO tools. We pass an
 /// empty MCP config with `--strict-mcp-config` so the subprocess loads ZERO MCP
 /// servers (not even csr-engine) — fastest possible `claude -p` startup and no
 /// recursive csr-engine spawn.
-fn invoke_haiku_briefing(prompt: &str) -> Result<String> {
+fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNarrative> {
     let mcp_config_path = write_minimal_mcp_config()?;
+    let mut last_err: Option<anyhow::Error> = None;
 
-    let mut child = Command::new("claude")
-        .arg("-p")
-        // The prompt MUST precede --mcp-config: that flag is variadic in the
-        // claude CLI and consumes any trailing positional arg as another config
-        // file path, failing with ENAMETOOLONG on the episode text.
-        .arg(prompt)
-        .arg("--model")
-        .arg("claude-haiku-4-5-20251001")
-        .arg("--output-format")
-        .arg("text")
-        .arg("--strict-mcp-config")
-        .arg("--mcp-config")
-        .arg(&mcp_config_path)
-        // No --dangerously-skip-permissions: episodes are session-derived text and
-        // the empty MCP config means zero tools, so this is a pure text summary.
-        // Skipping permissions would only widen the blast radius if an episode
-        // contained adversarial content. Print mode won't prompt interactively.
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .env("CSR_DISABLE_RECURSIVE_HOOKS", "1") // signal to nested csr-engine to skip hooks
-        .spawn()?;
+    for candidate in crate::narrative::model_candidates() {
+        let mut cmd = Command::new("claude");
+        cmd.arg("-p")
+            // The prompt MUST precede --mcp-config: that flag is variadic in the
+            // claude CLI and consumes any trailing positional arg as another config
+            // file path, failing with ENAMETOOLONG on the episode text.
+            .arg(prompt);
+        if let Some(model) = &candidate {
+            cmd.arg("--model").arg(model);
+        }
+        cmd.arg("--output-format")
+            .arg("json")
+            .arg("--strict-mcp-config")
+            .arg("--mcp-config")
+            .arg(&mcp_config_path)
+            // No --dangerously-skip-permissions: episodes are session-derived text and
+            // the empty MCP config means zero tools, so this is a pure text summary.
+            // Skipping permissions would only widen the blast radius if an episode
+            // contained adversarial content. Print mode won't prompt interactively.
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .env("CSR_DISABLE_RECURSIVE_HOOKS", "1"); // signal to nested csr-engine to skip hooks
 
-    // Manual timeout: poll for completion up to BRIEFING_TIMEOUT_SECS.
-    let timeout = Duration::from_secs(BRIEFING_TIMEOUT_SECS);
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait()? {
-            Some(_status) => break,
-            None => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    anyhow::bail!("claude -p timed out after {}s", BRIEFING_TIMEOUT_SECS);
+        let mut child = cmd.spawn()?;
+
+        // Manual timeout: poll for completion up to BRIEFING_TIMEOUT_SECS.
+        let timeout = Duration::from_secs(BRIEFING_TIMEOUT_SECS);
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait()? {
+                Some(_status) => break,
+                None => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        anyhow::bail!("claude -p timed out after {}s", BRIEFING_TIMEOUT_SECS);
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
                 }
-                std::thread::sleep(Duration::from_millis(200));
             }
+        }
+
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            if crate::narrative::is_model_not_found(&stderr)
+                || crate::narrative::is_model_not_found(&stdout)
+            {
+                tracing::warn!(model = ?candidate, "narrative model unavailable — trying next candidate");
+                last_err = Some(anyhow::anyhow!(
+                    "model unavailable: {}",
+                    if stderr.is_empty() { &stdout } else { &stderr }
+                ));
+                continue; // walk the chain ONLY on model-not-found
+            }
+            anyhow::bail!("claude -p failed: {}", stderr);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        match crate::narrative::parse_claude_json(&stdout) {
+            Some(parsed) => return Ok(parsed),
+            None if crate::narrative::is_model_not_found(&stdout) => {
+                last_err = Some(anyhow::anyhow!("model unavailable (json error result)"));
+                continue;
+            }
+            None => anyhow::bail!("claude -p returned unparseable/error JSON"),
         }
     }
 
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("claude -p failed: {}", stderr);
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no narrative model candidates succeeded")))
 }
 
 /// Store briefing as a tagged reflection. Replaces any previous briefing
@@ -223,10 +316,38 @@ fn write_minimal_mcp_config() -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
+/// Prompt-ready episode window plus stable (time-independent) precursors for
+/// the content-hash skip-gate.
+struct EpisodeWindow {
+    /// Prompt-ready text with relative ages — fed to claude -p.
+    rendered: String,
+    /// (timestamp, content) pairs for included episodes, BEFORE age formatting —
+    /// used only for the stable digest.
+    stable_entries: Vec<(String, String)>,
+}
+
+/// Digest of the stable (time-independent) precursor of an episode window:
+/// (timestamp, content) pairs, BEFORE relative-age rendering. Two calls to
+/// `recent_episodes_for_project` at different wall-clock times over the SAME
+/// underlying episodes must yield the SAME digest here, even though the
+/// *rendered* prompt text differs (different "Xh ago" strings). This is what
+/// makes the briefing skip-gate actually skip across a debounce-window-sized
+/// gap instead of re-triggering `claude -p` on every call.
+fn stable_episode_digest(entries: &[(String, String)]) -> String {
+    let mut stable = String::new();
+    for (ts, content) in entries {
+        stable.push_str(ts);
+        stable.push('\n');
+        stable.push_str(content);
+        stable.push('\n');
+    }
+    format!("{:016x}", crate::narrative::fnv1a_64(stable.as_bytes()))
+}
+
 /// Load the most recent `session_episode` reflections for `project` and format
 /// them (newest first, capped) for injection into the briefing prompt. Returns an
-/// empty string if none exist — the caller skips the briefing entirely.
-fn recent_episodes_for_project(engine: &Engine, project: &str) -> String {
+/// empty window if none exist — the caller skips the briefing entirely.
+fn recent_episodes_for_project(engine: &Engine, project: &str) -> EpisodeWindow {
     let project_tag = format!("project_{}", project);
     // Fetch by BOTH tags so the LIMIT applies after filtering — a busy project
     // can't be starved by its own non-episode reflections crowding a pre-filter
@@ -247,11 +368,15 @@ fn recent_episodes_for_project(engine: &Engine, project: &str) -> String {
             // Distinguish a real DB error from "no episodes" — both return empty,
             // but only this path is an operational problem worth surfacing.
             tracing::warn!(project, error = %e, "failed to load episodes for briefing");
-            return String::new();
+            return EpisodeWindow {
+                rendered: String::new(),
+                stable_entries: Vec::new(),
+            };
         }
     };
 
     let mut out = String::new();
+    let mut stable_entries = Vec::new();
     let mut n = 0;
     for (_, content, tags, ts) in &rows {
         if n >= MAX_EPISODES_IN_BRIEFING {
@@ -269,6 +394,10 @@ fn recent_episodes_for_project(engine: &Engine, project: &str) -> String {
             continue;
         }
         n += 1;
+        // Stable precursor BEFORE age formatting — used for the skip-gate digest.
+        // Full untruncated content: truncation is time-independent, but full content
+        // is simpler and strictly safer for uniqueness.
+        stable_entries.push((ts.clone(), content.clone()));
         // Relative age (e.g. "2h ago") so Haiku reports timing without citing the
         // raw UTC timestamp, which reads as a future date in the user's timezone.
         let age = crate::temporal::parse_timestamp(ts)
@@ -287,7 +416,10 @@ fn recent_episodes_for_project(engine: &Engine, project: &str) -> String {
             out.push_str(&format!("\n[Episode {} — {}]\n{}\n", n, age, content));
         }
     }
-    out
+    EpisodeWindow {
+        rendered: out,
+        stable_entries,
+    }
 }
 
 /// True if an episode's content is CSR talking to itself (agent transcript,
@@ -325,6 +457,23 @@ fn recent_briefing_exists(engine: &Engine, project: &str, within_minutes: i64) -
                 .map(|t| t.with_timezone(&chrono::Utc) > cutoff)
                 .unwrap_or(false)
     })
+}
+
+/// True if ANY `session_briefing` reflection exists for this project, regardless
+/// of age. Used by the content-hash skip-gate: if the user deleted reflections
+/// (so no briefing exists at all), we must regenerate even when the episode
+/// digest matches a stale stored hash.
+fn briefing_exists(engine: &Engine, project: &str) -> bool {
+    let project_tag = format!("project_{}", project);
+    let Ok(existing) = engine
+        .storage()
+        .get_reflections_by_tag("session_briefing", 50)
+    else {
+        return false;
+    };
+    existing
+        .iter()
+        .any(|(_, _, tags, _)| tags.iter().any(|t| t == &project_tag))
 }
 
 #[cfg(test)]
@@ -377,5 +526,60 @@ mod tests {
         assert!(is_meta_episode(analyst));
         assert!(is_meta_episode(summarizer));
         assert!(!is_meta_episode(real));
+    }
+
+    #[test]
+    fn test_narratives_disabled_gate_is_callable() {
+        // Callability smoke test: proves crate::narrative::narratives_disabled() is
+        // reachable and returns a bool. Does NOT exercise handle_inner's actual gate
+        // logic — we don't mutate CSR_NO_AI_NARRATIVES here (that env var is also
+        // touched by narrative.rs's own tests in the same --lib test binary, and cargo
+        // test runs tests in parallel by default — mutating shared process env from
+        // two test modules is a real race). Just prove the gate function is reachable
+        // and returns a bool without disabling narratives process-wide for every other
+        // test in this binary.
+        let _ = crate::narrative::narratives_disabled();
+    }
+
+    #[test]
+    fn test_briefing_hash_key_roundtrip() {
+        // Digest must be stable and hex-encoded — it is persisted in the meta table.
+        let digest = format!("{:016x}", crate::narrative::fnv1a_64(b"episode window"));
+        assert_eq!(digest.len(), 16);
+        assert_eq!(
+            digest,
+            format!("{:016x}", crate::narrative::fnv1a_64(b"episode window"))
+        );
+    }
+
+    #[test]
+    fn test_stable_episode_digest_ignores_relative_age() {
+        let entries = vec![(
+            "2026-07-10T10:00:00Z".to_string(),
+            r#"{"request":"fix bug"}"#.to_string(),
+        )];
+        let digest_a = stable_episode_digest(&entries);
+        let digest_b = stable_episode_digest(&entries);
+        assert_eq!(digest_a, digest_b, "stable digest must be deterministic");
+
+        // Simulate the OLD (buggy) approach: hashing the rendered text, which
+        // embeds a relative age that changes with wall-clock time even when
+        // the underlying episode window is identical.
+        let rendered_2h_ago = format!("\n[Episode 1 — 2h ago]\n{}\n", entries[0].1);
+        let rendered_3h_ago = format!("\n[Episode 1 — 3h ago]\n{}\n", entries[0].1);
+        let old_digest_1 = format!(
+            "{:016x}",
+            crate::narrative::fnv1a_64(rendered_2h_ago.as_bytes())
+        );
+        let old_digest_2 = format!(
+            "{:016x}",
+            crate::narrative::fnv1a_64(rendered_3h_ago.as_bytes())
+        );
+        assert_ne!(
+            old_digest_1, old_digest_2,
+            "sanity: old rendered-text hashing DOES change with age — this is the bug"
+        );
+        // The new stable digest does not depend on age at all.
+        assert_eq!(digest_a, digest_b);
     }
 }
