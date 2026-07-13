@@ -15,8 +15,8 @@ csr-engine setup
 
 ### status
 ```bash
-csr-engine status           # Full JSON
-csr-engine status --compact  # One-line for statusbar
+csr-engine status           # Full JSON (incl. "narratives" block: AI calls/tokens today + total)
+csr-engine status --compact  # One-line for statusbar, e.g. "AI 3c/12.4k tok today" or "AI off"
 ```
 
 ### hook
@@ -66,7 +66,8 @@ csr-engine quality src/main.rs
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| ANTHROPIC_API_KEY | (none) | Required for Layer 3 |
+| CSR_NARRATIVE_MODEL | (none) | Override AI narrative model (chain: this → `haiku` → CLI default) |
+| CSR_NO_AI_NARRATIVES | (none) | Set to `1` to disable AI narratives |
 | CSR_DB_PATH | ~/.claude-self-reflect/csr-engine.db | DB location |
 
 ## Data Locations

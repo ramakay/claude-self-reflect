@@ -16,7 +16,7 @@ This is what separates CSR from passive memory tools. **Context finds you.**
 
 Fires when you start a conversation. Injects three things:
 
-- **CONTINUUM** — last session's state: what was asked, where it ended (LAST), what's next (NEXT), and how many code anchors are still intact
+- **CONTINUUM** — last session's state: what was asked, where it ended (LAST), what's next (NEXT), and how many code anchors are still intact. Anchors are AST symbols in the six parsed languages, with whole-file fallback anchors for everything else (v9.3) — Swift, Kotlin, any language
 - **EPISODE INDEX** — recent sessions as a pickup menu, newest first, each with its outcome and a one-call lookup
 - **Anti-patterns** from incomplete past sessions
 
@@ -33,11 +33,12 @@ EPISODE INDEX — earlier threads, newest first:
 
 Fires every prompt. Routes first, then scores.
 
-**Intent routing (v9.2)** — a semantic classifier (exemplar embeddings over the same local MiniLM model, no extra model shipped) detects two intents:
+**Intent routing (v9.2, extended v9.3)** — a semantic classifier (exemplar embeddings over the same local MiniLM model, no extra model shipped) detects three intents:
 
 | Route | Intent | Threshold | Action |
 |-------|--------|-----------|--------|
 | A | Continue / StateRecall ("pick up where we left off", "what were we doing?") | 0.60 / 0.55 | Inject the matching episode's state directly |
+| A | Explore ("how does the ring navigation work?") | 0.55 | Inject a **CODE MAP** — file pointers from the conversation that built the feature, plus a ready-to-run recall call — before the agent re-maps the codebase |
 | B | Topic correlation | recency-weighted, 7-day half-life | Match prompt to a past episode; surface it as a pickup pointer |
 
 Everything else falls through to multi-signal scoring:
@@ -53,7 +54,7 @@ Everything else falls through to multi-signal scoring:
 
 ## SessionEnd — Automatic Narrative
 
-Imports final transcript, runs V3 extraction, synthesizes session story locally (free), falls back to Haiku if needed.
+Imports final transcript, runs V3 extraction, synthesizes session story locally (free), falls back to an AI narrative via `claude -p` if needed (model chain: `CSR_NARRATIVE_MODEL` → `haiku` → CLI default; every call metered, `CSR_NO_AI_NARRATIVES=1` disables).
 
 Stored narrative example:
 ```

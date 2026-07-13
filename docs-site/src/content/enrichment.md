@@ -26,9 +26,9 @@ Project: my-api | 45 min, 34 messages
 - Separate liveness and readiness probes
 ```
 
-## Layer 3: AI Narrative (optional, ~$0.012/conv)
+## Layer 3: AI Narrative (optional)
 
-Uses Anthropic Batch API (50% discount). Generates rich narratives.
+Generated locally via the Claude Code CLI (`claude -p`) — no API key, billed through your existing Claude subscription. Generates rich narratives.
 
 | Metric | Without AI | With AI |
 |--------|-----------|---------|
@@ -38,17 +38,35 @@ Uses Anthropic Batch API (50% discount). Generates rich narratives.
 ### Enable
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
 csr-engine daemon
 ```
 
-### Cost Estimates
+### Model Selection (v9.3)
 
-| Conversations | Cost |
-|---------------|------|
-| 100 | ~$1.20 |
-| 500 | ~$6.00 |
-| 1,000 | ~$12.00 |
+Narratives resolve the model through a chain — no dated model pin to go stale:
+
+1. `CSR_NARRATIVE_MODEL` (if set)
+2. `haiku` alias (cheapest tier)
+3. CLI default (only if the alias itself is unavailable)
+
+The chain only advances on a real model-not-found error, never on transient failures.
+
+### Cost Controls (v9.3)
+
+Every narrative call is metered — including failures and timeouts:
+
+```bash
+csr-engine status            # "narratives" block: calls/tokens today + total
+csr-engine status --compact  # "AI 3c/12.4k tok today" or "AI off"
+```
+
+Kill switch:
+
+```bash
+export CSR_NO_AI_NARRATIVES=1   # disables all AI narrative generation
+```
+
+The session briefing is also content-hash cached — it only regenerates when episode content actually changes.
 
 > **Tip**: Start without AI narratives. Free Layer 1+2 provides good search. Add Layer 3 later for best recall.
 
@@ -57,4 +75,5 @@ csr-engine daemon
 ```bash
 csr-engine status
 # enrichment.heuristic_completed, extracted_v3_completed, ai_narrative_completed
+# narratives.calls_today, narratives.tokens_today, narratives.disabled
 ```

@@ -17,8 +17,11 @@ Configured in `~/.claude/settings.json` via `csr-engine hook install --apply`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| ANTHROPIC_API_KEY | — | For Layer 3 AI narratives |
+| CSR_NARRATIVE_MODEL | — | Override model for AI narratives (falls back to `haiku`, then CLI default) |
+| CSR_NO_AI_NARRATIVES | — | Set to `1` to disable AI narrative generation entirely |
 | CSR_DB_PATH | ~/.claude-self-reflect/csr-engine.db | Custom DB path |
+
+AI narratives run through the Claude Code CLI (`claude -p`) — no API key required.
 
 ## Database
 
