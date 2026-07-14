@@ -119,6 +119,11 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         }
     };
 
+    // correlate_episode is expensive (semantic search over reflections); the
+    // Explore arm and Route B want the same result for the same prompt, so the
+    // first caller fills this memo and Route B reuses it on the fall-through.
+    let mut correlated_memo: Option<Option<(crate::hooks::stop::Episode, String, f32)>> = None;
+
     // Route A (semantic): nearest-prototype intent classification over the
     // same embedding space. The literal phrase match above catches exact
     // continuations for free; this catches rephrasings ("keep at it",
@@ -183,19 +188,20 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                         &cwd.to_string_lossy(),
                     )
                     .unwrap_or_default();
-                    if let Some((ep, age, _score)) = correlate_episode(
+                    let corr = correlate_episode(
                         engine,
                         &query_vec,
                         &current_project,
                         input.session_id.as_deref(),
                     )
-                    .await
-                    {
-                        if let Some(map) = format_code_map(&ep, &age) {
+                    .await;
+                    if let Some((ep, age, _score)) = &corr {
+                        if let Some(map) = format_code_map(ep, age) {
                             println!("{}", map);
                             return Ok(());
                         }
                     }
+                    correlated_memo = Some(corr);
                     // No correlated episode or no files — normal flow continues below.
                 }
             }
@@ -245,14 +251,19 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // episode with its retrieval handle, framed as prior art to verify (the
     // episode may be stale or the resemblance coincidental — never asserted
     // as the answer).
-    if let Some((ep, age, score)) = correlate_episode(
-        engine,
-        &query_vec,
-        &current_project,
-        input.session_id.as_deref(),
-    )
-    .await
-    {
+    let correlated = match correlated_memo {
+        Some(memo) => memo,
+        None => {
+            correlate_episode(
+                engine,
+                &query_vec,
+                &current_project,
+                input.session_id.as_deref(),
+            )
+            .await
+        }
+    };
+    if let Some((ep, age, score)) = correlated {
         emit_pickup(
             &ep,
             &age,
