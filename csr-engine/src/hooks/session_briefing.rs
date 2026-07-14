@@ -239,12 +239,11 @@ fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNar
         }
 
         let output = child.wait_with_output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            if crate::narrative::is_model_not_found(&stderr)
-                || crate::narrative::is_model_not_found(&stdout)
-            {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        match crate::narrative::classify_attempt(output.status.success(), &stdout, &stderr) {
+            crate::narrative::AttemptOutcome::Parsed(parsed) => return Ok(parsed),
+            crate::narrative::AttemptOutcome::ModelNotFound => {
                 tracing::warn!(model = ?candidate, "narrative model unavailable — trying next candidate");
                 last_err = Some(anyhow::anyhow!(
                     "model unavailable: {}",
@@ -252,17 +251,7 @@ fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNar
                 ));
                 continue; // walk the chain ONLY on model-not-found
             }
-            anyhow::bail!("claude -p failed: {}", stderr);
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        match crate::narrative::parse_claude_json(&stdout) {
-            Some(parsed) => return Ok(parsed),
-            None if crate::narrative::is_model_not_found(&stdout) => {
-                last_err = Some(anyhow::anyhow!("model unavailable (json error result)"));
-                continue;
-            }
-            None => anyhow::bail!("claude -p returned unparseable/error JSON"),
+            crate::narrative::AttemptOutcome::Failed(msg) => anyhow::bail!("{}", msg),
         }
     }
 
