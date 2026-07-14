@@ -126,27 +126,19 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
         .await;
 
         match attempt {
-            Ok(Some(output)) if output.status.success() => {
+            Ok(Some(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                match crate::narrative::parse_claude_json(&stdout) {
-                    Some(mut parsed) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                match crate::narrative::classify_attempt(output.status.success(), &stdout, &stderr)
+                {
+                    crate::narrative::AttemptOutcome::Parsed(mut parsed) => {
                         // Cap at 1000 chars — stories should be concise
                         parsed.text = parsed.text.chars().take(1000).collect();
                         return Some(parsed);
                     }
-                    None if crate::narrative::is_model_not_found(&stdout) => continue,
-                    None => return None,
+                    crate::narrative::AttemptOutcome::ModelNotFound => continue,
+                    crate::narrative::AttemptOutcome::Failed(_) => return None,
                 }
-            }
-            Ok(Some(output)) => {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                if crate::narrative::is_model_not_found(&stderr)
-                    || crate::narrative::is_model_not_found(&stdout)
-                {
-                    continue; // next candidate
-                }
-                return None; // real failure — don't burn the chain on rate limits
             }
             _ => return None, // timeout or spawn failure
         }

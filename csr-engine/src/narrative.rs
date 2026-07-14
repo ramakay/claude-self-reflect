@@ -30,6 +30,7 @@ pub fn model_candidates() -> Vec<Option<String>> {
     chain
 }
 
+#[derive(Debug)]
 pub struct ParsedNarrative {
     pub text: String,
     pub model: String,
@@ -90,6 +91,36 @@ pub fn is_model_not_found(stderr_or_json: &str) -> bool {
     (s.contains("issue with the selected model") || s.contains("may not exist"))
         || (s.contains("\"api_error_status\":404") && s.contains("model"))
         || (s.contains("model") && (s.contains("not found") || s.contains("invalid model")))
+}
+
+/// Outcome of one `claude -p` attempt. Decides whether the model chain
+/// walks to the next candidate (ModelNotFound) or stops (Failed).
+#[derive(Debug)]
+pub enum AttemptOutcome {
+    /// Exit success and stdout parsed as a narrative result.
+    Parsed(ParsedNarrative),
+    /// The requested model does not exist / is inaccessible — walk the chain.
+    ModelNotFound,
+    /// Any other failure (rate limit, network, garbage output) — stop; never
+    /// burn remaining candidates on non-model errors.
+    Failed(String),
+}
+
+pub fn classify_attempt(status_success: bool, stdout: &str, stderr: &str) -> AttemptOutcome {
+    if status_success {
+        match parse_claude_json(stdout) {
+            Some(p) => AttemptOutcome::Parsed(p),
+            None if is_model_not_found(stdout) => AttemptOutcome::ModelNotFound,
+            None => AttemptOutcome::Failed("claude -p returned unparseable/error JSON".to_string()),
+        }
+    } else if is_model_not_found(stderr) || is_model_not_found(stdout) {
+        AttemptOutcome::ModelNotFound
+    } else {
+        AttemptOutcome::Failed(format!(
+            "claude -p failed: {}",
+            if stderr.is_empty() { stdout } else { stderr }
+        ))
+    }
 }
 
 /// FNV-1a 64-bit. Deterministic across processes and versions (unlike
@@ -183,5 +214,67 @@ mod tests {
         std::env::set_var("CSR_NO_AI_NARRATIVES", "0");
         assert!(!narratives_disabled());
         std::env::remove_var("CSR_NO_AI_NARRATIVES");
+    }
+
+    #[test]
+    fn test_classify_attempt_success_fixture() {
+        match classify_attempt(true, FIXTURE, "") {
+            AttemptOutcome::Parsed(p) => assert!(!p.text.is_empty()),
+            other => panic!("expected Parsed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_classify_attempt_model_404_json_on_failure() {
+        let json = r#"{"is_error":true,"api_error_status":404,"result":"There's an issue with the selected model (zz9). It may not exist or you may not have access to it."}"#;
+        assert!(matches!(
+            classify_attempt(false, json, ""),
+            AttemptOutcome::ModelNotFound
+        ));
+        assert!(matches!(
+            classify_attempt(false, "", json),
+            AttemptOutcome::ModelNotFound
+        ));
+    }
+
+    #[test]
+    fn test_classify_attempt_model_404_wording_on_success_status() {
+        let json = r#"{"is_error":true,"result":"There's an issue with the selected model (zz9). It may not exist."}"#;
+        assert!(matches!(
+            classify_attempt(true, json, ""),
+            AttemptOutcome::ModelNotFound
+        ));
+    }
+
+    #[test]
+    fn test_classify_attempt_rate_limit_is_failed() {
+        assert!(matches!(
+            classify_attempt(false, "", "rate limit exceeded"),
+            AttemptOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_attempt_network_error_is_failed() {
+        assert!(matches!(
+            classify_attempt(false, "network error: connection refused", ""),
+            AttemptOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_attempt_garbage_on_success_is_failed() {
+        assert!(matches!(
+            classify_attempt(true, "not json at all", ""),
+            AttemptOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_attempt_failed_prefers_stderr() {
+        match classify_attempt(false, "stdout noise", "real error") {
+            AttemptOutcome::Failed(msg) => assert!(msg.contains("real error")),
+            other => panic!("expected Failed, got {:?}", other),
+        }
     }
 }
