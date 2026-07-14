@@ -8,18 +8,18 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "lucide-react": "^0.510.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "react-router-dom": "^7.15.0",
     "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1",
+    "react-router-dom": "^7.15.0",
     "rehype-raw": "^7.0.0",
-    "lucide-react": "^0.510.0"
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^4.5.2",
-    "vite": "^6.3.5",
     "@tailwindcss/vite": "^4.1.7",
-    "tailwindcss": "^4.1.7"
+    "@vitejs/plugin-react": "^4.5.2",
+    "tailwindcss": "^4.1.7",
+    "vite": "^6.4.3"
   }
 }
