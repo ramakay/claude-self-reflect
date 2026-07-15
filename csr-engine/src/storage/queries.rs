@@ -1616,23 +1616,43 @@ pub fn files_for_session(conn: &Connection, session_id: &str, limit: usize) -> R
 }
 
 /// Other sessions that touched the same file (code_evolution), excluding one session.
+/// Optionally scoped to a project (saga project-scoping fix — prevents cross-project
+/// graph spread in the reinstatement walk).
 /// Lifted from the Phase 0 spike (examples/saga_spike.rs::sessions_for_file), now with a
 /// caller-supplied limit instead of a hardcoded 12.
 pub fn sessions_for_file(
     conn: &Connection,
     file_path: &str,
     exclude_session: &str,
+    project: Option<&str>,
     limit: usize,
 ) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT session_id FROM code_evolution
-         WHERE file_path = ?1 AND session_id <> ?2 LIMIT ?3",
-    )?;
-    let rows = stmt.query_map(params![file_path, exclude_session, limit as i64], |row| {
-        row.get::<_, String>(0)
-    })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    match project {
+        Some(p) => {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT session_id FROM code_evolution
+                 WHERE file_path = ?1 AND session_id <> ?2 AND project_name = ?3 LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                params![file_path, exclude_session, p, limit as i64],
+                |row| row.get::<_, String>(0),
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT session_id FROM code_evolution
+                 WHERE file_path = ?1 AND session_id <> ?2 LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(params![file_path, exclude_session, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        }
+    }
 }
 
 /// Backfill UPDATE: set seq/is_sidechain on an existing chunk row by id.
@@ -1921,5 +1941,66 @@ mod tests {
             .unwrap();
         assert_eq!(seq, 7);
         assert_eq!(is_sidechain, 1);
+    }
+
+    /// Seed two projects that share a file path from different sessions.
+    fn seed_cross_project_shared_file(conn: &Connection) {
+        insert_code_evolution(
+            conn,
+            "sess_a",
+            "proj_a",
+            "shared.rs",
+            "rust",
+            "Edit",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+        )
+        .unwrap();
+        insert_code_evolution(
+            conn,
+            "sess_b",
+            "proj_b",
+            "shared.rs",
+            "rust",
+            "Edit",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sessions_for_file_filters_by_project() {
+        let conn = mem();
+        seed_cross_project_shared_file(&conn);
+
+        // Scoped to proj_a: must not leak sess_b from proj_b (same file path).
+        // Only other-project row exists, so filtered result is empty.
+        let got = sessions_for_file(&conn, "shared.rs", "sess_a", Some("proj_a"), 10).unwrap();
+        assert!(
+            !got.contains(&"sess_b".to_string()),
+            "project-scoped lookup must not return other-project sessions: {got:?}"
+        );
+    }
+
+    #[test]
+    fn sessions_for_file_none_project_is_unscoped() {
+        let conn = mem();
+        seed_cross_project_shared_file(&conn);
+
+        // Unscoped (None): back-compat — can see sess_b across projects.
+        let got = sessions_for_file(&conn, "shared.rs", "sess_a", None, 10).unwrap();
+        assert!(
+            got.contains(&"sess_b".to_string()),
+            "unscoped lookup must return other-project sessions: {got:?}"
+        );
     }
 }

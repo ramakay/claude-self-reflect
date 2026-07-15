@@ -643,10 +643,11 @@ impl Storage {
         &self,
         file_path: &str,
         exclude_session: &str,
+        project: Option<&str>,
         limit: usize,
     ) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::sessions_for_file(&conn, file_path, exclude_session, limit)
+        queries::sessions_for_file(&conn, file_path, exclude_session, project, limit)
     }
 
     pub fn set_chunk_saga_columns(

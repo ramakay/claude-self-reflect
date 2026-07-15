@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::RwLock;
 
 use crate::embeddings::EmbeddingEngine;
@@ -60,7 +60,7 @@ async fn arm_a_convs(
     storage: &Arc<Storage>,
     search: &Arc<RwLock<SearchEngine>>,
     query_vec: &[f32],
-) -> HashSet<String> {
+) -> Result<HashSet<String>> {
     const K: usize = 10;
     const MIN_SCORE: f32 = 0.20;
 
@@ -73,7 +73,11 @@ async fn arm_a_convs(
     };
 
     let chunk_ids: Vec<String> = chunks.iter().map(|r| r.id.clone()).collect();
-    let chunk_meta = storage.get_chunks_by_ids(&chunk_ids).unwrap_or_default();
+    // Fail closed: a metadata fetch error would silently undercount arm A and
+    // inflate B's relative win.
+    let chunk_meta = storage
+        .get_chunks_by_ids(&chunk_ids)
+        .context("arm A chunk metadata fetch failed")?;
 
     let mut cands: Vec<(f32, String)> = Vec::new();
     for r in &chunks {
@@ -92,7 +96,7 @@ async fn arm_a_convs(
     }
     cands.sort_by(|a, b| b.0.total_cmp(&a.0));
     cands.truncate(K);
-    cands.into_iter().map(|(_, c)| c).collect()
+    Ok(cands.into_iter().map(|(_, c)| c).collect())
 }
 
 /// Run the provenance benchmark against the live engine. Graceful on an empty/near-
@@ -102,7 +106,9 @@ pub async fn run_provenance(
     embeddings: &Arc<EmbeddingEngine>,
     search: &Arc<RwLock<SearchEngine>>,
 ) -> Result<ProvenanceReport> {
-    let total_chunks = storage.count_chunk_embeddings().unwrap_or(0);
+    let total_chunks = storage
+        .count_chunk_embeddings()
+        .context("count_chunk_embeddings failed")?;
     if total_chunks == 0 {
         return Ok(ProvenanceReport {
             text: "provenance eval skipped: no chunks in database\n".to_string(),
@@ -119,7 +125,7 @@ pub async fn run_provenance(
     for (qi, q) in QUERIES.iter().enumerate() {
         let gt = storage
             .ground_truth_sessions_for_target(q.target)
-            .unwrap_or_default();
+            .with_context(|| format!("ground truth lookup failed for Q{}", qi + 1))?;
         gt_possible += gt.len();
 
         let query_vec = match embed(embeddings, q.text).await {
@@ -130,13 +136,15 @@ pub async fn run_provenance(
             }
         };
 
-        let a_convs = arm_a_convs(storage, search, &query_vec).await;
+        let a_convs = arm_a_convs(storage, search, &query_vec)
+            .await
+            .with_context(|| format!("arm A failed for Q{}", qi + 1))?;
         let a_cov = a_convs.iter().filter(|c| gt.contains(*c)).count();
 
         let cfg = ReinstateConfig::default();
         let b_items = reinstate(storage, embeddings, search, q.text, None, &cfg)
             .await
-            .unwrap_or_default();
+            .with_context(|| format!("reinstate() failed for Q{}", qi + 1))?;
         let b_convs: HashSet<String> = b_items.iter().map(|i| i.conversation_id.clone()).collect();
         let b_cov = b_convs.iter().filter(|c| gt.contains(*c)).count();
 
@@ -227,6 +235,19 @@ mod tests {
         let storage = Storage::open_memory().unwrap();
         let gt = storage.ground_truth_sessions_for_target("").unwrap();
         assert!(gt.is_empty());
+    }
+
+    /// Storage does not expose raw SQL (private `conn`), so we cannot DROP
+    /// `code_evolution` after `Storage::open_memory()`. Instead we call the same
+    /// `queries::ground_truth_sessions_for_target` path that Storage wraps, on a
+    /// connection with no tables — missing table yields `Err` (not `Ok`/empty),
+    /// which `run_provenance` now propagates via `?` instead of `unwrap_or_default()`.
+    #[test]
+    fn ground_truth_lookup_returns_err_when_code_evolution_missing() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let result =
+            crate::storage::queries::ground_truth_sessions_for_target(&conn, "src/storage/mod.rs");
+        assert!(result.is_err());
     }
 
     #[tokio::test]

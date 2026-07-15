@@ -4,7 +4,7 @@
 
 Agentic coding sessions leave three correlated traces that most memory systems index separately or not at all: *intent* (human prompts), *deliberation* (agent reasoning and tool calls), and *artifact* (code changes). We call the joint structure spanning these traces for one unit of work a *saga*. This paper presents claude-self-reflect (CSR), a single Rust binary that jointly indexes Claude Code session transcripts, local embeddings, and an AST-derived code graph, and introduces *reinstatement recall*—a multi-hop retrieval algorithm, exposed as the MCP tool `csr_why`, that reinstates encoding context across a saga rather than matching a query with one-shot nearest neighbors.
 
-On a live corpus of 71,762 chunks, 528 conversations, and a code graph of 3,967 nodes / 13,908 edges, a pre-registered spike evaluation of 12 multi-hop provenance questions (“why does this code look like this?”) found that reinstatement raised summed ground-truth session coverage from 15 to 23 at k=10 (+53% relative; gate threshold +25%), winning 7/12 queries and tying 5/12 with zero losses. A same-day production reimplementation on a 20-query suite scored 15 → 18/19 under partial self-contamination. Mechanism attribution shows most of the gain comes from a pure-semantic context-blend step (a computational analogue of the Temporal Context Model), not graph walking. We also report a Heisenberg-like *observer effect*: evaluating a self-indexing memory system against a live corpus lets the evaluation session’s own transcripts displace origin conversations. A follow-up provenance-aware rerank of the reinstatement pool—centrally a *query-echo* defense that demotes chunks quoting the query verbatim and prefers non-echo seeds—held aggregate coverage while repairing the canonical acceptance-failure query (0 → 1 ground-truth sessions) on a frozen corpus. We argue that frozen pre-evaluation snapshots and provenance-aware demotion of self-echo are necessary methodological controls for any self-recording agent memory.
+On a live corpus of 71,762 chunks, 528 conversations, and a code graph of 3,967 nodes / 13,908 edges, a pre-registered spike evaluation of 12 multi-hop provenance questions (“why does this code look like this?”) found that reinstatement raised summed ground-truth session coverage from 15 to 23 at k=10 (+53% relative; gate threshold +25%), winning 7/12 queries and tying 5/12 with zero losses. A same-day production reimplementation of the same 12-query suite scored 15 → 18/19 under partial self-contamination. Mechanism attribution shows most of the gain comes from a pure-semantic context-blend step (a computational analogue of the Temporal Context Model), not graph walking. We also report a Heisenberg-like *observer effect*: evaluating a self-indexing memory system against a live corpus lets the evaluation session’s own transcripts displace origin conversations. A follow-up provenance-aware rerank of the reinstatement pool—centrally a *query-echo* defense that demotes chunks quoting the query verbatim and prefers non-echo seeds—held aggregate coverage while repairing the canonical acceptance-failure query (0 → 1 ground-truth sessions) on a frozen corpus. We argue that frozen pre-evaluation snapshots and provenance-aware demotion of self-echo are necessary methodological controls for any self-recording agent memory.
 
 ## Introduction
 
@@ -94,7 +94,7 @@ We evaluate *provenance recall*: multi-hop questions of the form “why does the
 
 **Disclosed circularity.** Arm B’s graph-spread step queries the same `code_evolution` table used to define GT, but only via seed sessions found by search: a bad seed yields no graph gain. The design is therefore not circular by construction, but shared plumbing could still inflate graph-channel hits. We therefore require mechanism attribution and M3, not M1 alone.
 
-**Corpus.** Live CSR development history (dogfooding). Phase 0 spike: morning of 2026-07-15, throwaway read-only binary against 71,762-chunk DB, 12 hand-written queries. Phase 1 production: evening of the same day, `csr-engine eval --provenance`, 20-query suite (superset of the 12), after a full day of development sessions had been imported.
+**Corpus.** Live CSR development history (dogfooding). Phase 0 spike: morning of 2026-07-15, throwaway read-only binary against 71,762-chunk DB, 12 hand-written queries. Phase 1 production: evening of the same day, `csr-engine eval --provenance`, the same 12-query suite lifted verbatim into the engine, after a full day of development sessions had been imported.
 
 ### Phase 0 spike results
 
@@ -125,10 +125,10 @@ The same walk was reimplemented as engine code and registered as the 14th MCP to
 
 | Run | A | B | Notes |
 |-----|---|---|--------|
-| Production `eval --provenance` (20 queries) | 15 | 18 | First production path |
+| Production `eval --provenance` (12 queries) | 15 | 18 | First production path |
 | Immediate rerun via original spike code path | 15 | 19 | Faithfulness check |
 
-Production reimplementation is faithful to the spike algorithm (18–19 vs. spike’s 23 on a larger suite under a dirtier corpus), not a regression to a weaker walk.
+Production reimplementation is faithful to the spike algorithm (18–19 vs. the spike’s 23 on the same 12-query suite under a dirtier corpus), not a regression to a weaker walk.
 
 ### Using the discrepancy as evidence
 
@@ -163,7 +163,7 @@ This observer effect is a Heisenberg-like issue for a class of systems, not a CS
 
 ### Limitations
 
-**(a) Scale and design.** Evaluation uses 12–20 hand-written queries on a single system, single corpus, with single-annotator M3—no inter-rater reliability, no external dataset, no multi-organization coding history.
+**(a) Scale and design.** Evaluation uses 12 hand-written queries on a single system, single corpus, with single-annotator M3—no inter-rater reliability, no external dataset, no multi-organization coding history.
 
 **(b) GT and graph plumbing.** GT is built from `code_evolution`, which Arm B also uses in step 3. Circularity is mitigated by seed dependence and by blend-channel dominance in attribution, but not eliminated.
 

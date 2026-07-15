@@ -383,6 +383,69 @@ fn test_post_tool_use_ignores_non_edit_tools() {
     assert!(!edit_tools.contains(&input.tool_name.as_deref().unwrap()));
 }
 
+/// Guards against silently missing sidechain/resumed sessions in the reinstatement graph walk.
+#[test]
+fn code_evolution_keys_by_transcript_stem_not_session_id() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Sidechain-style transcript path: stem differs from session_id.
+    let transcript = tmp.path().join("agent-abc123.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"user","message":{"content":[{"type":"text","text":"Add a helper function"}]},"timestamp":"2026-02-22T16:00:00Z"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Writing the new function."}]},"timestamp":"2026-02-22T16:00:01Z"}
+"#,
+    )
+    .unwrap();
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage.clone(),
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
+    );
+
+    let input = csr_engine::hooks::HookInput {
+        transcript_path: Some(transcript.to_string_lossy().to_string()),
+        session_id: Some("11111111-2222-3333-4444-555555555555".into()),
+        cwd: Some(tmp.path().to_string_lossy().to_string()),
+        tool_name: Some("Write".into()),
+        tool_input: Some(serde_json::json!({
+            "file_path": "/tmp/some_test_file.rs",
+            "content": "fn new_function() { }"
+        })),
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(csr_engine::hooks::post_tool_use::handle(
+        &input,
+        &engine,
+        tmp.path(),
+    ));
+    assert!(result.is_ok());
+
+    let rows = storage
+        .get_recent_code_evolution("/tmp/some_test_file.rs", "", 10)
+        .unwrap();
+    assert!(
+        !rows.is_empty(),
+        "Write with a new function should insert a code_evolution row"
+    );
+    assert_eq!(
+        rows[0].0, "agent-abc123",
+        "code_evolution.session_id must be transcript stem, not raw session_id"
+    );
+    assert_ne!(
+        rows[0].0, "11111111-2222-3333-4444-555555555555",
+        "must not key by raw session_id when transcript stem is available"
+    );
+}
+
 // ─── Install Config with All Hooks ───
 
 #[test]

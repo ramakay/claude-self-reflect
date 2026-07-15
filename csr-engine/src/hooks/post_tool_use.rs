@@ -208,7 +208,10 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
         return Ok(());
     }
 
-    let session_id = input.session_id.as_deref().unwrap_or("unknown");
+    // As of this fix: this column holds conversation ids (transcript stem), not raw session ids —
+    // see conv_id_for. Needed so the reinstatement graph walk (which joins on conversation_id)
+    // finds code evolution rows for sidechain/resumed sessions too.
+    let conv_id = conv_id_for(input);
 
     // Resolve project name for cross-project scoping
     let project_name = crate::search::cross_project::resolve_current_project().unwrap_or_default();
@@ -222,7 +225,7 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
     let ir = serde_json::to_string(&diff.imports_removed).unwrap_or_default();
 
     engine.storage().insert_code_evolution(
-        session_id,
+        &conv_id,
         &project_name,
         file_path,
         language,

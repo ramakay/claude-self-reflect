@@ -286,6 +286,10 @@ fn episode_prev_session(storage: &Storage, conv: &str) -> Result<Option<String>>
 
 /// The proven reinstatement walk: seed (hop 1) -> blend + graph spread + episode
 /// chain (hop 2), fused by max score per chunk id and truncated to `cfg.k`.
+/// Reflections are intentionally global (never project-filtered — parity with
+/// `reflect_on_past`); callers pass `project: "all"` normalized to `None` upstream
+/// (in `crate::search::cross_project::normalize_project_scope`) as the cross-project
+/// escape hatch.
 ///
 /// Async only because `SearchEngine` sits behind a `tokio::RwLock`; each HNSW
 /// search takes its own short-lived read guard rather than holding one for the
@@ -308,6 +312,13 @@ pub async fn reinstate(
         tokio::task::spawn_blocking(move || emb.embed_single(&q)).await??
     };
 
+    // Project chunk-id set, hoisted so hop-1 seed search and hop-2 blend share one
+    // lookup. Reflections stay unfiltered (global).
+    let project_chunk_ids: Option<std::collections::HashSet<String>> = match project {
+        Some(p) => Some(storage.get_chunk_ids_for_project(p)?.into_iter().collect()),
+        None => None,
+    };
+
     // ---- hop 1: chunks (project-scoped if given) + reflections, merged ----
     // 2x over-fetch so seed selection can skip verbatim query echoes and still
     // find cfg.seeds real seeds — on a re-asked question the top hits are all
@@ -315,10 +326,8 @@ pub async fn reinstate(
     let hop1_k = cfg.k * 2;
     let (chunk_hits, reflection_hits) = {
         let idx = search.read().await;
-        let chunks = if let Some(p) = project {
-            let ids: std::collections::HashSet<String> =
-                storage.get_chunk_ids_for_project(p)?.into_iter().collect();
-            idx.search_chunks_filtered(&query_vec, hop1_k, cfg.min_score, &ids)
+        let chunks = if let Some(ref ids) = project_chunk_ids {
+            idx.search_chunks_filtered(&query_vec, hop1_k, cfg.min_score, ids)
         } else {
             idx.search_chunks(&query_vec, hop1_k, cfg.min_score)
         };
@@ -390,12 +399,16 @@ pub async fn reinstate(
             continue;
         };
 
-        // (1) blended context vector, second-hop chunk search
+        // (1) blended context vector, second-hop chunk search (project-filtered when scoped)
         if let Some(sv) = seed_vecs.get(&seed.id) {
             let bv = blend(&query_vec, sv, cfg.blend_query_weight);
             let blend_hits = {
                 let idx = search.read().await;
-                idx.search_chunks(&bv, 5, cfg.min_score)
+                if let Some(ref ids) = project_chunk_ids {
+                    idx.search_chunks_filtered(&bv, 5, cfg.min_score, ids)
+                } else {
+                    idx.search_chunks(&bv, 5, cfg.min_score)
+                }
             };
             let bids: Vec<String> = blend_hits.iter().map(|r| r.id.clone()).collect();
             let bmeta = storage.get_chunks_by_ids(&bids)?;
@@ -415,9 +428,11 @@ pub async fn reinstate(
         }
 
         // (2) code-graph spread: seed session -> shared files -> neighbor sessions
+        // Neighbor lookup is project-scoped when `project` is Some, so graph spread
+        // cannot leak across projects that share a file path.
         let mut graph_cands: Vec<Candidate> = Vec::new();
         for file in storage.files_for_session(&seed_conv, 4)? {
-            for neighbor in storage.sessions_for_file(&file, &seed_conv, 12)? {
+            for neighbor in storage.sessions_for_file(&file, &seed_conv, project, 12)? {
                 if let Some((id, cos)) = best_chunk_for_conv(storage, &query_vec, &neighbor)? {
                     graph_cands.push(Candidate {
                         id,

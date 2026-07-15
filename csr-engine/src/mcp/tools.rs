@@ -582,7 +582,8 @@ pub async fn code_graph(
 
 /// Provenance recall: why does this code/decision exist. Reinstatement walk (seed ->
 /// blend + code-graph spread + episode chain), formatted as a cited evidence chain
-/// grouped by conversation.
+/// grouped by conversation. Project scope is normalized via
+/// `cross_project::normalize_project_scope` (same as every other MCP tool).
 pub async fn why(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
@@ -591,9 +592,17 @@ pub async fn why(
     project: Option<&str>,
     cfg: &crate::search::reinstatement::ReinstateConfig,
 ) -> Result<String> {
-    let items =
-        crate::search::reinstatement::reinstate(storage, embeddings, search, query, project, cfg)
-            .await?;
+    let (effective_project, _) = cross_project::normalize_project_scope(project);
+
+    let items = crate::search::reinstatement::reinstate(
+        storage,
+        embeddings,
+        search,
+        query,
+        effective_project.as_deref(),
+        cfg,
+    )
+    .await?;
 
     // TAD: log each returned chunk as an MCP-search retrieval event. session_id="mcp" is
     // the sentinel (MCP has no session id) — same pattern as reflect_on_past. Non-fatal:
