@@ -718,6 +718,30 @@ mod tests {
     }
 
     #[test]
+    fn test_outcome_success_when_binary_installed() {
+        // "installed" is a word-boundary success signal — a clean install/
+        // restart close with no errors must classify as success, not partial.
+        // Third line is a tool read so message_count >= 3; completed is the
+        // assistant text only (must not rely on "done"/"fixed" tokens).
+        let lines_owned = [
+            user_line("Ship the new csr-engine binary"),
+            assistant_tool_line(&[("Read", "/src/hooks/session_start.rs")]),
+            assistant_text_line(
+                "New binary installed at /usr/local/bin/csr-engine. Restart Claude Code now.",
+            ),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
+        let ep = extract_episode(&lines, "sess-installed", "proj");
+        assert!(
+            ep.completed.contains("installed"),
+            "completed should carry the install text: {}",
+            ep.completed
+        );
+        assert_eq!(ep.outcome, "success");
+        assert!(ep.error_signatures.is_empty());
+    }
+
+    #[test]
     fn test_request_skips_command_plumbing_and_probe_paste() {
         // Round-3 regression: caveat wrapper and pasted probe report must not
         // become the episode request — the first REAL user message should.
