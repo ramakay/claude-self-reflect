@@ -1,6 +1,7 @@
 pub mod code_rank;
 pub mod cross_project;
 pub mod decay;
+pub mod reinstatement;
 pub mod rerank;
 
 use std::collections::HashSet;

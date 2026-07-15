@@ -29,7 +29,7 @@ csr-engine eval --full         # Full eval (20 tests, ~200ms)
 csr-engine quality <file>      # AST code quality analysis
 ```
 
-## MCP Tools (13 total)
+## MCP Tools (14 total)
 
 ```
 csr_reflect_on_past   — Semantic search across past conversations
@@ -45,6 +45,7 @@ csr_get_more          — Paginate results
 get_full_conversation — Complete JSONL retrieval
 get_session_learnings — Iteration memory for Ralph loops
 csr_code_graph        — Which conversations shaped a function/file (AST anchors)
+csr_why               — Provenance chain: why does this code/decision exist (reinstatement recall)
 ```
 
 ## Critical Rules

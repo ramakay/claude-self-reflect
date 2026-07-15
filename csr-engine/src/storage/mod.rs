@@ -664,6 +664,14 @@ impl Storage {
         queries::list_all_import_state_file_paths(&conn)
     }
 
+    pub fn ground_truth_sessions_for_target(
+        &self,
+        target: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::ground_truth_sessions_for_target(&conn, target)
+    }
+
     // ─── Episode anchors (v9.3) ───
 
     /// Replace all anchors for a session (delete-then-insert upsert).

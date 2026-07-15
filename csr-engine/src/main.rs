@@ -107,6 +107,10 @@ enum Commands {
         /// Run the LIVE north-star probe against the real index (no fixture)
         #[arg(long = "continuity-live")]
         continuity_live: bool,
+        /// Provenance regression benchmark: reinstatement walk vs one-shot kNN (Saga
+        /// Phase 1 WS2). LOCAL opt-in only — never part of default eval/--full, never CI.
+        #[arg(long)]
+        provenance: bool,
     },
     /// Backfill session stories from V3/heuristic data (zero cost)
     BackfillStories {
@@ -240,6 +244,7 @@ async fn main() -> Result<()> {
         full,
         continuity,
         continuity_live,
+        provenance,
     }) = args.command
     {
         if let Some(parent) = args.db_path.parent() {
@@ -259,6 +264,19 @@ async fn main() -> Result<()> {
         if continuity {
             let report = csr_engine::eval::continuity::run_continuity(eng.embeddings()).await;
             print!("{}", report.format_text());
+            return Ok(());
+        }
+        if provenance {
+            let report = csr_engine::eval::provenance::run_provenance(
+                eng.storage(),
+                eng.embeddings(),
+                eng.search(),
+            )
+            .await?;
+            print!("{}", report.text);
+            if report.regression {
+                std::process::exit(1);
+            }
             return Ok(());
         }
         let report = if full {

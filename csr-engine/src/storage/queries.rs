@@ -1657,6 +1657,22 @@ pub fn list_all_import_state_file_paths(conn: &Connection) -> Result<Vec<String>
         .map_err(Into::into)
 }
 
+/// Distinct sessions that touched files matching a path suffix (hook-observed edits) —
+/// ground truth for the provenance eval (`eval --provenance`). Lifted from the Phase 0
+/// spike's `ground_truth`. Empty target -> empty set (judged-only queries have no GT).
+pub fn ground_truth_sessions_for_target(
+    conn: &Connection,
+    target: &str,
+) -> Result<std::collections::HashSet<String>> {
+    if target.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT session_id FROM code_evolution WHERE file_path LIKE '%' || ?1")?;
+    let rows = stmt.query_map(params![target], |r| r.get::<_, String>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 // ─── Consolidation queries (v9 Dreamer) ───
 
 /// Get conversations with V3 extraction or AI narrative but no consolidation.
