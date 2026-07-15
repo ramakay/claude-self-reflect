@@ -179,6 +179,37 @@ conversations for the very queries they discuss. Two consequences:
 
 Commits: `800636f` (spike), `1097485` (spec), `dadb14a` (WS1), WS2 committed on `saga-phase1`.
 
+## 7.5 Phase 1.5 results (2026-07-15 evening, commit `7dd95a7`)
+
+`reinstate()` now reranks its fused pool via rerank.rs under a new `RankPolicy::Provenance`.
+Evidence forced two deviations from the queued plan, plus two additions:
+
+1. **Mechanic demotion skipped** — `[Edit:]`-heavy chunks are provenance *evidence*;
+   demoting them evicted GT session `219ef49f` on eval Q5.
+2. **`W_USER` boost skipped** — the reinstatement pool is wide (min_score 0.20, ~46
+   candidates), so the flat +0.50 promoted weakly-relevant user chunks and user-role
+   compaction summaries over strong evidence (also observed as a Q5 regression).
+3. **Query-echo defense (new)** — a chunk quoting the query verbatim is a session that
+   *asked* it, not the origin that decided it: −0.35 in the pool, plus echo-aware hop-1
+   seed selection (2× over-fetch, non-echo hits preferred as walk seeds). Without the
+   seed fix, a re-asked question drowned the walk in its own prior askings — the live
+   "why did we drop Qdrant" pool collapsed to 3 contaminated conversations; with it, 5
+   conversations with the answer-bearing chunk ranked first in the top group.
+4. **Compaction summaries are scaffold (new)** — "This session is being continued from a
+   previous conversation" added to `is_scaffold_text`; benefits `reflect_on_past` too.
+
+Frozen-corpus eval (both binaries on clones of `eval-frozen-2026-07-15.db`, 73342 chunks):
+A=15 B=18 before and after. Coverage held rather than lifted; distribution improved where
+it matters — Q3, the DoD acceptance-failure query ("why is integrity check cached"),
+went B=0→1; Q12 1→2; Q5 2→1; Q10 4→3. Live-corpus runs during development confirmed the
+observer effect is continuous: chunk count drifted 73846→73882 across four eval runs as
+this session's own transcripts imported, changing per-query numbers between otherwise
+identical invocations. Frozen-corpus methodology is mandatory for the paper.
+
+Known remaining gap: the true origin conversation for pre-v8 decisions (e.g. the Qdrant
+drop) still doesn't surface — asker sessions win the top group. Needs `supersedes`
+population (backlog) and possibly conversation-level echo exclusion, not chunk-level.
+
 ## 8. Pipeline after this phase
 
 DoD pass → findings section appended here → paper draft ("Three-Trace Sagas: joint episodic
