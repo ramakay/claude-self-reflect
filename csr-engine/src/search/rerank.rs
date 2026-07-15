@@ -55,12 +55,35 @@ const W_PRIMACY: f32 = 0.15;
 /// old, vaguely-similar conversation claim origin over the real one.
 const PRIMACY_BAND: f32 = 0.05;
 
-/// Adjusted score for one candidate. Higher ranks first.
+/// Which retrieval surface a ranking serves. The policies share every signal
+/// except the mechanic demotion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankPolicy {
+    /// Conversational recall (`reflect_on_past`): build-log mechanics are
+    /// plumbing that buries meaning — demote them.
+    Recall,
+    /// Provenance recall (`csr_why`): defense-only. The reinstatement pool is
+    /// wide (min_score 0.20, ~46 candidates) where recall's is tight, so the
+    /// flat boosts distort it: `W_USER` promoted weakly-relevant user chunks
+    /// (and user-role compaction summaries) over strong evidence, and mechanic
+    /// demotion evicted `[Edit:]`-heavy chunks that are the very proof a
+    /// session shaped the code (both observed as eval Q5 regressions, saga
+    /// Phase 1.5). Keep scaffold/CSR-echo + poison penalties, supersedes, and
+    /// primacy; skip `W_USER` and the mechanic penalty.
+    Provenance,
+}
+
+/// Adjusted score for one candidate under the [`RankPolicy::Recall`] policy.
 pub fn adjusted_score(c: &RankCandidate) -> f32 {
+    adjusted_score_with(c, RankPolicy::Recall)
+}
+
+/// Adjusted score for one candidate under `policy`. Higher ranks first.
+pub fn adjusted_score_with(c: &RankCandidate, policy: RankPolicy) -> f32 {
     let mut s = c.cosine;
     let author = c.provenance.as_ref().map(|p| p.author);
 
-    if author == Some(Speaker::User) {
+    if policy == RankPolicy::Recall && author == Some(Speaker::User) {
         s += W_USER;
     }
     if c.provenance
@@ -70,7 +93,7 @@ pub fn adjusted_score(c: &RankCandidate) -> f32 {
     {
         s += W_SUPERSEDES;
     }
-    if is_mechanic_text(&c.content) {
+    if policy == RankPolicy::Recall && is_mechanic_text(&c.content) {
         s -= W_MECHANIC_PENALTY;
     }
     if is_scaffold_text(&c.content) {
@@ -122,12 +145,18 @@ fn primacy_conv(cands: &[RankCandidate]) -> Option<String> {
         .map(|(_, conv)| conv)
 }
 
-/// Re-rank candidates by adjusted score, descending. Stable: ties keep input
-/// order, so a pure-cosine ordering is preserved where no signal differs.
-pub fn rerank(mut cands: Vec<RankCandidate>) -> Vec<RankCandidate> {
+/// Re-rank candidates by adjusted score, descending, under the
+/// [`RankPolicy::Recall`] policy. Stable: ties keep input order, so a
+/// pure-cosine ordering is preserved where no signal differs.
+pub fn rerank(cands: Vec<RankCandidate>) -> Vec<RankCandidate> {
+    rerank_with(cands, RankPolicy::Recall)
+}
+
+/// Re-rank candidates by adjusted score under `policy`, descending. Stable.
+pub fn rerank_with(mut cands: Vec<RankCandidate>, policy: RankPolicy) -> Vec<RankCandidate> {
     let origin = primacy_conv(&cands);
     let score = |c: &RankCandidate| {
-        let mut s = adjusted_score(c);
+        let mut s = adjusted_score_with(c, policy);
         if let (Some(origin), Some(p)) = (origin.as_deref(), c.provenance.as_ref()) {
             if p.source_conv_id == origin && p.author == Speaker::User {
                 s += W_PRIMACY;
@@ -181,6 +210,9 @@ pub fn is_scaffold_text(content: &str) -> bool {
         || content.contains("<command-args>")
         || content.matches("═══").count() >= 2
         || content.matches("━━━").count() >= 2
+        // Compaction summaries carry the user role but are machine recitation —
+        // they quote the whole prior session back, so they out-cosine origins.
+        || content.contains("This session is being continued from a previous conversation")
         || crate::extraction::provenance::is_csr_emission(content)
 }
 
@@ -307,6 +339,60 @@ mod tests {
             }),
         };
         assert!(adjusted_score(&plain) > adjusted_score(&mixed));
+    }
+
+    #[test]
+    fn provenance_policy_keeps_mechanic_evidence() {
+        // csr_why: a build-log chunk is evidence the session shaped the code —
+        // no mechanic demotion under Provenance, demotion under Recall.
+        let m = mechanic("m", 0.80);
+        assert!(adjusted_score_with(&m, RankPolicy::Provenance) > adjusted_score(&m));
+        assert!((adjusted_score_with(&m, RankPolicy::Provenance) - 0.80).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn provenance_policy_still_demotes_scaffold_and_poison() {
+        // Contamination defenses survive the policy split.
+        let p = poison("p", 0.90);
+        assert!(adjusted_score_with(&p, RankPolicy::Provenance) < p.cosine);
+        let scaffold = RankCandidate {
+            timestamp: None,
+            id: "s".into(),
+            cosine: 0.9,
+            content: "━━━ CSR REPORT ━━━ quoted query ━━━ end ━━━".into(),
+            provenance: None,
+        };
+        assert!(adjusted_score_with(&scaffold, RankPolicy::Provenance) < scaffold.cosine);
+    }
+
+    #[test]
+    fn provenance_policy_no_user_boost() {
+        // Wide-pool distortion guard: a weakly-relevant user chunk must not
+        // leapfrog strong evidence in the reinstatement pool.
+        let u = user_chunk("u", "c1", 0.40, "2026-06-01T00:00:00Z", "some aside");
+        assert!((adjusted_score_with(&u, RankPolicy::Provenance) - 0.40).abs() < f32::EPSILON);
+        assert!(adjusted_score(&u) > 0.40); // Recall keeps the boost
+    }
+
+    #[test]
+    fn compaction_summary_is_scaffold() {
+        // User-role but machine recitation — must be demoted on BOTH policies.
+        let c = RankCandidate {
+            timestamp: None,
+            id: "compact".into(),
+            cosine: 0.5,
+            content: "This session is being continued from a previous conversation that ran \
+                      out of context. Summary: 1. Primary Request and Intent..."
+                .into(),
+            provenance: Some(ChunkProvenance {
+                author: Speaker::User,
+                source_conv_id: "c".into(),
+                supersedes: None,
+            }),
+        };
+        assert!(is_scaffold_text(&c.content));
+        assert!(adjusted_score_with(&c, RankPolicy::Provenance) < c.cosine);
+        assert!(adjusted_score(&c) < c.cosine + W_USER); // Recall: penalty offsets boost
     }
 
     #[test]
