@@ -148,8 +148,8 @@ fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
 
 pub fn insert_chunk(conn: &Connection, chunk: &ConversationChunk, embedding: &[f32]) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary, seq, is_sidechain)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             chunk.id,
             chunk.conversation_id,
@@ -158,6 +158,8 @@ pub fn insert_chunk(conn: &Connection, chunk: &ConversationChunk, embedding: &[f
             chunk.content,
             chunk.message_count as i64,
             chunk.summary,
+            chunk.seq as i64,
+            chunk.is_sidechain as i64,
         ],
     )?;
 
@@ -547,6 +549,11 @@ fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
         // reconstructed chunks default to non-authoritative. Live recall reads
         // provenance explicitly via get_chunk_provenance.
         author: crate::provenance::Speaker::ToolResult,
+        // seq/is_sidechain are not selected here (7-col SELECT, unchanged) — reads via this
+        // path don't need them for WS1; real values live in the chunks table and are read
+        // directly by the saga queries below when needed.
+        seq: 0,
+        is_sidechain: false,
     })
 }
 
@@ -1543,6 +1550,113 @@ pub fn get_session_code_evolution(
         .map_err(Into::into)
 }
 
+// ─── Saga Phase 1 (WS1): capture columns + provenance-walk storage helpers ───
+
+/// All chunk ids for a conversation, insertion order (no seq dependency — old rows may
+/// have seq=NULL). Used by WS2's exact per-conversation scoring (never
+/// SearchEngine::search_chunks_filtered — see spec).
+pub fn get_chunk_ids_for_conversation(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT id FROM chunks WHERE conversation_id = ?1 ORDER BY rowid")?;
+    let rows = stmt.query_map(params![conversation_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Embeddings for a specific set of chunk ids, chunked into ~500-id IN-clauses to stay
+/// under SQLite's default parameter limit. Decodes the same little-endian f32 blob format
+/// as `load_all_chunk_vectors`.
+pub fn get_chunk_vectors_by_ids(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<(String, Vec<f32>)>> {
+    const BATCH: usize = 500;
+    let mut results = Vec::new();
+    for batch in ids.chunks(BATCH) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT chunk_id, embedding FROM chunk_embeddings WHERE chunk_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let bound: Vec<&dyn rusqlite::ToSql> =
+            batch.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(bound.as_slice(), |row| {
+            let id: String = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((id, bytes_to_vec(&bytes)))
+        })?;
+        for row in rows {
+            results.push(row?);
+        }
+    }
+    Ok(results)
+}
+
+/// Most-touched files for a session (code_evolution), highest-frequency first. Lifted from
+/// the Phase 0 spike (examples/saga_spike.rs::files_for_session), now with a caller-supplied
+/// limit instead of a hardcoded 4.
+pub fn files_for_session(conn: &Connection, session_id: &str, limit: usize) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT file_path FROM code_evolution WHERE session_id = ?1
+         GROUP BY file_path ORDER BY COUNT(*) DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Other sessions that touched the same file (code_evolution), excluding one session.
+/// Lifted from the Phase 0 spike (examples/saga_spike.rs::sessions_for_file), now with a
+/// caller-supplied limit instead of a hardcoded 12.
+pub fn sessions_for_file(
+    conn: &Connection,
+    file_path: &str,
+    exclude_session: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT session_id FROM code_evolution
+         WHERE file_path = ?1 AND session_id <> ?2 LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![file_path, exclude_session, limit as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Backfill UPDATE: set seq/is_sidechain on an existing chunk row by id.
+pub fn set_chunk_saga_columns(
+    conn: &Connection,
+    chunk_id: &str,
+    seq: usize,
+    is_sidechain: bool,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE chunks SET seq = ?1, is_sidechain = ?2 WHERE id = ?3",
+        params![seq as i64, is_sidechain as i64, chunk_id],
+    )?;
+    Ok(())
+}
+
+/// All file paths recorded in import_state (for the saga-columns backfill to re-parse).
+pub fn list_all_import_state_file_paths(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT file_path FROM import_state")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 // ─── Consolidation queries (v9 Dreamer) ───
 
 /// Get conversations with V3 extraction or AI narrative but no consolidation.
@@ -1763,5 +1877,33 @@ mod tests {
         assert_eq!(s.calls_total, 1);
         assert_eq!(s.calls_today, 1);
         assert_eq!(s.tokens_total, 0);
+    }
+
+    #[test]
+    fn set_chunk_saga_columns_roundtrip() {
+        let conn = mem();
+        let chunk = ConversationChunk {
+            id: "chunk-saga-1".into(),
+            conversation_id: "conv-1".into(),
+            project_name: "proj".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            content: "hello saga".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        insert_chunk(&conn, &chunk, &[0.1; 384]).unwrap();
+        set_chunk_saga_columns(&conn, "chunk-saga-1", 7, true).unwrap();
+        let (seq, is_sidechain): (i64, i64) = conn
+            .query_row(
+                "SELECT seq, is_sidechain FROM chunks WHERE id = ?1",
+                params!["chunk-saga-1"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(seq, 7);
+        assert_eq!(is_sidechain, 1);
     }
 }

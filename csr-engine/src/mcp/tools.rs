@@ -87,6 +87,8 @@ fn lookup_by_conv_tag(
                     message_count: 0,
                     summary: None,
                     author: crate::provenance::Speaker::ToolResult,
+                    seq: 0,
+                    is_sidechain: false,
                 },
             }
         })
@@ -241,6 +243,8 @@ pub async fn reflect_on_past(
                     // Reflections/episodes are derived narratives, not raw
                     // user-authored chunks — no authority boost.
                     author: crate::provenance::Speaker::ToolResult,
+                    seq: 0,
+                    is_sidechain: false,
                 },
             });
         }
@@ -308,6 +312,13 @@ pub async fn reflect_on_past(
     let rank_of = |id: &str| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
     enriched.sort_by_key(|e| rank_of(&e.chunk.id));
     enriched.truncate(limit);
+
+    // TAD: log each returned memory as an MCP-search retrieval event. session_id="mcp" is a
+    // sentinel (MCP has no session id) — distinguishable from hook-driven sessions for future
+    // decay work. Non-fatal: a logging failure must never fail the search.
+    for e in &enriched {
+        let _ = storage.log_retrieval_event(&e.chunk.id, "chunk", "mcp_search", "mcp");
+    }
 
     Ok(format::format_search_results(
         &enriched,

@@ -284,6 +284,22 @@ pub fn run(conn: &Connection) -> Result<()> {
         let _ = conn.execute_batch("ALTER TABLE chunks ADD COLUMN summary TEXT;");
     }
 
+    // Migration: add seq + is_sidechain columns to chunks table (Saga Phase 1 WS1).
+    // seq is nullable — old rows stay NULL until backfilled; is_sidechain defaults 0
+    // (never sidechain) until backfilled. Both additive, no table rebuild.
+    let has_seq_col: bool = conn.prepare("SELECT seq FROM chunks LIMIT 0").is_ok();
+    if !has_seq_col {
+        let _ = conn.execute_batch("ALTER TABLE chunks ADD COLUMN seq INTEGER;");
+    }
+    let has_sidechain_col: bool = conn
+        .prepare("SELECT is_sidechain FROM chunks LIMIT 0")
+        .is_ok();
+    if !has_sidechain_col {
+        let _ = conn.execute_batch(
+            "ALTER TABLE chunks ADD COLUMN is_sidechain INTEGER NOT NULL DEFAULT 0;",
+        );
+    }
+
     // FTS5 for hybrid search — CREATE VIRTUAL TABLE doesn't support IF NOT EXISTS
     // so we check manually
     let has_fts: bool = conn
@@ -315,4 +331,21 @@ pub fn run(conn: &Connection) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saga_columns_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare("SELECT seq, is_sidechain FROM chunks LIMIT 0")
+                .is_ok(),
+            "seq and is_sidechain columns must exist after migration"
+        );
+    }
 }

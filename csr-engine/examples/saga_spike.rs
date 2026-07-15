@@ -167,7 +167,7 @@ fn best_chunk_for_conv(
     for id in ids {
         if let Some(v) = chunk_vecs.get(&id) {
             let c = cosine(qv, v);
-            if best.as_ref().map_or(true, |(_, b)| c > *b) {
+            if best.as_ref().is_none_or(|(_, b)| c > *b) {
                 best = Some((id, c));
             }
         }
@@ -250,7 +250,9 @@ async fn main() -> Result<()> {
         // ---- Arm A: one-shot kNN, chunks + reflections merged ----
         let mut a: Vec<Cand> = Vec::new();
         for r in idx.search_chunks(&qv, K, MIN_SCORE) {
-            let meta = engine.storage().get_chunks_by_ids(&[r.id.clone()])?;
+            let meta = engine
+                .storage()
+                .get_chunks_by_ids(std::slice::from_ref(&r.id))?;
             if let Some(ch) = meta.first() {
                 a.push(Cand {
                     id: r.id,
@@ -300,7 +302,9 @@ async fn main() -> Result<()> {
             if let Some(sv) = chunk_vecs.get(&seed.id) {
                 let bv = blend(&qv, sv, BLEND_Q);
                 for r in idx.search_chunks(&bv, 5, MIN_SCORE) {
-                    let meta = engine.storage().get_chunks_by_ids(&[r.id.clone()])?;
+                    let meta = engine
+                        .storage()
+                        .get_chunks_by_ids(std::slice::from_ref(&r.id))?;
                     if let Some(ch) = meta.first() {
                         push_cand(
                             &mut pool,
@@ -322,7 +326,9 @@ async fn main() -> Result<()> {
                 for neighbor in sessions_for_file(&raw, &file, &seed.conv)? {
                     if let Some((id, cos)) = best_chunk_for_conv(&raw, &chunk_vecs, &qv, &neighbor)?
                     {
-                        let meta = engine.storage().get_chunks_by_ids(&[id.clone()])?;
+                        let meta = engine
+                            .storage()
+                            .get_chunks_by_ids(std::slice::from_ref(&id))?;
                         if let Some(ch) = meta.first() {
                             graph_cands.push(Cand {
                                 id,
@@ -344,7 +350,9 @@ async fn main() -> Result<()> {
             // (3) episode chain: seed session's episode -> prev episode -> its session
             if let Some(prev_conv) = episode_prev_session(&raw, &seed.conv)? {
                 if let Some((id, cos)) = best_chunk_for_conv(&raw, &chunk_vecs, &qv, &prev_conv)? {
-                    let meta = engine.storage().get_chunks_by_ids(&[id.clone()])?;
+                    let meta = engine
+                        .storage()
+                        .get_chunks_by_ids(std::slice::from_ref(&id))?;
                     if let Some(ch) = meta.first() {
                         push_cand(
                             &mut pool,

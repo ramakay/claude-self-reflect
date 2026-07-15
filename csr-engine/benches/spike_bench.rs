@@ -166,6 +166,8 @@ fn bench_sqlite_operations(c: &mut Criterion) {
                 message_count: 10,
                 summary: None,
                 author: csr_engine::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
             };
             (chunk, vec)
         })

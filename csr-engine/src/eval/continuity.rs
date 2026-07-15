@@ -346,6 +346,8 @@ fn index_corpus(
             message_count: 1,
             summary: None,
             author: doc.author,
+            seq: 0,
+            is_sidechain: false,
         };
         storage.insert_chunk(&chunk, &vec)?;
         storage.insert_chunk_provenance(

@@ -42,6 +42,10 @@ struct Args {
     /// Backfill import_state and run heuristic enrichment for all conversations
     #[arg(long)]
     enrich: bool,
+
+    /// Backfill seq + is_sidechain on existing chunks from on-disk JSONLs (Saga Phase 1 WS1)
+    #[arg(long)]
+    backfill_saga: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -347,6 +351,11 @@ async fn main() -> Result<()> {
         );
     }
 
+    if args.backfill_saga {
+        let stats = csr_engine::import::backfill::backfill_saga_columns(&eng)?;
+        print!("{}", stats.format_text());
+    }
+
     if args.bench {
         tracing::info!("benchmark mode not yet implemented in main — use `cargo bench`");
         return Ok(());
@@ -360,7 +369,8 @@ async fn main() -> Result<()> {
     };
 
     // Start MCP stdio server if --serve or no explicit action
-    let should_serve = args.serve || (!args.import && !args.bench && !args.watch && !args.enrich);
+    let should_serve = args.serve
+        || (!args.import && !args.bench && !args.watch && !args.enrich && !args.backfill_saga);
     if should_serve {
         eng.serve_mcp().await?;
     } else if args.watch {

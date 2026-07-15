@@ -61,6 +61,8 @@ fn test_storage_insert_and_retrieve() {
         message_count: 4,
         summary: None,
         author: csr_engine::provenance::Speaker::ToolResult,
+        seq: 0,
+        is_sidechain: false,
     };
 
     // Fake 384-dim embedding
@@ -94,6 +96,8 @@ fn test_project_filtering() {
                 message_count: 2,
                 summary: None,
                 author: csr_engine::provenance::Speaker::ToolResult,
+                seq: 0,
+                is_sidechain: false,
             };
             storage.insert_chunk(&chunk, &fake_emb).unwrap();
         }
@@ -133,6 +137,8 @@ fn test_time_range_filtering() {
             message_count: 1,
             summary: None,
             author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
         };
         storage.insert_chunk(&chunk, &fake_emb).unwrap();
     }
@@ -166,6 +172,8 @@ fn test_fts5_search() {
             message_count: 2,
             summary: None,
             author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
         },
         ConversationChunk {
             id: "fts-2".into(),
@@ -176,6 +184,8 @@ fn test_fts5_search() {
             message_count: 2,
             summary: None,
             author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
         },
     ];
 
@@ -373,6 +383,8 @@ fn test_format_search_results_structure() {
             message_count: 4,
             summary: None,
             author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
         },
     }];
 
@@ -402,6 +414,8 @@ fn test_format_quick_check_structure() {
             message_count: 2,
             summary: None,
             author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
         },
     }];
 
@@ -435,6 +449,8 @@ fn test_xml_escaping_in_output() {
             message_count: 1,
             summary: None,
             author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
         },
     }];
 
@@ -533,6 +549,8 @@ fn test_recent_chunks() {
             message_count: 1,
             summary: None,
             author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
         };
         storage.insert_chunk(&chunk, &fake_emb).unwrap();
     }
@@ -558,6 +576,8 @@ fn test_timeline_grouping() {
             message_count: 1,
             summary: None,
             author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
         },
         ConversationChunk {
             id: "tl-2".into(),
@@ -568,6 +588,8 @@ fn test_timeline_grouping() {
             message_count: 1,
             summary: None,
             author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
         },
         ConversationChunk {
             id: "tl-3".into(),
@@ -578,6 +600,8 @@ fn test_timeline_grouping() {
             message_count: 1,
             summary: None,
             author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
         },
     ];
 
@@ -614,6 +638,8 @@ fn test_full_pipeline_storage_search_format() {
             message_count: 2,
             summary: None,
             author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
         };
 
         let mut embedding = vec![0.0f32; 384];
@@ -668,6 +694,8 @@ fn test_vector_storage_roundtrip() {
         message_count: 1,
         summary: None,
         author: csr_engine::provenance::Speaker::ToolResult,
+        seq: 0,
+        is_sidechain: false,
     };
 
     // Create a specific vector
@@ -761,6 +789,8 @@ fn test_unavailable_enrichment_not_requeued() {
             message_count: 1,
             summary: None,
             author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
         };
         storage.insert_chunk(&chunk, &fake_emb).unwrap();
         // mark_file_imported derives conversation_id from the file stem.
@@ -894,6 +924,8 @@ fn test_completions_project_name_prefix() {
         message_count: 5,
         summary: None,
         author: csr_engine::provenance::Speaker::ToolResult,
+        seq: 0,
+        is_sidechain: false,
     };
     let chunk2 = ConversationChunk {
         id: "chunk-comp-2".to_string(),
@@ -904,6 +936,8 @@ fn test_completions_project_name_prefix() {
         message_count: 3,
         summary: None,
         author: csr_engine::provenance::Speaker::ToolResult,
+        seq: 0,
+        is_sidechain: false,
     };
     let chunk3 = ConversationChunk {
         id: "chunk-comp-3".to_string(),
@@ -914,6 +948,8 @@ fn test_completions_project_name_prefix() {
         message_count: 2,
         summary: None,
         author: csr_engine::provenance::Speaker::ToolResult,
+        seq: 0,
+        is_sidechain: false,
     };
 
     let embedding = vec![0.1f32; 384];
@@ -1409,6 +1445,8 @@ fn test_get_chunk_content() {
         message_count: 5,
         summary: Some("Test summary".into()),
         author: csr_engine::provenance::Speaker::ToolResult,
+        seq: 0,
+        is_sidechain: false,
     };
     storage.insert_chunk(&chunk, &fake_emb).unwrap();
 
@@ -1434,6 +1472,8 @@ fn test_tad_batch_retrieval_events() {
         message_count: 1,
         summary: None,
         author: csr_engine::provenance::Speaker::ToolResult,
+        seq: 0,
+        is_sidechain: false,
     };
     storage.insert_chunk(&chunk, &[0.1; 384]).unwrap();
     storage

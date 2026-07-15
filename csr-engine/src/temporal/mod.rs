@@ -297,6 +297,8 @@ mod tests {
                 message_count: 1,
                 summary: None,
                 author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
             },
             ConversationChunk {
                 id: "2".into(),
@@ -307,6 +309,8 @@ mod tests {
                 message_count: 1,
                 summary: None,
                 author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
             },
             ConversationChunk {
                 id: "3".into(),
@@ -317,6 +321,8 @@ mod tests {
                 message_count: 1,
                 summary: None,
                 author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
             },
         ];
 
@@ -405,6 +411,8 @@ mod tests {
                 message_count: 1,
                 summary: None,
                 author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
             },
             ConversationChunk {
                 id: "2".into(),
@@ -415,6 +423,8 @@ mod tests {
                 message_count: 1,
                 summary: None,
                 author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
             },
         ];
 
