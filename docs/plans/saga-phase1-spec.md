@@ -152,7 +152,34 @@ cargo build --release
   commit `800636f` on `saga-phase1`; full run log in session scratchpad (saga_spike_run1.txt);
   CSR reflection stored (id 9810c8b8).
 
-## 7. Pipeline after this phase
+## 7. DoD results (2026-07-15, this machine)
+
+All verification run independently of the implementation lane (grok wrote, session verified).
+
+| DoD item | Result |
+|---|---|
+| fmt / clippy `--all-targets -D warnings` / tests | ✅ clean; 521 unit + 43 hooks + 57 integration green |
+| Migration + backfill | ✅ `--backfill-saga`: 732 files checked, 182 missing (reported), 33,015 chunks gained `seq`, 10,907 labeled `is_sidechain=1` (all `agent-*`; zero inline `isSidechain` flags found — current Claude Code puts subagents in separate `agent-*.jsonl` files) |
+| MCP retrieval logging | ✅ 60 `retrieval_events` rows, `hook_phase='mcp_search'`, `session_id='mcp'` after stdio probes |
+| `csr_why` | ✅ registered (14 tools), well-formed grouped evidence chain, **8ms warm** (target 100ms). ⚠ acceptance query "why is integrity check cached" no longer surfaces `7eccb720` directly — see contamination finding |
+| `eval --provenance` | ✅ A=15 B=18, exit 0 (B ≥ A). Same-day spike-code rerun: B=19 — production path is faithful |
+
+**Finding — observer effect / corpus self-contamination:** between the morning spike (B=23,
+`7eccb720` rescued) and evening DoD (B=18/19), THIS session's transcripts — which quote the
+eval queries and the spike output verbatim — were imported. They now outrank origin
+conversations for the very queries they discuss. Two consequences:
+1. **Paper methodology:** eval must run against a frozen corpus. Snapshot taken:
+   `~/.claude-self-reflect/backups/eval-frozen-2026-07-15.db` (4.2GB, pre-evening-import
+   state includes the contamination — treat 2026-07-15 morning numbers as the clean baseline
+   and re-freeze from a pre-session backup if exactness matters).
+2. **Phase 1.5 (queued, not blocking):** `reinstate()` should apply the existing rerank.rs
+   provenance layer (scaffold demotion, CSR-echo penalty, user-authority boost) to its fused
+   pool — `reflect_on_past` has it, `csr_why` doesn't yet. Likely recovers origin-surfacing
+   under contamination and may lift eval coverage.
+
+Commits: `800636f` (spike), `1097485` (spec), `dadb14a` (WS1), WS2 committed on `saga-phase1`.
+
+## 8. Pipeline after this phase
 
 DoD pass → findings section appended here → paper draft ("Three-Trace Sagas: joint episodic
 memory over intent, deliberation, and artifact in agentic software construction"; grounding:
