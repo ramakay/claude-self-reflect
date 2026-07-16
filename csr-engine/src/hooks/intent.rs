@@ -111,6 +111,14 @@ fn threshold(intent: Intent) -> f32 {
     }
 }
 
+/// Minimum clearance above `threshold()` before Route A's semantic
+/// classifier is allowed to fire a pickup. A bare `>= threshold` let a
+/// score sitting exactly on the boundary (0.55 observed live) trigger
+/// a stale-episode pickup; the margin turns the boundary into a small
+/// dead zone that falls through to abstain (Route B / content search)
+/// instead.
+pub(crate) const PICKUP_MARGIN: f32 = 0.05;
+
 /// Hash of the exemplar table (intent tags + sentences, order-sensitive).
 /// Changing any exemplar invalidates the on-disk vector cache.
 fn exemplar_hash() -> u64 {
@@ -226,7 +234,7 @@ impl ProbeSet {
                     best
                 }
             })
-            .filter(|(intent, score)| *score >= threshold(*intent))
+            .filter(|(intent, score)| *score >= threshold(*intent) + PICKUP_MARGIN)
     }
 
     #[cfg(test)]
@@ -289,6 +297,44 @@ mod tests {
         // StateRecall (0.55); negative on +z so Explore is also under 0.55.
         // cos(+x) = cos(+y) ≈ 0.348, cos(+z) ≈ -0.870.
         assert!(probes.classify(&unit(0.4, 0.4, -1.0)).is_none());
+    }
+
+    #[test]
+    fn classify_abstains_at_exact_threshold() {
+        // Bare score == threshold must not fire; the margin is the dead zone.
+        // StateRecall along +y only (no second exemplar that could pull max up).
+        // Residual mass on -x so Continue cosine is negative, not competing.
+        let probes = ProbeSet::from_probes(vec![
+            (Intent::Continue, vec![unit(1.0, 0.0, 0.0)]),
+            (Intent::StateRecall, vec![unit(0.0, 1.0, 0.0)]),
+            (Intent::Explore, vec![unit(0.0, 0.0, 1.0)]),
+        ]);
+        let b = threshold(Intent::StateRecall); // 0.55
+        let a = (1.0_f32 - b * b).sqrt();
+        // Construct unit vector directly so cos(+y) lands exactly on b.
+        let v = vec![-a, b, 0.0];
+        assert!(
+            probes.classify(&v).is_none(),
+            "score == threshold must abstain under PICKUP_MARGIN"
+        );
+    }
+
+    #[test]
+    fn classify_fires_at_threshold_plus_margin() {
+        let probes = ProbeSet::from_probes(vec![
+            (Intent::Continue, vec![unit(1.0, 0.0, 0.0)]),
+            (Intent::StateRecall, vec![unit(0.0, 1.0, 0.0)]),
+            (Intent::Explore, vec![unit(0.0, 0.0, 1.0)]),
+        ]);
+        let b = threshold(Intent::StateRecall) + PICKUP_MARGIN; // 0.60
+        let a = (1.0_f32 - b * b).sqrt();
+        let v = vec![-a, b, 0.0];
+        let got = probes.classify(&v);
+        assert_eq!(
+            got.map(|(i, _)| i),
+            Some(Intent::StateRecall),
+            "score == threshold + PICKUP_MARGIN must fire"
+        );
     }
 
     #[test]

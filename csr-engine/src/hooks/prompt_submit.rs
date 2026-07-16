@@ -83,7 +83,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // failure 2026-07-07: the previous session advertised "just say continue"
     // and this hook dropped that exact prompt.
     if is_continuation_prompt(prompt) {
-        if let Some((ep, age)) = crate::hooks::session_start::latest_tier0_episode(engine, cwd) {
+        if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
             emit_pickup(
                 &ep,
                 &age,
@@ -139,9 +139,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         if let Some((intent, _score)) = probes.classify(&query_vec) {
             match intent {
                 crate::hooks::intent::Intent::Continue => {
-                    if let Some((ep, age)) =
-                        crate::hooks::session_start::latest_tier0_episode(engine, cwd)
-                    {
+                    if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
                         emit_pickup(
                             &ep,
                             &age,
@@ -151,9 +149,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                     }
                 }
                 crate::hooks::intent::Intent::StateRecall => {
-                    if let Some((ep, age)) =
-                        crate::hooks::session_start::latest_tier0_episode(engine, cwd)
-                    {
+                    if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
                         emit_pickup(
                             &ep,
                             &age,
@@ -193,6 +189,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                         &query_vec,
                         &current_project,
                         input.session_id.as_deref(),
+                        prompt,
                     )
                     .await;
                     if let Some((ep, age, _score)) = &corr {
@@ -259,20 +256,13 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                 &query_vec,
                 &current_project,
                 input.session_id.as_deref(),
+                prompt,
             )
             .await
         }
     };
     if let Some((ep, age, score)) = correlated {
-        emit_pickup(
-            &ep,
-            &age,
-            &format!(
-                "this prompt matches a past episode (similarity {:.2}); \
-                 the work may already exist — verify against it before re-deriving.",
-                score
-            ),
-        );
+        print!("{}", format_semantic_pickup(&ep, &age, score));
     }
 
     // 2. Search chunks (past conversations) — scoped to current project
@@ -482,8 +472,9 @@ fn is_continuation_prompt(prompt: &str) -> bool {
 }
 
 /// Emit the CSR PICKUP block: reason line, Tier-0 episode state, resume
-/// imperative. Shared by the continuation (Route A) and episode-correlation
-/// (Route B) paths so every pickup shape lands on identical output.
+/// imperative. Used only by Route A lineage pickup (is_continuation_prompt /
+/// Continue / StateRecall) — the CONTINUUM banner is reserved for the active
+/// conversation lineage, never for a Route-B topic match.
 fn emit_pickup(ep: &crate::hooks::stop::Episode, age: &str, reason: &str) {
     println!("CSR PICKUP — {}", reason);
     print!(
@@ -491,6 +482,63 @@ fn emit_pickup(ep: &crate::hooks::stop::Episode, age: &str, reason: &str) {
         crate::hooks::session_start::format_tier0_block(ep, &[], age)
     );
     println!("Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything.");
+}
+
+/// Minimum length (both sides) before a prompt/episode-request containment
+/// check is a signal rather than coincidence. Mirrors QUERY_ECHO_MIN_LEN in
+/// search/reinstatement.rs::is_query_echo (verbatim/near-verbatim containment,
+/// no embedding call) — kept local to this file rather than imported, per scope.
+const PICKUP_ECHO_MIN_LEN: usize = 15;
+
+/// True when `prompt` and `episode_request` are near-verbatim of each other
+/// (either contains the other, both lowercased) and both are long enough for
+/// containment to be a signal rather than coincidence. Catches the case where
+/// the "matched" episode is itself just an earlier ASKING of the same
+/// question, not state to resume — it must not be surfaced as a pickup.
+fn is_pickup_echo(prompt: &str, episode_request: &str) -> bool {
+    let p = prompt.trim().to_lowercase();
+    let r = episode_request.trim().to_lowercase();
+    if p.len() < PICKUP_ECHO_MIN_LEN || r.len() < PICKUP_ECHO_MIN_LEN {
+        return false;
+    }
+    p.contains(&r) || r.contains(&p)
+}
+
+/// How many recency-ranked project episodes `pick_lineage_episode` will
+/// consider before giving up — an echo skip needs at least one fallback
+/// candidate, otherwise a single stale echoing episode silently blocks
+/// every Route-A pickup.
+const LINEAGE_CANDIDATE_LIMIT: usize = 3;
+
+/// Lineage pickup: the most recent project episode that is NOT an echo
+/// of the current prompt. Replaces bare `latest_tier0_episode` at every
+/// Route-A call site so a stale episode whose own stored `request` just
+/// restates the current question never displaces the active session
+/// thread. Falls through up to LINEAGE_CANDIDATE_LIMIT recency-ranked
+/// candidates; returns None (no pickup) if all are echoes.
+fn pick_lineage_episode(
+    engine: &Engine,
+    cwd: &Path,
+    prompt: &str,
+) -> Option<(crate::hooks::stop::Episode, String)> {
+    crate::hooks::session_start::recent_episodes(engine, cwd, LINEAGE_CANDIDATE_LIMIT)
+        .into_iter()
+        .find(|(ep, _)| !is_pickup_echo(prompt, &ep.request))
+}
+
+/// Semantic-pickup rendering for a topically-matched-but-not-lineage
+/// episode (Route B correlation). Deliberately NOT the Tier-0 CONTINUUM
+/// block (format_tier0_block) — that banner is reserved for the active
+/// conversation lineage (Route A / SessionStart), so a topic match can
+/// never be mistaken for "this is the session you're resuming". Renders
+/// as a PICKUP reason line + a single EPISODE-INDEX-style line.
+fn format_semantic_pickup(ep: &crate::hooks::stop::Episode, age: &str, score: f32) -> String {
+    let reason = format!(
+        "CSR PICKUP — this prompt matches a past episode (similarity {:.2}); \
+         the work may already exist — verify against it before re-deriving.\n",
+        score
+    );
+    reason + &crate::hooks::session_start::format_episode_index(&[(ep.clone(), age.to_string())])
 }
 
 /// Search floor for episode correlation — well below the firing threshold so
@@ -540,6 +588,7 @@ async fn correlate_episode(
     query_vec: &[f32],
     project: &str,
     current_session: Option<&str>,
+    prompt: &str,
 ) -> Option<(crate::hooks::stop::Episode, String, f32)> {
     let results = {
         let idx = engine.search().read().await;
@@ -581,6 +630,12 @@ async fn correlate_episode(
             continue;
         };
         if !crate::hooks::session_start::episode_carries_state(&ep) {
+            continue;
+        }
+        // Skip episodes whose stored request is a near-verbatim echo of the
+        // current prompt — that episode was itself just asking the same
+        // question, not state to resume as a pickup.
+        if is_pickup_echo(prompt, &ep.request) {
             continue;
         }
         // Unparseable timestamps rank as infinitely old (effective score 0)
@@ -1269,6 +1324,53 @@ mod tests {
         ));
         assert!(!is_continuation_prompt("fix the auth bug"));
         assert!(!is_continuation_prompt("/continue"));
+    }
+
+    // --- pickup echo guard (stale episode whose request restates the prompt) ---
+
+    #[test]
+    fn is_pickup_echo_rejects_near_verbatim_match() {
+        // Containment either direction, both sides long enough — the episode
+        // was itself just asking the same question, not state to resume.
+        assert!(is_pickup_echo(
+            "what's the status of the sessionstart debugging work",
+            "status of the sessionstart debugging work",
+        ));
+        assert!(is_pickup_echo(
+            "status of the sessionstart debugging work",
+            "what's the status of the sessionstart debugging work",
+        ));
+    }
+
+    #[test]
+    fn is_pickup_echo_accepts_unrelated_or_paraphrase() {
+        // Genuine content / paraphrase against a different episode request —
+        // no containment, so not an echo.
+        assert!(!is_pickup_echo(
+            "fix the auth timeout bug",
+            "status of the sessionstart debugging work",
+        ));
+        // Too short on either side is coincidence, not a signal.
+        assert!(!is_pickup_echo(
+            "short",
+            "status of the sessionstart debugging work"
+        ));
+        assert!(!is_pickup_echo(
+            "what's the status of the sessionstart debugging work",
+            "short",
+        ));
+    }
+
+    #[test]
+    fn format_semantic_pickup_has_no_continuum_banner() {
+        // Route B topic matches must never render the lineage CONTINUUM block.
+        let out = format_semantic_pickup(&code_map_episode(), "2d ago", 0.52);
+        assert!(out.contains("CSR PICKUP"));
+        assert!(
+            !out.contains("CSR CONTINUUM"),
+            "semantic pickup must not render lineage CONTINUUM banner: {out}"
+        );
+        assert!(out.contains("csr_reflect_on_past(\"conv_abc123\")"));
     }
 
     // --- format_code_map (Feature B, exploration-intent injection) ---
