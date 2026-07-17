@@ -60,7 +60,12 @@ rankings, largely predating the echo sessions.)
 
 Moderate κ on directs (prevalence-deflated; ~31 split items) — these splits route to the
 owner audit sample. Known judgment divergence: Sonnet counted code-comment rationale
-surfaced via Read dumps as `discusses`; grok stricter.
+surfaced via Read dumps as `discusses`; grok stricter on that but more liberal on DIRECTS
+(39 vs 21 positives). Quote-fidelity disclosure (grok self-check): ~5% of grok quotes not
+byte-exact verbatim — turn-boundary joins across `[ts]` markers and markdown-bold stripping;
+content faithful, no fabrication observed; consensus grading (conservative on splits)
+absorbs the discrepancy. Item-count delta: grok 205 vs sonnet 204 (sonnet dropped one A1
+section); grading treats single-vendor items as single-source, disclosed.
 
 ## Strata (disclosures)
 
