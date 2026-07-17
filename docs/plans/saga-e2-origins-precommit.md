@@ -54,3 +54,28 @@ MEMORY 11 (one weak, one ambiguous-referent) · UNRESOLVED 7 · OUT-OF-CORPUS 1 
 - Next: CUED second pass (disclosed) for Q1, Q3, Q7, Q11, A1, A2, A4 — cue source = session
   memory files + repo docs + git metadata, never CSR retrieval. Cued answers aid
   mapping/audit only; origin-MRR gold remains this sealed list.
+
+## CUED stratum (post-seal second pass, 2026-07-17 — same sitting, cues disclosed inline)
+
+Cue source: session memory files + repo docs + git metadata. NO CSR retrieval used. These
+entries aid mapping/audit and may support a separately-reported cued-recall metric; they
+NEVER enter the sealed origin-MRR gold.
+
+| Q | Cue given | Owner answer (verbatim option / text) |
+|---|---|---|
+| Q1 | v8 Rust rewrite, rusqlite Connection not shareable | "Agent build decision" — emerged during build, accepted not directed |
+| Q3 | v9.2 slow-status incident, 11.4s→11ms meta-table cache | "I flagged slowness" — owner-directed |
+| Q7 | triage week ~2026-07-10, PR #230 | "I reported bad results" — owner-directed |
+| Q11 | Route A continue/resume, keywords vs exemplars, research-verified | "I directed research" — owner-directed |
+| A1 | Core-3 finalize vs legacy setActive, sign-in bug vs upgrade | "ui was not showing signed in user after clerk signed in, hence expo" |
+| A2 | defer prompt, record intended action, prompt later | "Conversion data driven" — funnel/drop-off numbers |
+| A4 | PostHog anonymous→identified merge mismatch | "I questioned numbers" — owner noticed dashboard mismatch |
+| Q2 (audit) | rerank.rs impl 2026-07-07 vs owner's pre-v8 claim | "Idea old, impl July" — concept pre-v8, implementation July; sealed OUT-OF-CORPUS entry stands, mapping should look for BOTH an early concept conv (may be out-of-corpus) and the July implementation conv (grade 2 candidate) |
+
+Cued tally: 7/7 previously-unresolved now have cued recollections (4 owner-directed, 1
+agent-decided, 2 event descriptions); Q2 discrepancy resolved as idea-old/impl-July.
+Agent-decided note (Q1): "origin" may legitimately be a deliberation trace, not an intent
+trace — the originating conversation is where the agent made + owner accepted the build
+decision. Extraction should not assume DIRECTS exists for every query; absence of DIRECTS
+with ACCEPTS+edits = grade 2 ceiling per protocol, and that is the CORRECT label for
+agent-originated decisions. This is itself a finding: some provenance is agent-originated.
