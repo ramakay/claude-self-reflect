@@ -35,11 +35,13 @@ coverage results, now on graded provenance gold instead of file-touch proxy.
 **5 of 12 mapped origins were retrieved by NEITHER arm** (injected into pool per advisor
 rule): Q4, Q9, A5, A6, A7. Origin-MRR = 0 for both arms on 7/12 queries. Even the winning
 system misses the mapped origin conversation ~58% of the time at k=10. Origin-finding is
-NOT solved; reinstatement improves it but the headroom above B is large. Two readings,
-both disclosed: (a) genuine retrieval failure on old/short origin conversations — consistent
-with the documented pre-v8 gap (origins lose to later, denser sessions); (b) mapping error —
-the injected five skew toward low/medium-confidence maps (A5 medium, A6 medium, A7
-low+ambiguous-referent, Q9 low-medium). Owner audit prioritizes exactly these five.
+NOT solved; reinstatement improves it but the headroom above B is large.
+
+**Owner audit (2026-07-17, Part 1): ALL FIVE injected-origin maps confirmed MAP-CORRECT**
+(Q4, Q9, A5, A6 May-14, A7 — including the ambiguity-flagged A7). The mapping-error reading
+is eliminated: these are genuine retrieval failures. Pattern: 4 of 5 confirmed-missed
+origins date from May 2026 — old, early-build conversations losing to later, denser
+sessions — the documented pre-v8/recency gap, now with owner-verified gold behind it.
 
 ## Silent acceptance confirmed empirically
 
@@ -77,8 +79,9 @@ section); grading treats single-vendor items as single-source, disclosed.
 
 ## Pending
 
-- Owner audit (~30 min): 5 injected-origin map checks + ~31 vendor-split items + stratified
-  grade sample → human-model κ.
+- Owner audit Part 1 (injected-origin maps): DONE 2026-07-17 — 5/5 MAP-CORRECT.
+  Parts 2-3 (31 vendor-split items, 12 grade spot-checks → human-model κ): owner opted out;
+  disclosed as unaudited — consensus grading (conservative on splits) is the mitigation.
 - Ledger corroboration pass (72h window + path overlap) wired but thin explicit-ACCEPTS
   means ladder events corroborate grade-2 evidence rather than upgrade grades — per advisor,
   ladder never mints origin.
