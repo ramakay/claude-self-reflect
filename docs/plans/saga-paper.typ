@@ -62,7 +62,7 @@
   #text(size: 10pt, font: "DejaVu Sans Mono")[rama\@procsolve.com]
 
   #v(0.6em)
-  #text(size: 11pt)[July 15, 2026]
+  #text(size: 11pt)[July 17, 2026]
 ]
 
 #v(2em)
@@ -78,7 +78,7 @@
 
   #v(0.6em)
 
-  Across two within-operator corpora from unrelated codebases, reinstatement improved ground-truth session coverage over one-shot kNN by +53% and +47% at equal budget under pre-registered gates, with zero per-query losses; blind cross-vendor judge panels preferred it on both corpora. Evaluating the system surfaced a second finding: _self-indexing evaluation contamination_, in which the system ingests the evaluation dialogue itself and echoes of the questions displace the origin conversations being sought. Query-echo defenses repaired the measured displacement while holding coverage. We argue that frozen pre-evaluation snapshots, shared index builds, and echo defenses are necessary controls for any self-recording agent memory. External and multi-operator validation remain open.
+  Across two within-operator corpora from unrelated codebases, reinstatement improved ground-truth session coverage over one-shot kNN by +53% and +47% at equal budget under pre-registered gates, with zero per-query losses; blind cross-vendor judge panels preferred it on both corpora. On graded provenance gold derived from the operator's own ratification behavior (sealed pre-registered origin recall, dual-vendor dialog-act extraction, external ship-event ledgers), reinstatement wins on origin-MRR (+37%), `nDCG@10` (+29%), and graded recall (+25%) — while both systems miss the verified origin conversation on over half the queries, locating the open headroom. A channel ablation attributes the gain: code-graph spread, not semantic blending, carries the provenance signal. Evaluating the system surfaced a second finding: _self-indexing evaluation contamination_, in which the system ingests the evaluation dialogue itself and echoes of the questions displace the origin conversations being sought. A controlled dose-response experiment from a session-zero snapshot shows five scripted re-ask cycles capturing half of naive retrieval's top-10, with query-echo defenses repairing 72% of the echo occupancy (sham control null). We argue that frozen pre-evaluation snapshots, shared index builds, and echo defenses are necessary controls for any self-recording agent memory. External and multi-operator validation remain open.
 ]
 
 #v(0.6em)
@@ -422,7 +422,62 @@ To replace the spike's single-annotator M3, we re-ran side-by-side judging with 
 
 Majority verdicts: Arm B better on 8 of 12 queries, Arm A better on 1 (Q9, hooks catch-all policy, where the one-shot arm ranked the origin policy statement higher), ties on 3, no three-way splits. Seven of the twelve verdicts were unanimous across all three judges, in both side orders. Inter-rater agreement was moderate: Fleiss $kappa = 0.51$ (observed agreement 0.78 against 0.55 expected by chance). Judge rationales independently converged on the paper's central mechanism — the modal comment against Arm A was that its top ranks were occupied by the evaluation queries themselves (self-echo), while Arm B surfaced implementing sessions and root-cause dialogue. Caveats: the judges are LLMs, not humans; the judging instructions were written by the system's authors and explicitly instruct judges to penalize re-askings and evaluation echoes — so the panel is blinded to _side_ but not to the paper's preferred failure model (a second panel under a neutral "which side better answers why" prompt, plus a small human-maintainer panel, is the queued remedy); and the packet truncated each side to its first \~4,500 characters.
 
-// ==================== 5. Discussion ====================
+// ==================== 5. Phase 2 experiments ====================
+= Phase 2 experiments: graded gold, channel ablation, controlled contamination
+
+The three experiments queued in earlier drafts as the next revision's core have now been executed. Together they (i) replace the file-touch GT proxy with graded provenance gold, (ii) attribute the coverage effect to its mechanism, and (iii) convert self-indexing evaluation contamination from a documented incident into a dose-response phenomenon with a quantified repair.
+
+== Graded provenance gold from ratification behavior (E2)
+
+_Gold construction._ Rather than retrospective annotation, grades were derived from the operator's own contemporaneous dialog-acts and ratification behavior, under a protocol frozen before any retrieval ranks were seen. The operator first answered a sealed, pure-memory elicitation for all 20 queries — committed to version control _before_ any cueing or rank exposure — yielding strata: 12 origin descriptions recallable from memory, 7 unresolved (excluded from origin-ranked metrics, never soft-matched), and 1 out-of-corpus. Descriptions were then mapped to conversation IDs by metadata only (literal text search over pre-freeze chunks, git dates, external ship events — no embedding retrieval, which would reintroduce circularity). Candidate pools (both arms' frozen top-10s $union$ date-filtered file-touch history; 211 items, 205 reconstructible) were labeled by two independent LLM extractors from different vendors (Grok 4.5 and Claude Sonnet) applying a quote-anchored extractive protocol for DIRECTS / ACCEPTS / REJECTS / RE-ASKS acts; grading used strict two-vendor consensus, conservative on splits (directs agreement 84.8%, Cohen $kappa = 0.41$; splits routed to owner audit). Grade 3 was reserved for sealed-and-mapped origins — extraction can corroborate but never mint an origin. External ratification ledgers (git history across four repositories, npm publish timestamps, a release-train manifest) provide off-corpus acceptance evidence: across 204 extracted conversation-items the operator's dialogue contained 21 DIRECTS but only *1 explicit ACCEPTS* — operators direct in words and ratify by shipping, so independently timestamped ship events are the only acceptance signal that exists at scale.
+
+_Results (12 mapped-origin queries)._ Reinstatement beats kNN on every graded metric: origin-MRR 0.264 vs. 0.193 (+37%), `nDCG@10` 0.470 vs. 0.363 (+29%), Recall\@10 of grade-$gt.eq$2 items 0.553 vs. 0.444 (+25%) — direction consistent with the coverage results, now on decision-graded gold. The sobering companion finding: *5 of 12 mapped origins were retrieved by neither arm*, and origin-MRR is zero for both arms on 7 of 12 queries. An owner audit confirmed all five contested mappings correct (map-error reading eliminated); four of the five missed origins date from the corpus's earliest era — old, sparse origin conversations losing to later, denser sessions. Origin-finding is improved by reinstatement but not solved; the headroom above the winning system is large.
+
+== Channel ablation (E1)
+
+A seven-arm ablation (research harness mirroring the production walk; one process, one shared index build over 73,342 chunks; scored against the E2 gold; conversations outside the graded pool scored zero, a bias _against_ exploratory channels) decomposes the walk:
+
+#figure(
+  table(
+    columns: (auto, auto, auto, auto),
+    align: (left, right, right, right),
+    stroke: 0.5pt + rgb("#cccccc"),
+    inset: 5pt,
+    [*Arm*], [*origin-MRR*], [*nDCG\@10*], [*R$gt.eq$2\@10*],
+    [kNN baseline], [0.243], [0.394], [0.469],
+    [full reinstatement], [0.276], [0.477], [0.559],
+    [blend-only], [0.269], [0.446], [0.499],
+    [*graph-only*], [*0.329*], [*0.555*], [*0.607*],
+    [episode-only], [0.321], [0.457], [0.470],
+    [full $minus$ rerank], [0.257], [0.447], [0.563],
+    [full $minus$ echo-defense], [0.234], [0.434], [0.549],
+  ),
+  caption: [Channel ablation on graded gold, one shared index build. Within-grid comparisons only; absolute values are not comparable to the E2 table (different index build).],
+)
+
+Four findings. (1) _Graph spread is the workhorse_: graph-only beats the full walk on every metric despite the scoring bias against it — code-graph structure, not semantic blending, carries the provenance signal on graded gold. This refines the spike-era attribution: blend dominates when GT is file-touch _coverage_; graph dominates when gold is decision-graded. (2) _Fusion dilutes_: max-score fusion lets blend-sourced semantic neighbors crowd graph-sourced provenance neighbors out of the final budget; the tuning direction is a larger graph share, not more channels. (3) _Echo defense is causally necessary_: removing it drops origin-MRR to 0.234 — below the kNN baseline. (4) _The episode chain, previously a null result, is a strong origin-finder on graded gold_ (0.321 origin-MRR) though weak on evidence depth — it finds the origin thread, not the full evidence set.
+
+== Controlled contamination (E3)
+
+From a session-zero snapshot C0 (17,134 chunks, pre-dating all evaluation dialogue) we built C1 = C0 + only the evaluation-design transcript, C-sham = C0 + an unrelated transcript matched for size (107% of C1's bytes, zero query-text occurrences), and C5 = C0 + five scripted re-ask cycles (verbatim query re-askings with paraphrased answers, explicitly marked synthetic — a controlled self-referential injection, not a natural-ecology observation). Retrieval used exact brute-force scan, eliminating ANN variance so the independent variable is corpus content alone; 8 queries whose owner-audited origins pre-date C0; three arms.
+
+#figure(
+  table(
+    columns: (auto, auto, auto),
+    align: (left, right, right),
+    stroke: 0.5pt + rgb("#cccccc"),
+    inset: 5pt,
+    [*Arm under C5 (dosed re-asking)*], [*echo\@10*], [*origin-MRR*],
+    [kNN], [4.9 / 10], [0.014],
+    [walk $minus$ echo-defense], [4.9 / 10], [0.014],
+    [*walk with echo-defense*], [*1.4 / 10*], [*0.047*],
+  ),
+  caption: [Contamination dose-response and repair, exact-scan retrieval, mean over 8 eligible queries.],
+)
+
+Five scripted re-ask cycles capture half of naive retrieval's top-10 (on one query the entire top-3 becomes the synthetic cycles); the undefended walk is equally captured, since hop-2 spreads outward from echo seeds. The echo defense is a quantified repair: $minus$72% echo occupancy, 3.4$times$ the origin-MRR under dose, and on one query the origin _enters_ the top-10 only in the defended arm — demoting echoes clears ranked space for provenance. The sham control is null (rankings byte-identical to C0), so displacement is content-specific, not a corpus-size artifact; and C1 shows the evaluation-design conversation itself entering a query's top-3 — storing a single evaluation session measurably perturbs the system under evaluation. Disclosure: under exact scan on the session-zero corpus, origins sit outside the top-10 for 6–7 of 8 queries in _all_ conditions (the origin-finding floor from E2 again); the dose-response and repair rows are the load-bearing results, origin-rank trajectories are floor-limited.
+
+// ==================== 6. Discussion ====================
 = Discussion
 
 == What the results support
@@ -452,11 +507,11 @@ Self-indexing evaluation contamination is a class-level issue, not a CSR-only bu
 
 *(c) Observer effect partially mitigated, not solved.* Frozen snapshots and Phase 1.5 echo defenses repair the measured displacement cases but do not rescue origin conversations for decisions whose re-askings dominate entire conversations; conversation-level exclusion and `supersedes` chains remain open work.
 
-*(d) Episode-chain null result.* The episode hop contributed zero GT hits so far, attributed to sparse/young `prev_episode_id` chains. Strength is expected to grow as chained episode summaries accrue; currently unproven.
+*(d) Episode-chain value revised, not settled.* The episode hop contributed zero GT hits in the coverage-proxy era (sparse/young `prev_episode_id` chains); on graded gold the episode-only ablation arm is a strong origin-finder (0.321 origin-MRR) but weak on evidence depth. Its value is now positive but characterized on 12 mapped queries only.
 
 *(e) Generalizability.* The primary suite is maximally dogfooded (CSR indexing its own development). Within-operator cross-project replication on a second, unrelated corpus (TypeScript product/marketing history, +47% vs. the primary +53%) removes the self-description confound but not the single-operator one: all indexed history is one person's work with one agent stack. Multi-operator and multi-organization validation remain open.
 
-*(h) GT is a file-touch proxy, not decision provenance.* Defining GT as all `code_evolution` sessions touching the target file counts design-originating, implementing, bug-fixing, and merely-discussing sessions as equally correct, and shares plumbing with Arm B's graph channel. Graded origin-level labels (3 originating decision / 2 direct implementation or root cause / 1 later retrospective / 0 echo or unrelated touch) over the existing 20 queries, with file-touch history used only to build candidate sets, plus origin-MRR and `nDCG@10`, are the queued fix; summed-coverage results should be read as coverage of _decision-relevant activity_, not of decisions.
+*(h) GT layers and their residual weaknesses.* The coverage results use a file-touch proxy (all `code_evolution` sessions touching the target file count equally), which counts design-originating, implementing, and merely-discussing sessions as equally correct and shares plumbing with Arm B's graph channel; those results should be read as coverage of _decision-relevant activity_. The graded gold (E2) removes the proxy but has its own limits: grades derive from LLM-extracted dialog-acts (dual-vendor consensus, directs $kappa = 0.41$ — moderate; splits resolved conservatively and routed to owner audit, which the owner completed only for the five contested origin maps), the gold is same-corpus (mitigated by feature disjointness: grades come from dialog-acts and ship ledgers, retrieval from embeddings and graph structure), and origin-MRR rests on n=12 single-operator sealed recollections.
 
 *(f) Concurrent-work race.* ACT-Up, MRMS, and E-mem have now been close-read in full (Related Work reflects their actual mechanisms and evaluations), but the space is moving quickly; other concurrent preprints may exist that we have not surveyed, and the composition could be assembled by others within months.
 
@@ -464,18 +519,18 @@ Self-indexing evaluation contamination is a class-level issue, not a CSR-only bu
 
 == Deferred work and theoretical next steps
 
-Three experiments are specified and queued as the next revision's core. (1) *Factored ablation grid*: all arms share the identical reranker, dedup, and budget; candidate generation varies across one-shot kNN, kNN+echo demotion, centroid pseudo-relevance feedback, blend-only, graph-only, and the full walk — isolating whether per-seed reinstatement beats collapsed-centroid feedback, and which saga channel earns its cost. (2) *Graded provenance gold*: origin-level 0–3 labels over the 20 existing queries, origin-MRR and `nDCG@10`, with file-touch history demoted to candidate-set construction. (3) *Controlled contamination experiment*: from a session-zero snapshot C0 (pre-dating all evaluation dialogue; such backups exist in the archive), construct C1 = C0 + only the evaluation transcript, C-sham = C0 + an unrelated transcript matched for length and tool activity, and C5 = C0 + five repeated evaluation cycles; measure origin-session rank, echo occupancy of the top-10, and repair from chunk- and conversation-level defenses under one deterministic index construction. This would convert self-indexing evaluation contamination from a documented incident into a characterized phenomenon.
+The three experiments queued in earlier drafts — the factored ablation grid, graded provenance gold, and the controlled contamination experiment — have been executed and are reported above (Phase 2 experiments). What they leave open sets the queue. From E1: fusion re-weighting (a larger graph share, per-channel quotas) and a blend-free graph+episode arm. From E2: the origin-finding floor — 5 of 12 owner-verified origins missed by every arm, concentrated in the corpus's earliest era — motivating age-compensating retrieval; and a cross-persona replication with marketing-operations queries against the machine's purpose-built release-train ledger. From E3: conversation-level echo exclusion (chunk-level demotion repairs occupancy but cannot rescue origins whose re-askings dominate whole conversations) and `supersedes` population.
 
-Learned decay (Anderson & Schooler, 1991) is theoretically motivated and now _unblocked_ by MCP retrieval logging, but blocked on log accumulation (Phase 2). Chunk-level temporal reinstatement using `seq`, sidechain-aware scoring, and SessionStart saga narration remain non-goals of this phase. With Phase 1.5 shipped, the immediate product next steps are conversation-level echo exclusion and `supersedes` population; external validation is the immediate scientific next step.
+Learned decay (Anderson & Schooler, 1991) is theoretically motivated and now _unblocked_ by MCP retrieval logging, but blocked on log accumulation. Chunk-level temporal reinstatement using `seq`, sidechain-aware scoring, and SessionStart saga narration remain non-goals of this phase. External and multi-operator validation is the immediate scientific next step.
 
 // ==================== 6. Conclusion ====================
 = Conclusion
 
 We introduced _three-trace sagas_ — joint episodic structure over intent, deliberation, and artifact in agentic software construction — and _reinstatement recall_, a five-step, LLM-free retrieval algorithm that seeds with kNN, blends query and seed context (TCM analogue), spreads over a session–file code graph, hops episode chains, and fuses results under a provenance-aware rerank. On CSR's own development corpus, a pre-registered spike showed +53% summed GT-session coverage at $k = 10$ versus one-shot kNN, with mechanism attribution locating most gains in semantic context blend rather than graph walk. Production reimplementation as `csr_why` met latency and integration DoD under partial same-day self-contamination (15 $arrow.r$ 18/19), and a frozen-corpus rerank pass repaired the contamination-displaced acceptance query (0 $arrow.r$ 1) while holding aggregate coverage.
 
-*Supported on these corpora:* reinstatement beats flat kNN for multi-hop provenance questions, at sub-100 ms warm cost, without an LLM in the loop — supported by GT coverage on two unrelated within-operator corpora (+53% Rust/systems, +47% TypeScript/product; pooled sign test $p approx 0.001$) and by blind cross-vendor judge panels on both (8/12 preferred, $kappa = 0.51$; 5/8 preferred with zero baseline votes); query-echo demotion repairs measured contamination displacement without sacrificing coverage.
+*Supported on these corpora:* reinstatement beats flat kNN for multi-hop provenance questions, at sub-100 ms warm cost, without an LLM in the loop — supported by GT coverage on two unrelated within-operator corpora (+53% Rust/systems, +47% TypeScript/product; pooled sign test $p approx 0.001$), by blind cross-vendor judge panels on both (8/12 preferred, $kappa = 0.51$; 5/8 preferred with zero baseline votes), and by ratification-derived graded gold (+37% origin-MRR, +29% `nDCG@10`, +25% graded recall, n=12 owner-sealed origins). Channel ablation attributes the gain to code-graph spread and shows the echo defense is causally necessary (removing it falls below the kNN baseline); controlled contamination dosing shows five re-ask cycles capture half of naive retrieval's top-10 and that the same defense repairs 72% of echo occupancy at 3.4$times$ the origin-MRR, with a null sham control.
 
-*Not yet proven:* learned usage-weighted decay; sidechain-weighted scoring; chunk-sequence temporal reinstatement; episode-chain value; generalization beyond a single operator's history; origin recovery for decisions whose re-askings dominate whole conversations.
+*Not yet proven:* learned usage-weighted decay; sidechain-weighted scoring; chunk-sequence temporal reinstatement; generalization beyond a single operator's history; and origin recovery itself — the verified origin conversation stays outside every arm's top-10 on over half the graded queries, and re-askings that dominate whole conversations remain unrescued by chunk-level defenses.
 
 *Immediate next steps:* conversation-level echo exclusion and `supersedes` population; enforce session-zero frozen snapshots for all future evals; accumulate MCP retrieval logs for Phase 2 learned decay; validate on external agentic coding corpora.
 
