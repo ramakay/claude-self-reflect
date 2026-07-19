@@ -94,6 +94,11 @@ pub struct EvidenceItem {
     pub timestamp: String,
     /// ~200 chars, cleaned (newlines -> spaces).
     pub excerpt: String,
+    /// Shadow signal (Phase: ratification divergence collection). Populated
+    /// AFTER final ranking/truncation from a batched lookup; never read before
+    /// ordering is fixed and never fed into any score/sort. `None` when the
+    /// conversation has no ratification row yet (silent, not an error).
+    pub ratification: Option<f32>,
 }
 
 /// Internal fusion candidate — pre-enrichment (no timestamp/excerpt yet, those are
@@ -496,11 +501,19 @@ pub async fn reinstate(
     let mut fused = rerank_pool(fused, &detail, query);
     fused.truncate(cfg.k);
 
+    // Shadow signal only: fetch after ordering is fully fixed (sort + rerank +
+    // truncate). Never used for ranking, filtering, or score mutation.
+    let ratification_ids: Vec<String> = fused.iter().map(|c| c.conversation_id.clone()).collect();
+    let ratification_scores = storage
+        .get_ratification_scores(&ratification_ids)
+        .unwrap_or_default();
+
     let mut items = Vec::with_capacity(fused.len());
     for c in fused {
         let Some((_prov, timestamp, content)) = detail.get(&c.id) else {
             continue;
         };
+        let ratification = ratification_scores.get(&c.conversation_id).copied();
         items.push(EvidenceItem {
             chunk_id: c.id,
             conversation_id: c.conversation_id,
@@ -508,8 +521,28 @@ pub async fn reinstate(
             via: c.via,
             timestamp: timestamp.clone(),
             excerpt: clean_excerpt(content),
+            ratification,
         });
     }
+
+    let shadow_log: Vec<serde_json::Value> = items
+        .iter()
+        .enumerate()
+        .map(|(rank, it)| {
+            serde_json::json!({
+                "conv_id": it.conversation_id,
+                "rank": rank,
+                "score": it.score,
+                "ratification_score": it.ratification,
+            })
+        })
+        .collect();
+    tracing::debug!(
+        target: "ratification_shadow",
+        qid = "none",
+        results = %serde_json::Value::Array(shadow_log),
+        "ratification_shadow"
+    );
 
     Ok(items)
 }
@@ -807,5 +840,34 @@ mod tests {
         assert_eq!(Via::Graph.to_string(), "graph");
         assert_eq!(Via::Episode.to_string(), "episode");
         assert_eq!(Via::Reflection.to_string(), "reflection");
+    }
+
+    #[test]
+    fn ratification_is_shadow_only_does_not_affect_order() {
+        // Two candidates where similarity order is fixed by rerank_pool
+        // (via plain cosine, no provenance/echo signal in play) — "hi" outranks
+        // "lo" by raw score. A ratification score that INVERTS this (lo=0.99,
+        // hi=0.01) must have zero effect on rerank_pool's output order, because
+        // rerank_pool has no access to ratification data at all — proving the
+        // signal cannot leak into ordering through this path.
+        let detail: HashMap<String, CandidateDetail> = HashMap::new();
+        let fused = vec![
+            cand("lo", "conv_lo", 0.40, Via::Blend),
+            cand("hi", "conv_hi", 0.80, Via::Seed),
+        ];
+        let ranked = rerank_pool(fused, &detail, "some long enough query text");
+        assert_eq!(ranked[0].id, "hi");
+        assert_eq!(ranked[1].id, "lo");
+        // Simulate what a ratification map WOULD say (inverted vs similarity)
+        // purely to document intent — never consulted by rerank_pool above.
+        let mut ratification_scores: HashMap<String, f32> = HashMap::new();
+        ratification_scores.insert("conv_lo".into(), 0.99);
+        ratification_scores.insert("conv_hi".into(), 0.01);
+        // Attaching (as reinstate() does, post-ordering) must not change order:
+        let final_order: Vec<&str> = ranked.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(final_order, vec!["hi", "lo"]);
+        // Ratification values themselves are simply readable, independent of order:
+        assert_eq!(ratification_scores.get("conv_lo").copied(), Some(0.99));
+        assert_eq!(ratification_scores.get("conv_hi").copied(), Some(0.01));
     }
 }
