@@ -1,0 +1,3714 @@
+{
+ "grades": {
+  "Q1": {
+   "origin": null,
+   "injected": false,
+   "items": {
+    "agent-a21cf27f481c0f611": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a8bdd1cee9fe3ccb0": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "a2bc5dc7-35a7-48f3-94c1-4ee61543f9ad": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-aca7886e242cc0dc2": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "7eccb720-edbd-40ad-b09b-fc4b8084c353": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-ac75a944ec1b96bae": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a1346cca2a4352b7b": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "a4635d59-b028-4d45-a68f-1ccc5fb712b0": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-aeda9d22f16d95b16": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "8b266e91-292b-4e39-bdaa-29d32b9e22f5": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "219ef49f-e007-4b56-bda8-b848516dc9f8": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "69a05719-10c8-4a51-82ac-f84b80fe8a0b": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "70690eeb-8942-4bd9-b03d-8e0307f8d507": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "fc16f91d-7f9c-44ca-b19b-237bbc3a3c6b": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "Q2": {
+   "origin": null,
+   "injected": false,
+   "items": {
+    "a4635d59-b028-4d45-a68f-1ccc5fb712b0": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "ea57c42a-c723-45d8-98a3-77f004316856": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a7d3813ac86c386c3": {
+     "grade": 0,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-aa531e25f49e8896a": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-ade7bc7718c210367": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "69a05719-10c8-4a51-82ac-f84b80fe8a0b": {
+     "grade": 2,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "219ef49f-e007-4b56-bda8-b848516dc9f8": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "9810c8b8-a02d-44b3-aca7-c20a72420e1e": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": false,
+      "grok": false
+     }
+    },
+    "9a1b8bab-a90f-40d3-9b03-ca301a8e81ba": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "02484348-1b02-4c81-8a72-707d93253647": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "bb1688ad-2dd5-46ef-8773-4570f0fd75d3": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "Q3": {
+   "origin": null,
+   "injected": false,
+   "items": {
+    "a4635d59-b028-4d45-a68f-1ccc5fb712b0": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a21cf27f481c0f611": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a8bdd1cee9fe3ccb0": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a30f8eeb395f32156": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "7eccb720-edbd-40ad-b09b-fc4b8084c353": {
+     "grade": 2,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "219ef49f-e007-4b56-bda8-b848516dc9f8": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "69a05719-10c8-4a51-82ac-f84b80fe8a0b": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "70690eeb-8942-4bd9-b03d-8e0307f8d507": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "a2bc5dc7-35a7-48f3-94c1-4ee61543f9ad": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "fc16f91d-7f9c-44ca-b19b-237bbc3a3c6b": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "Q4": {
+   "origin": "dc689356-1df6-4bc4-9b78-e29866213090",
+   "injected": true,
+   "items": {
+    "4dd4e4a7-6c42-45c8-9650-c801c4090084": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "a4635d59-b028-4d45-a68f-1ccc5fb712b0": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-ab35e2715070db1ce": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "981ecf54-be8f-472a-a45c-18ef87f5fc2d": {
+     "grade": 0,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-aa663c18c955f01af": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a1346cca2a4352b7b": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "dc689356-1df6-4bc4-9b78-e29866213090": {
+     "grade": 3,
+     "acts": {},
+     "discusses": null,
+     "edits_target": null,
+     "extracted": {
+      "sonnet": false,
+      "grok": false
+     },
+     "injected": true
+    }
+   }
+  },
+  "Q5": {
+   "origin": "219ef49f-e007-4b56-bda8-b848516dc9f8",
+   "injected": false,
+   "items": {
+    "agent-ac75a944ec1b96bae": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "fc16f91d-7f9c-44ca-b19b-237bbc3a3c6b": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "7eccb720-edbd-40ad-b09b-fc4b8084c353": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "befa3eb3-17df-45ce-a95b-e7e2165b1cca": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "a4635d59-b028-4d45-a68f-1ccc5fb712b0": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a73cab15b8ba56ec3": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "8b266e91-292b-4e39-bdaa-29d32b9e22f5": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "4df1359c-ccba-4858-9983-eb205e5fb49b": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": false,
+      "grok": false
+     }
+    },
+    "5de2dd55-eceb-423b-9f5f-67f9d24ac197": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": false,
+      "grok": false
+     }
+    },
+    "0bab445f-36b8-454d-9960-a95fdf938652": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "219ef49f-e007-4b56-bda8-b848516dc9f8": {
+     "grade": 3,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "69a05719-10c8-4a51-82ac-f84b80fe8a0b": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "Q6": {
+   "origin": "69a05719-10c8-4a51-82ac-f84b80fe8a0b",
+   "injected": false,
+   "items": {
+    "befa3eb3-17df-45ce-a95b-e7e2165b1cca": {
+     "grade": 2,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a73cab15b8ba56ec3": {
+     "grade": 0,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "02484348-1b02-4c81-8a72-707d93253647": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "a4635d59-b028-4d45-a68f-1ccc5fb712b0": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "fc16f91d-7f9c-44ca-b19b-237bbc3a3c6b": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "69a05719-10c8-4a51-82ac-f84b80fe8a0b": {
+     "grade": 3,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "219ef49f-e007-4b56-bda8-b848516dc9f8": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "Q7": {
+   "origin": null,
+   "injected": false,
+   "items": {
+    "agent-a14e45fb3c98d88bd": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "b687fc7a-5d14-482e-80bb-6c35870f3d02": {
+     "grade": 2,
+     "acts": {
+      "directs": true,
+      "accepts": true,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-ac75a944ec1b96bae": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "02d270b9-f48d-4bb4-bd03-9017e1723fa3": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "219ef49f-e007-4b56-bda8-b848516dc9f8": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "Q8": {
+   "origin": "b687fc7a-5d14-482e-80bb-6c35870f3d02",
+   "injected": false,
+   "items": {
+    "agent-ae78271be59f9b362": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "b687fc7a-5d14-482e-80bb-6c35870f3d02": {
+     "grade": 3,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "7eccb720-edbd-40ad-b09b-fc4b8084c353": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a227180f3a1e5601f": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "219ef49f-e007-4b56-bda8-b848516dc9f8": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "Q9": {
+   "origin": "02d270b9-f48d-4bb4-bd03-9017e1723fa3",
+   "injected": true,
+   "items": {
+    "a2bc5dc7-35a7-48f3-94c1-4ee61543f9ad": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a46dd71a627b91bbb": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "8b266e91-292b-4e39-bdaa-29d32b9e22f5": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "7eccb720-edbd-40ad-b09b-fc4b8084c353": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "a1efc14e-6598-470e-b4dd-0ec45b902125": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "2d2f2651-30ba-4b62-9300-28cb8393e81c": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "981ecf54-be8f-472a-a45c-18ef87f5fc2d": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-aa41df3acf6f1cbe0": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "02d270b9-f48d-4bb4-bd03-9017e1723fa3": {
+     "grade": 3,
+     "acts": {},
+     "discusses": null,
+     "edits_target": null,
+     "extracted": {
+      "sonnet": false,
+      "grok": false
+     },
+     "injected": true
+    }
+   }
+  },
+  "Q10": {
+   "origin": "0b68eace-3e21-4841-9567-58d038cd89d7",
+   "injected": false,
+   "items": {
+    "0b68eace-3e21-4841-9567-58d038cd89d7": {
+     "grade": 3,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-ab6217d1ed75a87cd": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "63746bac-9762-47c8-8e45-a0a997e53192": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": false,
+      "grok": false
+     }
+    },
+    "02484348-1b02-4c81-8a72-707d93253647": {
+     "grade": 2,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "9a1b8bab-a90f-40d3-9b03-ca301a8e81ba": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "8b266e91-292b-4e39-bdaa-29d32b9e22f5": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "fc16f91d-7f9c-44ca-b19b-237bbc3a3c6b": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "99d5fbd4-e46c-418a-b050-83f36cc3f5d5": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": false,
+      "grok": false
+     }
+    },
+    "55715673-4bd7-41d5-a2d4-cf7431c2cd60": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "a2bc5dc7-35a7-48f3-94c1-4ee61543f9ad": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "ea57c42a-c723-45d8-98a3-77f004316856": {
+     "grade": 2,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "Q11": {
+   "origin": null,
+   "injected": false,
+   "items": {
+    "a4635d59-b028-4d45-a68f-1ccc5fb712b0": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "7eccb720-edbd-40ad-b09b-fc4b8084c353": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "9a1b8bab-a90f-40d3-9b03-ca301a8e81ba": {
+     "grade": 0,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "981ecf54-be8f-472a-a45c-18ef87f5fc2d": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a039095891dbaff94": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "55715673-4bd7-41d5-a2d4-cf7431c2cd60": {
+     "grade": 2,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-ae3e26ad55e9f52eb": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a8b662cea17be5c6d": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-abb15af4af0140225": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "fc16f91d-7f9c-44ca-b19b-237bbc3a3c6b": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "0b68eace-3e21-4841-9567-58d038cd89d7": {
+     "grade": 0,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "Q12": {
+   "origin": "8b266e91-292b-4e39-bdaa-29d32b9e22f5",
+   "injected": false,
+   "items": {
+    "a4635d59-b028-4d45-a68f-1ccc5fb712b0": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "8b266e91-292b-4e39-bdaa-29d32b9e22f5": {
+     "grade": 3,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "9a1b8bab-a90f-40d3-9b03-ca301a8e81ba": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a1346cca2a4352b7b": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "ea57c42a-c723-45d8-98a3-77f004316856": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "69a05719-10c8-4a51-82ac-f84b80fe8a0b": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "70690eeb-8942-4bd9-b03d-8e0307f8d507": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "A1": {
+   "origin": null,
+   "injected": false,
+   "items": {
+    "c7193f1a-6a13-4c93-9314-2cec92dce64d": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "07b1e55f-6e03-4544-ae6c-546a1ba90779": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "740e7a9b-1f8b-4f39-ab57-be19c15fb3fd": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": false,
+      "grok": true
+     }
+    },
+    "74303756-d080-4faa-a186-234069c7fd5e": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "e6e599b6-4875-4604-8d3e-bb50ded8b3f2": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "d083a973-634c-41b9-aa68-3c6bba6f3264": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "679a43b0-83f0-49bd-9608-007cdbd51bf9": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "c6b5284a-6587-41e1-b391-cfe8e1e23161": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "46d2386b-c3e9-4f09-a695-ca7de9e7ae84": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "ccb2297d-c9ae-44dc-9b9d-7e963d96d490": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "52300719-bece-4568-a094-9b48b7fd307f": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "c33c32db-95d6-458a-925c-cc39cec1e7e7": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "a9355b0a-e116-41b6-a0ae-3f885ac2c9b3": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "5a059527-41de-4f86-9c8b-5cae118a6cd9": {
+     "grade": 2,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "A2": {
+   "origin": null,
+   "injected": false,
+   "items": {
+    "07b1e55f-6e03-4544-ae6c-546a1ba90779": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "d083a973-634c-41b9-aa68-3c6bba6f3264": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "c7193f1a-6a13-4c93-9314-2cec92dce64d": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "ad171098-57b4-42a2-9788-57d1c5f4231a": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "740e7a9b-1f8b-4f39-ab57-be19c15fb3fd": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "679a43b0-83f0-49bd-9608-007cdbd51bf9": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "e6e599b6-4875-4604-8d3e-bb50ded8b3f2": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "A3": {
+   "origin": "71b8d18d-450b-4cd1-aba5-6db7fdcfae6e",
+   "injected": false,
+   "items": {
+    "agent-ad9ff94c5223e3fc4": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a2c6f35072e90c4f8": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a3bdc2ff912542107": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "5e8afd7c-6bde-4274-b351-d8c8fd920ee6": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-ac8e4ff98cb31a5bf": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "6adf7258-654f-4619-ba0d-d011255ad91a": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "fab14951-2679-4412-9530-447e235562db": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "48e822f9-efdc-4bf7-9e91-5e173877b154": {
+     "grade": 2,
+     "acts": {
+      "directs": true,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "6897846e-78db-4851-9848-695b27bc55d4": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-aebe3ed9b9524f965": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "9943d722-49c0-41e3-a740-5013715cd6f4": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "477e2e54-9b18-4d96-b1e9-5ccbd75adaa2": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "71b8d18d-450b-4cd1-aba5-6db7fdcfae6e": {
+     "grade": 3,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "b1aeb329-20e0-428c-b4ed-c0c620253a4b": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "08d225e1-ecc1-4dfd-bde4-2cf8cfdcfd2b": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "47c076d0-a9c5-4882-b628-3711c8f57d19": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "ce7aa627-f098-44ad-b1a7-260c3d980cc3": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "36426add-b53a-4dbc-ade2-669d7d6017c5": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "A4": {
+   "origin": null,
+   "injected": false,
+   "items": {
+    "b1aeb329-20e0-428c-b4ed-c0c620253a4b": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "08d225e1-ecc1-4dfd-bde4-2cf8cfdcfd2b": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a68103775405dc8aa": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "962b9d0e-aa3a-4ab2-a24a-e9a653ff152c": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "ce7aa627-f098-44ad-b1a7-260c3d980cc3": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a6ce2979ffa42ed5c": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "447b9d47-00c7-41e4-a89e-f5b85f0ad529": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "5931a5c9-5a2e-4f37-9946-bcc50a4a20be": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-ad157c5ff5ae7741b": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "fec59775-8c5e-4a95-98e5-9478c1b022d4": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "71b8d18d-450b-4cd1-aba5-6db7fdcfae6e": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "6897846e-78db-4851-9848-695b27bc55d4": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  },
+  "A5": {
+   "origin": "46d2386b-c3e9-4f09-a695-ca7de9e7ae84",
+   "injected": true,
+   "items": {
+    "667c49b3-3b32-4f64-ab3b-ade59e7ccae5": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "4997ca0e-a7a2-48c2-9bf5-58f0815b3ffc": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "a889e789-e08f-48b9-8c8e-b33374c88ade": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "142ef262-27e6-4518-9b9c-830228c4ff8a": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a5c719a04a00ef44e": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "9a3207ef-f2d9-4f17-92e0-547788ff3902": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "cf2c1f85-066b-4afa-8ab5-6b7145927e69": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "c5576586-ea1e-483e-bcb5-a774bdb9e0bf": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "036f2495-fdcb-4c38-b374-2a1d1796b55d": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "84d7d91e-6446-4164-84fc-dc9e24ec7e41": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "962b9d0e-aa3a-4ab2-a24a-e9a653ff152c": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "9943d722-49c0-41e3-a740-5013715cd6f4": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "74303756-d080-4faa-a186-234069c7fd5e": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "07b1e55f-6e03-4544-ae6c-546a1ba90779": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "e6e599b6-4875-4604-8d3e-bb50ded8b3f2": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "46d2386b-c3e9-4f09-a695-ca7de9e7ae84": {
+     "grade": 3,
+     "acts": {},
+     "discusses": null,
+     "edits_target": null,
+     "extracted": {
+      "sonnet": false,
+      "grok": false
+     },
+     "injected": true
+    }
+   }
+  },
+  "A6": {
+   "origin": "92fcab9e-a193-405e-92f6-34c72edc9cd2",
+   "injected": true,
+   "items": {
+    "e89dcf04-79ea-43d4-b7bb-89b54c469ba7": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "870a3acc-e28d-4ded-94dd-b013315df5f7": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "8b4ea568-3184-4d5a-9c1c-1f513848e0cd": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "d208e843-64f9-4ef6-ac11-dcab33f8eb11": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "96bbf8f2-cd85-4d93-96b0-7be9bb2896f8": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "122404ea-6e7b-470c-b2ac-91527f47f4b4": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "142ef262-27e6-4518-9b9c-830228c4ff8a": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "05e11c5b-88ca-4efa-957c-3312dbfe2fab": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-adb28be98e15589a6": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "7e998910-c17a-434a-aca5-89ee9baab216": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "871dcd95-131b-4507-ba50-c470136f16f0": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "ff5e27f6-6501-4779-b408-110d7d959ea8": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "4997ca0e-a7a2-48c2-9bf5-58f0815b3ffc": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "5931a5c9-5a2e-4f37-9946-bcc50a4a20be": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "7e6a540b-afc1-491c-a807-68522edb127e": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "71b8d18d-450b-4cd1-aba5-6db7fdcfae6e": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "b0beec4f-d528-4088-9f72-66b7711fc6fe": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "6adf7258-654f-4619-ba0d-d011255ad91a": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "92fcab9e-a193-405e-92f6-34c72edc9cd2": {
+     "grade": 3,
+     "acts": {},
+     "discusses": null,
+     "edits_target": null,
+     "extracted": {
+      "sonnet": false,
+      "grok": false
+     },
+     "injected": true
+    }
+   }
+  },
+  "A7": {
+   "origin": "a3e84413-c8f2-481e-8661-8086accd8fcc",
+   "injected": true,
+   "items": {
+    "a1036d75-0b69-4b89-9f16-76bff43f10e1": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "7fee72b8-90c9-4c98-827f-71982882d8f2": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-a627f202b1545ff43": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "19b0cca3-2229-4ca6-99f5-af5d18369c41": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "1247848b-b7fb-4e83-9fe7-4c8ded5f90fe": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": false,
+      "grok": false
+     }
+    },
+    "856cc6a0-d534-4a8a-9827-9a9c1e280847": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "agent-af56123faf41a1ae3": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "98ab1b7b-dc49-4cc6-8a44-4e9416147135": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "ff5e27f6-6501-4779-b408-110d7d959ea8": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "506e3624-7f82-4a89-9af7-51948b0607f0": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "96bbf8f2-cd85-4d93-96b0-7be9bb2896f8": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "a3e84413-c8f2-481e-8661-8086accd8fcc": {
+     "grade": 3,
+     "acts": {},
+     "discusses": null,
+     "edits_target": null,
+     "extracted": {
+      "sonnet": false,
+      "grok": false
+     },
+     "injected": true
+    }
+   }
+  },
+  "A8": {
+   "origin": "92fcab9e-a193-405e-92f6-34c72edc9cd2",
+   "injected": false,
+   "items": {
+    "agent-a972665e194eb0e47": {
+     "grade": 1,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "ce7aa627-f098-44ad-b1a7-260c3d980cc3": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": true,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "819028e3-936c-4d52-934e-fecd08bb62d7": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "27ba0557-e762-4825-a6d2-c62194bd97ed": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "8bbfe996-bc60-4cfa-856c-fee8f7550ca8": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "1a57c081-a482-46bd-bede-ba69969b48c9": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "92fcab9e-a193-405e-92f6-34c72edc9cd2": {
+     "grade": 3,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "84d7d91e-6446-4164-84fc-dc9e24ec7e41": {
+     "grade": 0,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": false,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    },
+    "5931a5c9-5a2e-4f37-9946-bcc50a4a20be": {
+     "grade": 2,
+     "acts": {
+      "directs": false,
+      "accepts": false,
+      "rejects": false,
+      "reasks": false
+     },
+     "discusses": false,
+     "edits_target": true,
+     "extracted": {
+      "sonnet": true,
+      "grok": true
+     }
+    }
+   }
+  }
+ },
+ "summary": {
+  "queries": [
+   {
+    "qid": "Q1",
+    "origin_mapped": false,
+    "injected": false,
+    "mrr_a": null,
+    "mrr_b": null,
+    "ndcg_a": 0.066,
+    "ndcg_b": 0.552,
+    "recall2_a": 0.0,
+    "recall2_b": 0.4
+   },
+   {
+    "qid": "Q2",
+    "origin_mapped": false,
+    "injected": false,
+    "mrr_a": null,
+    "mrr_b": null,
+    "ndcg_a": 0.463,
+    "ndcg_b": 0.636,
+    "recall2_a": 0.667,
+    "recall2_b": 0.667
+   },
+   {
+    "qid": "Q3",
+    "origin_mapped": false,
+    "injected": false,
+    "mrr_a": null,
+    "mrr_b": null,
+    "ndcg_a": 0.0,
+    "ndcg_b": 0.276,
+    "recall2_a": 0.0,
+    "recall2_b": 0.2
+   },
+   {
+    "qid": "Q4",
+    "origin_mapped": true,
+    "injected": true,
+    "mrr_a": 0.0,
+    "mrr_b": 0.0,
+    "ndcg_a": 0.109,
+    "ndcg_b": 0.0,
+    "recall2_a": 0.0,
+    "recall2_b": 0.0
+   },
+   {
+    "qid": "Q5",
+    "origin_mapped": true,
+    "injected": false,
+    "mrr_a": 0.0,
+    "mrr_b": 0.0,
+    "ndcg_a": 0.284,
+    "ndcg_b": 0.314,
+    "recall2_a": 0.5,
+    "recall2_b": 0.5
+   },
+   {
+    "qid": "Q6",
+    "origin_mapped": true,
+    "injected": false,
+    "mrr_a": 0.167,
+    "mrr_b": 0.333,
+    "ndcg_a": 0.529,
+    "ndcg_b": 0.75,
+    "recall2_a": 0.667,
+    "recall2_b": 1.0
+   },
+   {
+    "qid": "Q7",
+    "origin_mapped": false,
+    "injected": false,
+    "mrr_a": null,
+    "mrr_b": null,
+    "ndcg_a": 0.424,
+    "ndcg_b": 0.783,
+    "recall2_a": 0.333,
+    "recall2_b": 1.0
+   },
+   {
+    "qid": "Q8",
+    "origin_mapped": true,
+    "injected": false,
+    "mrr_a": 0.5,
+    "mrr_b": 0.5,
+    "ndcg_a": 0.71,
+    "ndcg_b": 0.71,
+    "recall2_a": 1.0,
+    "recall2_b": 1.0
+   },
+   {
+    "qid": "Q9",
+    "origin_mapped": true,
+    "injected": true,
+    "mrr_a": 0.0,
+    "mrr_b": 0.0,
+    "ndcg_a": 0.233,
+    "ndcg_b": 0.236,
+    "recall2_a": 0.5,
+    "recall2_b": 0.5
+   },
+   {
+    "qid": "Q10",
+    "origin_mapped": true,
+    "injected": false,
+    "mrr_a": 1.0,
+    "mrr_b": 1.0,
+    "ndcg_a": 0.701,
+    "ndcg_b": 0.732,
+    "recall2_a": 0.5,
+    "recall2_b": 0.5
+   },
+   {
+    "qid": "Q11",
+    "origin_mapped": false,
+    "injected": false,
+    "mrr_a": null,
+    "mrr_b": null,
+    "ndcg_a": 0.563,
+    "ndcg_b": 0.516,
+    "recall2_a": 1.0,
+    "recall2_b": 1.0
+   },
+   {
+    "qid": "Q12",
+    "origin_mapped": true,
+    "injected": false,
+    "mrr_a": 0.5,
+    "mrr_b": 1.0,
+    "ndcg_a": 0.681,
+    "ndcg_b": 0.967,
+    "recall2_a": 1.0,
+    "recall2_b": 1.0
+   },
+   {
+    "qid": "A1",
+    "origin_mapped": false,
+    "injected": false,
+    "mrr_a": null,
+    "mrr_b": null,
+    "ndcg_a": 0.257,
+    "ndcg_b": 0.217,
+    "recall2_a": 0.091,
+    "recall2_b": 0.182
+   },
+   {
+    "qid": "A2",
+    "origin_mapped": false,
+    "injected": false,
+    "mrr_a": null,
+    "mrr_b": null,
+    "ndcg_a": 0.581,
+    "ndcg_b": 0.581,
+    "recall2_a": 0.6,
+    "recall2_b": 0.6
+   },
+   {
+    "qid": "A3",
+    "origin_mapped": true,
+    "injected": false,
+    "mrr_a": 0.0,
+    "mrr_b": 0.0,
+    "ndcg_a": 0.223,
+    "ndcg_b": 0.322,
+    "recall2_a": 0.25,
+    "recall2_b": 0.333
+   },
+   {
+    "qid": "A4",
+    "origin_mapped": false,
+    "injected": false,
+    "mrr_a": null,
+    "mrr_b": null,
+    "ndcg_a": 0.357,
+    "ndcg_b": 0.564,
+    "recall2_a": 0.375,
+    "recall2_b": 0.625
+   },
+   {
+    "qid": "A5",
+    "origin_mapped": true,
+    "injected": true,
+    "mrr_a": 0.0,
+    "mrr_b": 0.0,
+    "ndcg_a": 0.0,
+    "ndcg_b": 0.0,
+    "recall2_a": 0.0,
+    "recall2_b": 0.0
+   },
+   {
+    "qid": "A6",
+    "origin_mapped": true,
+    "injected": true,
+    "mrr_a": 0.0,
+    "mrr_b": 0.0,
+    "ndcg_a": 0.093,
+    "ndcg_b": 0.068,
+    "recall2_a": 0.167,
+    "recall2_b": 0.167
+   },
+   {
+    "qid": "A7",
+    "origin_mapped": true,
+    "injected": true,
+    "mrr_a": 0.0,
+    "mrr_b": 0.0,
+    "ndcg_a": 0.501,
+    "ndcg_b": 0.581,
+    "recall2_a": 0.571,
+    "recall2_b": 0.714
+   },
+   {
+    "qid": "A8",
+    "origin_mapped": true,
+    "injected": false,
+    "mrr_a": 0.143,
+    "mrr_b": 0.333,
+    "ndcg_a": 0.483,
+    "ndcg_b": 0.591,
+    "recall2_a": 0.667,
+    "recall2_b": 0.667
+   }
+  ],
+  "origin_mrr": {
+   "n_mapped": 12,
+   "arm_a": 0.193,
+   "arm_b": 0.264
+  },
+  "ndcg10": {
+   "arm_a": 0.363,
+   "arm_b": 0.47
+  },
+  "recall2at10": {
+   "arm_a": 0.444,
+   "arm_b": 0.553
+  },
+  "vendor_agreement": {
+   "directs": {
+    "pct": 0.848,
+    "kappa": 0.412,
+    "n": 204
+   },
+   "accepts": {
+    "pct": 0.985,
+    "kappa": 0.395,
+    "n": 204
+   },
+   "rejects": {
+    "pct": 0.975,
+    "kappa": 0.0,
+    "n": 204
+   },
+   "reasks": {
+    "pct": 1.0,
+    "kappa": null,
+    "n": 204
+   }
+  },
+  "vendor_status": {
+   "Q1": {
+    "sonnet": true,
+    "grok": true
+   },
+   "Q2": {
+    "sonnet": true,
+    "grok": true
+   },
+   "Q3": {
+    "sonnet": true,
+    "grok": true
+   },
+   "Q4": {
+    "sonnet": true,
+    "grok": true
+   },
+   "Q5": {
+    "sonnet": true,
+    "grok": true
+   },
+   "Q6": {
+    "sonnet": true,
+    "grok": true
+   },
+   "Q7": {
+    "sonnet": true,
+    "grok": true
+   },
+   "Q8": {
+    "sonnet": true,
+    "grok": true
+   },
+   "Q9": {
+    "sonnet": true,
+    "grok": true
+   },
+   "Q10": {
+    "sonnet": true,
+    "grok": true
+   },
+   "Q11": {
+    "sonnet": true,
+    "grok": true
+   },
+   "Q12": {
+    "sonnet": true,
+    "grok": true
+   },
+   "A1": {
+    "sonnet": true,
+    "grok": true
+   },
+   "A2": {
+    "sonnet": true,
+    "grok": true
+   },
+   "A3": {
+    "sonnet": true,
+    "grok": true
+   },
+   "A4": {
+    "sonnet": true,
+    "grok": true
+   },
+   "A5": {
+    "sonnet": true,
+    "grok": true
+   },
+   "A6": {
+    "sonnet": true,
+    "grok": true
+   },
+   "A7": {
+    "sonnet": true,
+    "grok": true
+   },
+   "A8": {
+    "sonnet": true,
+    "grok": true
+   }
+  },
+  "injected_count": 5,
+  "strata": {
+   "mapped": [
+    "Q4",
+    "Q5",
+    "Q6",
+    "Q8",
+    "Q9",
+    "Q10",
+    "Q12",
+    "A3",
+    "A5",
+    "A6",
+    "A7",
+    "A8"
+   ],
+   "unresolved_excluded": [
+    "Q1",
+    "Q3",
+    "Q7",
+    "Q11",
+    "A1",
+    "A2",
+    "A4"
+   ],
+   "out_of_corpus": [
+    "Q2"
+   ]
+  }
+ }
+}
