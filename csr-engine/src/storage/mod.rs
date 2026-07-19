@@ -2,7 +2,7 @@ pub mod codegraph;
 pub mod migrations;
 pub mod queries;
 
-pub use queries::{NarrativeUsageRow, NarrativeUsageSummary};
+pub use queries::{NarrativeUsageRow, NarrativeUsageSummary, RatificationScoreRow};
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -446,6 +446,29 @@ impl Storage {
     pub fn narrative_usage_summary(&self) -> Result<NarrativeUsageSummary> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::narrative_usage_summary(&conn)
+    }
+
+    pub fn upsert_ratification_score(&self, row: &RatificationScoreRow) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::upsert_ratification_score(&conn, row)
+    }
+
+    pub fn get_ratification_score(&self, conversation_id: &str) -> Result<Option<f32>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_ratification_score(&conn, conversation_id)
+    }
+
+    pub fn get_ratification_scores(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, f32>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_ratification_scores(&conn, ids)
+    }
+
+    pub fn ratification_summary(&self) -> Result<(i64, f64)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::ratification_summary(&conn)
     }
 
     /// Integrity check with an app-level cache. SQLite recomputes

@@ -1230,6 +1230,84 @@ pub fn narrative_usage_summary(conn: &Connection) -> Result<NarrativeUsageSummar
     })
 }
 
+// ─── Ratification scores ───
+
+pub struct RatificationScoreRow {
+    pub conversation_id: String,
+    pub score: f32,
+    pub acts_json: String,
+    pub ledger_refs: Option<String>,
+    pub extractor_version: String,
+}
+
+pub fn upsert_ratification_score(conn: &Connection, row: &RatificationScoreRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO ratification_scores
+         (conversation_id, score, acts_json, ledger_refs, extractor_version, extracted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))
+         ON CONFLICT(conversation_id) DO UPDATE SET
+             score=?2, acts_json=?3, ledger_refs=?4, extractor_version=?5,
+             extracted_at=strftime('%s','now')",
+        params![
+            row.conversation_id,
+            row.score,
+            row.acts_json,
+            row.ledger_refs,
+            row.extractor_version,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_ratification_score(conn: &Connection, conversation_id: &str) -> Result<Option<f32>> {
+    conn.query_row(
+        "SELECT score FROM ratification_scores WHERE conversation_id = ?1",
+        params![conversation_id],
+        |r| r.get::<_, f32>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn get_ratification_scores(conn: &Connection, ids: &[String]) -> Result<HashMap<String, f32>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    const BATCH: usize = 500;
+    let mut results = HashMap::new();
+    for batch in ids.chunks(BATCH) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT conversation_id, score FROM ratification_scores WHERE conversation_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let bound: Vec<&dyn rusqlite::ToSql> =
+            batch.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(bound.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+        })?;
+        for row in rows {
+            let (id, score) = row?;
+            results.insert(id, score);
+        }
+    }
+    Ok(results)
+}
+
+pub fn ratification_summary(conn: &Connection) -> Result<(i64, f64)> {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(AVG(score), 0.0) FROM ratification_scores",
+        [],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
+    )
+    .map_err(Into::into)
+}
+
 // ─── TAD: Retrieval Event Tracking ───
 
 /// Log a retrieval event (memory was surfaced during a hook).
@@ -1865,6 +1943,33 @@ mod tests {
         assert_eq!(s.cache_tokens_total, 0);
         assert_eq!(s.cache_tokens_today, 0);
         assert_eq!(s.last_model, None);
+    }
+
+    #[test]
+    fn test_get_ratification_scores_empty_input() {
+        let conn = mem();
+        let map = get_ratification_scores(&conn, &[]).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_upsert_and_get_ratification_score() {
+        let conn = mem();
+        let row = RatificationScoreRow {
+            conversation_id: "c1".into(),
+            score: 0.6,
+            acts_json: r#"{"acts":[]}"#.into(),
+            ledger_refs: None,
+            extractor_version: "ratification-v1".into(),
+        };
+        upsert_ratification_score(&conn, &row).unwrap();
+        assert_eq!(get_ratification_score(&conn, "c1").unwrap(), Some(0.6));
+        let (count, avg) = ratification_summary(&conn).unwrap();
+        assert_eq!(count, 1);
+        assert!((avg - 0.6).abs() < 1e-6);
+        let map = get_ratification_scores(&conn, &["c1".into(), "missing".into()]).unwrap();
+        assert_eq!(map.get("c1"), Some(&0.6));
+        assert!(!map.contains_key("missing"));
     }
 
     #[test]

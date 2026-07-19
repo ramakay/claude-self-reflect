@@ -327,6 +327,14 @@ pub fn run(conn: &Connection) -> Result<()> {
             cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
             duration_ms INTEGER NOT NULL DEFAULT 0,
             success INTEGER NOT NULL DEFAULT 1
+         );
+         CREATE TABLE IF NOT EXISTS ratification_scores (
+            conversation_id TEXT PRIMARY KEY,
+            score REAL NOT NULL,
+            acts_json TEXT NOT NULL,
+            ledger_refs TEXT,
+            extractor_version TEXT NOT NULL,
+            extracted_at INTEGER NOT NULL
          );",
     )?;
 
@@ -346,6 +354,20 @@ mod tests {
             conn.prepare("SELECT seq, is_sidechain FROM chunks LIMIT 0")
                 .is_ok(),
             "seq and is_sidechain columns must exist after migration"
+        );
+    }
+
+    #[test]
+    fn ratification_scores_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare(
+                "SELECT conversation_id, score, acts_json, ledger_refs, extractor_version, extracted_at FROM ratification_scores LIMIT 0"
+            )
+            .is_ok(),
+            "ratification_scores table must exist after migration"
         );
     }
 }

@@ -23,6 +23,7 @@ pub struct StatusReport {
     pub import_percent: f64,
     pub enrichment: EnrichmentBreakdown,
     pub narratives: NarrativeStatus,
+    pub ratification: RatificationStatus,
     pub newest_chunk: Option<String>,
     pub db_size_bytes: u64,
     pub db_path: String,
@@ -50,6 +51,13 @@ pub struct NarrativeStatus {
     pub cache_tokens_total: i64,
     pub last_model: Option<String>,
     pub disabled: bool,
+}
+
+#[derive(Serialize, Default)]
+pub struct RatificationStatus {
+    pub count: i64,
+    pub avg_score: f64,
+    pub coverage_pct: f64, // scored / distinct conversation_ids in chunks table, 0-100
 }
 
 /// Run status check — opens SQLite directly (no EmbeddingEngine needed).
@@ -101,6 +109,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
                 disabled: crate::narrative::narratives_disabled(),
                 ..Default::default()
             },
+            ratification: RatificationStatus::default(),
             newest_chunk: None,
             db_size_bytes: 0,
             db_path: db_path.to_string_lossy().to_string(),
@@ -112,6 +121,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let narratives = gather_narratives(&storage);
 
     let conversations = storage.count_conversations().unwrap_or(0);
+    let ratification = gather_ratification(&storage, conversations);
     let projects = storage.count_projects().unwrap_or(0);
     let chunks = storage.count_chunk_embeddings().unwrap_or(0);
     let reflections = storage.count_reflection_embeddings().unwrap_or(0);
@@ -161,6 +171,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         import_percent,
         enrichment,
         narratives,
+        ratification,
         newest_chunk,
         db_size_bytes,
         db_path: db_path.to_string_lossy().to_string(),
@@ -183,6 +194,20 @@ fn gather_narratives(storage: &Storage) -> NarrativeStatus {
         cache_tokens_total: summary.cache_tokens_total,
         last_model: summary.last_model,
         disabled,
+    }
+}
+
+fn gather_ratification(storage: &Storage, total_conversations: usize) -> RatificationStatus {
+    let (count, avg_score) = storage.ratification_summary().unwrap_or((0, 0.0));
+    let coverage_pct = if total_conversations > 0 {
+        (count as f64 / total_conversations as f64) * 100.0
+    } else {
+        0.0
+    };
+    RatificationStatus {
+        count,
+        avg_score,
+        coverage_pct,
     }
 }
 
@@ -436,6 +461,7 @@ mod tests {
             import_percent: 90.9,
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus::default(),
+            ratification: RatificationStatus::default(),
             newest_chunk: None,
             db_size_bytes: 100_000_000,
             db_path: "/tmp/test.db".to_string(),

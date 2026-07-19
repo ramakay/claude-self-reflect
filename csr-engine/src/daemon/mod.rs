@@ -7,6 +7,7 @@
 //! 4. Consolidation loop (Layer 4) — Dreamer v1 typed fact extraction from narratives
 
 pub mod consolidation;
+pub mod ratification;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -219,6 +220,16 @@ impl Daemon {
         };
         tracing::info!("maintenance loop started (integrity cache + WAL checkpoint)");
 
+        // Ratification loop — dialog-act scoring (interval via CSR_RATIFICATION_INTERVAL_SECS)
+        let ratification_handle = {
+            let storage = self.storage.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                ratification_loop(storage, shutdown).await;
+            })
+        };
+        tracing::info!("ratification loop started");
+
         // Wait for Ctrl+C
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down daemon gracefully");
@@ -234,6 +245,7 @@ impl Daemon {
         }
         let _ = tokio::time::timeout(timeout, consolidation_handle).await;
         let _ = tokio::time::timeout(timeout, maintenance_handle).await;
+        let _ = tokio::time::timeout(timeout, ratification_handle).await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
 
         // Flush HNSW index to disk before exit
@@ -271,6 +283,35 @@ async fn extraction_loop(
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
     }
+}
+
+async fn ratification_loop(storage: Arc<Storage>, shutdown: Arc<AtomicBool>) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            tracing::info!("ratification loop: shutdown signal received");
+            break;
+        }
+        if crate::daemon::ratification::check_disabled() {
+            // logged once inside check_disabled via Once
+        } else if let Err(e) = ratification_loop_inner(&storage).await {
+            tracing::warn!(error = %e, "ratification loop iteration failed (non-fatal)");
+        }
+        let secs: u64 = std::env::var("CSR_RATIFICATION_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        tokio::time::sleep(tokio::time::Duration::from_secs(secs)).await;
+    }
+}
+
+async fn ratification_loop_inner(storage: &Arc<Storage>) -> Result<()> {
+    let unenriched = storage.get_unenriched_conversations("ratification", 1)?;
+    for (conv_id, _file_path) in &unenriched {
+        if let Err(e) = crate::daemon::ratification::process_ratification(storage, conv_id).await {
+            let _ = storage.mark_enrichment_failed(conv_id, "ratification", &e.to_string());
+        }
+    }
+    Ok(())
 }
 
 async fn extraction_loop_inner(
