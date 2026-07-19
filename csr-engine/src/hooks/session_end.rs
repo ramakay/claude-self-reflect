@@ -89,6 +89,32 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
             .update_retrieval_stats_for_session(session_id);
     }
 
+    // 6. Ratification re-enqueue (non-fatal): delete enrichment_state so the
+    //    daemon re-scores this conversation on its next poll. Enqueue-only —
+    //    never call an LLM from the hook.
+    if !crate::daemon::ratification::check_disabled() {
+        if let Some(ref tp) = input.transcript_path {
+            let reenqueue = (|| -> Result<()> {
+                let conv_id = std::path::Path::new(tp)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let chunk_ids = engine.storage().get_chunk_ids_for_conversation(&conv_id)?;
+                if chunk_ids.is_empty() {
+                    return Ok(());
+                }
+                engine
+                    .storage()
+                    .reset_enrichment(&conv_id, "ratification")?;
+                Ok(())
+            })();
+            if let Err(e) = reenqueue {
+                tracing::debug!("CSR: ratification re-enqueue failed (non-fatal): {e}");
+            }
+        }
+    }
+
     Ok(())
 }
 

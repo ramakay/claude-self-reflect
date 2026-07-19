@@ -174,6 +174,16 @@ struct ActItem {
 fn parse_acts(text: &str) -> Result<(String, u32, u32, u32)> {
     let stripped = strip_json_fences(text);
     let payload: ActsPayload = serde_json::from_str(stripped)
+        .or_else(|e| {
+            // Models sometimes wrap the JSON in prose; retry on the outermost
+            // brace-delimited slice before giving up.
+            match (stripped.find('{'), stripped.rfind('}')) {
+                (Some(start), Some(end)) if start < end => {
+                    serde_json::from_str(&stripped[start..=end])
+                }
+                _ => Err(e),
+            }
+        })
         .map_err(|e| anyhow!("ratification acts JSON parse failed: {e}"))?;
     let mut n_directs = 0u32;
     let mut n_accepts = 0u32;
@@ -465,6 +475,16 @@ fn conversation_time_span(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_acts_handles_prose_wrapped_json() {
+        let (_, d, a, r) = parse_acts(
+            "Looking at the digest, here are the acts:\n{\"acts\": [{\"type\": \"DIRECTS\", \"evidence\": \"fix it\", \"msg_hint\": \"early\"}]}\nLet me know if you need more.",
+        )
+        .unwrap();
+        assert_eq!((d, a, r), (1, 0, 0));
+        assert!(parse_acts("no json here at all").is_err());
+    }
 
     #[test]
     fn generic_basename_requires_parent_dir_match() {

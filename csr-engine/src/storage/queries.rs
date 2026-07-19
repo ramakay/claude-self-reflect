@@ -625,6 +625,21 @@ pub fn mark_enrichment_unavailable(
     Ok(())
 }
 
+/// Delete the enrichment_state row for a conversation + type, making it
+/// eligible again for `get_unenriched_conversations` (status IS NULL).
+/// No-op (Ok) if no matching row exists.
+pub fn reset_enrichment(
+    conn: &Connection,
+    conversation_id: &str,
+    enrichment_type: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM enrichment_state WHERE conversation_id = ?1 AND enrichment_type = ?2",
+        params![conversation_id, enrichment_type],
+    )?;
+    Ok(())
+}
+
 /// Get conversations that need enrichment of a given type.
 /// Returns (conversation_id, file_path) pairs.
 pub fn get_unenriched_conversations(
@@ -1970,6 +1985,20 @@ mod tests {
         let map = get_ratification_scores(&conn, &["c1".into(), "missing".into()]).unwrap();
         assert_eq!(map.get("c1"), Some(&0.6));
         assert!(!map.contains_key("missing"));
+    }
+
+    #[test]
+    fn test_reset_enrichment() {
+        let conn = mem();
+        mark_enrichment_completed(&conn, "conv-reset", "ratification", "x").unwrap();
+        assert!(is_conversation_enriched(&conn, "conv-reset", "ratification").unwrap());
+
+        reset_enrichment(&conn, "conv-reset", "ratification").unwrap();
+        assert!(!is_conversation_enriched(&conn, "conv-reset", "ratification").unwrap());
+
+        // Idempotent: deleting an absent row is Ok
+        reset_enrichment(&conn, "conv-reset", "ratification").unwrap();
+        assert!(!is_conversation_enriched(&conn, "conv-reset", "ratification").unwrap());
     }
 
     #[test]

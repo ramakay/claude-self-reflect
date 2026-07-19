@@ -1314,6 +1314,84 @@ fn test_session_end_v3_extraction() {
     );
 }
 
+/// SessionEnd deletes enrichment_state for ratification so the daemon re-scores.
+#[test]
+fn test_session_end_resets_ratification_enrichment() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let transcript = tmp.path().join("ratify-reset-session.jsonl");
+
+    let messages = r#"{"type":"user","message":{"content":[{"type":"text","text":"Fix the race condition in HNSW persistence that causes stale index on restart"}]},"timestamp":"2026-02-22T15:00:00Z"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"I see the issue. The dump_to_disk function doesn't acquire a lock."},{"type":"tool_use","name":"Edit","input":{"file_path":"/src/search.rs","old_string":"fn dump_to_disk","new_string":"fn dump_to_disk_with_lock"}}]},"timestamp":"2026-02-22T15:00:01Z"}
+{"type":"user","message":{"content":[{"type":"text","text":"Good, now add fs2 advisory locking"}]},"timestamp":"2026-02-22T15:00:02Z"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Added fs2 lock_exclusive before file dump. The index is now safe against concurrent access."},{"type":"tool_use","name":"Edit","input":{"file_path":"/src/engine.rs","old_string":"file_dump()","new_string":"lock.lock_exclusive(); file_dump()"}}]},"timestamp":"2026-02-22T15:00:03Z"}
+{"type":"user","message":{"content":[{"type":"text","text":"Run the tests"}]},"timestamp":"2026-02-22T15:00:04Z"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"All 200 tests pass with zero warnings. The race condition is fixed."}]},"timestamp":"2026-02-22T15:00:05Z"}
+"#;
+    std::fs::write(&transcript, messages).unwrap();
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage.clone(),
+        embeddings.clone(),
+        search.clone(),
+        std::path::PathBuf::from("/tmp"),
+    );
+
+    let input = csr_engine::hooks::HookInput {
+        transcript_path: Some(transcript.to_string_lossy().to_string()),
+        cwd: Some(tmp.path().to_string_lossy().to_string()),
+        session_id: Some("ratify-reset".into()),
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let conv_id = "ratify-reset-session";
+
+    // First session-end: import transcript + create chunks
+    let result = rt.block_on(csr_engine::hooks::session_end::handle(
+        &input,
+        &engine,
+        tmp.path(),
+    ));
+    assert!(result.is_ok());
+
+    let chunk_ids = storage.get_chunk_ids_for_conversation(conv_id).unwrap();
+    assert!(
+        !chunk_ids.is_empty(),
+        "session-end should import at least one chunk"
+    );
+
+    // Simulate a prior completed ratification score
+    storage
+        .mark_enrichment_completed(conv_id, "ratification", "x")
+        .unwrap();
+    assert!(
+        storage
+            .is_conversation_enriched(conv_id, "ratification")
+            .unwrap(),
+        "ratification should be marked completed before second session-end"
+    );
+
+    // Second session-end: should reset ratification enrichment_state
+    let result = rt.block_on(csr_engine::hooks::session_end::handle(
+        &input,
+        &engine,
+        tmp.path(),
+    ));
+    assert!(result.is_ok());
+
+    assert!(
+        !storage
+            .is_conversation_enriched(conv_id, "ratification")
+            .unwrap(),
+        "session-end should delete ratification enrichment_state so daemon re-scores"
+    );
+}
+
 /// Test: precompact hook imports transcript for all sessions.
 #[test]
 fn test_precompact_imports_for_all_sessions() {
