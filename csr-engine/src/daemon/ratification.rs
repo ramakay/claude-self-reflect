@@ -20,7 +20,7 @@ use crate::storage::{NarrativeUsageRow, RatificationScoreRow, Storage};
 const DIGEST_CHAR_CAP: usize = 8000;
 const RATIFICATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RATIFICATION_PROMPT_SIZE: u64 = 10 * 1024;
-const EXTRACTOR_VERSION: &str = "ratification-v1";
+const EXTRACTOR_VERSION: &str = "ratification-v2";
 const MAX_LEDGER_SHAS: usize = 20;
 
 static DISABLED_LOG: Once = Once::new();
@@ -66,26 +66,54 @@ fn load_ratification_prompt() -> String {
     include_str!("../../data/RATIFICATION_PROMPT.md").to_string()
 }
 
-/// Concatenate chunk contents with separators; head+tail truncate if over cap.
-pub fn build_digest(chunks: &[ConversationChunk], char_cap: usize) -> String {
-    let full: String = chunks
-        .iter()
-        .map(|c| c.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n---\n");
-    let total_chars = full.chars().count();
+fn head_tail(text: &str, char_cap: usize) -> String {
+    let total_chars = text.chars().count();
     if total_chars <= char_cap {
-        return full;
+        return text.to_string();
     }
     let head_n = char_cap / 2;
     let tail_n = char_cap / 2;
-    let head: String = full.chars().take(head_n).collect();
-    let tail: String = full
+    let head: String = text.chars().take(head_n).collect();
+    let tail: String = text
         .chars()
         .skip(total_chars.saturating_sub(tail_n))
         .collect();
     let omitted = total_chars.saturating_sub(head_n + tail_n);
     format!("{head}\n... [{omitted} chars omitted] ...\n{tail}")
+}
+
+/// v2: operator-turn-prioritized digest. Dialog-acts live in user-authored
+/// chunks (chunk author = genuine user prose, per import provenance); v1's
+/// undifferentiated head+tail sampled mostly assistant/tool text and starved
+/// the extractor of operator turns (Gate A' failure, 2026-07-19).
+pub fn build_digest(chunks: &[ConversationChunk], char_cap: usize) -> String {
+    use crate::provenance::Speaker;
+    let user_text: String = chunks
+        .iter()
+        .filter(|c| c.author == Speaker::User)
+        .map(|c| c.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    let other_text: String = chunks
+        .iter()
+        .filter(|c| c.author != Speaker::User)
+        .map(|c| c.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+
+    if user_text.is_empty() {
+        return head_tail(&other_text, char_cap);
+    }
+    let user_budget = char_cap * 3 / 4;
+    let user_part = head_tail(&user_text, user_budget);
+    let remaining = char_cap.saturating_sub(user_part.chars().count());
+    if remaining < 200 || other_text.is_empty() {
+        return format!("=== OPERATOR-TURN EXCERPTS ===\n{user_part}");
+    }
+    format!(
+        "=== OPERATOR-TURN EXCERPTS ===\n{user_part}\n=== OTHER CONTEXT (assistant/tool) ===\n{}",
+        head_tail(&other_text, remaining)
+    )
 }
 
 fn ratification_model_candidates() -> Vec<Option<String>> {
@@ -554,7 +582,40 @@ mod tests {
         };
         let digest = build_digest(&[chunk], 40);
         assert!(digest.contains("chars omitted"));
-        assert!(digest.starts_with("aaaaaaaaaa")); // head half of 40
-        assert!(digest.ends_with("aaaaaaaaaa")); // tail half
+        // v2: user-authored content leads under the operator-turn header,
+        // truncated to the 3/4 user budget (head+tail of 30 chars).
+        assert!(digest.starts_with("=== OPERATOR-TURN EXCERPTS ===\n"));
+        assert!(digest.ends_with("aaaaaaaaaaaaaaa")); // tail half of 30
+    }
+
+    #[test]
+    fn build_digest_prioritizes_operator_turns() {
+        let mk = |id: &str, content: &str, author: crate::provenance::Speaker| ConversationChunk {
+            id: id.into(),
+            conversation_id: "conv".into(),
+            project_name: "p".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let chunks = vec![
+            mk(
+                "c1",
+                "assistant explanation text",
+                crate::provenance::Speaker::Assistant,
+            ),
+            mk("c2", "fix the import bug", crate::provenance::Speaker::User),
+            mk("c3", "tool output", crate::provenance::Speaker::ToolResult),
+        ];
+        let digest = build_digest(&chunks, 8000);
+        let op = digest.find("OPERATOR-TURN EXCERPTS").unwrap();
+        let user_pos = digest.find("fix the import bug").unwrap();
+        let other = digest.find("OTHER CONTEXT").unwrap();
+        assert!(op < user_pos && user_pos < other);
+        assert!(digest.find("assistant explanation text").unwrap() > other);
     }
 }
