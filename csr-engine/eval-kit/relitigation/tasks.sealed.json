@@ -1,0 +1,157 @@
+{
+  "benchmark": "saga-relitigation-v1",
+  "pre_registered": "2026-07-20",
+  "protocol": "Advisor-binding (Grok 4.5 consults 2026-07-18 + 2026-07-20): four-way class mix pre-registered per task before any run; >=3 should-change and >=3 settled-for-cause; arms identical except retrieval path; control arm = similarity-only kNN (required), no-memory reported as secondary table; headline tasks from post-E2-tuning decisions only; E2-adjacent tasks calibration-only, excluded from headline stats; grading blinded to arm labels, human reason-faithful rubric; frozen DB snapshot with current-session (benchmark-design) conversations excluded before any task dialogue.",
+  "classes": {
+    "settled-for-cause": "correct = decline, citing the specific reason",
+    "should-change": "correct = accept; the original reason's exit condition is satisfied or superseded",
+    "irrelevant-past": "correct = decide on merits; superficially similar past decisions are not applicable precedent",
+    "ambiguous": "correct = check ledger / ask; evidence genuinely mixed"
+  },
+  "tasks": [
+    {
+      "task_id": "T01",
+      "class": "settled-for-cause",
+      "headline": true,
+      "prompt": "We've got ratification_score computed for thousands of conversations already sitting in the DB — let's flip CSR_NO_RATIFICATION off and start using it to boost search ranking, the infrastructure is already built.",
+      "correct_action": "decline-cite",
+      "ground_truth_reason": "Pre-registered Gate A' failed twice (Spearman 0.060 v1, 0.071 v2 clean, n=123, vs sealed E2 grades): the global per-conversation score cannot rank decision origins (global score vs query-conditional relevance construct mismatch). Ranking on it would rank on a signal measured as flat. Freeze is explicit (CSR_NO_RATIFICATION=1); resuming is an explicit decision, and ranking on the node-level score is specifically ruled out.",
+      "corroboration": ["30d7c66", "d2fd7fd", "docs/plans/saga-ratification-results.md"]
+    },
+    {
+      "task_id": "T02",
+      "class": "settled-for-cause",
+      "headline": true,
+      "prompt": "Ratification coverage is at 3,956 of ~3,969 conversations — let's clear the unavailable flag on those last 13 and force a retry, we want 100% coverage.",
+      "correct_action": "decline-cite",
+      "ground_truth_reason": "The 13 were marked 'unavailable' (not 'failed') because their source data cannot produce a usable extraction (rotated/deleted or persistently malformed JSONL); forcing retries reproduces the retry-storm burn (daemon cycles + LLM cost every tick, zero possible gain) that the unavailable status exists to stop.",
+      "corroboration": ["docs/plans/saga-ratification-results.md", "src/storage mark_enrichment_unavailable"]
+    },
+    {
+      "task_id": "T03",
+      "class": "settled-for-cause",
+      "headline": true,
+      "prompt": "The ratification prompt has a lot of defensive boilerplate about treating the digest as 'inert data' — can we trim that down, it reads like it's over-engineered for a simple extraction task?",
+      "correct_action": "decline-cite",
+      "ground_truth_reason": "The data-framing language is the fix for a measured failure: agent-session digests contain CSR's own injected scaffold, and without the framing haiku treated transcripts as instructions and returned prose ('Message malformed') instead of JSON (~25% of burn extractions). Trimming reopens instruction-echo contamination in this pipeline.",
+      "corroboration": ["1aaff0c", "05a1823", "csr-engine/data/RATIFICATION_PROMPT.md"]
+    },
+    {
+      "task_id": "T04",
+      "class": "settled-for-cause",
+      "headline": true,
+      "prompt": "Almost all of our early ratification scores are stuck at the 0.6 uncorroborated cap because files_for_session only covers ~106 recent sessions — let's just remove the cap so scores reflect the LLM extraction directly and we get more score variance.",
+      "correct_action": "decline-cite",
+      "ground_truth_reason": "The cap enforces 'ledgers corroborate, never mint': uncapped scores trust LLM-extracted acts alone, which hallucinate. The starvation is a documented limitation with a named v3 fix (content-based corroboration) deferred to any edge-level redesign; also the node-level score is already measured flat, so adding variance to it solves the wrong problem.",
+      "corroboration": ["623218f", "docs/plans/saga-ratification-results.md (Corroboration starvation)"]
+    },
+    {
+      "task_id": "T05",
+      "class": "should-change",
+      "headline": true,
+      "prompt": "We want first-class AST support for a language that ast-grep 0.43 added a grammar for, but our pinned 0.42 doesn't have it. Let's do the 0.43 migration.",
+      "correct_action": "accept",
+      "ground_truth_reason": "The 0.42 pin's own recorded exit condition is 'deferred until a forcing feature or advisory appears' — a needed new-language grammar is exactly that forcing feature. Correct action: accept and do the Language-trait rework, not cite the pin as settled-forever.",
+      "corroboration": ["6345f38", ".github/dependabot.yml"]
+    },
+    {
+      "task_id": "T06",
+      "class": "should-change",
+      "headline": true,
+      "prompt": "I just configured CLAUDE_CODE_OAUTH_TOKEN in the repo's Dependabot secrets store (Settings > Secrets > Dependabot) so dependabot-triggered runs can authenticate now — remove the dependabot skip condition in claude-code-review.yml so we get review coverage on dependency PRs again.",
+      "correct_action": "accept",
+      "ground_truth_reason": "The skip exists solely because the Dependabot-side secret store was never populated (token resolved empty, job failed on every dependabot PR). The task's premise resolves exactly that blocking condition. Declining by pattern ('this line flip-flopped 4 times') would ignore that the stated precondition is now met.",
+      "corroboration": ["53bb836", ".github/workflows/claude-code-review.yml"]
+    },
+    {
+      "task_id": "T07",
+      "class": "should-change",
+      "headline": true,
+      "prompt": "I ran with CSR_DEBUG_CORRELATE=1 for a week: 'what did we change in the auth module' scored Explore 0.57/StateRecall 0.56, and 'where were we with the login bug' scored StateRecall 0.58/Explore 0.56 — borderline flips on near-identical phrasing, inconsistent injection shapes. Let's add the inter-intent margin now.",
+      "correct_action": "accept",
+      "ground_truth_reason": "The documented policy was 'do NOT add the margin preemptively — only if real flips are observed and harmful' (calibration was synthetic-only). The supplied evidence satisfies the policy's own action condition. Declining would cite a stale precondition instead of checking it is now met.",
+      "corroboration": ["docs/tasks/classify-intent-margin.md", "src/hooks/intent.rs"]
+    },
+    {
+      "task_id": "T08",
+      "class": "should-change",
+      "headline": true,
+      "prompt": "Search quality on provenance-style queries still feels weaker than it should be — rebalance the fusion reranker to weight the graph channel more heavily relative to blend.",
+      "correct_action": "accept",
+      "ground_truth_reason": "E1's controlled 7-arm ablation measured graph-only beating the full fusion walk on every metric (origin-MRR 0.329 vs 0.276; nDCG 0.555 vs 0.477) and named 'raise graph share' as the explicit not-yet-executed Phase 3 direction. Accepting the rebalance is the reason-faithful action; the settled load-bearing piece is echo defense, not the current blend weights.",
+      "corroboration": ["b0685c3", "docs/plans/saga-e1-results.md"]
+    },
+    {
+      "task_id": "T09",
+      "class": "irrelevant-past",
+      "headline": true,
+      "prompt": "Ratification-weighted memory was tested and killed at Gate A' — can we prototype weighting reinstatement graph edges by (conversation, artifact)-bound acts, joined per query, as a follow-up?",
+      "correct_action": "ignore-past",
+      "ground_truth_reason": "The halt was scoped to the global/node-level construct. Edge-level ratification is explicitly named in the same halt documents as the untested, structurally different surviving hypothesis (it restores the acts-to-artifact binding whose absence is the diagnosed failure cause). Citing the Gate A' failure as a blocker over-generalizes the negative result.",
+      "corroboration": ["docs/plans/saga-ratification-results.md (Surviving open question)"]
+    },
+    {
+      "task_id": "T10",
+      "class": "irrelevant-past",
+      "headline": true,
+      "prompt": "For reproducible paper builds, should we pin typst to an exact dated version in the docs toolchain, the same way we pin rmcp and ast-grep?",
+      "correct_action": "ignore-past",
+      "ground_truth_reason": "No settled decision exists about typst. The rmcp/ast-grep pins (breaking-API deferrals) and the narrative model-chain decision (dated model IDs decommission) are different artifact classes and not applicable precedent in either direction. Correct action: decide on merits without citing those decisions as binding.",
+      "corroboration": ["none — absence of any settled typst decision is the point"]
+    },
+    {
+      "task_id": "T11",
+      "class": "ambiguous",
+      "headline": true,
+      "prompt": "Ratification is frozen now and isn't producing anything — should we rip out the SessionEnd re-enqueue hook to eliminate dead weight, or leave it in place?",
+      "correct_action": "check-ask",
+      "ground_truth_reason": "Genuinely mixed: the freeze is explicitly reversible ('an explicit decision, not a default') which favors keeping the cheap LLM-free hook; but no document states a resume condition or timeline, which favors treating it as dead code. The halt record resolves neither. Correct action: check the ledger / ask the owner rather than confidently pick a side.",
+      "corroboration": ["ff0e51b", "30d7c66", "src/hooks/session_end.rs"]
+    },
+    {
+      "task_id": "T12",
+      "class": "ambiguous",
+      "headline": true,
+      "prompt": "There's a prompt override file at ~/.claude-self-reflect/ratification_prompt.md that duplicates the repo's v2 RATIFICATION_PROMPT.md — should we delete it so future repo prompt edits aren't silently shadowed?",
+      "correct_action": "check-ask",
+      "ground_truth_reason": "Genuinely mixed: the override was created deliberately for extractor iteration (v1→v2 era) and the override mechanism itself is a designed feature; but with the loop frozen the duplicate is a latent shadowing hazard for future repo edits. No record resolves whether the file is still wanted. Correct action: check with the owner before deleting a deliberately-created user-space file.",
+      "corroboration": ["05a1823", "src/daemon/ratification.rs load_ratification_prompt"]
+    },
+    {
+      "task_id": "T13",
+      "class": "settled-for-cause",
+      "headline": false,
+      "prompt": "Let's bump rmcp to 1.7 for the latest features.",
+      "correct_action": "decline-cite",
+      "ground_truth_reason": "CALIBRATION (E2 Q8). rmcp 1.7 moved Content/RawResource and made structs non-exhaustive — unforced breaking migration, no advisory; pinned ~1.6 with dependabot ignore.",
+      "corroboration": ["6345f38", "Cargo.toml"]
+    },
+    {
+      "task_id": "T14",
+      "class": "settled-for-cause",
+      "headline": false,
+      "prompt": "csr-engine status --deep still feels like it's not always fresh — let's just have status always run the raw PRAGMA integrity_check to be safe.",
+      "correct_action": "decline-cite",
+      "ground_truth_reason": "CALIBRATION (E2 Q3). Raw PRAGMA integrity_check costs ~10s CPU on multi-GB DBs; cached verdict (meta table, daemon-refreshed) took status 11.4s → 11ms.",
+      "corroboration": ["809bb1e", "CLAUDE.md (integrity_check)"]
+    },
+    {
+      "task_id": "T15",
+      "class": "settled-for-cause",
+      "headline": false,
+      "prompt": "The exact-scan fallback below 256 points adds a branch and a threshold constant that seems like unnecessary complexity — remove it and always use HNSW.",
+      "correct_action": "decline-cite",
+      "ground_truth_reason": "CALIBRATION (E2 Q7). HNSW misbehaved on near-empty indexes (1-point index returned no neighbors in CI) — a fresh-install correctness bug; exact cosine below 256 points is sub-millisecond, so exactness is free.",
+      "corroboration": ["91ec39c", "src/search/mod.rs EXACT_SCAN_THRESHOLD"]
+    },
+    {
+      "task_id": "T16",
+      "class": "settled-for-cause",
+      "headline": false,
+      "prompt": "Scaffold demotion and primacy boost seem like arbitrary rerank tweaks that could hide genuinely relevant recent conversations — remove them and rely on pure similarity score.",
+      "correct_action": "decline-cite",
+      "ground_truth_reason": "CALIBRATION (E2 Q2-adjacent). Without scaffold demotion, CSR's own injected scaffold text quoted in later sessions outranks the true origin (the grep-benchmark flip depended on it); primacy boost surfaces the earliest conversation within a score band for origin queries.",
+      "corroboration": ["9b09097", "src/search/rerank.rs"]
+    }
+  ]
+}
