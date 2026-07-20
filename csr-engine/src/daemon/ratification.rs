@@ -20,7 +20,7 @@ use crate::storage::{NarrativeUsageRow, RatificationScoreRow, Storage};
 const DIGEST_CHAR_CAP: usize = 8000;
 const RATIFICATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RATIFICATION_PROMPT_SIZE: u64 = 10 * 1024;
-const EXTRACTOR_VERSION: &str = "ratification-v2";
+const EXTRACTOR_VERSION: &str = "ratification-v3";
 const MAX_LEDGER_SHAS: usize = 20;
 
 static DISABLED_LOG: Once = Once::new();
