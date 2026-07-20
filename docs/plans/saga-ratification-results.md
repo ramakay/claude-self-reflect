@@ -30,7 +30,19 @@ Pre-registered: Spearman between backfill scores and sealed E2 grades
 | Run | Extractor | ρ | n | Diagnosis |
 |---|---|---|---|---|
 | 1 | v1 | **0.060** | 121 | measurement artifact: 88% of convs extracted zero acts (digest sampled mostly assistant/tool text; echo-hardened prompt bailed to empty on instruction-like digests — which all agent digests are) |
-| 2 | v2 (operator-turn digest, rebalanced prompt) | **0.071** | 123 | clean: scores have variance (grade-group means 0.31–0.47), acts genuinely extracted — still no separation. Grade-3 sealed origins mean 0.362 vs grade-0 incidental 0.422 |
+| 2 | v2 (rebalanced prompt; digest silently still head/tail — see correction) | **0.071** | 123 | scores have variance (grade-group means 0.31–0.47), acts genuinely extracted — still no separation. Grade-3 sealed origins mean 0.362 vs grade-0 incidental 0.422 |
+| 3 | v3 (operator-turn digest genuinely active, post PR #246 fix) | **0.036** | 111 | flattest of all three. Grade-3 origins mean 0.447 vs grade-0 incidental 0.476 |
+
+**Correction (2026-07-20, post-merge review):** run 2 was described at the time as
+using the "operator-turn-prioritized digest." It did not. `get_chunks_by_ids`
+reconstructs chunks with a hardcoded `Speaker::ToolResult` author (author lives in
+`chunk_provenance`, not the `chunks` table), so `build_digest`'s operator-turn filter
+matched nothing and every v2 extraction silently fell back to head/tail sampling —
+v2's only real change was the rebalanced prompt. Found via CodeRabbit review of PR
+#245 (surfaced by the operator), fixed in PR #246 (`get_chunks_by_ids_with_provenance`
+join + regression test through the real storage path), and the gate was re-run as v3
+with the digest genuinely active. ρ dropped to 0.036 — the negative result is
+strengthened, not rescued, by the fix.
 
 ## Mechanism (why the thesis fails at node level)
 
@@ -81,6 +93,9 @@ v2 rescore of E2 set: 123). Kill switches: CSR_NO_RATIFICATION / CSR_NO_AI_NARRA
 ## Verdict for the paper
 
 Negative result with mechanism: *global ratification-probability does not rank
-decision origins in a high-ship-rate solo corpus (ρ=0.06→0.07 across two extractor
-versions, n=123, pre-registered gate).* The pre-registered halt is itself the
-demonstration that the E2/E1/E3 protocol discipline transfers to new hypotheses.
+decision origins in a high-ship-rate solo corpus (ρ=0.060→0.071→0.036 across three
+extractor versions, n=111–123, pre-registered gate).* The pre-registered halt is
+itself the demonstration that the E2/E1/E3 protocol discipline transfers to new
+hypotheses — including surviving a post-hoc mechanism correction: when external
+review exposed that v2's digest never actually prioritized operator turns, fixing
+the mechanism and re-running the gate made the correlation flatter, not better.
