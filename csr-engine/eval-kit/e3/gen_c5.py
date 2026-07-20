@@ -1,6 +1,6 @@
 import json, uuid, datetime, os
 
-OUT_DIR = "$SCRATCH/e3/c5_transcripts"
+OUT_DIR = os.path.expandvars("$SCRATCH/e3/c5_transcripts")
 
 QUERIES = [
     ("Q5", "why does import skip conversations that start with CSR agent prompts"),

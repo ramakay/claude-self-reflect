@@ -5,7 +5,7 @@ import json, os, re, subprocess, glob
 
 SP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 E2 = os.path.join(SP, "e2")
-DB = "$HOME/.claude-self-reflect/csr-engine.db"
+DB = os.path.expandvars("$HOME/.claude-self-reflect/csr-engine.db")
 SQLITE = "/opt/homebrew/opt/sqlite/bin/sqlite3"
 FREEZE = "2026-07-15"
 
@@ -32,7 +32,6 @@ def file_touch(target):
          "WHERE ce.file_path LIKE '%' || ? "
          "AND EXISTS (SELECT 1 FROM chunks c WHERE c.conversation_id = ce.session_id "
          "            AND c.timestamp <= '" + FREEZE + "T23:59:59Z')")
-    out = subprocess.run([SQLITE, DB, q], input=target, capture_output=True, text=True)
     # param binding via stdin doesn't work for sqlite3 CLI; inline safely (targets are our own constants)
     q2 = q.replace("?", "'" + target.replace("'", "''") + "'")
     out = subprocess.run([SQLITE, DB, q2], capture_output=True, text=True)

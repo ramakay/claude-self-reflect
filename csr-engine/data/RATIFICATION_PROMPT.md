@@ -36,7 +36,7 @@ object; never reply with prose.
 
 Output STRICT JSON only — no markdown fences, no commentary:
 
-```
+```json
 {"acts": [{"type": "DIRECTS", "evidence": "<short verbatim quote from the digest>", "msg_hint": "<brief location hint, e.g. 'early' or 'near end'>"}]}
 ```
 

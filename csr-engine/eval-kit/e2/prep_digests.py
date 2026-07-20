@@ -5,7 +5,7 @@ Deterministic, no judgment. Output: e2/digests/<qid>.md + e2/digest_index.json""
 import json, os, glob, re
 
 E2 = os.path.dirname(os.path.abspath(__file__))
-PROJ = "$HOME/.claude/projects"
+PROJ = os.path.expandvars("$HOME/.claude/projects")
 QUERIES = {q["id"]: q for q in json.load(open(os.path.join(E2, "queries.json")))}
 POOLS = json.load(open(os.path.join(E2, "pools.json")))
 OUTD = os.path.join(E2, "digests")
@@ -31,7 +31,7 @@ def text_of(content):
     return ""
 
 SQLITE = "/opt/homebrew/opt/sqlite/bin/sqlite3"
-DB = "$HOME/.claude-self-reflect/csr-engine.db"
+DB = os.path.expandvars("$HOME/.claude-self-reflect/csr-engine.db")
 
 def digest_conv_db(conv_id, target, in_file_touch):
     """Fallback for purged JSONLs: reconstruct from CSR DB chunks (pre-freeze rows, immutable).
@@ -92,11 +92,15 @@ def digest_conv(conv_id, target, in_file_touch=False):
             if tbase.split(".")[0].lower() in t.lower():
                 keep.add(i)
         rest = [i for i, _, _ in scored if i not in keep]
-        # fill with head+tail turns
-        for i in rest[: (TURN_CAP - len(keep)) // 2]:
-            keep.add(i)
-        for i in rest[-((TURN_CAP - len(keep))):] if TURN_CAP > len(keep) else []:
-            keep.add(i)
+        # fill with head+tail turns, only while capacity remains (len(keep) can
+        # already exceed TURN_CAP from target-mention matches alone; a negative
+        # remaining budget must not silently wrap into a huge negative slice)
+        if len(keep) < TURN_CAP:
+            needed = TURN_CAP - len(keep)
+            for i in rest[: needed // 2]:
+                keep.add(i)
+            for i in rest[-(needed - needed // 2):]:
+                keep.add(i)
         user_turns = [user_turns[i] for i in sorted(keep)][:TURN_CAP]
     else:
         user_turns = user_turns[:TURN_CAP]
