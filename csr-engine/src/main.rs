@@ -96,6 +96,13 @@ enum Commands {
         /// File path to analyze
         path: PathBuf,
     },
+    /// Run ratification extraction for specific conversation IDs (one-off,
+    /// bypasses the daemon queue ordering)
+    Ratify {
+        /// Conversation IDs to score
+        #[arg(required = true)]
+        conversation_ids: Vec<String>,
+    },
     /// Run evaluation tests
     Eval {
         /// Run full evaluation (20 tests) instead of quick (5 tests)
@@ -232,6 +239,24 @@ async fn main() -> Result<()> {
             !no_ai,
         );
         return daemon.run().await;
+    }
+
+    if let Some(Commands::Ratify {
+        ref conversation_ids,
+    }) = args.command
+    {
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let storage = eng.storage().clone();
+        for cid in conversation_ids {
+            match csr_engine::daemon::ratification::process_ratification(&storage, cid).await {
+                Ok(()) => println!("ratified {cid}"),
+                Err(e) => {
+                    let _ = storage.mark_enrichment_failed(cid, "ratification", &e.to_string());
+                    eprintln!("FAILED {cid}: {e}");
+                }
+            }
+        }
+        return Ok(());
     }
 
     if let Some(Commands::Quality { ref path }) = args.command {
