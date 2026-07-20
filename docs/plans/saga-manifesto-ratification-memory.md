@@ -126,3 +126,17 @@ human-rubric conditions now folded into this document. Named adjacency threats
 trigger on record: pitching "first unsupervised memory theory" without citing the
 adjacent work. Deciding risk: confounded or gameable tasks that credit policy, not
 memory.
+
+## Outcome (2026-07-20): pre-registered gate FAILED — node-level thesis dead
+
+The program ran backfill-first and halted at Gate A′: per-conversation ratification
+scores vs sealed E2 grades, Spearman **0.060 (v1) → 0.071 (v2, clean extraction,
+n=123)**. Mechanism: the score is global, E2 relevance is query-conditional; in a
+high-ship-rate solo corpus nearly every session is ratified at something, so
+node-level act-strength cannot rank decision origins. "Memory strength follows
+acts" survives, if at all, only as **edge-level** weighting — acts bound to
+(conversation, artifact) pairs, joined query-conditionally — which is untested.
+Stage D was not run (benchmark on a flat signal would credit policy, not memory —
+the advisor's deciding risk, honored). Full record: saga-ratification-results.md.
+This document stays as the goal statement it was; the next agent starts from the
+edge-level open question, not from this plan.
