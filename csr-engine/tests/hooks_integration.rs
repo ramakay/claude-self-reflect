@@ -1314,9 +1314,48 @@ fn test_session_end_v3_extraction() {
     );
 }
 
+/// Snapshot/restore guard for the ratification kill-switch env vars
+/// (`CSR_NO_AI_NARRATIVES`, `CSR_NO_RATIFICATION`). `session_end::handle`
+/// skips the enrichment-state reset entirely when either is set
+/// (`daemon::ratification::check_disabled`), and both vars are process-wide —
+/// mutated by unit tests elsewhere in this crate. Pinning them for the
+/// duration of this test (and restoring on drop, so a panic doesn't leak
+/// state to whichever test runs next in this binary) keeps the assertion
+/// deterministic regardless of what else is running.
+struct RatificationEnvGuard {
+    prev_narratives: Option<String>,
+    prev_ratification: Option<String>,
+}
+
+impl RatificationEnvGuard {
+    fn pinned_enabled() -> Self {
+        let guard = Self {
+            prev_narratives: std::env::var("CSR_NO_AI_NARRATIVES").ok(),
+            prev_ratification: std::env::var("CSR_NO_RATIFICATION").ok(),
+        };
+        std::env::remove_var("CSR_NO_AI_NARRATIVES");
+        std::env::remove_var("CSR_NO_RATIFICATION");
+        guard
+    }
+}
+
+impl Drop for RatificationEnvGuard {
+    fn drop(&mut self) {
+        match &self.prev_narratives {
+            Some(v) => std::env::set_var("CSR_NO_AI_NARRATIVES", v),
+            None => std::env::remove_var("CSR_NO_AI_NARRATIVES"),
+        }
+        match &self.prev_ratification {
+            Some(v) => std::env::set_var("CSR_NO_RATIFICATION", v),
+            None => std::env::remove_var("CSR_NO_RATIFICATION"),
+        }
+    }
+}
+
 /// SessionEnd deletes enrichment_state for ratification so the daemon re-scores.
 #[test]
 fn test_session_end_resets_ratification_enrichment() {
+    let _env_guard = RatificationEnvGuard::pinned_enabled();
     let tmp = tempfile::TempDir::new().unwrap();
     let transcript = tmp.path().join("ratify-reset-session.jsonl");
 

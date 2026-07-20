@@ -6,7 +6,7 @@ plus the git introduction/major commits of the target. NO embedding search."""
 import sys, subprocess, os
 
 SQLITE = "/opt/homebrew/opt/sqlite/bin/sqlite3"
-DB = "$HOME/.claude-self-reflect/csr-engine.db"
+DB = os.path.expandvars("$HOME/.claude-self-reflect/csr-engine.db")
 FREEZE = "2026-07-15T23:59:59Z"
 
 qid, repo, target = sys.argv[1], sys.argv[2], sys.argv[3]

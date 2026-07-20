@@ -20,7 +20,7 @@ use crate::storage::{NarrativeUsageRow, RatificationScoreRow, Storage};
 const DIGEST_CHAR_CAP: usize = 8000;
 const RATIFICATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RATIFICATION_PROMPT_SIZE: u64 = 10 * 1024;
-const EXTRACTOR_VERSION: &str = "ratification-v2";
+const EXTRACTOR_VERSION: &str = "ratification-v3";
 const MAX_LEDGER_SHAS: usize = 20;
 
 static DISABLED_LOG: Once = Once::new();
@@ -403,7 +403,12 @@ pub async fn process_ratification(storage: &Arc<Storage>, conv_id: &str) -> Resu
         storage.mark_enrichment_completed(conv_id, "ratification", "")?;
         return Ok(());
     }
-    let chunks = storage.get_chunks_by_ids(&chunk_ids)?;
+    // Must use the provenance-joined path: get_chunks_by_ids alone always
+    // defaults author to ToolResult (author lives in chunk_provenance, not the
+    // chunks table), which silently starves build_digest's operator-turn
+    // filter (author == Speaker::User) and degrades the v2 extractor to plain
+    // head/tail sampling. See get_chunks_by_ids_with_provenance.
+    let chunks = storage.get_chunks_by_ids_with_provenance(&chunk_ids)?;
     let digest = build_digest(&chunks, DIGEST_CHAR_CAP);
     let prompt = format!(
         "{}\n\nCONVERSATION DIGEST:\n{}",
@@ -617,5 +622,87 @@ mod tests {
         let other = digest.find("OTHER CONTEXT").unwrap();
         assert!(op < user_pos && user_pos < other);
         assert!(digest.find("assistant explanation text").unwrap() > other);
+    }
+
+    /// Regression (CodeRabbit PR #245 finding, pre-confirmed): the unit tests
+    /// above pass only because they build `ConversationChunk`s in memory with
+    /// `author` set directly. In production, `process_ratification` fetches
+    /// chunks via storage — and `get_chunks_by_ids` always defaults `author`
+    /// to `ToolResult` because the `chunks` table has no author column (it
+    /// lives in `chunk_provenance`). That meant `build_digest`'s
+    /// `author == Speaker::User` filter always saw an empty `user_text` in
+    /// production, silently degrading the v2 extractor to plain head/tail
+    /// sampling and never emitting the operator-turn excerpts section. This
+    /// test goes through the real storage path — insert chunks +
+    /// chunk_provenance rows into a temp DB, fetch via
+    /// `get_chunks_by_ids_with_provenance`, and confirm `build_digest` emits
+    /// the operator-turn section.
+    #[test]
+    fn ratification_digest_via_storage_emits_operator_turns() {
+        use crate::provenance::{ChunkProvenance, Speaker};
+
+        let storage = Storage::open_memory().unwrap();
+        let mk = |id: &str, content: &str| ConversationChunk {
+            id: id.into(),
+            conversation_id: "conv-real".into(),
+            project_name: "p".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            // Deliberately wrong/irrelevant: insert_chunk doesn't persist
+            // author (no such column on `chunks`); only chunk_provenance
+            // determines the real author once fetched via the joined path.
+            author: Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        };
+
+        let user_chunk = mk("rc1", "please fix the flaky HNSW persistence test");
+        let asst_chunk = mk("rc2", "done, added an advisory lock before dump_to_disk");
+        storage.insert_chunk(&user_chunk, &[0.0; 4]).unwrap();
+        storage.insert_chunk(&asst_chunk, &[0.0; 4]).unwrap();
+        storage
+            .insert_chunk_provenance(
+                "rc1",
+                &ChunkProvenance {
+                    author: Speaker::User,
+                    source_conv_id: "conv-real".into(),
+                    supersedes: None,
+                },
+            )
+            .unwrap();
+        storage
+            .insert_chunk_provenance(
+                "rc2",
+                &ChunkProvenance {
+                    author: Speaker::Assistant,
+                    source_conv_id: "conv-real".into(),
+                    supersedes: None,
+                },
+            )
+            .unwrap();
+
+        let ids = vec!["rc1".to_string(), "rc2".to_string()];
+
+        // Old path (what process_ratification used before this fix): every
+        // chunk defaults to ToolResult, so build_digest never sees a user turn.
+        let plain_chunks = storage.get_chunks_by_ids(&ids).unwrap();
+        let plain_digest = build_digest(&plain_chunks, DIGEST_CHAR_CAP);
+        assert!(
+            !plain_digest.contains("OPERATOR-TURN EXCERPTS"),
+            "sanity check: unjoined path must NOT surface operator turns (that's the bug)"
+        );
+
+        // New path: provenance-joined fetch recovers the true author, so
+        // build_digest correctly emits the operator-turn section.
+        let joined_chunks = storage.get_chunks_by_ids_with_provenance(&ids).unwrap();
+        let digest = build_digest(&joined_chunks, DIGEST_CHAR_CAP);
+        assert!(
+            digest.contains("=== OPERATOR-TURN EXCERPTS ==="),
+            "build_digest must emit the operator-turn section when fetched via \
+             get_chunks_by_ids_with_provenance; got: {digest}"
+        );
+        assert!(digest.contains("please fix the flaky HNSW persistence test"));
     }
 }

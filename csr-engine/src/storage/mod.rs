@@ -101,6 +101,20 @@ impl Storage {
         queries::get_chunks_by_ids(&conn, ids)
     }
 
+    /// Like [`Self::get_chunks_by_ids`], but resolves each chunk's true author
+    /// via a `LEFT JOIN` on `chunk_provenance` instead of defaulting to
+    /// `Speaker::ToolResult`. Needed by callers that filter on
+    /// `ConversationChunk::author` — e.g. ratification's `build_digest`, which
+    /// prioritizes `Speaker::User` turns and silently degraded to head/tail
+    /// sampling in production without this (author lives outside `chunks`).
+    pub fn get_chunks_by_ids_with_provenance(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<ConversationChunk>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunks_by_ids_with_provenance(&conn, ids)
+    }
+
     // ─── Reflection operations ───
 
     pub fn insert_reflection(

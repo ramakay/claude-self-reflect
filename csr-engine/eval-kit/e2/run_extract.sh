@@ -1,6 +1,6 @@
 #!/bin/zsh
 set -u
-SCRATCH="$SCRATCH"
+SCRATCH="${SCRATCH:?Environment variable SCRATCH must be set}"
 E2="$SCRATCH/e2"
 PROTO="$E2/extraction_prompt.md"
 OUTDIR="$E2/extract_grok"
@@ -77,14 +77,14 @@ for qid in "${QIDS[@]}"; do
   rawfile=$(run_one "$qid" 1 "")
   jsonfile="$OUTDIR/${qid}.json"
   extract_json_block < "$rawfile" > "$jsonfile.tmp"
-  if python3 -c "import json,sys; json.load(open('$jsonfile.tmp'))" 2>/dev/null; then
+  if python3 -c "import sys,json; json.load(sys.stdin)" < "$jsonfile.tmp" 2>/dev/null; then
     mv "$jsonfile.tmp" "$jsonfile"
     echo "$qid: OK (attempt 1)" >&2
   else
     echo "$qid: attempt 1 invalid JSON, retrying" >&2
     rawfile2=$(run_one "$qid" 2 "Your previous output was invalid JSON. Output only the JSON object.")
     extract_json_block < "$rawfile2" > "$jsonfile.tmp"
-    if python3 -c "import json,sys; json.load(open('$jsonfile.tmp'))" 2>/dev/null; then
+    if python3 -c "import sys,json; json.load(sys.stdin)" < "$jsonfile.tmp" 2>/dev/null; then
       mv "$jsonfile.tmp" "$jsonfile"
       echo "$qid: OK (attempt 2)" >&2
     else

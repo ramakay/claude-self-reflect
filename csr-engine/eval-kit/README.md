@@ -26,7 +26,7 @@ protocol audit: `docs/plans/saga-e2-audit-packet.md`.
 | `prep_ledger.sh` | Extract git/npm/release-train ship ledgers (repo paths = operator's) |
 | `run_extract.sh` | Dual-vendor extraction driver (grok + sonnet, strict consensus) |
 | `map_helper.py` | Metadata-only origin mapping helper (literal LIKE + git history + dates — NO embedding search) |
-| `grade.py` | Grading: acts × ledger corroboration → grades 0-3; grade 3 requires sealed+mapped origin |
+| `grade.py` | Grading: acts × ledger corroboration → grades 0-3; grade 3 requires a sealed, mapped origin |
 | `mapping.json` / `grades.json` / `pools.json` | Outputs: origin map (owner-audited), per-item grades (204 items), pools. Conversation IDs only — no transcript content |
 
 Rules that made it credible: extraction never sees rank lists; ledgers corroborate but

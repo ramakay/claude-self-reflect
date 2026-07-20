@@ -212,6 +212,38 @@ pub fn get_chunks_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<Conver
     Ok(chunks)
 }
 
+/// Like [`get_chunks_by_ids`], but resolves each chunk's true author via a
+/// `LEFT JOIN` on `chunk_provenance` instead of defaulting every chunk to
+/// `Speaker::ToolResult`. `get_chunks_by_ids` intentionally does not carry
+/// author (it's cheaper and most callers don't need it — reinstatement graph
+/// walks, MCP display, eval metadata); this variant exists for callers that
+/// filter on `ConversationChunk::author`, e.g. ratification's `build_digest`,
+/// which prioritizes `Speaker::User` turns. Chunks with no provenance row, or
+/// an unrecognized author token, degrade to `Speaker::ToolResult` — same
+/// fallback as [`get_chunk_provenance`].
+pub fn get_chunks_by_ids_with_provenance(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<ConversationChunk>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content,
+                c.message_count, c.summary, cp.author
+         FROM chunks c LEFT JOIN chunk_provenance cp ON cp.chunk_id = c.id
+         WHERE c.id = ?1",
+    )?;
+    let mut chunks = Vec::new();
+    for id in ids {
+        let mut rows = stmt.query_map(params![id], row_to_chunk_with_author)?;
+        if let Some(row) = rows.next() {
+            chunks.push(row?);
+        }
+    }
+    Ok(chunks)
+}
+
 pub fn insert_reflection(
     conn: &Connection,
     id: &str,
@@ -547,11 +579,35 @@ fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
         summary: row.get(6)?,
         // Author is stored separately in chunk_provenance, not the chunks table;
         // reconstructed chunks default to non-authoritative. Live recall reads
-        // provenance explicitly via get_chunk_provenance.
+        // provenance explicitly via get_chunk_provenance, or use
+        // get_chunks_by_ids_with_provenance / row_to_chunk_with_author below.
         author: crate::provenance::Speaker::ToolResult,
         // seq/is_sidechain are not selected here (7-col SELECT, unchanged) — reads via this
         // path don't need them for WS1; real values live in the chunks table and are read
         // directly by the saga queries below when needed.
+        seq: 0,
+        is_sidechain: false,
+    })
+}
+
+/// Helper: map a row to `ConversationChunk` with a resolved author, for queries
+/// that `LEFT JOIN chunk_provenance` (8th column: nullable `author` TEXT).
+/// See `get_chunks_by_ids_with_provenance`.
+fn row_to_chunk_with_author(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
+    let author_str: Option<String> = row.get(7)?;
+    let author = author_str
+        .and_then(|s| s.parse::<Speaker>().ok())
+        .unwrap_or(Speaker::ToolResult);
+    Ok(ConversationChunk {
+        id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        project_name: row.get(2)?,
+        timestamp: row.get(3)?,
+        content: row.get(4)?,
+        message_count: row.get::<_, i64>(5)? as usize,
+        summary: row.get(6)?,
+        author,
+        // Not selected here — same rationale as row_to_chunk above.
         seq: 0,
         is_sidechain: false,
     })
@@ -1965,6 +2021,74 @@ mod tests {
         let conn = mem();
         let map = get_ratification_scores(&conn, &[]).unwrap();
         assert!(map.is_empty());
+    }
+
+    /// Regression: `get_chunks_by_ids` alone always defaults `author` to
+    /// `ToolResult` (chunks table has no author column), which silently starved
+    /// ratification's `build_digest` of operator turns in production even
+    /// though import correctly wrote `Speaker::User` rows into
+    /// `chunk_provenance`. `get_chunks_by_ids_with_provenance` must recover the
+    /// real author via the LEFT JOIN.
+    #[test]
+    fn get_chunks_by_ids_with_provenance_resolves_true_author() {
+        let conn = mem();
+        let chunk = ConversationChunk {
+            id: "c1".into(),
+            conversation_id: "conv-1".into(),
+            project_name: "p".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            content: "fix the import bug".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::ToolResult, // irrelevant: insert_chunk doesn't persist author
+            seq: 0,
+            is_sidechain: false,
+        };
+        insert_chunk(&conn, &chunk, &[0.0; 4]).unwrap();
+        insert_chunk_provenance(
+            &conn,
+            "c1",
+            &ChunkProvenance {
+                author: Speaker::User,
+                source_conv_id: "conv-1".into(),
+                supersedes: None,
+            },
+        )
+        .unwrap();
+
+        // Plain path (no join) always degrades to ToolResult.
+        let plain = get_chunks_by_ids(&conn, &["c1".into()]).unwrap();
+        assert_eq!(plain[0].author, Speaker::ToolResult);
+
+        // Provenance-aware path recovers the true author.
+        let with_prov = get_chunks_by_ids_with_provenance(&conn, &["c1".into()]).unwrap();
+        assert_eq!(with_prov.len(), 1);
+        assert_eq!(with_prov[0].author, Speaker::User);
+        assert_eq!(with_prov[0].content, "fix the import bug");
+    }
+
+    /// A chunk with no `chunk_provenance` row at all must still degrade to
+    /// `ToolResult` (not error), matching `get_chunk_provenance`'s fallback.
+    #[test]
+    fn get_chunks_by_ids_with_provenance_defaults_when_no_row() {
+        let conn = mem();
+        let chunk = ConversationChunk {
+            id: "c2".into(),
+            conversation_id: "conv-2".into(),
+            project_name: "p".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            content: "no provenance row".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        };
+        insert_chunk(&conn, &chunk, &[0.0; 4]).unwrap();
+
+        let with_prov = get_chunks_by_ids_with_provenance(&conn, &["c2".into()]).unwrap();
+        assert_eq!(with_prov.len(), 1);
+        assert_eq!(with_prov[0].author, Speaker::ToolResult);
     }
 
     #[test]
