@@ -6,6 +6,7 @@
 //! provenance, beating a grep baseline (`csr-engine eval --continuity`).
 
 pub mod continuity;
+pub mod provenance;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -349,7 +350,7 @@ fn test_cache_status(index_dir: &Path) -> EvalResult {
 
 fn test_tool_count() -> EvalResult {
     let t = Instant::now();
-    let expected = 12;
+    let expected = 14;
     EvalResult::pass(
         "Tool Count",
         "infrastructure",

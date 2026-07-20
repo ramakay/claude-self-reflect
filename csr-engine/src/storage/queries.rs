@@ -148,8 +148,8 @@ fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
 
 pub fn insert_chunk(conn: &Connection, chunk: &ConversationChunk, embedding: &[f32]) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary, seq, is_sidechain)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             chunk.id,
             chunk.conversation_id,
@@ -158,6 +158,8 @@ pub fn insert_chunk(conn: &Connection, chunk: &ConversationChunk, embedding: &[f
             chunk.content,
             chunk.message_count as i64,
             chunk.summary,
+            chunk.seq as i64,
+            chunk.is_sidechain as i64,
         ],
     )?;
 
@@ -547,6 +549,11 @@ fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
         // reconstructed chunks default to non-authoritative. Live recall reads
         // provenance explicitly via get_chunk_provenance.
         author: crate::provenance::Speaker::ToolResult,
+        // seq/is_sidechain are not selected here (7-col SELECT, unchanged) — reads via this
+        // path don't need them for WS1; real values live in the chunks table and are read
+        // directly by the saga queries below when needed.
+        seq: 0,
+        is_sidechain: false,
     })
 }
 
@@ -614,6 +621,21 @@ pub fn mark_enrichment_unavailable(
          ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
              status = 'unavailable', error_message = ?3, updated_at = datetime('now')",
         params![conversation_id, enrichment_type, reason],
+    )?;
+    Ok(())
+}
+
+/// Delete the enrichment_state row for a conversation + type, making it
+/// eligible again for `get_unenriched_conversations` (status IS NULL).
+/// No-op (Ok) if no matching row exists.
+pub fn reset_enrichment(
+    conn: &Connection,
+    conversation_id: &str,
+    enrichment_type: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM enrichment_state WHERE conversation_id = ?1 AND enrichment_type = ?2",
+        params![conversation_id, enrichment_type],
     )?;
     Ok(())
 }
@@ -1223,6 +1245,84 @@ pub fn narrative_usage_summary(conn: &Connection) -> Result<NarrativeUsageSummar
     })
 }
 
+// ─── Ratification scores ───
+
+pub struct RatificationScoreRow {
+    pub conversation_id: String,
+    pub score: f32,
+    pub acts_json: String,
+    pub ledger_refs: Option<String>,
+    pub extractor_version: String,
+}
+
+pub fn upsert_ratification_score(conn: &Connection, row: &RatificationScoreRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO ratification_scores
+         (conversation_id, score, acts_json, ledger_refs, extractor_version, extracted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))
+         ON CONFLICT(conversation_id) DO UPDATE SET
+             score=?2, acts_json=?3, ledger_refs=?4, extractor_version=?5,
+             extracted_at=strftime('%s','now')",
+        params![
+            row.conversation_id,
+            row.score,
+            row.acts_json,
+            row.ledger_refs,
+            row.extractor_version,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_ratification_score(conn: &Connection, conversation_id: &str) -> Result<Option<f32>> {
+    conn.query_row(
+        "SELECT score FROM ratification_scores WHERE conversation_id = ?1",
+        params![conversation_id],
+        |r| r.get::<_, f32>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn get_ratification_scores(conn: &Connection, ids: &[String]) -> Result<HashMap<String, f32>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    const BATCH: usize = 500;
+    let mut results = HashMap::new();
+    for batch in ids.chunks(BATCH) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT conversation_id, score FROM ratification_scores WHERE conversation_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let bound: Vec<&dyn rusqlite::ToSql> =
+            batch.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(bound.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+        })?;
+        for row in rows {
+            let (id, score) = row?;
+            results.insert(id, score);
+        }
+    }
+    Ok(results)
+}
+
+pub fn ratification_summary(conn: &Connection) -> Result<(i64, f64)> {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(AVG(score), 0.0) FROM ratification_scores",
+        [],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
+    )
+    .map_err(Into::into)
+}
+
 // ─── TAD: Retrieval Event Tracking ───
 
 /// Log a retrieval event (memory was surfaced during a hook).
@@ -1543,6 +1643,149 @@ pub fn get_session_code_evolution(
         .map_err(Into::into)
 }
 
+// ─── Saga Phase 1 (WS1): capture columns + provenance-walk storage helpers ───
+
+/// All chunk ids for a conversation, insertion order (no seq dependency — old rows may
+/// have seq=NULL). Used by WS2's exact per-conversation scoring (never
+/// SearchEngine::search_chunks_filtered — see spec).
+pub fn get_chunk_ids_for_conversation(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT id FROM chunks WHERE conversation_id = ?1 ORDER BY rowid")?;
+    let rows = stmt.query_map(params![conversation_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Embeddings for a specific set of chunk ids, chunked into ~500-id IN-clauses to stay
+/// under SQLite's default parameter limit. Decodes the same little-endian f32 blob format
+/// as `load_all_chunk_vectors`.
+pub fn get_chunk_vectors_by_ids(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<(String, Vec<f32>)>> {
+    const BATCH: usize = 500;
+    let mut results = Vec::new();
+    for batch in ids.chunks(BATCH) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT chunk_id, embedding FROM chunk_embeddings WHERE chunk_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let bound: Vec<&dyn rusqlite::ToSql> =
+            batch.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(bound.as_slice(), |row| {
+            let id: String = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((id, bytes_to_vec(&bytes)))
+        })?;
+        for row in rows {
+            results.push(row?);
+        }
+    }
+    Ok(results)
+}
+
+/// Most-touched files for a session (code_evolution), highest-frequency first. Lifted from
+/// the Phase 0 spike (examples/saga_spike.rs::files_for_session), now with a caller-supplied
+/// limit instead of a hardcoded 4.
+pub fn files_for_session(conn: &Connection, session_id: &str, limit: usize) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT file_path FROM code_evolution WHERE session_id = ?1
+         GROUP BY file_path ORDER BY COUNT(*) DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Other sessions that touched the same file (code_evolution), excluding one session.
+/// Optionally scoped to a project (saga project-scoping fix — prevents cross-project
+/// graph spread in the reinstatement walk).
+/// Lifted from the Phase 0 spike (examples/saga_spike.rs::sessions_for_file), now with a
+/// caller-supplied limit instead of a hardcoded 12.
+pub fn sessions_for_file(
+    conn: &Connection,
+    file_path: &str,
+    exclude_session: &str,
+    project: Option<&str>,
+    limit: usize,
+) -> Result<Vec<String>> {
+    match project {
+        Some(p) => {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT session_id FROM code_evolution
+                 WHERE file_path = ?1 AND session_id <> ?2 AND project_name = ?3 LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                params![file_path, exclude_session, p, limit as i64],
+                |row| row.get::<_, String>(0),
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT session_id FROM code_evolution
+                 WHERE file_path = ?1 AND session_id <> ?2 LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(params![file_path, exclude_session, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        }
+    }
+}
+
+/// Backfill UPDATE: set seq/is_sidechain on an existing chunk row by id.
+pub fn set_chunk_saga_columns(
+    conn: &Connection,
+    chunk_id: &str,
+    seq: usize,
+    is_sidechain: bool,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE chunks SET seq = ?1, is_sidechain = ?2 WHERE id = ?3",
+        params![seq as i64, is_sidechain as i64, chunk_id],
+    )?;
+    Ok(())
+}
+
+/// All file paths recorded in import_state (for the saga-columns backfill to re-parse).
+pub fn list_all_import_state_file_paths(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT file_path FROM import_state")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Distinct sessions that touched files matching a path suffix (hook-observed edits) —
+/// ground truth for the provenance eval (`eval --provenance`). Lifted from the Phase 0
+/// spike's `ground_truth`. Empty target -> empty set (judged-only queries have no GT).
+pub fn ground_truth_sessions_for_target(
+    conn: &Connection,
+    target: &str,
+) -> Result<std::collections::HashSet<String>> {
+    if target.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT session_id FROM code_evolution WHERE file_path LIKE '%' || ?1")?;
+    let rows = stmt.query_map(params![target], |r| r.get::<_, String>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 // ─── Consolidation queries (v9 Dreamer) ───
 
 /// Get conversations with V3 extraction or AI narrative but no consolidation.
@@ -1718,6 +1961,47 @@ mod tests {
     }
 
     #[test]
+    fn test_get_ratification_scores_empty_input() {
+        let conn = mem();
+        let map = get_ratification_scores(&conn, &[]).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_upsert_and_get_ratification_score() {
+        let conn = mem();
+        let row = RatificationScoreRow {
+            conversation_id: "c1".into(),
+            score: 0.6,
+            acts_json: r#"{"acts":[]}"#.into(),
+            ledger_refs: None,
+            extractor_version: "ratification-v1".into(),
+        };
+        upsert_ratification_score(&conn, &row).unwrap();
+        assert_eq!(get_ratification_score(&conn, "c1").unwrap(), Some(0.6));
+        let (count, avg) = ratification_summary(&conn).unwrap();
+        assert_eq!(count, 1);
+        assert!((avg - 0.6).abs() < 1e-6);
+        let map = get_ratification_scores(&conn, &["c1".into(), "missing".into()]).unwrap();
+        assert_eq!(map.get("c1"), Some(&0.6));
+        assert!(!map.contains_key("missing"));
+    }
+
+    #[test]
+    fn test_reset_enrichment() {
+        let conn = mem();
+        mark_enrichment_completed(&conn, "conv-reset", "ratification", "x").unwrap();
+        assert!(is_conversation_enriched(&conn, "conv-reset", "ratification").unwrap());
+
+        reset_enrichment(&conn, "conv-reset", "ratification").unwrap();
+        assert!(!is_conversation_enriched(&conn, "conv-reset", "ratification").unwrap());
+
+        // Idempotent: deleting an absent row is Ok
+        reset_enrichment(&conn, "conv-reset", "ratification").unwrap();
+        assert!(!is_conversation_enriched(&conn, "conv-reset", "ratification").unwrap());
+    }
+
+    #[test]
     fn test_narrative_usage_summary_cache_tokens() {
         let conn = mem();
         let row = NarrativeUsageRow {
@@ -1763,5 +2047,94 @@ mod tests {
         assert_eq!(s.calls_total, 1);
         assert_eq!(s.calls_today, 1);
         assert_eq!(s.tokens_total, 0);
+    }
+
+    #[test]
+    fn set_chunk_saga_columns_roundtrip() {
+        let conn = mem();
+        let chunk = ConversationChunk {
+            id: "chunk-saga-1".into(),
+            conversation_id: "conv-1".into(),
+            project_name: "proj".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            content: "hello saga".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        insert_chunk(&conn, &chunk, &[0.1; 384]).unwrap();
+        set_chunk_saga_columns(&conn, "chunk-saga-1", 7, true).unwrap();
+        let (seq, is_sidechain): (i64, i64) = conn
+            .query_row(
+                "SELECT seq, is_sidechain FROM chunks WHERE id = ?1",
+                params!["chunk-saga-1"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(seq, 7);
+        assert_eq!(is_sidechain, 1);
+    }
+
+    /// Seed two projects that share a file path from different sessions.
+    fn seed_cross_project_shared_file(conn: &Connection) {
+        insert_code_evolution(
+            conn,
+            "sess_a",
+            "proj_a",
+            "shared.rs",
+            "rust",
+            "Edit",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+        )
+        .unwrap();
+        insert_code_evolution(
+            conn,
+            "sess_b",
+            "proj_b",
+            "shared.rs",
+            "rust",
+            "Edit",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sessions_for_file_filters_by_project() {
+        let conn = mem();
+        seed_cross_project_shared_file(&conn);
+
+        // Scoped to proj_a: must not leak sess_b from proj_b (same file path).
+        // Only other-project row exists, so filtered result is empty.
+        let got = sessions_for_file(&conn, "shared.rs", "sess_a", Some("proj_a"), 10).unwrap();
+        assert!(
+            !got.contains(&"sess_b".to_string()),
+            "project-scoped lookup must not return other-project sessions: {got:?}"
+        );
+    }
+
+    #[test]
+    fn sessions_for_file_none_project_is_unscoped() {
+        let conn = mem();
+        seed_cross_project_shared_file(&conn);
+
+        // Unscoped (None): back-compat — can see sess_b across projects.
+        let got = sessions_for_file(&conn, "shared.rs", "sess_a", None, 10).unwrap();
+        assert!(
+            got.contains(&"sess_b".to_string()),
+            "unscoped lookup must return other-project sessions: {got:?}"
+        );
     }
 }

@@ -40,7 +40,10 @@ use anyhow::Result;
 use crate::engine::Engine;
 use crate::extraction::ast_analysis::lang_from_path_str;
 use crate::extraction::codegraph::extract_graph_fragment;
-use crate::import::{discover_projects, list_jsonl_files, parse_jsonl_messages};
+use crate::import::{
+    discover_projects, list_jsonl_files, normalize_project_name, parse_jsonl_file,
+    parse_jsonl_messages,
+};
 use crate::storage::codegraph::EdgeRow;
 use crate::storage::Storage;
 
@@ -368,6 +371,68 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
         };
     }
 
+    Ok(stats)
+}
+
+/// Outcome of the seq/is_sidechain backfill (Saga Phase 1 WS1).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SagaBackfillStats {
+    /// Rows in import_state examined.
+    pub files_checked: usize,
+    /// import_state rows whose JSONL is no longer on disk (skipped, never silent).
+    pub files_missing: usize,
+    /// chunks rows updated with seq/is_sidechain.
+    pub chunks_updated: usize,
+}
+
+impl SagaBackfillStats {
+    pub fn format_text(&self) -> String {
+        format!(
+            "CSR saga-columns backfill\n\
+             ──────────────────────────\n\
+             files checked  : {}\n\
+             files missing  : {}\n\
+             chunks updated : {}\n",
+            self.files_checked, self.files_missing, self.chunks_updated,
+        )
+    }
+}
+
+/// Re-parse every JSONL still referenced in `import_state` and UPDATE its chunks' seq +
+/// is_sidechain columns to match a fresh `parse_jsonl_file` pass (same chunker, same
+/// deterministic UUIDv5 ids, so re-parsed chunk ids line up with existing rows). Files no
+/// longer on disk are skipped and counted — never silently dropped.
+pub fn backfill_saga_columns(engine: &Engine) -> Result<SagaBackfillStats> {
+    let storage = engine.storage();
+    let mut stats = SagaBackfillStats::default();
+    let file_paths = storage.list_all_import_state_file_paths()?;
+    for file_path in file_paths {
+        stats.files_checked += 1;
+        let path = Path::new(&file_path);
+        if !path.exists() {
+            stats.files_missing += 1;
+            eprintln!("CSR saga backfill: skip missing {file_path}");
+            continue;
+        }
+        let project_name = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| normalize_project_name(&n.to_string_lossy()))
+            .unwrap_or_default();
+        let chunks = match parse_jsonl_file(path, &project_name) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("CSR saga backfill: parse error {file_path} ({e})");
+                continue;
+            }
+        };
+        for chunk in &chunks {
+            match storage.set_chunk_saga_columns(&chunk.id, chunk.seq, chunk.is_sidechain) {
+                Ok(()) => stats.chunks_updated += 1,
+                Err(e) => eprintln!("CSR saga backfill: update error for {} ({e})", chunk.id),
+            }
+        }
+    }
     Ok(stats)
 }
 

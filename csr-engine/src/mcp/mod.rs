@@ -167,6 +167,16 @@ pub struct CodeGraphParams {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WhyParams {
+    /// The "why/how did this come to be" question.
+    pub query: String,
+    /// Max evidence items (default 10, capped at 50).
+    pub limit: Option<usize>,
+    /// Project scope (same semantics as csr_reflect_on_past).
+    pub project: Option<String>,
+}
+
 // ─── MCP Server ───
 
 /// The MCP server that exposes CSR search/reflection tools.
@@ -602,6 +612,39 @@ impl CsrServer {
             p.file.as_deref(),
             mode,
             limit,
+        )
+        .await;
+
+        tool_result(result)
+    }
+
+    // ─── Provenance recall (1) ───
+
+    #[tool(
+        name = "csr_why",
+        description = "Provenance chain: why does this code/decision exist. Reinstatement recall — seed retrieval, blended re-query, code-graph spread, and episode-chain hops surface the conversations that originated a decision, not just the ones that mention it.",
+        annotations(
+            title = "Why",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn why(&self, params: Parameters<WhyParams>) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+        let limit = p.limit.unwrap_or(10).min(50);
+        let cfg = crate::search::reinstatement::ReinstateConfig {
+            k: limit,
+            ..Default::default()
+        };
+
+        let result = tools::why(
+            &self.storage,
+            &self.embeddings,
+            &self.search,
+            &p.query,
+            p.project.as_deref(),
+            &cfg,
         )
         .await;
 

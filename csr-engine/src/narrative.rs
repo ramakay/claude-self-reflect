@@ -14,6 +14,13 @@ pub fn narratives_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Kill switch: user disabled ratification enrichment.
+pub fn ratification_disabled() -> bool {
+    std::env::var("CSR_NO_RATIFICATION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Model candidates in preference order. `None` means omit `--model` and let
 /// the claude CLI pick its default — the last-resort path if every Haiku-family
 /// alias is decommissioned.
@@ -214,6 +221,19 @@ mod tests {
         std::env::set_var("CSR_NO_AI_NARRATIVES", "0");
         assert!(!narratives_disabled());
         std::env::remove_var("CSR_NO_AI_NARRATIVES");
+    }
+
+    #[test]
+    fn test_ratification_disabled_env() {
+        std::env::remove_var("CSR_NO_RATIFICATION");
+        assert!(!ratification_disabled());
+        std::env::set_var("CSR_NO_RATIFICATION", "1");
+        assert!(ratification_disabled());
+        std::env::set_var("CSR_NO_RATIFICATION", "true");
+        assert!(ratification_disabled());
+        std::env::set_var("CSR_NO_RATIFICATION", "0");
+        assert!(!ratification_disabled());
+        std::env::remove_var("CSR_NO_RATIFICATION");
     }
 
     #[test]

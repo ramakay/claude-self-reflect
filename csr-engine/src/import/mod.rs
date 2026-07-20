@@ -29,6 +29,14 @@ pub struct ConversationChunk {
     /// Highest-authority speaker among this chunk's messages (User > Assistant >
     /// ToolResult). Drives provenance-aware recall; defaults to ToolResult.
     pub author: crate::provenance::Speaker,
+    /// Sequential chunk index within its conversation (0-based). Same index that
+    /// feeds the deterministic UUIDv5 chunk id. Saga Phase 1 provenance signal.
+    pub seq: usize,
+    /// True if ANY message in this chunk has JSONL `isSidechain: true`, OR the
+    /// conversation id starts with `agent-`. Over-labeling beats under-labeling
+    /// for later credit assignment (agent-pollution finding). Labeling only —
+    /// nothing filters on this yet (Phase 2+).
+    pub is_sidechain: bool,
 }
 
 /// Namespace UUID for deterministic chunk IDs (UUIDv5).
@@ -145,6 +153,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     let reader = BufReader::new(file);
     let mut messages: Vec<String> = Vec::new();
     let mut authors: Vec<crate::provenance::Speaker> = Vec::new();
+    let mut sidechains: Vec<bool> = Vec::new();
     let mut first_timestamp: Option<String> = None;
     let mut last_timestamp: Option<String> = None;
     let mut summary: Option<String> = None;
@@ -217,9 +226,14 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
+        let is_sidechain_msg = parsed
+            .get("isSidechain")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if !combined_text.is_empty() {
             messages.push(combined_text);
             authors.push(classify_message_author(&parsed));
+            sidechains.push(is_sidechain_msg);
         }
     }
 
@@ -255,9 +269,10 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     let mut chunks: Vec<ConversationChunk> = Vec::new();
     let mut buf = String::new();
     let mut buf_authors: Vec<crate::provenance::Speaker> = Vec::new();
+    let mut buf_sidechains: Vec<bool> = Vec::new();
     let mut buf_msgs = 0usize;
 
-    for (msg, author) in messages.iter().zip(authors.iter()) {
+    for ((msg, author), sidechain) in messages.iter().zip(authors.iter()).zip(sidechains.iter()) {
         // A single message larger than the budget is hard-split into multiple chunks
         // so its tail (e.g. the end of a long report) is embedded too.
         if msg.len() > CHUNK_CHAR_BUDGET {
@@ -271,8 +286,10 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
                     buf_msgs,
                     &chunk_summary,
                     chunk_author(&buf_authors),
+                    chunk_is_sidechain(&buf_sidechains, &conversation_id),
                 );
                 buf_authors.clear();
+                buf_sidechains.clear();
                 buf_msgs = 0;
             }
             let mut start = 0;
@@ -291,6 +308,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
                     1,
                     &chunk_summary,
                     *author,
+                    chunk_is_sidechain(std::slice::from_ref(sidechain), &conversation_id),
                 );
                 start = end;
             }
@@ -308,8 +326,10 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
                 buf_msgs,
                 &chunk_summary,
                 chunk_author(&buf_authors),
+                chunk_is_sidechain(&buf_sidechains, &conversation_id),
             );
             buf_authors.clear();
+            buf_sidechains.clear();
             buf_msgs = 0;
         }
         if !buf.is_empty() {
@@ -317,6 +337,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
         }
         buf.push_str(msg);
         buf_authors.push(*author);
+        buf_sidechains.push(*sidechain);
         buf_msgs += 1;
     }
     if !buf.is_empty() {
@@ -329,6 +350,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             buf_msgs,
             &chunk_summary,
             chunk_author(&buf_authors),
+            chunk_is_sidechain(&buf_sidechains, &conversation_id),
         );
     }
 
@@ -354,6 +376,7 @@ fn push_chunk(
     message_count: usize,
     summary: &Option<String>,
     author: crate::provenance::Speaker,
+    is_sidechain: bool,
 ) {
     let i = chunks.len();
     chunks.push(ConversationChunk {
@@ -365,6 +388,8 @@ fn push_chunk(
         message_count,
         summary: summary.clone(),
         author,
+        seq: i,
+        is_sidechain,
     });
 }
 
@@ -476,6 +501,13 @@ pub(crate) fn chunk_author(authors: &[crate::provenance::Speaker]) -> crate::pro
     } else {
         Speaker::ToolResult
     }
+}
+
+/// Aggregate sidechain status for a chunk: true if any of its messages is
+/// sidechain, OR the whole conversation is an agent-subprocess transcript
+/// (conversation_id starts with "agent-"). Over-labels on purpose.
+pub(crate) fn chunk_is_sidechain(sidechain_flags: &[bool], conversation_id: &str) -> bool {
+    sidechain_flags.iter().any(|&s| s) || conversation_id.starts_with("agent-")
 }
 
 fn extract_message_text(msg: &serde_json::Value) -> String {
@@ -649,6 +681,15 @@ mod tests {
         assert_eq!(chunk_author(&[ToolResult, Assistant]), Assistant);
         assert_eq!(chunk_author(&[ToolResult, ToolResult]), ToolResult);
         assert_eq!(chunk_author(&[]), ToolResult);
+    }
+
+    #[test]
+    fn chunk_is_sidechain_any_message_or_agent_prefix() {
+        assert!(chunk_is_sidechain(&[false, true], "conv-abc"));
+        assert!(chunk_is_sidechain(&[false, false], "agent-123"));
+        assert!(!chunk_is_sidechain(&[false], "conv-abc"));
+        assert!(!chunk_is_sidechain(&[], "conv-abc"));
+        assert!(chunk_is_sidechain(&[], "agent-xyz"));
     }
 
     #[test]

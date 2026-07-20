@@ -1,0 +1,26 @@
+{
+"sealed_commit": "4a42644",
+"cued_commit": "b676ab3",
+"strata": {
+ "Q1": {"stratum": "UNRESOLVED", "memory": null, "cued": "agent build decision, emerged during v8 Rust rewrite, accepted not directed"},
+ "Q2": {"stratum": "OUT_OF_CORPUS", "memory": null, "cued": "idea pre-v8, implementation July 2026-07-07 rerank.rs; map both concept conv (likely OOC) and impl conv (grade-2 candidate)"},
+ "Q3": {"stratum": "UNRESOLVED", "memory": null, "cued": "owner flagged slow status; v9.2 period ~2026-07-07; 11.4s to 11ms meta-table cache"},
+ "Q4": {"stratum": "MEMORY", "memory": "operator noticed we were not using latest haiku - llm providers provide monikers that resolve to latest versions so should use haiku vs haiku-04 etc.", "cued": null},
+ "Q5": {"stratum": "MEMORY", "memory": "CSR itself was querying its own fetches creating circular outcomes", "cued": null},
+ "Q6": {"stratum": "MEMORY", "memory": "tool results were noisy, and CSR tool results even noisier", "cued": null},
+ "Q7": {"stratum": "UNRESOLVED", "memory": null, "cued": "owner reported bad results; triage week ~2026-07-10 PR #230"},
+ "Q8": {"stratum": "MEMORY_WEAK", "memory": "some memory of a conflicting component", "cued": null},
+ "Q9": {"stratum": "MEMORY", "memory": "latency between usersubmit and starting and ending claude was unacceptable", "cued": null},
+ "Q10": {"stratum": "MEMORY", "memory": "session start went through many iterations; junk was provided that claude would frequently ignore as noise at start", "cued": null},
+ "Q11": {"stratum": "UNRESOLVED", "memory": null, "cued": "owner directed research; v9.5 continuity ~2026-07-08 Route A exemplars vs keywords"},
+ "Q12": {"stratum": "MEMORY", "memory": "retrieval was poor and not useful in the topic/subject being queried upon", "cued": null},
+ "A1": {"stratum": "UNRESOLVED", "memory": null, "cued": "ui was not showing signed in user after clerk signed in, hence expo"},
+ "A2": {"stratum": "UNRESOLVED", "memory": null, "cued": "conversion data driven - funnel/drop-off numbers"},
+ "A3": {"stratum": "MEMORY", "memory": "there was frequent rate limiting by Meta", "cued": null},
+ "A4": {"stratum": "UNRESOLVED", "memory": null, "cued": "owner questioned mismatched dashboard numbers"},
+ "A5": {"stratum": "MEMORY", "memory": "for anukriti command center to measure how many users reach score state", "cued": null},
+ "A6": {"stratum": "MEMORY", "memory": "what boosts/api retargets are running; later also youtube and other promotions for budget + current boost state", "cued": null},
+ "A7": {"stratum": "MEMORY_AMBIGUOUS", "memory": "not sure which radio reel; remotion for app store promo video; japa and radio features would have been single scene", "cued": null},
+ "A8": {"stratum": "MEMORY", "memory": "UI actions sometimes are not in supabase", "cued": null}
+}
+}

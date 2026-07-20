@@ -28,16 +28,64 @@ pub use signature::ConversationSignature;
 /// outcome classifier (decides failed vs partial when errors occurred) and the
 /// Tier-0 display, which reconciles stale episodes stored before this rule
 /// existed — so a `LAST: ...All 417 tests pass` line never shows `outcome=failed`.
+///
+/// Tokens match at word boundaries so `"incomplete"` does not fire on
+/// `"complete"`, while hyphenated forms like `"OK-INSTALLED"` still match
+/// `"installed"` (hyphen is a non-alphanumeric boundary).
 pub fn has_success_signal(text: &str) -> bool {
     let lower = text.to_lowercase();
-    lower.contains("complete")
-        || lower.contains("fixed")
-        || lower.contains("done")
-        || lower.contains("success")
-        || lower.contains("deployed")
-        || lower.contains("shipped")
-        || lower.contains("tests pass")
-        || lower.contains("all pass")
+    // Multi-word phrases are already unambiguous — plain substring is fine.
+    if lower.contains("tests pass") || lower.contains("all pass") {
+        return true;
+    }
+    const WORDS: &[&str] = &[
+        "complete",
+        "completed",
+        "fixed",
+        "done",
+        "success",
+        "successful",
+        "deployed",
+        "shipped",
+        "installed",
+        "verified",
+        "merged",
+        "passing",
+    ];
+    WORDS.iter().any(|w| contains_word(&lower, w))
+}
+
+/// True if `needle` appears in `haystack_lower` as a whole word: the characters
+/// immediately before and after must be non-alphanumeric (or string edges).
+/// Pure std, linear scan — no regex. Callers pass already-lowercased text.
+fn contains_word(haystack_lower: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut search_start = 0;
+    while search_start <= haystack_lower.len() {
+        let Some(rel) = haystack_lower[search_start..].find(needle) else {
+            return false;
+        };
+        let abs = search_start + rel;
+        let before_ok = abs == 0
+            || !haystack_lower[..abs]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        let after_start = abs + needle.len();
+        let after_ok = after_start >= haystack_lower.len()
+            || !haystack_lower[after_start..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        // Advance one byte past this hit (needle is ASCII; abs is a char boundary).
+        search_start = abs + 1;
+    }
+    false
 }
 
 /// Full extraction result for a conversation.
@@ -246,5 +294,45 @@ mod tests {
             get_message_data(&flat).get("role").unwrap().as_str(),
             Some("user")
         );
+    }
+
+    // --- has_success_signal / contains_word ---
+
+    #[test]
+    fn test_has_success_signal_rejects_incomplete() {
+        // Word-boundary: "complete" must not match inside "incomplete".
+        assert!(!has_success_signal("incomplete"));
+    }
+
+    #[test]
+    fn test_has_success_signal_installed() {
+        assert!(has_success_signal("New binary installed"));
+    }
+
+    #[test]
+    fn test_has_success_signal_hyphenated_boundary() {
+        // Hyphen is non-alphanumeric, so "installed" matches in "OK-INSTALLED".
+        assert!(has_success_signal("OK-INSTALLED"));
+    }
+
+    #[test]
+    fn test_has_success_signal_verified_merged_passing() {
+        assert!(has_success_signal("change verified"));
+        assert!(has_success_signal("PR merged"));
+        assert!(has_success_signal("all tests passing"));
+    }
+
+    #[test]
+    fn test_has_success_signal_phrases() {
+        assert!(has_success_signal("All 417 tests pass now"));
+        assert!(has_success_signal("suite all pass after rerun"));
+    }
+
+    #[test]
+    fn test_contains_word_basic() {
+        assert!(contains_word("done.", "done"));
+        assert!(!contains_word("undone", "done"));
+        assert!(contains_word("ok-installed", "installed"));
+        assert!(!contains_word("incomplete", "complete"));
     }
 }

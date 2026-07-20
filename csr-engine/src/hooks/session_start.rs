@@ -863,27 +863,182 @@ fn compact_preview(content: &str, max_chars: usize) -> String {
     format!("{}...", &clean[..boundary])
 }
 
-/// Preview that keeps both ends of the text when it overflows.
-///
-/// The Tier-0 `LAST:` line summarizes what a session concluded; episode
-/// `completed` text routinely opens with preamble and closes with the actual
-/// verdict. A head-only truncate (`compact_preview`) keeps whichever sentence
-/// happens to come first and drops the conclusion — so overflow elides the
-/// middle instead: head + " … " + tail.
+/// Claim-centric preview for Tier-0 `LAST:` — prefer a bold verdict sentence
+/// (or the first sentence), optionally append a distinct closing-state sentence,
+/// then word-boundary truncate. Char-level head/tail elision mid-cuts words and
+/// glues table fragments onto the verdict; sentence extraction keeps the claim.
 fn conclusion_preview(content: &str, max_chars: usize) -> String {
     let clean = sanitize_preview(content);
     if clean.len() <= max_chars {
         return clean;
     }
+
     const ELLIPSIS: &str = " … ";
-    let budget = max_chars.saturating_sub(ELLIPSIS.len());
-    // 60/40 head/tail: the head carries the verdict ("Done." / "Failed:"),
-    // the tail carries the closing state the next session resumes from.
-    let tail_budget = budget * 2 / 5;
-    let head_budget = budget - tail_budget;
-    let head_end = clean.floor_char_boundary(head_budget);
-    let tail_start = clean.ceil_char_boundary(clean.len() - tail_budget);
-    format!("{}{}{}", &clean[..head_end], ELLIPSIS, &clean[tail_start..])
+
+    // (start, end) byte ranges into `clean`, already trimmed.
+    let sentences = split_preview_sentences(&clean);
+    if sentences.is_empty() {
+        return truncate_at_word_boundary(&clean, max_chars);
+    }
+
+    // 1) Bold-span verdict: first **...** whose inner text is >= 10 chars.
+    // 2) Else first sentence.
+    let verdict = if let Some((span_start, span_end)) = find_bold_verdict_span(&clean) {
+        let (s0, s1) = sentences
+            .iter()
+            .copied()
+            .find(|&(a, b)| a <= span_start && span_end <= b)
+            .unwrap_or((span_start, span_end));
+        strip_bold_markers(&clean[s0..s1])
+    } else {
+        let (s0, s1) = sentences[0];
+        strip_bold_markers(&clean[s0..s1])
+    };
+
+    // 3) Append distinct last real sentence when verdict is short enough
+    // (~60% of max_chars). Prefer fitting both claims; step 4 word-truncates
+    // if the pair still overflows (all-or-nothing drop would hide closing state).
+    let mut result = verdict;
+    let budget_for_append = max_chars * 3 / 5;
+    if result.len() < budget_for_append {
+        if let Some(last) = sentences.iter().rev().find_map(|&(a, b)| {
+            let t = clean[a..b].trim();
+            if t.is_empty() || is_non_sentence_fragment(t) {
+                return None;
+            }
+            let stripped = strip_bold_markers(t);
+            if stripped == result {
+                return None;
+            }
+            Some(stripped)
+        }) {
+            result = format!("{result}{ELLIPSIS}{last}");
+        }
+    }
+
+    // 4) Word-boundary truncate if still over budget.
+    if result.len() > max_chars {
+        result = truncate_at_word_boundary(&result, max_chars);
+    }
+    result
+}
+
+/// Split on `.` / `!` / `?` when followed by space, EOS, or closing `**` then
+/// space/EOS (so `**Done now.** Next` yields a clean first sentence).
+/// Returns `(start, end)` byte ranges into `text` (trimmed content).
+fn split_preview_sentences(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if matches!(b, b'.' | b'!' | b'?') {
+            // Consume a run of the same terminator (ellipsis "...") as one end.
+            let punct = b;
+            let mut end = i + 1;
+            while end < bytes.len() && bytes[end] == punct {
+                end += 1;
+            }
+            // Optional closing markdown bold after the terminator (`now.** Next`).
+            if bytes.get(end) == Some(&b'*') && bytes.get(end + 1) == Some(&b'*') {
+                end += 2;
+            }
+            let is_end = end >= bytes.len() || bytes[end] == b' ';
+            if is_end {
+                let slice = &text[start..end];
+                let trim_start = slice.len() - slice.trim_start().len();
+                let trim_end = slice.trim_end().len();
+                if trim_end > trim_start {
+                    out.push((start + trim_start, start + trim_end));
+                }
+                while end < bytes.len() && bytes[end] == b' ' {
+                    end += 1;
+                }
+                start = end;
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if start < text.len() {
+        let slice = &text[start..];
+        let trim_start = slice.len() - slice.trim_start().len();
+        let trim_end = slice.trim_end().len();
+        if trim_end > trim_start {
+            out.push((start + trim_start, start + trim_end));
+        }
+    }
+    out
+}
+
+/// First `**...**` span whose trimmed inner text is at least 10 chars.
+/// Returns byte offsets `(start_of_open, end_of_close)` into `text`.
+fn find_bold_verdict_span(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'*' && bytes[i + 1] == b'*' {
+            let inner_start = i + 2;
+            let mut j = inner_start;
+            while j + 1 < bytes.len() {
+                if bytes[j] == b'*' && bytes[j + 1] == b'*' {
+                    let inner = text[inner_start..j].trim();
+                    if inner.chars().count() >= 10 {
+                        return Some((i, j + 2));
+                    }
+                    // Too short — keep scanning after this close.
+                    i = j + 2;
+                    break;
+                }
+                j += 1;
+            }
+            if j + 1 >= bytes.len() {
+                break;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn strip_bold_markers(s: &str) -> String {
+    s.replace("**", "")
+}
+
+/// Table rows (pipe-led) and fenced code are not resume-state claims.
+fn is_non_sentence_fragment(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with('|') || t.contains("```")
+}
+
+/// Truncate at the last space at or before `max_chars`, then append `"..."`.
+/// Falls back to a char-boundary cut when no space exists in the window.
+fn truncate_at_word_boundary(s: &str, max_chars: usize) -> String {
+    const TRUNC: &str = "...";
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    let budget = max_chars.saturating_sub(TRUNC.len());
+    let limit = s.floor_char_boundary(budget);
+    let window = &s[..limit];
+    let cut = window
+        .rfind(' ')
+        .map(|i| {
+            // Keep the word before the space; drop trailing spaces.
+            let end = window[..i].trim_end().len();
+            // end is a char boundary (ASCII space split on valid UTF-8).
+            if end == 0 {
+                limit
+            } else {
+                end
+            }
+        })
+        .unwrap_or(limit);
+    let cut = s.floor_char_boundary(cut);
+    format!("{}{TRUNC}", &s[..cut])
 }
 
 /// True if a session story leads with a question rather than narrating work.
@@ -1944,28 +2099,120 @@ mod tests {
 
     #[test]
     fn test_conclusion_preview_keeps_both_ends() {
-        // Verdict at the head, resumable state at the tail, filler between —
-        // the tail must survive truncation (the old head-only cut ate it).
+        // updated: claim-centric extraction replaces head/tail elision —
+        // first sentence is the verdict; when short, append the distinct last
+        // sentence (filler middle is dropped, not mid-cut).
         let text = format!(
             "Done. Answers to both interjections first. {} Final verdict: reimport confirmed, 52754 chunks live.",
             "filler sentence about intermediate steps. ".repeat(10)
         );
         let result = conclusion_preview(&text, 120);
-        assert!(result.len() <= 120 + " … ".len());
-        assert!(result.starts_with("Done. Answers"), "head lost: {result}");
+        assert!(result.len() <= 120, "over budget: {result}");
         assert!(
-            result.ends_with("52754 chunks live."),
-            "conclusion lost: {result}"
+            result.starts_with("Done."),
+            "verdict (first sentence) lost: {result}"
         );
-        assert!(result.contains(" … "));
+        assert!(
+            result.contains("52754 chunks live."),
+            "closing-state sentence lost: {result}"
+        );
+        assert!(
+            result.contains(" … "),
+            "expected verdict + ellipsis + last: {result}"
+        );
+        assert!(
+            !result.contains("filler sentence"),
+            "middle filler should be elided: {result}"
+        );
     }
 
     #[test]
     fn test_conclusion_preview_unicode_safe() {
+        // updated: claim-centric falls back to word/char-boundary truncate when
+        // there is no sentence structure; must not panic on non-ASCII.
         let content = "\u{1f600}".repeat(60);
         let result = conclusion_preview(&content, 20);
-        // Must not panic on char boundaries and must stay bounded.
         assert!(result.chars().count() <= 24);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_conclusion_preview_restart_installed_no_table_garble() {
+        // Real failure: head/tail elision mid-cut the verdict and glued a
+        // markdown table fragment onto LAST. Claim-centric must keep the bold
+        // restart sentence + installed closing state, never table pipes.
+        let content = "**Yes — restart Claude Code now.** New binary installed at \
+             /usr/local/bin/csr-engine (rm+cp, dodged codesign SIGKILL gotcha)...\n\n\
+             | step | result |\n|------|--------|\n| build | ok |\n";
+        let result = conclusion_preview(content, 120);
+        assert!(
+            result.contains("restart Claude Code"),
+            "verdict lost: {result}"
+        );
+        assert!(
+            result.contains("New binary installed"),
+            "closing state lost: {result}"
+        );
+        assert!(
+            !result.contains('|'),
+            "table fragment leaked into LAST: {result}"
+        );
+        assert!(
+            !result.contains("n start inject"),
+            "old mid-word garble pattern: {result}"
+        );
+        assert!(
+            !result.contains("**"),
+            "bold markers should be stripped: {result}"
+        );
+    }
+
+    #[test]
+    fn test_conclusion_preview_strips_bold_markers() {
+        let content = "**Done, all tests pass.** Some other trailing sentence here.";
+        // Force claim-centric path (overflow) so bold span is extracted.
+        let result = conclusion_preview(content, 40);
+        assert!(
+            !result.contains("**"),
+            "bold markers must be stripped: {result}"
+        );
+        assert!(
+            result.contains("Done, all tests pass"),
+            "bold inner text lost: {result}"
+        );
+    }
+
+    #[test]
+    fn test_conclusion_preview_word_boundary_no_punctuation() {
+        // No `.`/`!`/`?` — fall back to word-boundary truncate, never mid-word.
+        let content = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima \
+             mike november oscar papa quebec romeo sierra tango uniform victor whiskey";
+        let result = conclusion_preview(content, 50);
+        assert!(
+            result.ends_with("..."),
+            "expected truncate suffix: {result}"
+        );
+        assert!(result.len() <= 50, "over budget: {result}");
+        // Everything before "..." must be a clean prefix ending on a full word.
+        let body = result.trim_end_matches("...");
+        assert!(
+            !body.ends_with(char::is_alphanumeric) || content.starts_with(body),
+            "truncated body must be a word-aligned prefix: {result}"
+        );
+        assert!(
+            content.starts_with(body.trim_end()),
+            "must not invent/glue text: {result}"
+        );
+        // No mid-word cut: either body is empty, or next char in source is space/EOS.
+        let trimmed = body.trim_end();
+        if !trimmed.is_empty() {
+            let next = content.as_bytes().get(trimmed.len()).copied();
+            assert!(
+                next.is_none_or(|b| b == b' '),
+                "mid-word cut at {}: {result}",
+                trimmed.len()
+            );
+        }
     }
 
     // --- strip_preamble tests (Bug 4) ---

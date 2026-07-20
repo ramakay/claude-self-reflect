@@ -1,0 +1,19 @@
+{
+"method": "metadata-only: literal LIKE over pre-freeze chunks + git file history + date windows. NO embedding/CSR search. Rule: earliest MAIN session with substantive keyword presence consistent with owner description; ties noted as alt. UNRESOLVED-stratum queries not mapped (excluded from origin-MRR per protocol).",
+"mapped": {
+ "Q4": {"origin": "dc689356-1df6-4bc4-9b78-e29866213090", "alt": "b687fc7a-5d14-482e-80bb-6c35870f3d02", "confidence": "medium-high", "notes": "v9.3 narrative-cost-controls window Jul 11-12; npm 9.3.0 published 2026-07-12T05:11Z corroborates (ledger)"},
+ "Q5": {"origin": "219ef49f-e007-4b56-bda8-b848516dc9f8", "alt": "fc16f91d-7f9c-44ca-b19b-237bbc3a3c6b", "confidence": "medium", "notes": "self-pollution cluster head Jun 11; commit 7bd607f (break briefing self-pollution loop) 2026-06-11T00:02Z just precedes"},
+ "Q6": {"origin": "69a05719-10c8-4a51-82ac-f84b80fe8a0b", "alt": "befa3eb3-17df-45ce-a95b-e7e2165b1cca", "confidence": "high", "notes": "conv starts 2026-06-13T16:25Z, commit 16559b1 (chunking fix) 17:09Z same day, 29 keyword hits"},
+ "Q8": {"origin": "b687fc7a-5d14-482e-80bb-6c35870f3d02", "alt": null, "confidence": "high", "notes": "dependency-triage session Jul 10, 17 rmcp+1.7 hits, matches owner 'conflicting component' (schemars)"},
+ "Q9": {"origin": "02d270b9-f48d-4bb4-bd03-9017e1723fa3", "alt": "8b266e91-292b-4e39-bdaa-29d32b9e22f5", "confidence": "low-medium", "notes": "earliest 'never block'+hook cluster May 15/20 = v8 hook build era; matches owner latency description"},
+ "Q10": {"origin": "0b68eace-3e21-4841-9567-58d038cd89d7", "alt": "fc16f91d-7f9c-44ca-b19b-237bbc3a3c6b", "confidence": "medium", "notes": "Jul 7 fix session (20 MEMORY_MANIFEST hits) matches memory-file date; fc16f91d Jun 11 has 8 earlier mentions — earlier-origin possibility flagged"},
+ "Q12": {"origin": "8b266e91-292b-4e39-bdaa-29d32b9e22f5", "alt": null, "confidence": "medium", "notes": "earliest MAIN fts5 session May 20"},
+ "A3": {"origin": "71b8d18d-450b-4cd1-aba5-6db7fdcfae6e", "alt": null, "confidence": "low-medium", "notes": "earliest Meta rate-limit conv May 28 meta-campaigns; snapshot.ts lives in command-center — cross-project origin plausible but weak"},
+ "A5": {"origin": "46d2386b-c3e9-4f09-a695-ca7de9e7ae84", "alt": "e6e599b6-4875-4604-8d3e-bb50ded8b3f2", "confidence": "medium", "notes": "first substantial score_save session May 20 (7 hits); May 19 single-hit precursor as alt"},
+ "A6": {"origin": "92fcab9e-a193-405e-92f6-34c72edc9cd2", "alt": "5931a5c9-5a2e-4f37-9946-bcc50a4a20be", "confidence": "medium", "notes": "May 14 dashboard-build session (earliest); May 20 heavy-build session (42 hits) as alt"},
+ "A7": {"origin": "a3e84413-c8f2-481e-8661-8086accd8fcc", "alt": "9312ad1c-0ad0-4f05-a832-e3aa4452fe39", "confidence": "low", "notes": "owner flagged referent ambiguity; earliest Anukriti-Campaigns radio-reel conv May 16; treat with ambiguity disclosure"},
+ "A8": {"origin": "92fcab9e-a193-405e-92f6-34c72edc9cd2", "alt": null, "confidence": "medium", "notes": "May 14 session has 8 usePosthogLessons hits, earliest"}
+},
+"unmapped_unresolved": ["Q1", "Q3", "Q7", "Q11", "A1", "A2", "A4"],
+"out_of_corpus": {"Q2": {"impl_candidate": "grade-2: rerank.rs implementation session ~2026-07-07; concept conv owner-claimed pre-v8, unmappable"}}
+}

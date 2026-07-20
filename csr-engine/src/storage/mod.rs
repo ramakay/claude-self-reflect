@@ -2,7 +2,7 @@ pub mod codegraph;
 pub mod migrations;
 pub mod queries;
 
-pub use queries::{NarrativeUsageRow, NarrativeUsageSummary};
+pub use queries::{NarrativeUsageRow, NarrativeUsageSummary, RatificationScoreRow};
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -274,6 +274,11 @@ impl Storage {
         queries::mark_enrichment_unavailable(&conn, conversation_id, enrichment_type, reason)
     }
 
+    pub fn reset_enrichment(&self, conversation_id: &str, enrichment_type: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::reset_enrichment(&conn, conversation_id, enrichment_type)
+    }
+
     pub fn get_unenriched_conversations(
         &self,
         enrichment_type: &str,
@@ -446,6 +451,29 @@ impl Storage {
     pub fn narrative_usage_summary(&self) -> Result<NarrativeUsageSummary> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::narrative_usage_summary(&conn)
+    }
+
+    pub fn upsert_ratification_score(&self, row: &RatificationScoreRow) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::upsert_ratification_score(&conn, row)
+    }
+
+    pub fn get_ratification_score(&self, conversation_id: &str) -> Result<Option<f32>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_ratification_score(&conn, conversation_id)
+    }
+
+    pub fn get_ratification_scores(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, f32>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_ratification_scores(&conn, ids)
+    }
+
+    pub fn ratification_summary(&self) -> Result<(i64, f64)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::ratification_summary(&conn)
     }
 
     /// Integrity check with an app-level cache. SQLite recomputes
@@ -622,6 +650,57 @@ impl Storage {
         queries::get_session_code_evolution(&conn, session_id)
     }
 
+    // ─── Saga Phase 1 (WS1) ───
+
+    pub fn get_chunk_ids_for_conversation(&self, conversation_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_ids_for_conversation(&conn, conversation_id)
+    }
+
+    pub fn get_chunk_vectors_by_ids(&self, ids: &[String]) -> Result<Vec<(String, Vec<f32>)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_vectors_by_ids(&conn, ids)
+    }
+
+    pub fn files_for_session(&self, session_id: &str, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::files_for_session(&conn, session_id, limit)
+    }
+
+    pub fn sessions_for_file(
+        &self,
+        file_path: &str,
+        exclude_session: &str,
+        project: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::sessions_for_file(&conn, file_path, exclude_session, project, limit)
+    }
+
+    pub fn set_chunk_saga_columns(
+        &self,
+        chunk_id: &str,
+        seq: usize,
+        is_sidechain: bool,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::set_chunk_saga_columns(&conn, chunk_id, seq, is_sidechain)
+    }
+
+    pub fn list_all_import_state_file_paths(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::list_all_import_state_file_paths(&conn)
+    }
+
+    pub fn ground_truth_sessions_for_target(
+        &self,
+        target: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::ground_truth_sessions_for_target(&conn, target)
+    }
+
     // ─── Episode anchors (v9.3) ───
 
     /// Replace all anchors for a session (delete-then-insert upsert).
@@ -785,6 +864,8 @@ mod tests {
             message_count: 1,
             summary: None,
             author: Speaker::User,
+            seq: 0,
+            is_sidechain: false,
         };
         storage.insert_chunk(&chunk, &[0.0; 384]).unwrap();
 
@@ -806,6 +887,62 @@ mod tests {
         assert_eq!(got.supersedes.as_deref(), Some("behavioral continuity"));
 
         assert!(storage.get_chunk_provenance("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn get_chunk_vectors_by_ids_roundtrip() {
+        use crate::import::ConversationChunk;
+        use crate::provenance::Speaker;
+        use std::collections::HashMap;
+
+        let storage = Storage::open_memory().unwrap();
+        let id1 = "vec-chunk-1".to_string();
+        let id2 = "vec-chunk-2".to_string();
+        let emb1 = vec![0.1; 384];
+        let emb2 = vec![0.2; 384];
+        storage
+            .insert_chunk(
+                &ConversationChunk {
+                    id: id1.clone(),
+                    conversation_id: "conv-v".into(),
+                    project_name: "proj".into(),
+                    timestamp: "2026-06-10T12:00:00Z".into(),
+                    content: "one".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::User,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                &emb1,
+            )
+            .unwrap();
+        storage
+            .insert_chunk(
+                &ConversationChunk {
+                    id: id2.clone(),
+                    conversation_id: "conv-v".into(),
+                    project_name: "proj".into(),
+                    timestamp: "2026-06-10T12:00:00Z".into(),
+                    content: "two".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::User,
+                    seq: 1,
+                    is_sidechain: false,
+                },
+                &emb2,
+            )
+            .unwrap();
+
+        let got = storage
+            .get_chunk_vectors_by_ids(&[id1.clone(), id2.clone(), "nonexistent".to_string()])
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        let map: HashMap<String, Vec<f32>> = got.into_iter().collect();
+        assert!((map[&id1][0] - 0.1).abs() < 1e-6);
+        assert!((map[&id2][0] - 0.2).abs() < 1e-6);
+        assert!(!map.contains_key("nonexistent"));
     }
 
     #[test]

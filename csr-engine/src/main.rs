@@ -42,6 +42,10 @@ struct Args {
     /// Backfill import_state and run heuristic enrichment for all conversations
     #[arg(long)]
     enrich: bool,
+
+    /// Backfill seq + is_sidechain on existing chunks from on-disk JSONLs (Saga Phase 1 WS1)
+    #[arg(long)]
+    backfill_saga: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -92,6 +96,13 @@ enum Commands {
         /// File path to analyze
         path: PathBuf,
     },
+    /// Run ratification extraction for specific conversation IDs (one-off,
+    /// bypasses the daemon queue ordering)
+    Ratify {
+        /// Conversation IDs to score
+        #[arg(required = true)]
+        conversation_ids: Vec<String>,
+    },
     /// Run evaluation tests
     Eval {
         /// Run full evaluation (20 tests) instead of quick (5 tests)
@@ -103,6 +114,10 @@ enum Commands {
         /// Run the LIVE north-star probe against the real index (no fixture)
         #[arg(long = "continuity-live")]
         continuity_live: bool,
+        /// Provenance regression benchmark: reinstatement walk vs one-shot kNN (Saga
+        /// Phase 1 WS2). LOCAL opt-in only — never part of default eval/--full, never CI.
+        #[arg(long)]
+        provenance: bool,
     },
     /// Backfill session stories from V3/heuristic data (zero cost)
     BackfillStories {
@@ -226,6 +241,24 @@ async fn main() -> Result<()> {
         return daemon.run().await;
     }
 
+    if let Some(Commands::Ratify {
+        ref conversation_ids,
+    }) = args.command
+    {
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let storage = eng.storage().clone();
+        for cid in conversation_ids {
+            match csr_engine::daemon::ratification::process_ratification(&storage, cid).await {
+                Ok(()) => println!("ratified {cid}"),
+                Err(e) => {
+                    let _ = storage.mark_enrichment_failed(cid, "ratification", &e.to_string());
+                    eprintln!("FAILED {cid}: {e}");
+                }
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(Commands::Quality { ref path }) = args.command {
         let report = csr_engine::extraction::quality::analyze_file(path)?;
         print!("{}", report.format_text());
@@ -236,6 +269,7 @@ async fn main() -> Result<()> {
         full,
         continuity,
         continuity_live,
+        provenance,
     }) = args.command
     {
         if let Some(parent) = args.db_path.parent() {
@@ -255,6 +289,19 @@ async fn main() -> Result<()> {
         if continuity {
             let report = csr_engine::eval::continuity::run_continuity(eng.embeddings()).await;
             print!("{}", report.format_text());
+            return Ok(());
+        }
+        if provenance {
+            let report = csr_engine::eval::provenance::run_provenance(
+                eng.storage(),
+                eng.embeddings(),
+                eng.search(),
+            )
+            .await?;
+            print!("{}", report.text);
+            if report.regression {
+                std::process::exit(1);
+            }
             return Ok(());
         }
         let report = if full {
@@ -347,6 +394,11 @@ async fn main() -> Result<()> {
         );
     }
 
+    if args.backfill_saga {
+        let stats = csr_engine::import::backfill::backfill_saga_columns(&eng)?;
+        print!("{}", stats.format_text());
+    }
+
     if args.bench {
         tracing::info!("benchmark mode not yet implemented in main — use `cargo bench`");
         return Ok(());
@@ -360,7 +412,8 @@ async fn main() -> Result<()> {
     };
 
     // Start MCP stdio server if --serve or no explicit action
-    let should_serve = args.serve || (!args.import && !args.bench && !args.watch && !args.enrich);
+    let should_serve = args.serve
+        || (!args.import && !args.bench && !args.watch && !args.enrich && !args.backfill_saga);
     if should_serve {
         eng.serve_mcp().await?;
     } else if args.watch {

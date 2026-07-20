@@ -1,0 +1,22 @@
+[
+{"id":"Q1","corpus":"csr","text":"why is the sqlite connection wrapped in a mutex for thread safety","target":"src/storage/mod.rs"},
+{"id":"Q2","corpus":"csr","text":"why are tool mechanic scaffold chunks demoted in search ranking","target":"src/search/rerank.rs"},
+{"id":"Q3","corpus":"csr","text":"why is integrity check cached in the meta table instead of running pragma integrity_check directly","target":"src/storage/mod.rs"},
+{"id":"Q4","corpus":"csr","text":"why did AI narrative generation switch from a dated model pin to a model fallback chain","target":"src/narrative/mod.rs"},
+{"id":"Q5","corpus":"csr","text":"why does import skip conversations that start with CSR agent prompts","target":"src/import/mod.rs"},
+{"id":"Q6","corpus":"csr","text":"why were tool results dropped from import and how was chunking fixed to embed full conversations","target":"src/import/mod.rs"},
+{"id":"Q7","corpus":"csr","text":"why does search fall back to exact scan for tiny hnsw indexes","target":"src/search/mod.rs"},
+{"id":"Q8","corpus":"csr","text":"why is rmcp pinned to version 1.6 instead of upgrading to 1.7","target":""},
+{"id":"Q9","corpus":"csr","text":"why do hooks use catch-all wrappers so they never block claude code","target":"src/hooks/mod.rs"},
+{"id":"Q10","corpus":"csr","text":"why does session start inject a memory manifest header capability claim","target":"src/hooks/session_start.rs"},
+{"id":"Q11","corpus":"csr","text":"why does prompt submit classify intent with semantic exemplars instead of keywords","target":"src/hooks/intent.rs"},
+{"id":"Q12","corpus":"csr","text":"why was fts5 keyword fallback added when semantic scores are low","target":"src/mcp/tools.rs"},
+{"id":"A1","corpus":"anukriti","text":"why did sign in switch from Clerk Core 3 finalize to legacy setActive in the expo app","target":"anukriti/anukriti-mvp-expo/app/auth-sheet.tsx"},
+{"id":"A2","corpus":"anukriti","text":"why does the expo app defer sign in with an auth intent service instead of prompting immediately","target":"anukriti/anukriti-mvp-expo/src/services/auth-intent.ts"},
+{"id":"A3","corpus":"anukriti","text":"why does the command center cache campaign data in a snapshot instead of calling the APIs live on page load","target":"anukriti-command-center/src/lib/data/snapshot.ts"},
+{"id":"A4","corpus":"anukriti","text":"why do returning user and anonymous user counts differ in the posthog numbers on the command center","target":"anukriti-command-center/src/app/api/posthog/route.ts"},
+{"id":"A5","corpus":"anukriti","text":"why was score save instrumented with observability across multiple app runtime versions","target":"anukriti/anukriti-mvp-expo/components/lesson/LessonScreen.tsx"},
+{"id":"A6","corpus":"anukriti","text":"why does the whats running section exist on the command center and what does it monitor","target":"anukriti-command-center/src/components/sections/WhatsRunning.tsx"},
+{"id":"A7","corpus":"anukriti","text":"why was the radio reel video built as a remotion composition with a root of multiple scenes","target":"Anukriti-Campaigns/video/radio-reel/src/Root.tsx"},
+{"id":"A8","corpus":"anukriti","text":"why does the lessons page pull lesson analytics from posthog instead of supabase","target":"anukriti-command-center/src/hooks/usePosthogLessons.ts"}
+]

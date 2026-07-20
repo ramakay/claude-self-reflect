@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -87,6 +87,8 @@ fn lookup_by_conv_tag(
                     message_count: 0,
                     summary: None,
                     author: crate::provenance::Speaker::ToolResult,
+                    seq: 0,
+                    is_sidechain: false,
                 },
             }
         })
@@ -241,6 +243,8 @@ pub async fn reflect_on_past(
                     // Reflections/episodes are derived narratives, not raw
                     // user-authored chunks — no authority boost.
                     author: crate::provenance::Speaker::ToolResult,
+                    seq: 0,
+                    is_sidechain: false,
                 },
             });
         }
@@ -308,6 +312,13 @@ pub async fn reflect_on_past(
     let rank_of = |id: &str| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
     enriched.sort_by_key(|e| rank_of(&e.chunk.id));
     enriched.truncate(limit);
+
+    // TAD: log each returned memory as an MCP-search retrieval event. session_id="mcp" is a
+    // sentinel (MCP has no session id) — distinguishable from hook-driven sessions for future
+    // decay work. Non-fatal: a logging failure must never fail the search.
+    for e in &enriched {
+        let _ = storage.log_retrieval_event(&e.chunk.id, "chunk", "mcp_search", "mcp");
+    }
 
     Ok(format::format_search_results(
         &enriched,
@@ -567,6 +578,94 @@ pub async fn code_graph(
             ))
         }
     }
+}
+
+/// Provenance recall: why does this code/decision exist. Reinstatement walk (seed ->
+/// blend + code-graph spread + episode chain), formatted as a cited evidence chain
+/// grouped by conversation. Project scope is normalized via
+/// `cross_project::normalize_project_scope` (same as every other MCP tool).
+pub async fn why(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query: &str,
+    project: Option<&str>,
+    cfg: &crate::search::reinstatement::ReinstateConfig,
+) -> Result<String> {
+    let (effective_project, _) = cross_project::normalize_project_scope(project);
+
+    let items = crate::search::reinstatement::reinstate(
+        storage,
+        embeddings,
+        search,
+        query,
+        effective_project.as_deref(),
+        cfg,
+    )
+    .await?;
+
+    // TAD: log each returned chunk as an MCP-search retrieval event. session_id="mcp" is
+    // the sentinel (MCP has no session id) — same pattern as reflect_on_past. Non-fatal:
+    // a logging failure must never fail the search.
+    for item in &items {
+        let _ = storage.log_retrieval_event(&item.chunk_id, "chunk", "mcp_search", "mcp");
+    }
+
+    Ok(format_why(query, &items))
+}
+
+/// Format evidence items as: header, grouped-by-conversation body (chronological
+/// within group), footer summary.
+fn format_why(query: &str, items: &[crate::search::reinstatement::EvidenceItem]) -> String {
+    use crate::search::reinstatement::Via;
+
+    let mut out = String::new();
+    out.push_str(&format!("WHY: {query}\n\n"));
+
+    if items.is_empty() {
+        out.push_str("No evidence chain found.\n");
+        return out;
+    }
+
+    // Group by conversation, preserving first-seen (= highest-relevance) order.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<&crate::search::reinstatement::EvidenceItem>> =
+        HashMap::new();
+    for item in items {
+        if !groups.contains_key(&item.conversation_id) {
+            order.push(item.conversation_id.clone());
+        }
+        groups
+            .entry(item.conversation_id.clone())
+            .or_default()
+            .push(item);
+    }
+
+    for conv in &order {
+        let mut group = groups.remove(conv).unwrap_or_default();
+        group.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        out.push_str(&format!("conv_{conv}:\n"));
+        for it in &group {
+            out.push_str(&format!(
+                "  via={} score={:.3} [{}] conv_{}: {}\n",
+                it.via, it.score, it.timestamp, it.conversation_id, it.excerpt
+            ));
+        }
+        out.push('\n');
+    }
+
+    let seed_count = items.iter().filter(|i| i.via == Via::Seed).count();
+    let graph_count = items.iter().filter(|i| i.via == Via::Graph).count();
+    let episode_count = items.iter().filter(|i| i.via == Via::Episode).count();
+    out.push_str(&format!(
+        "conversations: {} | seeds -> graph/episode reach: {} seed(s), {} graph hop(s), {} episode hop(s)\n",
+        order.len(),
+        seed_count,
+        graph_count,
+        episode_count
+    ));
+
+    out
 }
 
 /// Resolve a symbol/file to a single best node id (highest rank).

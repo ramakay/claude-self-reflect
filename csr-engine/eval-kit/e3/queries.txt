@@ -1,0 +1,8 @@
+why does import skip conversations that start with CSR agent prompts
+why do hooks use catch-all wrappers so they never block claude code
+why was fts5 keyword fallback added when semantic scores are low
+why does the command center cache campaign data in a snapshot instead of calling the APIs live on page load
+why was score save instrumented with observability across multiple app runtime versions
+why does the whats running section exist on the command center and what does it monitor
+why was the radio reel video built as a remotion composition with a root of multiple scenes
+why does the lessons page pull lesson analytics from posthog instead of supabase
