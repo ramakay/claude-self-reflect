@@ -55,13 +55,14 @@ npm view claude-self-reflect time --json 2>/dev/null || echo '{}'
 echo ','
 echo -n '"release_train": '
 python3 -c '
-import json
+import json, os
+path = os.path.expandvars("$HOME/projects/anukriti/anukriti-mvp-expo/release-train.yaml")
 try:
     import yaml
-    d = yaml.safe_load(open("$HOME/projects/anukriti/anukriti-mvp-expo/release-train.yaml"))
+    d = yaml.safe_load(open(path))
     print(json.dumps(d, default=str))
 except Exception as e:
-    print(json.dumps({"raw": open("$HOME/projects/anukriti/anukriti-mvp-expo/release-train.yaml").read()[:8000]}))
+    print(json.dumps({"raw": open(path).read()[:8000]}))
 '
 echo '}'
 } > "$OUT"

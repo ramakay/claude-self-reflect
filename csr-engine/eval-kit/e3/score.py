@@ -55,8 +55,10 @@ for arm in ["knn_exact", "full_exact", "full_no_echo_exact"]:
             row += f"{str(rk):>8}"
             if r:
                 mrr[c].append(1.0 / rk if isinstance(rk, int) else 0.0)
-        e0 = echo10(data["c0"]["runs"][arm][qid]["chunks"]) if "c0" in data else "?"
-        e5 = echo10(data["c5"]["runs"][arm][qid]["chunks"]) if "c5" in data else "?"
+        r0 = data.get("c0", {}).get("runs", {}).get(arm, {}).get(qid)
+        e0 = echo10(r0["chunks"]) if r0 else "?"
+        r5 = data.get("c5", {}).get("runs", {}).get(arm, {}).get(qid)
+        e5 = echo10(r5["chunks"]) if r5 else "?"
         row += f"{str(e0)+' -> '+str(e5):>18}"
         print(row)
     print("oMRR " + "".join(f"{round(sum(v)/len(v),3) if v else '?':>8}" for v in (mrr[c] for c in CONDS)))

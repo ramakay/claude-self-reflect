@@ -7,17 +7,20 @@ from collections import defaultdict
 
 E1 = os.path.dirname(os.path.abspath(__file__))
 E2 = os.path.join(os.path.dirname(E1), "e2")
-G = json.load(open(os.path.join(E2, "grades.json")))["grades"]
-M = json.load(open(os.path.join(E2, "mapping.json")))
+with open(os.path.join(E2, "grades.json")) as f:
+    G = json.load(f)["grades"]
+with open(os.path.join(E2, "mapping.json")) as f:
+    M = json.load(f)
 
 runs = defaultdict(dict)  # arm -> qid -> convs
 meta = None
-for line in open(os.path.join(E1, "ablation.jsonl")):
-    d = json.loads(line)
-    if "meta" in d:
-        meta = d["meta"]
-        continue
-    runs[d["arm"]][d["qid"]] = d["convs"]
+with open(os.path.join(E1, "ablation.jsonl")) as f:
+    for line in f:
+        d = json.loads(line)
+        if "meta" in d:
+            meta = d["meta"]
+            continue
+        runs[d["arm"]][d["qid"]] = d["convs"]
 
 def grade(qid, conv):
     v = G[qid]["items"].get(conv)
@@ -61,5 +64,6 @@ for arm in order:
     table[arm] = row
     print(f"{arm:<15}{row['origin_mrr']!s:>7}{row['ndcg10']!s:>9}{row['recall2']!s:>9}{ung:>10}")
 
-json.dump({"meta": meta, "arms": table}, open(os.path.join(E1, "results.json"), "w"), indent=1)
+with open(os.path.join(E1, "results.json"), "w") as f:
+    json.dump({"meta": meta, "arms": table}, f, indent=1)
 print("\nresults.json written")

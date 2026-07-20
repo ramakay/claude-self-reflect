@@ -8,16 +8,25 @@ import json, os, math
 from collections import defaultdict
 
 E2 = os.path.dirname(os.path.abspath(__file__))
-load = lambda n: json.load(open(os.path.join(E2, n)))
-POOLS, MAPPING, QUERIES = load("pools.json"), load("mapping.json"), load("queries.json")
-LEDGER = load("ledger.json")
+
+
+def load_json(filename):
+    with open(os.path.join(E2, filename)) as f:
+        return json.load(f)
+
+
+POOLS = load_json("pools.json")
+MAPPING = load_json("mapping.json")
+QUERIES = load_json("queries.json")
+LEDGER = load_json("ledger.json")
 QIDS = [q["id"] for q in QUERIES]
 
 def ext(vendor, qid):
     p = os.path.join(E2, f"extract_{vendor}", f"{qid}.json")
     if not os.path.exists(p):
         return None
-    d = json.load(open(p))
+    with open(p) as f:
+        d = json.load(f)
     if "error" in d:
         return None
     return {i["conv_id"]: i for i in d.get("items", [])}
@@ -32,18 +41,6 @@ agree_counts = defaultdict(lambda: [0, 0])  # act -> [agree, total]
 kappa_cells = defaultdict(lambda: [0, 0, 0, 0])  # act -> [both_yes, s_only, g_only, both_no]
 vendor_status = {}
 grades, ledger_notes = {}, []
-
-def git_events_near(conv_ts_range, target, window_h=72):
-    """Ledger corroboration: commits touching target within window of conv span."""
-    if not conv_ts_range or not target:
-        return []
-    hits = []
-    tbase = os.path.basename(target)
-    for repo, commits in LEDGER.get("git", {}).items():
-        for c in commits:
-            if any(tbase in f for f in c.get("files", [])):
-                hits.append({"repo": repo, "hash": c["hash"], "date": c["date"], "subject": c["subject"][:60]})
-    return hits[:5]
 
 for qid in QIDS:
     s, g = ext("sonnet", qid), ext("grok", qid)
@@ -150,5 +147,6 @@ summary = {
                "unresolved_excluded": MAPPING["unmapped_unresolved"],
                "out_of_corpus": list(MAPPING.get("out_of_corpus", {}).keys())},
 }
-json.dump({"grades": grades, "summary": summary}, open(os.path.join(E2, "grades.json"), "w"), indent=1)
+with open(os.path.join(E2, "grades.json"), "w") as f:
+    json.dump({"grades": grades, "summary": summary}, f, indent=1)
 print(json.dumps(summary, indent=1))
