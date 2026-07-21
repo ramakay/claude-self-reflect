@@ -56,9 +56,35 @@ construct mismatch, not noise.
 
 Corollary: E2's gold worked precisely because it bound acts to a query's artifact
 (acts × ledger × target). The retention-weight version of the thesis dropped the
-binding and died. **Surviving open question (untested): edge-level ratification —
+binding and died. **Surviving open question: edge-level ratification —
 acts bound to (conversation, artifact) pairs weighting reinstatement graph edges,
 joined query-conditionally.** That is a redesign, not a tweak, and was not run.
+
+### Edge-level cheap pass — ruled infeasible by data audit (2026-07-21)
+
+Post-halt, a cross-vendor advisor consult (Grok 4.5) recommended one pre-registered
+Gate B on edge-conditional scores IF computable from data already on disk at zero
+model spend, with the predicate frozen before any correlation was computed. A Codex
+audit of the live DB then killed the cheap pass on coverage before any ρ was run:
+
+- Strict act↔artifact binding: only 5/124 sealed-gold conversation/query pairs have
+  an act evidence string containing the target path, and **none** of those also has
+  the corresponding ledger row — strict edge coverage is zero pairs.
+- `ledger_refs` persists only commit SHAs; the file identity used to select those
+  SHAs was discarded at write time. `code_evolution` covers 75/3,957 ratified
+  conversations (74/124 sealed gold; 56/124 overlap any E2 target file — 42.7%).
+- The only computable join binds conversation→file, not act→file. Assigning every
+  act to every touched file recreates the node-level construct mismatch at edge
+  granularity — a proxy, not the hypothesis.
+- Git history cannot backfill: commits carry no conversation ID; only probabilistic
+  timestamp matching is possible.
+
+Consequence: the sealed one-shot was **not** burned on an invalid predicate.
+Edge-level ratification remains untested and is now known to require re-extraction
+that persists act↔artifact bindings at write time (extractor generation 4) plus
+content-based corroboration — real spend on a construct family 0-for-3, declined
+under budget. Design lesson for any future attempt: the binding the mechanism needs
+must be persisted at extraction time; it cannot be reconstructed afterwards.
 
 ## Also found during the burn
 
