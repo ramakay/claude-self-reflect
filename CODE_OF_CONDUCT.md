@@ -30,7 +30,8 @@ Examples of unacceptable behavior:
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the project maintainer at rama@procsolve.io.
+reported to the project maintainers via
+https://github.com/ramakay/claude-self-reflect/issues.
 
 ## Attribution
 

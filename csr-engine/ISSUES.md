@@ -19,7 +19,7 @@
 ## Bug 3: `search_by_recency` silently defaults to 7-day window
 - **Severity**: LOW
 - **File**: `src/mcp/tools.rs:211-212`
-- **Reproduction**: `search_by_recency(query="procsolve", project="procsolve-website")` → no results (procsolve data is 45+ days old)
+- **Reproduction**: `search_by_recency(query="example-topic", project="example-project")` → no results (that project's data is 45+ days old)
 - **Root cause**: When no `time_range`/`since`/`until` provided, defaults to `now - 7 days`. User has no indication of the time constraint applied.
 - **Not a code bug**: Expected behavior, but the empty response should indicate what time range was searched.
 
