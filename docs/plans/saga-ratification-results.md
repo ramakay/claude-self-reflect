@@ -1,6 +1,7 @@
 # Ratification-Weighted Memory — Program Results (NEGATIVE, run 2026-07-18..20)
 
-Executed the manifesto's 30-day plan (saga-manifesto-ratification-memory.md) in
+Executed the manifesto's 30-day plan (saga-manifesto-ratification-memory.md, internal
+planning doc preserved in repo history) in
 backfill-first form. **The program halted at its pre-registered gate: per-conversation
 ratification scores do not correlate with sealed E2 relevance grades.** Node-level
 "memory strength follows acts" is dead on this corpus. This document is the honest

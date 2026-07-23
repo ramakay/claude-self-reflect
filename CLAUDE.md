@@ -145,4 +145,4 @@ The Rust binary re-imports from the same `~/.claude/projects/` JSONL files.
 Primary docs: https://ramakay.github.io/claude-self-reflect/ (GitHub Pages, built from `docs-site/`)
 
 ---
-*Plans and design docs: `docs/plans/`*
+*Published research record (saga paper + experiment results): `docs/plans/` — internal planning docs live in `.plans/` (untracked)*
