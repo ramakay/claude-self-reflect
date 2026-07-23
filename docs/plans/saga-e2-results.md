@@ -1,12 +1,13 @@
 # E2 Results — Ratification-Derived Graded Gold (run 2026-07-17)
 
-Protocol: docs/plans/saga-phase2-experiments.md (E2, advisor-locked). Sealed origins:
-docs/plans/saga-e2-origins-precommit.md (commit 4a42644, pre-ranks). Pipeline artifacts in
+Protocol: saga-phase2-experiments.md (E2, advisor-locked; internal planning doc, preserved
+in repo history). Sealed origins: saga-e2-origins-precommit.md (internal; sealed at commit
+4a42644, pre-ranks — the seal is verifiable in repo history). Pipeline artifacts in
 session scratchpad `e2/` (pools, ledger, digests, dual extractions, grades.json).
 
 ## Setup
 
-- 20 queries (12 CSR + 8 anukriti), frozen Jul-15 rank lists reused as arm rankings
+- 20 queries (12 CSR + 8 second-corpus), frozen Jul-15 rank lists reused as arm rankings
   (single documented index build; arms NOT re-run — no fresh contamination surface).
 - Pool = arm A top-10 ∪ arm B top-10 ∪ date-filtered code-graph file-touch = 211 items;
   205 digested (6 unrecoverable: JSONL purged AND absent from DB, disclosed).

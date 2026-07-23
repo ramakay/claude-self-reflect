@@ -13,8 +13,8 @@ records of the exact protocol run on 2026-07-16..17; adapt paths to reproduce.
 ## E2 — Ratification-derived graded gold (`e2/`)
 
 Graded relevance gold built from the operator's own dialog-acts + external ship
-ledgers, with sealed pre-registration. Results: `docs/plans/saga-e2-results.md`;
-protocol audit: `docs/plans/saga-e2-audit-packet.md`.
+ledgers, with sealed pre-registration. Results: `docs/plans/saga-e2-results.md`
+(the protocol audit packet is an internal doc, preserved in repo history).
 
 | File | Role |
 |---|---|
