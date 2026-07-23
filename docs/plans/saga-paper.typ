@@ -57,9 +57,8 @@
   #text(size: 17pt, weight: "bold")[Similarity Drowns Intent: Three-Trace Sagas and Reinstatement Recall for Provenance in Agentic Software Construction]
 
   #v(1.2em)
-  #text(size: 12pt)[Ramakrishnan Annaswamy] \
-  #text(size: 11pt)[Independent Researcher] \
-  #text(size: 10pt, font: "DejaVu Sans Mono")[rama\@procsolve.com]
+  #text(size: 12pt)[Rama Annaswamy] \
+  #text(size: 11pt)[Independent Research]
 
   #v(0.6em)
   #text(size: 11pt)[July 17, 2026]
