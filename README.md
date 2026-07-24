@@ -104,7 +104,9 @@ Higher quality context. Better decisions. Fewer tokens.
 curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
 ```
 
-One command. Downloads the binary, runs setup, registers MCP server, installs 6 hooks. Restart Claude Code.
+Downloads the binary (SHA256-verified), then asks before activating. Setup — which registers the MCP server, installs 6 hooks, and imports your conversations — only runs with your consent. Restart Claude Code after.
+
+Non-interactive installs never activate on their own: set `CSR_AUTO_SETUP=1` to opt in, or run `csr-engine setup` yourself.
 
 | Platform | Support |
 |----------|---------|
@@ -118,7 +120,10 @@ One command. Downloads the binary, runs setup, registers MCP server, installs 6 
 
 ```bash
 npm install -g claude-self-reflect
+csr-engine setup   # activation is a separate, explicit step
 ```
+
+`npm install` only downloads the checksummed binary — it never touches `~/.claude` or indexes conversations. Activation happens when you run `csr-engine setup`.
 
 </details>
 

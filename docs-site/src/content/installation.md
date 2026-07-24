@@ -16,7 +16,23 @@ No Docker. No Python. No API keys.
 curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
 ```
 
-Downloads the binary and auto-runs setup: imports conversations, registers MCP server, installs all 6 hooks.
+Downloads the binary (SHA256-verified) and then **asks before activating**. Setup — which imports conversations, registers the MCP server, and installs all 6 hooks — only runs after you confirm at the prompt.
+
+Non-interactive installs (CI, scripts) never activate automatically. Control the behavior with:
+
+| Variable | Effect |
+|----------|--------|
+| `CSR_AUTO_SETUP=1` | Run setup without prompting |
+| `CSR_SKIP_SETUP=1` | Download only, never run setup |
+
+### npm
+
+```bash
+npm install -g claude-self-reflect
+csr-engine setup
+```
+
+`npm install` only downloads the checksummed binary. It never modifies `~/.claude/settings.json`, registers MCP servers, or indexes conversations — activation is the separate, explicit `csr-engine setup` step (or set `CSR_AUTO_SETUP=1` during install to opt in).
 
 ## Verify
 

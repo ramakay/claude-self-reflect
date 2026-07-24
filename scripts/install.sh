@@ -4,6 +4,11 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
+#
+# Environment variables:
+#   CSR_INSTALL_DIR    — Binary install directory (default: ~/.local/bin)
+#   CSR_SKIP_SETUP=1   — Download only; never run `csr-engine setup`
+#   CSR_AUTO_SETUP=1   — Run setup without prompting (automation)
 
 set -e
 
@@ -180,8 +185,29 @@ Build from source instead:
     verify
     check_path
 
-    # Auto-run setup if binary is on PATH
-    if command -v "$BINARY_NAME" >/dev/null 2>&1 || [ -x "${INSTALL_DIR}/${BINARY_NAME}" ]; then
+    # Setup writes hooks into ~/.claude/settings.json, registers the MCP
+    # server, and imports conversation transcripts — that needs explicit
+    # consent. Prompt when a terminal is available; otherwise (CI, piped
+    # non-interactive shells) leave activation to the user.
+    RUN_SETUP=no
+    if [ "${CSR_SKIP_SETUP:-}" = "1" ]; then
+        RUN_SETUP=no
+    elif [ "${CSR_AUTO_SETUP:-}" = "1" ]; then
+        RUN_SETUP=yes
+    elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        printf '\n  Setup registers the MCP server, installs 6 Claude Code hooks\n' > /dev/tty
+        printf '  into ~/.claude/settings.json, and imports your conversations\n' > /dev/tty
+        printf '  from ~/.claude/projects/ into a local index.\n\n' > /dev/tty
+        printf '  \033[1mRun setup now? [Y/n]\033[0m ' > /dev/tty
+        answer=""
+        read -r answer < /dev/tty || answer=""
+        case "$answer" in
+            [Nn]*) RUN_SETUP=no ;;
+            *)     RUN_SETUP=yes ;;
+        esac
+    fi
+
+    if [ "$RUN_SETUP" = "yes" ]; then
         printf '\n  \033[1mRunning setup...\033[0m\n\n'
         if "${INSTALL_DIR}/${BINARY_NAME}" setup 2>&1; then
             printf '\n  \033[32m✓\033[0m  Done. Restart Claude Code to activate.\n\n'
@@ -191,9 +217,9 @@ Build from source instead:
             printf '    # Then restart Claude Code\n\n'
         fi
     else
-        printf '\n  \033[1mNext steps:\033[0m\n'
+        printf '\n  \033[1mNot yet active.\033[0m To register MCP, install hooks, and import conversations:\n'
         printf '    %s setup\n' "$BINARY_NAME"
-        printf '    # Restart Claude Code\n\n'
+        printf '    # Then restart Claude Code\n\n'
     fi
 }
 

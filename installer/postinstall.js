@@ -2,11 +2,15 @@
 
 /**
  * Post-install hook for npm.
- * Downloads the csr-engine binary from GitHub Releases.
+ * Downloads the csr-engine binary from GitHub Releases and verifies its
+ * checksum. Nothing else: activation (hook registration, MCP registration,
+ * conversation import) only happens when the user explicitly runs
+ * `csr-engine setup` — postinstall must never touch ~/.claude or index data.
  * Detects existing Python CSR installations and guides upgrade.
  *
  * Environment variables:
  *   CSR_SKIP_BINARY_DOWNLOAD=1  — Skip binary download (CI, offline, custom builds)
+ *   CSR_AUTO_SETUP=1            — Opt in to running `csr-engine setup` after download
  */
 
 import {
@@ -301,13 +305,23 @@ async function main() {
 
     console.log(`  \x1b[1;32mInstalled:\x1b[0m ${destPath}`);
 
-    // Auto-run setup
-    console.log('  Running setup...');
-    try {
-      execFileSync(destPath, ['setup'], { stdio: 'inherit', timeout: 60000 });
-      console.log('\n  \x1b[32mDone. Restart Claude Code to activate.\x1b[0m\n');
-    } catch {
-      console.log('\n  Setup encountered errors. Run manually: csr-engine setup\n');
+    // Activation is a separate consent event: setup writes hooks into
+    // ~/.claude/settings.json, registers the MCP server, and imports
+    // conversation transcripts. Never do that from a package manager
+    // lifecycle script unless the user explicitly opted in.
+    if (process.env.CSR_AUTO_SETUP === '1') {
+      console.log('  CSR_AUTO_SETUP=1 — running setup...');
+      try {
+        execFileSync(destPath, ['setup'], { stdio: 'inherit', timeout: 60000 });
+        console.log('\n  \x1b[32mDone. Restart Claude Code to activate.\x1b[0m\n');
+      } catch {
+        console.log('\n  Setup encountered errors. Run manually: csr-engine setup\n');
+      }
+    } else {
+      console.log('\n  \x1b[1mNot yet active.\x1b[0m To register the MCP server, install hooks,');
+      console.log('  and import your conversations, run:');
+      console.log('\n    \x1b[1;32mcsr-engine setup\x1b[0m\n');
+      console.log('  Then restart Claude Code.\n');
     }
 
     if (pythonSignals.length > 0) {
