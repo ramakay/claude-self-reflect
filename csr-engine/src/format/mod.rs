@@ -12,10 +12,57 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Preview truncation length (chars, not bytes) used across all result renderers.
+pub const PREVIEW_CHARS: usize = 500;
+
+/// Return the longest prefix of `s` with at most `max` chars, cut on a char
+/// boundary (never panics on multi-byte UTF-8, unlike `&s[..max]` byte slicing).
+pub fn truncate_chars(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
 /// A search result enriched with chunk metadata.
 pub struct EnrichedResult {
     pub score: f32,
     pub chunk: ConversationChunk,
+}
+
+/// Drop multi-route and near-duplicate results, keeping first occurrence.
+///
+/// Input is assumed sorted by score descending. A result is dropped if either:
+/// - its `chunk.id` was already seen, or
+/// - the compound key `(conversation_id, normalized 200-char content prefix)`
+///   was already seen.
+///
+/// Normalization: lowercase, collapse whitespace, take first 200 chars.
+/// Cross-conversation collapsing is out of scope — identical content from
+/// different conversation_ids both survive.
+pub fn dedupe_results(results: &mut Vec<EnrichedResult>) {
+    use std::collections::HashSet;
+
+    let mut seen_ids = HashSet::new();
+    let mut seen_keys = HashSet::new();
+
+    results.retain(|r| {
+        if !seen_ids.insert(r.chunk.id.clone()) {
+            return false;
+        }
+        let normalized: String = r
+            .chunk
+            .content
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(200)
+            .collect();
+        let compound = (r.chunk.conversation_id.clone(), normalized);
+        seen_keys.insert(compound)
+    });
 }
 
 /// Format search results as rich XML matching the Python server output.
@@ -69,8 +116,8 @@ pub fn format_search_results(
         };
 
         let preview = &results[0].chunk.content;
-        let preview_short = if preview.len() > 100 {
-            format!("{}...", &preview[..100])
+        let preview_short = if preview.chars().count() > 100 {
+            format!("{}...", truncate_chars(preview, 100))
         } else {
             preview.clone()
         };
@@ -121,17 +168,8 @@ pub fn format_search_results(
             xml_escape(&r.chunk.project_name)
         ));
 
-        // Relative time
-        if let Some(ts) = parse_timestamp(&r.chunk.timestamp) {
-            let now = Utc::now();
-            let days_ago = (now - ts).num_days();
-            let time_str = match days_ago {
-                0 => "today".to_string(),
-                1 => "yesterday".to_string(),
-                d => format!("{}d", d),
-            };
-            out.push_str(&format!("      <t>{}</t>\n", time_str));
-        }
+        // Age stamp
+        out.push_str(&format!("      <t>{}</t>\n", age_stamp(&r.chunk.timestamp)));
 
         // Excerpt
         let excerpt = &r.chunk.content;
@@ -164,10 +202,10 @@ pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
         out.push_str(&format!("    <score>{:.3}</score>\n", top.score));
         out.push_str(&format!(
             "    <timestamp>{}</timestamp>\n",
-            top.chunk.timestamp
+            age_stamp(&top.chunk.timestamp)
         ));
-        let preview = if top.chunk.content.len() > 200 {
-            format!("{}...", &top.chunk.content[..200])
+        let preview = if top.chunk.content.chars().count() > PREVIEW_CHARS {
+            format!("{}...", truncate_chars(&top.chunk.content, PREVIEW_CHARS))
         } else {
             top.chunk.content.clone()
         };
@@ -265,12 +303,12 @@ pub fn format_recent_work(chunks: &[ConversationChunk], group_by: &str) -> Strin
             out.push_str(&format!("<recent_work conversations='{}'>\n", convs.len()));
             for (conv_id, conv_chunks) in convs.iter().rev() {
                 let most_recent = conv_chunks.iter().max_by_key(|c| &c.timestamp).unwrap();
-                let preview = if most_recent.content.len() > 200 {
-                    format!("{}...", &most_recent.content[..200])
+                let preview = if most_recent.content.chars().count() > PREVIEW_CHARS {
+                    format!("{}...", truncate_chars(&most_recent.content, PREVIEW_CHARS))
                 } else {
                     most_recent.content.clone()
                 };
-                let relative = relative_time_str(&most_recent.timestamp);
+                let relative = age_stamp(&most_recent.timestamp);
                 out.push_str(&format!(
                     "  <conversation id='{}' time='{}' project='{}'>\n",
                     conv_id, relative, most_recent.project_name
@@ -311,9 +349,9 @@ pub fn format_recency_results(
     ));
 
     for (i, r) in results.iter().enumerate() {
-        let relative = relative_time_str(&r.chunk.timestamp);
-        let preview = if r.chunk.content.len() > 200 {
-            format!("{}...", &r.chunk.content[..200])
+        let relative = age_stamp(&r.chunk.timestamp);
+        let preview = if r.chunk.content.chars().count() > PREVIEW_CHARS {
+            format!("{}...", truncate_chars(&r.chunk.content, PREVIEW_CHARS))
         } else {
             r.chunk.content.clone()
         };
@@ -399,8 +437,8 @@ pub fn format_more_results(
     ));
 
     for (i, r) in results.iter().enumerate() {
-        let preview = if r.chunk.content.len() > 200 {
-            format!("{}...", &r.chunk.content[..200])
+        let preview = if r.chunk.content.chars().count() > PREVIEW_CHARS {
+            format!("{}...", truncate_chars(&r.chunk.content, PREVIEW_CHARS))
         } else {
             r.chunk.content.clone()
         };
@@ -408,7 +446,7 @@ pub fn format_more_results(
         out.push_str(&format!("    <score>{:.3}</score>\n", r.score));
         out.push_str(&format!(
             "    <timestamp>{}</timestamp>\n",
-            xml_escape(&r.chunk.timestamp)
+            xml_escape(&age_stamp(&r.chunk.timestamp))
         ));
         out.push_str(&format!(
             "    <preview>{}</preview>\n",
@@ -439,9 +477,9 @@ pub fn format_file_results(chunks: &[ConversationChunk], file_path: &str) -> Str
     ));
 
     for (i, chunk) in chunks.iter().enumerate() {
-        let relative = relative_time_str(&chunk.timestamp);
-        let preview = if chunk.content.len() > 200 {
-            format!("{}...", &chunk.content[..200])
+        let relative = age_stamp(&chunk.timestamp);
+        let preview = if chunk.content.chars().count() > PREVIEW_CHARS {
+            format!("{}...", truncate_chars(&chunk.content, PREVIEW_CHARS))
         } else {
             chunk.content.clone()
         };
@@ -515,7 +553,7 @@ pub fn format_session_learnings(
             out.push_str(&format!("    <learning iteration=\"{}\">\n", iteration));
             out.push_str(&format!(
                 "      <timestamp>{}</timestamp>\n",
-                xml_escape(timestamp)
+                xml_escape(&age_stamp(timestamp))
             ));
             out.push_str(&format!(
                 "      <content>{}</content>\n",
@@ -547,6 +585,19 @@ fn relative_time_str(timestamp: &str) -> String {
         }
     } else {
         "unknown".into()
+    }
+}
+
+/// Render an absolute-date + relative-age stamp: `as of 2026-07-03 (3w ago)`.
+/// Falls back to the raw string unchanged if the timestamp cannot be parsed.
+pub fn age_stamp(timestamp: &str) -> String {
+    match parse_timestamp(timestamp) {
+        Some(ts) => format!(
+            "as of {} ({})",
+            ts.format("%Y-%m-%d"),
+            relative_time_str(timestamp)
+        ),
+        None => timestamp.to_string(),
     }
 }
 
@@ -673,4 +724,123 @@ pub fn format_code_graph(
 /// Parse a JSON string array of names; empty vec on any error.
 fn parse_json_names(json: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(json).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provenance::Speaker;
+
+    fn make_chunk(id: &str, conversation_id: &str, content: &str) -> ConversationChunk {
+        ConversationChunk {
+            id: id.into(),
+            conversation_id: conversation_id.into(),
+            project_name: "test-project".into(),
+            timestamp: "2026-01-15T10:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        }
+    }
+
+    #[test]
+    fn truncate_chars_multi_byte_boundary() {
+        // Chinese chars are 3 bytes each; truncating by byte count would panic.
+        let s = "你好世界你好世界"; // 8 chars
+        let result = truncate_chars(s, 4);
+        assert_eq!(result.chars().count(), 4);
+        assert_eq!(result, "你好世界");
+    }
+
+    #[test]
+    fn truncate_chars_max_larger_than_string() {
+        let s = "café";
+        assert_eq!(truncate_chars(s, 100), s);
+        assert_eq!(truncate_chars(s, 4), s);
+    }
+
+    #[test]
+    fn age_stamp_valid_iso() {
+        let stamp = age_stamp("2026-01-01T00:00:00Z");
+        assert!(stamp.starts_with("as of 2026-01-01 ("), "got: {stamp}");
+        assert!(stamp.contains(')'), "got: {stamp}");
+    }
+
+    #[test]
+    fn age_stamp_unparseable_unchanged() {
+        assert_eq!(age_stamp("not-a-timestamp"), "not-a-timestamp");
+    }
+
+    #[test]
+    fn dedupe_drops_duplicate_chunk_id() {
+        let mut results = vec![
+            EnrichedResult {
+                score: 0.9,
+                chunk: make_chunk("same-id", "conv-a", "content A"),
+            },
+            EnrichedResult {
+                score: 0.5,
+                chunk: make_chunk("same-id", "conv-b", "content B"),
+            },
+        ];
+        dedupe_results(&mut results);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].score, 0.9);
+        assert_eq!(results[0].chunk.content, "content A");
+    }
+
+    #[test]
+    fn dedupe_drops_same_conversation_same_prefix_different_ids() {
+        let content = "shared prefix content that is long enough for testing";
+        let mut results = vec![
+            EnrichedResult {
+                score: 0.9,
+                chunk: make_chunk("id-1", "conv-1", content),
+            },
+            EnrichedResult {
+                score: 0.7,
+                chunk: make_chunk("id-2", "conv-1", content),
+            },
+        ];
+        dedupe_results(&mut results);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk.id, "id-1");
+    }
+
+    #[test]
+    fn dedupe_keeps_different_conversations_same_content() {
+        let content = "identical content across conversations";
+        let mut results = vec![
+            EnrichedResult {
+                score: 0.9,
+                chunk: make_chunk("id-1", "conv-1", content),
+            },
+            EnrichedResult {
+                score: 0.8,
+                chunk: make_chunk("id-2", "conv-2", content),
+            },
+        ];
+        dedupe_results(&mut results);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn dedupe_normalizes_whitespace_and_case_within_conversation() {
+        let mut results = vec![
+            EnrichedResult {
+                score: 0.9,
+                chunk: make_chunk("id-1", "conv-1", "Hello   World"),
+            },
+            EnrichedResult {
+                score: 0.7,
+                chunk: make_chunk("id-2", "conv-1", "hello world"),
+            },
+        ];
+        dedupe_results(&mut results);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk.id, "id-1");
+    }
 }

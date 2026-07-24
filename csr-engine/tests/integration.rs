@@ -399,6 +399,86 @@ fn test_format_search_results_structure() {
         "should contain content"
     );
     assert!(xml.contains("conv-1"), "should contain conversation ID");
+    assert!(xml.contains("as of "), "should render age stamp in <t> tag");
+}
+
+#[test]
+fn test_format_recency_results_includes_age_stamp() {
+    let results = vec![EnrichedResult {
+        score: 0.80,
+        chunk: ConversationChunk {
+            id: "r1".into(),
+            conversation_id: "conv-recency".into(),
+            project_name: "test-project".into(),
+            timestamp: "2026-01-15T10:00:00Z".into(),
+            content: "Recency search hit content".into(),
+            message_count: 2,
+            summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        },
+    }];
+
+    let xml = format::format_recency_results(&results, "recency query", "last 7 days");
+    assert!(
+        xml.contains("as of "),
+        "should render age stamp in recency results"
+    );
+    assert!(xml.contains("Recency search hit content"));
+}
+
+#[test]
+fn test_dedupe_results_collapses_same_conversation_duplicate() {
+    let shared = "the shared content string for dedupe integration test";
+    let mut results = vec![
+        EnrichedResult {
+            score: 0.95,
+            chunk: ConversationChunk {
+                id: "dup-a".into(),
+                conversation_id: "conv-shared".into(),
+                project_name: "test-project".into(),
+                timestamp: "2026-01-15T10:00:00Z".into(),
+                content: shared.into(),
+                message_count: 1,
+                summary: None,
+                author: csr_engine::provenance::Speaker::ToolResult,
+                seq: 0,
+                is_sidechain: false,
+            },
+        },
+        EnrichedResult {
+            score: 0.70,
+            chunk: ConversationChunk {
+                id: "dup-b".into(),
+                conversation_id: "conv-shared".into(),
+                project_name: "test-project".into(),
+                timestamp: "2026-01-15T11:00:00Z".into(),
+                content: shared.into(),
+                message_count: 1,
+                summary: None,
+                author: csr_engine::provenance::Speaker::ToolResult,
+                seq: 1,
+                is_sidechain: false,
+            },
+        },
+    ];
+
+    csr_engine::format::dedupe_results(&mut results);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].score, 0.95);
+
+    let output = format::format_search_results(&results, "dedupe", "test-project", 1, 1);
+    // Content appears in both <preview> and <excerpt>; assert a single result rank.
+    assert!(
+        output.contains(shared),
+        "output should include shared content"
+    );
+    assert_eq!(
+        output.matches("<r rank=").count(),
+        1,
+        "exactly one result element after dedupe"
+    );
 }
 
 #[test]
