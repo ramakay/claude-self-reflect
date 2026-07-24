@@ -2,7 +2,7 @@
 title: MCP Tools Reference
 ---
 
-13 tools available to Claude automatically via MCP.
+15 tools available to Claude automatically via MCP.
 
 ## Search Tools
 
@@ -52,6 +52,22 @@ Retrieve complete JSONL conversation by ID.
 Iteration-level memory for Ralph loops.
 
 ## Storage Tools
+
+### csr_why
+
+Provenance chain — why does this code or decision exist. Reinstatement recall: seed search, blended second hop through the code graph and episode chains.
+
+```
+csr_why("why does the rerank scaffold demotion exist")
+```
+
+### csr_resolve
+
+Record a verified verdict about chunks surfaced in search results: `resolved`, `still_open`, or `regressed`. Append-only ledger — future searches annotate these chunks and demote resolved ones within the page; a `regressed` verdict re-opens them. Use after verifying a recalled item against the repo or real world. Pass chunk ids from the `<id>` tags in search results.
+
+```
+csr_resolve(chunk_ids=["..."], status="resolved", evidence="shipped vc75, verified in app.json")
+```
 
 ### store_reflection
 Store insights for future retrieval. Embedded and indexed immediately.

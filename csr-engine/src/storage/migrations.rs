@@ -338,6 +338,21 @@ pub fn run(conn: &Connection) -> Result<()> {
          );",
     )?;
 
+    // Migration: resolution ledger (v9.4+) — append-only verdicts per chunk_id;
+    // latest row wins on read. No FK on chunk_id (may reference reflections too).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS resolution_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chunk_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('resolved','still_open','regressed')),
+            evidence TEXT NOT NULL,
+            claim TEXT,
+            source TEXT NOT NULL DEFAULT 'agent',
+            created_at TEXT DEFAULT (datetime('now'))
+         );
+         CREATE INDEX IF NOT EXISTS idx_resolution_chunk ON resolution_ledger(chunk_id, id);",
+    )?;
+
     Ok(())
 }
 
@@ -368,6 +383,20 @@ mod tests {
             )
             .is_ok(),
             "ratification_scores table must exist after migration"
+        );
+    }
+
+    #[test]
+    fn resolution_ledger_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare(
+                "SELECT chunk_id, status, evidence, claim, source, created_at FROM resolution_ledger LIMIT 0"
+            )
+            .is_ok(),
+            "resolution_ledger table must exist after migration"
         );
     }
 }
