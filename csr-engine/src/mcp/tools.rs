@@ -320,6 +320,8 @@ pub async fn reflect_on_past(
         let _ = storage.log_retrieval_event(&e.chunk.id, "chunk", "mcp_search", "mcp");
     }
 
+    format::dedupe_results(&mut enriched);
+
     Ok(format::format_search_results(
         &enriched,
         query,
@@ -648,7 +650,11 @@ fn format_why(query: &str, items: &[crate::search::reinstatement::EvidenceItem])
         for it in &group {
             out.push_str(&format!(
                 "  via={} score={:.3} [{}] conv_{}: {}\n",
-                it.via, it.score, it.timestamp, it.conversation_id, it.excerpt
+                it.via,
+                it.score,
+                format::age_stamp(&it.timestamp),
+                it.conversation_id,
+                it.excerpt
             ));
         }
         out.push('\n');
@@ -851,7 +857,7 @@ fn enrich_results(
     let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
     let chunks = storage.get_chunks_by_ids(&ids)?;
 
-    Ok(results
+    let mut enriched_vec: Vec<EnrichedResult> = results
         .iter()
         .filter_map(|r| {
             chunks
@@ -862,7 +868,9 @@ fn enrich_results(
                     chunk: c.clone(),
                 })
         })
-        .collect())
+        .collect();
+    format::dedupe_results(&mut enriched_vec);
+    Ok(enriched_vec)
 }
 
 #[cfg(test)]

@@ -235,9 +235,9 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// First ~200 chars of content, newlines/carriage-returns flattened to spaces.
+/// First ~PREVIEW_CHARS chars of content, newlines/carriage-returns flattened to spaces.
 fn clean_excerpt(content: &str) -> String {
-    let s: String = content.chars().take(200).collect();
+    let s: String = content.chars().take(crate::format::PREVIEW_CHARS).collect();
     s.replace(['\n', '\r'], " ")
 }
 
@@ -660,9 +660,9 @@ mod tests {
 
     #[test]
     fn excerpt_truncates_and_cleans_newlines() {
-        let long = "a".repeat(300) + "\nline2\r\nline3";
+        let long = "a".repeat(600) + "\nline2\r\nline3";
         let e = clean_excerpt(&long);
-        assert_eq!(e.chars().count(), 200);
+        assert_eq!(e.chars().count(), crate::format::PREVIEW_CHARS);
         assert!(!e.contains('\n'));
         assert!(!e.contains('\r'));
     }
