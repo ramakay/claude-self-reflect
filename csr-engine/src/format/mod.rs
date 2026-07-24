@@ -28,6 +28,8 @@ pub fn truncate_chars(s: &str, max: usize) -> &str {
 pub struct EnrichedResult {
     pub score: f32,
     pub chunk: ConversationChunk,
+    /// Resolution-ledger annotation, when a verdict has been recorded for this chunk.
+    pub resolution: Option<String>,
 }
 
 /// Drop multi-route and near-duplicate results, keeping first occurrence.
@@ -180,10 +182,34 @@ pub fn format_search_results(
 
         // Conversation ID
         out.push_str(&format!("      <cid>{}</cid>\n", r.chunk.conversation_id));
+        out.push_str(&format!("      <id>{}</id>\n", r.chunk.id));
+
+        if let Some(ref note) = r.resolution {
+            out.push_str(&format!(
+                "      <resolution>{}</resolution>\n",
+                xml_escape(note)
+            ));
+        }
 
         out.push_str("    </r>\n");
     }
     out.push_str("  </results>\n");
+
+    let resolved_count = results
+        .iter()
+        .filter(|r| {
+            r.resolution
+                .as_deref()
+                .is_some_and(|s| s.starts_with("resolved"))
+        })
+        .count();
+    if resolved_count > 0 {
+        out.push_str(&format!(
+            "  <note>{} resolved item(s) demoted within page — matched but verified addressed</note>\n",
+            resolved_count
+        ));
+    }
+
     out.push_str("</search>\n");
 
     out
@@ -369,6 +395,12 @@ pub fn format_recency_results(
             "    <conversation_id>{}</conversation_id>\n",
             xml_escape(&r.chunk.conversation_id)
         ));
+        if let Some(ref note) = r.resolution {
+            out.push_str(&format!(
+                "    <resolution>{}</resolution>\n",
+                xml_escape(note)
+            ));
+        }
         out.push_str("  </result>\n");
     }
 
@@ -452,6 +484,12 @@ pub fn format_more_results(
             "    <preview>{}</preview>\n",
             xml_escape(&preview)
         ));
+        if let Some(ref note) = r.resolution {
+            out.push_str(&format!(
+                "    <resolution>{}</resolution>\n",
+                xml_escape(note)
+            ));
+        }
         out.push_str("  </result>\n");
     }
 
@@ -598,6 +636,24 @@ pub fn age_stamp(timestamp: &str) -> String {
             relative_time_str(timestamp)
         ),
         None => timestamp.to_string(),
+    }
+}
+
+/// Render a resolution-ledger entry as a short annotation string.
+/// `created_at` is an RFC3339 timestamp; only the date portion (first 10
+/// chars, `YYYY-MM-DD`) is shown — falls back to the full string if shorter
+/// than 10 chars.
+pub fn resolution_note(entry_status: &str, evidence: &str, created_at: &str) -> String {
+    let date = if created_at.len() >= 10 {
+        &created_at[..10]
+    } else {
+        created_at
+    };
+    match entry_status {
+        "resolved" => format!("resolved — {} (verified {})", evidence, date),
+        "still_open" => format!("still open — verified {}", date),
+        "regressed" => format!("regressed — {} ({})", evidence, date),
+        other => format!("{} — {} ({})", other, evidence, date),
     }
 }
 
@@ -780,10 +836,12 @@ mod tests {
             EnrichedResult {
                 score: 0.9,
                 chunk: make_chunk("same-id", "conv-a", "content A"),
+                resolution: None,
             },
             EnrichedResult {
                 score: 0.5,
                 chunk: make_chunk("same-id", "conv-b", "content B"),
+                resolution: None,
             },
         ];
         dedupe_results(&mut results);
@@ -799,10 +857,12 @@ mod tests {
             EnrichedResult {
                 score: 0.9,
                 chunk: make_chunk("id-1", "conv-1", content),
+                resolution: None,
             },
             EnrichedResult {
                 score: 0.7,
                 chunk: make_chunk("id-2", "conv-1", content),
+                resolution: None,
             },
         ];
         dedupe_results(&mut results);
@@ -817,10 +877,12 @@ mod tests {
             EnrichedResult {
                 score: 0.9,
                 chunk: make_chunk("id-1", "conv-1", content),
+                resolution: None,
             },
             EnrichedResult {
                 score: 0.8,
                 chunk: make_chunk("id-2", "conv-2", content),
+                resolution: None,
             },
         ];
         dedupe_results(&mut results);
@@ -833,14 +895,80 @@ mod tests {
             EnrichedResult {
                 score: 0.9,
                 chunk: make_chunk("id-1", "conv-1", "Hello   World"),
+                resolution: None,
             },
             EnrichedResult {
                 score: 0.7,
                 chunk: make_chunk("id-2", "conv-1", "hello world"),
+                resolution: None,
             },
         ];
         dedupe_results(&mut results);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.id, "id-1");
+    }
+
+    #[test]
+    fn resolution_note_formats_resolved() {
+        let note = resolution_note("resolved", "shipped commit abc123", "2026-07-20T10:00:00Z");
+        assert!(note.starts_with("resolved —"), "got: {note}");
+        assert!(note.contains("shipped commit abc123"));
+        assert!(note.contains("2026-07-20"));
+    }
+
+    #[test]
+    fn resolution_note_formats_still_open() {
+        let note = resolution_note("still_open", "unused evidence", "2026-07-20T10:00:00Z");
+        assert!(note.starts_with("still open —"), "got: {note}");
+        assert!(note.contains("2026-07-20"));
+    }
+
+    #[test]
+    fn resolution_note_formats_regressed() {
+        let note = resolution_note("regressed", "broke again in v9.4", "2026-07-20T10:00:00Z");
+        assert!(note.starts_with("regressed —"), "got: {note}");
+        assert!(note.contains("broke again in v9.4"));
+        assert!(note.contains("2026-07-20"));
+    }
+
+    #[test]
+    fn format_search_results_renders_resolution_and_footer_count() {
+        let results = vec![
+            EnrichedResult {
+                score: 0.9,
+                chunk: make_chunk("id-open", "conv-1", "open item"),
+                resolution: None,
+            },
+            EnrichedResult {
+                score: 0.8,
+                chunk: make_chunk("id-resolved", "conv-1", "resolved item"),
+                resolution: Some(resolution_note(
+                    "resolved",
+                    "verified in prod",
+                    "2026-07-20T10:00:00Z",
+                )),
+            },
+        ];
+        let xml = format_search_results(&results, "q", "all", 1, 1);
+        assert!(xml.contains("<resolution>resolved"), "got: {xml}");
+        assert!(
+            xml.contains("<note>1 resolved item(s) demoted"),
+            "got: {xml}"
+        );
+        // The unresolved result must have no <resolution> tag rendered for it —
+        // check there is exactly one <resolution> element in total.
+        assert_eq!(xml.matches("<resolution>").count(), 1);
+    }
+
+    #[test]
+    fn format_search_results_no_resolution_tag_when_none() {
+        let results = vec![EnrichedResult {
+            score: 0.9,
+            chunk: make_chunk("id-1", "conv-1", "plain item"),
+            resolution: None,
+        }];
+        let xml = format_search_results(&results, "q", "all", 1, 1);
+        assert!(!xml.contains("<resolution>"), "got: {xml}");
+        assert!(!xml.contains("<note>"), "got: {xml}");
     }
 }

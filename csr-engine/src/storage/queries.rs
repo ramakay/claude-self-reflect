@@ -1969,6 +1969,91 @@ pub fn list_session_ids(conn: &Connection, prefix: &str, limit: usize) -> Result
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
+// ─── Resolution ledger ───
+
+/// Latest explicit verdict for a chunk (or reflection) id.
+#[derive(Debug, Clone)]
+pub struct ResolutionEntry {
+    pub status: String,
+    pub evidence: String,
+    pub claim: Option<String>,
+    pub created_at: String,
+}
+
+/// Append resolution verdicts for one or more chunk ids in a single transaction.
+/// Returns the number of rows inserted.
+pub fn insert_resolutions(
+    conn: &Connection,
+    chunk_ids: &[String],
+    status: &str,
+    evidence: &str,
+    claim: Option<&str>,
+    source: &str,
+) -> Result<usize> {
+    if chunk_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO resolution_ledger (chunk_id, status, evidence, claim, source, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for chunk_id in chunk_ids {
+            stmt.execute(params![chunk_id, status, evidence, claim, source, now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(chunk_ids.len())
+}
+
+/// Batch-fetch the latest resolution entry per chunk_id (highest `id` wins).
+/// Chunk ids with no ledger rows are absent from the returned map.
+pub fn get_resolutions_batch(
+    conn: &Connection,
+    chunk_ids: &[String],
+) -> Result<HashMap<String, ResolutionEntry>> {
+    if chunk_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders: Vec<String> = (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
+    let sql = format!(
+        "SELECT chunk_id, status, evidence, claim, source, created_at
+         FROM resolution_ledger
+         WHERE id IN (
+             SELECT MAX(id) FROM resolution_ledger WHERE chunk_id IN ({}) GROUP BY chunk_id
+         )",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> = chunk_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            ResolutionEntry {
+                status: row.get(1)?,
+                evidence: row.get(2)?,
+                claim: row.get(3)?,
+                created_at: row.get(5)?,
+            },
+        ))
+    })?;
+
+    let mut map = HashMap::new();
+    for row in rows {
+        let (chunk_id, entry) = row?;
+        map.insert(chunk_id, entry);
+    }
+    Ok(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

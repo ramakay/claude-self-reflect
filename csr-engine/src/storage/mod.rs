@@ -2,7 +2,9 @@ pub mod codegraph;
 pub mod migrations;
 pub mod queries;
 
-pub use queries::{NarrativeUsageRow, NarrativeUsageSummary, RatificationScoreRow};
+pub use queries::{
+    NarrativeUsageRow, NarrativeUsageSummary, RatificationScoreRow, ResolutionEntry,
+};
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -834,6 +836,30 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         codegraph::get_node_rank(&conn, id)
     }
+
+    // ─── Resolution ledger ───
+
+    /// Append resolution verdicts for one or more chunk ids.
+    pub fn insert_resolutions(
+        &self,
+        chunk_ids: &[String],
+        status: &str,
+        evidence: &str,
+        claim: Option<&str>,
+        source: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::insert_resolutions(&conn, chunk_ids, status, evidence, claim, source)
+    }
+
+    /// Batch-fetch latest resolution entries keyed by chunk_id.
+    pub fn get_resolutions_batch(
+        &self,
+        chunk_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, queries::ResolutionEntry>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_resolutions_batch(&conn, chunk_ids)
+    }
 }
 
 #[cfg(test)]
@@ -1088,5 +1114,83 @@ mod tests {
         let storage = Storage::open_memory().unwrap();
         // In-memory DBs have no WAL — the pragma must not error.
         let _ = storage.checkpoint_wal();
+    }
+
+    #[test]
+    fn resolution_ledger_insert_and_batch_read() {
+        let storage = Storage::open_memory().unwrap();
+        let n = storage
+            .insert_resolutions(
+                &["c1".to_string(), "c2".to_string()],
+                "resolved",
+                "test evidence",
+                None,
+                "agent",
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+
+        let map = storage
+            .get_resolutions_batch(&["c1".to_string(), "c2".to_string()])
+            .unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("c1").unwrap().status, "resolved");
+        assert_eq!(map.get("c2").unwrap().status, "resolved");
+        assert_eq!(map.get("c1").unwrap().evidence, "test evidence");
+    }
+
+    #[test]
+    fn resolution_ledger_latest_wins() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .insert_resolutions(&["c1".to_string()], "resolved", "first", None, "agent")
+            .unwrap();
+        storage
+            .insert_resolutions(&["c1".to_string()], "regressed", "later", None, "agent")
+            .unwrap();
+        storage
+            .insert_resolutions(&["c2".to_string()], "resolved", "ok", None, "agent")
+            .unwrap();
+
+        let map = storage
+            .get_resolutions_batch(&["c1".to_string(), "c2".to_string()])
+            .unwrap();
+        assert_eq!(map.get("c1").unwrap().status, "regressed");
+        assert_eq!(map.get("c2").unwrap().status, "resolved");
+    }
+
+    #[test]
+    fn resolution_ledger_unknown_id_absent() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .insert_resolutions(&["c1".to_string()], "resolved", "evidence", None, "agent")
+            .unwrap();
+
+        let map = storage
+            .get_resolutions_batch(&["c1".to_string(), "unknown-id".to_string()])
+            .unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("c1"));
+        assert!(!map.contains_key("unknown-id"));
+    }
+
+    #[test]
+    fn resolution_ledger_empty_batch() {
+        let storage = Storage::open_memory().unwrap();
+        let map = storage.get_resolutions_batch(&[]).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn resolution_ledger_invalid_status_errors() {
+        let storage = Storage::open_memory().unwrap();
+        let result = storage.insert_resolutions(
+            &["c1".to_string()],
+            "bogus_status",
+            "evidence",
+            None,
+            "agent",
+        );
+        assert!(result.is_err());
     }
 }

@@ -177,6 +177,18 @@ pub struct WhyParams {
     pub project: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResolveParams {
+    /// Chunk ids (from <id> tags in search results — NOT <cid>, which is the conversation id) this verdict applies to
+    pub chunk_ids: Vec<String>,
+    /// One of: resolved (verified addressed), still_open (verified still pending), regressed (previously resolved, broke again)
+    pub status: String,
+    /// What was verified and how, e.g. 'shipped vc75 commit 332ef68, confirmed in app.json'
+    pub evidence: String,
+    /// Optional short digest of the claim being resolved
+    pub claim: Option<String>,
+}
+
 // ─── MCP Server ───
 
 /// The MCP server that exposes CSR search/reflection tools.
@@ -647,6 +659,28 @@ impl CsrServer {
             &cfg,
         )
         .await;
+
+        tool_result(result)
+    }
+
+    #[tool(
+        name = "csr_resolve",
+        description = "Record an explicit verdict (resolved/still_open/regressed) about chunks surfaced in search results, verified against the repo or real world. Future searches annotate these chunks and demote resolved ones within the page. Verdict applies to the WHOLE chunk — for multi-claim chunks resolve only when all claims are addressed, otherwise use still_open. Append-only: a regressed verdict re-opens a resolved chunk.",
+        annotations(
+            title = "Record Resolution Verdict",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn resolve(
+        &self,
+        params: Parameters<ResolveParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+
+        let result =
+            tools::resolve_chunks(&self.storage, p.chunk_ids, p.status, p.evidence, p.claim).await;
 
         tool_result(result)
     }

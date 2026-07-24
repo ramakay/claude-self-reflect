@@ -90,6 +90,7 @@ fn lookup_by_conv_tag(
                     seq: 0,
                     is_sidechain: false,
                 },
+                resolution: None,
             }
         })
         .collect();
@@ -181,6 +182,7 @@ pub async fn reflect_on_past(
                 EnrichedResult {
                     score: final_score,
                     chunk: c.clone(),
+                    resolution: None,
                 }
             })
         })
@@ -246,6 +248,7 @@ pub async fn reflect_on_past(
                     seq: 0,
                     is_sidechain: false,
                 },
+                resolution: None,
             });
         }
     }
@@ -285,6 +288,7 @@ pub async fn reflect_on_past(
                         content: format!("[keyword] {}", chunk.content),
                         ..chunk
                     },
+                    resolution: None,
                 });
             }
         }
@@ -321,6 +325,7 @@ pub async fn reflect_on_past(
     }
 
     format::dedupe_results(&mut enriched);
+    apply_resolutions(&mut enriched, storage);
 
     Ok(format::format_search_results(
         &enriched,
@@ -360,6 +365,33 @@ pub async fn store_reflection(
     ))
 }
 
+/// Record a resolution verdict for one or more chunks.
+pub async fn resolve_chunks(
+    storage: &Arc<Storage>,
+    chunk_ids: Vec<String>,
+    status: String,
+    evidence: String,
+    claim: Option<String>,
+) -> Result<String> {
+    if !matches!(status.as_str(), "resolved" | "still_open" | "regressed") {
+        anyhow::bail!(
+            "invalid status '{}': must be resolved, still_open, or regressed",
+            status
+        );
+    }
+    if chunk_ids.is_empty() {
+        anyhow::bail!("chunk_ids must not be empty");
+    }
+    if evidence.trim().is_empty() {
+        anyhow::bail!("evidence must not be empty");
+    }
+
+    let n =
+        storage.insert_resolutions(&chunk_ids, &status, &evidence, claim.as_deref(), "agent")?;
+
+    Ok(format!("recorded {} verdict(s): {}", n, status))
+}
+
 /// Quick existence check — count + top match only.
 pub async fn quick_check(
     storage: &Arc<Storage>,
@@ -391,6 +423,7 @@ pub async fn quick_check(
                 .map(|c| EnrichedResult {
                     score: r.score,
                     chunk: c.clone(),
+                    resolution: None,
                 })
         })
         .collect();
@@ -866,11 +899,58 @@ fn enrich_results(
                 .map(|c| EnrichedResult {
                     score: r.score,
                     chunk: c.clone(),
+                    resolution: None,
                 })
         })
         .collect();
     format::dedupe_results(&mut enriched_vec);
+    apply_resolutions(&mut enriched_vec, storage);
     Ok(enriched_vec)
+}
+
+/// Annotate `enriched` results with any recorded resolution ledger verdicts
+/// (batch-fetched from storage) and stable-sink "resolved" entries to the
+/// bottom of the slice, preserving relative order otherwise. `still_open`
+/// and `regressed` verdicts annotate but do not move. Non-fatal: a storage
+/// error here must never fail the calling search.
+pub fn apply_resolutions(enriched: &mut Vec<EnrichedResult>, storage: &Arc<Storage>) {
+    if enriched.is_empty() {
+        return;
+    }
+    let chunk_ids: Vec<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
+    let ledger = match storage.get_resolutions_batch(&chunk_ids) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if ledger.is_empty() {
+        return;
+    }
+
+    for e in enriched.iter_mut() {
+        if let Some(entry) = ledger.get(&e.chunk.id) {
+            e.resolution = Some(format::resolution_note(
+                &entry.status,
+                &entry.evidence,
+                &entry.created_at,
+            ));
+        }
+    }
+
+    let mut unresolved = Vec::with_capacity(enriched.len());
+    let mut resolved = Vec::new();
+    for e in std::mem::take(enriched) {
+        let is_resolved = ledger
+            .get(&e.chunk.id)
+            .map(|entry| entry.status == "resolved")
+            .unwrap_or(false);
+        if is_resolved {
+            resolved.push(e);
+        } else {
+            unresolved.push(e);
+        }
+    }
+    unresolved.extend(resolved);
+    *enriched = unresolved;
 }
 
 #[cfg(test)]

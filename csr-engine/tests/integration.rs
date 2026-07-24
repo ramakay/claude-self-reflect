@@ -386,6 +386,7 @@ fn test_format_search_results_structure() {
             seq: 0,
             is_sidechain: false,
         },
+        resolution: None,
     }];
 
     let xml = format::format_search_results(&results, "docker memory", "test-project", 5, 2);
@@ -418,6 +419,7 @@ fn test_format_recency_results_includes_age_stamp() {
             seq: 0,
             is_sidechain: false,
         },
+        resolution: None,
     }];
 
     let xml = format::format_recency_results(&results, "recency query", "last 7 days");
@@ -446,6 +448,7 @@ fn test_dedupe_results_collapses_same_conversation_duplicate() {
                 seq: 0,
                 is_sidechain: false,
             },
+            resolution: None,
         },
         EnrichedResult {
             score: 0.70,
@@ -461,6 +464,7 @@ fn test_dedupe_results_collapses_same_conversation_duplicate() {
                 seq: 1,
                 is_sidechain: false,
             },
+            resolution: None,
         },
     ];
 
@@ -497,6 +501,7 @@ fn test_format_quick_check_structure() {
             seq: 0,
             is_sidechain: false,
         },
+        resolution: None,
     }];
 
     let xml = format::format_quick_check(&results, "JWT auth");
@@ -532,6 +537,7 @@ fn test_xml_escaping_in_output() {
             seq: 0,
             is_sidechain: false,
         },
+        resolution: None,
     }];
 
     let xml = format::format_search_results(&results, "test <query>", "test & <project>", 0, 0);
@@ -541,6 +547,87 @@ fn test_xml_escaping_in_output() {
     // Query should be escaped
     assert!(xml.contains("test &lt;query&gt;"));
     // Content in CDATA is OK as-is (CDATA handles it)
+}
+
+#[test]
+fn test_resolve_and_annotate() {
+    let storage = std::sync::Arc::new(Storage::open_memory().unwrap());
+    storage
+        .insert_resolutions(
+            &["c-resolved".to_string()],
+            "resolved",
+            "shipped and verified",
+            None,
+            "agent",
+        )
+        .unwrap();
+
+    let mut enriched = vec![
+        EnrichedResult {
+            score: 0.9,
+            chunk: ConversationChunk {
+                id: "c-unresolved".into(),
+                conversation_id: "conv-1".into(),
+                project_name: "test".into(),
+                timestamp: "2026-01-15T10:00:00Z".into(),
+                content: "unresolved claim".into(),
+                message_count: 1,
+                summary: None,
+                author: csr_engine::provenance::Speaker::ToolResult,
+                seq: 0,
+                is_sidechain: false,
+            },
+            resolution: None,
+        },
+        EnrichedResult {
+            score: 0.8,
+            chunk: ConversationChunk {
+                id: "c-resolved".into(),
+                conversation_id: "conv-1".into(),
+                project_name: "test".into(),
+                timestamp: "2026-01-15T10:00:00Z".into(),
+                content: "resolved claim".into(),
+                message_count: 1,
+                summary: None,
+                author: csr_engine::provenance::Speaker::ToolResult,
+                seq: 1,
+                is_sidechain: false,
+            },
+            resolution: None,
+        },
+    ];
+
+    csr_engine::mcp::tools::apply_resolutions(&mut enriched, &storage);
+
+    assert_eq!(enriched.len(), 2);
+    assert_eq!(
+        enriched[0].chunk.id, "c-unresolved",
+        "unresolved entry stays first"
+    );
+    assert_eq!(
+        enriched[1].chunk.id, "c-resolved",
+        "resolved entry sinks to the bottom"
+    );
+    assert!(enriched[0].resolution.is_none());
+    assert!(enriched[1]
+        .resolution
+        .as_deref()
+        .unwrap()
+        .starts_with("resolved"));
+}
+
+#[test]
+fn test_resolve_chunks_invalid_status_errors() {
+    let storage = std::sync::Arc::new(Storage::open_memory().unwrap());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(csr_engine::mcp::tools::resolve_chunks(
+        &storage,
+        vec!["c1".to_string()],
+        "bogus".to_string(),
+        "some evidence".to_string(),
+        None,
+    ));
+    assert!(result.is_err());
 }
 
 // ─── Test 12: Temporal parsing ───
@@ -750,6 +837,7 @@ fn test_full_pipeline_storage_search_format() {
                 .map(|c| EnrichedResult {
                     score: r.score,
                     chunk: c.clone(),
+                    resolution: None,
                 })
         })
         .collect();
