@@ -3,6 +3,9 @@ name: Release
 on:
   push:
     tags: ['v*']
+    # A branch named release/vX.Y.Z releases tag vX.Y.Z; the tag is
+    # created by the release step when it publishes.
+    branches: ['release/v*']
   workflow_dispatch:
     inputs:
       tag:
@@ -86,7 +89,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag || (startsWith(github.ref, 'refs/heads/release/') && replace(github.ref_name, 'release/', '')) || github.ref_name }}
           files: |
             *.tar.gz
             checksums.txt
