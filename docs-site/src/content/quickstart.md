@@ -2,6 +2,8 @@
 title: Quick Start
 ---
 
+> Everything below assumes CSR is activated — you've run `csr-engine setup` and restarted Claude Code. Installing alone doesn't activate anything; see [Installation](#/docs/installation).
+
 ## Your First Search
 
 Open Claude Code and ask:
