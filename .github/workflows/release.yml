@@ -3,15 +3,24 @@ name: Release
 on:
   push:
     tags: ['v*']
-    # A branch named release/vX.Y.Z releases tag vX.Y.Z; the tag is
-    # created by the release step when it publishes.
+    # A branch named release/vX.Y.Z releases tag vX.Y.Z; the tag is claimed at
+    # the built commit by the release job.
     branches: ['release/v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v9.3.1). Created at the dispatched ref by the release step if it doesn't exist."
+        description: "Release tag (e.g. v9.3.1). Claimed at the dispatched commit if it doesn't already exist."
         required: true
         type: string
+
+# Serialize releases so two runs cannot interleave around the tag claim. This
+# is defence in depth only — the atomic ref POST in the release job is what
+# actually decides the winner, since these groups do not coincide across
+# trigger types (a tag push and a release/v* push for the same version produce
+# different ref names, and expressions cannot normalize them).
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -92,46 +101,75 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: echo "tag=${INPUT_TAG:-${GITHUB_REF_NAME#release/}}" >> "$GITHUB_OUTPUT"
 
-      # target_commitish only decides where GitHub creates a tag that does not
-      # exist yet — it never moves an existing one. A workflow_dispatch can name
-      # an already-published tag while running from an unrelated ref, which would
-      # attach artifacts built from GITHUB_SHA to a release whose tag points
-      # somewhere else. Fail closed on that case before anything is uploaded.
-      - name: Verify tag matches built commit
+      # The invariant: the tag must name the commit these artifacts were built
+      # from. Checking whether the tag exists and then letting the release step
+      # create it is a check-then-use race — two runs for the same absent tag
+      # both pass, one creates the tag, and the other uploads artifacts built
+      # from a different commit onto it. So claim the tag with an atomic POST
+      # instead: ref creation is rejected when the ref already exists, which
+      # makes the winner unambiguous. A run that loses the claim (or was always
+      # going to reuse an existing tag, as on tag push) must then prove the
+      # existing tag already names its own commit, or refuse to publish.
+      - name: Claim or verify release tag
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          # A missing ref is a 404, and gh still writes the error body to stdout,
-          # so branch on the exit status and then on the parsed shape — never on
-          # whether stdout was empty.
-          if ! ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" 2>/dev/null)"; then
-            echo "Tag ${TAG} does not exist yet — it will be created at ${GITHUB_SHA}."
+          command -v gh >/dev/null 2>&1 || { echo "::error::gh CLI unavailable on this runner."; exit 1; }
+          command -v jq >/dev/null 2>&1 || { echo "::error::jq unavailable on this runner."; exit 1; }
+          case "$TAG" in
+            ''|*' '*|*'/'*) echo "::error::Refusing to release with implausible tag '${TAG}'."; exit 1 ;;
+          esac
+
+          # Atomic claim. 201 means this run owns the tag at its own commit.
+          if gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+               -f "ref=refs/tags/${TAG}" -f "sha=${GITHUB_SHA}" >/dev/null 2>&1; then
+            echo "Created tag ${TAG} at the built commit ${GITHUB_SHA}."
             exit 0
           fi
-          object_sha="$(printf '%s' "$ref_json" | jq -r '.object.sha // empty')"
-          object_type="$(printf '%s' "$ref_json" | jq -r '.object.type // empty')"
-          if [ -z "$object_sha" ]; then
-            echo "No exact tag ${TAG} resolved — it will be created at ${GITHUB_SHA}."
-            exit 0
+
+          # The claim failed. That is expected when the tag already exists, but
+          # it is equally what an auth failure, a rate limit or a 5xx looks like,
+          # so re-read the ref and branch on the actual HTTP status. Anything
+          # that is not a clean 200 fails closed — never assume "absent".
+          set +e
+          resp="$(gh api -i "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" 2>/dev/null)"
+          set -e
+          [ -n "$resp" ] || { echo "::error::Tag lookup for ${TAG} returned no response."; exit 1; }
+
+          # Not named "status": that identifier is read-only in some shells.
+          http_status="$(printf '%s\n' "$resp" | head -n1 | tr -d '\r' | awk '{print $2}')"
+          body="$(printf '%s\n' "$resp" | awk 'b{print} /^\r?$/{b=1}')"
+          if [ "$http_status" != "200" ]; then
+            echo "::error::Could not claim tag ${TAG}, and re-reading it returned HTTP ${http_status:-<none>}. Refusing to publish."
+            exit 1
           fi
+
+          object_sha="$(printf '%s' "$body" | jq -r '.object.sha // empty')"
+          object_type="$(printf '%s' "$body" | jq -r '.object.type // empty')"
+          if [ -z "$object_sha" ] || [ -z "$object_type" ]; then
+            echo "::error::Unexpected ref response shape for tag ${TAG}. Refusing to publish."
+            exit 1
+          fi
+
           # Annotated tags point at a tag object; peel it to reach the commit.
           if [ "$object_type" = "tag" ]; then
-            commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.sha')"
+            commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.sha // empty')"
           else
             commit="$object_sha"
           fi
+          [ -n "$commit" ] || { echo "::error::Could not resolve tag ${TAG} to a commit."; exit 1; }
+
           if [ "$commit" != "$GITHUB_SHA" ]; then
-            echo "::error::Tag ${TAG} points at ${commit}, but these artifacts were built from ${GITHUB_SHA}. Refusing to publish."
+            echo "::error::Tag ${TAG} names ${commit}, but these artifacts were built from ${GITHUB_SHA}. Refusing to publish."
             exit 1
           fi
-          echo "Tag ${TAG} already points at the built commit ${GITHUB_SHA}."
+          echo "Tag ${TAG} already names the built commit ${GITHUB_SHA}."
 
-      # target_commitish pins a newly created tag to the commit these artifacts
-      # were built from. Without it action-gh-release falls back to the
-      # repository default branch, so a release started from a release/v* branch
-      # (or a dispatch on any non-default ref) tags code that was never built.
+      # The tag now exists at GITHUB_SHA, established above. target_commitish is
+      # kept as a belt-and-braces default for the (unreached) case where the
+      # action would otherwise create the tag itself against the default branch.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
