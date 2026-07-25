@@ -27,7 +27,9 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # react-router 8 requires node >=22.22.0; 24 clears that and vite 7's
+          # floor without depending on how setup-node resolves a bare "22".
+          node-version: 24
           cache: npm
           cache-dependency-path: docs-site/package-lock.json
 

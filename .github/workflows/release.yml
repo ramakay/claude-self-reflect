@@ -92,10 +92,15 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: echo "tag=${INPUT_TAG:-${GITHUB_REF_NAME#release/}}" >> "$GITHUB_OUTPUT"
 
+      # target_commitish pins the tag to the commit these artifacts were built
+      # from. Without it action-gh-release falls back to the repository default
+      # branch, so a release started from a release/v* branch (or a dispatch on
+      # any non-default ref) tags code that was never built or published.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: |
             *.tar.gz
             checksums.txt

@@ -1,4 +1,4 @@
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { useEffect, useRef, useState } from 'react'
 import { Check, Copy, Github, Moon, Sun } from 'lucide-react'
 
