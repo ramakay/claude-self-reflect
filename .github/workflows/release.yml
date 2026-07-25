@@ -92,10 +92,46 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: echo "tag=${INPUT_TAG:-${GITHUB_REF_NAME#release/}}" >> "$GITHUB_OUTPUT"
 
-      # target_commitish pins the tag to the commit these artifacts were built
-      # from. Without it action-gh-release falls back to the repository default
-      # branch, so a release started from a release/v* branch (or a dispatch on
-      # any non-default ref) tags code that was never built or published.
+      # target_commitish only decides where GitHub creates a tag that does not
+      # exist yet — it never moves an existing one. A workflow_dispatch can name
+      # an already-published tag while running from an unrelated ref, which would
+      # attach artifacts built from GITHUB_SHA to a release whose tag points
+      # somewhere else. Fail closed on that case before anything is uploaded.
+      - name: Verify tag matches built commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # A missing ref is a 404, and gh still writes the error body to stdout,
+          # so branch on the exit status and then on the parsed shape — never on
+          # whether stdout was empty.
+          if ! ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" 2>/dev/null)"; then
+            echo "Tag ${TAG} does not exist yet — it will be created at ${GITHUB_SHA}."
+            exit 0
+          fi
+          object_sha="$(printf '%s' "$ref_json" | jq -r '.object.sha // empty')"
+          object_type="$(printf '%s' "$ref_json" | jq -r '.object.type // empty')"
+          if [ -z "$object_sha" ]; then
+            echo "No exact tag ${TAG} resolved — it will be created at ${GITHUB_SHA}."
+            exit 0
+          fi
+          # Annotated tags point at a tag object; peel it to reach the commit.
+          if [ "$object_type" = "tag" ]; then
+            commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.sha')"
+          else
+            commit="$object_sha"
+          fi
+          if [ "$commit" != "$GITHUB_SHA" ]; then
+            echo "::error::Tag ${TAG} points at ${commit}, but these artifacts were built from ${GITHUB_SHA}. Refusing to publish."
+            exit 1
+          fi
+          echo "Tag ${TAG} already points at the built commit ${GITHUB_SHA}."
+
+      # target_commitish pins a newly created tag to the commit these artifacts
+      # were built from. Without it action-gh-release falls back to the
+      # repository default branch, so a release started from a release/v* branch
+      # (or a dispatch on any non-default ref) tags code that was never built.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
