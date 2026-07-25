@@ -32,7 +32,7 @@ npm install -g claude-self-reflect
 csr-engine setup
 ```
 
-`npm install` only downloads the checksummed binary. It never modifies `~/.claude/settings.json`, registers MCP servers, or indexes conversations — activation is the separate, explicit `csr-engine setup` step (or set `CSR_AUTO_SETUP=1` during install to opt in).
+By default `npm install` only downloads the checksummed binary — it does not modify `~/.claude/settings.json`, register MCP servers, or index conversations. Activation is the separate, explicit `csr-engine setup` step, or set `CSR_AUTO_SETUP=1` during install to opt in.
 
 ## Verify
 

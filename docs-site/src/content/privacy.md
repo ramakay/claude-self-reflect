@@ -14,6 +14,10 @@ title: Privacy & Security
 
 **Zero network connections** by default. No telemetry.
 
+## Consent-Gated Activation
+
+Installing CSR does not activate it. Nothing is written to `~/.claude/settings.json`, no MCP server is registered, and no conversations are indexed until you explicitly run `csr-engine setup` (or approve the installer's prompt). npm postinstall is download-only, so sandboxed evaluation (`npm install --prefix`) leaves your live Claude Code configuration untouched. See [Installation](#/docs/installation) for the `CSR_AUTO_SETUP` / `CSR_SKIP_SETUP` controls.
+
 ## Optional Cloud: AI Narratives
 
 Only Layer 3 uses cloud API. Requires explicit opt-in:

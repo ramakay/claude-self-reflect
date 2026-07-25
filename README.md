@@ -27,7 +27,7 @@ Single 44MB binary. No databases. No containers. No API keys required.
 - [The Problem](#the-forgetting-problem) — Why Claude needs memory
 - [The Architecture](#one-binary-44mb) — How CSR solves it
 - [The Pipeline](#the-pipeline) — Progressive enrichment (9.3x improvement)
-- [Install](#install) — One command setup
+- [Install](#install) — One-command install, consent-first activation
 - [What You'll Ask](#what-youll-ask) — Natural language, no syntax
 - [Performance](#performance) | [MCP Tools](#mcp-tools) | [Hooks](#hooks) | [CLI](#cli-reference)
 - [AI Narratives](#ai-narratives-optional) | [Upgrading](#upgrading-from-v7x) | [Troubleshooting](#troubleshooting)
