@@ -123,7 +123,7 @@ npm install -g claude-self-reflect
 csr-engine setup   # activation is a separate, explicit step
 ```
 
-`npm install` only downloads the checksummed binary — it never touches `~/.claude` or indexes conversations. Activation happens when you run `csr-engine setup`.
+By default `npm install` only downloads the checksummed binary — it does not touch `~/.claude` or index conversations. Activation happens when you run `csr-engine setup`, or set `CSR_AUTO_SETUP=1` during install to opt in.
 
 </details>
 

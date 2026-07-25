@@ -200,11 +200,16 @@ Build from source instead:
         printf '  from ~/.claude/projects/ into a local index.\n\n' > /dev/tty
         printf '  \033[1mRun setup now? [Y/n]\033[0m ' > /dev/tty
         answer=""
-        read -r answer < /dev/tty || answer=""
-        case "$answer" in
-            [Nn]*) RUN_SETUP=no ;;
-            *)     RUN_SETUP=yes ;;
-        esac
+        # A failed read is not consent — only a successful (possibly empty)
+        # response may select the yes-default.
+        if read -r answer < /dev/tty; then
+            case "$answer" in
+                [Nn]*) RUN_SETUP=no ;;
+                *)     RUN_SETUP=yes ;;
+            esac
+        else
+            RUN_SETUP=no
+        fi
     fi
 
     if [ "$RUN_SETUP" = "yes" ]; then
@@ -215,6 +220,7 @@ Build from source instead:
             printf '\n  \033[33m⚠\033[0m  Setup encountered errors. Try manually:\n'
             printf '    %s setup\n' "$BINARY_NAME"
             printf '    # Then restart Claude Code\n\n'
+            exit 1
         fi
     else
         printf '\n  \033[1mNot yet active.\033[0m To register MCP, install hooks, and import conversations:\n'

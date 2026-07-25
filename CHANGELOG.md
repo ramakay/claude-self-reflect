@@ -14,10 +14,11 @@ postinstall — silently writing 6 hooks into the live `~/.claude/settings.json`
 registering the MCP server in `~/.claude.json`, and importing conversation
 transcripts, even for sandboxed `--prefix` evaluations. Reported in #247.
 
-- **npm postinstall is now download-only**: it fetches the binary, verifies
-  the SHA256 checksum, installs it to `~/.local/bin`, and stops. Activation
-  happens only when the user explicitly runs `csr-engine setup`. Opt back in
-  to the old one-shot behavior with `CSR_AUTO_SETUP=1`.
+- **npm postinstall is now download-only by default**: it fetches the binary,
+  verifies the SHA256 checksum, installs it to `~/.local/bin`, and stops.
+  Activation happens when the user explicitly runs `csr-engine setup`, or opt
+  back in to the old one-shot behavior with `CSR_AUTO_SETUP=1` (a failed
+  opt-in setup now exits nonzero so automation can detect it).
 - **`install.sh` now asks before running setup**: interactive installs get a
   clear prompt describing exactly what setup touches (hooks, MCP registration,
   conversation import) with a `[Y/n]` confirmation read from `/dev/tty`.
