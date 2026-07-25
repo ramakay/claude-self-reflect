@@ -139,6 +139,14 @@ jobs:
       # could have force-updated or recreated the tag at another commit, and
       # target_commitish would not correct that. Re-resolve, then publish only if
       # the tag still names the commit these artifacts came from.
+      #
+      # This narrows the window; it does not close it. Verification and
+      # publication are two API calls against a mutable ref, so a force-update
+      # landing between them still yields a published release whose tag names a
+      # different commit. Closing that requires a repository ruleset forbidding
+      # update and deletion of v* tags — configuration this workflow cannot
+      # assert. Until such a rule exists, treat this as defence in depth against
+      # accident, not as a guarantee against a privileged writer.
       - name: Verify tag and publish release
         env:
           GH_TOKEN: ${{ github.token }}

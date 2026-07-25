@@ -12,6 +12,11 @@
 # Every failure path refuses to publish. A lookup that did not clearly succeed
 # is never read as "the tag is absent".
 #
+# Limit worth stating plainly: refs are mutable, and verification and whatever
+# acts on the result are always separate API calls. This narrows the window in
+# which a tag can be swapped under a release; it cannot close it. Only a
+# repository ruleset forbidding update and deletion of release tags does that.
+#
 # Environment: GH_TOKEN, GITHUB_REPOSITORY, GITHUB_SHA, TAG
 
 set -euo pipefail
