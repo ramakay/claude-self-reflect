@@ -5,6 +5,29 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.3.1] - 2026-07-24
+
+### 🔒 SECURITY/CONSENT: Install and activation are now separate steps (#247)
+
+`npm install claude-self-reflect` used to auto-run `csr-engine setup` from
+postinstall — silently writing 6 hooks into the live `~/.claude/settings.json`,
+registering the MCP server in `~/.claude.json`, and importing conversation
+transcripts, even for sandboxed `--prefix` evaluations. Reported in #247.
+
+- **npm postinstall is now download-only by default**: it fetches the binary,
+  verifies the SHA256 checksum, installs it to `~/.local/bin`, and stops.
+  Activation happens when the user explicitly runs `csr-engine setup`, or opt
+  back in to the old one-shot behavior with `CSR_AUTO_SETUP=1` (a failed
+  opt-in setup now exits nonzero so automation can detect it).
+- **`install.sh` now asks before running setup**: interactive installs get a
+  clear prompt describing exactly what setup touches (hooks, MCP registration,
+  conversation import) with a `[Y/n]` confirmation read from `/dev/tty`.
+  Non-interactive installs (CI, no TTY) never auto-activate. New env controls:
+  `CSR_AUTO_SETUP=1` (run setup without prompting) and `CSR_SKIP_SETUP=1`
+  (download only).
+- **Docs updated** (README, installation guide, landing page) to describe the
+  two-step install → activate flow.
+
 ## [9.3.0] - 2026-07-11
 
 ### 🚀 FEATURE: Narrative Cost Controls

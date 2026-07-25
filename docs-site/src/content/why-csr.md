@@ -16,7 +16,7 @@ CSR is a single 44MB binary. SQLite, HNSW search, FastEmbed embeddings, MCP serv
 
 | | CSR | Typical Memory Tool |
 |--|-----|---------------------|
-| **Install** | `curl \| sh` (one command) | npm + Docker + Python + DB |
+| **Install** | `curl \| sh` (one command, asks before activating) | npm + Docker + Python + DB |
 | **Dependencies** | None | Docker, Python, vector DB, Node.js |
 | **Processes** | 1 (on-demand) | 3-5 background services |
 | **Startup** | ~150ms (cached) | Seconds to minutes |
@@ -48,3 +48,7 @@ Indexes ALL your Claude Code projects automatically. Solutions from one project 
 ### Privacy First
 
 Everything runs on your machine by default. No cloud APIs, no accounts, no telemetry. The only optional cloud feature is AI Narratives (Layer 3).
+
+### Consent First
+
+Install and activation are separate steps. Installing (via `curl | sh` or npm) only downloads the SHA256-verified binary — nothing touches `~/.claude/settings.json`, no MCP server is registered, and no conversations are indexed until you explicitly approve `csr-engine setup` (interactive installs prompt; non-interactive installs never activate on their own). See [Installation](#/docs/installation) for the `CSR_AUTO_SETUP` / `CSR_SKIP_SETUP` controls.

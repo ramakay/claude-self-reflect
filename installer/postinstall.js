@@ -2,11 +2,16 @@
 
 /**
  * Post-install hook for npm.
- * Downloads the csr-engine binary from GitHub Releases.
+ * Downloads the csr-engine binary from GitHub Releases and verifies its
+ * checksum. By default nothing else: activation (hook registration, MCP
+ * registration, conversation import) happens when the user explicitly runs
+ * `csr-engine setup` — postinstall does not touch ~/.claude or index data
+ * unless the user opts in with CSR_AUTO_SETUP=1.
  * Detects existing Python CSR installations and guides upgrade.
  *
  * Environment variables:
  *   CSR_SKIP_BINARY_DOWNLOAD=1  — Skip binary download (CI, offline, custom builds)
+ *   CSR_AUTO_SETUP=1            — Opt in to running `csr-engine setup` after download
  */
 
 import {
@@ -186,6 +191,30 @@ function findExpectedChecksum(checksumData, filename) {
   throw new Error(`No checksum entry found for ${filename}`);
 }
 
+// --- Activation ---
+
+// Activation is a separate consent event: setup writes hooks into
+// ~/.claude/settings.json, registers the MCP server, and imports
+// conversation transcripts. Never do that from a package manager
+// lifecycle script unless the user explicitly opted in.
+function runOrExplainActivation(binaryPath) {
+  if (process.env.CSR_AUTO_SETUP === '1') {
+    console.log('  CSR_AUTO_SETUP=1 — running setup...');
+    try {
+      execFileSync(binaryPath, ['setup'], { stdio: 'inherit', timeout: 60000 });
+      console.log('\n  \x1b[32mDone. Restart Claude Code to activate.\x1b[0m\n');
+    } catch {
+      console.log('\n  Setup failed. Run manually: csr-engine setup\n');
+      process.exitCode = 1;
+    }
+  } else {
+    console.log('\n  \x1b[1mTo activate\x1b[0m (registers the MCP server, installs hooks,');
+    console.log('  and imports your conversations), run:');
+    console.log('\n    \x1b[1;32mcsr-engine setup\x1b[0m\n');
+    console.log('  Then restart Claude Code.\n');
+  }
+}
+
 // --- Existing installation detection ---
 
 function findExistingBinary() {
@@ -251,7 +280,8 @@ async function main() {
         stdio: ['ignore', 'pipe', 'ignore'],
       }).trim();
       if (version === pkgVersion || version === tag || version.includes(` ${pkgVersion}`)) {
-        console.log(`\n  \x1b[1;32mcsr-engine ${pkgVersion} already installed.\x1b[0m\n`);
+        console.log(`\n  \x1b[1;32mcsr-engine ${pkgVersion} already installed.\x1b[0m`);
+        runOrExplainActivation(existingBinary);
         return;
       }
       console.log(`  Updating ${existingBinary} to ${tag}...`);
@@ -301,14 +331,7 @@ async function main() {
 
     console.log(`  \x1b[1;32mInstalled:\x1b[0m ${destPath}`);
 
-    // Auto-run setup
-    console.log('  Running setup...');
-    try {
-      execFileSync(destPath, ['setup'], { stdio: 'inherit', timeout: 60000 });
-      console.log('\n  \x1b[32mDone. Restart Claude Code to activate.\x1b[0m\n');
-    } catch {
-      console.log('\n  Setup encountered errors. Run manually: csr-engine setup\n');
-    }
+    runOrExplainActivation(destPath);
 
     if (pythonSignals.length > 0) {
       console.log('  Old Python stack can be cleaned up:');

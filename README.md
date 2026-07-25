@@ -27,7 +27,7 @@ Single 44MB binary. No databases. No containers. No API keys required.
 - [The Problem](#the-forgetting-problem) — Why Claude needs memory
 - [The Architecture](#one-binary-44mb) — How CSR solves it
 - [The Pipeline](#the-pipeline) — Progressive enrichment (9.3x improvement)
-- [Install](#install) — One command setup
+- [Install](#install) — One-command install, consent-first activation
 - [What You'll Ask](#what-youll-ask) — Natural language, no syntax
 - [Performance](#performance) | [MCP Tools](#mcp-tools) | [Hooks](#hooks) | [CLI](#cli-reference)
 - [AI Narratives](#ai-narratives-optional) | [Upgrading](#upgrading-from-v7x) | [Troubleshooting](#troubleshooting)
@@ -104,7 +104,9 @@ Higher quality context. Better decisions. Fewer tokens.
 curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
 ```
 
-One command. Downloads the binary, runs setup, registers MCP server, installs 6 hooks. Restart Claude Code.
+Downloads the binary (SHA256-verified), then asks before activating. Setup — which registers the MCP server, installs 6 hooks, and imports your conversations — only runs with your consent. Restart Claude Code after.
+
+Non-interactive installs never activate on their own: set `CSR_AUTO_SETUP=1` to opt in, or run `csr-engine setup` yourself.
 
 | Platform | Support |
 |----------|---------|
@@ -118,7 +120,10 @@ One command. Downloads the binary, runs setup, registers MCP server, installs 6 
 
 ```bash
 npm install -g claude-self-reflect
+csr-engine setup   # activation is a separate, explicit step
 ```
+
+By default `npm install` only downloads the checksummed binary — it does not touch `~/.claude` or index conversations. Activation happens when you run `csr-engine setup`, or set `CSR_AUTO_SETUP=1` during install to opt in.
 
 </details>
 

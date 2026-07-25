@@ -525,7 +525,7 @@ function InstallCard() {
             <code>curl -fsSL .../scripts/install.sh | sh</code>
             <CopyBtn text={command} />
           </div>
-          <p className="type-caption mt-2">One command. Downloads binary, auto-runs setup, registers hooks + MCP. Restart Claude Code.</p>
+          <p className="type-caption mt-2">One command. Downloads binary, then asks before activating hooks + MCP. Restart Claude Code.</p>
           <div className="install-tabs-inline">
             {['44MB binary', 'zero deps', '6 hooks', '12 MCP tools'].map((label, index) => (
               <span key={label} className="tear-tab" style={{ animationDelay: `${720 + index * 70}ms` }}>{label}</span>

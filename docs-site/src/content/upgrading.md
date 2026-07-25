@@ -21,8 +21,11 @@ v8.0 replaced the Python/Docker/Qdrant stack with a single Rust binary.
 docker compose down 2>/dev/null
 claude mcp remove claude-self-reflect 2>/dev/null
 
-# Install v8
+# Install v8 — the installer asks before running setup
 curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
+
+# If you declined (or installed non-interactively), activate explicitly:
+csr-engine setup
 
 # Restart Claude Code
 ```
