@@ -88,6 +88,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # Checked out only for .github/scripts/release-tag.sh. Pinned to the built
+      # commit so the verifier is the one from the code being released.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
@@ -105,80 +111,46 @@ jobs:
       # from. Checking whether the tag exists and then letting the release step
       # create it is a check-then-use race — two runs for the same absent tag
       # both pass, one creates the tag, and the other uploads artifacts built
-      # from a different commit onto it. So claim the tag with an atomic POST
-      # instead: ref creation is rejected when the ref already exists, which
-      # makes the winner unambiguous. A run that loses the claim (or was always
-      # going to reuse an existing tag, as on tag push) must then prove the
-      # existing tag already names its own commit, or refuse to publish.
-      - name: Claim or verify release tag
+      # from a different commit onto it. Claim it atomically instead; ref
+      # creation is rejected when the ref already exists, so the API decides the
+      # winner. A run that loses the claim — or that was always going to reuse an
+      # existing tag, as on tag push — must prove the tag names its own commit.
+      - name: Claim release tag
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
-        run: |
-          set -euo pipefail
-          command -v gh >/dev/null 2>&1 || { echo "::error::gh CLI unavailable on this runner."; exit 1; }
-          command -v jq >/dev/null 2>&1 || { echo "::error::jq unavailable on this runner."; exit 1; }
-          case "$TAG" in
-            ''|*' '*|*'/'*) echo "::error::Refusing to release with implausible tag '${TAG}'."; exit 1 ;;
-          esac
+        run: bash .github/scripts/release-tag.sh claim
 
-          # Atomic claim. 201 means this run owns the tag at its own commit.
-          if gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-               -f "ref=refs/tags/${TAG}" -f "sha=${GITHUB_SHA}" >/dev/null 2>&1; then
-            echo "Created tag ${TAG} at the built commit ${GITHUB_SHA}."
-            exit 0
-          fi
-
-          # The claim failed. That is expected when the tag already exists, but
-          # it is equally what an auth failure, a rate limit or a 5xx looks like,
-          # so re-read the ref and branch on the actual HTTP status. Anything
-          # that is not a clean 200 fails closed — never assume "absent".
-          set +e
-          resp="$(gh api -i "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" 2>/dev/null)"
-          set -e
-          [ -n "$resp" ] || { echo "::error::Tag lookup for ${TAG} returned no response."; exit 1; }
-
-          # Not named "status": that identifier is read-only in some shells.
-          http_status="$(printf '%s\n' "$resp" | head -n1 | tr -d '\r' | awk '{print $2}')"
-          body="$(printf '%s\n' "$resp" | awk 'b{print} /^\r?$/{b=1}')"
-          if [ "$http_status" != "200" ]; then
-            echo "::error::Could not claim tag ${TAG}, and re-reading it returned HTTP ${http_status:-<none>}. Refusing to publish."
-            exit 1
-          fi
-
-          object_sha="$(printf '%s' "$body" | jq -r '.object.sha // empty')"
-          object_type="$(printf '%s' "$body" | jq -r '.object.type // empty')"
-          if [ -z "$object_sha" ] || [ -z "$object_type" ]; then
-            echo "::error::Unexpected ref response shape for tag ${TAG}. Refusing to publish."
-            exit 1
-          fi
-
-          # Annotated tags point at a tag object; peel it to reach the commit.
-          if [ "$object_type" = "tag" ]; then
-            commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.sha // empty')"
-          else
-            commit="$object_sha"
-          fi
-          [ -n "$commit" ] || { echo "::error::Could not resolve tag ${TAG} to a commit."; exit 1; }
-
-          if [ "$commit" != "$GITHUB_SHA" ]; then
-            echo "::error::Tag ${TAG} names ${commit}, but these artifacts were built from ${GITHUB_SHA}. Refusing to publish."
-            exit 1
-          fi
-          echo "Tag ${TAG} already names the built commit ${GITHUB_SHA}."
-
-      # The tag now exists at GITHUB_SHA, established above. target_commitish is
-      # kept as a belt-and-braces default for the (unreached) case where the
-      # action would otherwise create the tag itself against the default branch.
-      - name: Create GitHub Release
+      # Staged as a draft: refs stay mutable, so nothing becomes public until the
+      # tag has been re-checked below with the assets already in place.
+      - name: Stage draft release
+        id: release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ github.sha }}
+          draft: true
           files: |
             *.tar.gz
             checksums.txt
           generate_release_notes: true
+
+      # Point of no return. Between the claim and here, anyone with push access
+      # could have force-updated or recreated the tag at another commit, and
+      # target_commitish would not correct that. Re-resolve, then publish only if
+      # the tag still names the commit these artifacts came from.
+      - name: Verify tag and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+        run: |
+          set -euo pipefail
+          [ -n "${RELEASE_ID:-}" ] || { echo "::error::No release id from the draft step."; exit 1; }
+          bash .github/scripts/release-tag.sh verify
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false -F make_latest=true >/dev/null
+          echo "Published release ${TAG}."
 
   publish-npm:
     needs: release
