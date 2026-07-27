@@ -15,6 +15,18 @@ csr-engine (44MB)
   └── 3-layer enrichment pipeline
 ```
 
+## Corpus Sources (v9.4+)
+
+| Source | Stage | Notes |
+|---|---|---|
+| `~/.claude/projects/*.jsonl` | import (watcher) | primary corpus, `source='conversation'` |
+| `~/.claude/tasks/<session>/` | Stop hook | authoritative task state → episode todos/outcome; completed tasks matching still-open verdicts → `resolution_proposals` (human promotes via `csr_resolve`) |
+| `~/.claude/plans/*.md` | daemon (30min) | `source='plan'`, `conversation_id=plan:<slug>`; margin-verified correlation, ambiguous → `_unscoped`; origin conversation always beats plan in search dedupe; decays via mtime timestamp |
+| `~/.claude/history.jsonl` | daemon (10min) | `session_registry` spine — never embedded/injected; coverage in `status` |
+| memories / paste-cache | NOT indexed | circularity / privacy — deliberate non-goals |
+
+`aux_schema_miss:*` counters in `csr-engine status` flag adapter parse failures — check them when Claude Code renames internal formats (TodoWrite→TaskCreate precedent).
+
 ## Key Commands
 
 ```bash
@@ -55,6 +67,7 @@ csr_resolve           — Record verified verdicts (resolved/still_open/regresse
 2. **TEST RULE**: Never claim success without running `cargo test`
 3. **RESTART RULE**: After modifying MCP server code, restart Claude Code
 4. **QUALITY GATE**: When pre-commit hook blocks, fix the issue — never use `--no-verify`
+5. **GOAL-SEEKING RULE**: Drive tasks to completion — never end a turn with a decision punt ("One thing I need from you", "your call", option menus for routine choices). Make routine judgment calls yourself and state them; ask only for destructive/irreversible actions, spend, publish/release, or genuine scope changes.
 
 ## Development
 
@@ -62,7 +75,7 @@ csr_resolve           — Record verified verdicts (resolved/still_open/regresse
 # Build
 cd csr-engine && cargo build --release
 
-# Test (52 unit + 68 hooks integration + 44 Phase 1 integration)
+# Test (615 unit + 45 hooks integration + 61 integration)
 cargo test
 cargo test --test hooks_integration
 cargo test --test integration

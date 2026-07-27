@@ -121,6 +121,10 @@ pub fn get_chunk_provenance(conn: &Connection, chunk_id: &str) -> Result<Option<
 /// A reflection row: (id, content, tags, timestamp).
 pub type ReflectionRow = (String, String, Vec<String>, String);
 
+/// A session_registry row projection: (project, first_ts, last_ts). Timestamps are
+/// nullable in the schema (registry rows can be created before a session closes).
+pub type SessionWindowRow = (String, Option<String>, Option<String>);
+
 /// Aggregated session info for timeline display.
 /// JOINs chunk data with enrichment reflections for rich context.
 pub struct SessionInfo {
@@ -147,9 +151,22 @@ fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
 }
 
 pub fn insert_chunk(conn: &Connection, chunk: &ConversationChunk, embedding: &[f32]) -> Result<()> {
+    insert_chunk_with_source(conn, chunk, embedding, "conversation")
+}
+
+/// `source` is a storage-level attribute ('conversation' | 'plan'), deliberately NOT a
+/// `ConversationChunk` field: ~45 construction sites would churn for a value only the
+/// aux-source importers set. Readers that need it distinguish plan chunks by the
+/// `conversation_id` prefix `plan:` instead.
+pub fn insert_chunk_with_source(
+    conn: &Connection,
+    chunk: &ConversationChunk,
+    embedding: &[f32],
+    source: &str,
+) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary, seq, is_sidechain)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary, seq, is_sidechain, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             chunk.id,
             chunk.conversation_id,
@@ -160,6 +177,7 @@ pub fn insert_chunk(conn: &Connection, chunk: &ConversationChunk, embedding: &[f
             chunk.summary,
             chunk.seq as i64,
             chunk.is_sidechain as i64,
+            source,
         ],
     )?;
 
@@ -176,6 +194,54 @@ pub fn insert_chunk(conn: &Connection, chunk: &ConversationChunk, embedding: &[f
         params![chunk.id, chunk.content],
     )?;
 
+    Ok(())
+}
+
+/// Read back a chunk's storage-level `source` ('conversation' | 'plan' | ...). The
+/// column is deliberately absent from `ConversationChunk` (see `insert_chunk_with_source`),
+/// so aux-source adapter tests need an explicit read path to assert on it.
+pub fn get_chunk_source(conn: &Connection, id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT source FROM chunks WHERE id = ?1",
+        params![id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Delete a whole conversation's chunks + their embeddings, FTS rows, and provenance
+/// edges. Aux-source adapters (plans, tasks, ...) reimport a whole document on content
+/// change, and the document can shrink — overwriting by deterministic chunk id alone
+/// would leave stale tail chunks (and their embeddings) orphaned in search forever, so
+/// a full wipe-then-rebuild is required for idempotent reimport.
+pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT id FROM chunks WHERE conversation_id = ?1")?;
+    let ids: Vec<String> = stmt
+        .query_map(params![conversation_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for id in &ids {
+        // chunks_fts has no FK on chunks.id (it's rowid-addressed), so its row must be
+        // dropped before the owning chunks row disappears and the rowid lookup goes stale.
+        conn.execute(
+            "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
+            params![id],
+        )?;
+        conn.execute(
+            "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
+            params![id],
+        )?;
+        conn.execute(
+            "DELETE FROM chunk_provenance WHERE chunk_id = ?1",
+            params![id],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM chunks WHERE conversation_id = ?1",
+        params![conversation_id],
+    )?;
     Ok(())
 }
 
@@ -985,6 +1051,68 @@ pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Resu
         params![path_str, conv_id, chunks as i64, mtime],
     )?;
     Ok(())
+}
+
+/// Read the stored mtime for an import_state row keyed by an arbitrary `file_path`
+/// string. Aux-source adapters (plans, tasks, ...) key `import_state` by a synthetic
+/// id (e.g. `"plan:<slug>"`) that isn't a real filesystem path, so `is_file_imported`
+/// (which stats the path itself) can't be reused — this never touches the filesystem.
+pub fn get_import_state_mtime(conn: &Connection, file_path: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT file_mtime FROM import_state WHERE file_path = ?1",
+        params![file_path],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Upsert an import_state row with a caller-supplied mtime, for aux-source adapters
+/// whose "file_path" key is synthetic. Mirrors `mark_file_imported`'s INSERT OR
+/// REPLACE shape but never derives mtime from `Path::metadata` (see
+/// `get_import_state_mtime`).
+pub fn upsert_import_state_explicit(
+    conn: &Connection,
+    file_path: &str,
+    conversation_id: &str,
+    chunks: usize,
+    mtime: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO import_state (file_path, conversation_id, chunks_imported, file_mtime) VALUES (?1, ?2, ?3, ?4)",
+        params![file_path, conversation_id, chunks as i64, mtime],
+    )?;
+    Ok(())
+}
+
+// ─── Session registry queries (multi-source corpus, v9.4) ───
+// The registry itself is written elsewhere (lane/p4-registry); these are read-only
+// lookups for correlating an aux-source document (e.g. a plan) to the session whose
+// time window contains it.
+
+/// (first_ts, last_ts) for one session, if the registry has a row for it. The registry
+/// can lag import, so callers must treat "no row" as "unknown," not "no match."
+pub fn get_session_registry_window(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<(Option<String>, Option<String>)>> {
+    conn.query_row(
+        "SELECT first_ts, last_ts FROM session_registry WHERE session_id = ?1",
+        params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// All (project, first_ts, last_ts) rows in the registry. Small table (one row per
+/// session), so callers filter by time window in Rust rather than pushing per-call
+/// date arithmetic into SQL.
+pub fn list_session_registry_windows(conn: &Connection) -> Result<Vec<SessionWindowRow>> {
+    let mut stmt = conn.prepare("SELECT project, first_ts, last_ts FROM session_registry")?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 // ─── Backfill queries (for enrichment pipeline repair) ───
@@ -2052,6 +2180,134 @@ pub fn get_resolutions_batch(
         map.insert(chunk_id, entry);
     }
     Ok(map)
+}
+
+// ─── Session registry (history.jsonl spine — never embedded / never injected) ───
+
+/// One row per session to upsert: (session_id, project, first_prompt,
+/// first_ts_rfc3339, last_ts_rfc3339, prompt_count_delta).
+#[derive(Debug, Clone)]
+pub struct SessionRegistryRow {
+    pub session_id: String,
+    pub project: String,
+    pub first_prompt: Option<String>,
+    pub first_ts: String,
+    pub last_ts: String,
+    pub prompt_count_delta: i64,
+}
+
+/// Upsert session_registry rows within an existing transaction. On conflict:
+/// first_prompt/first_ts kept from whichever row has the EARLIER first_ts
+/// (existing row wins unless the existing row's first_ts is null/absent or
+/// later than the new row's), last_ts = MAX(existing, new), prompt_count =
+/// existing + delta.
+///
+/// Does NOT open a new transaction — caller already holds one (see
+/// `Storage::with_transaction` for atomic upsert+checkpoint).
+pub fn upsert_session_registry_batch(
+    conn: &Connection,
+    rows: &[SessionRegistryRow],
+) -> Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare(
+        "INSERT INTO session_registry (session_id, project, first_prompt, first_ts, last_ts, prompt_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id) DO UPDATE SET
+           first_prompt = CASE
+             WHEN excluded.first_ts < session_registry.first_ts
+                  OR session_registry.first_ts IS NULL
+             THEN excluded.first_prompt
+             ELSE session_registry.first_prompt
+           END,
+           first_ts = CASE
+             WHEN excluded.first_ts < session_registry.first_ts
+                  OR session_registry.first_ts IS NULL
+             THEN excluded.first_ts
+             ELSE session_registry.first_ts
+           END,
+           last_ts = CASE
+             WHEN session_registry.last_ts IS NULL
+                  OR excluded.last_ts > session_registry.last_ts
+             THEN excluded.last_ts
+             ELSE session_registry.last_ts
+           END,
+           prompt_count = session_registry.prompt_count + excluded.prompt_count",
+    )?;
+    for row in rows {
+        stmt.execute(params![
+            row.session_id,
+            row.project,
+            row.first_prompt,
+            row.first_ts,
+            row.last_ts,
+            row.prompt_count_delta,
+        ])?;
+    }
+    Ok(rows.len())
+}
+
+/// (sessions_seen, sessions_imported, gap).
+/// sessions_seen = COUNT(*) FROM session_registry.
+/// sessions_imported = registry sessions that appear in non-plan chunks.
+/// gap = sessions_seen - sessions_imported (never negative).
+pub fn coverage_stats(conn: &Connection) -> Result<(i64, i64, i64)> {
+    let (seen, imported): (i64, i64) = conn.query_row(
+        "SELECT
+           (SELECT COUNT(*) FROM session_registry) AS seen,
+           (SELECT COUNT(*) FROM session_registry sr
+              WHERE EXISTS (
+                SELECT 1 FROM chunks c
+                WHERE c.conversation_id = sr.session_id
+                  AND c.conversation_id NOT LIKE 'plan:%'
+              )
+           ) AS imported",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let gap = (seen - imported).max(0);
+    Ok((seen, imported, gap))
+}
+
+/// Subset of `candidates` present in either session_registry or chunks.conversation_id.
+pub fn known_session_ids(
+    conn: &Connection,
+    candidates: &[String],
+) -> Result<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    // Batched ≤500 candidates per statement: one flat ?1..?N list would hit
+    // SQLITE_MAX_VARIABLE_NUMBER on large transcript dirs, and the caller's
+    // unwrap_or_default would silently report every session as unknown
+    // (CodeRabbit). Numbered placeholders are reused on both UNION sides —
+    // each candidate binds once.
+    const BATCH: usize = 500;
+    let mut out = HashSet::new();
+    for batch in candidates.chunks(BATCH) {
+        let placeholders: Vec<String> = (1..=batch.len()).map(|i| format!("?{i}")).collect();
+        let in_list = placeholders.join(", ");
+        let sql = format!(
+            "SELECT session_id FROM session_registry WHERE session_id IN ({in_list})
+             UNION
+             SELECT conversation_id FROM chunks WHERE conversation_id IN ({in_list})"
+        );
+
+        let params: Vec<&dyn rusqlite::types::ToSql> = batch
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+        for row in rows {
+            out.insert(row?);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -300,6 +300,17 @@ pub fn run(conn: &Connection) -> Result<()> {
         );
     }
 
+    // Migration: chunk source dimension (v9.4 multi-source corpus). Pure additive
+    // ALTER, O(1) on multi-GB DBs. Deliberately NO index: two-value column with no
+    // consuming query yet (Codex adversarial review — a CREATE INDEX here would scan
+    // the full chunks table during Storage::open on production DBs).
+    let has_source_col: bool = conn.prepare("SELECT source FROM chunks LIMIT 0").is_ok();
+    if !has_source_col {
+        let _ = conn.execute_batch(
+            "ALTER TABLE chunks ADD COLUMN source TEXT NOT NULL DEFAULT 'conversation';",
+        );
+    }
+
     // FTS5 for hybrid search — CREATE VIRTUAL TABLE doesn't support IF NOT EXISTS
     // so we check manually
     let has_fts: bool = conn
@@ -351,6 +362,32 @@ pub fn run(conn: &Connection) -> Result<()> {
             created_at TEXT DEFAULT (datetime('now'))
          );
          CREATE INDEX IF NOT EXISTS idx_resolution_chunk ON resolution_ledger(chunk_id, id);",
+    )?;
+
+    // v9.4 multi-source corpus: session registry (history.jsonl spine — never embedded,
+    // never injected) and resolution proposals (task-derived candidates; invisible to
+    // search/annotation until a human promotes them via csr_resolve — Codex adversarial
+    // review: automatic writes to resolution_ledger would be indistinguishable from
+    // human verdicts at read time).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_registry (
+            session_id TEXT PRIMARY KEY,
+            project TEXT NOT NULL,
+            first_prompt TEXT,
+            first_ts TEXT,
+            last_ts TEXT,
+            prompt_count INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS idx_session_registry_project ON session_registry(project);
+         CREATE TABLE IF NOT EXISTS resolution_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chunk_id TEXT NOT NULL,
+            claim TEXT,
+            evidence TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(chunk_id, session_id)
+         );",
     )?;
 
     Ok(())

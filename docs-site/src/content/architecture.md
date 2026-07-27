@@ -49,7 +49,7 @@ Single database at `~/.claude-self-reflect/csr-engine.db`. Thread-safe via `Mute
 Stores: conversation chunks, vector embeddings, reflections (stored insights), enrichment state, retrieval events (for TAD scoring), import deduplication state.
 
 ### MCP Server (`src/mcp/`)
-Built on rmcp. Exposes 13 tools via Model Context Protocol. Runs as stdio server — Claude Code starts it on demand. No HTTP, no ports, no long-running daemon.
+Built on rmcp. Exposes 15 tools via Model Context Protocol. Runs as stdio server — Claude Code starts it on demand. No HTTP, no ports, no long-running daemon.
 
 ### Enrichment Pipeline (`src/extraction/`)
 Three-layer progressive enrichment. Each layer supersedes the previous in the search index:

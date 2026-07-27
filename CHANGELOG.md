@@ -5,6 +5,38 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.4.0] - 2026-07-27
+
+### Multi-source memory corpus
+
+CSR's corpus was JSONL-transcripts-only. v9.4 absorbs the rest of `~/.claude`,
+each source at the lifecycle stage it belongs to — not one big importer.
+
+- **FIX (live regression): episode task extraction.** Claude Code renamed
+  `TodoWrite` → `TaskCreate`/`TaskUpdate`; the Stop hook still mined the old
+  tool, so every recent episode had empty todos, no next-steps, and degraded
+  outcome labels. The hook now parses the new tools (ids bound via tool
+  results, never transcript ordinals) and reads the authoritative final state
+  from `~/.claude/tasks/<session>/` — sessions with open tasks can no longer be
+  remembered as unqualified successes.
+- **Plan documents** (`~/.claude/plans/*.md`) are imported as searchable chunks
+  (`source='plan'`), correlated to their origin project/conversation with a
+  margin-verified token match (ambiguous plans stay unscoped rather than
+  guessing), provenance-linked, and deduplicated at search time — the origin
+  conversation always outranks its plan restatement.
+- **Session registry** from `~/.claude/history.jsonl`: a cross-project spine of
+  every session (never embedded, never injected) powering honest coverage
+  stats — `csr-engine status` now reports sessions seen vs imported, plus
+  file-history and unindexed-transcript counts.
+- **Resolution proposals**: completed tasks matching open queue items generate
+  proposals in a separate table — invisible to search until a human promotes
+  them via `csr_resolve` (no automatic verdicts).
+- **Schema-miss telemetry**: every aux adapter counts what it fails to parse
+  (`aux_schema_miss:*` in status) — silent format churn like the TodoWrite
+  rename can't rot quality invisibly again.
+- Schema: additive `chunks.source` column (O(1) migration, no index),
+  `session_registry` + `resolution_proposals` tables.
+
 ## [9.3.1] - 2026-07-24
 
 ### 🔒 SECURITY/CONSENT: Install and activation are now separate steps (#247)

@@ -220,6 +220,100 @@ impl Daemon {
         };
         tracing::info!("maintenance loop started (integrity cache + WAL checkpoint)");
 
+        // Registry loop: every 10 minutes, incrementally ingest ~/.claude/history.jsonl
+        // into session_registry (coverage spine — never embedded, never injected).
+        // Daemon is the ONLY caller by design: single-writer serialization is part of
+        // the checkpoint's crash-safety contract (Codex adversarial review).
+        let registry_handle = {
+            let storage = self.storage.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    for _ in 0..60 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    let s = storage.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let Some(home) = dirs::home_dir() else { return };
+                        let path = home.join(".claude/history.jsonl");
+                        match crate::import::registry::ingest_history(&s, &path) {
+                            Ok(stats) => tracing::debug!(
+                                lines = stats.lines_read,
+                                sessions = stats.sessions_upserted,
+                                errors = stats.parse_errors,
+                                "session registry ingested"
+                            ),
+                            Err(e) => tracing::warn!("registry ingest failed: {e}"),
+                        }
+                    })
+                    .await;
+                }
+            })
+        };
+        tracing::info!("registry loop started (history.jsonl → session_registry)");
+
+        // Plans loop: every 30 minutes, (re)import changed ~/.claude/plans/*.md docs
+        // as source='plan' chunks. Runs AFTER registry ingest has had a chance to
+        // populate session windows (correlation's Strategy 2 needs them, but waives
+        // gracefully when absent). mtime-keyed import_state makes each pass cheap.
+        let plans_handle = {
+            // Daemon holds the parts, not an Engine — assemble one for import_plan
+            // (same Arcs, so storage/index writes land in the shared instances).
+            let engine = Arc::new(crate::engine::Engine::from_parts(
+                self.storage.clone(),
+                self.embeddings.clone(),
+                self.search.clone(),
+                self.projects_dir.clone(),
+            ));
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    for _ in 0..180 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    let eng = engine.clone();
+                    let shutdown_inner = shutdown.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let Some(home) = dirs::home_dir() else { return };
+                        let plans_dir = home.join(".claude/plans");
+                        let plans =
+                            match crate::import::plans::discover_plans(&plans_dir, eng.storage()) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    tracing::warn!("plan discovery failed: {e}");
+                                    return;
+                                }
+                            };
+                        for plan in plans {
+                            // Imports mutate chunks + the shared HNSW index; a batch
+                            // that straddles shutdown would race the final
+                            // dump_to_disk (CodeRabbit). Stop between plans — each
+                            // single import is bounded and awaited below.
+                            if shutdown_inner.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            match crate::import::plans::import_plan(&eng, &plan) {
+                                Ok(n) => {
+                                    tracing::debug!(slug = %plan.slug, chunks = n, "plan imported")
+                                }
+                                Err(e) => {
+                                    tracing::warn!(slug = %plan.slug, "plan import failed: {e}")
+                                }
+                            }
+                        }
+                    })
+                    .await;
+                }
+            })
+        };
+        tracing::info!("plans loop started (~/.claude/plans → source='plan' chunks)");
+
         // Ratification loop — dialog-act scoring (interval via CSR_RATIFICATION_INTERVAL_SECS)
         let ratification_handle = {
             let storage = self.storage.clone();
@@ -245,6 +339,13 @@ impl Daemon {
         }
         let _ = tokio::time::timeout(timeout, consolidation_handle).await;
         let _ = tokio::time::timeout(timeout, maintenance_handle).await;
+        let _ = tokio::time::timeout(timeout, registry_handle).await;
+        // Plans imports write the HNSW index the flush below persists. A timeout
+        // here would DETACH the task, not stop it — it could then mutate the
+        // index after dump_to_disk read its state (Codex). The loop stops
+        // between plans on shutdown, so at most one bounded import is in
+        // flight: await it fully.
+        let _ = plans_handle.await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
 

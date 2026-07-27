@@ -350,13 +350,17 @@ fn test_cache_status(index_dir: &Path) -> EvalResult {
 
 fn test_tool_count() -> EvalResult {
     let t = Instant::now();
-    let expected = 14;
-    EvalResult::pass(
-        "Tool Count",
-        "infrastructure",
-        t.elapsed().as_secs_f64() * 1000.0,
-        format!("{expected} MCP tools defined"),
-    )
+    // Counted from the live rmcp router, not a constant — a hardcoded expectation
+    // sat at 14 while the server shipped 15 tools (silently-inert eval).
+    let actual = crate::mcp::CsrServer::tool_count();
+    let expected = 15;
+    let detail = format!("{actual} MCP tools defined (expected {expected})");
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    if actual == expected {
+        EvalResult::pass("Tool Count", "infrastructure", ms, detail)
+    } else {
+        EvalResult::fail("Tool Count", "infrastructure", ms, detail)
+    }
 }
 
 // --- Semantic search tests ---

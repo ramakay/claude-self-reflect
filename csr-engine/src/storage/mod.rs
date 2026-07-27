@@ -459,6 +459,92 @@ impl Storage {
         queries::set_meta(&conn, key, value)
     }
 
+    /// Increment the schema-miss counter for an aux corpus source (tasks/plans/history…).
+    /// Silence was the failure mode that let the TodoWrite→TaskCreate rename rot episode
+    /// extraction for weeks — every aux adapter counts what it fails to parse.
+    pub fn bump_aux_counter(&self, source: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let key = format!("aux_schema_miss:{source}");
+        let current: i64 = queries::get_meta(&conn, &key)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        queries::set_meta(&conn, &key, &(current + 1).to_string())
+    }
+
+    /// All aux schema-miss counters as (source, count), for status surfacing.
+    pub fn get_aux_counters(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt =
+            conn.prepare("SELECT key, value FROM meta WHERE key LIKE 'aux_schema_miss:%'")?;
+        let rows = stmt.query_map([], |row| {
+            let key: String = row.get(0)?;
+            let value: String = row.get(1)?;
+            Ok((key, value))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, value) = row?;
+            let source = key.trim_start_matches("aux_schema_miss:").to_string();
+            out.push((source, value.parse().unwrap_or(0)));
+        }
+        Ok(out)
+    }
+
+    pub fn insert_chunk_with_source(
+        &self,
+        chunk: &ConversationChunk,
+        embedding: &[f32],
+        source: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::insert_chunk_with_source(&conn, chunk, embedding, source)
+    }
+
+    /// Record a task-derived resolution proposal. Proposals are NOT verdicts:
+    /// they live in their own table, invisible to search annotation, until a
+    /// human promotes one via csr_resolve (Codex adversarial review — automatic
+    /// ledger rows would be indistinguishable from human verdicts at read time).
+    /// Idempotent per (chunk_id, session_id).
+    pub fn insert_resolution_proposal(
+        &self,
+        chunk_id: &str,
+        claim: Option<&str>,
+        evidence: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO resolution_proposals (chunk_id, claim, evidence, session_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![chunk_id, claim, evidence, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_resolution_proposals(&self) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(
+            conn.query_row("SELECT COUNT(*) FROM resolution_proposals", [], |r| {
+                r.get(0)
+            })?,
+        )
+    }
+
+    /// Read back a chunk's storage-level `source` attribute (see
+    /// `insert_chunk_with_source`) — used by aux-source adapter tests.
+    pub fn get_chunk_source(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_source(&conn, id)
+    }
+
+    /// Wipe a conversation's chunks + embeddings + FTS rows + provenance edges, so an
+    /// aux-source adapter can rebuild it from scratch on reimport (idempotent even when
+    /// the source document shrinks). See `queries::delete_chunks_for_conversation`.
+    pub fn delete_chunks_for_conversation(&self, conversation_id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::delete_chunks_for_conversation(&conn, conversation_id)
+    }
+
     pub fn record_narrative_usage(&self, row: &NarrativeUsageRow) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::record_narrative_usage(&conn, row)
@@ -546,6 +632,45 @@ impl Storage {
     pub fn mark_file_imported(&self, path: &Path, chunks: usize) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::mark_file_imported(&conn, path, chunks)
+    }
+
+    /// Read an import_state mtime keyed by a synthetic (non-filesystem) `file_path`,
+    /// for aux-source adapters. See `queries::get_import_state_mtime`.
+    pub fn get_import_state_mtime(&self, file_path: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_import_state_mtime(&conn, file_path)
+    }
+
+    /// Upsert an import_state row with an explicit mtime, for aux-source adapters. See
+    /// `queries::upsert_import_state_explicit`.
+    pub fn upsert_import_state_explicit(
+        &self,
+        file_path: &str,
+        conversation_id: &str,
+        chunks: usize,
+        mtime: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::upsert_import_state_explicit(&conn, file_path, conversation_id, chunks, mtime)
+    }
+
+    // ─── Session registry queries (multi-source corpus, v9.4) ───
+
+    /// (first_ts, last_ts) for one session, if registered. See
+    /// `queries::get_session_registry_window`.
+    pub fn get_session_registry_window(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_session_registry_window(&conn, session_id)
+    }
+
+    /// All (project, first_ts, last_ts) rows. See
+    /// `queries::list_session_registry_windows`.
+    pub fn list_session_registry_windows(&self) -> Result<Vec<queries::SessionWindowRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::list_session_registry_windows(&conn)
     }
 
     // ─── TAD: Retrieval Events ───
@@ -860,6 +985,40 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_resolutions_batch(&conn, chunk_ids)
     }
+
+    // ─── Session registry / aux coverage ───
+
+    /// Runs `f` with the raw connection inside a single SQLite transaction.
+    /// Used by registry ingest to make "upsert rows" + "advance checkpoint"
+    /// atomic — a crash between the two is otherwise how a batch could be
+    /// replayed or silently dropped. Enforced via this single
+    /// `with_transaction` call wrapping both the row upserts and the meta
+    /// checkpoint writes in `import::registry::ingest_history`.
+    pub fn with_transaction<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.unchecked_transaction()?;
+        let result = f(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// (sessions_seen, sessions_imported, gap) from session_registry vs chunks.
+    pub fn coverage_stats(&self) -> anyhow::Result<(i64, i64, i64)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::coverage_stats(&conn)
+    }
+
+    /// Subset of candidate session ids present in session_registry or chunks.
+    pub fn known_session_ids(
+        &self,
+        candidates: &[String],
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::known_session_ids(&conn, candidates)
+    }
 }
 
 #[cfg(test)]
@@ -927,6 +1086,52 @@ mod tests {
         assert_eq!(got.supersedes.as_deref(), Some("behavioral continuity"));
 
         assert!(storage.get_chunk_provenance("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn chunk_source_persists_and_defaults() {
+        use crate::provenance::Speaker;
+        let storage = Storage::open_memory().unwrap();
+        let mk = |id: &str| ConversationChunk {
+            id: id.into(),
+            conversation_id: format!("conv-{id}"),
+            project_name: "proj".into(),
+            timestamp: "2026-07-27T12:00:00Z".into(),
+            content: "content".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&mk("a"), &[0.0; 4]).unwrap();
+        storage
+            .insert_chunk_with_source(&mk("b"), &[0.0; 4], "plan")
+            .unwrap();
+        let conn = storage.conn.lock().unwrap();
+        let src = |id: &str| -> String {
+            conn.query_row("SELECT source FROM chunks WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(src("a"), "conversation");
+        assert_eq!(src("b"), "plan");
+    }
+
+    #[test]
+    fn aux_counters_increment_and_list() {
+        let storage = Storage::open_memory().unwrap();
+        assert!(storage.get_aux_counters().unwrap().is_empty());
+        storage.bump_aux_counter("tasks").unwrap();
+        storage.bump_aux_counter("tasks").unwrap();
+        storage.bump_aux_counter("history").unwrap();
+        let mut counters = storage.get_aux_counters().unwrap();
+        counters.sort();
+        assert_eq!(
+            counters,
+            vec![("history".to_string(), 1), ("tasks".to_string(), 2)]
+        );
     }
 
     #[test]
@@ -1192,5 +1397,45 @@ mod tests {
             "agent",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn coverage_stats_math() {
+        use crate::import::ConversationChunk;
+        use crate::provenance::Speaker;
+
+        let storage = Storage::open_memory().unwrap();
+        // Seed 3 session_registry rows directly.
+        {
+            let conn = storage.conn.lock().unwrap();
+            for (id, proj) in [("sr1", "p"), ("sr2", "p"), ("sr3", "p")] {
+                conn.execute(
+                    "INSERT INTO session_registry (session_id, project, first_prompt, first_ts, last_ts, prompt_count)
+                     VALUES (?1, ?2, 'x', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 1)",
+                    rusqlite::params![id, proj],
+                )
+                .unwrap();
+            }
+        }
+        // Chunks for exactly 1 of those 3 conversation_ids.
+        storage
+            .insert_chunk(
+                &ConversationChunk {
+                    id: "chunk-sr1".into(),
+                    conversation_id: "sr1".into(),
+                    project_name: "p".into(),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                    content: "c".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::User,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                &[0.0; 4],
+            )
+            .unwrap();
+
+        assert_eq!(storage.coverage_stats().unwrap(), (3, 1, 2));
     }
 }

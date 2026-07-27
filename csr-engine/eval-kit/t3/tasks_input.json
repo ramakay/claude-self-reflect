@@ -1,0 +1,110 @@
+[
+ {
+  "task_id": "t3-01",
+  "prompt": "Why did the reflection system gain a way for an agent to explicitly mark a recalled item as resolved, rather than relying on the assistant's prose saying \"already shipped\"?"
+ },
+ {
+  "task_id": "t3-02",
+  "prompt": "Why was a Spearman-correlation check against the sealed E2 grades made a required, non-optional gate in the ratification work, rather than something to check after building everything?"
+ },
+ {
+  "task_id": "t3-03",
+  "prompt": "Plan work proposed keeping the `csr_resolve` tool out of the set of tools a background agent can invoke on its own \u2014 did that restriction make it into the shipped tool?"
+ },
+ {
+  "task_id": "t3-04",
+  "prompt": "The ratification-memory plan called for a two-arm re-litigation benchmark comparing a ratification-weighted memory arm against a similarity-only control \u2014 did that specific benchmark ever get run?"
+ },
+ {
+  "task_id": "t3-05",
+  "prompt": "Did the \"operator-turn-prioritized\" digest extractor for ratification scoring actually prioritize operator turns from the moment it shipped?"
+ },
+ {
+  "task_id": "t3-06",
+  "prompt": "Does the `supersedes` field on a memory chunk's provenance \u2014 the one the reranker gives a score boost to \u2014 actually get set to something other than empty by any of the live import or daemon pipelines?"
+ },
+ {
+  "task_id": "t3-07",
+  "prompt": "Did the final blinded benchmark grading show reinstatement-based memory retrieval beating plain kNN similarity search, or something more modest?"
+ },
+ {
+  "task_id": "t3-08",
+  "prompt": "Did the CSR paper keep an early framing that reinstatement recall improves ranking, or was that language walked back after the re-litigation results came in?"
+ },
+ {
+  "task_id": "t3-09",
+  "prompt": "As of the current unmerged multi-source-corpus branch, has the \"task-derived resolution proposals\" feature (auto-suggesting resolutions from completed tasks) reached the main branch yet?"
+ },
+ {
+  "task_id": "t3-10",
+  "prompt": "The resolution-ledger plan says its branch would be \"stacked on `result-hygiene`\" with the PR base retargeted to `main` only after PR #1 merged, due to a GitHub outage blocking PR creation. Did the merge actually happen in that order?"
+ },
+ {
+  "task_id": "t3-11",
+  "prompt": "A task recorded as \"Stage D: re-litigation benchmark (seal, harness, run, grade)\" shows a terminal status of `deleted`, with no completion timestamp ever recorded. What happened to that task, and does it match the plan's account of why Stage D never ran?"
+ },
+ {
+  "task_id": "t3-12",
+  "prompt": "Why did the paywall get redesigned into a bottom sheet with benefit copy and price preview, instead of keeping the settings/collection buttons calling the purchase flow directly?"
+ },
+ {
+  "task_id": "t3-13",
+  "prompt": "Why was the paywall-v2 build split into exactly three parallel implementer lanes with disjoint file ownership, instead of one sequential pass?"
+ },
+ {
+  "task_id": "t3-14",
+  "prompt": "Why did the settings screen's active-subscription card need \"Restore Purchases\" removed from it specifically?"
+ },
+ {
+  "task_id": "t3-15",
+  "prompt": "Did the goal-aware rewrite of the ad-campaign grading logic (installs as the north star, sample-size guards, stripped hardcoded numbers) actually reach the live command-center dashboard?"
+ },
+ {
+  "task_id": "t3-16",
+  "prompt": "Did the anonymous-browsing-channel group id backfilled for the 2026-07-24 radio-monetization OTA still appear in the release-train manifest as of the most recent commit touching that file?"
+ },
+ {
+  "task_id": "t3-17",
+  "prompt": "Was the \"Manage Subscription\" button in settings \u2014 reported dead the same day as two other subscription-related bugs \u2014 actually fixed with a code change?"
+ },
+ {
+  "task_id": "t3-18",
+  "prompt": "Did the OpenAI Ads pixel integration described in its own plan (loader component, tracking wrapper, conversion events on store-badge clicks) ever get committed to version control?"
+ },
+ {
+  "task_id": "t3-19",
+  "prompt": "A plan for next-OTA-cycle ANR mitigation on the 1.5.5 binary was logged as a task and then never touched again in the tracker \u2014 did the underlying ANR problem it targeted get fixed anyway?"
+ },
+ {
+  "task_id": "t3-20",
+  "prompt": "The \"fb4a Meta install influx\" investigation was logged as a single completed task in the meta-campaigns session history \u2014 did it leave behind any retrievable written finding or code change in these repos?"
+ },
+ {
+  "task_id": "t3-21",
+  "prompt": "The Saadhana feature's epic plan, BRD/TDD doc, and Phase-0 instrumentation task were all recorded in a session under the marketing-analytics project's directory \u2014 does the mobile app repo's own documentation explain why its feature work would be tracked there?"
+ },
+ {
+  "task_id": "t3-22",
+  "prompt": "The Japa-engagement analytics module and the active-release resolver were tracked as completed in a session dated 2026-06-27 \u2014 does the commit that actually contains those files carry the same date?"
+ },
+ {
+  "task_id": "t3-23",
+  "prompt": "The audio production for the Guru Brahma and Jagannathashtakam radio tracks, and their release into specific app stations, happened on the same calendar day \u2014 did both halves happen in the same repository?"
+ },
+ {
+  "task_id": "t3-24",
+  "prompt": "A set of \"capture\" tasks for practice/feedback-hero, japa, calendar, streak, and radio screenshots was logged in the mobile app repo's task history as never completed \u2014 were those specific captures ever actually produced, and if so, where does the evidence live?"
+ },
+ {
+  "task_id": "t3-25",
+  "prompt": "Is the OpenAI Ads pixel work findable anywhere as a committed change in the repository its own plan file names as the deployment target?"
+ },
+ {
+  "task_id": "t3-26",
+  "prompt": "The \"production-submit invariant\" hardening idea (rejecting anon-profile builds from production submission) was raised in the same session as a real production release \u2014 did it, or an equivalent guard, ever land in any of the four core repos, under any name?"
+ },
+ {
+  "task_id": "t3-27",
+  "prompt": "The plan for the release-train dual-OTA-group fix said the writer/helper/test files it built would live in an \"unversioned\" location outside any project repo \u2014 is that still an accurate description of where those files live today?"
+ }
+]
