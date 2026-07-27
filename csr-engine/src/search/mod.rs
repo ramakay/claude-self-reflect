@@ -130,6 +130,24 @@ impl SearchEngine {
         }
     }
 
+    /// Remove a chunk from search results — same blank-the-mapping mechanism as
+    /// [`Self::remove_reflection`] (HNSW has no true deletion). Needed by plan
+    /// reimport: deleting the SQLite rows alone left the old vectors live, and
+    /// re-inserting a reused deterministic id was skipped as a duplicate (Codex
+    /// HIGH), so stale plan content kept matching forever.
+    pub fn remove_chunk(&mut self, id: &str) {
+        let removed = if let Some(pos) = self.chunk_id_map.iter().position(|x| x == id) {
+            self.chunk_id_map[pos] = String::new();
+            true
+        } else {
+            false
+        };
+        let removed_from_set = self.chunk_id_set.remove(id);
+        if removed || removed_from_set {
+            self.dirty = true;
+        }
+    }
+
     /// Check if a reflection ID exists in the index (non-blanked).
     pub fn has_reflection(&self, id: &str) -> bool {
         self.reflection_id_set.contains(id)

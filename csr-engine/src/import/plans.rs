@@ -362,7 +362,17 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     // Content can shrink between reimports; deterministic chunk ids would only
     // overwrite the chunks that still exist, leaving a stale tail behind. Wipe first,
     // rebuild from scratch, so reimport is a true replace rather than a merge.
+    // The live HNSW index must drop the old ids too (Codex HIGH): deleting only
+    // the SQLite rows left old vectors matching, and a reused deterministic id
+    // was skipped as a duplicate on re-insert, pinning stale content forever.
+    let old_ids = storage.get_chunk_ids_for_conversation(&conv_id)?;
     storage.delete_chunks_for_conversation(&conv_id)?;
+    if !old_ids.is_empty() {
+        let mut idx = engine.search().blocking_write();
+        for id in &old_ids {
+            idx.remove_chunk(id);
+        }
+    }
 
     let (project_name, source_conv) =
         correlate_project(plan, storage).unwrap_or(("_unscoped".to_string(), None));

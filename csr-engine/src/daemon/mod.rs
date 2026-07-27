@@ -340,10 +340,12 @@ impl Daemon {
         let _ = tokio::time::timeout(timeout, consolidation_handle).await;
         let _ = tokio::time::timeout(timeout, maintenance_handle).await;
         let _ = tokio::time::timeout(timeout, registry_handle).await;
-        // Plans imports write the HNSW index the flush below persists — give the
-        // in-flight import (it stops between plans, so at most one) time to land
-        // rather than abandoning it mid-write (CodeRabbit).
-        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(30), plans_handle).await;
+        // Plans imports write the HNSW index the flush below persists. A timeout
+        // here would DETACH the task, not stop it — it could then mutate the
+        // index after dump_to_disk read its state (Codex). The loop stops
+        // between plans on shutdown, so at most one bounded import is in
+        // flight: await it fully.
+        let _ = plans_handle.await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
 

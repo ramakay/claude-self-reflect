@@ -310,20 +310,18 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
                                 let (_, index) = pending_task_ids.remove(pos);
                                 Some(index)
                             } else {
-                                // No match for this tool_use_id — fall back to the
-                                // OLDEST unbound TaskCreate: creations and their
-                                // results arrive in the same order, so FIFO keeps
-                                // ids aligned when blocks lack ids (CodeRabbit —
-                                // LIFO cross-bound two unlabeled creates).
-                                if pending_task_ids.is_empty() {
-                                    None
-                                } else {
-                                    Some(pending_task_ids.remove(0).1)
-                                }
+                                // Explicit tool_use_id that matches nothing means
+                                // this result belongs to a capped, malformed, or
+                                // unrelated create — binding it anywhere would
+                                // corrupt later TaskUpdates (Codex). Leave unbound.
+                                None
                             }
                         } else if pending_task_ids.is_empty() {
                             None
                         } else {
+                            // No tool_use_id on the block at all: creations and
+                            // results arrive in order, so FIFO keeps unlabeled
+                            // creates aligned (CodeRabbit — LIFO cross-bound them).
                             Some(pending_task_ids.remove(0).1)
                         };
                         if let Some(index) = todos_index {
@@ -526,8 +524,17 @@ pub async fn extract_and_store_episode(
         }
     }
     if let Some(state) = task_dir_state {
-        if !state.is_empty() {
-            episode.todos = state;
+        if state.parse_failures > 0 {
+            // Files existed but didn't parse — the schema-drift signal (Codex:
+            // all-failures used to read as "no tasks" and stay invisible).
+            let _ = engine.storage().bump_aux_counter("tasks");
+        }
+        // Authoritative whenever the dir actually held task files — INCLUDING an
+        // all-deleted session, which must override stale transcript tasks rather
+        // than let them set next_steps and cap the outcome (Codex). A dir with
+        // zero task files carries no signal; transcript state stands.
+        if state.files_seen > state.parse_failures {
+            episode.todos = state.todos;
             episode.next_steps = episode
                 .todos
                 .iter()
@@ -625,10 +632,34 @@ fn propose_task_resolutions(
         return;
     }
     for todo in completed {
-        let Ok(hits) = storage.fts5_search(&todo.content, 1, Some(project_name)) else {
+        let Ok(hits) = storage.fts5_search(&todo.content, 3, Some(project_name)) else {
             continue;
         };
-        let Some(hit) = hits.first() else {
+        // fts5_search OR-joins terms, so a hit can rank on one shared word.
+        // Require most of the subject's significant tokens verbatim in the hit
+        // before proposing — identity, not similarity (Codex: single-word
+        // matches attached completed tasks to unrelated still-open chunks).
+        let subject_tokens: Vec<String> = todo
+            .content
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|w| w.to_lowercase())
+            .filter(|w| w.len() > 3)
+            .collect();
+        if subject_tokens.is_empty() {
+            continue;
+        }
+        let Some(hit) = hits.iter().find(|h| {
+            let content_tokens: std::collections::HashSet<String> = h
+                .content
+                .split(|c: char| !c.is_alphanumeric())
+                .map(|w| w.to_lowercase())
+                .collect();
+            let matched = subject_tokens
+                .iter()
+                .filter(|t| content_tokens.contains(*t))
+                .count();
+            matched * 10 >= subject_tokens.len() * 6 // >= 60% overlap
+        }) else {
             continue;
         };
         let ids = vec![hit.id.clone()];
@@ -650,16 +681,27 @@ fn propose_task_resolutions(
 /// Authoritative final task state from `~/.claude/tasks/<session_id>/`.
 /// None on any error (missing dir, unreadable) — fail-soft so the Stop hook
 /// never errors or panics because of task-dir I/O.
-fn load_task_dir_state(session_id: &str) -> Option<Vec<TodoItem>> {
+fn load_task_dir_state(session_id: &str) -> Option<TaskDirState> {
     let dir = dirs::home_dir()?.join(".claude/tasks").join(session_id);
     load_task_state_from_dir(&dir)
+}
+
+/// What a task-directory read found. `files_seen` counts task JSON files present
+/// (including deleted ones); `parse_failures` counts files that existed but
+/// could not be read/parsed — the schema-drift signal the aux counter needs
+/// (Codex: `Some([])` from all-failures used to be indistinguishable from
+/// "no tasks", leaving drift invisible).
+struct TaskDirState {
+    todos: Vec<TodoItem>,
+    files_seen: usize,
+    parse_failures: usize,
 }
 
 /// Read numeric `N.json` task files from a directory. Testable helper used by
 /// `load_task_dir_state`; returns `None` only when the directory itself cannot
 /// be read. Per-file parse failures are skipped (caller with Storage/Engine
 /// could `bump_aux_counter("tasks")` — this fn stays Storage-free).
-fn load_task_state_from_dir(dir: &Path) -> Option<Vec<TodoItem>> {
+fn load_task_state_from_dir(dir: &Path) -> Option<TaskDirState> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut files: Vec<(u32, std::path::PathBuf)> = Vec::new();
     for entry in entries.flatten() {
@@ -680,18 +722,24 @@ fn load_task_state_from_dir(dir: &Path) -> Option<Vec<TodoItem>> {
     }
     files.sort_by_key(|(n, _)| *n);
 
+    let files_seen = files.len();
+    let mut parse_failures = 0usize;
     let mut todos = Vec::new();
     for (_, path) in files {
         let Ok(raw) = std::fs::read_to_string(&path) else {
+            parse_failures += 1;
             continue;
         };
         let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            parse_failures += 1;
             continue;
         };
         let Some(subject) = val.get("subject").and_then(|s| s.as_str()) else {
+            parse_failures += 1;
             continue;
         };
         let Some(status) = val.get("status").and_then(|s| s.as_str()) else {
+            parse_failures += 1;
             continue;
         };
         if status == "deleted" {
@@ -702,7 +750,11 @@ fn load_task_state_from_dir(dir: &Path) -> Option<Vec<TodoItem>> {
             status: status.to_string(),
         });
     }
-    Some(todos)
+    Some(TaskDirState {
+        todos,
+        files_seen,
+        parse_failures,
+    })
 }
 
 /// Handle the stop hook.
@@ -1436,8 +1488,10 @@ mod tests {
         std::fs::write(dir.path().join("notes.txt"), "ignore me").unwrap();
 
         let state = load_task_state_from_dir(dir.path()).expect("dir readable");
+        assert_eq!(state.files_seen, 2);
+        assert_eq!(state.parse_failures, 0);
         assert_eq!(
-            state,
+            state.todos,
             vec![
                 TodoItem {
                     content: "first".to_string(),
@@ -1449,6 +1503,23 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn task_dir_all_deleted_is_authoritative_empty_and_failures_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("1.json"),
+            r#"{"subject":"gone","status":"deleted"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("2.json"), "not json at all").unwrap();
+        let state = load_task_state_from_dir(dir.path()).expect("dir readable");
+        // Deleted task counts as a seen file (authority signal) but not a todo;
+        // the garbage file counts as a parse failure (schema-drift signal).
+        assert_eq!(state.files_seen, 2);
+        assert_eq!(state.parse_failures, 1);
+        assert!(state.todos.is_empty());
     }
 
     #[test]
