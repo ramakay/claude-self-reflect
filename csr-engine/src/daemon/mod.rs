@@ -278,6 +278,7 @@ impl Daemon {
                         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                     }
                     let eng = engine.clone();
+                    let shutdown_inner = shutdown.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         let Some(home) = dirs::home_dir() else { return };
                         let plans_dir = home.join(".claude/plans");
@@ -290,6 +291,13 @@ impl Daemon {
                                 }
                             };
                         for plan in plans {
+                            // Imports mutate chunks + the shared HNSW index; a batch
+                            // that straddles shutdown would race the final
+                            // dump_to_disk (CodeRabbit). Stop between plans — each
+                            // single import is bounded and awaited below.
+                            if shutdown_inner.load(Ordering::SeqCst) {
+                                return;
+                            }
                             match crate::import::plans::import_plan(&eng, &plan) {
                                 Ok(n) => {
                                     tracing::debug!(slug = %plan.slug, chunks = n, "plan imported")
@@ -332,7 +340,10 @@ impl Daemon {
         let _ = tokio::time::timeout(timeout, consolidation_handle).await;
         let _ = tokio::time::timeout(timeout, maintenance_handle).await;
         let _ = tokio::time::timeout(timeout, registry_handle).await;
-        let _ = tokio::time::timeout(timeout, plans_handle).await;
+        // Plans imports write the HNSW index the flush below persists — give the
+        // in-flight import (it stops between plans, so at most one) time to land
+        // rather than abandoning it mid-write (CodeRabbit).
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(30), plans_handle).await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
 

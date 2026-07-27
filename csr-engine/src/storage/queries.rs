@@ -2280,26 +2280,32 @@ pub fn known_session_ids(
         return Ok(HashSet::new());
     }
 
-    // Numbered placeholders (?1..?N) are reused on both sides of the UNION —
-    // bind each candidate once.
-    let placeholders: Vec<String> = (1..=candidates.len()).map(|i| format!("?{i}")).collect();
-    let in_list = placeholders.join(", ");
-    let sql = format!(
-        "SELECT session_id FROM session_registry WHERE session_id IN ({in_list})
-         UNION
-         SELECT conversation_id FROM chunks WHERE conversation_id IN ({in_list})"
-    );
-
-    let params: Vec<&dyn rusqlite::types::ToSql> = candidates
-        .iter()
-        .map(|id| id as &dyn rusqlite::types::ToSql)
-        .collect();
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+    // Batched ≤500 candidates per statement: one flat ?1..?N list would hit
+    // SQLITE_MAX_VARIABLE_NUMBER on large transcript dirs, and the caller's
+    // unwrap_or_default would silently report every session as unknown
+    // (CodeRabbit). Numbered placeholders are reused on both UNION sides —
+    // each candidate binds once.
+    const BATCH: usize = 500;
     let mut out = HashSet::new();
-    for row in rows {
-        out.insert(row?);
+    for batch in candidates.chunks(BATCH) {
+        let placeholders: Vec<String> = (1..=batch.len()).map(|i| format!("?{i}")).collect();
+        let in_list = placeholders.join(", ");
+        let sql = format!(
+            "SELECT session_id FROM session_registry WHERE session_id IN ({in_list})
+             UNION
+             SELECT conversation_id FROM chunks WHERE conversation_id IN ({in_list})"
+        );
+
+        let params: Vec<&dyn rusqlite::types::ToSql> = batch
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+        for row in rows {
+            out.insert(row?);
+        }
     }
     Ok(out)
 }

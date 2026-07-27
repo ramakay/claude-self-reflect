@@ -59,13 +59,17 @@ pub fn ingest_history(storage: &Storage, history_path: &Path) -> Result<IngestSt
     let has_checkpoint = stored_offset.is_some() || stored_inode.is_some() || stored_head.is_some();
 
     let mut offset = stored_offset.unwrap_or(0);
+    let mut was_reset = false;
     if has_checkpoint {
         let inode_ok = stored_inode.as_deref() == Some(&inode.to_string());
         let head_ok = stored_head.as_deref() == Some(head_hash.as_str());
         let size_ok = offset <= file_size;
         if !inode_ok || !head_ok || !size_ok {
-            // File replaced or truncated — re-read from byte 0.
+            // File replaced or truncated — re-read from byte 0. The registry is
+            // rebuilt, not merged: additive prompt_count upserts would double-
+            // count every session that survived the rotation (CodeRabbit).
             offset = 0;
+            was_reset = true;
         }
     }
 
@@ -87,6 +91,9 @@ pub fn ingest_history(storage: &Storage, history_path: &Path) -> Result<IngestSt
 
     // Atomic: upserts + checkpoint meta in one transaction.
     storage.with_transaction(|tx| {
+        if was_reset {
+            tx.execute("DELETE FROM session_registry", [])?;
+        }
         queries::upsert_session_registry_batch(tx, &rows)?;
         queries::set_meta(tx, META_OFFSET, &offset_str)?;
         queries::set_meta(tx, META_INODE, &inode_str)?;
@@ -136,6 +143,13 @@ fn read_parse_from_offset(
         buf.clear();
         let n = reader.read_until(b'\n', &mut buf)?;
         if n == 0 {
+            break;
+        }
+        // A tail with no newline is a line Claude Code is mid-appending: do NOT
+        // count it into the offset, or the checkpoint advances past a line we
+        // never parsed and it is lost forever (CodeRabbit). Next tick re-reads
+        // it once the write completes.
+        if buf.last() != Some(&b'\n') {
             break;
         }
         bytes_read += n as u64;
@@ -196,9 +210,10 @@ fn parse_history_line(line: &str) -> Option<SessionRegistryRow> {
         .unwrap_or(project_path)
         .to_string();
 
-    let ts = chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)
-        .unwrap_or_default()
-        .to_rfc3339();
+    // An unrepresentable timestamp must be a parse error, not the Unix epoch —
+    // epoch wins every earliest-first_ts comparison and poisons the session
+    // window plan correlation relies on (CodeRabbit).
+    let ts = chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)?.to_rfc3339();
 
     Some(SessionRegistryRow {
         session_id,

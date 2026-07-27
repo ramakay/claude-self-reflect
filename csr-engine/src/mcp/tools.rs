@@ -315,15 +315,11 @@ pub async fn reflect_on_past(
         .collect();
     let rank_of = |id: &str| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
     enriched.sort_by_key(|e| rank_of(&e.chunk.id));
-    enriched.truncate(limit);
 
-    // TAD: log each returned memory as an MCP-search retrieval event. session_id="mcp" is a
-    // sentinel (MCP has no session id) — distinguishable from hook-driven sessions for future
-    // decay work. Non-fatal: a logging failure must never fail the search.
-    for e in &enriched {
-        let _ = storage.log_retrieval_event(&e.chunk.id, "chunk", "mcp_search", "mcp");
-    }
-
+    // Dedupe BEFORE the limit cut (CodeRabbit): truncating first let a higher-
+    // ranked plan chunk survive while its origin conversation fell outside the
+    // page — inverting the authoritative-origin rule — and could return a short
+    // page after filtering.
     format::dedupe_results(&mut enriched);
     // Plan-doc chunks defer to their origin conversation when both matched (v9.4):
     // the plan restates the decision; the conversation is where it was made.
@@ -339,6 +335,15 @@ pub async fn reflect_on_past(
         })
         .collect();
     format::dedupe_plan_origins(&mut enriched, &origin_of);
+    enriched.truncate(limit);
+
+    // TAD: log each RETURNED memory as an MCP-search retrieval event — after the
+    // limit cut, so telemetry agrees with what the caller actually saw.
+    // session_id="mcp" is a sentinel (MCP has no session id). Non-fatal.
+    for e in &enriched {
+        let _ = storage.log_retrieval_event(&e.chunk.id, "chunk", "mcp_search", "mcp");
+    }
+
     apply_resolutions(&mut enriched, storage);
 
     Ok(format::format_search_results(

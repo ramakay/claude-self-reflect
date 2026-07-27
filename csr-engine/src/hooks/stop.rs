@@ -310,12 +310,21 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
                                 let (_, index) = pending_task_ids.remove(pos);
                                 Some(index)
                             } else {
-                                // No match for this tool_use_id — fall back to
-                                // most recent unbound TaskCreate.
-                                pending_task_ids.pop().map(|(_, index)| index)
+                                // No match for this tool_use_id — fall back to the
+                                // OLDEST unbound TaskCreate: creations and their
+                                // results arrive in the same order, so FIFO keeps
+                                // ids aligned when blocks lack ids (CodeRabbit —
+                                // LIFO cross-bound two unlabeled creates).
+                                if pending_task_ids.is_empty() {
+                                    None
+                                } else {
+                                    Some(pending_task_ids.remove(0).1)
+                                }
                             }
+                        } else if pending_task_ids.is_empty() {
+                            None
                         } else {
-                            pending_task_ids.pop().map(|(_, index)| index)
+                            Some(pending_task_ids.remove(0).1)
                         };
                         if let Some(index) = todos_index {
                             task_id_map.insert(numeric_id, index);
@@ -325,6 +334,12 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
             }
         }
     }
+
+    // Deleted tasks are not open work: the dir loader skips them, so the
+    // transcript path must too, or an all-deleted session gets capped at
+    // "partial" on one path and not the other (CodeRabbit). Filtered after the
+    // event loop because task_id_map holds indices into `todos` during it.
+    todos.retain(|t| t.status != "deleted");
 
     // next_steps comes ONLY from structured task/todo state (first non-completed
     // item from TodoWrite or TaskCreate/TaskUpdate). Keyword-snippet harvesting
@@ -592,15 +607,20 @@ pub async fn extract_and_store_episode(
 
 /// For each completed task, look for a chunk in this project carrying a
 /// still-open resolution verdict whose content matches the task subject; write
-/// a proposal row for the top match. Bounded: at most 10 todos (episode cap),
-/// one FTS probe each, one proposal per chunk+session (idempotent upsert).
+/// a proposal row for the top match. Bounded here to 10 completed tasks — the
+/// transcript path caps todos at 10, but dir-loaded task state is uncapped
+/// (CodeRabbit), and this fn must not fan out FTS probes with it.
 fn propose_task_resolutions(
     storage: &crate::storage::Storage,
     todos: &[TodoItem],
     project_name: &str,
     session_id: &str,
 ) {
-    let completed: Vec<&TodoItem> = todos.iter().filter(|t| t.status == "completed").collect();
+    let completed: Vec<&TodoItem> = todos
+        .iter()
+        .filter(|t| t.status == "completed")
+        .take(10)
+        .collect();
     if completed.is_empty() {
         return;
     }
