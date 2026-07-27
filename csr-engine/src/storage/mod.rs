@@ -459,6 +459,47 @@ impl Storage {
         queries::set_meta(&conn, key, value)
     }
 
+    /// Increment the schema-miss counter for an aux corpus source (tasks/plans/history…).
+    /// Silence was the failure mode that let the TodoWrite→TaskCreate rename rot episode
+    /// extraction for weeks — every aux adapter counts what it fails to parse.
+    pub fn bump_aux_counter(&self, source: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let key = format!("aux_schema_miss:{source}");
+        let current: i64 = queries::get_meta(&conn, &key)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        queries::set_meta(&conn, &key, &(current + 1).to_string())
+    }
+
+    /// All aux schema-miss counters as (source, count), for status surfacing.
+    pub fn get_aux_counters(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt =
+            conn.prepare("SELECT key, value FROM meta WHERE key LIKE 'aux_schema_miss:%'")?;
+        let rows = stmt.query_map([], |row| {
+            let key: String = row.get(0)?;
+            let value: String = row.get(1)?;
+            Ok((key, value))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, value) = row?;
+            let source = key.trim_start_matches("aux_schema_miss:").to_string();
+            out.push((source, value.parse().unwrap_or(0)));
+        }
+        Ok(out)
+    }
+
+    pub fn insert_chunk_with_source(
+        &self,
+        chunk: &ConversationChunk,
+        embedding: &[f32],
+        source: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::insert_chunk_with_source(&conn, chunk, embedding, source)
+    }
+
     pub fn record_narrative_usage(&self, row: &NarrativeUsageRow) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::record_narrative_usage(&conn, row)
@@ -927,6 +968,52 @@ mod tests {
         assert_eq!(got.supersedes.as_deref(), Some("behavioral continuity"));
 
         assert!(storage.get_chunk_provenance("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn chunk_source_persists_and_defaults() {
+        use crate::provenance::Speaker;
+        let storage = Storage::open_memory().unwrap();
+        let mk = |id: &str| ConversationChunk {
+            id: id.into(),
+            conversation_id: format!("conv-{id}"),
+            project_name: "proj".into(),
+            timestamp: "2026-07-27T12:00:00Z".into(),
+            content: "content".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&mk("a"), &[0.0; 4]).unwrap();
+        storage
+            .insert_chunk_with_source(&mk("b"), &[0.0; 4], "plan")
+            .unwrap();
+        let conn = storage.conn.lock().unwrap();
+        let src = |id: &str| -> String {
+            conn.query_row("SELECT source FROM chunks WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(src("a"), "conversation");
+        assert_eq!(src("b"), "plan");
+    }
+
+    #[test]
+    fn aux_counters_increment_and_list() {
+        let storage = Storage::open_memory().unwrap();
+        assert!(storage.get_aux_counters().unwrap().is_empty());
+        storage.bump_aux_counter("tasks").unwrap();
+        storage.bump_aux_counter("tasks").unwrap();
+        storage.bump_aux_counter("history").unwrap();
+        let mut counters = storage.get_aux_counters().unwrap();
+        counters.sort();
+        assert_eq!(
+            counters,
+            vec![("history".to_string(), 1), ("tasks".to_string(), 2)]
+        );
     }
 
     #[test]

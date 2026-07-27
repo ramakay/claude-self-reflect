@@ -147,9 +147,22 @@ fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
 }
 
 pub fn insert_chunk(conn: &Connection, chunk: &ConversationChunk, embedding: &[f32]) -> Result<()> {
+    insert_chunk_with_source(conn, chunk, embedding, "conversation")
+}
+
+/// `source` is a storage-level attribute ('conversation' | 'plan'), deliberately NOT a
+/// `ConversationChunk` field: ~45 construction sites would churn for a value only the
+/// aux-source importers set. Readers that need it distinguish plan chunks by the
+/// `conversation_id` prefix `plan:` instead.
+pub fn insert_chunk_with_source(
+    conn: &Connection,
+    chunk: &ConversationChunk,
+    embedding: &[f32],
+    source: &str,
+) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary, seq, is_sidechain)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary, seq, is_sidechain, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             chunk.id,
             chunk.conversation_id,
@@ -160,6 +173,7 @@ pub fn insert_chunk(conn: &Connection, chunk: &ConversationChunk, embedding: &[f
             chunk.summary,
             chunk.seq as i64,
             chunk.is_sidechain as i64,
+            source,
         ],
     )?;
 
