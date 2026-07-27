@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           # react-router 8 requires node >=22.22.0; 24 clears that and vite 7's
           # floor without depending on how setup-node resolves a bare "22".
