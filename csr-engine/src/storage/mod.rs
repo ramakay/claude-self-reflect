@@ -589,6 +589,41 @@ impl Storage {
         queries::mark_file_imported(&conn, path, chunks)
     }
 
+    // ─── Session registry / plans re-import ───
+
+    /// Session [first_ts, last_ts] for plans correlation Strategy 1 (see queries).
+    pub fn get_session_window(&self, conversation_id: &str) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_session_window(&conn, conversation_id)
+    }
+
+    /// Distinct projects whose registry window contains `ts` ± margin_hours (Strategy 2).
+    pub fn get_projects_with_window_containing(
+        &self,
+        ts: &str,
+        margin_hours: i64,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_projects_with_window_containing(&conn, ts, margin_hours)
+    }
+
+    /// Clean-slate delete for plans re-import (children first — FKs have no CASCADE).
+    pub fn delete_chunks_for_conversation(&self, conversation_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::delete_chunks_for_conversation(&conn, conversation_id)
+    }
+
+    /// Test helper: read the storage-level `source` column (no typed accessor elsewhere).
+    #[cfg(test)]
+    pub fn chunk_sources_for_conversation(&self, conversation_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt =
+            conn.prepare("SELECT source FROM chunks WHERE conversation_id = ?1 ORDER BY rowid")?;
+        let rows = stmt.query_map(rusqlite::params![conversation_id], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     // ─── TAD: Retrieval Events ───
 
     pub fn log_retrieval_event(

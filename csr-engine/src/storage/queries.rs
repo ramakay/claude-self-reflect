@@ -2068,6 +2068,102 @@ pub fn get_resolutions_batch(
     Ok(map)
 }
 
+// ─── Session registry (plans correlation) ───
+
+/// Fetch a session's [first_ts, last_ts] window from session_registry, if recorded.
+/// Used by plans::correlate_project's Strategy-1 time-window verification — an FTS hit whose
+/// conversation has a REAL registry window but whose timestamp doesn't fit it is a same-topic-
+/// different-time false positive, not a genuine correlation.
+pub fn get_session_window(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Option<(String, String)>> {
+    let result: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT first_ts, last_ts FROM session_registry WHERE session_id = ?1",
+            params![conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match result {
+        Some((Some(a), Some(b))) => Ok(Some((a, b))),
+        // Missing row, or NULL first_ts/last_ts — no usable window (same as absent).
+        _ => Ok(None),
+    }
+}
+
+/// Distinct projects whose session_registry window [first_ts, last_ts] contains `ts` (with a
+/// margin_hours slack on both ends). Used by plans::correlate_project's Strategy 2 — a plan
+/// mtime landing inside exactly one project's active-session window is decent circumstantial
+/// evidence when FTS found nothing usably distinctive to key on.
+pub fn get_projects_with_window_containing(
+    conn: &Connection,
+    ts: &str,
+    margin_hours: i64,
+) -> Result<Vec<String>> {
+    // Filtered in Rust (not SQL) — session_registry is tiny (per-session rows) and RFC3339
+    // string comparison against a +/- margin needs real datetime arithmetic, not lexical BETWEEN.
+    let target = chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .map_err(|e| anyhow::anyhow!("bad timestamp: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT project, first_ts, last_ts FROM session_registry
+         WHERE first_ts IS NOT NULL AND last_ts IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let margin = chrono::Duration::hours(margin_hours);
+    let mut projects = std::collections::HashSet::new();
+    for row in rows {
+        let (project, first_ts, last_ts) = row?;
+        let (Ok(first), Ok(last)) = (
+            chrono::DateTime::parse_from_rfc3339(&first_ts),
+            chrono::DateTime::parse_from_rfc3339(&last_ts),
+        ) else {
+            continue;
+        };
+        let (first, last) = (
+            first.with_timezone(&chrono::Utc),
+            last.with_timezone(&chrono::Utc),
+        );
+        if target >= first - margin && target <= last + margin {
+            projects.insert(project);
+        }
+    }
+    Ok(projects.into_iter().collect())
+}
+
+/// Delete all chunks (+ their embeddings, FTS rows, provenance edges) for a conversation_id.
+/// Used by plans re-import: a changed plan doc may chunk into fewer pieces than the previous
+/// run, and INSERT OR REPLACE alone can't remove a stale trailing chunk — every aux-source
+/// importer that supports mtime-triggered re-import needs a clean-slate delete first.
+pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) -> Result<usize> {
+    // FTS5 is rowid-keyed, not conversation_id-keyed — delete via subquery while the chunks
+    // rows (and thus their rowids) still exist.
+    conn.execute(
+        "DELETE FROM chunks_fts WHERE rowid IN (SELECT rowid FROM chunks WHERE conversation_id = ?1)",
+        params![conversation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM chunk_embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE conversation_id = ?1)",
+        params![conversation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM chunk_provenance WHERE chunk_id IN (SELECT id FROM chunks WHERE conversation_id = ?1)",
+        params![conversation_id],
+    )?;
+    let n = conn.execute(
+        "DELETE FROM chunks WHERE conversation_id = ?1",
+        params![conversation_id],
+    )?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
