@@ -530,6 +530,21 @@ impl Storage {
         )
     }
 
+    /// Read back a chunk's storage-level `source` attribute (see
+    /// `insert_chunk_with_source`) — used by aux-source adapter tests.
+    pub fn get_chunk_source(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_source(&conn, id)
+    }
+
+    /// Wipe a conversation's chunks + embeddings + FTS rows + provenance edges, so an
+    /// aux-source adapter can rebuild it from scratch on reimport (idempotent even when
+    /// the source document shrinks). See `queries::delete_chunks_for_conversation`.
+    pub fn delete_chunks_for_conversation(&self, conversation_id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::delete_chunks_for_conversation(&conn, conversation_id)
+    }
+
     pub fn record_narrative_usage(&self, row: &NarrativeUsageRow) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::record_narrative_usage(&conn, row)
@@ -617,6 +632,45 @@ impl Storage {
     pub fn mark_file_imported(&self, path: &Path, chunks: usize) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::mark_file_imported(&conn, path, chunks)
+    }
+
+    /// Read an import_state mtime keyed by a synthetic (non-filesystem) `file_path`,
+    /// for aux-source adapters. See `queries::get_import_state_mtime`.
+    pub fn get_import_state_mtime(&self, file_path: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_import_state_mtime(&conn, file_path)
+    }
+
+    /// Upsert an import_state row with an explicit mtime, for aux-source adapters. See
+    /// `queries::upsert_import_state_explicit`.
+    pub fn upsert_import_state_explicit(
+        &self,
+        file_path: &str,
+        conversation_id: &str,
+        chunks: usize,
+        mtime: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::upsert_import_state_explicit(&conn, file_path, conversation_id, chunks, mtime)
+    }
+
+    // ─── Session registry queries (multi-source corpus, v9.4) ───
+
+    /// (first_ts, last_ts) for one session, if registered. See
+    /// `queries::get_session_registry_window`.
+    pub fn get_session_registry_window(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_session_registry_window(&conn, session_id)
+    }
+
+    /// All (project, first_ts, last_ts) rows. See
+    /// `queries::list_session_registry_windows`.
+    pub fn list_session_registry_windows(&self) -> Result<Vec<queries::SessionWindowRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::list_session_registry_windows(&conn)
     }
 
     // ─── TAD: Retrieval Events ───
