@@ -121,6 +121,10 @@ pub fn get_chunk_provenance(conn: &Connection, chunk_id: &str) -> Result<Option<
 /// A reflection row: (id, content, tags, timestamp).
 pub type ReflectionRow = (String, String, Vec<String>, String);
 
+/// A session_registry row projection: (project, first_ts, last_ts). Timestamps are
+/// nullable in the schema (registry rows can be created before a session closes).
+pub type SessionRegistryRow = (String, Option<String>, Option<String>);
+
 /// Aggregated session info for timeline display.
 /// JOINs chunk data with enrichment reflections for rich context.
 pub struct SessionInfo {
@@ -190,6 +194,54 @@ pub fn insert_chunk_with_source(
         params![chunk.id, chunk.content],
     )?;
 
+    Ok(())
+}
+
+/// Read back a chunk's storage-level `source` ('conversation' | 'plan' | ...). The
+/// column is deliberately absent from `ConversationChunk` (see `insert_chunk_with_source`),
+/// so aux-source adapter tests need an explicit read path to assert on it.
+pub fn get_chunk_source(conn: &Connection, id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT source FROM chunks WHERE id = ?1",
+        params![id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Delete a whole conversation's chunks + their embeddings, FTS rows, and provenance
+/// edges. Aux-source adapters (plans, tasks, ...) reimport a whole document on content
+/// change, and the document can shrink — overwriting by deterministic chunk id alone
+/// would leave stale tail chunks (and their embeddings) orphaned in search forever, so
+/// a full wipe-then-rebuild is required for idempotent reimport.
+pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT id FROM chunks WHERE conversation_id = ?1")?;
+    let ids: Vec<String> = stmt
+        .query_map(params![conversation_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for id in &ids {
+        // chunks_fts has no FK on chunks.id (it's rowid-addressed), so its row must be
+        // dropped before the owning chunks row disappears and the rowid lookup goes stale.
+        conn.execute(
+            "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
+            params![id],
+        )?;
+        conn.execute(
+            "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
+            params![id],
+        )?;
+        conn.execute(
+            "DELETE FROM chunk_provenance WHERE chunk_id = ?1",
+            params![id],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM chunks WHERE conversation_id = ?1",
+        params![conversation_id],
+    )?;
     Ok(())
 }
 
@@ -999,6 +1051,68 @@ pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Resu
         params![path_str, conv_id, chunks as i64, mtime],
     )?;
     Ok(())
+}
+
+/// Read the stored mtime for an import_state row keyed by an arbitrary `file_path`
+/// string. Aux-source adapters (plans, tasks, ...) key `import_state` by a synthetic
+/// id (e.g. `"plan:<slug>"`) that isn't a real filesystem path, so `is_file_imported`
+/// (which stats the path itself) can't be reused — this never touches the filesystem.
+pub fn get_import_state_mtime(conn: &Connection, file_path: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT file_mtime FROM import_state WHERE file_path = ?1",
+        params![file_path],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Upsert an import_state row with a caller-supplied mtime, for aux-source adapters
+/// whose "file_path" key is synthetic. Mirrors `mark_file_imported`'s INSERT OR
+/// REPLACE shape but never derives mtime from `Path::metadata` (see
+/// `get_import_state_mtime`).
+pub fn upsert_import_state_explicit(
+    conn: &Connection,
+    file_path: &str,
+    conversation_id: &str,
+    chunks: usize,
+    mtime: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO import_state (file_path, conversation_id, chunks_imported, file_mtime) VALUES (?1, ?2, ?3, ?4)",
+        params![file_path, conversation_id, chunks as i64, mtime],
+    )?;
+    Ok(())
+}
+
+// ─── Session registry queries (multi-source corpus, v9.4) ───
+// The registry itself is written elsewhere (lane/p4-registry); these are read-only
+// lookups for correlating an aux-source document (e.g. a plan) to the session whose
+// time window contains it.
+
+/// (first_ts, last_ts) for one session, if the registry has a row for it. The registry
+/// can lag import, so callers must treat "no row" as "unknown," not "no match."
+pub fn get_session_registry_window(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<(Option<String>, Option<String>)>> {
+    conn.query_row(
+        "SELECT first_ts, last_ts FROM session_registry WHERE session_id = ?1",
+        params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// All (project, first_ts, last_ts) rows in the registry. Small table (one row per
+/// session), so callers filter by time window in Rust rather than pushing per-call
+/// date arithmetic into SQL.
+pub fn list_session_registry_windows(conn: &Connection) -> Result<Vec<SessionRegistryRow>> {
+    let mut stmt = conn.prepare("SELECT project, first_ts, last_ts FROM session_registry")?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 // ─── Backfill queries (for enrichment pipeline repair) ───

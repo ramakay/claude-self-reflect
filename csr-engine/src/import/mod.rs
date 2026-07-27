@@ -1,4 +1,5 @@
 pub mod backfill;
+pub mod plans;
 pub mod watcher;
 
 use std::fs;
