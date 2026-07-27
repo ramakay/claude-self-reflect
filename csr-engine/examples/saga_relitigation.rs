@@ -32,10 +32,20 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use csr_engine::engine::Engine;
 use csr_engine::search::reinstatement::{reinstate, ReinstateConfig};
+use csr_engine::storage::queries::ResolutionEntry;
 use serde::Deserialize;
 
 /// Matches `ReinstateConfig::default().min_score` / saga_ablation.rs's MIN_SCORE.
 const MIN_SCORE: f32 = 0.20;
+
+/// RRF pool size per channel (vector, FTS) before fusion — see `walk_knn`.
+const RRF_POOL_SIZE: usize = 20;
+
+/// RRF's rank-damping constant. Standard value from Cormack et al. 2009
+/// ("Reciprocal Rank Fusion outperforms Condorcet..."); also matches the
+/// `docs/plans/saga-t3-preregistration.md` merge-rule spec verbatim
+/// (`score = Σ 1/(60+rank)`).
+const RRF_K: f32 = 60.0;
 
 /// Only the fields this harness needs. Extra grading-metadata fields on each
 /// task object are ignored automatically (serde skips unknown fields unless
@@ -44,6 +54,27 @@ const MIN_SCORE: f32 = 0.20;
 struct Task {
     task_id: String,
     prompt: String,
+}
+
+/// Task-file input shape. Accepts either a bare JSON array of tasks or a
+/// `{"tasks": [...]}` wrapper object — both forms have been used by different
+/// question-set generation passes for this benchmark family, and the harness
+/// should not care which one it's handed. Untagged: serde tries each variant
+/// in order and takes the first that parses.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TasksFile {
+    Wrapped { tasks: Vec<Task> },
+    Bare(Vec<Task>),
+}
+
+impl TasksFile {
+    fn into_tasks(self) -> Vec<Task> {
+        match self {
+            TasksFile::Wrapped { tasks } => tasks,
+            TasksFile::Bare(tasks) => tasks,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -109,19 +140,39 @@ fn sort_deterministic(rows: &mut [EvidenceRow]) {
     rows.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
 }
 
-/// Arm K: similarity-only kNN. `search_chunks` + `search_reflections`, merged
-/// by max score per id, sorted, truncated to `k`. No hop-2 spread (blend/graph/
-/// episode), no provenance rerank, no echo demotion — the plain-recall baseline.
-async fn walk_knn(engine: &Engine, query_vec: &[f32], k: usize) -> Result<Vec<EvidenceRow>> {
+/// Arm K: similarity-only kNN, PLUS the preregistration's granted FTS/substring
+/// access (docs/plans/saga-t3-preregistration.md, "Arms" §2: "K retains
+/// substring/FTS access — commit hashes in chunk text are searchable text for
+/// K; only *typed edge traversal* is exclusive to R").
+///
+/// Two independently-ranked channels feed a Reciprocal Rank Fusion merge:
+///   1. Vector channel: `search_chunks` + `search_reflections`, max-score
+///      merged per id, sorted, pool capped at `RRF_POOL_SIZE`.
+///   2. FTS channel: `Storage::fts5_search` (chunks_fts, top `RRF_POOL_SIZE`)
+///      over the raw task prompt — this is the "substring/FTS access" the
+///      preregistration grants arm K; it is the only channel that can surface
+///      a commit hash the vector embedding didn't rank highly.
+///
+/// Merge rule (preregistration verbatim): `score = Σ 1/(60+rank)` across the
+/// two ranked lists (1-indexed rank per list), summed when an id appears in
+/// both; deduped by chunk/reflection id; final list truncated to `k`. No
+/// hop-2 spread (blend/graph/episode), no provenance rerank, no echo
+/// demotion — those remain exclusive to arm R.
+async fn walk_knn(
+    engine: &Engine,
+    query: &str,
+    query_vec: &[f32],
+    k: usize,
+) -> Result<Vec<EvidenceRow>> {
     let (chunk_hits, reflection_hits) = {
         let idx = engine.search().read().await;
-        let chunks = idx.search_chunks(query_vec, k, MIN_SCORE);
-        let reflections = idx.search_reflections(query_vec, k, MIN_SCORE);
+        let chunks = idx.search_chunks(query_vec, RRF_POOL_SIZE, MIN_SCORE);
+        let reflections = idx.search_reflections(query_vec, RRF_POOL_SIZE, MIN_SCORE);
         (chunks, reflections)
     };
 
     let storage = engine.storage();
-    let mut pool: HashMap<String, EvidenceRow> = HashMap::new();
+    let mut vector_pool: HashMap<String, EvidenceRow> = HashMap::new();
 
     let chunk_ids: Vec<String> = chunk_hits.iter().map(|r| r.id.clone()).collect();
     let chunk_meta = storage.get_chunks_by_ids(&chunk_ids)?;
@@ -131,7 +182,7 @@ async fn walk_knn(engine: &Engine, query_vec: &[f32], k: usize) -> Result<Vec<Ev
     for r in &chunk_hits {
         if let Some(c) = meta_by_id.get(r.id.as_str()) {
             push_max(
-                &mut pool,
+                &mut vector_pool,
                 EvidenceRow {
                     id: r.id.clone(),
                     conversation_id: c.conversation_id.clone(),
@@ -149,7 +200,7 @@ async fn walk_knn(engine: &Engine, query_vec: &[f32], k: usize) -> Result<Vec<Ev
                 .find_map(|t| t.strip_prefix("conv_").map(str::to_string))
                 .unwrap_or_else(|| format!("refl_{}", r.id));
             push_max(
-                &mut pool,
+                &mut vector_pool,
                 EvidenceRow {
                     id: r.id.clone(),
                     conversation_id: conv,
@@ -160,8 +211,46 @@ async fn walk_knn(engine: &Engine, query_vec: &[f32], k: usize) -> Result<Vec<Ev
             );
         }
     }
+    let mut vector_rows: Vec<EvidenceRow> = vector_pool.into_values().collect();
+    sort_deterministic(&mut vector_rows);
+    vector_rows.truncate(RRF_POOL_SIZE);
 
-    let mut rows: Vec<EvidenceRow> = pool.into_values().collect();
+    // FTS channel — chunks_fts only covers `chunks`, not reflections, so this
+    // channel is chunk-only by construction. `fts5_search` already orders by
+    // `fts.rank` (best match first), so list position IS the rank.
+    let fts_chunks = storage.fts5_search(query, RRF_POOL_SIZE, None)?;
+
+    let mut rrf_score: HashMap<String, f32> = HashMap::new();
+    let mut meta: HashMap<String, EvidenceRow> = HashMap::new();
+
+    for (i, row) in vector_rows.iter().enumerate() {
+        let rank = (i + 1) as f32;
+        *rrf_score.entry(row.id.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank);
+        meta.entry(row.id.clone()).or_insert_with(|| row.clone());
+    }
+    for (i, c) in fts_chunks.iter().enumerate() {
+        let rank = (i + 1) as f32;
+        *rrf_score.entry(c.id.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank);
+        meta.entry(c.id.clone()).or_insert_with(|| EvidenceRow {
+            id: c.id.clone(),
+            conversation_id: c.conversation_id.clone(),
+            // Placeholder — overwritten with the fused RRF score below. Only
+            // ever used for TSV/sort, never rendered into context.md.
+            score: 0.0,
+            timestamp: Some(c.timestamp.clone()),
+            excerpt: clean_excerpt(&c.content),
+        });
+    }
+
+    let mut rows: Vec<EvidenceRow> = rrf_score
+        .into_iter()
+        .filter_map(|(id, fused)| {
+            meta.remove(&id).map(|mut row| {
+                row.score = fused;
+                row
+            })
+        })
+        .collect();
     sort_deterministic(&mut rows);
     rows.truncate(k);
     Ok(rows)
@@ -205,7 +294,20 @@ async fn walk_reinstatement(engine: &Engine, query: &str, k: usize) -> Result<Ve
 /// scores, no arm-specific wording — a blinded grader sees identical shape
 /// for both arms; only the ranked content (and which conversations appear)
 /// differs.
-fn render_context_md(task_id: &str, prompt: &str, rows: &[EvidenceRow]) -> String {
+///
+/// Per the preregistration ("R: ... with the resolution ledger loaded (T2
+/// verdicts written before any arm runs)"), each rendered chunk's ledger
+/// verdict (if any) is appended as a `status: <verdict> (<date>)` line. This
+/// rendering path is called identically for both arms — the ledger lookup
+/// itself is arm-blind (keyed only by chunk id), so there is no arm-
+/// conditional branch here, matching the file's advisor-binding arm-identity
+/// invariant above.
+fn render_context_md(
+    task_id: &str,
+    prompt: &str,
+    rows: &[EvidenceRow],
+    ledger: &HashMap<String, ResolutionEntry>,
+) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Retrieval Context: {task_id}\n\n"));
     out.push_str(&format!("Query: {prompt}\n\n"));
@@ -219,7 +321,16 @@ fn render_context_md(task_id: &str, prompt: &str, rows: &[EvidenceRow]) -> Strin
             )),
             None => out.push_str(&format!("{rank}. conversation: {}\n", row.conversation_id)),
         }
-        out.push_str(&format!("   {}\n\n", row.excerpt));
+        out.push_str(&format!("   {}\n", row.excerpt));
+        if let Some(entry) = ledger.get(&row.id) {
+            let date = if entry.created_at.len() >= 10 {
+                &entry.created_at[..10]
+            } else {
+                entry.created_at.as_str()
+            };
+            out.push_str(&format!("   status: {} ({date})\n", entry.status));
+        }
+        out.push('\n');
     }
     out
 }
@@ -291,8 +402,12 @@ async fn main() -> Result<()> {
 
     let tasks_raw = fs::read_to_string(&args.tasks)
         .with_context(|| format!("read tasks file {}", args.tasks.display()))?;
-    let tasks: Vec<Task> = serde_json::from_str(&tasks_raw)
-        .context("parse tasks json (expected an array of {task_id, prompt, ...})")?;
+    let tasks: Vec<Task> = serde_json::from_str::<TasksFile>(&tasks_raw)
+        .context(
+            "parse tasks json (expected a bare array of {task_id, prompt, ...} \
+             or a {\"tasks\": [...]} wrapper object)",
+        )?
+        .into_tasks();
     if tasks.is_empty() {
         bail!("tasks file contains zero tasks");
     }
@@ -316,11 +431,17 @@ async fn main() -> Result<()> {
         let query_vec = engine.embeddings().embed_single(&task.prompt)?;
 
         let rows = match args.arm {
-            Arm::Knn => walk_knn(&engine, &query_vec, args.topk).await?,
+            Arm::Knn => walk_knn(&engine, &task.prompt, &query_vec, args.topk).await?,
             Arm::Reinstatement => walk_reinstatement(&engine, &task.prompt, args.topk).await?,
         };
 
-        let md = render_context_md(&task.task_id, &task.prompt, &rows);
+        // Ledger lookup runs identically for both arms (see `render_context_md`
+        // doc comment) — the preregistration requires both arms to run "with
+        // the resolution ledger loaded", not just R.
+        let chunk_ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let ledger = engine.storage().get_resolutions_batch(&chunk_ids)?;
+
+        let md = render_context_md(&task.task_id, &task.prompt, &rows, &ledger);
         let md_path = args
             .out
             .join(format!("{}.{}.context.md", task.task_id, args.arm.as_str()));

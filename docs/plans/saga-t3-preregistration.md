@@ -84,6 +84,28 @@ One corpus snapshot, constructed once, used by all arms:
 5. Mechanical scoring; judging packets built; cross-family judging.
 6. Results file: saga-t3-results.md.
 
+## Amendments (recorded 2026-07-27, before any arm ran)
+
+1. **K-arm FTS mechanics**: the substring/FTS grant is implemented as
+   reciprocal-rank fusion (score = Σ 1/(60+rank)) over two ranked lists —
+   vector top-20 and chunks_fts top-20 — deduped, deterministic tie-break,
+   truncated to k. R-arm untouched.
+2. **Registry-spine symmetry**: session_registry rows are not retrievable by
+   either arm's search path (spine metadata only). This is symmetric and does
+   not advantage either arm; "registry-spine metadata" in Materials is
+   corrected to corpus-construction metadata, not retrievable content.
+3. **Ledger rendering**: both arms render `status: <verdict> (<date>)` under
+   any result chunk carrying a resolution-ledger verdict — one shared code
+   path, no arm-conditional logic.
+4. **Mechanical roster freeze**: 27 of 529 pairs' receipt-gold conversations
+   fall inside the corpus-freeze exclusion (benchmark-construction sessions);
+   the frozen mechanical roster is the remaining **396 receipt-class pairs**
+   (eval-kit/t3/mech_pairs.frozen.csv, sha256 5e03eb25…). Citation-only pairs
+   are excluded from Gate M as pre-specified (receipt-class primary).
+5. **Snapshot identity**: sha256 1d2b9923c79b078d3e923fa4987ca0c712e0851068b4edef726dd317e174fa18
+   (t3-frozen-20260727/csr.db); 119 conversations excluded; leak check clean;
+   37 ledger verdicts and 48 plan chunks present.
+
 ## Failure interpretation (pre-committed)
 
 - Gate M fails, Gate D fails: reinstatement's multi-hop advantage is not
