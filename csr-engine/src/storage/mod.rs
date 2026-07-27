@@ -931,6 +931,40 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_resolutions_batch(&conn, chunk_ids)
     }
+
+    // ─── Session registry / aux coverage ───
+
+    /// Runs `f` with the raw connection inside a single SQLite transaction.
+    /// Used by registry ingest to make "upsert rows" + "advance checkpoint"
+    /// atomic — a crash between the two is otherwise how a batch could be
+    /// replayed or silently dropped. Enforced via this single
+    /// `with_transaction` call wrapping both the row upserts and the meta
+    /// checkpoint writes in `import::registry::ingest_history`.
+    pub fn with_transaction<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.unchecked_transaction()?;
+        let result = f(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// (sessions_seen, sessions_imported, gap) from session_registry vs chunks.
+    pub fn coverage_stats(&self) -> anyhow::Result<(i64, i64, i64)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::coverage_stats(&conn)
+    }
+
+    /// Subset of candidate session ids present in session_registry or chunks.
+    pub fn known_session_ids(
+        &self,
+        candidates: &[String],
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::known_session_ids(&conn, candidates)
+    }
 }
 
 #[cfg(test)]
@@ -1309,5 +1343,45 @@ mod tests {
             "agent",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn coverage_stats_math() {
+        use crate::import::ConversationChunk;
+        use crate::provenance::Speaker;
+
+        let storage = Storage::open_memory().unwrap();
+        // Seed 3 session_registry rows directly.
+        {
+            let conn = storage.conn.lock().unwrap();
+            for (id, proj) in [("sr1", "p"), ("sr2", "p"), ("sr3", "p")] {
+                conn.execute(
+                    "INSERT INTO session_registry (session_id, project, first_prompt, first_ts, last_ts, prompt_count)
+                     VALUES (?1, ?2, 'x', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 1)",
+                    rusqlite::params![id, proj],
+                )
+                .unwrap();
+            }
+        }
+        // Chunks for exactly 1 of those 3 conversation_ids.
+        storage
+            .insert_chunk(
+                &ConversationChunk {
+                    id: "chunk-sr1".into(),
+                    conversation_id: "sr1".into(),
+                    project_name: "p".into(),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                    content: "c".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::User,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                &[0.0; 4],
+            )
+            .unwrap();
+
+        assert_eq!(storage.coverage_stats().unwrap(), (3, 1, 2));
     }
 }
