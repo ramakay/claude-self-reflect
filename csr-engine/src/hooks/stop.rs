@@ -9,15 +9,21 @@
 //! in a session (request, files investigated/modified, tools, outcome, errors).
 //! Always returns Ok(()) — never blocks Claude Code.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::LazyLock;
 
 use anyhow::Result;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::HookInput;
 use crate::engine::Engine;
 use crate::search::cross_project::resolve_project_from_cwd;
+
+/// Matches Claude Code TaskCreate tool_result text: "Task #N created successfully".
+static TASK_CREATED_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Task #(\d+) created successfully").unwrap());
 
 /// A single todo item captured from the last TodoWrite call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -70,6 +76,13 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
     let mut message_count: usize = 0;
     let mut todos: Vec<TodoItem> = Vec::new();
     let mut approved_plan: Option<String> = None;
+    // TaskCreate/TaskUpdate tracking: numeric task id → index into `todos`.
+    // Ids come only from tool_result text ("Task #N created successfully"),
+    // never from transcript ordinal position (pre-existing/deleted tasks break that).
+    let mut task_id_map: HashMap<String, usize> = HashMap::new();
+    // TaskCreate blocks awaiting their tool_result binding: (tool_use_id, todos_index).
+    // tool_use_id may be empty if the block had no "id" field.
+    let mut pending_task_ids: Vec<(String, usize)> = Vec::new();
 
     // Tool names whose file_path inputs count as "investigated"
     let read_tools: HashSet<&str> = ["Read", "Glob", "Grep"].into_iter().collect();
@@ -120,6 +133,9 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
                                         .and_then(|i| i.get("todos"))
                                         .and_then(|t| t.as_array())
                                     {
+                                        // Full-list rewrite — replaces any prior
+                                        // TaskCreate-derived state and invalidates
+                                        // id bindings (indices no longer apply).
                                         todos = items
                                             .iter()
                                             .filter_map(|t| {
@@ -137,6 +153,64 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
                                             })
                                             .take(10)
                                             .collect();
+                                        task_id_map.clear();
+                                        pending_task_ids.clear();
+                                    }
+                                }
+                                if name == "TaskCreate" {
+                                    // Shared cap with TodoWrite — silently drop overflow.
+                                    if todos.len() < 10 {
+                                        if let Some(subject) = block
+                                            .get("input")
+                                            .and_then(|i| i.get("subject"))
+                                            .and_then(|s| s.as_str())
+                                        {
+                                            let index = todos.len();
+                                            todos.push(TodoItem {
+                                                content: subject.to_string(),
+                                                status: "pending".to_string(),
+                                            });
+                                            let tool_use_id = block
+                                                .get("id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or_default()
+                                                .to_string();
+                                            pending_task_ids.push((tool_use_id, index));
+                                        }
+                                    }
+                                }
+                                if name == "TaskUpdate" {
+                                    // TODO: unknown task ids should bump an aux
+                                    // counter in the Stop handler; extract_episode
+                                    // stays pure and cannot report this out.
+                                    if let Some(input) = block.get("input") {
+                                        let task_id = input.get("taskId").and_then(|v| {
+                                            if let Some(s) = v.as_str() {
+                                                Some(s.to_string())
+                                            } else if let Some(n) = v.as_i64() {
+                                                Some(n.to_string())
+                                            } else {
+                                                v.as_u64().map(|n| n.to_string())
+                                            }
+                                        });
+                                        if let Some(id) = task_id {
+                                            if let Some(&idx) = task_id_map.get(&id) {
+                                                if let Some(status) =
+                                                    input.get("status").and_then(|s| s.as_str())
+                                                {
+                                                    if let Some(item) = todos.get_mut(idx) {
+                                                        item.status = status.to_string();
+                                                    }
+                                                }
+                                                if let Some(subject) =
+                                                    input.get("subject").and_then(|s| s.as_str())
+                                                {
+                                                    if let Some(item) = todos.get_mut(idx) {
+                                                        item.content = subject.to_string();
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 if name == "ExitPlanMode" {
@@ -188,7 +262,8 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
             }
         }
 
-        // Extract error signatures from tool_result blocks
+        // Extract error signatures from tool_result blocks; also bind
+        // TaskCreate numeric ids from per-block tool_result text.
         if msg_type == "tool_result" || msg_type == "user" {
             if let Some(content) = val.get("message").and_then(|m| m.get("content")) {
                 let text = extract_text_from_content(content);
@@ -208,39 +283,63 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
                         }
                     }
                 }
+
+                // Per-block TaskCreate id binding — needs tool_use_id, which the
+                // merged text path above discards. Only the tool_result content
+                // matching "Task #N created successfully" is relevant here.
+                if let Some(arr) = content.as_array() {
+                    for block in arr {
+                        if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+                            continue;
+                        }
+                        let block_text = block
+                            .get("content")
+                            .map(extract_text_from_content)
+                            .unwrap_or_default();
+                        let Some(caps) = TASK_CREATED_RE.captures(&block_text) else {
+                            continue;
+                        };
+                        let Some(numeric_id) = caps.get(1).map(|m| m.as_str().to_string()) else {
+                            continue;
+                        };
+                        let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str());
+                        let todos_index = if let Some(tuid) = tool_use_id {
+                            if let Some(pos) =
+                                pending_task_ids.iter().position(|(id, _)| id == tuid)
+                            {
+                                let (_, index) = pending_task_ids.remove(pos);
+                                Some(index)
+                            } else {
+                                // No match for this tool_use_id — fall back to
+                                // most recent unbound TaskCreate.
+                                pending_task_ids.pop().map(|(_, index)| index)
+                            }
+                        } else {
+                            pending_task_ids.pop().map(|(_, index)| index)
+                        };
+                        if let Some(index) = todos_index {
+                            task_id_map.insert(numeric_id, index);
+                        }
+                    }
+                }
             }
         }
     }
 
-    // next_steps comes ONLY from structured TodoWrite state (first non-completed
-    // item). Keyword-snippet harvesting of free prose was the recurring
-    // self-pollution channel: in sessions about CSR itself, prose legitimately
-    // mentions "next:"/"todo:" while describing the extractor, and no content
-    // filter can tell that apart from a real next step. Structured todos are
-    // authored as tasks, so they can't be mentions.
+    // next_steps comes ONLY from structured task/todo state (first non-completed
+    // item from TodoWrite or TaskCreate/TaskUpdate). Keyword-snippet harvesting
+    // of free prose was the recurring self-pollution channel: in sessions about
+    // CSR itself, prose legitimately mentions "next:"/"todo:" while describing
+    // the extractor, and no content filter can tell that apart from a real next
+    // step. Structured todos are authored as tasks, so they can't be mentions.
     let next_steps = todos
         .iter()
         .find(|t| t.status != "completed")
         .map(|t| t.content.clone());
 
-    // Determine outcome
+    // Determine outcome (task-aware: incomplete todos cap success at partial)
     let success_signal = crate::extraction::has_success_signal(&completed);
-    let outcome = if message_count < 3 {
-        "interrupted".to_string()
-    } else if !error_signatures.is_empty() {
-        // Errors occurred, but a closing success signal means the session
-        // recovered — "partial", not "failed". A dev session that hits and
-        // fixes test failures should not be remembered as a failure.
-        if success_signal {
-            "partial".to_string()
-        } else {
-            "failed".to_string()
-        }
-    } else if success_signal {
-        "success".to_string()
-    } else {
-        "partial".to_string()
-    };
+    let outcome = compute_outcome(message_count, &error_signatures, success_signal, &todos);
 
     let mut investigated_vec: Vec<String> = investigated.into_iter().collect();
     investigated_vec.sort();
@@ -269,6 +368,42 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
         approved_plan,
         prev_episode_id: None,
         anchors: Vec::new(),
+    }
+}
+
+/// Infer session outcome from message volume, errors, closing success signal,
+/// and structured task completion state.
+///
+/// Incomplete todos cap the result at `"partial"` even when prose signals
+/// success — unresolved task state means the session is not a clean win.
+fn compute_outcome(
+    message_count: usize,
+    error_signatures: &[String],
+    success_signal: bool,
+    todos: &[TodoItem],
+) -> String {
+    let outcome = if message_count < 3 {
+        "interrupted".to_string()
+    } else if !error_signatures.is_empty() {
+        // Errors occurred, but a closing success signal means the session
+        // recovered — "partial", not "failed". A dev session that hits and
+        // fixes test failures should not be remembered as a failure.
+        if success_signal {
+            "partial".to_string()
+        } else {
+            "failed".to_string()
+        }
+    } else if success_signal {
+        "success".to_string()
+    } else {
+        "partial".to_string()
+    };
+
+    // Incomplete tasks cannot be a clean success even if closing prose says so.
+    if outcome == "success" && todos.iter().any(|t| t.status != "completed") {
+        "partial".to_string()
+    } else {
+        outcome
     }
 }
 
@@ -360,6 +495,27 @@ pub async fn extract_and_store_episode(
 
     let mut episode = extract_episode(&lines, session_id, project_name);
 
+    // Authoritative on-disk task directory overrides transcript-mined todos
+    // when present and non-empty (Claude Code's ~/.claude/tasks/<session_id>/).
+    // Empty vec is "no signal" — leave transcript-derived state alone.
+    if let Some(state) = load_task_dir_state(session_id) {
+        if !state.is_empty() {
+            episode.todos = state;
+            episode.next_steps = episode
+                .todos
+                .iter()
+                .find(|t| t.status != "completed")
+                .map(|t| t.content.clone());
+            let success_signal = crate::extraction::has_success_signal(&episode.completed);
+            episode.outcome = compute_outcome(
+                episode.message_count,
+                &episode.error_signatures,
+                success_signal,
+                &episode.todos,
+            );
+        }
+    }
+
     // AST anchors for modified files (cap 10 files; relative paths resolve to cwd)
     for f in episode.files_modified.iter().take(10) {
         let p = std::path::Path::new(f);
@@ -411,6 +567,64 @@ pub async fn extract_and_store_episode(
     );
 
     Ok(())
+}
+
+/// Authoritative final task state from `~/.claude/tasks/<session_id>/`.
+/// None on any error (missing dir, unreadable) — fail-soft so the Stop hook
+/// never errors or panics because of task-dir I/O.
+fn load_task_dir_state(session_id: &str) -> Option<Vec<TodoItem>> {
+    let dir = dirs::home_dir()?.join(".claude/tasks").join(session_id);
+    load_task_state_from_dir(&dir)
+}
+
+/// Read numeric `N.json` task files from a directory. Testable helper used by
+/// `load_task_dir_state`; returns `None` only when the directory itself cannot
+/// be read. Per-file parse failures are skipped (caller with Storage/Engine
+/// could `bump_aux_counter("tasks")` — this fn stays Storage-free).
+fn load_task_state_from_dir(dir: &Path) -> Option<Vec<TodoItem>> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut files: Vec<(u32, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if ext != "json" {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(n) = stem.parse::<u32>() else {
+            continue;
+        };
+        files.push((n, path));
+    }
+    files.sort_by_key(|(n, _)| *n);
+
+    let mut todos = Vec::new();
+    for (_, path) in files {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(subject) = val.get("subject").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        let Some(status) = val.get("status").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        if status == "deleted" {
+            continue;
+        }
+        todos.push(TodoItem {
+            content: subject.to_string(),
+            status: status.to_string(),
+        });
+    }
+    Some(todos)
 }
 
 /// Handle the stop hook.
@@ -914,5 +1128,199 @@ mod tests {
         let ep: Episode = serde_json::from_str(v1).expect("v1 compat");
         assert!(ep.todos.is_empty());
         assert!(ep.approved_plan.is_none());
+    }
+
+    /// Assistant tool_use line with an explicit block id and free-form input.
+    fn assistant_named_tool(name: &str, tool_use_id: &str, input: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": name,
+                    "input": input
+                }]
+            }
+        })
+        .to_string()
+    }
+
+    /// User message carrying a tool_result block bound to a tool_use_id.
+    fn tool_result_bound(tool_use_id: &str, content: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": content
+                }]
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn episode_v2_extracts_taskcreate_taskupdate() {
+        let lines_owned = [
+            user_line("do the work"),
+            assistant_named_tool(
+                "TaskCreate",
+                "toolu_1",
+                serde_json::json!({"subject": "first task"}),
+            ),
+            tool_result_bound("toolu_1", "Task #1 created successfully."),
+            assistant_named_tool(
+                "TaskCreate",
+                "toolu_2",
+                serde_json::json!({"subject": "second task"}),
+            ),
+            tool_result_bound("toolu_2", "Task #2 created successfully."),
+            assistant_named_tool(
+                "TaskUpdate",
+                "toolu_3",
+                serde_json::json!({"taskId": "2", "status": "completed"}),
+            ),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
+        let ep = extract_episode(&lines, "sess-tc", "proj");
+
+        assert_eq!(ep.todos.len(), 2);
+        assert_eq!(ep.todos[0].content, "first task");
+        assert_eq!(ep.todos[0].status, "pending");
+        assert_eq!(ep.todos[1].content, "second task");
+        assert_eq!(ep.todos[1].status, "completed");
+        // next_steps is the first non-completed item (id 1 / first task)
+        assert_eq!(ep.next_steps.as_deref(), Some("first task"));
+    }
+
+    #[test]
+    fn taskupdate_unknown_id_ignored() {
+        let lines_owned = [
+            user_line("update a phantom task"),
+            assistant_named_tool(
+                "TaskUpdate",
+                "toolu_x",
+                serde_json::json!({"taskId": "9", "status": "completed"}),
+            ),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
+        let ep = extract_episode(&lines, "sess-unk", "proj");
+        assert!(ep.todos.is_empty());
+        assert_eq!(ep.next_steps, None);
+    }
+
+    #[test]
+    fn taskcreate_result_id_binding_nonsequential() {
+        // Non-sequential ids prove we bind from tool_result text, not ordinal index.
+        let lines_owned = [
+            user_line("resume prior tasks"),
+            assistant_named_tool(
+                "TaskCreate",
+                "toolu_a",
+                serde_json::json!({"subject": "item three"}),
+            ),
+            tool_result_bound("toolu_a", "Task #3 created successfully."),
+            assistant_named_tool(
+                "TaskCreate",
+                "toolu_b",
+                serde_json::json!({"subject": "item seven"}),
+            ),
+            tool_result_bound("toolu_b", "Task #7 created successfully."),
+            assistant_named_tool(
+                "TaskUpdate",
+                "toolu_c",
+                serde_json::json!({"taskId": "7", "status": "completed"}),
+            ),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
+        let ep = extract_episode(&lines, "sess-ns", "proj");
+
+        assert_eq!(ep.todos.len(), 2);
+        assert_eq!(ep.todos[0].content, "item three");
+        assert_eq!(ep.todos[0].status, "pending");
+        assert_eq!(ep.todos[1].content, "item seven");
+        assert_eq!(ep.todos[1].status, "completed");
+    }
+
+    #[test]
+    fn todowrite_after_taskcreate_replaces() {
+        let lines_owned = [
+            user_line("mix task systems"),
+            assistant_named_tool(
+                "TaskCreate",
+                "toolu_1",
+                serde_json::json!({"subject": "from taskcreate"}),
+            ),
+            tool_result_bound("toolu_1", "Task #1 created successfully."),
+            assistant_named_tool(
+                "TodoWrite",
+                "toolu_2",
+                serde_json::json!({
+                    "todos": [
+                        {"content": "from todowrite a", "status": "pending"},
+                        {"content": "from todowrite b", "status": "in_progress"}
+                    ]
+                }),
+            ),
+            // Stale id from the cleared TaskCreate map must not corrupt the list.
+            assistant_named_tool(
+                "TaskUpdate",
+                "toolu_3",
+                serde_json::json!({"taskId": "1", "status": "completed"}),
+            ),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
+        let ep = extract_episode(&lines, "sess-prec", "proj");
+
+        assert_eq!(ep.todos.len(), 2);
+        assert_eq!(ep.todos[0].content, "from todowrite a");
+        assert_eq!(ep.todos[0].status, "pending");
+        assert_eq!(ep.todos[1].content, "from todowrite b");
+        assert_eq!(ep.todos[1].status, "in_progress");
+    }
+
+    #[test]
+    fn load_task_dir_state_reads_numeric_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("1.json"),
+            r#"{"subject":"first","status":"pending"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("2.json"),
+            r#"{"subject":"second","status":"completed"}"#,
+        )
+        .unwrap();
+        // Non-json / non-numeric names must be skipped without error.
+        std::fs::write(dir.path().join(".lock"), "busy").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "ignore me").unwrap();
+
+        let state = load_task_state_from_dir(dir.path()).expect("dir readable");
+        assert_eq!(
+            state,
+            vec![
+                TodoItem {
+                    content: "first".to_string(),
+                    status: "pending".to_string(),
+                },
+                TodoItem {
+                    content: "second".to_string(),
+                    status: "completed".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn outcome_pending_task_caps_at_partial() {
+        let todos = [TodoItem {
+            content: "x".into(),
+            status: "pending".into(),
+        }];
+        let outcome = compute_outcome(5, &[], true, &todos);
+        assert_eq!(outcome, "partial");
     }
 }
