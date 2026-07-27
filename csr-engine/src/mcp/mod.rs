@@ -230,6 +230,12 @@ impl CsrServer {
         }
     }
 
+    /// Number of tools the rmcp router exposes — the eval suite asserts on this
+    /// so the count can't silently drift from what docs claim.
+    pub fn tool_count() -> usize {
+        Self::tool_router().list_all().len()
+    }
+
     /// Flush the HNSW index to disk if dirty.
     async fn flush_index(&self) {
         let mut idx = self.search.write().await;
