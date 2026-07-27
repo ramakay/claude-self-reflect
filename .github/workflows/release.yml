@@ -3,15 +3,24 @@ name: Release
 on:
   push:
     tags: ['v*']
-    # A branch named release/vX.Y.Z releases tag vX.Y.Z; the tag is
-    # created by the release step when it publishes.
+    # A branch named release/vX.Y.Z releases tag vX.Y.Z; the tag is claimed at
+    # the built commit by the release job.
     branches: ['release/v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v9.3.1). Created at the dispatched ref by the release step if it doesn't exist."
+        description: "Release tag (e.g. v9.3.1). Claimed at the dispatched commit if it doesn't already exist."
         required: true
         type: string
+
+# Serialize releases so two runs cannot interleave around the tag claim. This
+# is defence in depth only — the atomic ref POST in the release job is what
+# actually decides the winner, since these groups do not coincide across
+# trigger types (a tag push and a release/v* push for the same version produce
+# different ref names, and expressions cannot normalize them).
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -79,6 +88,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # Checked out only for .github/scripts/release-tag.sh. Pinned to the built
+      # commit so the verifier is the one from the code being released.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
@@ -92,14 +107,58 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: echo "tag=${INPUT_TAG:-${GITHUB_REF_NAME#release/}}" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release
+      # The invariant: the tag must name the commit these artifacts were built
+      # from. Checking whether the tag exists and then letting the release step
+      # create it is a check-then-use race — two runs for the same absent tag
+      # both pass, one creates the tag, and the other uploads artifacts built
+      # from a different commit onto it. Claim it atomically instead; ref
+      # creation is rejected when the ref already exists, so the API decides the
+      # winner. A run that loses the claim — or that was always going to reuse an
+      # existing tag, as on tag push — must prove the tag names its own commit.
+      - name: Claim release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: bash .github/scripts/release-tag.sh claim
+
+      # Staged as a draft: refs stay mutable, so nothing becomes public until the
+      # tag has been re-checked below with the assets already in place.
+      - name: Stage draft release
+        id: release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: true
           files: |
             *.tar.gz
             checksums.txt
           generate_release_notes: true
+
+      # Point of no return. Between the claim and here, anyone with push access
+      # could have force-updated or recreated the tag at another commit, and
+      # target_commitish would not correct that. Re-resolve, then publish only if
+      # the tag still names the commit these artifacts came from.
+      #
+      # This narrows the window; it does not close it. Verification and
+      # publication are two API calls against a mutable ref, so a force-update
+      # landing between them still yields a published release whose tag names a
+      # different commit. Closing that requires a repository ruleset forbidding
+      # update and deletion of v* tags — configuration this workflow cannot
+      # assert. Until such a rule exists, treat this as defence in depth against
+      # accident, not as a guarantee against a privileged writer.
+      - name: Verify tag and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+        run: |
+          set -euo pipefail
+          [ -n "${RELEASE_ID:-}" ] || { echo "::error::No release id from the draft step."; exit 1; }
+          bash .github/scripts/release-tag.sh verify
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false -F make_latest=true >/dev/null
+          echo "Published release ${TAG}."
 
   publish-npm:
     needs: release

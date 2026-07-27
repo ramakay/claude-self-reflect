@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom'
+import { Outlet, Link, useLocation, useNavigate } from 'react-router'
 import { Github, ChevronDown, ChevronRight, Menu, X, ArrowLeft, Sun, Moon, Search } from 'lucide-react'
 import { navigation, pages } from '../content'
 
