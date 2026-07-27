@@ -2068,6 +2068,128 @@ pub fn get_resolutions_batch(
     Ok(map)
 }
 
+// ─── Session registry (history.jsonl spine — never embedded / never injected) ───
+
+/// One row per session to upsert: (session_id, project, first_prompt,
+/// first_ts_rfc3339, last_ts_rfc3339, prompt_count_delta).
+#[derive(Debug, Clone)]
+pub struct SessionRegistryRow {
+    pub session_id: String,
+    pub project: String,
+    pub first_prompt: Option<String>,
+    pub first_ts: String,
+    pub last_ts: String,
+    pub prompt_count_delta: i64,
+}
+
+/// Upsert session_registry rows within an existing transaction. On conflict:
+/// first_prompt/first_ts kept from whichever row has the EARLIER first_ts
+/// (existing row wins unless the existing row's first_ts is null/absent or
+/// later than the new row's), last_ts = MAX(existing, new), prompt_count =
+/// existing + delta.
+///
+/// Does NOT open a new transaction — caller already holds one (see
+/// `Storage::with_transaction` for atomic upsert+checkpoint).
+pub fn upsert_session_registry_batch(
+    conn: &Connection,
+    rows: &[SessionRegistryRow],
+) -> Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare(
+        "INSERT INTO session_registry (session_id, project, first_prompt, first_ts, last_ts, prompt_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id) DO UPDATE SET
+           first_prompt = CASE
+             WHEN excluded.first_ts < session_registry.first_ts
+                  OR session_registry.first_ts IS NULL
+             THEN excluded.first_prompt
+             ELSE session_registry.first_prompt
+           END,
+           first_ts = CASE
+             WHEN excluded.first_ts < session_registry.first_ts
+                  OR session_registry.first_ts IS NULL
+             THEN excluded.first_ts
+             ELSE session_registry.first_ts
+           END,
+           last_ts = CASE
+             WHEN session_registry.last_ts IS NULL
+                  OR excluded.last_ts > session_registry.last_ts
+             THEN excluded.last_ts
+             ELSE session_registry.last_ts
+           END,
+           prompt_count = session_registry.prompt_count + excluded.prompt_count",
+    )?;
+    for row in rows {
+        stmt.execute(params![
+            row.session_id,
+            row.project,
+            row.first_prompt,
+            row.first_ts,
+            row.last_ts,
+            row.prompt_count_delta,
+        ])?;
+    }
+    Ok(rows.len())
+}
+
+/// (sessions_seen, sessions_imported, gap).
+/// sessions_seen = COUNT(*) FROM session_registry.
+/// sessions_imported = registry sessions that appear in non-plan chunks.
+/// gap = sessions_seen - sessions_imported (never negative).
+pub fn coverage_stats(conn: &Connection) -> Result<(i64, i64, i64)> {
+    let (seen, imported): (i64, i64) = conn.query_row(
+        "SELECT
+           (SELECT COUNT(*) FROM session_registry) AS seen,
+           (SELECT COUNT(*) FROM session_registry sr
+              WHERE EXISTS (
+                SELECT 1 FROM chunks c
+                WHERE c.conversation_id = sr.session_id
+                  AND c.conversation_id NOT LIKE 'plan:%'
+              )
+           ) AS imported",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let gap = (seen - imported).max(0);
+    Ok((seen, imported, gap))
+}
+
+/// Subset of `candidates` present in either session_registry or chunks.conversation_id.
+pub fn known_session_ids(
+    conn: &Connection,
+    candidates: &[String],
+) -> Result<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    // Numbered placeholders (?1..?N) are reused on both sides of the UNION —
+    // bind each candidate once.
+    let placeholders: Vec<String> = (1..=candidates.len()).map(|i| format!("?{i}")).collect();
+    let in_list = placeholders.join(", ");
+    let sql = format!(
+        "SELECT session_id FROM session_registry WHERE session_id IN ({in_list})
+         UNION
+         SELECT conversation_id FROM chunks WHERE conversation_id IN ({in_list})"
+    );
+
+    let params: Vec<&dyn rusqlite::types::ToSql> = candidates
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+    let mut out = HashSet::new();
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

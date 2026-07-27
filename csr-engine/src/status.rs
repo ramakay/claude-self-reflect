@@ -28,6 +28,30 @@ pub struct StatusReport {
     pub db_size_bytes: u64,
     pub db_path: String,
     pub healthy: bool,
+    /// Aux corpus coverage (session_registry vs chunks) — never injected into search.
+    pub aux: AuxStatus,
+}
+
+#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+pub struct CoverageStats {
+    pub sessions_seen: i64,
+    pub sessions_imported: i64,
+    pub gap: i64,
+}
+
+#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+pub struct SchemaMissCounts {
+    pub tasks: i64,
+    pub plans: i64,
+    pub history: i64,
+}
+
+#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+pub struct AuxStatus {
+    pub coverage: CoverageStats,
+    pub file_history_sessions: usize,
+    pub transcripts_unindexed: usize,
+    pub schema_misses: SchemaMissCounts,
 }
 
 #[derive(Serialize, Default)]
@@ -114,6 +138,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             db_size_bytes: 0,
             db_path: db_path.to_string_lossy().to_string(),
             healthy: false,
+            aux: AuxStatus::default(),
         });
     }
 
@@ -161,6 +186,8 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         }
     }
 
+    let aux = gather_aux(&storage, projects_dir);
+
     Ok(StatusReport {
         conversations,
         projects,
@@ -176,7 +203,80 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         db_size_bytes,
         db_path: db_path.to_string_lossy().to_string(),
         healthy,
+        aux,
     })
+}
+
+/// Assemble aux coverage / file-history / transcript gap stats. Fail-soft to zeros.
+fn gather_aux(storage: &Storage, projects_dir: &Path) -> AuxStatus {
+    let (seen, imported, gap) = storage.coverage_stats().unwrap_or((0, 0, 0));
+    let claude_dir = projects_dir.parent();
+
+    let file_history_sessions = claude_dir
+        .map(|d| d.join("file-history"))
+        .filter(|p| p.is_dir())
+        .and_then(|p| std::fs::read_dir(p).ok())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .count()
+        })
+        .unwrap_or(0);
+
+    let transcripts_unindexed = count_unindexed_transcripts(storage, claude_dir);
+
+    let counters = storage.get_aux_counters().unwrap_or_default();
+    let mut schema_misses = SchemaMissCounts::default();
+    for (source, count) in counters {
+        match source.as_str() {
+            "tasks" => schema_misses.tasks = count,
+            "plans" => schema_misses.plans = count,
+            "history" => schema_misses.history = count,
+            _ => {}
+        }
+    }
+
+    AuxStatus {
+        coverage: CoverageStats {
+            sessions_seen: seen,
+            sessions_imported: imported,
+            gap,
+        },
+        file_history_sessions,
+        transcripts_unindexed,
+        schema_misses,
+    }
+}
+
+fn count_unindexed_transcripts(storage: &Storage, claude_dir: Option<&Path>) -> usize {
+    let dir = match claude_dir.map(|d| d.join("transcripts")) {
+        Some(d) if d.is_dir() => d,
+        _ => return 0,
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let candidates: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?.to_string();
+            // Only ses_*.jsonl per spec.
+            if !stem.starts_with("ses_") {
+                return None;
+            }
+            Some(stem.strip_prefix("ses_").unwrap_or(&stem).to_string())
+        })
+        .collect();
+    if candidates.is_empty() {
+        return 0;
+    }
+    let known = storage.known_session_ids(&candidates).unwrap_or_default();
+    candidates.iter().filter(|c| !known.contains(*c)).count()
 }
 
 /// Aggregate narrative_usage via the existing Storage helper. Tolerates the
@@ -466,6 +566,7 @@ mod tests {
             db_size_bytes: 100_000_000,
             db_path: "/tmp/test.db".to_string(),
             healthy: true,
+            aux: AuxStatus::default(),
         };
         // Just verify it doesn't panic
         print_compact(&report);
@@ -486,5 +587,20 @@ mod tests {
         assert_eq!(report.chunks, 0);
         assert!(report.healthy); // empty DB passes integrity check
         assert_eq!(report.import_percent, 0.0);
+    }
+
+    #[test]
+    fn status_aux_block_assembles_with_missing_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        // No sibling file-history/ or transcripts/ dirs.
+
+        let _storage = Storage::open(&db_path).unwrap();
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert_eq!(report.aux.coverage, CoverageStats::default());
+        assert_eq!(report.aux.file_history_sessions, 0);
+        assert_eq!(report.aux.transcripts_unindexed, 0);
     }
 }
