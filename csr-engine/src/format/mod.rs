@@ -67,6 +67,37 @@ pub fn dedupe_results(results: &mut Vec<EnrichedResult>) {
     });
 }
 
+/// Drop plan-doc chunks whose origin conversation is already in the result set.
+///
+/// A `~/.claude/plans/*.md` chunk (conversation_id `plan:<slug>`) correlated to
+/// conversation C carries the same decision text that C's ExitPlanMode turn does.
+/// When both surface for one query, the origin conversation always survives and
+/// the plan chunk is dropped — deterministic, no similarity threshold (Codex
+/// adversarial review: content-shingle thresholds mis-collapse boilerplate and
+/// can evict the authoritative side). `origin_of` maps a plan chunk id to its
+/// correlated conversation id (from `chunk_provenance.source_conv_id`); plans
+/// without a correlation are never dropped here.
+pub fn dedupe_plan_origins(
+    results: &mut Vec<EnrichedResult>,
+    origin_of: &std::collections::HashMap<String, String>,
+) {
+    use std::collections::HashSet;
+    let present_convs: HashSet<String> = results
+        .iter()
+        .filter(|r| !r.chunk.conversation_id.starts_with("plan:"))
+        .map(|r| r.chunk.conversation_id.clone())
+        .collect();
+    results.retain(|r| {
+        if !r.chunk.conversation_id.starts_with("plan:") {
+            return true;
+        }
+        match origin_of.get(&r.chunk.id) {
+            Some(conv) => !present_convs.contains(conv),
+            None => true,
+        }
+    });
+}
+
 /// Format search results as rich XML matching the Python server output.
 pub fn format_search_results(
     results: &[EnrichedResult],
@@ -800,6 +831,32 @@ mod tests {
             seq: 0,
             is_sidechain: false,
         }
+    }
+
+    #[test]
+    fn dedupe_plan_origins_drops_plan_when_origin_present() {
+        use std::collections::HashMap;
+        let mk = |id: &str, conv: &str| EnrichedResult {
+            score: 0.9,
+            chunk: make_chunk(id, conv, "shared decision text"),
+            resolution: None,
+        };
+        // Correlated plan + its origin conversation both matched: plan drops.
+        let mut results = vec![mk("p1", "plan:witty"), mk("c1", "conv-a")];
+        let origin_of: HashMap<String, String> = [("p1".to_string(), "conv-a".to_string())].into();
+        dedupe_plan_origins(&mut results, &origin_of);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk.id, "c1");
+
+        // Origin NOT in the result set: correlated plan survives.
+        let mut results = vec![mk("p1", "plan:witty"), mk("c2", "conv-b")];
+        dedupe_plan_origins(&mut results, &origin_of);
+        assert_eq!(results.len(), 2);
+
+        // Uncorrelated plan (no provenance edge) never drops.
+        let mut results = vec![mk("p2", "plan:crispy"), mk("c1", "conv-a")];
+        dedupe_plan_origins(&mut results, &HashMap::new());
+        assert_eq!(results.len(), 2);
     }
 
     #[test]

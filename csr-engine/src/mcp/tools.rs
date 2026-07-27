@@ -325,6 +325,20 @@ pub async fn reflect_on_past(
     }
 
     format::dedupe_results(&mut enriched);
+    // Plan-doc chunks defer to their origin conversation when both matched (v9.4):
+    // the plan restates the decision; the conversation is where it was made.
+    let origin_of: std::collections::HashMap<String, String> = enriched
+        .iter()
+        .filter(|e| e.chunk.conversation_id.starts_with("plan:"))
+        .filter_map(|e| {
+            storage
+                .get_chunk_provenance(&e.chunk.id)
+                .ok()
+                .flatten()
+                .map(|p| (e.chunk.id.clone(), p.source_conv_id))
+        })
+        .collect();
+    format::dedupe_plan_origins(&mut enriched, &origin_of);
     apply_resolutions(&mut enriched, storage);
 
     Ok(format::format_search_results(
