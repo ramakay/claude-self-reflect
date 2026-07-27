@@ -500,6 +500,36 @@ impl Storage {
         queries::insert_chunk_with_source(&conn, chunk, embedding, source)
     }
 
+    /// Record a task-derived resolution proposal. Proposals are NOT verdicts:
+    /// they live in their own table, invisible to search annotation, until a
+    /// human promotes one via csr_resolve (Codex adversarial review — automatic
+    /// ledger rows would be indistinguishable from human verdicts at read time).
+    /// Idempotent per (chunk_id, session_id).
+    pub fn insert_resolution_proposal(
+        &self,
+        chunk_id: &str,
+        claim: Option<&str>,
+        evidence: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO resolution_proposals (chunk_id, claim, evidence, session_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![chunk_id, claim, evidence, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_resolution_proposals(&self) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(
+            conn.query_row("SELECT COUNT(*) FROM resolution_proposals", [], |r| {
+                r.get(0)
+            })?,
+        )
+    }
+
     pub fn record_narrative_usage(&self, row: &NarrativeUsageRow) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::record_narrative_usage(&conn, row)

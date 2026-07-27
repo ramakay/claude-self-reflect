@@ -498,7 +498,19 @@ pub async fn extract_and_store_episode(
     // Authoritative on-disk task directory overrides transcript-mined todos
     // when present and non-empty (Claude Code's ~/.claude/tasks/<session_id>/).
     // Empty vec is "no signal" — leave transcript-derived state alone.
-    if let Some(state) = load_task_dir_state(session_id) {
+    let task_dir_state = load_task_dir_state(session_id);
+    if task_dir_state.is_none() {
+        // None with the dir actually present = unreadable/format churn, the
+        // silent-rot channel this release exists to close. Missing dir is the
+        // normal no-tasks case and does not count.
+        let dir_exists = dirs::home_dir()
+            .map(|h| h.join(".claude/tasks").join(session_id).is_dir())
+            .unwrap_or(false);
+        if dir_exists {
+            let _ = engine.storage().bump_aux_counter("tasks");
+        }
+    }
+    if let Some(state) = task_dir_state {
         if !state.is_empty() {
             episode.todos = state;
             episode.next_steps = episode
@@ -514,6 +526,15 @@ pub async fn extract_and_store_episode(
                 &episode.todos,
             );
         }
+    }
+
+    // Task-derived resolution proposals: a completed task whose subject matches a
+    // chunk carrying a still-open verdict suggests that item is now resolved.
+    // Proposals only — never verdicts (see Storage::insert_resolution_proposal).
+    // Kill switch mirrors the narrative one. Fail-soft: proposal errors never
+    // block the Stop hook.
+    if std::env::var("CSR_NO_TASK_RESOLUTION").is_err() {
+        propose_task_resolutions(engine.storage(), &episode.todos, project_name, session_id);
     }
 
     // AST anchors for modified files (cap 10 files; relative paths resolve to cwd)
@@ -567,6 +588,43 @@ pub async fn extract_and_store_episode(
     );
 
     Ok(())
+}
+
+/// For each completed task, look for a chunk in this project carrying a
+/// still-open resolution verdict whose content matches the task subject; write
+/// a proposal row for the top match. Bounded: at most 10 todos (episode cap),
+/// one FTS probe each, one proposal per chunk+session (idempotent upsert).
+fn propose_task_resolutions(
+    storage: &crate::storage::Storage,
+    todos: &[TodoItem],
+    project_name: &str,
+    session_id: &str,
+) {
+    let completed: Vec<&TodoItem> = todos.iter().filter(|t| t.status == "completed").collect();
+    if completed.is_empty() {
+        return;
+    }
+    for todo in completed {
+        let Ok(hits) = storage.fts5_search(&todo.content, 1, Some(project_name)) else {
+            continue;
+        };
+        let Some(hit) = hits.first() else {
+            continue;
+        };
+        let ids = vec![hit.id.clone()];
+        let Ok(resolutions) = storage.get_resolutions_batch(&ids) else {
+            continue;
+        };
+        let Some(entry) = resolutions.get(&hit.id) else {
+            continue; // no verdict recorded — nothing to propose against
+        };
+        if entry.status != "still_open" {
+            continue;
+        }
+        let evidence = format!("task completed in session {session_id}: {}", todo.content);
+        let _ =
+            storage.insert_resolution_proposal(&hit.id, Some(&todo.content), &evidence, session_id);
+    }
 }
 
 /// Authoritative final task state from `~/.claude/tasks/<session_id>/`.
@@ -751,6 +809,65 @@ fn truncate_str(s: &str, max_chars: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn propose_task_resolutions_only_for_still_open_matches() {
+        use crate::import::ConversationChunk;
+        use crate::provenance::Speaker;
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let mk = |id: &str, content: &str, status: Option<&str>| {
+            let chunk = ConversationChunk {
+                id: id.into(),
+                conversation_id: format!("conv-{id}"),
+                project_name: "proj".into(),
+                timestamp: "2026-07-27T12:00:00Z".into(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
+            if let Some(s) = status {
+                storage
+                    .insert_resolutions(&[id.to_string()], s, "seed", None, "agent")
+                    .unwrap();
+            }
+        };
+        mk(
+            "open",
+            "fix registry offset checkpoint races",
+            Some("still_open"),
+        );
+        mk(
+            "done",
+            "narrative cache invalidation stale",
+            Some("resolved"),
+        );
+        mk("naked", "unrelated quantum topic", None);
+
+        let todos = vec![
+            TodoItem {
+                content: "fix registry offset checkpoint races".into(),
+                status: "completed".into(),
+            },
+            TodoItem {
+                content: "narrative cache invalidation stale".into(),
+                status: "completed".into(),
+            },
+            TodoItem {
+                content: "unrelated quantum topic".into(),
+                status: "pending".into(), // not completed — never proposes
+            },
+        ];
+        propose_task_resolutions(&storage, &todos, "proj", "sess-1");
+        // Only the still_open match yields a proposal; resolved + pending don't.
+        assert_eq!(storage.count_resolution_proposals().unwrap(), 1);
+        // Idempotent per (chunk, session).
+        propose_task_resolutions(&storage, &todos, "proj", "sess-1");
+        assert_eq!(storage.count_resolution_proposals().unwrap(), 1);
+    }
 
     /// Build a JSONL line for a user message.
     fn user_line(text: &str) -> String {
