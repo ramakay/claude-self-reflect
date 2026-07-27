@@ -238,6 +238,40 @@ fn draw_index_panel(f: &mut Frame, area: Rect, t: &Telemetry) {
         lines.push(Line::from(format!("  newest      {}", newest)));
     }
 
+    let src = &t.status.aux.sources;
+    let miss = &t.status.aux.schema_misses;
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "Sources",
+        Style::default().add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(format!(
+        "  plans       {} docs / {} chunks  ({} unscoped)",
+        src.plan_docs, src.plan_chunks, src.plan_unscoped_docs
+    )));
+    lines.push(Line::from(format!(
+        "  tasks       {} sessions on disk",
+        src.task_sessions_on_disk
+    )));
+    lines.push(Line::from(format!(
+        "  registry    {} sessions",
+        src.registry_sessions
+    )));
+    lines.push(Line::from(format!(
+        "  resolve     {} proposals / {} verdicts",
+        src.resolution_proposals, src.resolution_verdicts
+    )));
+    let total_miss = miss.tasks + miss.plans + miss.history;
+    if total_miss > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  schema_miss tasks={} plans={} history={}",
+                miss.tasks, miss.plans, miss.history
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
     let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Index "));
     f.render_widget(p, parts[1]);
 }

@@ -100,6 +100,10 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
     for candidate in crate::narrative::model_candidates() {
         let attempt = tokio::time::timeout(HAIKU_TIMEOUT, async {
             let mut cmd = tokio::process::Command::new("claude");
+            // Nested sessions inherit the user's hook config — without this guard
+            // every narrative call fires all 6 CSR hooks and its Stop hook stores
+            // the analyst transcript as a session_episode (meta-episode pollution).
+            cmd.env("CSR_DISABLE_RECURSIVE_HOOKS", "1");
             if let Some(model) = &candidate {
                 cmd.args(["--model", model]);
             }

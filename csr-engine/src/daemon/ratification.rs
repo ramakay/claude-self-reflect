@@ -133,6 +133,10 @@ async fn call_claude_for_acts(prompt: &str) -> Option<crate::narrative::ParsedNa
     for candidate in ratification_model_candidates() {
         let attempt = tokio::time::timeout(RATIFICATION_TIMEOUT, async {
             let mut cmd = tokio::process::Command::new("claude");
+            // Same recursion guard as session_briefing: nested claude sessions
+            // inherit hook config; without it each extraction call fires all CSR
+            // hooks and Stop stores the extractor transcript as an episode.
+            cmd.env("CSR_DISABLE_RECURSIVE_HOOKS", "1");
             if let Some(model) = &candidate {
                 cmd.args(["--model", model]);
             }

@@ -46,12 +46,26 @@ pub struct SchemaMissCounts {
     pub history: i64,
 }
 
+/// Positive per-source corpus counts (v9.4 multi-source adapters).
+/// `schema_misses` says what failed to parse; this says what actually landed.
+#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+pub struct SourceCounts {
+    pub plan_docs: i64,
+    pub plan_chunks: i64,
+    pub plan_unscoped_docs: i64,
+    pub registry_sessions: i64,
+    pub task_sessions_on_disk: usize,
+    pub resolution_proposals: i64,
+    pub resolution_verdicts: i64,
+}
+
 #[derive(Serialize, Default, Debug, PartialEq, Eq)]
 pub struct AuxStatus {
     pub coverage: CoverageStats,
     pub file_history_sessions: usize,
     pub transcripts_unindexed: usize,
     pub schema_misses: SchemaMissCounts,
+    pub sources: SourceCounts,
 }
 
 #[derive(Serialize, Default)]
@@ -236,6 +250,19 @@ fn gather_aux(storage: &Storage, projects_dir: &Path) -> AuxStatus {
         }
     }
 
+    let (plan_docs, plan_chunks, plan_unscoped_docs) =
+        storage.plan_source_counts().unwrap_or((0, 0, 0));
+    let task_sessions_on_disk = claude_dir
+        .map(|d| d.join("tasks"))
+        .filter(|p| p.is_dir())
+        .and_then(|p| std::fs::read_dir(p).ok())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .count()
+        })
+        .unwrap_or(0);
+
     AuxStatus {
         coverage: CoverageStats {
             sessions_seen: seen,
@@ -245,6 +272,15 @@ fn gather_aux(storage: &Storage, projects_dir: &Path) -> AuxStatus {
         file_history_sessions,
         transcripts_unindexed,
         schema_misses,
+        sources: SourceCounts {
+            plan_docs,
+            plan_chunks,
+            plan_unscoped_docs,
+            registry_sessions: seen,
+            task_sessions_on_disk,
+            resolution_proposals: storage.count_resolution_proposals().unwrap_or(0),
+            resolution_verdicts: storage.count_resolution_verdicts().unwrap_or(0),
+        },
     }
 }
 

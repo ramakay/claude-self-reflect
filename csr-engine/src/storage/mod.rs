@@ -530,6 +530,27 @@ impl Storage {
         )
     }
 
+    pub fn count_resolution_verdicts(&self) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(conn.query_row("SELECT COUNT(*) FROM resolution_ledger", [], |r| r.get(0))?)
+    }
+
+    /// Plan-corpus counts: (docs, chunks, unscoped_docs). Plan chunks are
+    /// identified by their `plan:` conversation-id prefix, not `chunks.source`,
+    /// matching how every reader distinguishes them.
+    pub fn plan_source_counts(&self) -> Result<(i64, i64, i64)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.query_row(
+            "SELECT COUNT(DISTINCT conversation_id), COUNT(*),
+                    COUNT(DISTINCT CASE WHEN project_name = '_unscoped'
+                          THEN conversation_id END)
+             FROM chunks WHERE conversation_id LIKE 'plan:%'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(Into::into)
+    }
+
     /// Read back a chunk's storage-level `source` attribute (see
     /// `insert_chunk_with_source`) — used by aux-source adapter tests.
     pub fn get_chunk_source(&self, id: &str) -> Result<Option<String>> {
