@@ -67,6 +67,7 @@ csr_resolve           — Record verified verdicts (resolved/still_open/regresse
 2. **TEST RULE**: Never claim success without running `cargo test`
 3. **RESTART RULE**: After modifying MCP server code, restart Claude Code
 4. **QUALITY GATE**: When pre-commit hook blocks, fix the issue — never use `--no-verify`
+5. **GOAL-SEEKING RULE**: Drive tasks to completion — never end a turn with a decision punt ("One thing I need from you", "your call", option menus for routine choices). Make routine judgment calls yourself and state them; ask only for destructive/irreversible actions, spend, publish/release, or genuine scope changes.
 
 ## Development
 
