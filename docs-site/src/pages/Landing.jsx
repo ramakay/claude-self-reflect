@@ -818,25 +818,25 @@ function WhatsNewCard() {
   return (
     <BentoCard className="card--whatsnew" delay={560} id="whats-new">
       <CardKicker number="—" label="LATEST RELEASE" accent="purple" />
-      <h2 className="type-hl-sm">What's New in v9.3.0</h2>
+      <h2 className="type-hl-sm">What's New in v9.4.0</h2>
       <ul className="whatsnew-list">
         <li>
-          <strong>Narrative token accounting</strong> — every AI narrative call is metered, including failures; <code>csr-engine status</code> reports calls and tokens spent today and all-time
+          <strong>Multi-source memory</strong> — CSR now absorbs more of <code>~/.claude</code> than transcripts: task outcomes, plan documents, and a cross-project session registry, each at the lifecycle stage it belongs to
         </li>
         <li>
-          <strong>Model chain + kill switch</strong> — narratives resolve <code>CSR_NARRATIVE_MODEL</code> → <code>haiku</code> → CLI default instead of a dated model pin; <code>CSR_NO_AI_NARRATIVES=1</code> turns AI narratives off entirely
+          <strong>Task-state regression fixed</strong> — Claude Code renamed TodoWrite → TaskCreate and episode task extraction silently emptied; episodes carry real todos and task-aware outcomes again, with open tasks capping a session at "partial"
         </li>
         <li>
-          <strong>CODE MAP injection</strong> — exploration prompts ("how does the ring navigation work?") are detected semantically and answered with file pointers from the conversation that built the feature — before the agent re-maps the codebase
+          <strong>Plan documents searchable</strong> — <code>~/.claude/plans/*.md</code> imported as decay-aware chunks, correlated to their origin conversation; the origin always outranks its plan restatement in search
         </li>
         <li>
-          <strong>File-level anchors</strong> — code provenance tracking now covers every language via whole-file anchors, not just the six AST-parsed ones
+          <strong>Honest coverage</strong> — <code>csr-engine status</code> now measures sessions seen vs imported, unindexed transcripts, and per-source schema-miss counters so silent format churn can't rot quality invisibly
         </li>
         <li>
-          <strong>Briefing cache</strong> — the session briefing regenerates only when episode content actually changes, cutting repeat SessionStart cost to zero
+          <strong>Resolution proposals</strong> — completed tasks matching still-open items generate proposals a human promotes via <code>csr_resolve</code>; never automatic verdicts
         </li>
       </ul>
-      <a className="cite-link" href="https://github.com/ramakay/claude-self-reflect/releases/tag/v9.3.0" target="_blank" rel="noopener noreferrer">Full release notes →</a>
+      <a className="cite-link" href="https://github.com/ramakay/claude-self-reflect/releases/tag/v9.4.0" target="_blank" rel="noopener noreferrer">Full release notes →</a>
     </BentoCard>
   )
 }

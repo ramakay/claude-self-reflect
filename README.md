@@ -12,11 +12,11 @@ Single 44MB binary. No databases. No containers. No API keys required.
 
 [Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
-> **v9.2 — Episode Intelligence**
-> Sessions end as structured episodes; new sessions open with a CONTINUUM of where you left off.
-> Provenance re-ranking, semantic intent routing, code graph, full-transcript recall, telemetry dashboard.
-> Sub-millisecond search, ~150ms cached startup, 570+ tests, zero external dependencies.
-> [Release notes](https://github.com/ramakay/claude-self-reflect/releases/tag/v9.2.0) | [Announcement](https://github.com/ramakay/claude-self-reflect/discussions/175)
+> **v9.4 — Multi-Source Memory**
+> CSR now remembers more than transcripts: task outcomes, plan documents, and a cross-project session registry — each absorbed at the lifecycle stage it belongs to.
+> Episodes carry real task state again (Claude Code's TodoWrite→TaskCreate rename had silently emptied them — found, fixed, and guarded with schema-miss telemetry).
+> Sub-millisecond search, ~150ms cached startup, 720+ tests, zero external dependencies.
+> [Release notes](https://github.com/ramakay/claude-self-reflect/releases/tag/v9.4.0)
 
 <img src="docs-site/public/images/csr-demo.gif" alt="CSR Demo — Setup, Search, and Hooks" width="800" />
 
@@ -166,7 +166,7 @@ No special syntax. No commands. CSR finds relevant past context and injects it a
 </details>
 
 <details>
-<summary><strong>MCP Tools</strong> — 12 annotated tools available to Claude</summary>
+<summary><strong>MCP Tools</strong> — 15 annotated tools available to Claude</summary>
 
 All tools include [MCP tool annotations](https://spec.modelcontextprotocol.io/specification/2025-11-05/server/tools/#annotations) so Claude Code understands their safety characteristics.
 
@@ -184,6 +184,9 @@ All tools include [MCP tool annotations](https://spec.modelcontextprotocol.io/sp
 | `csr_get_more` | Paginate through additional results | read-only |
 | `get_full_conversation` | Retrieve complete JSONL conversation | read-only |
 | `get_session_learnings` | Iteration-level memory for Ralph loops | read-only |
+| `csr_code_graph` | Which conversations shaped a function or file (AST anchors) | read-only |
+| `csr_why` | Provenance chain — why does this code/decision exist | read-only |
+| `csr_resolve` | Record verified verdicts (resolved/still_open/regressed) on chunks | **writes** |
 
 </details>
 
