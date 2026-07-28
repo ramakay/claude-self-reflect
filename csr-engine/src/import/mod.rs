@@ -138,7 +138,14 @@ pub fn list_jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
 /// contains: import-skip drops a whole conversation, so only transcripts that
 /// ARE an agent prompt qualify — not real sessions that merely quote one.
 fn is_csr_agent_prompt(first_user_message: &str) -> bool {
-    let trimmed = first_user_message.trim_start();
+    let mut trimmed = first_user_message.trim_start();
+    // `claude -p -` (prompt via stdin) records the literal "-" argument as the
+    // first line of the user message, with the piped prompt following it.
+    if let Some(rest) = trimmed.strip_prefix('-') {
+        if rest.starts_with('\n') || rest.starts_with("\r\n") {
+            trimmed = rest.trim_start();
+        }
+    }
     crate::extraction::provenance::AGENT_PROMPT_SIGNATURES
         .iter()
         .any(|sig| trimmed.starts_with(sig))
@@ -728,6 +735,16 @@ mod tests {
         // (only the leading window is tested).
         let quoted = format!("{}You are CSR Episode Analyst", "x".repeat(300));
         assert!(!is_csr_agent_prompt(&quoted));
+        // Ratification extractor transcripts: `claude -p -` records the literal
+        // "-" stdin marker as the first line before the piped prompt.
+        assert!(is_csr_agent_prompt(
+            "-\n# Ratification Dialog-Act Extraction\n\nYou are extracting OBSERVABLE dialog-acts"
+        ));
+        assert!(is_csr_agent_prompt(
+            "# Ratification Dialog-Act Extraction\n\nYou are extracting"
+        ));
+        // A real message that merely starts with a dash stays importable.
+        assert!(!is_csr_agent_prompt("- fix the daemon\n- ship release"));
     }
 
     #[test]

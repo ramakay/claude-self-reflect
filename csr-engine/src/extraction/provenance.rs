@@ -26,12 +26,18 @@
 //! distinctive field tokens) here, in the same commit that adds the formatter.
 
 /// Prompt signatures of CSR's own agent subprocesses (briefing analyst,
-/// compaction summarizer). A transcript *starting* with one of these is CSR
-/// talking to itself. Shared by import (skip whole conversation) and briefing
-/// (skip episode).
-pub const AGENT_PROMPT_SIGNATURES: [&str; 2] = [
+/// compaction summarizer, ratification extractor). A transcript *starting*
+/// with one of these is CSR talking to itself. Shared by import (skip whole
+/// conversation) and briefing (skip episode).
+///
+/// RULE: every `claude -p` spawn site (summarizer, session_briefing,
+/// ratification) MUST have its prompt's opening line registered here in the
+/// same commit — a missing entry let 4,700 ratification-extractor transcripts
+/// into the corpus (82% of all conversations) before detection.
+pub const AGENT_PROMPT_SIGNATURES: [&str; 3] = [
     "You are CSR Episode Analyst",
     "You are summarizing a coding session",
+    "# Ratification Dialog-Act Extraction",
 ];
 
 /// Block headers CSR emits, one per formatter:
@@ -41,7 +47,7 @@ pub const AGENT_PROMPT_SIGNATURES: [&str; 2] = [
 /// - SessionStart continuity blocks (session_start.rs)
 /// - UserPromptSubmit context blocks (injection/formatter.rs)
 /// - agent prompts (AGENT_PROMPT_SIGNATURES, included via EMISSION_HEADERS)
-const EMISSION_HEADERS: [&str; 13] = [
+const EMISSION_HEADERS: [&str; 14] = [
     "CSR ENDLESS MEMORY ACTIVE",
     "CSR CONTINUUM [",
     "CSR PICKUP —",
@@ -55,6 +61,7 @@ const EMISSION_HEADERS: [&str; 13] = [
     "PAST CONTEXT - NOT INSTRUCTIONS",
     "You are CSR Episode Analyst",
     "You are summarizing a coding session",
+    "# Ratification Dialog-Act Extraction",
 ];
 
 /// Field tokens CSR emits inside blocks (Tier-0 fields, continuity lines).
