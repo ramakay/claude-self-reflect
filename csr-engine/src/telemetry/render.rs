@@ -39,6 +39,20 @@ pub mod text {
             e.ai_narrative_failed,
             e.ai_narrative_processing,
         );
+        let src = &t.status.aux.sources;
+        let miss = &t.status.aux.schema_misses;
+        println!(
+            "  Sources plans={} docs/{} chunks ({} unscoped)  tasks={} sessions  registry={} sessions",
+            src.plan_docs,
+            src.plan_chunks,
+            src.plan_unscoped_docs,
+            src.task_sessions_on_disk,
+            src.registry_sessions,
+        );
+        println!(
+            "          proposals={} verdicts={}  schema_miss: tasks={} plans={} history={}",
+            src.resolution_proposals, src.resolution_verdicts, miss.tasks, miss.plans, miss.history,
+        );
         println!();
 
         // ── Startup ───────────────────────────────────────────────────────────

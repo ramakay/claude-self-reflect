@@ -364,6 +364,42 @@ async fn main() -> Result<()> {
             return csr_engine::hooks::install::handle(apply);
         }
 
+        // Recursion guard, checked before the engine is built: nested `claude -p`
+        // sessions (briefing, narratives, ratification) inherit hook config —
+        // exit before paying model/index startup for a no-op.
+        if std::env::var("CSR_DISABLE_RECURSIVE_HOOKS").as_deref() == Ok("1") {
+            return Ok(());
+        }
+
+        // SessionEnd races app exit: Claude Code cancels hooks still running at
+        // quit, so engine startup + HNSW flush (~0.5s) almost always dies as
+        // "Hook cancelled". Re-spawn ourselves disowned and return immediately;
+        // the child does the real work and survives the parent's cancellation.
+        // SessionEnd output is never injected, so nothing is lost by detaching.
+        if name == "session-end" && std::env::var("CSR_HOOK_DETACHED").as_deref() != Ok("1") {
+            use std::io::{Read, Write};
+            let mut stdin_buf = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut stdin_buf);
+            let exe = std::env::current_exe()?;
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(["hook", "session-end"])
+                .env("CSR_HOOK_DETACHED", "1")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0);
+            }
+            if let Ok(mut child) = cmd.spawn() {
+                if let Some(mut pipe) = child.stdin.take() {
+                    let _ = pipe.write_all(&stdin_buf);
+                }
+            }
+            return Ok(());
+        }
+
         // Other hooks need the engine
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
