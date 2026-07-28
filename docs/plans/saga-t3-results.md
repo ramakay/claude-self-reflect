@@ -86,3 +86,67 @@ git-grounded, cross-source question set with external cross-family judges.
 - **Next scientific step:** ablate *which component* of K's win is FTS vs
   vector (exploratory, post-hoc, labeled as such), and test whether typed
   receipt edges (chunk↔commit) close the gap R couldn't.
+## Amendment A — contamination vector 4 and clean re-run (recorded after results were committed)
+
+**Discovery.** A hook-recursion bug (fixed in PR #264) had caused ~4,800 nested
+`claude -p` extractor/narrative spawns to write transcripts that the import
+watcher indexed as conversations. The frozen snapshot (`1d2b9923…`) contained
+**4,346 such conversations — 84% of its 5,187 conversations, 38% of its
+154,389 chunks**. The pre-registered freeze exclusion (119 conversations)
+missed them because they predate the 2026-07-27 cutoff. This is a fourth
+self-contamination vector (assistant-side hook recursion), alongside the three
+already documented.
+
+**Impact measurement (original run).** Garbage occupied 9.5% of R's Gate M
+top-5 slots vs 5.1% of K's; Gate D contexts carried ~14% garbage items in both
+arms (7-8 of 27 questions affected each arm) — symmetric.
+
+**Clean re-run.** Snapshot scrubbed of all 4,346 spawn conversations
+(classifier: first chunk = extractor prompt; 0 overlap with mechanical gold;
+scrubbed sha `5af69d81…`, 841 conversations / 97,861 chunks, residual 0).
+Both gates re-run end-to-end:
+
+| Gate M recall@5 | R | K | discordant | p |
+|---|---|---|---|---|
+| as-published (polluted) | 0.545 | 0.783 | 13/107 | ≈1.5e-19 |
+| clean re-run | 0.581 | 0.813 | 11/103 | ≈6.9e-20 |
+
+| Gate D (clean; fresh K/R answers from scrubbed contexts, nomem reused; grok+codex consensus, 7 splits) | nomem | K | R | discordant | p |
+|---|---|---|---|---|---|
+| multi-hop (primary, n=14) | 0/14 | 4/12 | 3/13 | R-0 / K-2 | 0.50 |
+| full set (n=27) | 0/27 | 11/22 | 10/25 | R-0 / K-4 | 0.125 |
+
+**Both verdicts replicate on the clean corpus.** Gate M FAIL stands; Gate D
+NULL stands. Contamination depressed absolute scores symmetrically but changed
+no conclusion.
+
+## Amendment B — mechanism correction (FTS-vs-vector ablation, exploratory as pre-committed)
+
+The published mechanism sentence ("the FTS component matches them exactly,
+while the reinstatement walk dilutes exact-token evidence") is **wrong** per
+the ablation on the clean snapshot:
+
+| arm | recall@5 |
+|---|---|
+| K fused (vector+FTS RRF) | 0.813 |
+| K vector-only | 0.697 |
+| R (walk) | 0.581 |
+| K FTS-only | 0.162 |
+
+FTS alone is weak; the vector channel does the heavy lifting and RRF fusion
+adds ~12 points. The decisive fact is that **the walk scores 12 points below
+its own seed channel** (0.581 vs 0.697). Traced causes in
+`search/reinstatement.rs`: (1) `prefer_non_echo_seeds` deprioritizes seeds
+containing the query verbatim — on receipt lookup the verbatim-containing
+chunk IS the gold, so hop-2 spreads from wrong sessions (63/103 failures: gold
+absent from top-10); (2) `W_QUERY_ECHO` (−0.35) + scaffold (−0.30) demotions
+stack on receipt-shaped chunks (40/103 failures: gold at rank 6-10). The
+observer-effect defenses, correct for conversational recall, invert into
+anti-lookup behavior on exact-key tasks. This sharpens, rather than weakens,
+the receipts conclusion: verbatim/receipt signals must be consumed as typed
+keys (chunk↔commit edges, v9.5 task #5), not left to semantic machinery that
+is tuned to distrust them.
+
+Additional scoping note for Gate D: both arms' context files render 200-char
+excerpts per item; multi-hop evidence chains are frequently truncated for both
+arms, which bounds absolute Gate D scores independently of the R/K comparison.

@@ -81,6 +81,10 @@ impl TasksFile {
 enum Arm {
     Reinstatement,
     Knn,
+    /// Ablation: arm K's vector channel alone (no FTS, no RRF).
+    KnnVec,
+    /// Ablation: arm K's FTS channel alone (no vector, no RRF).
+    KnnFts,
 }
 
 impl Arm {
@@ -88,7 +92,11 @@ impl Arm {
         match s {
             "reinstatement" => Ok(Arm::Reinstatement),
             "knn" => Ok(Arm::Knn),
-            other => bail!("--arm must be 'reinstatement' or 'knn', got '{other}'"),
+            "knn-vec" => Ok(Arm::KnnVec),
+            "knn-fts" => Ok(Arm::KnnFts),
+            other => {
+                bail!("--arm must be 'reinstatement', 'knn', 'knn-vec' or 'knn-fts', got '{other}'")
+            }
         }
     }
 
@@ -96,6 +104,8 @@ impl Arm {
         match self {
             Arm::Reinstatement => "reinstatement",
             Arm::Knn => "knn",
+            Arm::KnnVec => "knn-vec",
+            Arm::KnnFts => "knn-fts",
         }
     }
 }
@@ -158,11 +168,22 @@ fn sort_deterministic(rows: &mut [EvidenceRow]) {
 /// both; deduped by chunk/reflection id; final list truncated to `k`. No
 /// hop-2 spread (blend/graph/episode), no provenance rerank, no echo
 /// demotion — those remain exclusive to arm R.
+/// Which of arm K's channels to run — `Fused` is the pre-registered arm;
+/// the single-channel modes exist only for the post-hoc FTS-vs-vector
+/// ablation (exploratory, labeled as such in the results doc).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KnnMode {
+    Fused,
+    VecOnly,
+    FtsOnly,
+}
+
 async fn walk_knn(
     engine: &Engine,
     query: &str,
     query_vec: &[f32],
     k: usize,
+    mode: KnnMode,
 ) -> Result<Vec<EvidenceRow>> {
     let (chunk_hits, reflection_hits) = {
         let idx = engine.search().read().await;
@@ -215,10 +236,32 @@ async fn walk_knn(
     sort_deterministic(&mut vector_rows);
     vector_rows.truncate(RRF_POOL_SIZE);
 
+    if mode == KnnMode::VecOnly {
+        vector_rows.truncate(k);
+        return Ok(vector_rows);
+    }
+
     // FTS channel — chunks_fts only covers `chunks`, not reflections, so this
     // channel is chunk-only by construction. `fts5_search` already orders by
     // `fts.rank` (best match first), so list position IS the rank.
     let fts_chunks = storage.fts5_search(query, RRF_POOL_SIZE, None)?;
+
+    if mode == KnnMode::FtsOnly {
+        let mut rows: Vec<EvidenceRow> = fts_chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| EvidenceRow {
+                id: c.id.clone(),
+                conversation_id: c.conversation_id.clone(),
+                // fts.rank order preserved as a descending score; TSV-only.
+                score: 1.0 / (i as f32 + 1.0),
+                timestamp: Some(c.timestamp.clone()),
+                excerpt: clean_excerpt(&c.content),
+            })
+            .collect();
+        rows.truncate(k);
+        return Ok(rows);
+    }
 
     let mut rrf_score: HashMap<String, f32> = HashMap::new();
     let mut meta: HashMap<String, EvidenceRow> = HashMap::new();
@@ -431,7 +474,29 @@ async fn main() -> Result<()> {
         let query_vec = engine.embeddings().embed_single(&task.prompt)?;
 
         let rows = match args.arm {
-            Arm::Knn => walk_knn(&engine, &task.prompt, &query_vec, args.topk).await?,
+            Arm::Knn => {
+                walk_knn(&engine, &task.prompt, &query_vec, args.topk, KnnMode::Fused).await?
+            }
+            Arm::KnnVec => {
+                walk_knn(
+                    &engine,
+                    &task.prompt,
+                    &query_vec,
+                    args.topk,
+                    KnnMode::VecOnly,
+                )
+                .await?
+            }
+            Arm::KnnFts => {
+                walk_knn(
+                    &engine,
+                    &task.prompt,
+                    &query_vec,
+                    args.topk,
+                    KnnMode::FtsOnly,
+                )
+                .await?
+            }
             Arm::Reinstatement => walk_reinstatement(&engine, &task.prompt, args.topk).await?,
         };
 
