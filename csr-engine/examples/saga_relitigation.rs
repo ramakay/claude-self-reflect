@@ -77,7 +77,7 @@ impl TasksFile {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arm {
     Reinstatement,
     Knn,
@@ -107,6 +107,24 @@ impl Arm {
             Arm::KnnVec => "knn-vec",
             Arm::KnnFts => "knn-fts",
         }
+    }
+}
+
+#[cfg(test)]
+mod arm_tests {
+    use super::Arm;
+
+    #[test]
+    fn parse_as_str_round_trips_all_variants() {
+        for arm in [Arm::Reinstatement, Arm::Knn, Arm::KnnVec, Arm::KnnFts] {
+            assert!(matches!(Arm::parse(arm.as_str()), Ok(a) if a == arm));
+        }
+    }
+
+    #[test]
+    fn invalid_arm_error_lists_ablation_names() {
+        let err = Arm::parse("bogus").unwrap_err().to_string();
+        assert!(err.contains("knn-vec") && err.contains("knn-fts"));
     }
 }
 
@@ -185,6 +203,28 @@ async fn walk_knn(
     k: usize,
     mode: KnnMode,
 ) -> Result<Vec<EvidenceRow>> {
+    let storage = engine.storage();
+
+    // FTS-only ablation short-circuits before any vector work — no HNSW
+    // search, no metadata joins, and (via main's gating) no query embedding.
+    if mode == KnnMode::FtsOnly {
+        let fts_chunks = storage.fts5_search(query, RRF_POOL_SIZE, None)?;
+        let mut rows: Vec<EvidenceRow> = fts_chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| EvidenceRow {
+                id: c.id.clone(),
+                conversation_id: c.conversation_id.clone(),
+                // fts.rank order preserved as a descending score; TSV-only.
+                score: 1.0 / (i as f32 + 1.0),
+                timestamp: Some(c.timestamp.clone()),
+                excerpt: clean_excerpt(&c.content),
+            })
+            .collect();
+        rows.truncate(k);
+        return Ok(rows);
+    }
+
     let (chunk_hits, reflection_hits) = {
         let idx = engine.search().read().await;
         let chunks = idx.search_chunks(query_vec, RRF_POOL_SIZE, MIN_SCORE);
@@ -192,7 +232,6 @@ async fn walk_knn(
         (chunks, reflections)
     };
 
-    let storage = engine.storage();
     let mut vector_pool: HashMap<String, EvidenceRow> = HashMap::new();
 
     let chunk_ids: Vec<String> = chunk_hits.iter().map(|r| r.id.clone()).collect();
@@ -245,23 +284,6 @@ async fn walk_knn(
     // channel is chunk-only by construction. `fts5_search` already orders by
     // `fts.rank` (best match first), so list position IS the rank.
     let fts_chunks = storage.fts5_search(query, RRF_POOL_SIZE, None)?;
-
-    if mode == KnnMode::FtsOnly {
-        let mut rows: Vec<EvidenceRow> = fts_chunks
-            .iter()
-            .enumerate()
-            .map(|(i, c)| EvidenceRow {
-                id: c.id.clone(),
-                conversation_id: c.conversation_id.clone(),
-                // fts.rank order preserved as a descending score; TSV-only.
-                score: 1.0 / (i as f32 + 1.0),
-                timestamp: Some(c.timestamp.clone()),
-                excerpt: clean_excerpt(&c.content),
-            })
-            .collect();
-        rows.truncate(k);
-        return Ok(rows);
-    }
 
     let mut rrf_score: HashMap<String, f32> = HashMap::new();
     let mut meta: HashMap<String, EvidenceRow> = HashMap::new();
@@ -471,7 +493,13 @@ async fn main() -> Result<()> {
 
     let n = tasks.len();
     for (i, task) in tasks.iter().enumerate() {
-        let query_vec = engine.embeddings().embed_single(&task.prompt)?;
+        // Only the vector-backed knn arms embed the prompt here: knn-fts must
+        // stay embedding-free (that's the ablation), and reinstatement embeds
+        // internally via `reinstate`.
+        let query_vec = match args.arm {
+            Arm::Knn | Arm::KnnVec => engine.embeddings().embed_single(&task.prompt)?,
+            Arm::KnnFts | Arm::Reinstatement => Vec::new(),
+        };
 
         let rows = match args.arm {
             Arm::Knn => {

@@ -104,7 +104,9 @@ arms (7-8 of 27 questions affected each arm) — symmetric.
 **Clean re-run.** Snapshot scrubbed of all 4,346 spawn conversations
 (classifier: first chunk = extractor prompt; 0 overlap with mechanical gold;
 scrubbed sha `5af69d81…`, 841 conversations / 97,861 chunks, residual 0).
-Both gates re-run end-to-end:
+Re-run scope: Gate M fully re-run, and Gate D's K and R answers regenerated
+from scrubbed contexts; the no-memory answers were reused (they consume no
+retrieved context, so the scrub cannot affect them):
 
 | Gate M recall@5 | R | K | discordant | p |
 |---|---|---|---|---|
@@ -120,7 +122,7 @@ Both gates re-run end-to-end:
 NULL stands. Contamination depressed absolute scores symmetrically but changed
 no conclusion.
 
-## Amendment B — mechanism correction (FTS-vs-vector ablation, exploratory as pre-committed)
+## Amendment B — mechanism correction (FTS-vs-vector ablation, post-hoc exploratory)
 
 The published mechanism sentence ("the FTS component matches them exactly,
 while the reinstatement walk dilutes exact-token evidence") is **wrong** per
