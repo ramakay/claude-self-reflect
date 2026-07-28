@@ -841,6 +841,85 @@ function WhatsNewCard() {
   )
 }
 
+function MultiSourceCard() {
+  const todos = [
+    { label: 'Fix TaskCreate regression', i: 0 },
+    { label: 'Correlate plan → origin conversation', i: 1 },
+    { label: 'Ingest history.jsonl registry', i: 2 },
+    { label: 'Wire schema-miss telemetry', i: 3 },
+  ]
+  const sources = [
+    { name: 'transcripts', path: '~/.claude/projects', color: 'var(--color-purple)' },
+    { name: 'tasks', path: '~/.claude/tasks', color: 'var(--color-sage)' },
+    { name: 'plans', path: '~/.claude/plans', color: 'var(--color-rose)' },
+    { name: 'registry', path: '~/.claude/history.jsonl', color: 'var(--color-muted)' },
+  ]
+
+  return (
+    <BentoCard className="card--multisource" delay={600}>
+      <CardKicker number="—" label="V9.4 — MULTI-SOURCE" accent="sage" />
+      <h2 className="type-hl-sm">More Than Transcripts</h2>
+      <p className="type-dateline mt-2">Tasks, plans, and session history — absorbed where they belong.</p>
+      <div className="multisource-layout">
+        <div className="todo-anim" aria-hidden="true">
+          <p className="todo-anim__title">SESSION TASKS</p>
+          {todos.map(({ label, i }) => (
+            <div key={label} className="todo-anim__item" style={{ '--i': i }}>
+              <span className="todo-anim__box">
+                <svg viewBox="0 0 10 10"><path d="M2 5.2 4.2 7.4 8 2.8" fill="none" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
+              </span>
+              <span className="todo-anim__label">{label}</span>
+            </div>
+          ))}
+          <span className="todo-anim__outcome">outcome: shipped</span>
+        </div>
+        <div className="multisource-sources">
+          {sources.map(({ name, path, color }, i) => (
+            <div key={name} className="multisource-source" style={{ '--i': i, '--dot': color }}>
+              <span className="multisource-source__dot" />
+              <span className="multisource-source__name">{name}</span>
+              <span className="multisource-source__path">{path}</span>
+            </div>
+          ))}
+          <p className="type-caption multisource-caption">
+            Task outcomes cap sessions honestly — open tasks mean "partial", never "success". Plans decay with age; the origin conversation always outranks its plan restatement.
+          </p>
+        </div>
+      </div>
+    </BentoCard>
+  )
+}
+
+function PaperCard() {
+  return (
+    <BentoCard className="card--paper" delay={660}>
+      <CardKicker number="—" label="PUBLISHED RESEARCH" accent="purple" />
+      <h2 className="type-hl-sm">The Paper</h2>
+      <p className="paper-title">
+        Similarity Drowns Intent: Three-Trace Sagas and Reinstatement Recall for Provenance in Agentic Software Construction
+      </p>
+      <div className="paper-traces" aria-hidden="true">
+        {['intent', 'deliberation', 'artifact'].map((t, i) => (
+          <span key={t} className="paper-trace" style={{ '--i': i }}>{t}</span>
+        ))}
+      </div>
+      <ul className="paper-findings">
+        <li><strong>+53% / +47%</strong> ground-truth session coverage over one-shot kNN at equal budget, pre-registered gates, two corpora</li>
+        <li><strong>Self-indexing contamination</strong> — a memory system that records its own evaluation drowns the answers in echoes; defenses repair 72% of echo occupancy</li>
+        <li><strong>Negative result, kept</strong> — ratification weighting halted at ρ≈0 and forbade an inference-based staleness design</li>
+      </ul>
+      <a
+        className="cite-link"
+        href="https://github.com/ramakay/claude-self-reflect/blob/main/docs/plans/annaswamy-2026-similarity-drowns-intent.pdf"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        Read the paper (PDF) →
+      </a>
+    </BentoCard>
+  )
+}
+
 function HostedMemoryCard() {
   return (
     <BentoCard className="card--hosted" delay={960}>
@@ -1213,6 +1292,8 @@ export default function Landing() {
           <WhatYouAskCard />
           <ArchCard />
           <WhatsNewCard />
+          <MultiSourceCard />
+          <PaperCard />
           <div className="bento-section-header">
             <span />
             <h2>How others do it</h2>
