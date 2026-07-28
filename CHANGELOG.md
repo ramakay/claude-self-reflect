@@ -5,6 +5,41 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.4.1] - 2026-07-28
+
+### Self-hosting hygiene: hook cancellation, recursion, and corpus contamination
+
+- **FIX: SessionEnd "Hook cancelled".** Claude Code cancels hooks still running
+  at quit; CSR's engine startup + HNSW flush (~0.5s) lost that race on almost
+  every session end. The hook now re-spawns itself disowned and returns in
+  ~7ms — the detached child does the real work and survives the cancellation.
+- **FIX: nested-session hook recursion.** The narrative and ratification
+  `claude -p` spawns did not set `CSR_DISABLE_RECURSIVE_HOOKS`, so every
+  enrichment call fired all six CSR hooks inside the nested session and its
+  Stop hook stored the extractor transcript as a session episode. Both spawn
+  sites now set the guard, and the guard is checked before engine startup so
+  nested no-ops cost nothing.
+- **FIX: self-indexing contamination at import.** The ratification extractor's
+  prompt was missing from `AGENT_PROMPT_SIGNATURES`, and `claude -p -` records
+  a literal `-` stdin marker as the first user-message line that defeated
+  prefix matching — so the import watcher ingested every extraction run as a
+  real conversation (on the development corpus: 82% of conversations were CSR
+  talking to itself). The signature is registered, the dash marker is
+  normalized, and the rule is documented in code: every `claude -p` spawn site
+  registers its prompt opening in the same commit.
+- **Source visibility in status/telemetry.** `csr-engine status` gains
+  `aux.sources` — plan docs/chunks/unscoped counts, registry sessions, task
+  sessions on disk, resolution proposals and verdicts — and
+  `csr-engine telemetry` renders the same block in the text report and TUI.
+  Schema-miss counters said what failed to parse; this says what landed.
+- **Docs site**: multi-source task-ledger card (animated todo ticks, outcome
+  chip, source lanes) and a tile for the published paper *Similarity Drowns
+  Intent*; grid row collision fixed.
+
+Existing installs with a contaminated corpus: transcripts already imported are
+not retroactively purged by the upgrade. `aux.sources` + `get_recent_work` make
+the pollution visible; a future release will ship a maintenance purge command.
+
 ## [9.4.0] - 2026-07-27
 
 ### Multi-source memory corpus
