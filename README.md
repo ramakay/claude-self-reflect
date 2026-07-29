@@ -10,7 +10,7 @@
 
 Single 44MB binary. No databases. No containers. No API keys required.
 
-[Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
+[Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [Paper](docs/plans/annaswamy-2026-similarity-drowns-intent.pdf) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
 > **v9.4 — Multi-Source Memory**
 > CSR now remembers more than transcripts: task outcomes, plan documents, and a cross-project session registry — each absorbed at the lifecycle stage it belongs to.
@@ -27,7 +27,7 @@ Single 44MB binary. No databases. No containers. No API keys required.
 - [The Problem](#the-forgetting-problem) — Why Claude needs memory
 - [The Architecture](#one-binary-44mb) — How CSR solves it
 - [The Pipeline](#the-pipeline) — Progressive enrichment (9.3x improvement)
-- [The Paper](#the-paper) — Published research behind the retrieval design
+- [The Paper](#the-paper) — The research behind the retrieval design (preprint)
 - [Install](#install) — One-command install, consent-first activation
 - [What You'll Ask](#what-youll-ask) — Natural language, no syntax
 - [Performance](#performance) | [MCP Tools](#mcp-tools) | [Hooks](#hooks) | [CLI](#cli-reference)
@@ -101,7 +101,7 @@ Higher quality context. Better decisions. Fewer tokens.
 
 ## The Paper
 
-CSR's retrieval design is documented in a research paper, measured on the system's own development history:
+CSR's retrieval design is documented in a research preprint, measured on the system's own development history:
 
 > **Similarity Drowns Intent: Three-Trace Sagas and Reinstatement Recall for Provenance in Agentic Software Construction**
 > 2026 — [PDF](docs/plans/annaswamy-2026-similarity-drowns-intent.pdf)

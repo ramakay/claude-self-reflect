@@ -893,7 +893,7 @@ function MultiSourceCard() {
 function PaperCard() {
   return (
     <BentoCard className="card--paper" delay={660}>
-      <CardKicker number="—" label="PUBLISHED RESEARCH" accent="purple" />
+      <CardKicker number="—" label="RESEARCH PREPRINT" accent="purple" />
       <h2 className="type-hl-sm">The Paper</h2>
       <p className="paper-title">
         Similarity Drowns Intent: Three-Trace Sagas and Reinstatement Recall for Provenance in Agentic Software Construction
