@@ -27,6 +27,7 @@ Single 44MB binary. No databases. No containers. No API keys required.
 - [The Problem](#the-forgetting-problem) — Why Claude needs memory
 - [The Architecture](#one-binary-44mb) — How CSR solves it
 - [The Pipeline](#the-pipeline) — Progressive enrichment (9.3x improvement)
+- [The Paper](#the-paper) — Published research behind the retrieval design
 - [Install](#install) — One-command install, consent-first activation
 - [What You'll Ask](#what-youll-ask) — Natural language, no syntax
 - [Performance](#performance) | [MCP Tools](#mcp-tools) | [Hooks](#hooks) | [CLI](#cli-reference)
@@ -95,6 +96,17 @@ Higher quality context. Better decisions. Fewer tokens.
 <br clear="both" />
 
 > **[Explore the full documentation →](https://ramakay.github.io/claude-self-reflect/#/docs/enrichment)**
+
+---
+
+## The Paper
+
+CSR's retrieval design is documented in a research paper, measured on the system's own development history:
+
+> **Similarity Drowns Intent: Three-Trace Sagas and Reinstatement Recall for Provenance in Agentic Software Construction**
+> 2026 — [PDF](docs/plans/annaswamy-2026-similarity-drowns-intent.pdf)
+
+Ask a memory system "why did we drop Qdrant?" and cosine similarity returns a recording of you asking that question earlier, at 0.984 similarity. The decision itself scores lower than its own echoes. The paper measures this failure, the multi-hop walk built to counter it (+53% and +47% ground-truth session coverage over one-shot kNN on two corpora, pre-registered gates, blind cross-vendor judging), and a second finding that fell out of evaluation: a self-recording memory system ingests its own eval dialogue and drowns the answers it's being tested on. It also keeps its negative results — a pre-registered ratification-weighting hypothesis died at ρ≈0 and forbade an entire staleness design.
 
 ---
 
