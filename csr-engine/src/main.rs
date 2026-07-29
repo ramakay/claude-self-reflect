@@ -118,6 +118,12 @@ enum Commands {
         /// Phase 1 WS2). LOCAL opt-in only — never part of default eval/--full, never CI.
         #[arg(long)]
         provenance: bool,
+        /// Run the deterministic code-graph release gate
+        #[arg(long)]
+        codegraph: bool,
+        /// Measure the code-graph gate against the live database
+        #[arg(long)]
+        live: bool,
     },
     /// Backfill session stories from V3/heuristic data (zero cost)
     BackfillStories {
@@ -270,6 +276,8 @@ async fn main() -> Result<()> {
         continuity,
         continuity_live,
         provenance,
+        codegraph,
+        live,
     }) = args.command
     {
         if let Some(parent) = args.db_path.parent() {
@@ -300,6 +308,18 @@ async fn main() -> Result<()> {
             .await?;
             print!("{}", report.text);
             if report.regression {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        if codegraph {
+            let report = if live {
+                csr_engine::eval::codegraph::run_codegraph_live(eng.storage())?
+            } else {
+                csr_engine::eval::codegraph::run_codegraph(eng.storage())?
+            };
+            print!("{}", report.format_text());
+            if report.results.iter().any(|result| !result.passed) {
                 std::process::exit(1);
             }
             return Ok(());

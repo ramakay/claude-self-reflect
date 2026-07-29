@@ -21,6 +21,18 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Run an internal read or write operation while holding the SQLite mutex.
+    ///
+    /// Kept crate-private so diagnostics can take consistent multi-table
+    /// snapshots without exposing the raw connection as part of the public API.
+    pub(crate) fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        operation(&conn)
+    }
+
     /// Open (or create) the database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;

@@ -5,6 +5,7 @@
 //! Continuity mode: the North Star gate — CSR must recall its own vision with
 //! provenance, beating a grep baseline (`csr-engine eval --continuity`).
 
+pub mod codegraph;
 pub mod continuity;
 pub mod provenance;
 

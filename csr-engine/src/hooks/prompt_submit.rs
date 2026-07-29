@@ -958,7 +958,7 @@ pub(crate) fn format_code_map(ep: &crate::hooks::stop::Episode, age: &str) -> Op
 
 /// Build compact code-graph slices for files/symbols named in the prompt.
 /// Returns at most 2 short lines, each carrying last-change provenance.
-fn build_graph_slices(
+pub(crate) fn build_graph_slices(
     storage: &crate::storage::Storage,
     prompt: &str,
     current_files: &[String],
