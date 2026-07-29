@@ -33,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `csr-engine telemetry` renders the same block in the text report and TUI.
   Schema-miss counters said what failed to parse; this says what landed.
 - **Docs site**: multi-source task-ledger card (animated todo ticks, outcome
-  chip, source lanes) and a tile for the published paper *Similarity Drowns
+  chip, source lanes) and a tile for the research preprint *Similarity Drowns
   Intent*; grid row collision fixed.
 
 Existing installs with a contaminated corpus: transcripts already imported are
