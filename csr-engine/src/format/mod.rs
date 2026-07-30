@@ -528,21 +528,24 @@ pub fn format_more_results(
     out
 }
 
-/// Format file-based search results.
-pub fn format_file_results(chunks: &[ConversationChunk], file_path: &str) -> String {
+/// Format file-based search results. `indexed` reports whether the code
+/// graph has any extraction record for this file at all — false here means
+/// this is a pure keyword fallback with no graph backing whatsoever.
+pub fn format_file_results(chunks: &[ConversationChunk], file_path: &str, indexed: bool) -> String {
     let mut out = String::new();
 
     if chunks.is_empty() {
         return format!(
-            "<file_search><message>No conversations found analyzing {}</message></file_search>",
-            file_path
+            "<file_search indexed='{}'><message>No conversations found analyzing {}</message></file_search>",
+            indexed, file_path
         );
     }
 
     out.push_str(&format!(
-        "<file_search file='{}' count='{}'>\n",
+        "<file_search file='{}' count='{}' indexed='{}'>\n",
         xml_escape(file_path),
-        chunks.len()
+        chunks.len(),
+        indexed
     ));
 
     for (i, chunk) in chunks.iter().enumerate() {
@@ -696,26 +699,41 @@ pub fn format_file_ledger(ledger: &crate::storage::codegraph::FileLedger) -> Str
 
     if ledger.symbols.is_empty() && ledger.timeline.is_empty() {
         return format!(
-            "<file_ledger file='{}'><message>No graph or evolution history for {}</message></file_ledger>",
+            "<file_ledger file='{}' indexed='{}'><message>No graph or evolution history for {}</message></file_ledger>",
             xml_escape(&ledger.file),
+            ledger.indexed,
             xml_escape(&ledger.file)
         );
     }
 
     let mut out = String::new();
-    let _ = writeln!(out, "<file_ledger file='{}'>", xml_escape(&ledger.file));
+    let _ = writeln!(
+        out,
+        "<file_ledger file='{}' indexed='{}'>",
+        xml_escape(&ledger.file),
+        ledger.indexed
+    );
 
     // Symbols now (with conversation provenance).
     out.push_str("  <symbols_now>\n");
     for s in &ledger.symbols {
+        // span_start/span_end are 0-based line numbers; the module-node
+        // sentinel hardcodes both to 0, which is not a real span — omit
+        // `lines=` rather than print the misleading '1-1'.
+        let lines_attr = if s.span_start == 0 && s.span_end == 0 {
+            String::new()
+        } else {
+            format!(" lines='{}-{}'", s.span_start + 1, s.span_end + 1)
+        };
         let _ = writeln!(
             out,
-            "    <symbol kind='{}' name='{}' first_conv='{}' last_conv='{}' body_hash='{}'/>",
+            "    <symbol kind='{}' name='{}' first_conv='{}' last_conv='{}' body_hash='{}'{}/>",
             xml_escape(&s.kind),
             xml_escape(&s.name),
             xml_escape(&s.first_conv_id),
             xml_escape(&s.last_conv_id),
             xml_escape(&s.body_hash),
+            lines_attr,
         );
     }
     out.push_str("  </symbols_now>\n");
@@ -793,13 +811,27 @@ pub fn format_code_graph(
             let _ = writeln!(out, "  <message>No {} found</message>", xml_escape(mode));
         }
         for n in nodes {
+            let match_attr = if n.name_only {
+                "name-only"
+            } else {
+                "definition"
+            };
+            // span_start/span_end are 0-based line numbers; the module-node
+            // sentinel hardcodes both to 0 — omit `lines=` rather than print '1-1'.
+            let lines_attr = if n.span_start == 0 && n.span_end == 0 {
+                String::new()
+            } else {
+                format!(" lines='{}-{}'", n.span_start + 1, n.span_end + 1)
+            };
             let _ = writeln!(
                 out,
-                "  <node name='{}' kind='{}' file='{}' last_conv='{}'/>",
+                "  <node name='{}' kind='{}' file='{}' last_conv='{}' match='{}'{}/>",
                 xml_escape(&n.name),
                 xml_escape(&n.kind),
                 xml_escape(&n.file),
                 xml_escape(&n.last_conv_id),
+                match_attr,
+                lines_attr,
             );
         }
     }
@@ -1027,5 +1059,50 @@ mod tests {
         let xml = format_search_results(&results, "q", "all", 1, 1);
         assert!(!xml.contains("<resolution>"), "got: {xml}");
         assert!(!xml.contains("<note>"), "got: {xml}");
+    }
+
+    #[test]
+    fn format_code_graph_marks_name_only_vs_definition_with_lines() {
+        use crate::storage::codegraph::NodeRow;
+        let name_only_node = NodeRow {
+            name: "resolve_edges".into(),
+            kind: "function".into(),
+            file: "src/other_project/resolver.rs".into(),
+            last_conv_id: "conv_1".into(),
+            name_only: true,
+            ..NodeRow::default()
+        };
+        let def_node = NodeRow {
+            name: "resolve_edges".into(),
+            kind: "function".into(),
+            file: "src/extraction/resolver.rs".into(),
+            last_conv_id: "conv_2".into(),
+            span_start: 9,
+            span_end: 20,
+            name_only: false,
+            ..NodeRow::default()
+        };
+        let xml = format_code_graph("callers", "resolve_edges", &[name_only_node, def_node], &[]);
+        assert!(xml.contains("match='name-only'"), "got: {xml}");
+        assert!(xml.contains("match='definition'"), "got: {xml}");
+        // span_start/span_end are 0-based; rendered as 1-based lines.
+        assert!(xml.contains("lines='10-21'"), "got: {xml}");
+    }
+
+    #[test]
+    fn format_code_graph_omits_lines_for_zero_span() {
+        use crate::storage::codegraph::NodeRow;
+        let module_node = NodeRow {
+            name: "src/demo.rs".into(),
+            kind: "module".into(),
+            file: "src/demo.rs".into(),
+            last_conv_id: "conv_1".into(),
+            span_start: 0,
+            span_end: 0,
+            name_only: false,
+            ..NodeRow::default()
+        };
+        let xml = format_code_graph("callers", "demo", &[module_node], &[]);
+        assert!(!xml.contains("lines="), "got: {xml}");
     }
 }

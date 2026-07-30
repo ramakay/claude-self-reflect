@@ -12,6 +12,7 @@ pub mod index_builder;
 pub mod patterns;
 pub mod provenance;
 pub mod quality;
+pub mod repo_path;
 pub mod resolver;
 pub mod scoring;
 pub mod signature;

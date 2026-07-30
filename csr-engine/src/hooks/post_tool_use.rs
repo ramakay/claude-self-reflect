@@ -76,19 +76,23 @@ fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
             return Ok(());
         }
     }
+    // Read from the original path (worktree-local); store under the canonical
+    // main-repo path so worktree edits do not create duplicate nodes.
     let source = match std::fs::read_to_string(file_path) {
         Ok(s) => s,
         Err(_) => return Ok(()), // file gone/unreadable — skip silently
     };
 
-    let project = crate::search::cross_project::resolve_current_project().unwrap_or_default();
+    let project = resolve_project_for_hook(Path::new(file_path).parent());
+    let stored_path = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path));
+    let stored_path_str = stored_path.to_string_lossy();
     let session_id = input.session_id.clone().unwrap_or_default();
     let conv_id = conv_id_for(input);
 
     let fragment = crate::extraction::codegraph::extract_graph_fragment(
         &source,
         lang,
-        file_path,
+        &stored_path_str,
         &project,
         &project,
         &conv_id,
@@ -99,10 +103,10 @@ fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
     for node in &fragment.nodes {
         storage.upsert_code_node(node)?;
     }
-    storage.replace_code_file_edges(&project, file_path, &fragment.edges)?;
+    storage.replace_code_file_edges(&project, &stored_path_str, &fragment.edges)?;
 
     let content_hash = crate::extraction::anchors::hash_normalized(&source);
-    storage.upsert_code_file_state(&project, file_path, &content_hash, false)?;
+    storage.upsert_code_file_state(&project, &stored_path_str, &content_hash, false)?;
 
     // Re-resolve + re-rank so the live graph is queryable right after the edit.
     let _ = storage.resolve_code_edges(&project)?;
@@ -110,7 +114,7 @@ fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
 
     eprintln!(
         "CSR: code graph updated for {} ({} nodes, {} edges)",
-        file_path,
+        stored_path_str,
         fragment.nodes.len(),
         fragment.edges.len()
     );
@@ -214,7 +218,7 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
     let conv_id = conv_id_for(input);
 
     // Resolve project name for cross-project scoping
-    let project_name = crate::search::cross_project::resolve_current_project().unwrap_or_default();
+    let project_name = resolve_project_for_hook(Path::new(file_path).parent());
 
     // Serialize to JSON arrays
     let fa = serde_json::to_string(&diff.functions_added).unwrap_or_default();
@@ -246,4 +250,52 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
     );
 
     Ok(())
+}
+
+/// Resolve project name for hook processes (no `MCP_CLIENT_CWD`).
+///
+/// Fallback chain:
+/// 1. parent directory of the edited file (via `resolve_project_from_cwd`)
+/// 2. `CLAUDE_PROJECT_DIR` env var
+/// 3. `MCP_CLIENT_CWD` via `resolve_current_project` (MCP tool path)
+/// 4. empty string
+fn resolve_project_for_hook(file_path_parent: Option<&Path>) -> String {
+    if let Some(parent) = file_path_parent {
+        let parent_str = parent.to_string_lossy();
+        if let Some(p) = crate::search::cross_project::resolve_project_from_cwd(&parent_str) {
+            if !p.is_empty() {
+                return p;
+            }
+        }
+    }
+    if let Ok(dir) = std::env::var("CLAUDE_PROJECT_DIR") {
+        if let Some(p) = crate::search::cross_project::resolve_project_from_cwd(&dir) {
+            if !p.is_empty() {
+                return p;
+            }
+        }
+    }
+    if let Some(p) = crate::search::cross_project::resolve_current_project() {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_project_for_hook_from_file_parent() {
+        // Isolate from any MCP/Claude env set by other tests in this process.
+        std::env::remove_var("MCP_CLIENT_CWD");
+        std::env::remove_var("CLAUDE_PROJECT_DIR");
+
+        let parent = Path::new("/Users/x/projects/my-repo/src/main.rs").parent();
+        let project = resolve_project_for_hook(parent);
+        assert_eq!(project, "my-repo");
+        assert!(!project.is_empty());
+    }
 }

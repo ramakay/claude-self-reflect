@@ -577,9 +577,17 @@ pub async fn search_by_file(
         return Ok(format::format_file_ledger(&ledger));
     }
 
-    // Secondary enrichment: fall back to FTS5 over chunk content.
+    // Secondary enrichment: fall back to FTS5 over chunk content. The ledger
+    // is empty here, but that is not the same as "never extracted": a
+    // supported-language file with no definitions and no recorded edits is
+    // indexed and legitimately empty. Report the real state so the caller can
+    // tell a coverage gap from an honest absence.
     let chunks = storage.fts5_search(file_path, limit, project)?;
-    Ok(format::format_file_results(&chunks, file_path))
+    Ok(format::format_file_results(
+        &chunks,
+        file_path,
+        ledger.indexed,
+    ))
 }
 
 /// Code-graph query: neighbors | callers | callees (no transitive impact in v1).

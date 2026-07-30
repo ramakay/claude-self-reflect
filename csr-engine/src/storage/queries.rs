@@ -1754,10 +1754,11 @@ pub fn insert_code_evolution(
         &uuid::Uuid::new_v4().to_string()[..8],
         chrono::Utc::now().timestamp_millis()
     );
+    let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO code_evolution (id, session_id, project_name, file_path, language, tool_name, functions_added, functions_removed, types_added, types_removed, imports_added, imports_removed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![id, session_id, project_name, file_path, language, tool_name, functions_added, functions_removed, types_added, types_removed, imports_added, imports_removed],
+        "INSERT INTO code_evolution (id, session_id, project_name, file_path, language, tool_name, functions_added, functions_removed, types_added, types_removed, imports_added, imports_removed, timestamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![id, session_id, project_name, file_path, language, tool_name, functions_added, functions_removed, types_added, types_removed, imports_added, imports_removed, now],
     )?;
     Ok(())
 }

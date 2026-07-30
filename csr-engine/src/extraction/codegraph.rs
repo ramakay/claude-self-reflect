@@ -230,6 +230,199 @@ fn bare_callee(text: &str) -> Option<String> {
     }
 }
 
+/// Extract imported local binding names from an import AST node.
+///
+/// Uses tree-sitter grammar fields so multi-symbol imports become one edge
+/// per symbol (e.g. `use std::sync::{Arc, OnceLock}` -> `["Arc", "OnceLock"]`)
+/// rather than a concatenated blob from the whole statement text.
+fn import_symbols<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    lang: SupportLang,
+) -> Vec<String> {
+    match lang {
+        SupportLang::Rust => rust_import_symbols(node),
+        SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => {
+            js_ts_import_symbols(node)
+        }
+        SupportLang::Python => python_import_symbols(node),
+        SupportLang::Go => go_import_symbols(node),
+        _ => Vec::new(),
+    }
+}
+
+fn push_nonempty(out: &mut Vec<String>, s: impl AsRef<str>) {
+    let t = s.as_ref().trim();
+    if !t.is_empty() {
+        out.push(t.to_string());
+    }
+}
+
+/// Rust `use_declaration`: field `argument`, then recurse the use-path tree.
+fn rust_import_symbols<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(arg) = node.field("argument") {
+        rust_use_path_symbols(&arg, &mut out);
+    }
+    out
+}
+
+fn rust_use_path_symbols<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    out: &mut Vec<String>,
+) {
+    match node.kind().as_ref() {
+        "identifier" => push_nonempty(out, node.text()),
+        "scoped_identifier" => {
+            if let Some(name) = node.field("name") {
+                push_nonempty(out, name.text());
+            }
+        }
+        "scoped_use_list" => {
+            if let Some(list) = node.field("list") {
+                rust_use_path_symbols(&list, out);
+            }
+        }
+        "use_list" => {
+            for child in node.children() {
+                if child.is_named() {
+                    rust_use_path_symbols(&child, out);
+                }
+            }
+        }
+        "use_as_clause" => {
+            if let Some(alias) = node.field("alias") {
+                push_nonempty(out, alias.text());
+            }
+        }
+        "use_wildcard" => {
+            // `use foo::*;` — no local binding name to track.
+        }
+        _ => {}
+    }
+}
+
+/// JS/TS `import_statement`: non-field child `import_clause` holds bindings.
+fn js_ts_import_symbols<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> Vec<String> {
+    let mut out = Vec::new();
+    for child in node.children() {
+        if !child.is_named() || child.kind().as_ref() != "import_clause" {
+            continue;
+        }
+        for part in child.children() {
+            if !part.is_named() {
+                continue;
+            }
+            match part.kind().as_ref() {
+                "identifier" => push_nonempty(&mut out, part.text()),
+                "named_imports" => {
+                    for spec in part.children() {
+                        if !spec.is_named() || spec.kind().as_ref() != "import_specifier" {
+                            continue;
+                        }
+                        if let Some(alias) = spec.field("alias") {
+                            push_nonempty(&mut out, alias.text());
+                        } else if let Some(name) = spec.field("name") {
+                            push_nonempty(&mut out, name.text());
+                        }
+                    }
+                }
+                "namespace_import" => {
+                    for id in part.children() {
+                        if id.is_named() && id.kind().as_ref() == "identifier" {
+                            push_nonempty(&mut out, id.text());
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Python `import_statement` / `import_from_statement`.
+fn python_import_symbols<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> Vec<String> {
+    let mut out = Vec::new();
+    match node.kind().as_ref() {
+        "import_statement" | "import_from_statement" => {
+            // `name` is multiple; `.field("name")` would only return the first.
+            // `module_name` on import_from is deliberately skipped.
+            // `wildcard_import` is a non-field child and emits nothing.
+            for name_node in node.field_children("name") {
+                python_import_name(&name_node, &mut out);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn python_import_name<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    out: &mut Vec<String>,
+) {
+    match node.kind().as_ref() {
+        "aliased_import" => {
+            if let Some(alias) = node.field("alias") {
+                push_nonempty(out, alias.text());
+            }
+        }
+        "dotted_name" => {
+            // Bound name is the last identifier segment (`os.path` -> `path`).
+            let mut last: Option<String> = None;
+            for child in node.children() {
+                if child.is_named() && child.kind().as_ref() == "identifier" {
+                    last = Some(child.text().to_string());
+                }
+            }
+            if let Some(name) = last {
+                push_nonempty(out, name);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Go `import_declaration` -> `import_spec` / `import_spec_list`.
+fn go_import_symbols<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> Vec<String> {
+    let mut out = Vec::new();
+    for child in node.children() {
+        if !child.is_named() {
+            continue;
+        }
+        match child.kind().as_ref() {
+            "import_spec" => go_import_spec(&child, &mut out),
+            "import_spec_list" => {
+                for spec in child.children() {
+                    if spec.is_named() && spec.kind().as_ref() == "import_spec" {
+                        go_import_spec(&spec, &mut out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn go_import_spec<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>, out: &mut Vec<String>) {
+    if let Some(name) = node.field("name") {
+        push_nonempty(out, name.text());
+        return;
+    }
+    if let Some(path) = node.field("path") {
+        let raw = path.text();
+        let unquoted = raw
+            .trim()
+            .trim_matches(|c| c == '"' || c == '`')
+            .trim_matches('\'');
+        if let Some(seg) = unquoted.rsplit('/').next() {
+            push_nonempty(out, seg);
+        }
+    }
+}
+
 /// Canonical kind for a definition AST kind.
 fn canonical_kind(ast_kind: &str, lang: SupportLang) -> &'static str {
     if func_kinds(lang).contains(&ast_kind) {
@@ -312,6 +505,8 @@ fn extract_inner(
             first_conv_id: conv_id.into(),
             last_conv_id: conv_id.into(),
             last_session_id: session_id.into(),
+            // Extracted definition node — always definition-backed.
+            name_only: false,
         },
     );
 
@@ -335,6 +530,8 @@ fn extract_inner(
             first_conv_id: conv_id.into(),
             last_conv_id: conv_id.into(),
             last_session_id: session_id.into(),
+            // Extracted definition node — always definition-backed.
+            name_only: false,
         }
     };
 
@@ -378,15 +575,15 @@ fn extract_inner(
         }
     }
 
-    // Imports -> imports edge from module (placeholder dst).
+    // Imports -> imports edge from module (placeholder dst per imported symbol).
     for kind in import_kinds(lang) {
         let matcher = KindMatcher::new(kind, lang);
         for n in root.find_all(&matcher) {
-            if let Some(name) = bare_callee(&n.text()) {
-                if is_noise_callee(&name) {
+            for sym in import_symbols(&n, lang) {
+                if is_noise_callee(&sym) {
                     continue;
                 }
-                add_edge(module_id.clone(), format!("name:{name}"), "imports", 0);
+                add_edge(module_id.clone(), format!("name:{sym}"), "imports", 0);
             }
         }
     }
@@ -535,5 +732,178 @@ mod tests {
             extract_graph_fragment("fn ( {{{ ", SupportLang::Rust, "x.rs", "r", "p", "c", "s");
         // module node always present; no panic is the assertion.
         assert!(frag.nodes.iter().any(|n| n.kind == "module"));
+    }
+
+    fn import_dsts(frag: &GraphFragment) -> Vec<&str> {
+        frag.edges
+            .iter()
+            .filter(|e| e.kind == "imports")
+            .map(|e| e.dst_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn rust_multi_symbol_use_emits_per_symbol_import_edges() {
+        let src = "use std::sync::{Arc, OnceLock};\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::Rust,
+            "a.rs",
+            "repo",
+            "proj",
+            "conv_1",
+            "sess_1",
+        );
+        let dsts = import_dsts(&frag);
+        assert!(
+            dsts.contains(&"name:Arc"),
+            "expected name:Arc among {dsts:?}"
+        );
+        assert!(
+            dsts.contains(&"name:OnceLock"),
+            "expected name:OnceLock among {dsts:?}"
+        );
+        for d in &dsts {
+            assert!(
+                !d.contains("ArcOnce"),
+                "old blob concatenation must not appear: {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_use_alias_emits_alias_binding() {
+        let src = "use foo::Bar as Baz;\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::Rust,
+            "a.rs",
+            "repo",
+            "proj",
+            "conv_1",
+            "sess_1",
+        );
+        let dsts = import_dsts(&frag);
+        assert!(
+            dsts.contains(&"name:Baz"),
+            "expected name:Baz among {dsts:?}"
+        );
+        assert!(
+            !dsts
+                .iter()
+                .any(|d| d.contains("BarBaz") || *d == "name:BarBaz"),
+            "must not concatenate path+alias: {dsts:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_default_named_namespace_imports() {
+        let src = "import fs from 'fs';\nimport { fileURLToPath } from 'url';\nimport * as path from 'path';\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "conv_1",
+            "sess_1",
+        );
+        let dsts = import_dsts(&frag);
+        assert!(dsts.contains(&"name:fs"), "expected name:fs among {dsts:?}");
+        assert!(
+            dsts.contains(&"name:fileURLToPath"),
+            "expected name:fileURLToPath among {dsts:?}"
+        );
+        assert!(
+            dsts.contains(&"name:path"),
+            "expected name:path among {dsts:?}"
+        );
+    }
+
+    #[test]
+    fn python_from_import_and_aliased_import() {
+        // Spec fixture. `join` is extracted correctly but is also in the frozen
+        // NOISE_CALLEES set (string ops), so edge emission filters it — same
+        // is_noise_callee gate as calls. Assert raw symbols + non-noise edges.
+        let src = "from os.path import join, exists\nimport numpy as np\n";
+        let grep = SupportLang::Python.ast_grep(src);
+        let root = grep.root();
+        let mut raw: Vec<String> = Vec::new();
+        for kind in import_kinds(SupportLang::Python) {
+            let matcher = KindMatcher::new(kind, SupportLang::Python);
+            for n in root.find_all(&matcher) {
+                raw.extend(import_symbols(&n, SupportLang::Python));
+            }
+        }
+        assert!(
+            raw.iter().any(|s| s == "join"),
+            "AST extraction must yield join: {raw:?}"
+        );
+        assert!(
+            raw.iter().any(|s| s == "exists"),
+            "AST extraction must yield exists: {raw:?}"
+        );
+        assert!(
+            raw.iter().any(|s| s == "np"),
+            "AST extraction must yield np: {raw:?}"
+        );
+        assert!(
+            is_noise_callee("join"),
+            "fixture assumes join is noise-filtered at edge emission"
+        );
+
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::Python,
+            "a.py",
+            "repo",
+            "proj",
+            "conv_1",
+            "sess_1",
+        );
+        let dsts = import_dsts(&frag);
+        assert!(
+            !dsts.contains(&"name:join"),
+            "join is NOISE_CALLEES — must not emit import edge: {dsts:?}"
+        );
+        assert!(
+            dsts.contains(&"name:exists"),
+            "expected name:exists among {dsts:?}"
+        );
+        assert!(dsts.contains(&"name:np"), "expected name:np among {dsts:?}");
+    }
+
+    #[test]
+    fn import_edges_do_not_swallow_keyword_tokens() {
+        let fixtures: &[(&str, SupportLang, &str)] = &[
+            (
+                "use std::sync::{Arc, OnceLock};\n",
+                SupportLang::Rust,
+                "a.rs",
+            ),
+            ("use foo::Bar as Baz;\n", SupportLang::Rust, "b.rs"),
+            (
+                "import fs from 'fs';\nimport { fileURLToPath } from 'url';\nimport * as path from 'path';\n",
+                SupportLang::TypeScript,
+                "a.ts",
+            ),
+            (
+                "from os.path import join, exists\nimport numpy as np\n",
+                SupportLang::Python,
+                "a.py",
+            ),
+        ];
+        for (src, lang, file) in fixtures {
+            let frag = extract_graph_fragment(src, *lang, file, "repo", "proj", "conv_1", "sess_1");
+            for e in frag.edges.iter().filter(|e| e.kind == "imports") {
+                let name = e.dst_id.strip_prefix("name:").unwrap_or(&e.dst_id);
+                assert!(
+                    !name.contains("import") && !name.contains("from") && !name.contains("require"),
+                    "keyword blob regression in {} dst_id={}: {name}",
+                    file,
+                    e.dst_id
+                );
+            }
+        }
     }
 }

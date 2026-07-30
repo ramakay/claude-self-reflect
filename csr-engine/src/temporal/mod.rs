@@ -19,6 +19,10 @@ pub fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
         return Some(naive.and_utc());
     }
+    // SQLite datetime('now') shape: space separator, no zone (still UTC).
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(naive.and_utc());
+    }
     None
 }
 
@@ -396,6 +400,16 @@ mod tests {
     fn test_parse_timestamp_invalid() {
         assert!(parse_timestamp("not a timestamp").is_none());
         assert!(parse_timestamp("").is_none());
+    }
+
+    #[test]
+    fn test_parse_timestamp_sqlite_datetime() {
+        // SQLite `datetime('now')` uses a space separator and no zone marker.
+        // Must parse as UTC (same instant as the RFC 3339 Z form), not local time.
+        let sqlite = parse_timestamp("2026-07-29 20:25:33");
+        assert!(sqlite.is_some());
+        let rfc = parse_timestamp("2026-07-29T20:25:33Z").unwrap();
+        assert_eq!(sqlite.unwrap(), rfc);
     }
 
     #[test]

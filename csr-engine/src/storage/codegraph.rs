@@ -28,6 +28,10 @@ pub struct NodeRow {
     pub first_conv_id: String,
     pub last_conv_id: String,
     pub last_session_id: String,
+    /// true when this row is an unverified name-collision guess (matched via
+    /// the `name:<bare>` placeholder or an unresolved edge), false when it is
+    /// backed by a real resolved `code_nodes` definition.
+    pub name_only: bool,
 }
 
 /// A graph edge row (a relation between nodes).
@@ -77,6 +81,10 @@ pub struct FileLedger {
     pub timeline: Vec<LedgerTimelineEntry>,
     /// (caller_name, caller_file) for symbols that depend on this file.
     pub callers: Vec<(String, String)>,
+    /// true when `code_graph_file_state` has a row for this file — i.e. the
+    /// file went through extraction, even if it produced zero symbols.
+    /// Distinguishes "never extracted" from "indexed and confirmed empty".
+    pub indexed: bool,
 }
 
 /// All `code_nodes` columns, in a stable order shared by every read.
@@ -99,6 +107,7 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
         first_conv_id: row.get(11)?,
         last_conv_id: row.get(12)?,
         last_session_id: row.get(13)?,
+        name_only: false,
     })
 }
 
@@ -269,6 +278,11 @@ fn resolve_target_ids(conn: &Connection, name_or_id: &str, project: &str) -> Res
 
 /// Who calls `name_or_id` — inbound `calls` edges (resolved id match OR the
 /// `name:<symbol>` placeholder, so callers surface even before resolution).
+/// The caller (source) node is scoped to `project` when non-empty — a bare
+/// `name:<symbol>` placeholder is unqualified and would otherwise pull in
+/// same-named callers from every other project sharing this database (e.g.
+/// git worktree copies). Each row's `name_only` is true unless at least one
+/// matching edge is resolved (definition-backed).
 pub fn query_callers(
     conn: &Connection,
     name_or_id: &str,
@@ -287,26 +301,36 @@ pub fn query_callers(
     }
 
     let placeholders: Vec<String> = (0..targets.len()).map(|i| format!("?{}", i + 2)).collect();
+    let project_idx = targets.len() + 2;
     let cols = NODE_COLS
         .split(", ")
         .map(|c| format!("s.{c}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let node_col_count = NODE_COLS.split(", ").count();
     let sql = format!(
-        "SELECT DISTINCT {cols} FROM code_edges e
+        "SELECT {cols}, MAX(e.resolved) AS any_resolved FROM code_edges e
          JOIN code_nodes s ON s.id = e.src_id
          WHERE e.kind = 'calls' AND e.dst_id IN ({})
+           AND (?{project_idx} = '' OR s.project = ?{project_idx})
+         GROUP BY s.id
          ORDER BY s.id LIMIT ?1",
         placeholders.join(", ")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut p: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(targets.len() + 1);
+    let mut p: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(targets.len() + 2);
     let lim = limit as i64;
     p.push(&lim);
     for t in &targets {
         p.push(t);
     }
-    let rows = stmt.query_map(p.as_slice(), row_to_node)?;
+    p.push(&project);
+    let rows = stmt.query_map(p.as_slice(), |row| {
+        let mut node = row_to_node(row)?;
+        let any_resolved: i64 = row.get(node_col_count)?;
+        node.name_only = any_resolved == 0;
+        Ok(node)
+    })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -328,7 +352,7 @@ pub fn query_callees(conn: &Connection, node_id: &str, limit: usize) -> Result<V
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![node_id, limit as i64], |row| {
         let dst_id: String = row.get(0)?;
-        let _resolved: i64 = row.get(1)?;
+        let resolved: i64 = row.get(1)?;
         // Columns 2.. are the joined node (may be all NULL if unresolved).
         let id: Option<String> = row.get(2)?;
         if let Some(_id) = id {
@@ -348,14 +372,18 @@ pub fn query_callees(conn: &Connection, node_id: &str, limit: usize) -> Result<V
                 first_conv_id: row.get(13)?,
                 last_conv_id: row.get(14)?,
                 last_session_id: row.get(15)?,
+                name_only: resolved == 0,
             })
         } else {
-            // Unresolved placeholder: surface the bare name.
+            // Unresolved placeholder: surface the bare name. Both signals
+            // must be present — a downstream consumer keys off
+            // `kind == "unresolved" || name_only`.
             let name = dst_id.strip_prefix("name:").unwrap_or(&dst_id).to_string();
             Ok(NodeRow {
                 id: dst_id,
                 kind: "unresolved".to_string(),
                 name,
+                name_only: true,
                 ..NodeRow::default()
             })
         }
@@ -454,6 +482,7 @@ fn shift2_node(row: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
         first_conv_id: row.get(13)?,
         last_conv_id: row.get(14)?,
         last_session_id: row.get(15)?,
+        name_only: false,
     })
 }
 
@@ -518,11 +547,25 @@ pub fn file_ledger(conn: &Connection, project: &str, file: &str) -> Result<FileL
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
+    // 4. Indexed flag: was this file ever run through extraction at all
+    //    (regardless of whether it produced any symbols)? Distinguishes
+    //    "never extracted" from "indexed and confirmed empty" — both used
+    //    to render identically via the FTS5 fallback.
+    let indexed = {
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM code_graph_file_state
+             WHERE (file = ?1 OR file LIKE ?2) AND (?3 = '' OR project = ?3)
+             LIMIT 1",
+        )?;
+        stmt.exists(params![file, suffix, project])?
+    };
+
     Ok(FileLedger {
         file: file.to_string(),
         symbols,
         timeline,
         callers,
+        indexed,
     })
 }
 
@@ -639,5 +682,165 @@ mod tests {
         assert_eq!(ledger.symbols[0].first_conv_id, "conv_A");
         assert_eq!(ledger.timeline.len(), 1);
         assert_eq!(ledger.timeline[0].tool_name, "Edit");
+    }
+
+    #[test]
+    fn query_callers_classifies_name_only_vs_definition() {
+        let conn = mem();
+        upsert_node(
+            &conn,
+            &node("target1", "t.rs", "function", "target_fn", "conv_T"),
+        )
+        .unwrap();
+        // Caller that resolved directly to the real id.
+        upsert_node(
+            &conn,
+            &node("caller_resolved", "a.rs", "function", "caller_a", "conv_A"),
+        )
+        .unwrap();
+        replace_file_edges(
+            &conn,
+            "proj",
+            "a.rs",
+            &[EdgeRow {
+                src_id: "caller_resolved".into(),
+                dst_id: "target1".into(),
+                kind: "calls".into(),
+                src_file: "a.rs".into(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+        // Caller that only matched via the bare-name placeholder.
+        upsert_node(
+            &conn,
+            &node(
+                "caller_placeholder",
+                "b.rs",
+                "function",
+                "caller_b",
+                "conv_B",
+            ),
+        )
+        .unwrap();
+        replace_file_edges(
+            &conn,
+            "proj",
+            "b.rs",
+            &[EdgeRow {
+                src_id: "caller_placeholder".into(),
+                dst_id: "name:target_fn".into(),
+                kind: "calls".into(),
+                src_file: "b.rs".into(),
+                resolved: 0,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+
+        let callers = query_callers(&conn, "target_fn", "proj", 20).unwrap();
+        let resolved_caller = callers.iter().find(|n| n.id == "caller_resolved").unwrap();
+        assert!(
+            !resolved_caller.name_only,
+            "definition-backed match must not be name_only"
+        );
+        let placeholder_caller = callers
+            .iter()
+            .find(|n| n.id == "caller_placeholder")
+            .unwrap();
+        assert!(
+            placeholder_caller.name_only,
+            "placeholder-only match must be name_only"
+        );
+    }
+
+    #[test]
+    fn query_callers_scopes_caller_by_project() {
+        let conn = mem();
+        upsert_node(
+            &conn,
+            &node("target1", "t.rs", "function", "target_fn", "conv_T"),
+        )
+        .unwrap();
+        // Caller in a DIFFERENT project — must not leak into a "proj"-scoped query.
+        let mut other = node("caller_other", "x.rs", "function", "caller_x", "conv_X");
+        other.project = "other".into();
+        upsert_node(&conn, &other).unwrap();
+        replace_file_edges(
+            &conn,
+            "other",
+            "x.rs",
+            &[EdgeRow {
+                src_id: "caller_other".into(),
+                dst_id: "name:target_fn".into(),
+                kind: "calls".into(),
+                src_file: "x.rs".into(),
+                resolved: 0,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+
+        let callers = query_callers(&conn, "target_fn", "proj", 20).unwrap();
+        assert!(
+            callers.iter().all(|n| n.id != "caller_other"),
+            "caller from another project must not leak: {:?}",
+            callers.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn query_callees_marks_unresolved_name_only() {
+        let conn = mem();
+        upsert_node(
+            &conn,
+            &node("caller1", "a.rs", "function", "caller_fn", "conv_A"),
+        )
+        .unwrap();
+        upsert_node(
+            &conn,
+            &node("callee1", "b.rs", "function", "callee_fn", "conv_B"),
+        )
+        .unwrap();
+        replace_file_edges(
+            &conn,
+            "proj",
+            "a.rs",
+            &[
+                EdgeRow {
+                    src_id: "caller1".into(),
+                    dst_id: "callee1".into(),
+                    kind: "calls".into(),
+                    src_file: "a.rs".into(),
+                    resolved: 1,
+                    weight: 1.0,
+                    ..EdgeRow::default()
+                },
+                EdgeRow {
+                    src_id: "caller1".into(),
+                    dst_id: "name:ghost_fn".into(),
+                    kind: "calls".into(),
+                    src_file: "a.rs".into(),
+                    resolved: 0,
+                    weight: 1.0,
+                    ..EdgeRow::default()
+                },
+            ],
+        )
+        .unwrap();
+
+        let callees = query_callees(&conn, "caller1", 20).unwrap();
+        let resolved = callees.iter().find(|n| n.id == "callee1").unwrap();
+        assert!(!resolved.name_only, "resolved callee must not be name_only");
+        let unresolved = callees.iter().find(|n| n.kind == "unresolved").unwrap();
+        assert!(
+            unresolved.name_only,
+            "unresolved placeholder callee must be name_only"
+        );
+        assert_eq!(unresolved.name, "ghost_fn");
     }
 }

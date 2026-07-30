@@ -33,6 +33,17 @@ const EXTRACTION_LATENCY_MAX_MS: f64 = 50.0;
 const QUERY_P95_MAX_MS: f64 = 5.0;
 const QUERY_SAMPLES_PER_MODE: usize = 20;
 const QUERY_TRIALS: usize = 3;
+/// Max plausible length for a single imported identifier. Measured against the
+/// live corpus: the longest real identifier actually stored in `code_nodes` is
+/// 64 chars (`task_dir_all_deleted_is_authoritative_empty_and_failures_counted`),
+/// and legitimate SCREAMING_CASE constants reach 43
+/// (`HOME_ONBOARDING_SPOTLIGHT_FALLBACK_DELAY_MS`). 80 clears both with margin.
+///
+/// This is only a backstop for keyword-free concatenations; the primary
+/// detector is the multi-keyword rule in `import_key_sanity_gate`. An earlier
+/// value of 40 was set from a grep of `pub fn` signatures alone and produced
+/// false positives on real constants.
+const IMPORT_KEY_MAX_LEN: usize = 80;
 
 const API_FILE: &str = "src/api.rs";
 const SERVICE_FILE: &str = "src/service.rs";
@@ -48,6 +59,27 @@ pub fn alpha_fn() -> usize { beta_fn() }
 const WORKER_SOURCE: &str = r#"
 use crate::api::gamma_fn;
 pub fn delta_fn() -> usize { gamma_fn() + beta_fn() }
+"#;
+
+// TypeScript and Python fixture files. Both import a symbol already defined
+// in API_SOURCE (`beta_fn` / `gamma_fn`) so the resolver's project-unique
+// rule resolves them deterministically without dragging down the
+// calls+imports resolution rate (see RESOLUTION_RATE_MIN).
+const TS_FILE: &str = "src/util.ts";
+const PY_FILE: &str = "src/consumer.py";
+const TS_SOURCE: &str = r#"
+import { beta_fn } from './api';
+
+export function epsilon_fn(): number {
+    return 5;
+}
+"#;
+const PY_SOURCE: &str = r#"
+from api import gamma_fn
+
+
+def zeta_fn():
+    return 7
 "#;
 
 #[derive(Debug, Clone, Default)]
@@ -110,6 +142,185 @@ fn resolution_gate(snapshot: &GraphSnapshot) -> EvalResult {
     )
 }
 
+/// Zero `imports` edges whose placeholder key (dst_id with the `name:` prefix
+/// stripped) is not a plausible single identifier. Only unresolved
+/// (`name:`-prefixed) import edges are in scope — a resolved dst_id is a real
+/// `code_nodes.id` (a sha256 hash), not a name blob, and is not a placeholder
+/// key at all. Catches the text-mangling bug that ran a helper over the whole
+/// import statement instead of per-symbol AST fields (verified live examples:
+/// `name:ArcOnce`, `name:BTreeMapBTreeSet`, `name:importfileURLToPathfromurl`,
+/// `name:AtomicBoolOrdering`).
+fn import_key_sanity_gate(snapshot: &GraphSnapshot) -> EvalResult {
+    let started = Instant::now();
+    let mut total = 0usize;
+    let mut offenders: Vec<&str> = Vec::new();
+    for edge in &snapshot.edges {
+        if edge.kind != "imports" || !edge.dst_id.starts_with("name:") {
+            continue;
+        }
+        total += 1;
+        let key = edge.dst_id.strip_prefix("name:").unwrap_or(&edge.dst_id);
+        // A single keyword substring is NOT evidence of the bug: real
+        // identifiers legitimately contain them (`requireApiAuth`,
+        // `extract_name_from_def`, `resolve_project_from_cwd`, `SeekFrom`).
+        // The blob signature is statement text collapsed into one token, which
+        // necessarily carries TWO or more syntax keywords
+        // (`importReactfromreact`, `importfileURLToPathfromurl`). A key that is
+        // exactly a bare keyword is also malformed.
+        // NB: a key equal to a bare keyword is NOT an offender either. This
+        // crate has a module literally named `import`, so `use crate::import;`
+        // correctly yields `name:import`.
+        let keyword_hits = ["import", "from", "require"]
+            .iter()
+            .filter(|needle| key.contains(*needle))
+            .count();
+        if keyword_hits >= 2 || key.len() > IMPORT_KEY_MAX_LEN {
+            offenders.push(key);
+        }
+    }
+    let bad = offenders.len();
+    let examples: Vec<&str> = offenders.iter().take(3).copied().collect();
+    judge(
+        "Import key sanity",
+        started,
+        bad == 0,
+        format!(
+            "{bad}/{total} unresolved import edge keys are implausible (>=2 of import/from/require, or over {IMPORT_KEY_MAX_LEN} chars); examples={examples:?}"
+        ),
+    )
+}
+
+/// Zero `code_nodes` rows with `project == ""`. The hook path used to resolve
+/// the project from an env var that is never set in hook processes, leaving
+/// nodes unscoped and invisible to project-filtered queries.
+fn project_attribution_gate(snapshot: &GraphSnapshot) -> EvalResult {
+    let started = Instant::now();
+    let total = snapshot.nodes.len();
+    let unscoped = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.project.is_empty())
+        .count();
+    judge(
+        "Project attribution",
+        started,
+        unscoped == 0,
+        format!("{unscoped}/{total} code_nodes rows have project == \"\" (unscoped)"),
+    )
+}
+
+const LEAK_PROJECT: &str = "codegraph-eval-leak";
+const LEAK_REPO: &str = "fixture-leak-repo";
+const LEAK_CALLER_FILE: &str = "src/leak_caller.rs";
+const LEAK_TARGET_FILE: &str = "src/leak_target.rs";
+const LEAK_CALLER_SOURCE: &str = r#"
+pub fn leak_caller_fn() -> usize { real_callee_fn() + unresolvable_callee_fn() }
+"#;
+const LEAK_TARGET_SOURCE: &str = r#"
+pub fn real_callee_fn() -> usize { 1 }
+"#;
+
+/// `build_graph_slices`' symbol-anchored slice must never render an
+/// unresolved (placeholder) callee name as an undecorated call target
+/// indistinguishable from a verified one.
+///
+/// Property asserted: build an isolated fixture where one outbound `calls`
+/// edge resolves (`real_callee_fn`) and one deliberately cannot
+/// (`unresolvable_callee_fn` is never defined anywhere). Use
+/// `code_query_callees` directly to get the ground-truth set of unresolved
+/// callee names (surfaced with `kind == "unresolved"`), then render the same
+/// prompt through `build_graph_slices` and check that none of those names
+/// appear as an exact, undecorated token in the comma-separated call-target
+/// list of the rendered "<name> calls -> <targets>" line. A name may be
+/// absent from that list, or present but visibly annotated as unverified —
+/// either satisfies the property. It may not appear bare.
+fn placeholder_leak_gate() -> EvalResult {
+    let started = Instant::now();
+    let measured = (|| -> Result<(bool, String)> {
+        let storage = Arc::new(Storage::open_memory()?);
+        extract_and_store(
+            &storage,
+            LEAK_TARGET_SOURCE,
+            LEAK_TARGET_FILE,
+            LEAK_REPO,
+            LEAK_PROJECT,
+            "conv-leak-target",
+        )?;
+        extract_and_store(
+            &storage,
+            LEAK_CALLER_SOURCE,
+            LEAK_CALLER_FILE,
+            LEAK_REPO,
+            LEAK_PROJECT,
+            "conv-leak-caller",
+        )?;
+        storage.resolve_code_edges(LEAK_PROJECT)?;
+
+        let node = storage
+            .code_nodes_by_name("leak_caller_fn", LEAK_PROJECT, 1)?
+            .into_iter()
+            .next()
+            .context("placeholder-leak fixture: leak_caller_fn node missing")?;
+        let callees = storage.code_query_callees(&node.id, 6)?;
+        let unresolved_names: Vec<String> = callees
+            .iter()
+            .filter(|callee| callee.kind == "unresolved")
+            .map(|callee| callee.name.clone())
+            .collect();
+        if unresolved_names.is_empty() {
+            anyhow::bail!(
+                "placeholder-leak fixture setup error: expected >=1 unresolved callee, got {:?}",
+                callees
+                    .iter()
+                    .map(|callee| (&callee.name, &callee.kind))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let slices = build_graph_slices(
+            &storage,
+            "Review leak_caller_fn in src/leak_caller.rs",
+            &[LEAK_CALLER_FILE.to_string()],
+            LEAK_PROJECT,
+        );
+        let rendered = slices.join("\n");
+
+        let mut leaked: Vec<String> = Vec::new();
+        for line in rendered.lines() {
+            let parts: Vec<&str> = line.splitn(2, "calls → ").collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let after_arrow = parts[1];
+            let token_list = after_arrow
+                .split(" (last changed")
+                .next()
+                .unwrap_or(after_arrow);
+            let tokens: Vec<&str> = token_list.split(", ").map(str::trim).collect();
+            for name in &unresolved_names {
+                if tokens.contains(&name.as_str()) {
+                    leaked.push(name.clone());
+                }
+            }
+        }
+
+        let detail = format!(
+            "unresolved callees={unresolved_names:?}; rendered={rendered:?}; leaked as bare undecorated tokens={leaked:?}"
+        );
+        Ok((leaked.is_empty(), detail))
+    })();
+
+    match measured {
+        Ok((passed, detail)) => judge("No placeholder leak in injection", started, passed, detail),
+        Err(error) => judge(
+            "No placeholder leak in injection",
+            started,
+            false,
+            format!("placeholder-leak gate error: {error:#}"),
+        ),
+    }
+}
+
 fn extract_and_store(
     storage: &Arc<Storage>,
     source: &str,
@@ -144,6 +355,8 @@ fn seed_fixture() -> Result<Arc<Storage>> {
         (API_SOURCE, API_FILE, "conv-api"),
         (SERVICE_SOURCE, SERVICE_FILE, "conv-service"),
         (WORKER_SOURCE, WORKER_FILE, "conv-worker"),
+        (TS_SOURCE, TS_FILE, "conv-util"),
+        (PY_SOURCE, PY_FILE, "conv-consumer"),
     ] {
         extract_and_store(&storage, source, file, REPO, PROJECT, conv_id)?;
     }
@@ -175,6 +388,9 @@ fn snapshot(storage: &Arc<Storage>) -> Result<GraphSnapshot> {
                     first_conv_id: row.get(11)?,
                     last_conv_id: row.get(12)?,
                     last_session_id: row.get(13)?,
+                    // Snapshot row read straight from code_nodes: a stored
+                    // definition, never a name-only query match.
+                    name_only: false,
                 })
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -796,6 +1012,9 @@ pub fn run_codegraph(_storage: &Arc<Storage>) -> Result<EvalReport> {
         ),
         query_latency_gate(&fixture, &fixture_snapshot.nodes),
         round_trip_gate(&fixture, REPO, PROJECT),
+        import_key_sanity_gate(&fixture_snapshot),
+        project_attribution_gate(&fixture_snapshot),
+        placeholder_leak_gate(),
     ];
 
     Ok(EvalReport {
@@ -847,6 +1066,9 @@ pub fn run_codegraph_live(storage: &Arc<Storage>) -> Result<EvalReport> {
         "__csr_codegraph_eval_repo__",
         "__csr_codegraph_eval_project__",
     ));
+    results.push(import_key_sanity_gate(&live_snapshot));
+    results.push(project_attribution_gate(&live_snapshot));
+    results.push(placeholder_leak_gate());
     results.push(health_result(&live_snapshot));
 
     Ok(EvalReport {
@@ -880,12 +1102,12 @@ mod tests {
     }
 
     #[test]
-    fn fixture_codegraph_gate_passes_all_six_gates() {
+    fn fixture_codegraph_gate_passes_all_nine_gates() {
         let storage = Arc::new(Storage::open_memory().unwrap());
 
         let report = run_codegraph(&storage).unwrap();
 
-        assert_eq!(report.results.len(), 6);
+        assert_eq!(report.results.len(), 9);
         assert!(
             report.results.iter().all(|result| result.passed),
             "fixture failures: {:?}",
