@@ -56,13 +56,29 @@ pub fn read_stdin_json() -> HookInput {
 
     // If stdin is a TTY (not piped), don't block waiting for input
     if std::io::stdin().is_terminal() {
+        crate::telemetry::append_timing_line("CSR stdin: is a terminal, no piped input");
         return HookInput::default();
     }
 
     let mut buf = String::new();
     match std::io::stdin().read_to_string(&mut buf) {
-        Ok(_) if !buf.trim().is_empty() => serde_json::from_str(&buf).unwrap_or_default(),
-        _ => HookInput::default(),
+        Ok(_) if !buf.trim().is_empty() => match serde_json::from_str(&buf) {
+            Ok(input) => input,
+            Err(e) => {
+                // A parse failure here silently degrades to Default (no prompt,
+                // no transcript_path) — the hook then no-ops. Log it loudly.
+                crate::telemetry::append_timing_line(&format!(
+                    "CSR stdin: {}B received but JSON parse FAILED: {}",
+                    buf.len(),
+                    e
+                ));
+                HookInput::default()
+            }
+        },
+        _ => {
+            crate::telemetry::append_timing_line("CSR stdin: empty (no JSON piped)");
+            HookInput::default()
+        }
     }
 }
 
@@ -119,16 +135,35 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     let input = read_stdin_json();
     let t_stdin = t0.elapsed();
 
+    // Field-presence diagnostic: hook=0ms exits are indistinguishable from a
+    // missing prompt without this (live debugging 2026-07-30).
+    crate::telemetry::append_timing_line(&format!(
+        "CSR hook {} input: prompt_len={} cwd={:?} transcript={} session={}",
+        hook_name,
+        input.prompt.as_deref().map(str::len).unwrap_or(0),
+        input.cwd,
+        input.transcript_path.is_some(),
+        input.session_id.is_some(),
+    ));
+
     // Determine CWD: prefer input.cwd, fall back to process CWD
     // Validate that cwd is a real directory under $HOME (S-3 fix)
     let cwd = if let Some(ref dir) = input.cwd {
         let p = std::path::PathBuf::from(dir);
         if p.is_dir() {
             let canonical = p.canonicalize()?;
-            if let Some(home) = dirs::home_dir() {
-                if !canonical.starts_with(&home) {
-                    anyhow::bail!("cwd {} is outside home directory", canonical.display());
-                }
+            // S-3 check, Windows-fixed: canonicalize() returns a \\?\-prefixed
+            // path, so the raw home_dir() never prefix-matched and this bailed
+            // on EVERY hook that carried a cwd — compare canonical vs canonical.
+            // And outside-home is a warning, not an error: projects legitimately
+            // live on other drives (D:\...), and a hook that dies here silently
+            // disables both injection and live transcript import.
+            let home_ok = dirs::home_dir()
+                .and_then(|h| h.canonicalize().ok())
+                .map(|h| canonical.starts_with(&h))
+                .unwrap_or(false);
+            if !home_ok {
+                eprintln!("CSR: cwd {} outside home (allowed)", canonical.display());
             }
             canonical
         } else {

@@ -7,6 +7,24 @@ pub fn resolve_project_from_cwd(cwd: &str) -> Option<String> {
         return None;
     }
 
+    // Windows drive path ("D:\Claude", or "\\?\D:\Claude" after canonicalize):
+    // stored project names are Claude Code's ~/.claude/projects folder names,
+    // which encode the FULL path with every non-alphanumeric char as '-'
+    // ("D:\Claude" → "D--Claude"). The last-component fallback below returned
+    // "Claude", which matches no stored project and silently emptied every
+    // project-scoped search. Hooks receive the project root as cwd, so no
+    // component-walking is needed here.
+    let stripped = cwd.strip_prefix(r"\\?\").unwrap_or(cwd);
+    let trimmed = stripped.trim_end_matches(['\\', '/']);
+    if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
+        return Some(
+            trimmed
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect(),
+        );
+    }
+
     let path = std::path::Path::new(cwd);
     let dir_name = path.file_name()?.to_string_lossy().to_string();
 
