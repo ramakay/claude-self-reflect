@@ -1019,32 +1019,36 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
         // bare target name -> {src_name -> (src_kind, callee_kind, evidence)}
         // — EVERY fresh edge of this file, regardless of src attribution —
         // rather than a flat `(src_name, bare)` -> value map. The inner
-        // `BTreeMap` gives two things: an exact-match lookup at a specific
-        // `src_name` key (the pre-existing behavior, unchanged), AND, when
-        // that misses, the CANDIDATE SET for the Finding 2 re-point
-        // uniqueness check below — a pending edge whose OLD src no longer
-        // matches (because an attribution RULE changed, e.g. commit
-        // 92179d1 unifying closure-nested call src with binding-scope
-        // attribution — not because the call site itself changed) can
-        // still find the IDENTICAL call/import site under its NEW
-        // attribution and re-point to it, instead of being wrongly
-        // drift-classified — but ONLY when this candidate set has EXACTLY
-        // ONE entry (Finding 2, Codex round 4 adversarial review): two or
-        // more distinct fresh srcs calling the same bare name means the
-        // edit could equally be "attribution moved" OR "a real edit made a
-        // second, unrelated caller" — indistinguishable by name alone, so
-        // re-pointing would be a guess. `src_kind` (Finding 3, Codex round
-        // 4) is threaded alongside so the WINNING candidate's real shadow
-        // id can be resolved via the kind-qualified `shadow_name_to_id`
-        // instead of a bare-name lookup — see that map's own doc comment.
-        // Deliberately NAME-keyed (not `edge.src_id`) — see
-        // `shadow_name_to_id`'s doc comment for why the fresh fragment's OWN
-        // id is a different (wrong) id space than this shadow's
-        // `code_nodes`. `imports` edges are always module-sourced (see
-        // `extract_inner`'s imports loop — `src` is always `module_id`), so
-        // their inner map in practice never has more than one key; kept
-        // symmetric with `calls` rather than special-cased, since a single,
-        // shared code path is less risk than two subtly different ones.
+        // `BTreeMap` gives an exact-match lookup at a specific `src_name`
+        // key (the pre-existing behavior, unchanged), AND, when that misses,
+        // the per-candidate `(src_kind, callee_kind, evidence)` data the
+        // re-point below needs once `call_legacy_correspondence` (Codex
+        // round 5, immediately below) has decided WHICH candidate — if
+        // any — a pending edge's stale src provably corresponds to.
+        // `src_kind` (Finding 3, Codex round 4) is threaded alongside so the
+        // WINNING candidate's real shadow id can be resolved via the
+        // kind-qualified `shadow_name_to_id` instead of a bare-name lookup —
+        // see that map's own doc comment. Deliberately NAME-keyed (not
+        // `edge.src_id`) — see `shadow_name_to_id`'s doc comment for why the
+        // fresh fragment's OWN id is a different (wrong) id space than this
+        // shadow's `code_nodes`. `imports` edges are always module-sourced
+        // (see `extract_inner`'s imports loop — `src` is always
+        // `module_id`), so their inner map in practice never has more than
+        // one key; kept symmetric with `calls` rather than special-cased,
+        // since a single, shared code path is less risk than two subtly
+        // different ones.
+        //
+        // Codex round 4 (Finding 2) used to gate re-pointing on THIS map's
+        // candidate COUNT alone (exactly one entry -> re-point). Codex round
+        // 5 adversarial review found that unsound: candidate-count
+        // uniqueness is not identity. A genuinely REMOVED call in one
+        // function (`ghost`) plus one unrelated, unchanged function
+        // (`alpha`) that ALSO happens to call the same bare name is
+        // indistinguishable from attribution skew by count alone — and was
+        // being wrongly re-pointed to `alpha`, corrupting provenance and
+        // suppressing the legitimate drift on `ghost`'s own edge. This map
+        // alone is no longer sufficient to decide re-pointing — see
+        // `call_legacy_correspondence`, immediately below.
         let mut calls_any_src: BTreeMap<String, BTreeMap<String, (String, String, String)>> =
             BTreeMap::new();
         let mut imports_any_src: BTreeMap<String, BTreeMap<String, (String, String)>> =
@@ -1075,6 +1079,44 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                 }
                 _ => {}
             }
+        }
+
+        // Codex round 5 adversarial review: POSITIVE transition evidence,
+        // replacing round 4's candidate-count re-point rule (see
+        // `calls_any_src`'s doc comment, immediately above, for the exact
+        // finding). Keyed by `(kind, bare_callee, legacy_src_name)` ->
+        // the SET of distinct CURRENT src names among fresh call/import
+        // SITES whose `legacy_src_attribution` (the FROZEN pre-92179d1
+        // rule) equals `legacy_src_name` — built straight from
+        // `fragment.call_attribution_pairs` (per-SITE, not aggregated by
+        // edge, since two sites aggregated into the same fresh edge can
+        // carry DIFFERENT legacy attributions).
+        //
+        // A pending historical edge `(src_name, callee, kind)` that misses
+        // the exact-match lookup above is eligible for re-pointing ONLY when
+        // this map has an entry for `(kind, callee, src_name)` — i.e. some
+        // fresh call/import site, under the OLD rule, provably attributes to
+        // EXACTLY this historical src. That is direct physical evidence the
+        // historical edge and that fresh site are the SAME call, just
+        // recorded under different attribution rules — not a guess from
+        // bare-name survival. When the resulting current-src set has more
+        // than one distinct member, WHICH of them owns the historical edge
+        // is still unproven (two sites both attribute to the old src under
+        // the old rule, but disagree under the new one) — left untouched,
+        // same "ambiguous, never guess" outcome round 4 established, just
+        // reached via correspondence instead of count. When NO fresh site
+        // legacy-corresponds to this historical src at all, this is not
+        // attribution skew — the edge falls through to the pre-existing
+        // `can_drift` guard below and is judged as ordinary drift evidence,
+        // honestly, rather than being permanently stuck merely because the
+        // bare name happens to survive SOMEWHERE ELSE in the file.
+        let mut call_legacy_correspondence: BTreeMap<(String, String, String), BTreeSet<String>> =
+            BTreeMap::new();
+        for (legacy_src, current_src, callee, kind) in &fragment.call_attribution_pairs {
+            call_legacy_correspondence
+                .entry((kind.clone(), callee.clone(), legacy_src.clone()))
+                .or_default()
+                .insert(current_src.clone());
         }
         // No early bailout when both maps are empty (WCR Phase 8, TASK B):
         // that shape — fresh extraction found NO calls/imports at all in
@@ -1169,11 +1211,15 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
             // BEFORE any drift decision, per kind below — an exact-key miss
             // (`calls_any_src`/`imports_any_src` has no entry at THIS edge's
             // own `src_name`) is not automatically drift when the callee
-            // exists SOMEWHERE ELSE in the fresh fragment. Only when the
-            // whole per-kind candidate map for this bare name is empty
-            // (the callee is absent from the file's ENTIRE fresh edge set,
-            // not just from this src) does the pre-existing `can_drift`
-            // gate (parse_clean + def_names, unchanged) get to run at all.
+            // exists SOMEWHERE ELSE in the fresh fragment: it first goes
+            // through the `call_legacy_correspondence` check (Codex round 5)
+            // below, which decides re-point vs ambiguous vs "fall through to
+            // the ordinary drift guard" — see that map's doc comment. Only
+            // when the whole per-kind candidate map for this bare name is
+            // empty (the callee is absent from the file's ENTIRE fresh edge
+            // set, not just from this src) does `can_drift` (parse_clean +
+            // def_names, unchanged) get to run WITHOUT going through
+            // correspondence first — there is no candidate to correspond to.
             match kind.as_str() {
                 "calls" => {
                     match calls_any_src.get(bare) {
@@ -1195,56 +1241,81 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                             edges_updated += 1;
                         }
                         Some(candidates) if !candidates.is_empty() => {
-                            // RE-POINT, not drift: the identical call still
-                            // exists in the fresh extraction, just attributed
-                            // to a DIFFERENT src node than this historical
-                            // edge carries. Finding 2 (Codex round 4
-                            // adversarial review): re-point ONLY when the
-                            // transition is UNIQUELY derivable — exactly ONE
-                            // candidate src in the fresh fragment for this
-                            // (callee, kind) in the file. A REAL edit (a
-                            // ghost function removing its own `helper()` call
-                            // while an unrelated, unchanged function still
-                            // calls `helper()`) is indistinguishable BY NAME
-                            // from attribution skew — resurrecting the edge
-                            // under the surviving caller would corrupt
-                            // provenance and silently suppress the
-                            // legitimate drift on the ghost's own edge. With
-                            // >= 2 candidates, the callee demonstrably still
-                            // exists SOMEWHERE (so this is NOT drift), but
-                            // WHICH candidate owns this particular historical
-                            // edge is unproven (so re-pointing is a guess) —
-                            // left untouched: pending, unexplained, the
-                            // honest bucket for "true but unattributable".
-                            if candidates.len() == 1 {
-                                let (name, (src_kind, new_kind, new_evidence)) =
-                                    candidates.iter().next().expect("len == 1");
-                                // Finding 3: kind-qualified lookup — a
-                                // missing or non-unique (kind, name) match in
-                                // `shadow_name_to_id` is NO match, never a
-                                // lexicographic guess. See that map's doc
-                                // comment.
-                                if let Some(new_src_id) =
-                                    shadow_name_to_id.get(&(src_kind.clone(), name.clone()))
-                                {
-                                    repoint_or_dedupe_edge(
-                                        shadow,
-                                        &src_id,
-                                        &dst_id,
-                                        "calls",
-                                        new_src_id,
-                                        Some(new_kind),
-                                        new_evidence,
-                                    )?;
-                                    edges_updated += 1;
+                            // Codex round 5 adversarial review: re-point ONLY
+                            // on POSITIVE transition evidence — a fresh call
+                            // site that, under the FROZEN pre-92179d1 rule,
+                            // provably attributes to THIS historical edge's
+                            // own src (`call_legacy_correspondence`'s doc
+                            // comment has the full finding). Candidate COUNT
+                            // alone (the round 4 rule this replaces) could not
+                            // tell "attribution moved" apart from "a real edit
+                            // made a second, unrelated caller" — this can.
+                            let legacy_key = (kind.clone(), bare.to_string(), src_name.clone());
+                            match call_legacy_correspondence.get(&legacy_key) {
+                                Some(current_srcs) if current_srcs.len() == 1 => {
+                                    let winning = current_srcs.iter().next().expect("len == 1");
+                                    if let Some((src_kind, new_kind, new_evidence)) =
+                                        candidates.get(winning)
+                                    {
+                                        // Finding 3 (Codex round 4): kind-qualified
+                                        // lookup — a missing or non-unique
+                                        // (kind, name) match in
+                                        // `shadow_name_to_id` is NO match, never
+                                        // a lexicographic guess. See that map's
+                                        // doc comment.
+                                        if let Some(new_src_id) = shadow_name_to_id
+                                            .get(&(src_kind.clone(), winning.clone()))
+                                        {
+                                            repoint_or_dedupe_edge(
+                                                shadow,
+                                                &src_id,
+                                                &dst_id,
+                                                "calls",
+                                                new_src_id,
+                                                Some(new_kind),
+                                                new_evidence,
+                                            )?;
+                                            edges_updated += 1;
+                                        }
+                                        // else: the winning candidate's (kind,
+                                        // name) has no valid real shadow id —
+                                        // never guess by falling back to a
+                                        // different one. Leave untouched.
+                                    }
+                                    // else: the legacy-matched winning src isn't
+                                    // itself a `calls_any_src` candidate —
+                                    // structurally shouldn't happen (every
+                                    // `call_attribution_pairs` site also
+                                    // produced a `fragment.edges` entry at its
+                                    // own current src), but never guess if it
+                                    // somehow is. Leave untouched.
                                 }
-                                // else: the sole candidate's (kind, name) has
-                                // no valid real shadow id — never guess by
-                                // falling back to a different one. Leave
-                                // untouched.
+                                Some(_) => {
+                                    // >= 2 distinct current srcs among
+                                    // legacy-matched sites: WHICH one owns this
+                                    // historical edge is unproven — ambiguous,
+                                    // never guess. Left untouched: pending,
+                                    // unexplained, the honest bucket for "true
+                                    // but unattributable". Never drifted either
+                                    // — a legacy-corresponding site DOES exist.
+                                }
+                                None => {
+                                    // NO fresh site legacy-corresponds to this
+                                    // historical src at all — this is not
+                                    // attribution skew (a genuinely removed
+                                    // call, e.g. `ghost`'s own `helper()` call
+                                    // deleted, looks exactly like this even
+                                    // though `helper` still exists elsewhere in
+                                    // the file via an unrelated caller). Fall
+                                    // through to the ordinary drift guard —
+                                    // honest classification, not permanently
+                                    // stuck merely because the bare name
+                                    // survives SOMEWHERE ELSE.
+                                    if can_drift {
+                                        mark_drifted(shadow, &src_id, &dst_id, "calls")?;
+                                    }
+                                }
                             }
-                            // else (>= 2 candidates): ambiguous identity —
-                            // never guess. Leave untouched.
                         }
                         _ => {
                             if can_drift {
@@ -1278,33 +1349,46 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                         edges_updated += 1;
                     }
                     Some(candidates) if !candidates.is_empty() => {
-                        // Same re-point rule as `calls`, above (Finding 2:
-                        // uniqueness-gated; Finding 3: kind-qualified
-                        // lookup) — in practice a near-no-op for `imports`
-                        // (its src is always the module node, see
-                        // `imports_any_src`'s doc comment), kept symmetric
-                        // rather than special-cased.
-                        if candidates.len() == 1 {
-                            let (name, (src_kind, new_evidence)) =
-                                candidates.iter().next().expect("len == 1");
-                            if let Some(new_src_id) =
-                                shadow_name_to_id.get(&(src_kind.clone(), name.clone()))
-                            {
-                                repoint_or_dedupe_edge(
-                                    shadow,
-                                    &src_id,
-                                    &dst_id,
-                                    "imports",
-                                    new_src_id,
-                                    None,
-                                    new_evidence,
-                                )?;
-                                edges_updated += 1;
+                        // Same correspondence-gated re-point rule as `calls`,
+                        // above (Codex round 5) — in practice a near-no-op for
+                        // `imports` (both legacy AND current attribution are
+                        // ALWAYS the module node, see
+                        // `GraphFragment::call_attribution_pairs`'s doc
+                        // comment, so this can only ever fire when the
+                        // historical src itself already equals the module —
+                        // which the exact-match arm above would have already
+                        // caught), kept symmetric rather than special-cased.
+                        let legacy_key = (kind.clone(), bare.to_string(), src_name.clone());
+                        match call_legacy_correspondence.get(&legacy_key) {
+                            Some(current_srcs) if current_srcs.len() == 1 => {
+                                let winning = current_srcs.iter().next().expect("len == 1");
+                                if let Some((src_kind, new_evidence)) = candidates.get(winning) {
+                                    if let Some(new_src_id) =
+                                        shadow_name_to_id.get(&(src_kind.clone(), winning.clone()))
+                                    {
+                                        repoint_or_dedupe_edge(
+                                            shadow,
+                                            &src_id,
+                                            &dst_id,
+                                            "imports",
+                                            new_src_id,
+                                            None,
+                                            new_evidence,
+                                        )?;
+                                        edges_updated += 1;
+                                    }
+                                    // else: no valid real shadow id — never guess.
+                                }
                             }
-                            // else: no valid real shadow id — never guess.
+                            Some(_) => {
+                                // ambiguous — never guess. Leave untouched.
+                            }
+                            None => {
+                                if can_drift {
+                                    mark_drifted(shadow, &src_id, &dst_id, "imports")?;
+                                }
+                            }
                         }
-                        // else (>= 2 candidates): ambiguous identity — never
-                        // guess. Leave untouched.
                     }
                     _ => {
                         if can_drift {
@@ -3608,43 +3692,94 @@ mod tests {
     }
 
     #[test]
-    fn backfill_never_repoints_when_multiple_candidate_srcs_exist() {
-        // MANDATED TEST (Codex round 4 adversarial review, Finding 2):
-        // supersedes the old "lexicographically-smallest-wins" behavior —
-        // that WAS the guess this finding removes. A callee invoked from
-        // MORE THAN ONE def in the fresh fragment (none of which match the
-        // pending edge's own stale src) is NOT drift (the callee genuinely
-        // still exists) but is ALSO not re-pointed (which of the >= 2
-        // candidates the historical edge should now attribute to is
-        // unproven — indistinguishable from "a real edit added a second,
-        // unrelated caller"). The edge is left completely untouched: still
-        // pending, still unexplained, the honest bucket.
+    fn backfill_never_repoints_when_legacy_matched_sites_have_multiple_distinct_current_srcs() {
+        // MANDATED TEST (Codex round 5 adversarial review): supersedes
+        // round 4's candidate-COUNT ambiguity test (candidate count is no
+        // longer what gates re-pointing at all — see
+        // `call_legacy_correspondence`'s doc comment). TWO closures in TWO
+        // DIFFERENT named components both fall back to the SAME module src
+        // under the FROZEN pre-92179d1 rule, so BOTH fresh call sites
+        // legacy-correspond to the historical module-src edge — this is
+        // genuine positive transition evidence, unlike bare-name survival.
+        // But WHICH of the two owns the historical edge (which aggregated
+        // whichever calls existed when it was recorded, e.g. only
+        // ComponentA's) is still unproven — re-pointing to either would be
+        // a guess. The edge must stay pending, unexplained, and NEVER
+        // drift either (a legacy-corresponding site does exist — this is
+        // provably not "removed", just unattributably ambiguous).
         let tmp = tempfile::tempdir().unwrap();
-        let file_path = tmp.path().join("a.rs");
+        let file_path = tmp.path().join("a.tsx");
         std::fs::write(
             &file_path,
-            "fn bravo() {\n    helper();\n}\nfn alpha() {\n    helper();\n}\n",
+            "function ComponentA() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n\
+             function ComponentB() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n",
         )
         .unwrap();
         let file_str = file_path.to_string_lossy().to_string();
 
         let shadow = Arc::new(Storage::open_memory().unwrap());
-        // Stale src is a THIRD name, absent from the fresh fragment
-        // entirely — never a candidate itself, forcing the ambiguity.
-        let ghost_id =
-            crate::extraction::codegraph::node_id("repo", &file_str, "function", "ghost");
-        seed_backfill_node(&shadow, &ghost_id, &file_str, "ghost");
-        let alpha_id =
-            crate::extraction::codegraph::node_id("repo", &file_str, "function", "alpha");
-        let bravo_id =
-            crate::extraction::codegraph::node_id("repo", &file_str, "function", "bravo");
-        seed_backfill_node(&shadow, &alpha_id, &file_str, "alpha");
-        seed_backfill_node(&shadow, &bravo_id, &file_str, "bravo");
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "tsx".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        let component_a_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "ComponentA");
+        let component_b_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "ComponentB");
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: component_a_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "tsx".into(),
+                kind: "function".into(),
+                name: "ComponentA".into(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: component_b_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "tsx".into(),
+                kind: "function".into(),
+                name: "ComponentB".into(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
         shadow
             .replace_code_file_edges(
                 "proj",
                 &file_str,
-                &[stale_calls_edge(&ghost_id, "helper", &file_str, "direct")],
+                &[EdgeRow {
+                    src_id: module_id.clone(),
+                    dst_id: "name:helper".into(),
+                    kind: "calls".into(),
+                    src_file: file_str.clone(),
+                    resolved: 0,
+                    weight: 1.0,
+                    callee_kind: "direct".into(),
+                    ..EdgeRow::default()
+                }],
             )
             .unwrap();
 
@@ -3652,7 +3787,7 @@ mod tests {
         assert_eq!(files, 1, "the on-disk file was still re-extracted");
         assert_eq!(
             edges, 0,
-            "ambiguous identity: not an exact match, not a unique re-point, not drift"
+            "legacy-corresponding sites exist in BOTH components — ambiguous, never guessed"
         );
         let (src_id, boundary, resolved, callee_kind): (String, String, i64, String) = shadow
             .with_connection(|conn| {
@@ -3666,14 +3801,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            src_id, ghost_id,
-            "must stay on its ORIGINAL stale src — never guess between alpha/bravo"
+            src_id, module_id,
+            "must stay on its ORIGINAL module src — never guess between ComponentA/ComponentB"
         );
-        assert_ne!(src_id, alpha_id);
-        assert_ne!(src_id, bravo_id);
+        assert_ne!(src_id, component_a_id);
+        assert_ne!(src_id, component_b_id);
         assert_eq!(
             boundary, "",
-            "not drifted — the callee still exists in the fresh source"
+            "not drifted — a legacy-corresponding call site DOES exist, just ambiguous which"
         );
         assert_eq!(resolved, 0);
         assert_eq!(
@@ -3683,12 +3818,18 @@ mod tests {
     }
 
     #[test]
-    fn backfill_repoints_when_exactly_one_candidate_src_exists() {
-        // MANDATED TEST counterpart (Codex round 4 adversarial review,
-        // Finding 2): the positive case — exactly ONE candidate src in the
-        // fresh fragment for this callee IS uniquely derivable, and must
-        // still re-point (this is the common, legitimate case Finding 2
-        // must not break while closing the >= 2 candidate guess).
+    fn backfill_never_repoints_bare_name_survivor_without_legacy_match() {
+        // MANDATED TEST (Codex round 5 adversarial review): the EXACT
+        // unsoundness the round-4 candidate-COUNT rule had — this used to
+        // be `backfill_repoints_when_exactly_one_candidate_src_exists`,
+        // asserting a WRONG re-point. `alpha` calls `helper()` directly
+        // (not closure-nested — its legacy attribution, under the frozen
+        // pre-92179d1 rule, is `alpha` itself, never `ghost`), so it does
+        // NOT legacy-correspond to the historical `ghost`-sourced edge.
+        // `ghost` itself is entirely ABSENT from the fresh file too, so the
+        // ordinary drift guard's calling-symbol-present condition also
+        // fails. The edge must stay pending, unexplained — NEVER
+        // re-pointed onto `alpha` merely because `helper` survives there.
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.rs");
         std::fs::write(&file_path, "fn alpha() {\n    helper();\n}\n").unwrap();
@@ -3712,20 +3853,210 @@ mod tests {
         let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
         assert_eq!(files, 1);
         assert_eq!(
-            edges, 1,
-            "the sole candidate is uniquely derivable — re-pointed"
+            edges, 0,
+            "alpha's legacy attribution is itself, not ghost — no correspondence, no re-point"
         );
-        let repointed_src: String = shadow
+        let (src_id, boundary, resolved, callee_kind): (String, String, i64, String) = shadow
             .with_connection(|conn| {
                 conn.query_row(
-                    "SELECT src_id FROM code_edges WHERE dst_id = 'name:helper' AND kind = 'calls'",
+                    "SELECT src_id, boundary, resolved, callee_kind FROM code_edges
+                     WHERE dst_id = 'name:helper' AND kind = 'calls'",
                     [],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .map_err(Into::into)
             })
             .unwrap();
-        assert_eq!(repointed_src, alpha_id);
+        assert_eq!(
+            src_id, ghost_id,
+            "must stay on its ORIGINAL stale src — never guessed onto alpha"
+        );
+        assert_ne!(src_id, alpha_id);
+        assert_eq!(
+            boundary, "",
+            "ghost itself is absent from the fresh extraction — not trustworthy drift evidence"
+        );
+        assert_eq!(resolved, 0);
+        assert_eq!(
+            callee_kind, "direct",
+            "untouched — the original stale value"
+        );
+    }
+
+    #[test]
+    fn backfill_drifts_ghost_call_removal_despite_unrelated_direct_survivor() {
+        // MANDATED TEST (Codex round 5 adversarial review — the flagged
+        // finding itself): `ghost` STILL EXISTS in the fresh file
+        // (conditions (b)/(c) both hold) but no longer calls `helper()` —
+        // a genuinely REMOVED call. `alpha`, an unrelated, unchanged
+        // function, still calls `helper()` directly — its legacy
+        // attribution is `alpha`, never `ghost`, so no fresh site
+        // legacy-corresponds to the historical `ghost`-sourced edge.
+        // Before this fix, `helper`'s bare-name survival via `alpha` (the
+        // sole round-4 "candidate") would have wrongly re-pointed the edge
+        // onto `alpha`, corrupting provenance and silently suppressing
+        // this legitimate drift. After the fix, the edge correctly falls
+        // through to the ordinary drift guard and drifts honestly.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.rs");
+        std::fs::write(
+            &file_path,
+            "fn ghost() {}\nfn alpha() {\n    helper();\n}\n",
+        )
+        .unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let ghost_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "ghost");
+        seed_backfill_node(&shadow, &ghost_id, &file_str, "ghost");
+        let alpha_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "alpha");
+        seed_backfill_node(&shadow, &alpha_id, &file_str, "alpha");
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[stale_calls_edge(&ghost_id, "helper", &file_str, "direct")],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(
+            edges, 0,
+            "mark_drifted does not increment edges_updated — only exact-match/re-point do \
+             (see backfill_marks_drifted_for_edges_vanished_from_fresh_extraction)"
+        );
+
+        let (src_id, boundary, evidence, resolved): (String, String, String, i64) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT src_id, boundary, evidence, resolved FROM code_edges
+                     WHERE dst_id = 'name:helper' AND kind = 'calls'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            src_id, ghost_id,
+            "drift never moves src_id — stays on ghost"
+        );
+        assert_ne!(src_id, alpha_id);
+        assert_eq!(
+            boundary, "drifted",
+            "ghost's own call to helper() was genuinely removed — no legacy correspondence \
+             to alpha's unrelated direct call rescues it"
+        );
+        assert_eq!(evidence, "not_in_current_source");
+        assert_eq!(resolved, 0);
+    }
+
+    #[test]
+    fn backfill_never_repoints_module_src_edge_when_closure_removed_and_unrelated_direct_survivor_exists(
+    ) {
+        // MANDATED TEST (Codex round 5 adversarial review, scenario 3): the
+        // historical edge carries the OLD module-src attribution (as if
+        // extracted from a PRIOR version of the file with a closure-nested
+        // `helper()` call, same shape as
+        // `backfill_repoints_closure_call_from_stale_module_src_instead_of_drifting`,
+        // above) — but the file has SINCE been edited: the closure is gone
+        // entirely, replaced by an UNRELATED top-level function `Alpha`
+        // that calls `helper()` directly (not closure-nested). `Alpha`'s
+        // legacy attribution is `Alpha` itself, never the module, so it
+        // does NOT legacy-correspond to the historical module-src edge —
+        // re-pointing to `Alpha` would be exactly the same corruption as
+        // the ghost/alpha case, just via the module fallback instead of a
+        // named ghost. The edge must fall through to the ordinary drift
+        // guard, which — for a module-src edge — always drifts (condition
+        // (c)'s `src_name == src_file` case).
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.tsx");
+        std::fs::write(&file_path, "function Alpha() {\n    helper();\n}\n").unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "tsx".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        let alpha_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "Alpha");
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: alpha_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "tsx".into(),
+                kind: "function".into(),
+                name: "Alpha".into(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[EdgeRow {
+                    src_id: module_id.clone(),
+                    dst_id: "name:helper".into(),
+                    kind: "calls".into(),
+                    src_file: file_str.clone(),
+                    resolved: 0,
+                    weight: 1.0,
+                    callee_kind: "direct".into(),
+                    ..EdgeRow::default()
+                }],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(
+            edges, 0,
+            "mark_drifted does not increment edges_updated — only exact-match/re-point do"
+        );
+
+        let (src_id, boundary, evidence, resolved): (String, String, String, i64) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT src_id, boundary, evidence, resolved FROM code_edges
+                     WHERE dst_id = 'name:helper' AND kind = 'calls'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            src_id, module_id,
+            "drift never moves src_id — stays on the module node"
+        );
+        assert_ne!(src_id, alpha_id);
+        assert_eq!(
+            boundary, "drifted",
+            "Alpha's unrelated direct call never legacy-corresponds to the module fallback \
+             — no re-point, honest drift instead"
+        );
+        assert_eq!(evidence, "not_in_current_source");
+        assert_eq!(resolved, 0);
     }
 
     // ─── end-to-end scope-chain threading (Codex round 3 adversarial
@@ -4114,45 +4445,63 @@ mod tests {
 
     #[test]
     fn backfill_never_repoints_via_kind_ambiguous_name_collision() {
-        // MANDATED-STYLE TEST (Finding 3): a bare NAME that collides across
-        // TWO DIFFERENT node kinds in this shadow's own `code_nodes` (a
-        // `function helper` AND a `type helper`, both already present —
-        // `node_id` disambiguates them by kind, so both coexist) must NEVER
-        // be resolved by picking one lexicographically. The fresh
-        // extraction's sole candidate src for the `orphaned` callee is
-        // named "helper" — but `shadow_name_to_id` now requires a UNIQUE
-        // `(kind, name)` match, and `(function, helper)` alone IS unique
-        // (the `type helper` node has a DIFFERENT kind key), so this
-        // specific case must still resolve correctly to the function.
-        // Kept alongside a genuinely non-unique case (same kind, colliding
-        // scenario is structurally impossible via `node_id`'s own hash) to
-        // document the "missing/non-unique -> no match" contract via the
-        // API path this backfill actually calls.
+        // MANDATED-STYLE TEST (Finding 3, Codex round 4 — re-verified under
+        // Codex round 5's legacy-correspondence rule): a bare NAME that
+        // collides across TWO DIFFERENT node kinds in this shadow's own
+        // `code_nodes` (a `function Component` AND a `type Component`, both
+        // already present — `node_id` disambiguates them by kind, so both
+        // coexist) must NEVER be resolved by picking one lexicographically
+        // — even once the WINNING candidate is chosen via legacy
+        // correspondence rather than bare-name count. The historical edge
+        // carries the OLD module-src attribution (a closure-nested call,
+        // same shape as
+        // `backfill_repoints_closure_call_from_stale_module_src_instead_of_drifting`,
+        // above): its sole legacy-matched fresh site's CURRENT attribution
+        // is named "Component" — `shadow_name_to_id` must resolve that
+        // (kind, name) pair to the FUNCTION node, never the co-named TYPE
+        // node.
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.ts");
-        std::fs::write(&file_path, "function helper() {\n    orphaned();\n}\n").unwrap();
+        std::fs::write(
+            &file_path,
+            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n",
+        )
+        .unwrap();
         let file_str = file_path.to_string_lossy().to_string();
 
         let shadow = Arc::new(Storage::open_memory().unwrap());
-        let ghost_id =
-            crate::extraction::codegraph::node_id("repo", &file_str, "function", "ghost");
-        seed_backfill_node(&shadow, &ghost_id, &file_str, "ghost");
-        let helper_fn_id =
-            crate::extraction::codegraph::node_id("repo", &file_str, "function", "helper");
-        seed_backfill_node(&shadow, &helper_fn_id, &file_str, "helper");
-        // A DIFFERENT node, same bare name, DIFFERENT kind — must not be
-        // confused with `helper_fn_id` above by a kind-blind lookup.
-        let helper_type_id =
-            crate::extraction::codegraph::node_id("repo", &file_str, "type", "helper");
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
         shadow
             .upsert_code_node(&NodeRow {
-                id: helper_type_id.clone(),
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "typescript".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        let component_fn_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "Component");
+        seed_backfill_node(&shadow, &component_fn_id, &file_str, "Component");
+        // A DIFFERENT node, same bare name, DIFFERENT kind — must not be
+        // confused with `component_fn_id` above by a kind-blind lookup.
+        let component_type_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "type", "Component");
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: component_type_id.clone(),
                 repo: "repo".into(),
                 project: "proj".into(),
                 file: file_str.clone(),
                 lang: "typescript".into(),
                 kind: "type".into(),
-                name: "helper".into(),
+                name: "Component".into(),
                 first_conv_id: "c".into(),
                 last_conv_id: "c".into(),
                 ..NodeRow::default()
@@ -4162,7 +4511,16 @@ mod tests {
             .replace_code_file_edges(
                 "proj",
                 &file_str,
-                &[stale_calls_edge(&ghost_id, "orphaned", &file_str, "direct")],
+                &[EdgeRow {
+                    src_id: module_id.clone(),
+                    dst_id: "name:helper".into(),
+                    kind: "calls".into(),
+                    src_file: file_str.clone(),
+                    resolved: 0,
+                    weight: 1.0,
+                    callee_kind: "direct".into(),
+                    ..EdgeRow::default()
+                }],
             )
             .unwrap();
 
@@ -4170,12 +4528,12 @@ mod tests {
         assert_eq!(files, 1);
         assert_eq!(
             edges, 1,
-            "the sole (function, helper) candidate is still uniquely resolvable"
+            "the sole legacy-matched (function, Component) candidate is still uniquely resolvable"
         );
         let repointed_src: String = shadow
             .with_connection(|conn| {
                 conn.query_row(
-                    "SELECT src_id FROM code_edges WHERE dst_id = 'name:orphaned' AND kind = 'calls'",
+                    "SELECT src_id FROM code_edges WHERE dst_id = 'name:helper' AND kind = 'calls'",
                     [],
                     |r| r.get(0),
                 )
@@ -4183,10 +4541,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            repointed_src, helper_fn_id,
+            repointed_src, component_fn_id,
             "must resolve to the FUNCTION node, never the co-named type node"
         );
-        assert_ne!(repointed_src, helper_type_id);
+        assert_ne!(repointed_src, component_type_id);
     }
 
     #[test]

@@ -87,6 +87,31 @@ pub struct GraphFragment {
     /// fresh parse) — never persist one across different file versions as
     /// if directly comparable.
     pub call_scope_chains: BTreeMap<(String, String, String), BTreeSet<String>>,
+    /// Codex round 5 adversarial review (backfill re-point correctness):
+    /// `(legacy_src_name, current_src_name, callee, kind)` for EVERY fresh
+    /// `calls`/`imports` SITE (not aggregated by edge — a single aggregated
+    /// `edges` entry can hide several sites with DIFFERENT legacy
+    /// attributions, e.g. one site inside a closure and a sibling one that
+    /// isn't). `legacy_src_name` is `legacy_src_attribution`'s frozen
+    /// pre-92179d1 rule; `current_src_name` is the SAME site's live
+    /// `nearest_def_node` attribution (matching `edges[..].src_id`'s owning
+    /// node's `name`). Both are NAMES (`code_nodes.name`), never ids — the
+    /// module fallback's name is `file`, same convention `calls_any_src`/
+    /// `imports_any_src` already use in `backfill_wcr_witnesses`. `callee` is
+    /// the bare target name (no `name:` prefix); `kind` is `"calls"` or
+    /// `"imports"`, matching `edges[..].kind`.
+    ///
+    /// Witness machinery ONLY for `backfill_wcr_witnesses`'s re-point
+    /// correspondence check (Codex round 5: replaces the round-4
+    /// candidate-COUNT re-point rule, which manufactured certainty from
+    /// bare-name survival — see `legacy_src_attribution`'s doc comment) —
+    /// never used for GRAPH attribution, and never read by any live-pipeline
+    /// fragment consumer (`hooks::post_tool_use`, `import::backfill`,
+    /// `extraction::repo_scan` all only ever touch `nodes`/`edges`). Same
+    /// "computed unconditionally from the one shared parse, consumed
+    /// selectively" convention as `local_bindings`/`call_scope_chains`,
+    /// immediately above.
+    pub call_attribution_pairs: Vec<(String, String, String, String)>,
     /// Finding 3 (X4 adversarial review): `true` iff the tree-sitter parse
     /// of this file produced NO `ERROR`/`MISSING` node anywhere in the tree
     /// (see `tree_has_error`). A degraded/partial parse can still recover
@@ -885,6 +910,56 @@ fn nearest_def_node<D: ast_grep_core::Doc>(
     None
 }
 
+/// WCR truth-pass Codex round 5 finding: a FROZEN reimplementation of the
+/// PRE-commit-92179d1 calls-edge src attribution rule — kept SOLELY as a
+/// migration witness for `backfill_wcr_witnesses`'s re-point correspondence
+/// check (`GraphFragment::call_attribution_pairs`), never for live GRAPH
+/// attribution (`nearest_def_node` above is the current, correct rule for
+/// that — this function must never replace it anywhere else).
+///
+/// The OLD walk, verbatim (see `extract_inner`'s pre-92179d1 calls-edge loop
+/// in git history): break at the FIRST `func_kinds` ancestor, unconditionally
+/// — never walking past it, unlike `nearest_def_node`. If that ancestor has
+/// a name (`child_name`), attribute to it; otherwise (an ANONYMOUS
+/// function-kind ancestor — a closure, or even a top-level const-assigned
+/// arrow function, since the old walk never called
+/// `top_level_const_fn_name` either) attribute to the MODULE — `None` here,
+/// matching `nearest_def_node`'s own `None` convention (caller falls back to
+/// `module_id`/the module's `name` field, which is `file`). If `node` has NO
+/// `func_kinds` ancestor at all, also `None` (module) — same as the old
+/// walk's initial `src = module_id` never being overwritten.
+///
+/// Why this matters: historical `code_edges` rows extracted before
+/// 92179d1 carry THIS rule's attribution, not `nearest_def_node`'s. A
+/// historical edge whose src no longer matches the fresh extraction's
+/// CURRENT attribution for that exact call site is not necessarily drift —
+/// it may simply be the SAME physical call, attributed under the OLD rule,
+/// now attributed differently under the NEW one. This function lets the
+/// backfill prove that correspondence mechanically (same call site, same
+/// callee) rather than guessing from bare-name candidate-count alone (Codex
+/// round 5: candidate-count uniqueness is not identity — a genuinely
+/// REMOVED call in one function plus one unrelated surviving caller of the
+/// same bare name is indistinguishable from attribution skew by count
+/// alone, and was being wrongly re-pointed to the unrelated survivor).
+fn legacy_src_attribution<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    lang: SupportLang,
+) -> Option<(&'static str, String)> {
+    for anc in node.ancestors() {
+        if !func_kinds(lang).contains(&anc.kind().as_ref()) {
+            continue;
+        }
+        if let Some(name) = child_name(&anc) {
+            return Some((canonical_kind(anc.kind().as_ref(), lang), name));
+        }
+        // Anonymous first func-kind ancestor: the old walk broke here
+        // WITHOUT updating `src` — falls straight to module, never walking
+        // outward for a named ancestor the way `nearest_def_node` does.
+        return None;
+    }
+    None
+}
+
 /// Assigns a stable preorder index to EVERY `func_kinds` node in this parse
 /// (named or anonymous alike) — the deterministic within-parse identity
 /// `scope_chain` uses to name an otherwise-nameless anonymous closure
@@ -1395,6 +1470,11 @@ fn extract_inner(
     // quantify over.
     let mut call_scope_chains: BTreeMap<(String, String, String), BTreeSet<String>> =
         BTreeMap::new();
+    // Codex round 5 adversarial review: per-SITE (legacy_src, current_src,
+    // callee, kind) pairs — see `GraphFragment::call_attribution_pairs`'s
+    // doc comment. Built alongside `call_scope_chains` from the SAME sites,
+    // never a second pass.
+    let mut call_attribution_pairs: Vec<(String, String, String, String)> = Vec::new();
 
     // Synthetic module node anchoring the file.
     let module_id = node_id(repo, file, "module", file);
@@ -1553,6 +1633,17 @@ fn extract_inner(
                     .entry((module_id.clone(), dst, "imports".to_string()))
                     .or_default()
                     .insert(import_chain.clone());
+                // Imports are ALWAYS module-sourced (no ancestor walk, old
+                // rule or new — see `add_edge` call directly above), so
+                // legacy and current attribution are trivially identical.
+                // Populated anyway for symmetry with `calls`, immediately
+                // below — never special-cased.
+                call_attribution_pairs.push((
+                    file.to_string(),
+                    file.to_string(),
+                    sym,
+                    "imports".to_string(),
+                ));
             }
         }
     }
@@ -1601,9 +1692,18 @@ fn extract_inner(
             // the nearest function-kind ancestor happens to be anonymous —
             // see `nearest_def_node`'s doc comment for the real-world TSX
             // repro this fixes.
-            let src = match nearest_def_node(&n, lang) {
-                Some((kind, def_name)) => node_id(repo, file, kind, &def_name),
-                None => module_id.clone(),
+            let (src, current_src_name) = match nearest_def_node(&n, lang) {
+                Some((kind, def_name)) => (node_id(repo, file, kind, &def_name), def_name),
+                None => (module_id.clone(), file.to_string()),
+            };
+            // Codex round 5: the SAME site's attribution under the FROZEN
+            // pre-92179d1 rule — see `legacy_src_attribution`'s and
+            // `GraphFragment::call_attribution_pairs`'s doc comments.
+            // Deliberately independent of `src`/`current_src_name` above,
+            // same reasoning as `scope_chain` vs `nearest_def_node` below.
+            let legacy_src_name = match legacy_src_attribution(&n, lang) {
+                Some((_, name)) => name,
+                None => file.to_string(),
             };
             let evidence = match qualifier {
                 Some(q) if !q.is_empty() => {
@@ -1613,6 +1713,12 @@ fn extract_inner(
             };
             let dst = format!("name:{callee}");
             add_edge(src.clone(), dst.clone(), "calls", 0, callee_kind, &evidence);
+            call_attribution_pairs.push((
+                legacy_src_name,
+                current_src_name,
+                callee,
+                "calls".to_string(),
+            ));
             // Finding 4 (X4 adversarial review): the call SITE's own scope
             // chain — deliberately independent of `src` above (which is the
             // coarse, closures-flattened GRAPH attribution from
@@ -1647,6 +1753,7 @@ fn extract_inner(
         edges: edges.into_values().collect(),
         local_bindings,
         call_scope_chains,
+        call_attribution_pairs,
         parse_clean,
     }
 }
