@@ -251,6 +251,49 @@ pub fn run(conn: &Connection) -> Result<()> {
         );
     }
 
+    // Migration: witness-closure resolution columns on code_edges (v9.5 Phase 1).
+    // callee_kind is captured at extraction time (before bare_callee() strips the
+    // receiver); boundary + evidence are populated later by the resolver (Phase 2+).
+    // Same idempotent ALTER-guard pattern as the src_file migration above.
+    {
+        let has_callee_kind: bool = conn
+            .prepare("SELECT callee_kind FROM code_edges LIMIT 0")
+            .is_ok();
+        if !has_callee_kind {
+            let _ = conn
+                .execute_batch("ALTER TABLE code_edges ADD COLUMN callee_kind TEXT DEFAULT '';");
+        }
+        let has_boundary: bool = conn
+            .prepare("SELECT boundary FROM code_edges LIMIT 0")
+            .is_ok();
+        if !has_boundary {
+            let _ =
+                conn.execute_batch("ALTER TABLE code_edges ADD COLUMN boundary TEXT DEFAULT '';");
+        }
+        let has_evidence: bool = conn
+            .prepare("SELECT evidence FROM code_edges LIMIT 0")
+            .is_ok();
+        if !has_evidence {
+            let _ =
+                conn.execute_batch("ALTER TABLE code_edges ADD COLUMN evidence TEXT DEFAULT '';");
+        }
+    }
+
+    // repo_defs (v9.5 Phase 1): per-file symbol inventory (name/kind/lang) feeding
+    // witness-closure resolution (Phase 2+). Populated by a repo scan; replace-per-file
+    // semantics mirror code_edges (see upsert_repo_defs in storage/codegraph.rs).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS repo_defs (
+            project    TEXT NOT NULL,
+            file       TEXT NOT NULL,
+            name       TEXT NOT NULL,
+            kind       TEXT NOT NULL,
+            lang       TEXT NOT NULL DEFAULT '',
+            scanned_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (project, file, name, kind)
+        );",
+    )?;
+
     // Migration: add project_name to code_evolution if missing (v9 cross-project fix)
     {
         let has_project_col: bool = conn
@@ -420,6 +463,25 @@ mod tests {
             )
             .is_ok(),
             "ratification_scores table must exist after migration"
+        );
+    }
+
+    #[test]
+    fn witness_closure_columns_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare("SELECT callee_kind, boundary, evidence FROM code_edges LIMIT 0")
+                .is_ok(),
+            "callee_kind, boundary, evidence columns must exist on code_edges after migration"
+        );
+        assert!(
+            conn.prepare(
+                "SELECT project, file, name, kind, lang, scanned_at FROM repo_defs LIMIT 0"
+            )
+            .is_ok(),
+            "repo_defs table must exist after migration"
         );
     }
 

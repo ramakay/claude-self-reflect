@@ -204,6 +204,13 @@ static NOISE_CALLEES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         "format",
         "vec",
         "panic",
+        // language keywords misparsed as callees (WCR Phase 7, TASK D): a
+        // dynamic `import('./mod')` is a `call_expression` whose `function`
+        // field is the literal keyword token `import`, not a symbol
+        // reference — there is no def anywhere for it to bind to, by
+        // construction of the language grammar itself, so classifying it as
+        // a real callee only manufactures unexplained edges.
+        "import",
     ]
     .into_iter()
     .collect()
@@ -213,6 +220,88 @@ static NOISE_CALLEES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 /// like `r`/`e`, generics like `T`) or a known language built-in.
 fn is_noise_callee(name: &str) -> bool {
     name.len() < 2 || NOISE_CALLEES.contains(name)
+}
+
+/// Max length of a module specifier recorded in an `imports` edge's
+/// `evidence` field (`from:<module>`), matching the WCR spec's plausibility
+/// backstop for identifier-shaped keys elsewhere in the gate.
+const MODULE_EVIDENCE_MAX_LEN: usize = 120;
+
+/// Truncate `s` to at most `max` **characters** (not bytes) — safe for
+/// multi-byte UTF-8 module specifiers, unlike a raw byte-index slice.
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// True when a call's `function` field node kind denotes a receiver-based
+/// (method/field) callee rather than a bare identifier or path. Checked BEFORE
+/// `bare_callee()` strips the receiver, since the stripped text can't tell the
+/// two apart. Rust path calls (`mod::foo()`) fall through to "direct" — they
+/// have no runtime receiver, just a namespace qualifier.
+fn is_method_callee_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "field_expression"      // Rust: r.map_err(f)
+            | "member_expression" // TS/JS: obj.fetch()
+            | "attribute"          // Python: self.run()
+            | "selector_expression" // Go: obj.Method()
+    )
+}
+
+/// Extract a "qualifier" path preceding the final callee segment, when
+/// syntactically trivial and worth recording as `via:<qualifier>` calls-edge
+/// evidence for the resolver's qualifier-aware classification (WCR Phase 6,
+/// TASK A/B — see `extraction::resolver::qualifier_tier`). Checked BEFORE
+/// `bare_callee()` strips the qualifier away, same reasoning as
+/// `is_method_callee_kind`.
+///
+/// - Rust `scoped_identifier` (namespace-path calls: `Instant::now()`,
+///   `fs::read_to_string()`, `std::mem::swap(a, b)`) — the AST `path` field,
+///   everything before the final `::segment`, via the same field-based
+///   approach `rust_use_path_symbols` uses for `use` statements.
+/// - Python `attribute` (`json.dumps(...)`, `os.path.abspath(...)`, and also
+///   `self.run()` / `self.x.run()`) — the AST `object` field, everything
+///   before the final `.attr`. Captured even though Python attribute calls
+///   are already `callee_kind = "method"` — the qualifier lets the resolver
+///   recognize a module-qualified call (`json.dumps`) as X1 `external`
+///   rather than the vaguer X2 `method` (receiver-call) bucket.
+/// - TS/JS `member_expression` (`obj.fetch()`) — the `object` field's raw
+///   text, but only when it is a "trivial" dotted identifier chain (ASCII
+///   letters/digits/`_`/`.` only). Anything with call parens, brackets, or
+///   other punctuation (`(a || b).x()`, `arr[i].x()`) is a shape we don't
+///   try to summarize — skipped rather than guessed at.
+///
+/// Returns `None` for a bare (unqualified) call or any other kind/language
+/// combination — the caller then falls back to no `via:` evidence, exactly
+/// today's behavior.
+fn call_qualifier<D: ast_grep_core::Doc>(
+    func: &ast_grep_core::Node<'_, D>,
+    lang: SupportLang,
+) -> Option<String> {
+    match lang {
+        SupportLang::Rust if func.kind().as_ref() == "scoped_identifier" => {
+            func.field("path").map(|p| p.text().to_string())
+        }
+        SupportLang::Python if func.kind().as_ref() == "attribute" => {
+            func.field("object").map(|o| o.text().to_string())
+        }
+        SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript
+            if func.kind().as_ref() == "member_expression" =>
+        {
+            let object = func.field("object")?;
+            let text = object.text().to_string();
+            let trivial = !text.is_empty()
+                && text
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.');
+            if trivial {
+                Some(text)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Reduce a callee expression's text to its bare trailing name:
@@ -230,7 +319,12 @@ fn bare_callee(text: &str) -> Option<String> {
     }
 }
 
-/// Extract imported local binding names from an import AST node.
+/// Extract imported local binding names from an import AST node, paired with
+/// the module specifier they were imported from (Rust `use` path prefix, the
+/// JS/TS import source string, the Python module, the Go import path — see
+/// each per-language helper's doc comment). The module half is `""` when no
+/// module context is derivable (e.g. bare `use std;` — `std` IS the module,
+/// there is no prefix before it).
 ///
 /// Uses tree-sitter grammar fields so multi-symbol imports become one edge
 /// per symbol (e.g. `use std::sync::{Arc, OnceLock}` -> `["Arc", "OnceLock"]`)
@@ -238,7 +332,7 @@ fn bare_callee(text: &str) -> Option<String> {
 fn import_symbols<D: ast_grep_core::Doc>(
     node: &ast_grep_core::Node<'_, D>,
     lang: SupportLang,
-) -> Vec<String> {
+) -> Vec<(String, String)> {
     match lang {
         SupportLang::Rust => rust_import_symbols(node),
         SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => {
@@ -250,48 +344,81 @@ fn import_symbols<D: ast_grep_core::Doc>(
     }
 }
 
-fn push_nonempty(out: &mut Vec<String>, s: impl AsRef<str>) {
-    let t = s.as_ref().trim();
-    if !t.is_empty() {
-        out.push(t.to_string());
+fn push_symbol(out: &mut Vec<(String, String)>, symbol: impl AsRef<str>, module: impl AsRef<str>) {
+    let s = symbol.as_ref().trim();
+    if !s.is_empty() {
+        out.push((s.to_string(), module.as_ref().trim().to_string()));
     }
 }
 
-/// Rust `use_declaration`: field `argument`, then recurse the use-path tree.
-fn rust_import_symbols<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> Vec<String> {
+/// Strip surrounding quotes (`'`, `"`, `` ` ``) from a raw string-literal token.
+fn unquote(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|c| c == '"' || c == '`')
+        .trim_matches('\'')
+        .to_string()
+}
+
+/// Rust `use_declaration`: field `argument`, then recurse the use-path tree,
+/// threading the accumulated module prefix (everything before the final
+/// path segment) down to each leaf symbol. `use std::collections::HashMap;`
+/// yields `("HashMap", "std::collections")`; `use std;` yields
+/// `("std", "")` — there is no prefix, `std` itself is the module.
+fn rust_import_symbols<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if let Some(arg) = node.field("argument") {
-        rust_use_path_symbols(&arg, &mut out);
+        rust_use_path_symbols(&arg, None, &mut out);
     }
     out
 }
 
 fn rust_use_path_symbols<D: ast_grep_core::Doc>(
     node: &ast_grep_core::Node<'_, D>,
-    out: &mut Vec<String>,
+    inherited_module: Option<&str>,
+    out: &mut Vec<(String, String)>,
 ) {
     match node.kind().as_ref() {
-        "identifier" => push_nonempty(out, node.text()),
+        "identifier" => {
+            push_symbol(out, node.text(), inherited_module.unwrap_or(""));
+        }
         "scoped_identifier" => {
             if let Some(name) = node.field("name") {
-                push_nonempty(out, name.text());
+                // field("path") is everything before `::name` — the module
+                // prefix for this leaf directly, no manual reconstruction.
+                let module = node
+                    .field("path")
+                    .map(|p| p.text().to_string())
+                    .or_else(|| inherited_module.map(str::to_string))
+                    .unwrap_or_default();
+                push_symbol(out, name.text(), module);
             }
         }
         "scoped_use_list" => {
+            let module = node.field("path").map(|p| p.text().to_string());
             if let Some(list) = node.field("list") {
-                rust_use_path_symbols(&list, out);
+                rust_use_path_symbols(&list, module.as_deref().or(inherited_module), out);
             }
         }
         "use_list" => {
             for child in node.children() {
                 if child.is_named() {
-                    rust_use_path_symbols(&child, out);
+                    rust_use_path_symbols(&child, inherited_module, out);
                 }
             }
         }
         "use_as_clause" => {
             if let Some(alias) = node.field("alias") {
-                push_nonempty(out, alias.text());
+                // field("path") is the full aliased path (e.g. `foo::Bar` for
+                // `use foo::Bar as Baz;`); its own field("path") — one level
+                // deeper — is the prefix before the final segment (`foo`).
+                let module = node
+                    .field("path")
+                    .and_then(|p| p.field("path"))
+                    .map(|inner| inner.text().to_string())
+                    .unwrap_or_default();
+                push_symbol(out, alias.text(), module);
             }
         }
         "use_wildcard" => {
@@ -301,9 +428,17 @@ fn rust_use_path_symbols<D: ast_grep_core::Doc>(
     }
 }
 
-/// JS/TS `import_statement`: non-field child `import_clause` holds bindings.
-fn js_ts_import_symbols<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> Vec<String> {
+/// JS/TS `import_statement`: field `source` holds the module specifier
+/// string literal, shared by every binding in the statement; non-field child
+/// `import_clause` holds the bindings themselves.
+fn js_ts_import_symbols<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    let module = node
+        .field("source")
+        .map(|s| unquote(&s.text()))
+        .unwrap_or_default();
     for child in node.children() {
         if !child.is_named() || child.kind().as_ref() != "import_clause" {
             continue;
@@ -313,23 +448,23 @@ fn js_ts_import_symbols<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>
                 continue;
             }
             match part.kind().as_ref() {
-                "identifier" => push_nonempty(&mut out, part.text()),
+                "identifier" => push_symbol(&mut out, part.text(), &module),
                 "named_imports" => {
                     for spec in part.children() {
                         if !spec.is_named() || spec.kind().as_ref() != "import_specifier" {
                             continue;
                         }
                         if let Some(alias) = spec.field("alias") {
-                            push_nonempty(&mut out, alias.text());
+                            push_symbol(&mut out, alias.text(), &module);
                         } else if let Some(name) = spec.field("name") {
-                            push_nonempty(&mut out, name.text());
+                            push_symbol(&mut out, name.text(), &module);
                         }
                     }
                 }
                 "namespace_import" => {
                     for id in part.children() {
                         if id.is_named() && id.kind().as_ref() == "identifier" {
-                            push_nonempty(&mut out, id.text());
+                            push_symbol(&mut out, id.text(), &module);
                             break;
                         }
                     }
@@ -341,16 +476,27 @@ fn js_ts_import_symbols<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>
     out
 }
 
-/// Python `import_statement` / `import_from_statement`.
-fn python_import_symbols<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> Vec<String> {
+/// Python `import_statement` / `import_from_statement`. For `from X import
+/// a, b as c`, `field("module_name")` (`X`) is the module shared by every
+/// bound name. For a bare `import a.b.c` / `import a.b.c as d`, there is no
+/// `from` module — the dotted path being imported (before any alias) IS the
+/// module.
+fn python_import_symbols<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     match node.kind().as_ref() {
-        "import_statement" | "import_from_statement" => {
+        "import_statement" => {
             // `name` is multiple; `.field("name")` would only return the first.
-            // `module_name` on import_from is deliberately skipped.
+            for name_node in node.field_children("name") {
+                python_import_name(&name_node, None, &mut out);
+            }
+        }
+        "import_from_statement" => {
+            let module = node.field("module_name").map(|m| m.text().to_string());
             // `wildcard_import` is a non-field child and emits nothing.
             for name_node in node.field_children("name") {
-                python_import_name(&name_node, &mut out);
+                python_import_name(&name_node, module.as_deref(), &mut out);
             }
         }
         _ => {}
@@ -360,12 +506,21 @@ fn python_import_symbols<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D
 
 fn python_import_name<D: ast_grep_core::Doc>(
     node: &ast_grep_core::Node<'_, D>,
-    out: &mut Vec<String>,
+    from_module: Option<&str>,
+    out: &mut Vec<(String, String)>,
 ) {
     match node.kind().as_ref() {
         "aliased_import" => {
             if let Some(alias) = node.field("alias") {
-                push_nonempty(out, alias.text());
+                // Under `from X import Y as Z`, `from_module` (`X`) wins.
+                // Under bare `import Y as Z`, there is no from-module — the
+                // aliased name's own dotted path is the module.
+                let module = from_module.map(str::to_string).unwrap_or_else(|| {
+                    node.field("name")
+                        .map(|n| n.text().to_string())
+                        .unwrap_or_default()
+                });
+                push_symbol(out, alias.text(), module);
             }
         }
         "dotted_name" => {
@@ -377,15 +532,21 @@ fn python_import_name<D: ast_grep_core::Doc>(
                 }
             }
             if let Some(name) = last {
-                push_nonempty(out, name);
+                let module = from_module
+                    .map(str::to_string)
+                    .unwrap_or_else(|| node.text().to_string());
+                push_symbol(out, name, module);
             }
         }
         _ => {}
     }
 }
 
-/// Go `import_declaration` -> `import_spec` / `import_spec_list`.
-fn go_import_symbols<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> Vec<String> {
+/// Go `import_declaration` -> `import_spec` / `import_spec_list`. The module
+/// is the full (unquoted) import path, e.g. `github.com/foo/bar`.
+fn go_import_symbols<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for child in node.children() {
         if !child.is_named() {
@@ -406,21 +567,81 @@ fn go_import_symbols<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -
     out
 }
 
-fn go_import_spec<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>, out: &mut Vec<String>) {
+fn go_import_spec<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    out: &mut Vec<(String, String)>,
+) {
+    let module = node
+        .field("path")
+        .map(|p| unquote(&p.text()))
+        .unwrap_or_default();
     if let Some(name) = node.field("name") {
-        push_nonempty(out, name.text());
+        push_symbol(out, name.text(), &module);
         return;
     }
-    if let Some(path) = node.field("path") {
-        let raw = path.text();
-        let unquoted = raw
-            .trim()
-            .trim_matches(|c| c == '"' || c == '`')
-            .trim_matches('\'');
-        if let Some(seg) = unquoted.rsplit('/').next() {
-            push_nonempty(out, seg);
+    if !module.is_empty() {
+        if let Some(seg) = module.rsplit('/').next() {
+            push_symbol(out, seg, &module);
         }
     }
+}
+
+/// TS/JS/TSX top-level `const`/`let`/`var` declaration AST kinds (WCR Phase
+/// 7, TASK C): `lexical_declaration` covers both `const` and `let`,
+/// `variable_declaration` covers `var`. No other language: Rust has no
+/// module-level mutable/const-binding equivalent worth indexing the same
+/// way (a `const`/`static` item is already a distinct AST kind this
+/// extractor doesn't currently walk, out of scope here), and Python/Go
+/// module-level assignments have no dedicated declaration-kind wrapper node
+/// to anchor a program-level check on.
+fn const_decl_kinds(lang: SupportLang) -> &'static [&'static str] {
+    match lang {
+        SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => {
+            &["lexical_declaration", "variable_declaration"]
+        }
+        _ => &[],
+    }
+}
+
+/// True when `node` (a `lexical_declaration`/`variable_declaration`) is a
+/// direct program-level statement — a bare top-level `const X = ...;`, or
+/// one wrapped in `export_statement` (`export const X = ...;`) that is
+/// itself a direct child of `program`. A `const` nested inside a function
+/// body, block, or class is local scope, not a repo-wide symbol worth
+/// indexing the same way a def node is (WCR Phase 7, TASK C).
+fn is_program_level_declaration<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind().as_ref() {
+        "program" => true,
+        "export_statement" => parent
+            .parent()
+            .is_some_and(|grandparent| grandparent.kind().as_ref() == "program"),
+        _ => false,
+    }
+}
+
+/// Simple-identifier binding names declared by a `lexical_declaration`/
+/// `variable_declaration` (WCR Phase 7, TASK C): one name per
+/// `variable_declarator` child whose `name` field is a plain `identifier`.
+/// Destructuring patterns (`const {a, b} = obj`, `const [a, b] = arr`) are
+/// deliberately skipped — there is no single declared symbol name to anchor
+/// a def node on, and guessing at one from the pattern shape would violate
+/// the evidence-only rule.
+fn const_decl_names<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> Vec<String> {
+    let mut out = Vec::new();
+    for child in node.children() {
+        if !child.is_named() || child.kind().as_ref() != "variable_declarator" {
+            continue;
+        }
+        if let Some(name_node) = child.field("name") {
+            if name_node.kind().as_ref() == "identifier" {
+                out.push(name_node.text().to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Canonical kind for a definition AST kind.
@@ -535,22 +756,33 @@ fn extract_inner(
         }
     };
 
-    let mut add_edge = |src: String, dst: String, kind: &str, resolved: i64| {
-        let key = (src.clone(), dst.clone(), kind.to_string());
-        edges
-            .entry(key)
-            .and_modify(|e| e.weight += 1.0)
-            .or_insert(EdgeRow {
-                src_id: src,
-                dst_id: dst,
-                kind: kind.into(),
-                src_file: file.into(),
-                resolved,
-                weight: 1.0,
-                conv_id: conv_id.into(),
-                session_id: session_id.into(),
-            });
-    };
+    // `callee_kind` is '' for defines/imports edges; 'direct'/'method' for calls.
+    // `evidence` is '' for defines edges; `from:<module>` (<=120 chars, may be
+    // '' when no module is derivable) for imports edges; `via:<qualifier>`
+    // (<=120 chars, may be '' when the call has no capturable qualifier —
+    // WCR Phase 6, TASK A) for calls edges — captured at extraction time so
+    // the resolver's X1 tier can classify boundaries by module/qualifier
+    // rather than degraded bound-symbol-name matching.
+    let mut add_edge =
+        |src: String, dst: String, kind: &str, resolved: i64, callee_kind: &str, evidence: &str| {
+            let key = (src.clone(), dst.clone(), kind.to_string());
+            edges
+                .entry(key)
+                .and_modify(|e| e.weight += 1.0)
+                .or_insert(EdgeRow {
+                    src_id: src,
+                    dst_id: dst,
+                    kind: kind.into(),
+                    src_file: file.into(),
+                    resolved,
+                    weight: 1.0,
+                    conv_id: conv_id.into(),
+                    session_id: session_id.into(),
+                    callee_kind: callee_kind.into(),
+                    boundary: String::new(),
+                    evidence: evidence.into(),
+                });
+        };
 
     // Definitions: functions + types -> defines edge from module.
     for (kinds, canon) in [(func_kinds(lang), "function"), (type_kinds(lang), "type")] {
@@ -569,8 +801,34 @@ fn extract_inner(
                     let node = mk_node(canon, &name, &text, start, end);
                     let nid = node.id.clone();
                     nodes.insert(nid.clone(), node);
-                    add_edge(module_id.clone(), nid, "defines", 1);
+                    add_edge(module_id.clone(), nid, "defines", 1, "", "");
                 }
+            }
+        }
+    }
+
+    // TS/JS/TSX top-level const/let/var declarations -> def nodes kind
+    // 'const' (WCR Phase 7, TASK C). Only program-level (see
+    // `is_program_level_declaration`) — a local declaration inside a
+    // function body is not a repo-wide symbol. Destructuring patterns are
+    // skipped (see `const_decl_names`).
+    for kind in const_decl_kinds(lang) {
+        let matcher = KindMatcher::new(kind, lang);
+        for n in root.find_all(&matcher) {
+            if !is_program_level_declaration(&n) {
+                continue;
+            }
+            for name in const_decl_names(&n) {
+                if name.len() < 2 {
+                    continue;
+                }
+                let text = n.text().to_string();
+                let start = n.start_pos().line() as i64;
+                let end = start + text.lines().count().saturating_sub(1) as i64;
+                let node = mk_node("const", &name, &text, start, end);
+                let nid = node.id.clone();
+                nodes.insert(nid.clone(), node);
+                add_edge(module_id.clone(), nid, "defines", 1, "", "");
             }
         }
     }
@@ -579,11 +837,23 @@ fn extract_inner(
     for kind in import_kinds(lang) {
         let matcher = KindMatcher::new(kind, lang);
         for n in root.find_all(&matcher) {
-            for sym in import_symbols(&n, lang) {
+            for (sym, module) in import_symbols(&n, lang) {
                 if is_noise_callee(&sym) {
                     continue;
                 }
-                add_edge(module_id.clone(), format!("name:{sym}"), "imports", 0);
+                let evidence = if module.is_empty() {
+                    String::new()
+                } else {
+                    format!("from:{}", truncate_chars(&module, MODULE_EVIDENCE_MAX_LEN))
+                };
+                add_edge(
+                    module_id.clone(),
+                    format!("name:{sym}"),
+                    "imports",
+                    0,
+                    "",
+                    &evidence,
+                );
             }
         }
     }
@@ -592,7 +862,21 @@ fn extract_inner(
     for kind in call_kinds(lang) {
         let matcher = KindMatcher::new(kind, lang);
         for n in root.find_all(&matcher) {
-            let callee = match n.field("function").and_then(|f| bare_callee(&f.text())) {
+            let func = match n.field("function") {
+                Some(f) => f,
+                None => continue,
+            };
+            // Capture the kind BEFORE bare_callee() strips the receiver — the
+            // stripped text alone can't distinguish `obj.foo()` from `foo()`.
+            let callee_kind = if is_method_callee_kind(func.kind().as_ref()) {
+                "method"
+            } else {
+                "direct"
+            };
+            // Captured BEFORE bare_callee() strips the qualifier away — see
+            // call_qualifier's doc comment (WCR Phase 6, TASK A).
+            let qualifier = call_qualifier(&func, lang);
+            let callee = match bare_callee(&func.text()) {
                 Some(c) => c,
                 None => continue,
             };
@@ -616,7 +900,20 @@ fn extract_inner(
                     break;
                 }
             }
-            add_edge(src, format!("name:{callee}"), "calls", 0);
+            let evidence = match qualifier {
+                Some(q) if !q.is_empty() => {
+                    format!("via:{}", truncate_chars(&q, MODULE_EVIDENCE_MAX_LEN))
+                }
+                _ => String::new(),
+            };
+            add_edge(
+                src,
+                format!("name:{callee}"),
+                "calls",
+                0,
+                callee_kind,
+                &evidence,
+            );
         }
     }
 
@@ -676,6 +973,108 @@ mod tests {
 
         // defines edges from module
         assert!(frag.edges.iter().any(|e| e.kind == "defines"));
+    }
+
+    #[test]
+    fn callee_kind_rust_method_vs_direct() {
+        // `map_err` is a receiver-based (method) call — must be classified 'method'.
+        let method_src = "fn foo() {\n    let r: Result<(), ()> = Err(());\n    let _ = r.map_err(handler);\n}\nfn handler(_e: ()) {}\n";
+        let frag = extract_graph_fragment(
+            method_src,
+            SupportLang::Rust,
+            "a.rs",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let kind = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:map_err")
+            .expect("map_err calls edge present")
+            .callee_kind
+            .clone();
+        assert_eq!(kind, "method", "receiver call must be classified method");
+
+        // `helper()` is a bare identifier call — must be classified 'direct'.
+        let direct_src = "fn foo() {\n    helper();\n}\nfn helper() {}\n";
+        let frag2 = extract_graph_fragment(
+            direct_src,
+            SupportLang::Rust,
+            "a.rs",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let kind2 = frag2
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:helper")
+            .expect("helper calls edge present")
+            .callee_kind
+            .clone();
+        assert_eq!(
+            kind2, "direct",
+            "bare identifier call must be classified direct"
+        );
+    }
+
+    #[test]
+    fn callee_kind_typescript_member_vs_bare() {
+        let member_src = "function run() {\n    obj.fetch();\n}\n";
+        let frag = extract_graph_fragment(
+            member_src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let kind = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:fetch")
+            .expect("fetch calls edge present")
+            .callee_kind
+            .clone();
+        assert_eq!(kind, "method", "obj.fetch() must be classified method");
+
+        let bare_src = "function run() {\n    fetch();\n}\n";
+        let frag2 = extract_graph_fragment(
+            bare_src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let kind2 = frag2
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:fetch")
+            .expect("fetch calls edge present")
+            .callee_kind
+            .clone();
+        assert_eq!(kind2, "direct", "bare fetch() must be classified direct");
+    }
+
+    #[test]
+    fn callee_kind_python_method_call() {
+        let src = "class Foo:\n    def handler(self):\n        self.run()\n";
+        let frag =
+            extract_graph_fragment(src, SupportLang::Python, "a.py", "repo", "proj", "c", "s");
+        let kind = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:run")
+            .expect("run calls edge present")
+            .callee_kind
+            .clone();
+        assert_eq!(kind, "method", "self.run() must be classified method");
     }
 
     #[test]
@@ -828,7 +1227,7 @@ mod tests {
         let src = "from os.path import join, exists\nimport numpy as np\n";
         let grep = SupportLang::Python.ast_grep(src);
         let root = grep.root();
-        let mut raw: Vec<String> = Vec::new();
+        let mut raw: Vec<(String, String)> = Vec::new();
         for kind in import_kinds(SupportLang::Python) {
             let matcher = KindMatcher::new(kind, SupportLang::Python);
             for n in root.find_all(&matcher) {
@@ -836,16 +1235,16 @@ mod tests {
             }
         }
         assert!(
-            raw.iter().any(|s| s == "join"),
-            "AST extraction must yield join: {raw:?}"
+            raw.iter().any(|(s, m)| s == "join" && m == "os.path"),
+            "AST extraction must yield join from os.path: {raw:?}"
         );
         assert!(
-            raw.iter().any(|s| s == "exists"),
-            "AST extraction must yield exists: {raw:?}"
+            raw.iter().any(|(s, m)| s == "exists" && m == "os.path"),
+            "AST extraction must yield exists from os.path: {raw:?}"
         );
         assert!(
-            raw.iter().any(|s| s == "np"),
-            "AST extraction must yield np: {raw:?}"
+            raw.iter().any(|(s, m)| s == "np" && m == "numpy"),
+            "AST extraction must yield np from numpy: {raw:?}"
         );
         assert!(
             is_noise_callee("join"),
@@ -905,5 +1304,424 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ─── Module specifier capture (WCR Phase 5, TASK 1) ───
+
+    fn import_evidence<'a>(frag: &'a GraphFragment, dst: &str) -> &'a str {
+        frag.edges
+            .iter()
+            .find(|e| e.kind == "imports" && e.dst_id == dst)
+            .unwrap_or_else(|| panic!("no imports edge for {dst}"))
+            .evidence
+            .as_str()
+    }
+
+    #[test]
+    fn rust_import_evidence_records_module_path_prefix() {
+        let frag = extract_graph_fragment(
+            "use std::collections::HashMap;\n",
+            SupportLang::Rust,
+            "a.rs",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        assert_eq!(
+            import_evidence(&frag, "name:HashMap"),
+            "from:std::collections"
+        );
+    }
+
+    #[test]
+    fn rust_import_evidence_multi_symbol_use_shares_module() {
+        let frag = extract_graph_fragment(
+            "use std::sync::{Arc, OnceLock};\n",
+            SupportLang::Rust,
+            "a.rs",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        assert_eq!(import_evidence(&frag, "name:Arc"), "from:std::sync");
+        assert_eq!(import_evidence(&frag, "name:OnceLock"), "from:std::sync");
+    }
+
+    #[test]
+    fn rust_import_evidence_alias_records_prefix_before_original_name() {
+        let frag = extract_graph_fragment(
+            "use foo::Bar as Baz;\n",
+            SupportLang::Rust,
+            "a.rs",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        assert_eq!(import_evidence(&frag, "name:Baz"), "from:foo");
+    }
+
+    #[test]
+    fn rust_import_evidence_bare_crate_has_no_module_prefix() {
+        // `use std;` — `std` IS the module, there is no prefix before it, so
+        // evidence stays empty rather than recording a meaningless `from:`.
+        let frag = extract_graph_fragment(
+            "use std;\n",
+            SupportLang::Rust,
+            "a.rs",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        assert_eq!(import_evidence(&frag, "name:std"), "");
+    }
+
+    #[test]
+    fn typescript_import_evidence_records_source_string() {
+        let frag = extract_graph_fragment(
+            "import fs from 'fs';\nimport { fileURLToPath } from 'url';\nimport * as path from 'path';\nimport { helper } from './util';\n",
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        assert_eq!(import_evidence(&frag, "name:fs"), "from:fs");
+        assert_eq!(import_evidence(&frag, "name:fileURLToPath"), "from:url");
+        assert_eq!(import_evidence(&frag, "name:path"), "from:path");
+        assert_eq!(import_evidence(&frag, "name:helper"), "from:./util");
+    }
+
+    #[test]
+    fn python_import_evidence_records_full_dotted_module() {
+        let frag = extract_graph_fragment(
+            "from os.path import exists\nimport numpy as np\n",
+            SupportLang::Python,
+            "a.py",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        assert_eq!(import_evidence(&frag, "name:exists"), "from:os.path");
+        assert_eq!(import_evidence(&frag, "name:np"), "from:numpy");
+    }
+
+    #[test]
+    fn go_import_evidence_records_full_import_path() {
+        // Alias must be >=2 chars: `is_noise_callee` drops single-char names
+        // (closure-param-style noise), so a `j "encoding/json"` alias would
+        // never reach edge emission at all.
+        let src = "package main\n\nimport (\n\t\"fmt\"\n\tjs \"encoding/json\"\n)\n\nfunc main() {\n\tfmt.Println(js)\n}\n";
+        let frag = extract_graph_fragment(src, SupportLang::Go, "a.go", "repo", "proj", "c", "s");
+        assert_eq!(import_evidence(&frag, "name:fmt"), "from:fmt");
+        assert_eq!(import_evidence(&frag, "name:js"), "from:encoding/json");
+    }
+
+    #[test]
+    fn import_module_evidence_is_capped_at_120_chars() {
+        let long_segment = "a".repeat(200);
+        let src = format!("import {{ thing }} from '{long_segment}';\n");
+        let frag = extract_graph_fragment(
+            &src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let evidence = import_evidence(&frag, "name:thing");
+        // "from:" (5 chars) + at most 120 chars of module.
+        assert!(
+            evidence.len() <= 5 + 120,
+            "evidence must be capped: {} chars: {evidence}",
+            evidence.len()
+        );
+        assert!(evidence.starts_with("from:aaaa"));
+    }
+
+    // ─── Call-site qualifier capture (WCR Phase 6, TASK A) ───
+
+    fn call_evidence<'a>(frag: &'a GraphFragment, dst: &str) -> &'a str {
+        frag.edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == dst)
+            .unwrap_or_else(|| panic!("no calls edge for {dst}"))
+            .evidence
+            .as_str()
+    }
+
+    #[test]
+    fn rust_scoped_call_captures_qualifier_as_via_evidence() {
+        let src = "fn foo() {\n    let _ = std::time::Instant::now();\n    let _ = fs::read_to_string(\"x\");\n}\n";
+        let frag = extract_graph_fragment(src, SupportLang::Rust, "a.rs", "repo", "proj", "c", "s");
+        assert_eq!(
+            call_evidence(&frag, "name:now"),
+            "via:std::time::Instant",
+            "qualifier is everything before the final ::segment"
+        );
+        assert_eq!(call_evidence(&frag, "name:read_to_string"), "via:fs");
+    }
+
+    #[test]
+    fn rust_bare_call_has_no_qualifier_and_stays_direct() {
+        let src = "fn foo() {\n    helper();\n}\nfn helper() {}\n";
+        let frag = extract_graph_fragment(src, SupportLang::Rust, "a.rs", "repo", "proj", "c", "s");
+        let edge = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:helper")
+            .unwrap();
+        assert_eq!(edge.evidence, "");
+        assert_eq!(edge.callee_kind, "direct", "callee_kind stays as-is");
+    }
+
+    #[test]
+    fn rust_method_call_does_not_capture_a_via_qualifier() {
+        // `r.map_err(f)` is a field_expression (method) callee, not a
+        // scoped_identifier — TASK A only captures qualifiers for path calls.
+        let src = "fn foo() {\n    let r: Result<(), ()> = Err(());\n    let _ = r.map_err(handler);\n}\nfn handler(_e: ()) {}\n";
+        let frag = extract_graph_fragment(src, SupportLang::Rust, "a.rs", "repo", "proj", "c", "s");
+        let edge = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:map_err")
+            .unwrap();
+        assert_eq!(edge.evidence, "");
+        assert_eq!(edge.callee_kind, "method");
+    }
+
+    #[test]
+    fn python_attribute_call_captures_dotted_receiver_as_via_evidence() {
+        let src = "import json\nimport os.path\n\ndef handler():\n    json.dumps({})\n    os.path.abspath(\".\")\n    self.run()\n";
+        let frag =
+            extract_graph_fragment(src, SupportLang::Python, "a.py", "repo", "proj", "c", "s");
+        assert_eq!(call_evidence(&frag, "name:dumps"), "via:json");
+        assert_eq!(call_evidence(&frag, "name:abspath"), "via:os.path");
+        assert_eq!(call_evidence(&frag, "name:run"), "via:self");
+        // Python attribute calls are still classified 'method' by callee_kind
+        // — capturing a qualifier does not change that (TASK A leaves
+        // callee_kind as-is; the resolver's qualifier tier is what changes
+        // behavior downstream, see resolver::qualifier_tier).
+        let run_edge = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:run")
+            .unwrap();
+        assert_eq!(run_edge.callee_kind, "method");
+    }
+
+    #[test]
+    fn typescript_trivial_member_call_captures_object_path_as_via_evidence() {
+        // `x.y.z()` — not `a.b.c()`: single-char trailing names (`c`) are
+        // dropped by is_noise_callee's len<2 rule regardless of TASK A.
+        let src = "function run() {\n    obj.fetch();\n    x.y.helper_call();\n}\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        assert_eq!(call_evidence(&frag, "name:fetch"), "via:obj");
+        assert_eq!(call_evidence(&frag, "name:helper_call"), "via:x.y");
+    }
+
+    #[test]
+    fn typescript_non_trivial_member_call_has_no_via_evidence() {
+        // `(a || b).x()` — the object is not a simple dotted identifier
+        // chain; TASK A deliberately skips it rather than guessing.
+        let src = "function run() {\n    (a || b).nontrivial_method();\n}\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let edge = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:nontrivial_method");
+        if let Some(edge) = edge {
+            assert_eq!(edge.evidence, "", "non-trivial object must not be captured");
+        }
+    }
+
+    // ─── Dynamic import() keyword noise (WCR Phase 7, TASK D) ───
+
+    #[test]
+    fn dynamic_import_call_is_not_emitted_as_a_calls_edge() {
+        let src =
+            "async function run() {\n    const mod = await import('./lazy');\n    return mod;\n}\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let call_dsts: Vec<&str> = frag
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .map(|e| e.dst_id.as_str())
+            .collect();
+        assert!(
+            !call_dsts.contains(&"name:import"),
+            "dynamic import() keyword must not be emitted as a calls edge: {call_dsts:?}"
+        );
+    }
+
+    #[test]
+    fn via_evidence_is_capped_at_120_chars() {
+        let long_segment = "a".repeat(200);
+        let src = format!("fn foo() {{\n    {long_segment}::helper_call_fn();\n}}\n");
+        let frag =
+            extract_graph_fragment(&src, SupportLang::Rust, "a.rs", "repo", "proj", "c", "s");
+        let evidence = call_evidence(&frag, "name:helper_call_fn");
+        assert!(
+            evidence.len() <= 4 + 120,
+            "evidence must be capped: {} chars: {evidence}",
+            evidence.len()
+        );
+        assert!(evidence.starts_with("via:aaaa"));
+    }
+
+    // ─── Top-level const/let/var def nodes (WCR Phase 7, TASK C) ───
+
+    fn def_names_of_kind<'a>(frag: &'a GraphFragment, kind: &str) -> Vec<&'a str> {
+        frag.nodes
+            .iter()
+            .filter(|n| n.kind == kind)
+            .map(|n| n.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn typescript_top_level_const_becomes_a_def_node() {
+        let src = "export const COLORS = { primary: 'blue' };\nconst AnalyticsEvents = 1;\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let names = def_names_of_kind(&frag, "const");
+        assert!(names.contains(&"COLORS"), "names: {names:?}");
+        assert!(names.contains(&"AnalyticsEvents"), "names: {names:?}");
+
+        // A defines edge from the module anchors each const def, same as a
+        // function/type def.
+        let colors_id = node_id("repo", "a.ts", "const", "COLORS");
+        assert!(frag
+            .edges
+            .iter()
+            .any(|e| e.kind == "defines" && e.dst_id == colors_id));
+    }
+
+    #[test]
+    fn typescript_top_level_let_and_var_become_def_nodes() {
+        let src = "let styles = {};\nvar legacyThing = 1;\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let names = def_names_of_kind(&frag, "const");
+        assert!(names.contains(&"styles"), "names: {names:?}");
+        assert!(names.contains(&"legacyThing"), "names: {names:?}");
+    }
+
+    #[test]
+    fn javascript_and_tsx_top_level_const_becomes_a_def_node() {
+        for lang in [SupportLang::JavaScript, SupportLang::Tsx] {
+            let src = "export const widgetConfig = 1;\n";
+            let frag = extract_graph_fragment(src, lang, "a.tsx", "repo", "proj", "c", "s");
+            let names = def_names_of_kind(&frag, "const");
+            assert!(names.contains(&"widgetConfig"), "{lang:?} names: {names:?}");
+        }
+    }
+
+    #[test]
+    fn const_declared_inside_a_function_body_is_not_a_def_node() {
+        let src = "function run() {\n    const local_thing = 1;\n    return local_thing;\n}\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let names = def_names_of_kind(&frag, "const");
+        assert!(
+            !names.contains(&"local_thing"),
+            "function-local const must not become a def node: {names:?}"
+        );
+    }
+
+    #[test]
+    fn destructuring_const_pattern_is_skipped() {
+        let src = "export const { a, b } = obj;\nexport const [c, d] = arr;\nexport const real_one = 1;\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let names = def_names_of_kind(&frag, "const");
+        assert!(
+            !names.iter().any(|n| ["a", "b", "c", "d"].contains(n)),
+            "destructuring patterns must not yield def nodes: {names:?}"
+        );
+        assert!(names.contains(&"real_one"), "names: {names:?}");
+    }
+
+    #[test]
+    fn rust_and_python_do_not_emit_const_def_nodes() {
+        let rust_frag = extract_graph_fragment(
+            "const MAX: usize = 10;\nfn foo() {}\n",
+            SupportLang::Rust,
+            "a.rs",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        assert!(def_names_of_kind(&rust_frag, "const").is_empty());
+
+        let py_frag = extract_graph_fragment(
+            "SOME_CONST = 1\n\ndef foo():\n    pass\n",
+            SupportLang::Python,
+            "a.py",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        assert!(def_names_of_kind(&py_frag, "const").is_empty());
     }
 }

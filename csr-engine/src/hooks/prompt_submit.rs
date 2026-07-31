@@ -1568,6 +1568,7 @@ mod tests {
                         weight: 1.0,
                         conv_id: "conv1".into(),
                         session_id: "sess1".into(),
+                        ..Default::default()
                     },
                     crate::storage::codegraph::EdgeRow {
                         src_id: "n_source".into(),
@@ -1578,6 +1579,7 @@ mod tests {
                         weight: 1.0,
                         conv_id: "conv1".into(),
                         session_id: "sess1".into(),
+                        ..Default::default()
                     },
                 ],
             )
@@ -1648,6 +1650,7 @@ mod tests {
                     weight: 1.0,
                     conv_id: "conv2".into(),
                     session_id: "sess2".into(),
+                    ..Default::default()
                 }],
             )
             .unwrap();

@@ -354,9 +354,13 @@ mod tests {
     fn test_parse_last_n_months() {
         let (start, end) = parse_time_expression("last 6 months").unwrap();
         assert!(start < end);
-        // Should be roughly 180 days (varies 150-210 depending on month lengths)
+        // `start` is the 1st of the month 6 months back; `end` is `now`, so the
+        // range = 6 full calendar months (181-184 days depending on which months)
+        // + elapsed days into the current month (0-30). Verified min/max across a
+        // full leap and non-leap year is 181-214 days; use a wider margin (220) so
+        // this isn't fragile to which day of the month the suite happens to run on.
         let diff = end - start;
-        assert!(diff.num_days() > 150 && diff.num_days() <= 210);
+        assert!(diff.num_days() > 150 && diff.num_days() <= 220);
     }
 
     #[test]

@@ -47,6 +47,14 @@ pub struct EdgeRow {
     pub weight: f64,
     pub conv_id: String,
     pub session_id: String,
+    /// '' | 'direct' | 'method' — how the callee was syntactically invoked,
+    /// captured at extraction time before `bare_callee()` strips the receiver.
+    /// Only set on `calls` edges; '' for `imports`/`defines`.
+    pub callee_kind: String,
+    /// '' | 'external' | 'method' — set by the resolver (Phase 2+), not extraction.
+    pub boundary: String,
+    /// Resolver evidence for the edge's resolution decision (Phase 2+); '' until then.
+    pub evidence: String,
 }
 
 /// One neighbour edge in a `query_neighbors` result.
@@ -177,8 +185,9 @@ pub fn replace_file_edges(
     {
         let mut stmt = tx.prepare(
             "INSERT OR REPLACE INTO code_edges
-                (src_id, dst_id, kind, src_file, resolved, weight, conv_id, session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (src_id, dst_id, kind, src_file, resolved, weight, conv_id, session_id,
+                 callee_kind, boundary, evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         for e in edges {
             stmt.execute(params![
@@ -190,11 +199,57 @@ pub fn replace_file_edges(
                 e.weight,
                 e.conv_id,
                 e.session_id,
+                e.callee_kind,
+                e.boundary,
+                e.evidence,
             ])?;
         }
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Replace-per-file upsert of `repo_defs` (name, kind, lang) for `(project, file)`:
+/// delete existing rows then bulk-insert the fresh set. Same per-file replace
+/// semantics as `replace_file_edges` — a rescanned file never leaves stale defs.
+pub fn upsert_repo_defs(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    defs: &[(String, String, String)],
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM repo_defs WHERE project = ?1 AND file = ?2",
+        params![project, file],
+    )?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO repo_defs (project, file, name, kind, lang, scanned_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+        )?;
+        for (name, kind, lang) in defs {
+            stmt.execute(params![project, file, name, kind, lang])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Definition sites for `name` within `project`: `(file, kind)`, deterministic order.
+pub fn lookup_repo_defs(
+    conn: &Connection,
+    project: &str,
+    name: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT file, kind FROM repo_defs WHERE project = ?1 AND name = ?2 ORDER BY file, kind",
+    )?;
+    let rows = stmt.query_map(params![project, name], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 /// Upsert per-file extraction state (content hash + dirty flag).
@@ -842,5 +897,47 @@ mod tests {
             "unresolved placeholder callee must be name_only"
         );
         assert_eq!(unresolved.name, "ghost_fn");
+    }
+
+    #[test]
+    fn repo_defs_upsert_lookup_and_per_file_replace() {
+        let conn = mem();
+        upsert_repo_defs(
+            &conn,
+            "proj",
+            "a.rs",
+            &[
+                ("foo".into(), "function".into(), "rust".into()),
+                ("Bar".into(), "type".into(), "rust".into()),
+            ],
+        )
+        .unwrap();
+        upsert_repo_defs(
+            &conn,
+            "proj",
+            "b.rs",
+            &[("foo".into(), "function".into(), "rust".into())],
+        )
+        .unwrap();
+
+        let hits = lookup_repo_defs(&conn, "proj", "foo").unwrap();
+        assert_eq!(hits.len(), 2, "foo defined in both files: {hits:?}");
+        assert!(hits.contains(&("a.rs".to_string(), "function".to_string())));
+        assert!(hits.contains(&("b.rs".to_string(), "function".to_string())));
+
+        // Replacing a.rs's defs with a set that drops `foo` must not leave a stale row.
+        upsert_repo_defs(
+            &conn,
+            "proj",
+            "a.rs",
+            &[("Baz".into(), "type".into(), "rust".into())],
+        )
+        .unwrap();
+        let hits = lookup_repo_defs(&conn, "proj", "foo").unwrap();
+        assert_eq!(
+            hits,
+            vec![("b.rs".to_string(), "function".to_string())],
+            "a.rs's foo def must be gone after replace: {hits:?}"
+        );
     }
 }

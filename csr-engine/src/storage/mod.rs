@@ -915,6 +915,23 @@ impl Storage {
         codegraph::replace_file_edges(&conn, project, src_file, edges)
     }
 
+    /// Replace-per-file upsert of repo_defs (name, kind, lang) for `(project, file)`.
+    pub fn upsert_repo_defs(
+        &self,
+        project: &str,
+        file: &str,
+        defs: &[(String, String, String)],
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::upsert_repo_defs(&conn, project, file, defs)
+    }
+
+    /// Definition sites for `name` within `project`: `(file, kind)`.
+    pub fn lookup_repo_defs(&self, project: &str, name: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::lookup_repo_defs(&conn, project, name)
+    }
+
     pub fn upsert_code_file_state(
         &self,
         project: &str,
@@ -932,12 +949,38 @@ impl Storage {
     }
 
     /// Re-resolve placeholder edges for a project (two-pass name resolution).
+    /// Uses a direct-stat default for the WCR Phase 6 TASK C stale-file
+    /// check (`canonical_repo_path(file).is_file()`), suitable for hooks and
+    /// backfill callers that resolve a handful of files at a time. Callers
+    /// that will check many distinct files in one pass (e.g. the live eval
+    /// gate, scanning the whole corpus) should precompute an existence set
+    /// once and call `resolve_code_edges_with_fs_check` instead — see that
+    /// method's doc comment.
     pub fn resolve_code_edges(
         &self,
         project: &str,
     ) -> Result<crate::extraction::resolver::ResolveStats> {
+        self.resolve_code_edges_with_fs_check(project, &|file: &str| {
+            crate::extraction::repo_path::canonical_repo_path(std::path::Path::new(file)).is_file()
+        })
+    }
+
+    /// Same as `resolve_code_edges`, but with the WCR Phase 6 TASK C
+    /// stale-file existence check supplied by the caller instead of
+    /// defaulted. `file_exists` receives a `Pending::src_file` as stored
+    /// (raw, not canonicalized) and must apply `canonical_repo_path` itself
+    /// before checking — see `extraction::resolver::resolve_edges`'s doc
+    /// comment. Exists so a caller resolving many projects/files in one pass
+    /// (the live eval gate) can precompute a canonicalized existence set
+    /// once up front and close over it, rather than re-stat'ing the
+    /// filesystem per pending edge.
+    pub fn resolve_code_edges_with_fs_check(
+        &self,
+        project: &str,
+        file_exists: &dyn Fn(&str) -> bool,
+    ) -> Result<crate::extraction::resolver::ResolveStats> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        crate::extraction::resolver::resolve_edges(&conn, project)
+        crate::extraction::resolver::resolve_edges(&conn, project, file_exists)
     }
 
     /// Recompute degree ranks for a project.
