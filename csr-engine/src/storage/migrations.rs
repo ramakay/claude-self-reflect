@@ -433,6 +433,22 @@ pub fn run(conn: &Connection) -> Result<()> {
          );",
     )?;
 
+    // local_bindings (WCR truth pass, TASK 2): the X4 `local` classify tier's
+    // witness table — per (project, file), the set of names bound as
+    // function/closure parameters or local (non-top-level) variable
+    // declarations, as gathered by `extraction::codegraph::collect_local_bindings`.
+    // Populated by `eval::codegraph::backfill_wcr_witnesses` from the SAME
+    // parse it already does for callee_kind/evidence backfill — never a
+    // second parse. Read by `extraction::resolver::resolve_edges`'s X4 tier.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS local_bindings (
+            project TEXT NOT NULL,
+            file    TEXT NOT NULL,
+            name    TEXT NOT NULL,
+            PRIMARY KEY (project, file, name)
+        );",
+    )?;
+
     Ok(())
 }
 
@@ -497,5 +513,34 @@ mod tests {
             .is_ok(),
             "resolution_ledger table must exist after migration"
         );
+    }
+
+    #[test]
+    fn local_bindings_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare("SELECT project, file, name FROM local_bindings LIMIT 0")
+                .is_ok(),
+            "local_bindings table must exist after migration"
+        );
+        // PRIMARY KEY(project, file, name) makes a repeat insert a no-op
+        // (INSERT OR IGNORE), not an error — the table is a plain
+        // idempotent witness set, never accumulates duplicates.
+        conn.execute(
+            "INSERT INTO local_bindings (project, file, name) VALUES ('p', 'f.ts', 'reject')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO local_bindings (project, file, name) VALUES ('p', 'f.ts', 'reject')",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_bindings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

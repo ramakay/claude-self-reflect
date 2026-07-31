@@ -11,7 +11,7 @@
 //!
 //! All tree-sitter work is wrapped in `catch_unwind` (malformed input can panic).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::LazyLock;
 
@@ -28,6 +28,14 @@ use crate::storage::codegraph::{EdgeRow, NodeRow};
 pub struct GraphFragment {
     pub nodes: Vec<NodeRow>,
     pub edges: Vec<EdgeRow>,
+    /// TASK 2 (WCR truth pass X4 tier): local-binding names declared in this
+    /// file — function/closure parameters, catch clause params, and local
+    /// (non-top-level) variable declarations/destructuring targets. See
+    /// `collect_local_bindings`'s doc comment. Populated from the SAME parse
+    /// as `nodes`/`edges` (`extract_inner` calls the shared
+    /// `collect_local_bindings_from_root` on its own already-parsed `root`),
+    /// never a second, separate parse.
+    pub local_bindings: BTreeSet<String>,
 }
 
 /// Stable node id: sha256(repo|file|kind|name), truncated to 40 hex chars.
@@ -246,6 +254,44 @@ fn is_method_callee_kind(kind: &str) -> bool {
             | "attribute"          // Python: self.run()
             | "selector_expression" // Go: obj.Method()
     )
+}
+
+/// TASK 1 (WCR truth pass, "await-glue" bug): TS/JS's grammar disambiguates a
+/// generic call immediately after `await` — `await foo<T>(...)`, `await
+/// obj.m<T>(...)` — by attaching the `call_expression`'s `function` field to
+/// an `await_expression` node whose OWN text is `"await foo"` / `"await
+/// obj.m"` (the literal `await` keyword glued to the real callee expression
+/// by the parser, with `type_arguments` and `arguments` as trailing SIBLINGS
+/// of that `await_expression`, not children of a nested call) — verified by
+/// dumping the tree-sitter-typescript parse of `await metaFetch<any[]>(...)`
+/// (a real, live corpus example, `anukriti-command-center/src/lib/data/meta.ts`).
+/// Every downstream callee-text helper (`is_method_callee_kind`,
+/// `call_qualifier`, `bare_callee`) assumes its `func` argument names the
+/// callee directly; fed the outer `await_expression` node as-is, `bare_callee`
+/// happily strips the space between "await" and the real name, producing a
+/// garbage callee like `awaitmetaFetch` — no def anywhere can ever match it,
+/// permanently swelling the unexplained residual.
+///
+/// Descends past the literal `await` keyword token to the `await_expression`'s
+/// one non-keyword child — the real callee expression (an `identifier` for
+/// `await foo<T>()`, a `member_expression` for `await obj.m<T>()`) — so every
+/// caller downstream operates on the correct node. A plain (non-generic)
+/// `await foo(...)` never hits this at all: its `call_expression`'s own
+/// `function` field is already the bare `identifier`/`member_expression`
+/// directly (verified the same way), with the `await_expression` sitting
+/// ABOVE the `call_expression` as its parent, never as its `function` field —
+/// this helper's `kind() != "await_expression"` guard is a true no-op for
+/// that (overwhelmingly common) shape. Returns the original `func` unchanged
+/// on any other kind, or on the (believed-unreachable, but never-guess)
+/// shape where an `await_expression` has no non-`await` child at all.
+fn unwrap_await_glued_function<D: ast_grep_core::Doc>(
+    func: ast_grep_core::Node<'_, D>,
+) -> ast_grep_core::Node<'_, D> {
+    if func.kind().as_ref() != "await_expression" {
+        return func;
+    }
+    let inner = func.children().find(|c| c.kind().as_ref() != "await");
+    inner.unwrap_or(func)
 }
 
 /// Extract a "qualifier" path preceding the final callee segment, when
@@ -655,6 +701,342 @@ fn canonical_kind(ast_kind: &str, lang: SupportLang) -> &'static str {
     }
 }
 
+// ─── TASK 2 (WCR truth pass): local-binding name collection, X4 tier ───
+//
+// The X4 `local` classify tier (`resolver::resolve_edges`) needs real,
+// disk-verifiable proof that a bare name IS bound SOMEWHERE in a specific
+// file before it will classify an otherwise-unexplained edge as a local
+// scope reference — never a guess from name shape alone. This is that
+// proof: the set of names bound as function/closure parameters (including
+// destructured/defaulted/rest forms and catch-clause params) and local
+// (non-top-level) variable declarations, gathered from real tree-sitter AST
+// structure, one recursive pattern-walker per language family. Every AST
+// shape below was verified against a real parse before being coded (never
+// guessed from grammar docs alone) — unrecognized/unverified node kinds are
+// silently skipped (a false negative, never a false positive: `match`'s
+// `_ => {}` arm never fabricates a name).
+
+/// The set of local-binding names declared in `source` — see this section's
+/// module-doc-comment-style header above. Independently parses `source`
+/// (unlike `collect_local_bindings_from_root`, which reuses an
+/// already-parsed root — see that function's doc comment for the
+/// single-parse production path via `extract_inner`/`GraphFragment`); this
+/// entry point exists for standalone unit-testing per language and for any
+/// future caller that doesn't already have a parsed root at hand. Wrapped in
+/// `catch_unwind` (malformed input can panic mid-parse), same convention as
+/// `extract_graph_fragment`.
+pub fn collect_local_bindings(source: &str, lang: SupportLang) -> BTreeSet<String> {
+    if source.len() < 2 {
+        return BTreeSet::new();
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let grep = lang.ast_grep(source);
+        collect_local_bindings_from_root(&grep.root(), lang)
+    }));
+    result.unwrap_or_default()
+}
+
+/// Shared by `collect_local_bindings` (standalone parse, for unit tests) and
+/// `extract_inner` (reuses its own already-parsed `root` — no second parse).
+fn collect_local_bindings_from_root<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    lang: SupportLang,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    match lang {
+        SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => {
+            collect_ts_js_local_bindings(root, lang, &mut out);
+        }
+        SupportLang::Python => {
+            collect_python_local_bindings(root, lang, &mut out);
+        }
+        SupportLang::Rust => {
+            collect_rust_local_bindings(root, lang, &mut out);
+        }
+        _ => {}
+    }
+    out
+}
+
+fn insert_binding_name(out: &mut BTreeSet<String>, name: impl Into<String>) {
+    let name = name.into();
+    // Same len>=2 floor as `is_noise_callee`: a single-char name can never
+    // be the target of a pending `calls`/`imports` placeholder edge in the
+    // first place (extraction drops single-char callees/import symbols), so
+    // a single-char local-binding entry could never be looked up by the X4
+    // tier — skip recording it at all.
+    if name.len() >= 2 {
+        out.insert(name);
+    }
+}
+
+/// TS/TSX/JS local bindings: every parameter list in the file (function
+/// declarations, arrow functions, method definitions, function expressions
+/// all share the `formal_parameters` node kind), every `catch_clause`'s
+/// `parameter` field, and local (non-top-level — see
+/// `is_program_level_declaration`) `const`/`let`/`var` declarations,
+/// INCLUDING destructuring targets (unlike `const_decl_names`, which backs
+/// TOP-LEVEL def nodes and deliberately skips destructuring — there is no
+/// ambiguity to avoid here, a local binding is never a repo-wide symbol).
+fn collect_ts_js_local_bindings<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    lang: SupportLang,
+    out: &mut BTreeSet<String>,
+) {
+    let params_matcher = KindMatcher::new("formal_parameters", lang);
+    for params in root.find_all(&params_matcher) {
+        for child in params.children() {
+            if child.is_named() {
+                ts_js_pattern_names(&child, out);
+            }
+        }
+    }
+    let catch_matcher = KindMatcher::new("catch_clause", lang);
+    for clause in root.find_all(&catch_matcher) {
+        if let Some(param) = clause.field("parameter") {
+            ts_js_pattern_names(&param, out);
+        }
+    }
+    for kind in const_decl_kinds(lang) {
+        let matcher = KindMatcher::new(kind, lang);
+        for decl in root.find_all(&matcher) {
+            if is_program_level_declaration(&decl) {
+                // Already a `const`-kind def node (WCR Phase 7, TASK C) —
+                // recording it again here would double-count a repo-wide
+                // symbol as a "local" one.
+                continue;
+            }
+            for child in decl.children() {
+                if child.is_named() && child.kind().as_ref() == "variable_declarator" {
+                    if let Some(name) = child.field("name") {
+                        ts_js_pattern_names(&name, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Recursive TS/JS binding-pattern name extractor — every AST shape here was
+/// verified against a real parse (see this section's header comment).
+/// Handles: bare identifiers, object/array destructuring (including nested,
+/// renamed (`{a: b}`), defaulted (`{a = 1}`/`a = 1`), and rest (`...rest`)
+/// forms), and the TS `required_parameter`/`optional_parameter` wrapper
+/// (whose `pattern` field holds the actual binding, `type`/`value` fields
+/// holding the type annotation / default value — neither a binding name).
+fn ts_js_pattern_names<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    out: &mut BTreeSet<String>,
+) {
+    match node.kind().as_ref() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            insert_binding_name(out, node.text().to_string());
+        }
+        "object_pattern" | "array_pattern" => {
+            for child in node.children() {
+                if child.is_named() {
+                    ts_js_pattern_names(&child, out);
+                }
+            }
+        }
+        "pair_pattern" => {
+            // `{a: renamed}` — `key` is the source property name (not a
+            // binding), `value` is the actual bound local name.
+            if let Some(value) = node.field("value") {
+                ts_js_pattern_names(&value, out);
+            }
+        }
+        "rest_pattern" => {
+            for child in node.children() {
+                if child.is_named() {
+                    ts_js_pattern_names(&child, out);
+                }
+            }
+        }
+        "assignment_pattern" | "object_assignment_pattern" => {
+            // `x = 1` / `{a = 1}` — `left` is the bound name, `right` the
+            // default-value expression (not a binding).
+            if let Some(left) = node.field("left") {
+                ts_js_pattern_names(&left, out);
+            }
+        }
+        "required_parameter" | "optional_parameter" => {
+            if let Some(pattern) = node.field("pattern") {
+                ts_js_pattern_names(&pattern, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Python local bindings, per this tier's spec: function parameters (every
+/// `parameters` node) and assignment targets INSIDE function bodies only
+/// (module-level Python assignments are out of scope for this tier — see
+/// `is_inside_python_function`).
+fn collect_python_local_bindings<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    lang: SupportLang,
+    out: &mut BTreeSet<String>,
+) {
+    let params_matcher = KindMatcher::new("parameters", lang);
+    for params in root.find_all(&params_matcher) {
+        for child in params.children() {
+            if child.is_named() {
+                python_pattern_names(&child, out);
+            }
+        }
+    }
+    let assign_matcher = KindMatcher::new("assignment", lang);
+    for assign in root.find_all(&assign_matcher) {
+        if !is_inside_python_function(&assign) {
+            continue;
+        }
+        if let Some(left) = assign.field("left") {
+            python_pattern_names(&left, out);
+        }
+    }
+}
+
+/// True when `node` has a `function_definition` ancestor.
+fn is_inside_python_function<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> bool {
+    node.ancestors()
+        .any(|anc| anc.kind().as_ref() == "function_definition")
+}
+
+/// Recursive Python binding-pattern name extractor — every AST shape here
+/// was verified against a real parse (see this section's header comment).
+/// Handles: bare identifiers, `typed_parameter` (`a: int` — no `name` field;
+/// the identifier is the first named child before the `:`), `default_parameter`/
+/// `typed_default_parameter` (`name` field is the bound identifier, `value`
+/// the default expression), `*args`/`**kwargs` splat patterns, and bare tuple
+/// unpacking targets (`pattern_list`, e.g. `a, b = 1, 2`).
+fn python_pattern_names<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    out: &mut BTreeSet<String>,
+) {
+    match node.kind().as_ref() {
+        "identifier" => {
+            insert_binding_name(out, node.text().to_string());
+        }
+        "typed_parameter" => {
+            if let Some(name) = node
+                .children()
+                .find(|c| c.is_named() && c.kind().as_ref() == "identifier")
+            {
+                python_pattern_names(&name, out);
+            }
+        }
+        "default_parameter" | "typed_default_parameter" => {
+            if let Some(name) = node.field("name") {
+                python_pattern_names(&name, out);
+            }
+        }
+        "list_splat_pattern" | "dictionary_splat_pattern" | "pattern_list" => {
+            for child in node.children() {
+                if child.is_named() {
+                    python_pattern_names(&child, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rust local bindings, per this tier's spec: `let` bindings (any depth,
+/// including `if let`/`while let` condition patterns and destructuring) and
+/// closure parameters. Deliberately NOT regular `fn` parameters — out of
+/// this tier's spec.
+fn collect_rust_local_bindings<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    lang: SupportLang,
+    out: &mut BTreeSet<String>,
+) {
+    for kind in ["let_declaration", "let_condition"] {
+        let matcher = KindMatcher::new(kind, lang);
+        for decl in root.find_all(&matcher) {
+            if let Some(pattern) = decl.field("pattern") {
+                rust_pattern_names(&pattern, out);
+            }
+        }
+    }
+    let closure_matcher = KindMatcher::new("closure_parameters", lang);
+    for params in root.find_all(&closure_matcher) {
+        for child in params.children() {
+            if !child.is_named() {
+                continue;
+            }
+            if child.kind().as_ref() == "parameter" {
+                if let Some(pattern) = child.field("pattern") {
+                    rust_pattern_names(&pattern, out);
+                }
+            } else {
+                rust_pattern_names(&child, out);
+            }
+        }
+    }
+}
+
+/// Recursive Rust binding-pattern name extractor — every AST shape here was
+/// verified against a real parse (see this section's header comment).
+/// Handles: bare identifiers, `mut` bindings (`mut_pattern` wraps the
+/// identifier alongside a `mutable_specifier` token — the `let_declaration`/
+/// `parameter` `pattern` field itself is already the bare identifier for a
+/// top-level `let mut x`, so `mut_pattern` is only reached nested inside a
+/// tuple/struct pattern, e.g. `let (mut a, b) = ...`), tuple destructuring
+/// (`tuple_pattern`), enum/tuple-struct destructuring (`tuple_struct_pattern`
+/// — its `type` field is the variant/type path, e.g. `Some`, NEVER a
+/// binding; every OTHER named child is), and struct destructuring
+/// (`struct_pattern` -> `field_pattern` children, each either a renamed
+/// binding (`pattern` field holds the real local name, `name` field is the
+/// STRUCT FIELD name, not a binding) or a shorthand binding (`name` field's
+/// own `shorthand_field_identifier` kind IS the binding)).
+fn rust_pattern_names<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    out: &mut BTreeSet<String>,
+) {
+    match node.kind().as_ref() {
+        "identifier" | "shorthand_field_identifier" => {
+            insert_binding_name(out, node.text().to_string());
+        }
+        "tuple_pattern" | "mut_pattern" => {
+            for child in node.children() {
+                if child.is_named() {
+                    rust_pattern_names(&child, out);
+                }
+            }
+        }
+        "tuple_struct_pattern" => {
+            let type_range = node.field("type").map(|t| t.range());
+            for child in node.children() {
+                if !child.is_named() {
+                    continue;
+                }
+                if Some(child.range()) == type_range {
+                    continue;
+                }
+                rust_pattern_names(&child, out);
+            }
+        }
+        "struct_pattern" => {
+            for child in node.children() {
+                if child.is_named() && child.kind().as_ref() == "field_pattern" {
+                    rust_pattern_names(&child, out);
+                }
+            }
+        }
+        "field_pattern" => {
+            if let Some(pattern) = node.field("pattern") {
+                rust_pattern_names(&pattern, out);
+            } else if let Some(name) = node.field("name") {
+                if name.kind().as_ref() == "shorthand_field_identifier" {
+                    rust_pattern_names(&name, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Path-driven convenience wrapper: derive the language from `file`'s extension.
 /// Returns an empty fragment for unsupported file types.
 pub fn extract_graph_fragment_for_file(
@@ -866,6 +1248,12 @@ fn extract_inner(
                 Some(f) => f,
                 None => continue,
             };
+            // TASK 1 (WCR truth pass, "await-glue" bug): unwrap a TS/JS
+            // generic-call-after-await `await_expression` function-field
+            // artifact BEFORE any callee-text helper runs — see
+            // `unwrap_await_glued_function`'s doc comment. A no-op for every
+            // other shape.
+            let func = unwrap_await_glued_function(func);
             // Capture the kind BEFORE bare_callee() strips the receiver — the
             // stripped text alone can't distinguish `obj.foo()` from `foo()`.
             let callee_kind = if is_method_callee_kind(func.kind().as_ref()) {
@@ -917,9 +1305,14 @@ fn extract_inner(
         }
     }
 
+    // TASK 2 (WCR truth pass X4 tier): local-binding names, from the SAME
+    // parsed `root` above — never a second parse.
+    let local_bindings = collect_local_bindings_from_root(&root, lang);
+
     GraphFragment {
         nodes: nodes.into_values().collect(),
         edges: edges.into_values().collect(),
+        local_bindings,
     }
 }
 
@@ -1584,6 +1977,92 @@ mod tests {
         );
     }
 
+    // ─── await-glue callee extraction (WCR truth pass, TASK 1) ───
+
+    #[test]
+    fn await_generic_direct_call_extracts_bare_callee_not_glued_with_await() {
+        // Real, live-corpus shape: `await metaFetch<any[]>(...)` — TS parses
+        // the call_expression's `function` field as an `await_expression`
+        // node whose own text is "await metaFetch" (see
+        // `unwrap_await_glued_function`'s doc comment). Before the fix this
+        // produced callee `awaitmetaFetch`.
+        let src = "async function f() {\n    const x = await metaFetch<any[]>(url, opts);\n}\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let call = frag
+            .edges
+            .iter()
+            .find(|e| {
+                e.kind == "calls" && e.dst_id.starts_with("name:") && e.dst_id.contains("etaFetch")
+            })
+            .expect("a calls edge targeting metaFetch must exist");
+        assert_eq!(
+            call.dst_id, "name:metaFetch",
+            "await-glued generic call must extract the bare callee, not `awaitmetaFetch`"
+        );
+        assert_eq!(call.callee_kind, "direct");
+    }
+
+    #[test]
+    fn await_generic_method_call_extracts_bare_callee_and_method_kind() {
+        // `await obj.m<T>(...)` — the same await-glue grammar shape, but the
+        // real callee expression is a member_expression, so this must
+        // classify `method`, not `direct`.
+        let src = "async function f(obj) {\n    const x = await obj.method<number>(url);\n}\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let call = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id.contains("method"))
+            .expect("a calls edge targeting method must exist");
+        assert_eq!(call.dst_id, "name:method");
+        assert_eq!(
+            call.callee_kind, "method",
+            "await-glued generic member call must still classify as a method call"
+        );
+    }
+
+    #[test]
+    fn plain_await_call_without_generics_is_unaffected_by_the_unwrap() {
+        // The overwhelmingly common (non-generic) shape: `await foo(...)`
+        // already had its call_expression's `function` field pointing
+        // directly at the bare identifier, with `await_expression` as the
+        // call_expression's PARENT, not its function field —
+        // `unwrap_await_glued_function` must be a true no-op here.
+        let src = "async function f() {\n    const x = await metaFetch(url, opts);\n}\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        let call = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls")
+            .expect("a calls edge must exist");
+        assert_eq!(call.dst_id, "name:metaFetch");
+        assert_eq!(call.callee_kind, "direct");
+    }
+
     #[test]
     fn via_evidence_is_capped_at_120_chars() {
         let long_segment = "a".repeat(200);
@@ -1723,5 +2202,146 @@ mod tests {
             "s",
         );
         assert!(def_names_of_kind(&py_frag, "const").is_empty());
+    }
+
+    // ─── collect_local_bindings (WCR truth pass, TASK 2, X4 tier) ───
+
+    #[test]
+    fn ts_local_bindings_cover_params_destructuring_and_catch() {
+        let src = "function f({ playTrack, count = 1, ...rest }: Opts, [first, second]: number[]) {\n  const { solo, other: renamed } = obj;\n  const [head, ...tail] = arr;\n  try {} catch (caught) {}\n  const cb = (err) => { return err; };\n}\nconst TOP_LEVEL = 1;\n";
+        let names = collect_local_bindings(src, SupportLang::TypeScript);
+        for expected in [
+            "playTrack",
+            "count",
+            "rest",
+            "first",
+            "second",
+            "solo",
+            "renamed",
+            "head",
+            "tail",
+            "caught",
+            "err",
+            "cb",
+        ] {
+            assert!(names.contains(expected), "missing {expected}: {names:?}");
+        }
+        assert!(
+            !names.contains("TOP_LEVEL"),
+            "top-level consts are already def nodes — must not double-count as local: {names:?}"
+        );
+    }
+
+    #[test]
+    fn ts_local_bindings_js_default_and_object_default_params() {
+        // Plain JS shape (no `required_parameter` TS wrapper): `assignment_pattern`
+        // / `object_assignment_pattern` directly under `formal_parameters`.
+        let src = "function f(width = 1, { height = 2 } = {}) {\n  return width + height;\n}\n";
+        let names = collect_local_bindings(src, SupportLang::JavaScript);
+        assert!(names.contains("width"), "{names:?}");
+        assert!(names.contains("height"), "{names:?}");
+    }
+
+    #[test]
+    fn ts_local_bindings_arrow_closure_param_reject() {
+        // The task's own motivating example: `new Promise((resolve, reject) => ...)`.
+        let src = "function f() {\n  return new Promise((resolve, reject) => {\n    reject();\n  });\n}\n";
+        let names = collect_local_bindings(src, SupportLang::TypeScript);
+        assert!(names.contains("resolve"), "{names:?}");
+        assert!(names.contains("reject"), "{names:?}");
+    }
+
+    #[test]
+    fn python_local_bindings_cover_params_and_body_assignments() {
+        let src = "TOP_LEVEL = 1\n\ndef f(a, b=1, *args, **kwargs):\n    local_x = 1\n    local_y, local_z = 2, 3\n    return local_x\n";
+        let names = collect_local_bindings(src, SupportLang::Python);
+        for expected in ["args", "kwargs", "local_x", "local_y", "local_z"] {
+            assert!(names.contains(expected), "missing {expected}: {names:?}");
+        }
+        // `a`/`b` are single-char, filtered by the len>=2 floor.
+        assert!(!names.contains("a") && !names.contains("b"));
+        assert!(
+            !names.contains("TOP_LEVEL"),
+            "module-level assignments are out of scope for this tier: {names:?}"
+        );
+    }
+
+    #[test]
+    fn python_local_bindings_typed_params() {
+        let src = "def f(count: int, label: str = 'x'):\n    return count\n";
+        let names = collect_local_bindings(src, SupportLang::Python);
+        assert!(names.contains("count"), "{names:?}");
+        assert!(names.contains("label"), "{names:?}");
+        assert!(
+            !names.contains("int") && !names.contains("str"),
+            "type annotations are not bindings: {names:?}"
+        );
+    }
+
+    #[test]
+    fn rust_local_bindings_cover_let_and_closures() {
+        let src = "fn f() {\n    let simple_x = 1;\n    let (tuple_a, tuple_b) = (1, 2);\n    if let Some(cond_y) = opt {}\n    let closure = |param_p, param_q| param_p + param_q;\n    let Point { field_x: renamed_x, field_y } = pt;\n}\n";
+        let names = collect_local_bindings(src, SupportLang::Rust);
+        for expected in [
+            "simple_x",
+            "tuple_a",
+            "tuple_b",
+            "cond_y",
+            "param_p",
+            "param_q",
+            "renamed_x",
+            "field_y",
+        ] {
+            assert!(names.contains(expected), "missing {expected}: {names:?}");
+        }
+        assert!(
+            !names.contains("Point") && !names.contains("Some"),
+            "the type/variant path is never a binding: {names:?}"
+        );
+        assert!(
+            !names.contains("field_x"),
+            "the renamed struct field's SOURCE name is not the local binding: {names:?}"
+        );
+    }
+
+    #[test]
+    fn rust_local_bindings_do_not_cover_fn_parameters() {
+        // Deliberately out of scope for this tier (task spec: "Rust let
+        // bindings + closure params").
+        let src = "fn f(fn_param: i32) {\n    let _ = fn_param;\n}\n";
+        let names = collect_local_bindings(src, SupportLang::Rust);
+        assert!(
+            !names.contains("fn_param"),
+            "regular fn params are out of scope for this tier: {names:?}"
+        );
+    }
+
+    #[test]
+    fn local_bindings_empty_for_source_with_no_local_scope() {
+        let src = "pub fn top_level_only() -> usize { 1 }\n";
+        let names = collect_local_bindings(src, SupportLang::Rust);
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn extract_graph_fragment_populates_local_bindings_from_the_same_parse() {
+        // GraphFragment.local_bindings must reflect the SAME parse used for
+        // nodes/edges (extract_inner calls the shared root-based collector
+        // directly) — verified end-to-end via the public entry point.
+        let src = "function f() {\n  const cb = (reject) => { reject(); };\n}\n";
+        let frag = extract_graph_fragment(
+            src,
+            SupportLang::TypeScript,
+            "a.ts",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        assert!(
+            frag.local_bindings.contains("reject"),
+            "{:?}",
+            frag.local_bindings
+        );
     }
 }

@@ -192,6 +192,13 @@ fn resolution_gate(snapshot: &GraphSnapshot) -> EvalResult {
 /// `resolved`) by also crediting X1/X2 classification as a legitimate,
 /// evidenced outcome rather than silence. Takes `&ResolveStats` directly so
 /// the pass/fail boundary is unit-testable without a database.
+///
+/// `local=` (WCR truth pass, TASK 2) added to the detail string alongside
+/// the pre-registered `bound`/`external`/`method`/`stale`/`internal_module`/
+/// `drifted` fields — reporting only, the SAME `>= 90%` threshold and the
+/// SAME `stats.closure_rate` field drive pass/fail exactly as before; the X4
+/// class is already folded into `closure_rate` by `resolve_edges` itself
+/// (see `ResolveStats::local`'s doc comment), never re-derived here.
 fn witness_closure_gate(stats: &ResolveStats) -> EvalResult {
     let started = Instant::now();
     judge(
@@ -199,13 +206,14 @@ fn witness_closure_gate(stats: &ResolveStats) -> EvalResult {
         started,
         stats.closure_rate >= WITNESS_CLOSURE_MIN,
         format!(
-            "bound={} external={} method={} stale={} internal_module={} drifted={} unexplained={} ambiguous={} closure={:.1}% (threshold >= 90%)",
+            "bound={} external={} method={} stale={} internal_module={} drifted={} local={} unexplained={} ambiguous={} closure={:.1}% (threshold >= 90%)",
             stats.bound,
             stats.external,
             stats.method,
             stats.stale,
             stats.internal_module,
             stats.drifted,
+            stats.local,
             stats.unexplained,
             stats.ambiguous_remaining,
             stats.closure_rate * 100.0
@@ -219,17 +227,32 @@ fn witness_closure_gate(stats: &ResolveStats) -> EvalResult {
 /// `external`/`method` boundary crossings, >= 70% must actually bind to a
 /// real definition rather than merely being explained. Takes `&ResolveStats`
 /// directly so the pass/fail boundary is unit-testable without a database.
+///
+/// `eligible`'s formula (WCR truth pass, TASK 2) now also subtracts
+/// `stats.local` — reporting only, matching `resolve_edges`'s own
+/// `internal_denominator` formula exactly (`ResolveStats::internal_binding_rate`
+/// already excludes `local` from its denominator; this local `eligible`
+/// re-derivation exists only to print the same number in the detail string,
+/// so it must track that formula 1:1, same as it already did for
+/// `internal_module`/`drifted` when THOSE classes were added). The `>= 70%`
+/// threshold and `stats.internal_binding_rate` field driving pass/fail are
+/// unchanged.
 fn internal_binding_gate(stats: &ResolveStats) -> EvalResult {
     let started = Instant::now();
     let eligible = stats.total.saturating_sub(
-        stats.external + stats.method + stats.stale + stats.internal_module + stats.drifted,
+        stats.external
+            + stats.method
+            + stats.stale
+            + stats.internal_module
+            + stats.drifted
+            + stats.local,
     );
     judge(
         "Internal binding",
         started,
         stats.internal_binding_rate >= INTERNAL_BINDING_MIN,
         format!(
-            "bound={} / eligible={} = {:.1}% (threshold >= 70%); denominator excludes evidence-classified external+method+stale+internal_module+drifted",
+            "bound={} / eligible={} = {:.1}% (threshold >= 70%); denominator excludes evidence-classified external+method+stale+internal_module+drifted+local",
             stats.bound,
             eligible,
             stats.internal_binding_rate * 100.0
@@ -841,6 +864,14 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
         );
         files_touched += 1;
 
+        // TASK 2 (WCR truth pass, X4 tier): persist local-binding names from
+        // THIS SAME fresh-extraction fragment — never a second parse. See
+        // `extraction::codegraph::GraphFragment::local_bindings`'s doc
+        // comment. Same error-propagation convention as every other shadow
+        // write in this function (`?` — a DB write failure here is exactly
+        // as fatal to the backfill pass as any other).
+        persist_local_bindings(shadow, &project, &src_file, &fragment.local_bindings)?;
+
         let id_to_name: HashMap<&str, &str> = fragment
             .nodes
             .iter()
@@ -945,7 +976,33 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
             // into structure or the caller itself having been renamed/
             // removed (a different, unaddressed fact — see this function's
             // doc comment).
-            let can_drift = !def_names.is_empty() && def_names.contains(src_name.as_str());
+            //
+            // TASK 1 (WCR truth pass): `src_name == src_file` extends
+            // condition (c) to MODULE-LEVEL (top-level) call/import sites —
+            // every `imports` edge, and any `calls` edge whose enclosing def
+            // is the file itself rather than a named function, is sourced
+            // from the synthetic module node, whose OWN `code_nodes.name` is
+            // the file path (see `extract_inner`'s `mk_node`/module-node
+            // construction — `name: file.into()`), never a def_names entry
+            // (def_names deliberately excludes `kind == "module"`, condition
+            // (b)'s own emptiness-diagnostic). Without this, condition (c)
+            // could never be satisfied for a module-level edge — comparing a
+            // file path against function/type/const names is a category
+            // mismatch — so such an edge could NEVER drift no matter how
+            // stale, even on a file that re-extracts perfectly cleanly. A
+            // module's identity IS the file itself: if the file re-extracted
+            // with real structure (condition (b) still holds) and this exact
+            // (module, kind, bare name) triple isn't in the fresh fragment,
+            // that is exactly as trustworthy as a named function surviving —
+            // there is no "renamed enclosing function" ambiguity to guard
+            // against at module scope. Verified against a real, live-corpus
+            // case: 8 stale `imports`/`calls` edges targeting the literal
+            // name `import` (predating the `is_noise_callee` filter that now
+            // drops it at extraction time — WCR Phase 7 TASK D, and this same
+            // filter applied to `import_symbols`) were permanently stuck
+            // `unexplained` because every one of them is module-scoped.
+            let can_drift = !def_names.is_empty()
+                && (def_names.contains(src_name.as_str()) || src_name == src_file);
             let key = (src_name, bare.to_string());
             match kind.as_str() {
                 "calls" => {
@@ -995,6 +1052,36 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
     }
 
     Ok((files_touched, edges_updated))
+}
+
+/// TASK 2 (WCR truth pass, X4 tier): persist `names` — local-binding names
+/// from the SAME fresh-extraction fragment `backfill_wcr_witnesses` already
+/// computed for this (project, file), never a second parse — into the
+/// shadow's `local_bindings` witness table. `INSERT OR IGNORE`: the table's
+/// only columns ARE its primary key (project, file, name), so a repeat name
+/// is a true no-op, not a conflict to resolve.
+fn persist_local_bindings(
+    shadow: &Arc<Storage>,
+    project: &str,
+    file: &str,
+    names: &BTreeSet<String>,
+) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    shadow.with_connection(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO local_bindings (project, file, name) VALUES (?1, ?2, ?3)",
+            )?;
+            for name in names {
+                stmt.execute(rusqlite::params![project, file, name])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    })
 }
 
 /// WCR Phase 8, TASK B: classify a pending edge `boundary = 'drifted'`,
@@ -1071,6 +1158,19 @@ fn wcr_dump_import_modules(shadow: &Arc<Storage>) -> Result<BTreeSet<(String, St
 /// failing that, repo_defs) against edges left `resolved=0, boundary=''` —
 /// the DB itself no longer distinguishes the two post-`clear_edge`. Never
 /// mutates the shadow and never runs unless `CSR_WCR_DUMP` is set.
+///
+/// WCR truth pass, TASK 2: the query's `e.boundary = ''` filter already
+/// EXCLUDES every X4 `local`-classified edge from this dump by construction
+/// — `resolve_edges` sets `boundary = 'local'` on a match (see
+/// `resolver::resolve_edges`'s X4 tier), so a locally-explained edge is no
+/// longer `unexplained`/`ambiguous` at all, and correctly stops appearing
+/// here without any bucket-name change. `had_local_binding` is added purely
+/// as a regression trip-wire alongside the pre-existing `had_import_module`:
+/// for every row that DOES still reach this dump (i.e. `resolve_edges`
+/// decided NOT to classify it `local`), this independently re-derives
+/// whether `local_bindings` had a matching witness anyway — it must always
+/// be `false` in a correct dump (a `true` value would mean the resolver's
+/// X4 tier and this dump's read-only reconstruction have diverged).
 fn wcr_dump_write(
     shadow: &Arc<Storage>,
     import_modules: &BTreeSet<(String, String)>,
@@ -1088,6 +1188,16 @@ fn wcr_dump_write(
         for row in defs.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
             let (name, file) = row?;
             by_name.entry(name).or_default().insert(file);
+        }
+
+        // WCR truth pass, TASK 2: the same local_bindings witness set the X4
+        // resolver tier reads, for the `had_local_binding` trip-wire field.
+        let mut local_bindings: BTreeSet<(String, String, String)> = BTreeSet::new();
+        let mut lb_stmt = conn.prepare("SELECT project, file, name FROM local_bindings")?;
+        for row in
+            lb_stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+        {
+            local_bindings.insert(row?);
         }
 
         let mut stmt = conn.prepare(
@@ -1131,6 +1241,11 @@ fn wcr_dump_write(
                 .unwrap_or("")
                 .to_string();
             let had_import_module = import_modules.contains(&(src_file.clone(), name.clone()));
+            let had_local_binding = local_bindings.contains(&(
+                project.clone(),
+                src_file.clone(),
+                name.clone(),
+            ));
             out.push(serde_json::json!({
                 "bucket": bucket,
                 "kind": kind,
@@ -1140,6 +1255,7 @@ fn wcr_dump_write(
                 "project": project,
                 "lang": lang,
                 "had_import_module": had_import_module,
+                "had_local_binding": had_local_binding,
                 "def_file_count": def_files,
             }));
         }
@@ -1988,6 +2104,7 @@ mod tests {
         stale: usize,
         internal_module: usize,
         drifted: usize,
+        local: usize,
         unexplained: usize,
         ambiguous_remaining: usize,
         closure_rate: f64,
@@ -2002,6 +2119,7 @@ mod tests {
             stale,
             internal_module,
             drifted,
+            local,
             unexplained,
             ambiguous_remaining,
             closure_rate,
@@ -2011,14 +2129,26 @@ mod tests {
 
     #[test]
     fn witness_closure_gate_boundary() {
-        let at_threshold =
-            resolve_stats(10, 8, 1, 0, 0, 0, 0, 1, 0, WITNESS_CLOSURE_MIN, 8.0 / 9.0);
+        let at_threshold = resolve_stats(
+            10,
+            8,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            WITNESS_CLOSURE_MIN,
+            8.0 / 9.0,
+        );
         let result = witness_closure_gate(&at_threshold);
         assert!(result.passed, "{}", result.detail);
         assert!(
             result
                 .detail
-                .contains("bound=8 external=1 method=0 stale=0 internal_module=0 drifted=0 unexplained=1 ambiguous=0 closure=90.0% (threshold >= 90%)"),
+                .contains("bound=8 external=1 method=0 stale=0 internal_module=0 drifted=0 local=0 unexplained=1 ambiguous=0 closure=90.0% (threshold >= 90%)"),
             "{}",
             result.detail
         );
@@ -2027,6 +2157,7 @@ mod tests {
             10,
             8,
             1,
+            0,
             0,
             0,
             0,
@@ -2046,13 +2177,13 @@ mod tests {
 
     #[test]
     fn internal_binding_gate_boundary() {
-        let at_threshold = resolve_stats(10, 7, 2, 1, 0, 0, 0, 0, 0, 1.0, INTERNAL_BINDING_MIN);
+        let at_threshold = resolve_stats(10, 7, 2, 1, 0, 0, 0, 0, 0, 0, 1.0, INTERNAL_BINDING_MIN);
         let result = internal_binding_gate(&at_threshold);
         assert!(result.passed, "{}", result.detail);
         assert!(
             result
                 .detail
-                .contains("bound=7 / eligible=7 = 70.0% (threshold >= 70%); denominator excludes evidence-classified external+method+stale+internal_module+drifted"),
+                .contains("bound=7 / eligible=7 = 70.0% (threshold >= 70%); denominator excludes evidence-classified external+method+stale+internal_module+drifted+local"),
             "{}",
             result.detail
         );
@@ -2062,6 +2193,7 @@ mod tests {
             7,
             2,
             1,
+            0,
             0,
             0,
             0,
@@ -2083,7 +2215,7 @@ mod tests {
         // 10 total, 5 bound, 5 internal_module, everything else 0 -> closure
         // 100% (WCR Phase 7, TASK E: internal_module is an evidenced outcome,
         // same treatment as external/method/stale).
-        let stats = resolve_stats(10, 5, 0, 0, 0, 5, 0, 0, 0, 1.0, 1.0);
+        let stats = resolve_stats(10, 5, 0, 0, 0, 5, 0, 0, 0, 0, 1.0, 1.0);
         let result = witness_closure_gate(&stats);
         assert!(result.passed, "{}", result.detail);
         assert!(
@@ -2098,7 +2230,7 @@ mod tests {
         // 10 total, 5 bound, 5 drifted, everything else 0 -> closure 100%
         // (WCR Phase 8, TASK B: drifted is an evidenced outcome, same
         // treatment as external/method/stale/internal_module).
-        let stats = resolve_stats(10, 5, 0, 0, 0, 0, 5, 0, 0, 1.0, 1.0);
+        let stats = resolve_stats(10, 5, 0, 0, 0, 0, 5, 0, 0, 0, 1.0, 1.0);
         let result = witness_closure_gate(&stats);
         assert!(result.passed, "{}", result.detail);
         assert!(result.detail.contains("drifted=5"), "{}", result.detail);
@@ -2107,7 +2239,33 @@ mod tests {
     #[test]
     fn internal_binding_gate_excludes_drifted_from_denominator() {
         // 10 total, 7 bound, 3 drifted -> eligible = 10 - 3 = 7, 7/7 = 100%.
-        let stats = resolve_stats(10, 7, 0, 0, 0, 0, 3, 0, 0, 1.0, 1.0);
+        let stats = resolve_stats(10, 7, 0, 0, 0, 0, 3, 0, 0, 0, 1.0, 1.0);
+        let result = internal_binding_gate(&stats);
+        assert!(result.passed, "{}", result.detail);
+        assert!(
+            result.detail.contains("bound=7 / eligible=7"),
+            "{}",
+            result.detail
+        );
+    }
+
+    // ─── X4 `local` tier accounting (WCR truth pass, TASK 2) ───
+
+    #[test]
+    fn witness_closure_gate_counts_local_toward_closure() {
+        // 10 total, 5 bound, 5 local, everything else 0 -> closure 100%
+        // (a local-scope witness is an evidenced outcome, same treatment as
+        // external/method/stale/internal_module/drifted).
+        let stats = resolve_stats(10, 5, 0, 0, 0, 0, 0, 5, 0, 0, 1.0, 1.0);
+        let result = witness_closure_gate(&stats);
+        assert!(result.passed, "{}", result.detail);
+        assert!(result.detail.contains("local=5"), "{}", result.detail);
+    }
+
+    #[test]
+    fn internal_binding_gate_excludes_local_from_denominator() {
+        // 10 total, 7 bound, 3 local -> eligible = 10 - 3 = 7, 7/7 = 100%.
+        let stats = resolve_stats(10, 7, 0, 0, 0, 0, 0, 3, 0, 0, 1.0, 1.0);
         let result = internal_binding_gate(&stats);
         assert!(result.passed, "{}", result.detail);
         assert!(
@@ -2155,7 +2313,7 @@ mod tests {
     #[test]
     fn witness_closure_gate_counts_stale_toward_closure() {
         // 10 total, 5 bound, 0 external, 0 method, 5 stale -> closure 100%.
-        let stats = resolve_stats(10, 5, 0, 0, 5, 0, 0, 0, 0, 1.0, 5.0 / 5.0);
+        let stats = resolve_stats(10, 5, 0, 0, 5, 0, 0, 0, 0, 0, 1.0, 5.0 / 5.0);
         let result = witness_closure_gate(&stats);
         assert!(result.passed, "{}", result.detail);
         assert!(result.detail.contains("stale=5"), "{}", result.detail);
@@ -2657,6 +2815,144 @@ mod tests {
         );
         assert_eq!(evidence, "");
         assert_eq!(resolved, 0);
+    }
+
+    #[test]
+    fn backfill_marks_drifted_for_a_module_scoped_edge_when_import_symbol_vanishes() {
+        // TASK 1 (WCR truth pass): a module-level (top-level) `imports` edge
+        // — e.g. `use crate::import;` — is sourced from the synthetic MODULE
+        // node, whose own `code_nodes.name` is the file path itself, never a
+        // def_names entry (def_names excludes `kind == "module"`). Before
+        // this fix, condition (c) could never match a module-scoped edge —
+        // comparing a file path against function/type/const names is a
+        // category mismatch — so it could never drift no matter how stale.
+        // Verified against a real, live-corpus case: 8 stale `imports`/
+        // `calls` edges targeting the literal name `import` (predating the
+        // noise filter that now drops it at extraction time) were
+        // permanently stuck `unexplained` because every one is module-scoped.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.rs");
+        // Fresh, on-disk truth: `foo` is defined (real structure exists —
+        // condition (b) holds) but the file no longer imports `ghost_module`
+        // at all.
+        std::fs::write(&file_path, "fn foo() {}\n").unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "rust".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[EdgeRow {
+                    src_id: module_id.clone(),
+                    dst_id: "name:ghost_module".into(),
+                    kind: "imports".into(),
+                    src_file: file_str.clone(),
+                    resolved: 0,
+                    weight: 1.0,
+                    ..EdgeRow::default()
+                }],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1, "the on-disk file was re-extracted");
+        assert_eq!(edges, 0, "ghost_module has no match in the fresh fragment");
+
+        let (boundary, evidence, resolved): (String, String, i64) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT boundary, evidence, resolved FROM code_edges
+                     WHERE src_id = ?1 AND dst_id = 'name:ghost_module'",
+                    [&module_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            boundary, "drifted",
+            "a module-scoped edge must be drift-eligible too, not stuck unexplained forever"
+        );
+        assert_eq!(evidence, "not_in_current_source");
+        assert_eq!(resolved, 0);
+    }
+
+    #[test]
+    fn backfill_matched_module_scoped_edge_is_not_marked_drifted() {
+        // Sanity counterpart: a module-scoped `imports` edge that DOES still
+        // match the fresh extraction must not be touched by the new
+        // module-level drift eligibility — matched-vs-drifted stays mutually
+        // exclusive per edge, exactly as for function-scoped edges.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.rs");
+        std::fs::write(&file_path, "use crate::still_here;\nfn foo() {}\n").unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "rust".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[EdgeRow {
+                    src_id: module_id.clone(),
+                    dst_id: "name:still_here".into(),
+                    kind: "imports".into(),
+                    src_file: file_str.clone(),
+                    resolved: 0,
+                    weight: 1.0,
+                    ..EdgeRow::default()
+                }],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(edges, 1, "still_here matches the fresh extraction");
+
+        let boundary: String = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT boundary FROM code_edges WHERE src_id = ?1 AND dst_id = 'name:still_here'",
+                    [&module_id],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(boundary, "", "a matched edge must never be marked drifted");
     }
 
     #[test]

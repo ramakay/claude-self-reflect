@@ -115,14 +115,30 @@
 //!   `ResolveStats::drifted`. Same standing as `stale` in both rates:
 //!   counted in `closure_rate`'s numerator, excluded from
 //!   `internal_binding_rate`'s denominator.
+//! - **X4 `local`** (WCR truth pass, TASK 2) — the LAST classify tier,
+//!   reached only once X0/X1b/X1c/X1/X2/`internal_module_tier` have all
+//!   failed to explain the edge AND `N` has zero defs anywhere (code_nodes
+//!   or repo_defs — the SAME never-guess precondition every classify tier
+//!   above already requires, so this can never preempt a bind tier). `N` IS,
+//!   however, a witnessed LOCAL binding — a function/closure parameter or a
+//!   local (non-top-level) variable/destructuring target — in the edge's own
+//!   (project, src_file), per the `local_bindings` shadow table (see
+//!   `extraction::codegraph::collect_local_bindings`, populated by
+//!   `eval::codegraph::backfill_wcr_witnesses` from the same re-extraction
+//!   pass that backs every other WCR witness tier). `evidence =
+//!   "local_scope:<name>"`. Same standing as `stale`/`internal_module`/
+//!   `drifted` in both rates: counted in `closure_rate`'s numerator,
+//!   excluded from `internal_binding_rate`'s denominator — a local-scope
+//!   witness proves the edge isn't a mystery, not that a repo-wide symbol
+//!   was found.
 //!
 //! Everything else is `unexplained`: no def anywhere, no builtin/qualifier
-//! match, no import evidence, not a method call, and the file still exists.
-//! `ambiguous_remaining` is the subset of `unexplained` where multiple
-//! candidates existed (code_nodes and/or repo_defs) but could not be
-//! disambiguated — as opposed to genuinely no information at all. A would-be
-//! `unexplained`/`ambiguous` edge whose file is missing is `stale` instead,
-//! not counted in either.
+//! match, no import evidence, not a method call, not a witnessed local
+//! binding, and the file still exists. `ambiguous_remaining` is the subset
+//! of `unexplained` where multiple candidates existed (code_nodes and/or
+//! repo_defs) but could not be disambiguated — as opposed to genuinely no
+//! information at all. A would-be `unexplained`/`ambiguous` edge whose file
+//! is missing is `stale` instead, not counted in either.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -173,16 +189,41 @@ pub struct ResolveStats {
     /// `internal_binding_rate`'s denominator, same treatment as
     /// `external`/`method`/`stale`/`internal_module`.
     pub drifted: usize,
-    /// `total - bound - external - method - stale - internal_module - drifted`.
+    /// Edges classified `boundary = 'local'` (WCR truth pass, TASK 2, X4
+    /// tier): `N` has NO def anywhere (code_nodes or repo_defs — same
+    /// zero-defs precondition as X0/X1/X2 above, verified BEFORE this tier
+    /// ever runs so it can never preempt a bind tier) but `N` IS a witnessed
+    /// LOCAL binding — a function/closure parameter or a local (non-top-level)
+    /// variable/destructuring target — in the edge's own (project, src_file),
+    /// per `local_bindings` (see `extraction::codegraph::collect_local_bindings`,
+    /// populated by `eval::codegraph::backfill_wcr_witnesses` from the SAME
+    /// re-extraction pass that backs the other WCR witness tiers). This is
+    /// the honest explanation for the WCR truth-pass residual's dominant
+    /// shape: JS/TS component-scoped `const playTrack = ...` and closure
+    /// params like `reject` — real code, correctly never bound to any
+    /// `code_nodes`/`repo_defs` entry because a local binding is by
+    /// definition not a repo-wide symbol. Runs LAST among classify tiers —
+    /// after X0/X1b/X1c/X1/X2/`internal_module_tier`, before `stale` — see
+    /// `classify_only`. `evidence = "local_scope:<name>"`. Counted in
+    /// `closure_rate`'s numerator; EXCLUDED from `internal_binding_rate`'s
+    /// denominator, same treatment as `external`/`method`/`stale`/
+    /// `internal_module`/`drifted` — a local-scope witness is not evidence
+    /// either for or against REPO-WIDE symbol-binding quality. Silent (never
+    /// fires) whenever `local_bindings` has no rows for the edge's
+    /// (project, src_file) — e.g. every resolve pass outside the WCR live
+    /// gate, since only `backfill_wcr_witnesses` ever populates the table.
+    pub local: usize,
+    /// `total - bound - external - method - stale - internal_module -
+    /// drifted - local`.
     pub unexplained: usize,
     /// Subset of `unexplained`: a def existed (code_nodes and/or repo_defs)
     /// somewhere but multiple candidates could not be disambiguated.
     pub ambiguous_remaining: usize,
-    /// `(bound + external + method + stale + internal_module + drifted) /
-    /// total`. `1.0` when `total == 0`.
+    /// `(bound + external + method + stale + internal_module + drifted +
+    /// local) / total`. `1.0` when `total == 0`.
     pub closure_rate: f64,
     /// `bound / (total - external - method - stale - internal_module -
-    /// drifted)`. `1.0` when the denominator is 0.
+    /// drifted - local)`. `1.0` when the denominator is 0.
     pub internal_binding_rate: f64,
 }
 
@@ -315,6 +356,31 @@ pub fn resolve_edges(
         }
     }
 
+    // Pass 1d (WCR truth pass, TASK 2): per (project, file) local-binding
+    // name set — the X4 tier's witness table, populated only by
+    // `eval::codegraph::backfill_wcr_witnesses` (see
+    // `extraction::codegraph::collect_local_bindings`). Empty on every DB
+    // this table hasn't been backfilled into — the X4 tier is then silent
+    // by construction (an empty/missing `BTreeMap` entry never matches),
+    // not an error.
+    let mut local_bindings: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT project, file, name FROM local_bindings WHERE (?1 = '' OR project = ?1)",
+        )?;
+        let rows = stmt.query_map(params![project], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for r in rows {
+            let (proj, file, name) = r?;
+            local_bindings.entry((proj, file)).or_default().insert(name);
+        }
+    }
+
     // Pass 2: collect placeholder edges (calls + imports), deterministically.
     let mut pending: Vec<Pending> = Vec::new();
     {
@@ -362,6 +428,7 @@ pub fn resolve_edges(
     let mut stale = 0usize;
     let mut internal_module = 0usize;
     let mut drifted = 0usize;
+    let mut local = 0usize;
     let mut ambiguous_remaining = 0usize;
     // TASK E (WCR Phase 6): memoizes `repo_scan::project_roots` per project
     // across the whole pass — a DB query, and many pending edges typically
@@ -404,6 +471,17 @@ pub fn resolve_edges(
             let has_import = imports_by_file
                 .get(&p.src_file)
                 .is_some_and(|s| s.contains(&p.name));
+            // X4 precondition (WCR truth pass, TASK 2): `defs` above only
+            // reflects THIS receiver-gated edge's B0 same-file eligibility —
+            // it says nothing about whether `code_nodes`/`repo_defs` has a
+            // def of `N` elsewhere in the project (a method-gated edge
+            // deliberately never looks past B0). The X4 tier must never
+            // preempt a bind tier, so it independently verifies zero defs
+            // ANYWHERE (code_nodes across the whole project, not just this
+            // file, AND repo_defs) before it is even offered the chance to
+            // fire inside `classify_only`.
+            let zero_defs_anywhere = defs.map(|d| d.is_empty()).unwrap_or(true)
+                && repo_candidate_files(conn, &p.project, &p.name)?.is_empty();
             match classify_only(
                 conn,
                 p,
@@ -412,11 +490,14 @@ pub fn resolve_edges(
                 &imports_module_by_file,
                 &mut roots_cache,
                 file_exists,
+                zero_defs_anywhere,
+                &local_bindings,
             )? {
                 Some("external") => external += 1,
                 Some("method") => method += 1,
                 Some("internal_module") => internal_module += 1,
                 Some("stale") => stale += 1,
+                Some("local") => local += 1,
                 _ => {}
             }
             continue;
@@ -476,6 +557,12 @@ pub fn resolve_edges(
                     ambiguous_remaining += 1;
                 }
             } else {
+                // X4 precondition (WCR truth pass, TASK 2): reached only
+                // when `distinct.is_empty()` (zero code_nodes defs) AND
+                // `repo_files` is neither len==1 nor len>=2 — i.e. also
+                // empty. Zero defs anywhere is therefore ALREADY guaranteed
+                // here, unconditionally — no extra query needed (unlike the
+                // gate-based call site above, which has to verify it itself).
                 match classify_only(
                     conn,
                     p,
@@ -484,11 +571,14 @@ pub fn resolve_edges(
                     &imports_module_by_file,
                     &mut roots_cache,
                     file_exists,
+                    true,
+                    &local_bindings,
                 )? {
                     Some("external") => external += 1,
                     Some("method") => method += 1,
                     Some("internal_module") => internal_module += 1,
                     Some("stale") => stale += 1,
+                    Some("local") => local += 1,
                     _ => {}
                 }
             }
@@ -549,13 +639,16 @@ pub fn resolve_edges(
         }
     }
 
-    let unexplained = total - resolved - external - method - stale - internal_module - drifted;
+    let unexplained =
+        total - resolved - external - method - stale - internal_module - drifted - local;
     let closure_rate = if total == 0 {
         1.0
     } else {
-        (resolved + external + method + stale + internal_module + drifted) as f64 / total as f64
+        (resolved + external + method + stale + internal_module + drifted + local) as f64
+            / total as f64
     };
-    let internal_denominator = total - external - method - stale - internal_module - drifted;
+    let internal_denominator =
+        total - external - method - stale - internal_module - drifted - local;
     let internal_binding_rate = if internal_denominator == 0 {
         1.0
     } else {
@@ -571,6 +664,7 @@ pub fn resolve_edges(
         stale,
         internal_module,
         drifted,
+        local,
         unexplained,
         ambiguous_remaining,
         closure_rate,
@@ -694,7 +788,8 @@ fn classify_tier(
 
 /// Classify tiers only (X0 `builtin_tier` / X1b `qualifier_tier` / X1c
 /// `qualifier_import_tier` / X1+X2 `classify_tier` / `internal_module_tier` /
-/// `stale`-or-clear) — no bind tier runs here. Two callers:
+/// X4 local-binding witness / `stale`-or-clear) — no bind tier runs here.
+/// Two callers:
 ///
 /// - The historical "no `code_nodes` def anywhere AND no (or ambiguous)
 ///   `repo_defs` candidate" path in `resolve_edges`'s `distinct.is_empty()`
@@ -705,6 +800,15 @@ fn classify_tier(
 ///   same-named def — a shared bare name is not binding evidence for a
 ///   receiver call, so `classify_tier`'s X2 method classification must be
 ///   reachable even when such defs exist elsewhere in the project.
+///
+/// `zero_defs_anywhere` (WCR truth pass, TASK 2) gates the X4 tier alone:
+/// `true` iff `N` has NO def anywhere (code_nodes project-wide, AND
+/// repo_defs) — the caller computes this itself (see each call site in
+/// `resolve_edges`; the `distinct.is_empty()` call site gets it for free
+/// from checks it already made, the method-gate call site verifies it
+/// independently since a gated edge's own `defs` lookup only reflects B0
+/// same-file eligibility). `local_bindings` is the X4 witness table (see
+/// `ResolveStats::local`'s doc comment).
 ///
 /// Performs the DB write itself (`classify_edge`, or `clear_edge` via
 /// `resolve_stale_or_unexplained`) and reports which `ResolveStats` bucket
@@ -719,6 +823,8 @@ fn classify_only(
     imports_module_by_file: &BTreeMap<String, BTreeMap<String, String>>,
     roots_cache: &mut BTreeMap<String, Vec<PathBuf>>,
     file_exists: &dyn Fn(&str) -> bool,
+    zero_defs_anywhere: bool,
+    local_bindings: &BTreeMap<(String, String), BTreeSet<String>>,
 ) -> Result<Option<&'static str>> {
     if let Some((boundary, evidence)) = builtin_tier(p) {
         // X0: language-defined prelude/builtin/global — runs before X1
@@ -763,6 +869,21 @@ fn classify_only(
         // `ResolveStats::internal_module`).
         classify_edge(conn, p, &boundary, &evidence)?;
         return Ok(Some("internal_module"));
+    }
+    // X4 (WCR truth pass, TASK 2): local-binding witness — the LAST classify
+    // tier, and ONLY for names with zero defs anywhere (never guessed, never
+    // able to preempt a bind tier — see `zero_defs_anywhere`'s doc comment
+    // above and `ResolveStats::local`). `N` is a witnessed function/closure
+    // parameter or local variable/destructuring target in the edge's own
+    // (project, src_file) per `local_bindings` — real, disk-verified AST
+    // evidence, not a name-shape guess.
+    if zero_defs_anywhere {
+        if let Some(names) = local_bindings.get(&(p.project.clone(), p.src_file.clone())) {
+            if names.contains(&p.name) {
+                classify_edge(conn, p, "local", &format!("local_scope:{}", p.name))?;
+                return Ok(Some("local"));
+            }
+        }
     }
     if resolve_stale_or_unexplained(conn, p, file_exists)? {
         return Ok(Some("stale"));
@@ -3195,5 +3316,190 @@ mod tests {
             "byte-identical across the repeated pass"
         );
         assert_eq!(evidence, "not_in_current_source");
+    }
+
+    // ─── X4 local-binding witness tier (WCR truth pass, TASK 2) ───
+
+    fn insert_local_binding(conn: &Connection, project: &str, file: &str, name: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO local_bindings (project, file, name) VALUES (?1, ?2, ?3)",
+            params![project, file, name],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn x4_local_binding_classifies_when_zero_defs_anywhere_and_witnessed() {
+        let conn = mem();
+        upsert_node(&conn, &def("foo", "a.ts", "foo")).unwrap();
+        // No def anywhere for "playTrack" — code_nodes has no def, repo_defs
+        // is empty.
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.ts",
+            &[call_edge("foo", "playTrack", "a.ts")],
+        )
+        .unwrap();
+        insert_local_binding(&conn, "proj", "a.ts", "playTrack");
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(stats.local, 1);
+        assert_eq!(stats.resolved, 0, "local classifies, never binds");
+        assert_eq!(stats.unexplained, 0);
+        assert_eq!(
+            stats.closure_rate, 1.0,
+            "local counts toward the closure numerator"
+        );
+
+        let (boundary, evidence, resolved, dst_id): (String, String, i64, String) = conn
+            .query_row(
+                "SELECT boundary, evidence, resolved, dst_id FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(boundary, "local");
+        assert_eq!(evidence, "local_scope:playTrack");
+        assert_eq!(resolved, 0);
+        assert_eq!(dst_id, "name:playTrack", "dst_id stays the placeholder");
+    }
+
+    #[test]
+    fn x4_local_binding_excluded_from_internal_binding_denominator() {
+        let conn = mem();
+        upsert_node(&conn, &def("foo", "a.ts", "foo")).unwrap();
+        upsert_node(&conn, &def("bar", "a.ts", "bar")).unwrap();
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.ts",
+            &[
+                // Binds normally via B0 same_file.
+                call_edge("foo", "bar", "a.ts"),
+                // No def anywhere, but witnessed local.
+                call_edge("foo", "playTrack", "a.ts"),
+            ],
+        )
+        .unwrap();
+        insert_local_binding(&conn, "proj", "a.ts", "playTrack");
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.resolved, 1, "bar binds via B0");
+        assert_eq!(stats.local, 1);
+        assert_eq!(
+            stats.internal_binding_rate, 1.0,
+            "denominator excludes the local edge: 1 bound / 1 eligible"
+        );
+    }
+
+    #[test]
+    fn x4_never_fires_when_a_real_def_exists_elsewhere_for_the_name() {
+        // Adversarial self-check: a name that is BOTH a witnessed local
+        // SOMEWHERE and has a real def elsewhere in the project must NOT
+        // classify local — def_file_count > 0 blocks it (condition (a)).
+        // Uses the same receiver-gated (NoBind) shape as
+        // `method_call_with_non_self_receiver_does_not_bind_via_unique_def_elsewhere`:
+        // a method call off a non-self receiver never reaches a bind tier
+        // even though `save` has exactly one code_nodes def elsewhere, so
+        // the ONLY thing standing between this edge and a wrong `local`
+        // classification is the explicit zero-defs-anywhere check.
+        let conn = mem();
+        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
+        upsert_node(&conn, &def("save_b", "b.rs", "save")).unwrap();
+        let mut e = call_edge_via("foo", "save", "a.rs", "obj");
+        e.callee_kind = "method".into();
+        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
+        // "save" also happens to be a local binding name in a.rs itself —
+        // must still not classify local, because a real def of "save"
+        // exists (in b.rs).
+        insert_local_binding(&conn, "proj", "a.rs", "save");
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(stats.local, 0, "a real def elsewhere must block X4");
+        assert_eq!(stats.method, 1, "falls through to X2 method instead");
+
+        let boundary: String = conn
+            .query_row(
+                "SELECT boundary FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(boundary, "method");
+    }
+
+    #[test]
+    fn x4_never_preempts_a_successful_bind_tier() {
+        // Adversarial self-check: a local_bindings witness for the SAME
+        // (project, file, name) as an edge that a bind tier can already
+        // resolve must never be reached at all — bind tiers run to
+        // completion (and `continue`) long before `classify_only` (and
+        // therefore X4) is ever called.
+        let conn = mem();
+        upsert_node(&conn, &def("bar", "x.rs", "bar")).unwrap();
+        upsert_node(&conn, &def("foo", "z.rs", "foo")).unwrap();
+        codegraph::replace_file_edges(&conn, "proj", "z.rs", &[call_edge("foo", "bar", "z.rs")])
+            .unwrap();
+        insert_local_binding(&conn, "proj", "z.rs", "bar");
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(stats.local, 0);
+        assert_eq!(stats.resolved, 1, "B2 unique_def still binds it");
+
+        let (dst, evidence): (String, String) = conn
+            .query_row(
+                "SELECT dst_id, evidence FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dst, "bar");
+        assert_eq!(evidence, "unique_def");
+    }
+
+    #[test]
+    fn x4_silent_when_local_bindings_table_is_empty() {
+        // Empty local_bindings table (every resolve pass outside the WCR
+        // live gate, since only `backfill_wcr_witnesses` ever populates it)
+        // -> zero local classifications, tier silent not erroring; the edge
+        // falls through to the pre-existing unexplained/ambiguous behavior
+        // exactly as before this tier was added.
+        let conn = mem();
+        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.rs",
+            &[call_edge("foo", "ghost_symbol_xyz", "a.rs")],
+        )
+        .unwrap();
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(stats.local, 0);
+        assert_eq!(stats.unexplained, 1);
+    }
+
+    #[test]
+    fn resolve_is_deterministic_with_local_tier() {
+        let conn = mem();
+        upsert_node(&conn, &def("foo", "a.ts", "foo")).unwrap();
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.ts",
+            &[call_edge("foo", "playTrack", "a.ts")],
+        )
+        .unwrap();
+        insert_local_binding(&conn, "proj", "a.ts", "playTrack");
+
+        let first = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        let second = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(
+            first, second,
+            "local tier stays deterministic across repeated passes"
+        );
+        assert_eq!(first.local, 1);
     }
 }
