@@ -141,7 +141,12 @@ pub fn node_id(repo: &str, file: &str, kind: &str, name: &str) -> String {
 }
 
 /// 16-hex-char sha256 of a node's source text (change detection without diff).
-fn body_hash(text: &str) -> String {
+/// `pub(crate)` (WCR truth pass, Codex round 6): `eval::codegraph`'s tests
+/// need to compute the SAME hash a fresh re-parse would produce, to seed
+/// fixtures whose stored `code_nodes.body_hash` deterministically matches
+/// (or deliberately mismatches) current on-disk content — see
+/// `historical_src_content_unchanged`'s doc comment.
+pub(crate) fn body_hash(text: &str) -> String {
     let digest = Sha256::digest(text.as_bytes());
     let mut s = String::with_capacity(16);
     for b in digest.iter() {

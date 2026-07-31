@@ -758,6 +758,59 @@ fn scan_repo_defs(
 /// wall-time against a corpus containing very large source files.
 const BACKFILL_MAX_FILE_BYTES: u64 = 512 * 1024;
 
+/// Codex round 6 adversarial review (legacy-attribution correspondence is
+/// NOT cross-version site identity): `call_legacy_correspondence` (see its
+/// own doc comment, in `backfill_wcr_witnesses` below) proves that SOME
+/// fresh call/import site's NAME/KIND attribution, under the frozen
+/// pre-92179d1 rule, matches a historical pending edge's own src. It does
+/// NOT prove that fresh site is the SAME physical call the historical edge
+/// recorded — a genuinely REMOVED call from one def (e.g. a closure inside
+/// `Alpha`) and an unrelated, newly ADDED call from another def (a closure
+/// inside `Beta`) can both legacy-attribute to the identical historical src
+/// (the module node, when both are anonymous closures) — indistinguishable
+/// from attribution skew by correspondence alone, exactly as candidate COUNT
+/// alone was indistinguishable in round 4 (`calls_any_src`'s doc comment).
+/// Re-pointing on correspondence alone credits gate closure that the
+/// evidence does not support.
+///
+/// This gate makes the re-point DEDUCTIVE instead of inferential: sound only
+/// when the historical src node's OWN CONTENT is provably unchanged since
+/// the edge was recorded — its stored `body_hash` (last written to
+/// `code_nodes` for that exact `(kind, name)`) equals the body_hash of the
+/// SAME node recomputed from CURRENT on-disk content by this fresh re-parse
+/// (`fresh_hash_by_kind_name`, built once per file in `backfill_wcr_witnesses`,
+/// covers both shapes uniformly — the module node's hash is the whole-file
+/// hash for module-src edges, a named def's own body-span hash for
+/// named-src edges; no special-casing by kind). Equal hash is a mechanical
+/// proof, not a guess: the OLD attribution rule, applied to content
+/// byte-identical to today's, is what produced the historical edge — so the
+/// historical edge and the fresh legacy-corresponding site are the same
+/// physical call, full stop.
+///
+/// A missing historical hash (`stored_body_hash` empty — never recorded, or
+/// pre-dates this column) or a missing fresh hash (`fresh_hash_by_kind_name`
+/// has no entry — the historical `(kind, name)` node doesn't exist at all in
+/// the fresh fragment, e.g. it was itself removed) are both treated
+/// IDENTICALLY to a mismatch: `false`, never a guess. `body_hash` (a sha256
+/// digest) is never the empty string for any real text, so an empty stored
+/// hash can never coincidentally equal a real fresh one — this is checked
+/// explicitly anyway so the "missing never guesses" invariant is documented,
+/// not merely accidental. A `false` result here means the pending edge falls
+/// through to the SAME honest classification path as when no legacy
+/// correspondence exists at all — the ordinary drift guard (`can_drift`), or
+/// untouched/pending when that also fails. Never a separate, weaker outcome.
+fn historical_src_content_unchanged(
+    fresh_hash_by_kind_name: &HashMap<(&str, &str), &str>,
+    src_kind: &str,
+    src_name: &str,
+    stored_body_hash: &str,
+) -> bool {
+    !stored_body_hash.is_empty()
+        && fresh_hash_by_kind_name
+            .get(&(src_kind, src_name))
+            .is_some_and(|fresh_hash| *fresh_hash == stored_body_hash)
+}
+
 /// Witness backfill (WCR Phase 5, TASK 2; evidence propagation extended WCR
 /// Phase 7; drifted-edge classification added WCR Phase 8, TASK B): for
 /// every distinct (project, src_file) with pending (`resolved = 0`)
@@ -1004,6 +1057,28 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
             .map(|n| n.name.as_str())
             .collect();
 
+        // Codex round 6 adversarial review (legacy-attribution correspondence
+        // is NOT cross-version site identity — see
+        // `historical_src_content_unchanged`'s doc comment for the full
+        // finding): `(kind, name) -> body_hash`, from THIS SAME fresh
+        // fragment, for EVERY node including the module node — the content
+        // the re-point gate below compares the historical, previously-stored
+        // hash against. Duplicate `(kind, name)` keys (should not normally
+        // happen — `node_id`'s own hash already disambiguates by kind+name
+        // within a file) are removed entirely, same "ambiguous, never guess"
+        // convention `shadow_name_to_id` already uses, above.
+        let fresh_hash_by_kind_name: HashMap<(&str, &str), &str> = {
+            let mut counts: HashMap<(&str, &str), u32> = HashMap::new();
+            let mut map: HashMap<(&str, &str), &str> = HashMap::new();
+            for n in &fragment.nodes {
+                let key = (n.kind.as_str(), n.name.as_str());
+                *counts.entry(key).or_insert(0) += 1;
+                map.entry(key).or_insert(n.body_hash.as_str());
+            }
+            map.retain(|key, _| counts.get(key) == Some(&1));
+            map
+        };
+
         // WCR Phase 7: `(callee_kind, evidence)` — the `evidence` half is
         // the `via:<qualifier>` data captured at extraction time (WCR Phase
         // 6, TASK A), added AFTER this backfill function was originally
@@ -1129,10 +1204,16 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
         // never classified" IS the correct outcome for it, not a shortcut
         // to take before checking.
 
-        let pending_edges: Vec<(String, String, String, String)> =
+        // Codex round 6 adversarial review: `n.kind` (the SRC node's OWN
+        // kind, distinct from `e.kind`, the edge kind calls/imports) and
+        // `n.body_hash` (the HISTORICAL, previously-stored content hash for
+        // that exact node) are pulled alongside `n.name` now — both required
+        // by the re-point content-identity gate below (see
+        // `historical_src_content_unchanged`'s doc comment).
+        let pending_edges: Vec<(String, String, String, String, String, String)> =
             shadow.with_connection(|conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT e.src_id, e.dst_id, e.kind, n.name
+                    "SELECT e.src_id, e.dst_id, e.kind, n.name, n.kind, n.body_hash
                      FROM code_edges e JOIN code_nodes n ON n.id = e.src_id
                      WHERE e.resolved = 0 AND e.dst_id LIKE 'name:%' AND e.kind IN ('calls', 'imports')
                        AND e.src_file = ?1 AND n.project = ?2
@@ -1144,13 +1225,15 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 })?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(Into::into)
             })?;
 
-        for (src_id, dst_id, kind, src_name) in pending_edges {
+        for (src_id, dst_id, kind, src_name, src_node_kind, src_body_hash) in pending_edges {
             let Some(bare) = dst_id.strip_prefix("name:") else {
                 continue;
             };
@@ -1254,41 +1337,72 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                             match call_legacy_correspondence.get(&legacy_key) {
                                 Some(current_srcs) if current_srcs.len() == 1 => {
                                     let winning = current_srcs.iter().next().expect("len == 1");
-                                    if let Some((src_kind, new_kind, new_evidence)) =
-                                        candidates.get(winning)
-                                    {
-                                        // Finding 3 (Codex round 4): kind-qualified
-                                        // lookup — a missing or non-unique
-                                        // (kind, name) match in
-                                        // `shadow_name_to_id` is NO match, never
-                                        // a lexicographic guess. See that map's
-                                        // doc comment.
-                                        if let Some(new_src_id) = shadow_name_to_id
-                                            .get(&(src_kind.clone(), winning.clone()))
+                                    // Codex round 6 adversarial review: legacy
+                                    // correspondence alone is not cross-version
+                                    // site identity — see
+                                    // `historical_src_content_unchanged`'s doc
+                                    // comment for the full finding (the
+                                    // Alpha/Beta case: a removed closure-Alpha
+                                    // call and an unrelated added closure-Beta
+                                    // call both legacy-attribute to this same
+                                    // historical src). Gated DEDUCTIVELY on the
+                                    // historical src node's content being
+                                    // provably unchanged since this edge was
+                                    // recorded, checked BEFORE trusting the
+                                    // correspondence to re-point at all.
+                                    if historical_src_content_unchanged(
+                                        &fresh_hash_by_kind_name,
+                                        &src_node_kind,
+                                        &src_name,
+                                        &src_body_hash,
+                                    ) {
+                                        if let Some((src_kind, new_kind, new_evidence)) =
+                                            candidates.get(winning)
                                         {
-                                            repoint_or_dedupe_edge(
-                                                shadow,
-                                                &src_id,
-                                                &dst_id,
-                                                "calls",
-                                                new_src_id,
-                                                Some(new_kind),
-                                                new_evidence,
-                                            )?;
-                                            edges_updated += 1;
+                                            // Finding 3 (Codex round 4): kind-qualified
+                                            // lookup — a missing or non-unique
+                                            // (kind, name) match in
+                                            // `shadow_name_to_id` is NO match, never
+                                            // a lexicographic guess. See that map's
+                                            // doc comment.
+                                            if let Some(new_src_id) = shadow_name_to_id
+                                                .get(&(src_kind.clone(), winning.clone()))
+                                            {
+                                                repoint_or_dedupe_edge(
+                                                    shadow,
+                                                    &src_id,
+                                                    &dst_id,
+                                                    "calls",
+                                                    new_src_id,
+                                                    Some(new_kind),
+                                                    new_evidence,
+                                                )?;
+                                                edges_updated += 1;
+                                            }
+                                            // else: the winning candidate's (kind,
+                                            // name) has no valid real shadow id —
+                                            // never guess by falling back to a
+                                            // different one. Leave untouched.
                                         }
-                                        // else: the winning candidate's (kind,
-                                        // name) has no valid real shadow id —
-                                        // never guess by falling back to a
-                                        // different one. Leave untouched.
+                                        // else: the legacy-matched winning src isn't
+                                        // itself a `calls_any_src` candidate —
+                                        // structurally shouldn't happen (every
+                                        // `call_attribution_pairs` site also
+                                        // produced a `fragment.edges` entry at its
+                                        // own current src), but never guess if it
+                                        // somehow is. Leave untouched.
+                                    } else if can_drift {
+                                        // Content-identity gate failed: the
+                                        // historical src's own content changed
+                                        // (or was never hashed) since this edge
+                                        // was recorded — cross-version site
+                                        // identity is unprovable. Fall through to
+                                        // the SAME honest drift classification a
+                                        // missing legacy correspondence gets,
+                                        // immediately below — never a guessed
+                                        // re-point.
+                                        mark_drifted(shadow, &src_id, &dst_id, "calls")?;
                                     }
-                                    // else: the legacy-matched winning src isn't
-                                    // itself a `calls_any_src` candidate —
-                                    // structurally shouldn't happen (every
-                                    // `call_attribution_pairs` site also
-                                    // produced a `fragment.edges` entry at its
-                                    // own current src), but never guess if it
-                                    // somehow is. Leave untouched.
                                 }
                                 Some(_) => {
                                     // >= 2 distinct current srcs among
@@ -1362,22 +1476,38 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                         match call_legacy_correspondence.get(&legacy_key) {
                             Some(current_srcs) if current_srcs.len() == 1 => {
                                 let winning = current_srcs.iter().next().expect("len == 1");
-                                if let Some((src_kind, new_evidence)) = candidates.get(winning) {
-                                    if let Some(new_src_id) =
-                                        shadow_name_to_id.get(&(src_kind.clone(), winning.clone()))
+                                // Codex round 6 adversarial review: same
+                                // content-identity gate as the `calls` arm
+                                // above — see `historical_src_content_unchanged`'s
+                                // doc comment.
+                                if historical_src_content_unchanged(
+                                    &fresh_hash_by_kind_name,
+                                    &src_node_kind,
+                                    &src_name,
+                                    &src_body_hash,
+                                ) {
+                                    if let Some((src_kind, new_evidence)) = candidates.get(winning)
                                     {
-                                        repoint_or_dedupe_edge(
-                                            shadow,
-                                            &src_id,
-                                            &dst_id,
-                                            "imports",
-                                            new_src_id,
-                                            None,
-                                            new_evidence,
-                                        )?;
-                                        edges_updated += 1;
+                                        if let Some(new_src_id) = shadow_name_to_id
+                                            .get(&(src_kind.clone(), winning.clone()))
+                                        {
+                                            repoint_or_dedupe_edge(
+                                                shadow,
+                                                &src_id,
+                                                &dst_id,
+                                                "imports",
+                                                new_src_id,
+                                                None,
+                                                new_evidence,
+                                            )?;
+                                            edges_updated += 1;
+                                        }
+                                        // else: no valid real shadow id — never guess.
                                     }
-                                    // else: no valid real shadow id — never guess.
+                                } else if can_drift {
+                                    // Content-identity gate failed — same fall
+                                    // through as the `calls` arm above.
+                                    mark_drifted(shadow, &src_id, &dst_id, "imports")?;
                                 }
                             }
                             Some(_) => {
@@ -3568,13 +3698,19 @@ mod tests {
         // `src_name == src_file` since the stale edge's own src IS the
         // module node) and the edge would wrongly drift, manufacturing
         // gate credit while silently discarding the call/import site.
+        //
+        // Codex round 6 adversarial review: re-pointing now additionally
+        // requires the historical module node's stored `body_hash` to equal
+        // the fresh re-parse's module hash — i.e. this file's content must be
+        // PROVABLY UNCHANGED since the edge was recorded. This is exactly
+        // that positive case: `source` below is BOTH what's on disk AND what
+        // the historical node's hash was computed from, so the gate must
+        // pass and this MANDATED regression must stay green.
+        let source =
+            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.tsx");
-        std::fs::write(
-            &file_path,
-            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n",
-        )
-        .unwrap();
+        std::fs::write(&file_path, source).unwrap();
         let file_str = file_path.to_string_lossy().to_string();
 
         let shadow = Arc::new(Storage::open_memory().unwrap());
@@ -3592,6 +3728,11 @@ mod tests {
                 lang: "tsx".into(),
                 kind: "module".into(),
                 name: file_str.clone(),
+                // Content-identity gate (Codex round 6): the historical
+                // module node's hash must match `source`'s own hash — same
+                // content, computed the same way `extract_inner`'s module
+                // node does (`body_hash(source)`, the WHOLE-FILE text).
+                body_hash: crate::extraction::codegraph::body_hash(source),
                 first_conv_id: "c".into(),
                 last_conv_id: "c".into(),
                 ..NodeRow::default()
@@ -3815,6 +3956,266 @@ mod tests {
             callee_kind, "direct",
             "untouched entirely — the original stale value, never refreshed"
         );
+    }
+
+    // ─── content-identity gate on legacy-attribution re-point (Codex round 6
+    // adversarial review): correspondence alone proves NAME/KIND attribution
+    // under the frozen old rule, never cross-version SITE identity — see
+    // `historical_src_content_unchanged`'s doc comment for the full finding. ───
+
+    #[test]
+    fn backfill_never_repoints_when_historical_module_hash_mismatches_current_content() {
+        // MANDATED REGRESSION TEST (Codex round 6 adversarial review,
+        // verbatim scenario): the historical module-src `helper` edge was
+        // recorded from a PRIOR version of this file where a closure inside
+        // `Alpha` called `helper()`. Since then the file was edited:
+        // `Alpha`'s call was REMOVED, and an unrelated closure inside a
+        // NEWLY ADDED `Beta` was added that ALSO calls `helper()`. Both
+        // Alpha's (historical) and Beta's (fresh) closures legacy-attribute
+        // to the MODULE node under the frozen pre-92179d1 rule — a single,
+        // unique current-src candidate ("Beta") — so round 5's
+        // correspondence rule alone would wrongly re-point the historical
+        // edge to Beta, crediting gate closure the evidence does not
+        // support: Beta's call was never proven to be the SAME physical call
+        // Alpha's was. The module node's stored `body_hash` (computed from
+        // the OLD, Alpha-containing content) does NOT match the fresh
+        // module hash (computed from the CURRENT, Beta-containing content on
+        // disk) — the content-identity gate must refuse the re-point. The
+        // edge must fall through to the ordinary drift guard exactly as if
+        // no legacy correspondence existed at all (module-src edges always
+        // satisfy `can_drift`'s condition (c)), never silently guessed onto
+        // Beta.
+        let old_content =
+            "function Alpha() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
+        let current_content =
+            "function Beta() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.tsx");
+        std::fs::write(&file_path, current_content).unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "tsx".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                // Historical hash from the OLD (Alpha) content — deliberately
+                // DIFFERENT from what a fresh re-parse of `current_content`
+                // (Beta) will produce.
+                body_hash: crate::extraction::codegraph::body_hash(old_content),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        // `Beta`'s real node — present in the shadow exactly as it would be
+        // from a real prior extraction. Seeded so that, if the content-
+        // identity gate were ever removed or bypassed, the re-point would
+        // actually succeed (proving this test catches a real regression,
+        // not merely a missing shadow lookup entry).
+        let beta_id = crate::extraction::codegraph::node_id("repo", &file_str, "function", "Beta");
+        seed_backfill_node(&shadow, &beta_id, &file_str, "Beta");
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[EdgeRow {
+                    src_id: module_id.clone(),
+                    dst_id: "name:helper".into(),
+                    kind: "calls".into(),
+                    src_file: file_str.clone(),
+                    resolved: 0,
+                    weight: 1.0,
+                    callee_kind: "direct".into(),
+                    ..EdgeRow::default()
+                }],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(
+            files, 1,
+            "the on-disk (current, Beta-containing) file was re-extracted"
+        );
+        assert_eq!(
+            edges, 0,
+            "content-identity mismatch refuses the re-point — never counted as updated"
+        );
+
+        let (src_id, boundary, evidence, resolved): (String, String, String, i64) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT src_id, boundary, evidence, resolved FROM code_edges
+                     WHERE dst_id = 'name:helper' AND kind = 'calls'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            src_id, module_id,
+            "must NOT re-point to Beta — content identity is unprovable across the edit"
+        );
+        assert_ne!(src_id, beta_id);
+        assert_eq!(
+            boundary, "drifted",
+            "falls through to the ordinary drift guard — same honest classification as \
+             when no legacy correspondence exists at all"
+        );
+        assert_eq!(evidence, "not_in_current_source");
+        assert_eq!(resolved, 0);
+    }
+
+    #[test]
+    fn backfill_never_repoints_when_historical_module_hash_is_missing() {
+        // MANDATED TEST (Codex round 6 adversarial review): a historical
+        // module node whose `body_hash` was never recorded (empty string —
+        // e.g. a row from before this column existed, or a shadow/copy path
+        // that dropped it) must NEVER be treated as a match by accident.
+        // `body_hash` is a sha256 digest and is never the empty string for
+        // any real text, so an empty stored hash can never coincidentally
+        // equal a real fresh one — this test locks that invariant in
+        // directly rather than relying on it being merely accidental.
+        // Content is otherwise UNCHANGED (same shape as the hash-match
+        // positive test) — the only difference is the missing historical
+        // hash — so this isolates "missing" from "mismatched".
+        let source =
+            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.tsx");
+        std::fs::write(&file_path, source).unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "tsx".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                // Deliberately MISSING — `NodeRow::default()`'s body_hash is
+                // "", never overwritten here.
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        let component_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "Component");
+        seed_backfill_node(&shadow, &component_id, &file_str, "Component");
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[EdgeRow {
+                    src_id: module_id.clone(),
+                    dst_id: "name:helper".into(),
+                    kind: "calls".into(),
+                    src_file: file_str.clone(),
+                    resolved: 0,
+                    weight: 1.0,
+                    callee_kind: "direct".into(),
+                    ..EdgeRow::default()
+                }],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(
+            edges, 0,
+            "a missing historical hash refuses the re-point, same as a mismatched one"
+        );
+
+        let (src_id, boundary): (String, String) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT src_id, boundary FROM code_edges
+                     WHERE dst_id = 'name:helper' AND kind = 'calls'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            src_id, module_id,
+            "must NOT re-point to Component — no historical hash to verify against"
+        );
+        assert_ne!(src_id, component_id);
+        assert_eq!(
+            boundary, "drifted",
+            "falls through to the ordinary drift guard, same as a content mismatch"
+        );
+    }
+
+    #[test]
+    fn historical_src_content_unchanged_gates_module_and_named_def_hashes_uniformly() {
+        // MANDATED TEST (Codex round 6 adversarial review): direct unit
+        // coverage of the gate function itself, for BOTH shapes the fix
+        // must handle — module-src (the only shape actually reachable
+        // through `backfill_wcr_witnesses`'s real `legacy_src_attribution`
+        // vs `nearest_def_node` divergence, since the two rules provably
+        // never disagree on a NAMED first ancestor — see
+        // `legacy_src_attribution`'s doc comment) and named-def-src (the
+        // general case the gate is written to handle uniformly, with no
+        // module special-casing, even though today's extractor cannot
+        // itself produce a named-src legacy-correspondence edge). Matching
+        // hash allows; mismatched, and missing, hashes refuse — never a
+        // guess either way.
+        let mut fresh: HashMap<(&str, &str), &str> = HashMap::new();
+        fresh.insert(("module", "a.tsx"), "abc123");
+        fresh.insert(("function", "helper2"), "def456");
+
+        // Module-src: matching hash -> allowed.
+        assert!(historical_src_content_unchanged(
+            &fresh, "module", "a.tsx", "abc123"
+        ));
+        // Module-src: mismatched hash -> refused.
+        assert!(!historical_src_content_unchanged(
+            &fresh, "module", "a.tsx", "zzz999"
+        ));
+        // Module-src: missing historical hash -> refused.
+        assert!(!historical_src_content_unchanged(
+            &fresh, "module", "a.tsx", ""
+        ));
+        // Module-src: no fresh node at all for this (kind, name) -> refused.
+        assert!(!historical_src_content_unchanged(
+            &fresh, "module", "gone.tsx", "abc123"
+        ));
+
+        // Named-def-src: matching hash -> allowed.
+        assert!(historical_src_content_unchanged(
+            &fresh, "function", "helper2", "def456"
+        ));
+        // Named-def-src: mismatched hash -> refused.
+        assert!(!historical_src_content_unchanged(
+            &fresh, "function", "helper2", "stale000"
+        ));
+        // Named-def-src: missing historical hash -> refused.
+        assert!(!historical_src_content_unchanged(
+            &fresh, "function", "helper2", ""
+        ));
+        // Named-def-src: right name, WRONG kind (e.g. a `type` node sharing
+        // the bare name) -> refused — kind-blind matching is exactly the
+        // guess this gate (and `shadow_name_to_id`, elsewhere) must never
+        // make.
+        assert!(!historical_src_content_unchanged(
+            &fresh, "type", "helper2", "def456"
+        ));
     }
 
     #[test]
@@ -4208,13 +4609,16 @@ mod tests {
         // failed: code_edges.src_id, code_edges.dst_id, code_edges.kind`),
         // aborting the ENTIRE backfill pass (no per-file catch) and
         // silently leaving every file after the collision un-backfilled.
+        //
+        // Codex round 6: content unchanged since recording (`source` is both
+        // on disk and the historical module hash's source), so the
+        // content-identity gate must pass and this dedupe path must still
+        // exercise a real re-point.
+        let source =
+            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.tsx");
-        std::fs::write(
-            &file_path,
-            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n",
-        )
-        .unwrap();
+        std::fs::write(&file_path, source).unwrap();
         let file_str = file_path.to_string_lossy().to_string();
 
         let shadow = Arc::new(Storage::open_memory().unwrap());
@@ -4229,6 +4633,7 @@ mod tests {
                 lang: "tsx".into(),
                 kind: "module".into(),
                 name: file_str.clone(),
+                body_hash: crate::extraction::codegraph::body_hash(source),
                 first_conv_id: "c".into(),
                 last_conv_id: "c".into(),
                 ..NodeRow::default()
@@ -4322,13 +4727,14 @@ mod tests {
         // own pairing (never split across rows), and callee_kind/evidence
         // are refreshed from the CURRENT fresh extraction on the
         // surviving row regardless of which branch touches it.
+        //
+        // Codex round 6: content unchanged since recording — same
+        // content-identity gate note as the dedupe test above.
+        let source =
+            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.tsx");
-        std::fs::write(
-            &file_path,
-            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n",
-        )
-        .unwrap();
+        std::fs::write(&file_path, source).unwrap();
         let file_str = file_path.to_string_lossy().to_string();
 
         let shadow = Arc::new(Storage::open_memory().unwrap());
@@ -4343,6 +4749,7 @@ mod tests {
                 lang: "tsx".into(),
                 kind: "module".into(),
                 name: file_str.clone(),
+                body_hash: crate::extraction::codegraph::body_hash(source),
                 first_conv_id: "c".into(),
                 last_conv_id: "c".into(),
                 ..NodeRow::default()
@@ -4460,13 +4867,14 @@ mod tests {
         // is named "Component" — `shadow_name_to_id` must resolve that
         // (kind, name) pair to the FUNCTION node, never the co-named TYPE
         // node.
+        //
+        // Codex round 6: content unchanged since recording — same
+        // content-identity gate note as the dedupe tests above.
+        let source =
+            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.ts");
-        std::fs::write(
-            &file_path,
-            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n",
-        )
-        .unwrap();
+        std::fs::write(&file_path, source).unwrap();
         let file_str = file_path.to_string_lossy().to_string();
 
         let shadow = Arc::new(Storage::open_memory().unwrap());
@@ -4481,6 +4889,7 @@ mod tests {
                 lang: "typescript".into(),
                 kind: "module".into(),
                 name: file_str.clone(),
+                body_hash: crate::extraction::codegraph::body_hash(source),
                 first_conv_id: "c".into(),
                 last_conv_id: "c".into(),
                 ..NodeRow::default()
