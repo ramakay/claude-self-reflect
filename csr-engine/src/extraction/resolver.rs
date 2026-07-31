@@ -248,25 +248,36 @@ struct Pending {
     /// already-classified, and every tier is skipped for it.
     boundary: String,
     name: String,
-    /// Second X4 adversarial review, Finding 4: this edge's own call/import-
-    /// site scope CHAIN — `edge_scope_chains.chain` for this edge's
-    /// `(src_id, dst_id, kind)` when `eval::codegraph::backfill_wcr_witnesses`
-    /// populated a row (LEFT JOINed in the query that builds `Pending`, see
-    /// `resolve_edges`), or, when no such row exists (this edge was outside
-    /// the backfill pass's scope — e.g. every resolve pass that isn't the
-    /// WCR live gate, since only `backfill_wcr_witnesses` ever populates
-    /// `edge_scope_chains`, exactly the same silence-by-construction
-    /// convention as `local_bindings`), the pre-chain fallback (computed in
+    /// Second X4 adversarial review, Finding 4; upgraded to ALL of an edge's
+    /// distinct chains by the Codex round 4 adversarial review, Finding 1:
+    /// every DISTINCT call/import-site scope CHAIN recorded in
+    /// `edge_scope_chains` for this edge's `(src_id, dst_id, kind)` —
+    /// fetched as a separate `(src_id, dst_id, kind) -> Vec<chain>` map in
+    /// `resolve_edges`'s Pass 1e (never a JOIN against the main Pending
+    /// query: a JOIN would fan out into one Pending row PER CHAIN for a
+    /// multi-occurrence edge, corrupting the one-Pending-per-DB-row
+    /// invariant every stat bucket in this module relies on). When
+    /// `eval::codegraph::backfill_wcr_witnesses` populated at least one row
+    /// (only the WCR live gate ever does — every other resolve pass has no
+    /// rows in `edge_scope_chains` at all, exactly the same
+    /// silence-by-construction convention as `local_bindings`), this is
+    /// that full set. Otherwise, the pre-chain fallback (computed in
     /// `resolve_edges`'s Pass 2, from `code_nodes.name` of `src_id` — the
     /// edge's own calling def, or the synthetic module node's own name,
-    /// which IS the file path, for a module-level edge): `""` when that
-    /// calling "def" IS the file itself, else the calling def's bare name —
-    /// i.e. "act as if this call/import sits directly in its calling def,
-    /// no closure nesting known", the X4 adversarial review Finding 1
-    /// behavior this replaces. `classify_only`'s X4 block prefix-matches
-    /// each `local_bindings` witness's own chain against THIS field, never
-    /// `src_name` directly — see `chain_prefix_matches`'s doc comment.
-    call_scope_chain: String,
+    /// which IS the file path, for a module-level edge) as the SOLE
+    /// element: `""` when that calling "def" IS the file itself, else the
+    /// calling def's bare name — i.e. "act as if this call/import sits
+    /// directly in its calling def, no closure nesting known", the X4
+    /// adversarial review Finding 1 behavior this replaces. Always
+    /// non-empty (the fallback guarantees at least one element) —
+    /// `classify_only`'s X4 block relies on this: it requires a witness's
+    /// binding chain to be a prefix of EVERY element (conservative
+    /// universal quantification — Finding 1, Codex round 4: one call site's
+    /// chain is no longer allowed to stand in for a whole aggregated edge's
+    /// worth of occurrences), and `[].iter().all(..)` is vacuously `true`,
+    /// so an accidentally-empty vec here would wrongly witness everything.
+    /// Never `src_name` directly — see `chain_prefix_matches`'s doc comment.
+    call_scope_chains: Vec<String>,
 }
 
 /// Resolve all `name:<symbol>` placeholder edges within `project` (empty =
@@ -412,19 +423,50 @@ pub fn resolve_edges(
         }
     }
 
+    // Pass 1e (Codex round 4 adversarial review, Finding 1): every fresh
+    // call/import site's own scope CHAIN for a pending edge's own
+    // `(src_id, dst_id, kind)` key — potentially MULTIPLE rows per key now
+    // (`edge_scope_chains`' primary key grew `chain` — see its migration
+    // comment), one per distinct physical occurrence
+    // `extraction::codegraph::extract_inner` recorded for the aggregated
+    // edge. Fetched as a SEPARATE map, never via a JOIN in the Pass 2 query
+    // below — a LEFT JOIN would fan out into one row PER CHAIN for a
+    // multi-occurrence edge, corrupting the one-Pending-per-DB-row
+    // invariant every stat bucket in this module relies on (double-counting
+    // `resolved` and every other counter). Grouped in ascending `chain`
+    // order (the SQL `ORDER BY` — deterministic regardless of INSERT
+    // order, which is exactly what the Finding 1 "test both orders"
+    // regression needs).
+    let mut edge_scope_chains: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT src_id, dst_id, kind, chain FROM edge_scope_chains
+             WHERE (?1 = '' OR project = ?1)
+             ORDER BY src_id, dst_id, kind, chain",
+        )?;
+        let rows = stmt.query_map(params![project], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for r in rows {
+            let (src_id, dst_id, kind, chain) = r?;
+            edge_scope_chains
+                .entry((src_id, dst_id, kind))
+                .or_default()
+                .push(chain);
+        }
+    }
+
     // Pass 2: collect placeholder edges (calls + imports), deterministically.
-    // Second X4 adversarial review, Finding 4: LEFT JOIN `edge_scope_chains`
-    // (never an INNER JOIN — most resolve passes outside the WCR live gate
-    // have no rows there at all, and even within it not every pending edge
-    // has one; see `Pending::call_scope_chain`'s doc comment for the
-    // fallback this feeds).
     let mut pending: Vec<Pending> = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT e.src_id, e.dst_id, e.kind, n.file, n.project, e.callee_kind, e.evidence, e.boundary, n.name, esc.chain
+            "SELECT e.src_id, e.dst_id, e.kind, n.file, n.project, e.callee_kind, e.evidence, e.boundary, n.name
              FROM code_edges e JOIN code_nodes n ON n.id = e.src_id
-             LEFT JOIN edge_scope_chains esc
-               ON esc.src_id = e.src_id AND esc.dst_id = e.dst_id AND esc.kind = e.kind
              WHERE e.resolved = 0 AND e.dst_id LIKE 'name:%'
                AND (?1 = '' OR n.project = ?1)
              ORDER BY e.src_id, e.dst_id, e.kind",
@@ -440,7 +482,6 @@ pub fn resolve_edges(
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
-                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         for r in rows {
@@ -454,22 +495,28 @@ pub fn resolve_edges(
                 evidence,
                 boundary,
                 src_name,
-                chain,
             ) = r?;
             let name = dst_id.strip_prefix("name:").unwrap_or(&dst_id).to_string();
-            // Fallback mirrors the pre-chain `caller_scope` computation that
+            // Second X4 adversarial review, Finding 4; upgraded to a Vec by
+            // Finding 1 (Codex round 4): when `edge_scope_chains` has at
+            // least one row for this edge, use ALL of them. Otherwise, the
+            // fallback mirrors the pre-chain `caller_scope` computation that
             // used to live in `classify_only` itself: module-level (this
             // edge's own calling "def" IS the synthetic module node, whose
             // `code_nodes.name` is the file path) maps to `""`; otherwise
             // the bare calling-def name, unchanged from before chains
-            // existed — see `Pending::call_scope_chain`'s doc comment.
-            let call_scope_chain = chain.unwrap_or_else(|| {
-                if src_name == src_file {
-                    String::new()
-                } else {
-                    src_name.clone()
-                }
-            });
+            // existed — see `Pending::call_scope_chains`'s doc comment. The
+            // fallback vec always has exactly one element — `call_scope_chains`
+            // must never be empty (see that field's own doc comment).
+            let call_scope_chains =
+                match edge_scope_chains.get(&(src_id.clone(), dst_id.clone(), kind.clone())) {
+                    Some(chains) if !chains.is_empty() => chains.clone(),
+                    _ => vec![if src_name == src_file {
+                        String::new()
+                    } else {
+                        src_name.clone()
+                    }],
+                };
             pending.push(Pending {
                 src_id,
                 dst_id,
@@ -480,7 +527,7 @@ pub fn resolve_edges(
                 evidence,
                 boundary,
                 name,
-                call_scope_chain,
+                call_scope_chains,
             });
         }
     }
@@ -945,25 +992,41 @@ fn classify_only(
     // Scope-qualified as of the X4 adversarial review (Finding 1), and
     // CHAIN-qualified (prefix match, not exact) as of the second X4
     // adversarial review (Finding 4): a witness only counts when its scope
-    // CHAIN is this edge's own call-site chain (`p.call_scope_chain`) OR AN
-    // OUTER PREFIX OF IT — never merely "some binding of this name exists
-    // somewhere in the file", and never merely "same enclosing NAMED def"
-    // either. Finding 1 alone (flat scope-equality on the enclosing named
-    // def's bare name) was still too coarse: `nearest_def_node` deliberately
-    // flattens every anonymous closure onto the outer named def for GRAPH
-    // attribution, so a parameter named `handler` bound in one anonymous
-    // closure and an unrelated `handler()` call in a SIBLING anonymous
-    // closure — both nested in the SAME named function — reported the SAME
-    // bare scope and wrongly matched. `chain_prefix_matches` fixes this:
-    // "outer bindings flow inward" (a binding declared directly in a
-    // function's body is visible to every closure nested inside it) but
-    // "never sideways" (a binding declared inside one closure is invisible
-    // to an unrelated sibling closure, even though both share the same
-    // outer named def). See `chain_prefix_matches`'s own doc comment.
+    // CHAIN is this edge's own call-site chain OR AN OUTER PREFIX OF IT —
+    // never merely "some binding of this name exists somewhere in the
+    // file", and never merely "same enclosing NAMED def" either. Finding 1
+    // alone (flat scope-equality on the enclosing named def's bare name)
+    // was still too coarse: `nearest_def_node` deliberately flattens every
+    // anonymous closure onto the outer named def for GRAPH attribution, so
+    // a parameter named `handler` bound in one anonymous closure and an
+    // unrelated `handler()` call in a SIBLING anonymous closure — both
+    // nested in the SAME named function — reported the SAME bare scope and
+    // wrongly matched. `chain_prefix_matches` fixes this: "outer bindings
+    // flow inward" (a binding declared directly in a function's body is
+    // visible to every closure nested inside it) but "never sideways" (a
+    // binding declared inside one closure is invisible to an unrelated
+    // sibling closure, even though both share the same outer named def).
+    // See `chain_prefix_matches`'s own doc comment.
+    //
+    // UNIVERSAL quantification over `p.call_scope_chains` as of the Codex
+    // round 4 adversarial review, Finding 1: `code_edges` AGGREGATES every
+    // physical call/import site sharing this edge's `(src_id, dst_id, kind)`
+    // into ONE row, so `call_scope_chains` can hold MORE THAN ONE chain —
+    // one per distinct site folded into the aggregate. A binding only
+    // witnesses the WHOLE aggregate when its chain is a prefix of EVERY ONE
+    // of them (`.all(..)`), not merely one — the previous "first chain
+    // recorded" behavior was order-dependent and could falsely witness an
+    // aggregate via a binding that only encloses ONE of its (possibly many)
+    // sibling-closure occurrences. `call_scope_chains` is guaranteed
+    // non-empty (see that field's own doc comment), so `.all(..)` here is
+    // never vacuously `true` by construction.
     if zero_defs_anywhere {
         if let Some(pairs) = local_bindings.get(&(p.project.clone(), p.src_file.clone())) {
             let hit = pairs.iter().any(|(binding_chain, name)| {
-                name == &p.name && chain_prefix_matches(binding_chain, &p.call_scope_chain)
+                name == &p.name
+                    && p.call_scope_chains
+                        .iter()
+                        .all(|call_chain| chain_prefix_matches(binding_chain, call_chain))
             });
             if hit {
                 classify_edge(conn, p, "local", &format!("local_scope:{}", p.name))?;
@@ -3451,10 +3514,15 @@ mod tests {
     /// Second X4 adversarial review, Finding 4: seeds an `edge_scope_chains`
     /// row directly — the shape `eval::codegraph::backfill_wcr_witnesses`
     /// would have written for a `(src_id, dst_id, kind)` edge whose call/
-    /// import site sits at `chain` (see `Pending::call_scope_chain`'s doc
+    /// import site sits at `chain` (see `Pending::call_scope_chains`'s doc
     /// comment). `project`/`file` are fixed at `"proj"`/the edge's own
     /// `src_file` convention used throughout this test module (`def`/
-    /// `call_edge` above all hardcode `project = "proj"`).
+    /// `call_edge` above all hardcode `project = "proj"`). `chain` joined
+    /// `edge_scope_chains`' own PRIMARY KEY as of the Codex round 4
+    /// adversarial review (Finding 1), so calling this MORE THAN ONCE for
+    /// the SAME `(src_id, dst_name, kind)` with DIFFERENT `chain` values
+    /// inserts one row PER chain (never overwrites) — exactly what a
+    /// multi-occurrence aggregated edge needs.
     fn insert_edge_scope_chain(
         conn: &Connection,
         file: &str,
@@ -3967,7 +4035,7 @@ mod tests {
     #[test]
     fn x4_chain_falls_back_to_bare_scope_when_no_edge_scope_chains_row() {
         // No `edge_scope_chains` row for this edge (e.g. outside a
-        // `backfill_wcr_witnesses` pass) — `call_scope_chain` must fall back
+        // `backfill_wcr_witnesses` pass) — `call_scope_chains` must fall back
         // to the pre-chain bare enclosing-def name, preserving the ORIGINAL
         // X4 adversarial review (Finding 1) exact-match behavior exactly.
         // This is also implicitly covered by every OTHER X4 test in this
@@ -3989,5 +4057,170 @@ mod tests {
             stats.local, 1,
             "bare-name fallback still matches a bare-name binding"
         );
+    }
+
+    // ─── X4 universal quantification over multi-chain edges (Codex round 4
+    // adversarial review, Finding 1: one scope chain reused for multiple
+    // distinct call sites) ───
+
+    #[test]
+    fn x4_multi_chain_aggregate_not_local_when_binding_scope_a_inserted_first() {
+        // MANDATED TEST (Finding 1), order A: the SAME callee (`helper`)
+        // called from TWO SIBLING anonymous closures aggregates into ONE
+        // `code_edges` row (both share src `Component`) but carries TWO
+        // distinct `edge_scope_chains` rows — one per physical site. A
+        // binding witnessed inside only ONE of the two sibling closures
+        // (`Component>anon3`) must NOT classify the aggregate `local`: it
+        // is not a prefix of the OTHER occurrence's chain
+        // (`Component>anon9`), and Finding 1 requires a witness to be a
+        // prefix of EVERY occurrence, not just one. `Component>anon3` row
+        // inserted FIRST here; the companion test below inserts
+        // `Component>anon9` first — both must produce the identical result.
+        let conn = mem();
+        upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.tsx",
+            &[call_edge("Component", "helper", "a.tsx")],
+        )
+        .unwrap();
+        insert_edge_scope_chain(
+            &conn,
+            "a.tsx",
+            "Component",
+            "helper",
+            "calls",
+            "Component>anon3",
+        );
+        insert_edge_scope_chain(
+            &conn,
+            "a.tsx",
+            "Component",
+            "helper",
+            "calls",
+            "Component>anon9",
+        );
+        insert_local_binding(&conn, "proj", "a.tsx", "Component>anon3", "helper");
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(
+            stats.local, 0,
+            "a binding that only encloses ONE of the aggregate's two sibling-closure \
+             occurrences must never witness the whole aggregate"
+        );
+        assert_eq!(stats.unexplained, 1);
+
+        let boundary: String = conn
+            .query_row(
+                "SELECT boundary FROM code_edges WHERE src_id = 'Component' AND kind = 'calls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(boundary, "", "must stay unexplained, not local");
+    }
+
+    #[test]
+    fn x4_multi_chain_aggregate_not_local_when_binding_scope_b_inserted_first() {
+        // MANDATED TEST (Finding 1), order B: same scenario as the test
+        // above, with the TWO `edge_scope_chains` rows inserted in the
+        // OPPOSITE order (`Component>anon9` first, `Component>anon3`
+        // second). Universal quantification over the full chain SET must
+        // be order-independent — both tests must assert the identical
+        // outcome (`stats.local == 0`).
+        let conn = mem();
+        upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.tsx",
+            &[call_edge("Component", "helper", "a.tsx")],
+        )
+        .unwrap();
+        insert_edge_scope_chain(
+            &conn,
+            "a.tsx",
+            "Component",
+            "helper",
+            "calls",
+            "Component>anon9",
+        );
+        insert_edge_scope_chain(
+            &conn,
+            "a.tsx",
+            "Component",
+            "helper",
+            "calls",
+            "Component>anon3",
+        );
+        insert_local_binding(&conn, "proj", "a.tsx", "Component>anon3", "helper");
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(
+            stats.local, 0,
+            "insertion order must never change the outcome — same result as scope-A-first"
+        );
+        assert_eq!(stats.unexplained, 1);
+
+        let boundary: String = conn
+            .query_row(
+                "SELECT boundary FROM code_edges WHERE src_id = 'Component' AND kind = 'calls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(boundary, "", "must stay unexplained, not local");
+    }
+
+    #[test]
+    fn x4_multi_chain_aggregate_local_when_binding_prefixes_every_occurrence() {
+        // Positive counterpart: a binding declared directly in `Component`'s
+        // OWN body (chain == the bare name, no closure nesting of its own)
+        // IS a prefix of BOTH sibling closures' chains — universal
+        // quantification must still succeed when the witness genuinely
+        // encloses every occurrence, proving the fix doesn't just block
+        // everything.
+        let conn = mem();
+        upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.tsx",
+            &[call_edge("Component", "helper", "a.tsx")],
+        )
+        .unwrap();
+        insert_edge_scope_chain(
+            &conn,
+            "a.tsx",
+            "Component",
+            "helper",
+            "calls",
+            "Component>anon3",
+        );
+        insert_edge_scope_chain(
+            &conn,
+            "a.tsx",
+            "Component",
+            "helper",
+            "calls",
+            "Component>anon9",
+        );
+        insert_local_binding(&conn, "proj", "a.tsx", "Component", "helper");
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(
+            stats.local, 1,
+            "an outer binding that encloses EVERY occurrence must still classify local"
+        );
+
+        let boundary: String = conn
+            .query_row(
+                "SELECT boundary FROM code_edges WHERE src_id = 'Component' AND kind = 'calls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(boundary, "local");
     }
 }

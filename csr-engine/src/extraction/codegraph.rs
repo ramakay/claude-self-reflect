@@ -47,24 +47,46 @@ pub struct GraphFragment {
     /// on its own already-parsed `root`), never a second, separate parse.
     pub local_bindings: BTreeSet<(String, String)>,
     /// X4 adversarial review, Finding 4 (sibling anonymous-closure
-    /// conflation): the AST scope CHAIN of each `calls`/`imports` call/
-    /// import site — keyed identically to `edges`, `(src_id, dst_id, kind)`
-    /// — from the SAME parse as `nodes`/`edges`/`local_bindings`, never a
-    /// second one. A chain is the nearest enclosing NAMED def's name
-    /// followed by `>anon<idx>` for each anonymous function-kind ancestor
-    /// between that named def and the site (outer to inner), `<idx>` a
-    /// deterministic within-parse preorder index over every func-kind node
-    /// in the file (see `func_node_preorder_index`/`scope_chain`) — e.g.
-    /// `"Component"` / `"Component>anon12"` / `"Component>anon12>anon15"`.
-    /// `""` for a module-level site. Witness machinery ONLY for the X4
-    /// resolver tier's prefix match (see `local_bindings`'s doc comment and
-    /// `nearest_def_node`'s Finding 4 note) — GRAPH src attribution
-    /// (`edges[..].src_id`, still from `nearest_def_node` alone) is
-    /// unaffected. Chains are only ever compared within a single re-
-    /// extraction of the SAME file content (`local_bindings` and this map
-    /// are recomputed together from the same fresh parse) — never persist
-    /// one across different file versions as if directly comparable.
-    pub call_scope_chains: BTreeMap<(String, String, String), String>,
+    /// conflation); upgraded to ALL DISTINCT chains per edge by the Codex
+    /// round 4 adversarial review, Finding 1: the AST scope CHAIN of EVERY
+    /// `calls`/`imports` call/import site — keyed identically to `edges`,
+    /// `(src_id, dst_id, kind)` — from the SAME parse as
+    /// `nodes`/`edges`/`local_bindings`, never a second one. A chain is the
+    /// nearest enclosing NAMED def's name followed by `>anon<idx>` for each
+    /// anonymous function-kind ancestor between that named def and the site
+    /// (outer to inner), `<idx>` a deterministic within-parse preorder
+    /// index over every func-kind node in the file (see
+    /// `func_node_preorder_index`/`scope_chain`) — e.g. `"Component"` /
+    /// `"Component>anon12"` / `"Component>anon12>anon15"`. `""` for a
+    /// module-level site.
+    ///
+    /// `edges` AGGREGATES every physical call/import site sharing the same
+    /// `(src_id, dst_id, kind)` triple into ONE edge (`add_edge`'s own
+    /// `and_modify` — only `weight` accumulates, `callee_kind`/`evidence`
+    /// keep the first occurrence's values). Before Finding 1, this map kept
+    /// only the FIRST such site's chain too (`or_insert_with`) — for an
+    /// edge aggregating calls from TWO sibling anonymous closures, that
+    /// meant the X4 resolver tier evaluated the whole aggregate against
+    /// exactly ONE occurrence's chain, order-dependent on `root.find_all`'s
+    /// traversal order: it could falsely witness the aggregate via a
+    /// binding that only encloses the OTHER (unrecorded) occurrence, or
+    /// fail to witness a binding that correctly encloses every recorded
+    /// occurrence. The value here is now the FULL SET of distinct chains
+    /// (a `BTreeSet` — deterministic order, natural dedup of repeat
+    /// occurrences at the identical chain), and the X4 tier classifies
+    /// `local` only when a witness's binding chain is a prefix of EVERY
+    /// member (conservative universal quantification — see
+    /// `resolver::Pending::call_scope_chains`'s doc comment).
+    ///
+    /// Witness machinery ONLY for the X4 resolver tier's prefix match (see
+    /// `local_bindings`'s doc comment and `nearest_def_node`'s Finding 4
+    /// note) — GRAPH src attribution (`edges[..].src_id`, still from
+    /// `nearest_def_node` alone) is unaffected. Chains are only ever
+    /// compared within a single re-extraction of the SAME file content
+    /// (`local_bindings` and this map are recomputed together from the same
+    /// fresh parse) — never persist one across different file versions as
+    /// if directly comparable.
+    pub call_scope_chains: BTreeMap<(String, String, String), BTreeSet<String>>,
     /// Finding 3 (X4 adversarial review): `true` iff the tree-sitter parse
     /// of this file produced NO `ERROR`/`MISSING` node anywhere in the tree
     /// (see `tree_has_error`). A degraded/partial parse can still recover
@@ -1364,13 +1386,15 @@ fn extract_inner(
     let lang_name = lang_name(lang);
     let mut nodes: BTreeMap<String, NodeRow> = BTreeMap::new();
     let mut edges: BTreeMap<(String, String, String), EdgeRow> = BTreeMap::new();
-    // X4 adversarial review, Finding 4: keyed identically to `edges`
+    // X4 adversarial review, Finding 4; ALL-distinct-chains as of the Codex
+    // round 4 adversarial review, Finding 1: keyed identically to `edges`
     // — `(src_id, dst_id, kind)` — see `GraphFragment::call_scope_chains`'s
-    // doc comment. First-wins on a repeat key, same convention as `edges`'
-    // own `and_modify` (only bumps weight, never overwrites callee_kind/
-    // evidence on a dedup hit) — every physical occurrence of a given
-    // (src, callee, kind) triple is treated as equivalent.
-    let mut call_scope_chains: BTreeMap<(String, String, String), String> = BTreeMap::new();
+    // doc comment. Every physical occurrence's OWN chain is recorded (never
+    // just the first), so an edge aggregating calls from multiple distinct
+    // scopes carries the full set the X4 resolver tier needs to universally
+    // quantify over.
+    let mut call_scope_chains: BTreeMap<(String, String, String), BTreeSet<String>> =
+        BTreeMap::new();
 
     // Synthetic module node anchoring the file.
     let module_id = node_id(repo, file, "module", file);
@@ -1527,7 +1551,8 @@ fn extract_inner(
                 add_edge(module_id.clone(), dst.clone(), "imports", 0, "", &evidence);
                 call_scope_chains
                     .entry((module_id.clone(), dst, "imports".to_string()))
-                    .or_insert_with(|| import_chain.clone());
+                    .or_default()
+                    .insert(import_chain.clone());
             }
         }
     }
@@ -1596,9 +1621,16 @@ fn extract_inner(
             // way, so two calls that share `src` (same enclosing named def)
             // but sit in different sibling closures still get DIFFERENT
             // chains — see `GraphFragment::call_scope_chains`'s doc comment.
+            // Codex round 4, Finding 1: inserted into the chain SET, never
+            // `or_insert_with` — a repeat `(src, dst, "calls")` key (a
+            // second physical call site aggregated into the same edge) adds
+            // its OWN chain alongside any already recorded, rather than
+            // being silently dropped in favor of whichever site was walked
+            // first.
             call_scope_chains
                 .entry((src, dst, "calls".to_string()))
-                .or_insert_with(|| scope_chain(&n, lang, &func_index));
+                .or_default()
+                .insert(scope_chain(&n, lang, &func_index));
         }
     }
 
@@ -2986,7 +3018,7 @@ function Component() {\n\
             "GRAPH attribution must stay flattened to the named def: {frag:?}"
         );
 
-        let call_chain = frag
+        let call_chains = frag
             .call_scope_chains
             .get(&(
                 call.src_id.clone(),
@@ -2994,6 +3026,12 @@ function Component() {\n\
                 "calls".to_string(),
             ))
             .expect("a calls edge must have a recorded scope chain");
+        assert_eq!(
+            call_chains.len(),
+            1,
+            "single physical call site: exactly one chain recorded: {call_chains:?}"
+        );
+        let call_chain = call_chains.iter().next().unwrap();
         assert!(
             call_chain.starts_with("Component>anon"),
             "the call site is itself inside an anonymous closure: {call_chain}"
@@ -3034,7 +3072,7 @@ function Component() {\n\
             .iter()
             .find(|e| e.kind == "calls" && e.dst_id == "name:playTrack")
             .expect("playTrack() calls edge present");
-        let call_chain = frag
+        let call_chains = frag
             .call_scope_chains
             .get(&(
                 call.src_id.clone(),
@@ -3042,6 +3080,12 @@ function Component() {\n\
                 "calls".to_string(),
             ))
             .expect("a calls edge must have a recorded scope chain");
+        assert_eq!(
+            call_chains.len(),
+            1,
+            "single physical call site: exactly one chain recorded: {call_chains:?}"
+        );
+        let call_chain = call_chains.iter().next().unwrap();
         assert!(
             call_chain.starts_with("Component>anon"),
             "the call is made from inside a sibling useCallback closure: {call_chain}"
@@ -3053,5 +3097,60 @@ function Component() {\n\
             "the call's chain must be nested strictly inside the outer \"Component\" \
              binding's chain (a real chain-segment boundary, not just a text prefix): {call_chain}"
         );
+    }
+
+    #[test]
+    fn call_scope_chains_records_every_distinct_site_for_an_aggregated_edge() {
+        // MANDATED TEST (Codex round 4 adversarial review, Finding 1): the
+        // SAME callee invoked from TWO SIBLING anonymous closures aggregates
+        // into ONE `code_edges` row (`add_edge`'s own `(src_id, dst_id,
+        // kind)` dedup — both calls share the same enclosing named def,
+        // `Component`), but `call_scope_chains` must carry BOTH sites' own
+        // chains, not just whichever was walked first.
+        let src = "\
+function Component() {\n\
+    useCallback(() => {\n\
+        helper();\n\
+    }, []);\n\
+    useCallback(() => {\n\
+        helper();\n\
+    }, []);\n\
+}\n";
+        let frag = extract_graph_fragment(src, SupportLang::Tsx, "a.tsx", "repo", "proj", "c", "s");
+        let calls: Vec<_> = frag
+            .edges
+            .iter()
+            .filter(|e| e.kind == "calls" && e.dst_id == "name:helper")
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "both physical call sites aggregate into ONE edge: {calls:?}"
+        );
+        let call = calls[0];
+        assert_eq!(
+            call.weight, 2.0,
+            "weight still accumulates per physical occurrence, unaffected by this fix"
+        );
+        let call_chains = frag
+            .call_scope_chains
+            .get(&(
+                call.src_id.clone(),
+                call.dst_id.clone(),
+                "calls".to_string(),
+            ))
+            .expect("a calls edge must have recorded scope chains");
+        assert_eq!(
+            call_chains.len(),
+            2,
+            "BOTH sibling closures' own chains must be recorded, not just the first: \
+             {call_chains:?}"
+        );
+        for chain in call_chains {
+            assert!(
+                chain.starts_with("Component>anon"),
+                "each recorded chain must be nested inside Component: {chain}"
+            );
+        }
     }
 }

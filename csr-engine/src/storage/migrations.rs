@@ -475,36 +475,68 @@ pub fn run(conn: &Connection) -> Result<()> {
         );",
     )?;
 
-    // edge_scope_chains (X4 adversarial review, Finding 4): per pending
-    // `calls`/`imports` edge, the AST scope CHAIN of its own call/import
-    // site — keyed identically to `code_edges`' own primary key
-    // `(src_id, dst_id, kind)`. A brand-new table (no prior schema to
-    // migrate away from, unlike `local_bindings` above), so a plain
-    // `CREATE TABLE IF NOT EXISTS` is sufficient. Populated by
-    // `eval::codegraph::backfill_wcr_witnesses` for EVERY fresh `calls`/
-    // `imports` edge in a re-extracted file (`extraction::codegraph::
-    // GraphFragment::call_scope_chains`), unconditionally — same
-    // "persist everything this fresh pass saw" philosophy as
-    // `local_bindings`, never filtered down to only the edges some pending
-    // row happened to match. A pending edge that MATCHES or gets
-    // RE-POINTED (Finding: attribution-skewed re-point, see
-    // `backfill_wcr_witnesses`) to a fresh edge therefore ends this
-    // backfill pass with a `(src_id, dst_id, kind)` that IS a key in this
-    // table; an edge left untouched (no fresh counterpart found at all)
-    // has none — `extraction::resolver::resolve_edges`'s Pending query
-    // LEFT JOINs this table and falls back to the edge's own calling-def
-    // name when no row exists (see `Pending::call_scope_chain`'s doc
-    // comment), preserving the pre-chain exact-match behavior for edges
-    // this backfill pass has no fresh chain data for.
+    // edge_scope_chains (X4 adversarial review, Finding 4; multi-row-per-
+    // edge as of the Codex round 4 adversarial review, Finding 1): per
+    // pending `calls`/`imports` edge, the AST scope CHAIN of EVERY DISTINCT
+    // physical call/import site `code_edges` aggregated into that one
+    // `(src_id, dst_id, kind)` row. Before Finding 1, this table kept only
+    // the FIRST site's chain per edge key (`INSERT OR IGNORE` against a PK
+    // that didn't include `chain`), so an edge aggregating calls from two
+    // DIFFERENT sibling closures silently discarded every occurrence but
+    // one — order-dependent, and able to both falsely witness an aggregate
+    // via an unrelated sibling closure's chain and hide a valid witness.
+    // `chain` is now part of the PRIMARY KEY, so every distinct chain for
+    // the same edge gets its own row (identical chains from repeat physical
+    // sites still collapse to one row — `INSERT OR IGNORE` dedup, same as
+    // before). `extraction::resolver::resolve_edges`'s X4 tier reads ALL
+    // rows for an edge and requires a witness's binding chain to be a
+    // prefix of EVERY one of them (conservative universal quantification —
+    // see `Pending::call_scope_chains`' doc comment) rather than any single
+    // one, matching the true "this edge only reduces to ONE call site"
+    // semantics only when there genuinely is only one.
+    //
+    // DROP+CREATE (same reasoning as `local_bindings`, immediately above):
+    // this table only ever holds shadow/witness data, rebuilt from scratch
+    // by every `backfill_wcr_witnesses` pass (see
+    // `persist_call_scope_chains`'s transactional replace-per-file
+    // semantics), so an unconditional drop-and-recreate on every migration
+    // run is safe; it is also necessary — a pre-existing DB with the OLD
+    // 5-column `(src_id, dst_id, kind)`-only-PK schema would otherwise
+    // silently keep that schema forever (`CREATE TABLE IF NOT EXISTS` is a
+    // no-op once the table exists), breaking every query below that now
+    // expects `chain` to be part of the key (a stale single-row-per-edge DB
+    // would silently drop every occurrence past the first on the next
+    // `INSERT OR IGNORE`, reintroducing the exact bug this migration fixes).
+    //
+    // Populated by `eval::codegraph::backfill_wcr_witnesses` for EVERY
+    // fresh `calls`/`imports` call/import site in a re-extracted file
+    // (`extraction::codegraph::GraphFragment::call_scope_chains`),
+    // unconditionally — same "persist everything this fresh pass saw"
+    // philosophy as `local_bindings`, never filtered down to only the
+    // edges some pending row happened to match. A pending edge that
+    // MATCHES or gets RE-POINTED (Finding: attribution-skewed re-point,
+    // see `backfill_wcr_witnesses`) to a fresh edge therefore ends this
+    // backfill pass with a `(src_id, dst_id, kind)` that has at least one
+    // row in this table; an edge left untouched (no fresh counterpart
+    // found at all) has none — `extraction::resolver::resolve_edges`
+    // fetches this table as a separate `(src_id, dst_id, kind) -> Vec<chain>`
+    // map (never a JOIN against the main Pending query — a JOIN would fan
+    // out into one Pending row per chain for a multi-occurrence edge,
+    // corrupting the one-Pending-per-DB-row invariant every stat bucket
+    // relies on) and falls back to the edge's own calling-def name when no
+    // row exists (see `Pending::call_scope_chains`'s doc comment),
+    // preserving the pre-chain exact-match behavior for edges this
+    // backfill pass has no fresh chain data for.
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS edge_scope_chains (
+        "DROP TABLE IF EXISTS edge_scope_chains;
+         CREATE TABLE edge_scope_chains (
             project TEXT NOT NULL,
             file    TEXT NOT NULL,
             src_id  TEXT NOT NULL,
             dst_id  TEXT NOT NULL,
             kind    TEXT NOT NULL,
             chain   TEXT NOT NULL,
-            PRIMARY KEY (src_id, dst_id, kind)
+            PRIMARY KEY (src_id, dst_id, kind, chain)
         );
         CREATE INDEX IF NOT EXISTS idx_edge_scope_chains_file ON edge_scope_chains(project, file);",
     )?;

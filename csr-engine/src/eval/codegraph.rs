@@ -872,10 +872,19 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
         // as fatal to the backfill pass as any other).
         persist_local_bindings(shadow, &project, &src_file, &fragment.local_bindings)?;
 
-        let id_to_name: HashMap<&str, &str> = fragment
+        // Finding 3 (Codex round 4 adversarial review): kind-qualified —
+        // `id -> (kind, name)`, not `id -> name` alone. `node_id` itself
+        // already disambiguates by kind (the id hash is
+        // `sha256(repo|file|kind|name)`), so a bare name CAN collide across
+        // DIFFERENT def kinds in the same file (e.g. a `function helper`
+        // alongside a top-level `const helper`) — throwing the kind away
+        // before any name-based candidate lookup is what let
+        // `shadow_name_to_id` silently resolve to the WRONG node's id on
+        // such a collision.
+        let id_to_name_kind: HashMap<&str, (&str, &str)> = fragment
             .nodes
             .iter()
-            .map(|n| (n.id.as_str(), n.name.as_str()))
+            .map(|n| (n.id.as_str(), (n.kind.as_str(), n.name.as_str())))
             .collect();
 
         // Codex round 3 adversarial review (the SAME id-mismatch class the
@@ -889,60 +898,92 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
         // `code_nodes` rows (copied verbatim from the live DB) whenever
         // `project` is non-empty, which is effectively always. Only NAMES
         // are safe to compare across the two id spaces (`def_names`,
-        // `id_to_name`'s VALUES, `local_bindings`'s scope strings — none of
-        // those are ids). `shadow_name_to_id` is the bridge: the REAL,
-        // disk-verified `code_nodes.id` for a given name in THIS shadow —
-        // required any time this backfill needs to WRITE a node id into
-        // `code_edges`/`edge_scope_chains` (re-pointing `src_id`, and
-        // translating `fragment.call_scope_chains`' fresh-fragment keys
-        // into real ones before persisting), never for pure name-to-name
-        // comparisons, which never needed this in the first place. Smallest
-        // id wins deterministically on a rare same-file name collision
-        // across kinds (`ORDER BY name, id` + first-insert-wins below).
-        let shadow_name_to_id: HashMap<String, String> = {
-            let rows: Vec<(String, String)> = shadow.with_connection(|conn| {
+        // `id_to_name_kind`'s VALUES, `local_bindings`'s scope strings —
+        // none of those are ids). `shadow_name_to_id` is the bridge: the
+        // REAL, disk-verified `code_nodes.id` for a given (kind, name) in
+        // THIS shadow — required any time this backfill needs to WRITE a
+        // node id into `code_edges`/`edge_scope_chains` (re-pointing
+        // `src_id`, and translating `fragment.call_scope_chains`'
+        // fresh-fragment keys into real ones before persisting), never for
+        // pure name-to-name comparisons, which never needed this in the
+        // first place.
+        //
+        // Finding 3 (Codex round 4 adversarial review): keyed by
+        // `(kind, name)`, never bare `name` — a bare-name collision across
+        // TWO DIFFERENT kinds in this shadow's own `code_nodes` (e.g. a
+        // `function helper` node AND a `type helper` node both present for
+        // this file) used to be silently resolved by picking whichever id
+        // sorted lexicographically smallest (`ORDER BY name, id` +
+        // first-insert-wins) — a GUESS, indistinguishable from a correct
+        // match at the call site. A `(kind, name)` pair that resolves to
+        // MORE THAN ONE id (should be structurally impossible given
+        // `node_id`'s own hash includes `kind`, but the shadow is a copy
+        // that could in principle carry duplicate/legacy rows) is treated
+        // identically to a MISSING match — removed from the map entirely —
+        // so every caller's `.get()` uniformly means "no valid match",
+        // never "pick one anyway".
+        let shadow_name_to_id: HashMap<(String, String), String> = {
+            let rows: Vec<(String, String, String)> = shadow.with_connection(|conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT name, id FROM code_nodes WHERE project = ?1 AND file = ?2
-                     ORDER BY name, id",
+                    "SELECT kind, name, id FROM code_nodes WHERE project = ?1 AND file = ?2
+                     ORDER BY kind, name, id",
                 )?;
                 let mapped = stmt.query_map(rusqlite::params![project, src_file], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?;
                 mapped
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(Into::into)
             })?;
-            let mut map = HashMap::new();
-            for (name, id) in rows {
-                map.entry(name).or_insert(id);
+            let mut counts: HashMap<(String, String), u32> = HashMap::new();
+            let mut map: HashMap<(String, String), String> = HashMap::new();
+            for (kind, name, id) in rows {
+                let key = (kind, name);
+                *counts.entry(key.clone()).or_insert(0) += 1;
+                map.entry(key).or_insert(id);
             }
+            map.retain(|key, _| counts.get(key) == Some(&1));
             map
         };
 
-        // X4 adversarial review, Finding 4: persist EVERY fresh calls/
-        // imports edge's own scope chain, unconditionally — never filtered
-        // to only the edges some pending row happens to match (same
-        // philosophy as `persist_local_bindings`, immediately above). Keys
-        // are TRANSLATED from `fragment.call_scope_chains`'s fresh-fragment
-        // ids into real shadow ids (via `id_to_name` then
-        // `shadow_name_to_id`, per that map's own doc comment) before
-        // persisting — the raw fresh-fragment key would never match this
-        // shadow's `code_edges.src_id` at read time otherwise. A fresh call/
-        // import site whose owning name has no shadow `code_nodes` row at
-        // all (rare — see `shadow_name_to_id`'s doc comment) is skipped:
-        // no key exists for `resolve_edges`' LEFT JOIN to ever need anyway.
-        let translated_chains: BTreeMap<(String, String, String), String> = fragment
-            .call_scope_chains
-            .iter()
-            .filter_map(|((fresh_src_id, dst_id, kind), chain)| {
-                let fresh_name = id_to_name.get(fresh_src_id.as_str())?;
-                let real_id = shadow_name_to_id.get(*fresh_name)?;
-                Some((
-                    (real_id.clone(), dst_id.clone(), kind.clone()),
-                    chain.clone(),
-                ))
-            })
-            .collect();
+        // X4 adversarial review, Finding 4; multi-chain-per-edge as of the
+        // Codex round 4 adversarial review, Finding 1: persist EVERY fresh
+        // calls/imports edge's OWN DISTINCT scope chains, unconditionally —
+        // never filtered to only the edges some pending row happens to
+        // match (same philosophy as `persist_local_bindings`, immediately
+        // above). Keys are TRANSLATED from `fragment.call_scope_chains`'
+        // fresh-fragment ids into real shadow ids (via `id_to_name_kind`
+        // then the kind-qualified `shadow_name_to_id`, per that map's own
+        // doc comment — Finding 3) before persisting — the raw
+        // fresh-fragment key would never match this shadow's
+        // `code_edges.src_id` at read time otherwise. A fresh call/import
+        // site whose owning (kind, name) has no unique shadow `code_nodes`
+        // row (missing OR ambiguous — Finding 3) is skipped: no key exists
+        // for `resolve_edges`'s chain lookup to ever need anyway. Chain SETS
+        // for the same translated key are merged (`.extend`), not
+        // overwritten, so two fresh-fragment src ids that both translate to
+        // the same real shadow id (should not normally happen, but never
+        // silently drops data if it does) keep every chain either
+        // contributed.
+        let mut translated_chains: BTreeMap<(String, String, String), BTreeSet<String>> =
+            BTreeMap::new();
+        for ((fresh_src_id, dst_id, kind), chains) in &fragment.call_scope_chains {
+            let Some((fresh_kind, fresh_name)) = id_to_name_kind.get(fresh_src_id.as_str()) else {
+                continue;
+            };
+            let lookup_key = (fresh_kind.to_string(), fresh_name.to_string());
+            let Some(real_id) = shadow_name_to_id.get(&lookup_key) else {
+                continue;
+            };
+            translated_chains
+                .entry((real_id.clone(), dst_id.clone(), kind.clone()))
+                .or_default()
+                .extend(chains.iter().cloned());
+        }
         persist_call_scope_chains(shadow, &project, &src_file, &translated_chains)?;
 
         // Finding 1 (WCR truth pass): def node names actually present in the
@@ -975,50 +1016,62 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
         // tests: real bug, not a hypothetical.
         //
         // Finding (Codex round 3, attribution-skewed re-point): keyed by
-        // bare target name -> {src_name -> callee_kind/evidence} — EVERY
-        // fresh edge of this file, regardless of src attribution — rather
-        // than a flat `(src_name, bare)` -> value map. The inner `BTreeMap`
-        // gives two things: an exact-match lookup at a specific `src_name`
-        // key (the pre-existing behavior, unchanged), AND, when that
-        // misses, iteration in ascending (deterministic) src-name order for
-        // the re-point tie-break below — a pending edge whose OLD src no
-        // longer matches (because an attribution RULE changed, e.g. commit
+        // bare target name -> {src_name -> (src_kind, callee_kind, evidence)}
+        // — EVERY fresh edge of this file, regardless of src attribution —
+        // rather than a flat `(src_name, bare)` -> value map. The inner
+        // `BTreeMap` gives two things: an exact-match lookup at a specific
+        // `src_name` key (the pre-existing behavior, unchanged), AND, when
+        // that misses, the CANDIDATE SET for the Finding 2 re-point
+        // uniqueness check below — a pending edge whose OLD src no longer
+        // matches (because an attribution RULE changed, e.g. commit
         // 92179d1 unifying closure-nested call src with binding-scope
         // attribution — not because the call site itself changed) can
         // still find the IDENTICAL call/import site under its NEW
         // attribution and re-point to it, instead of being wrongly
-        // drift-classified. Deliberately NAME-keyed only, never carrying
-        // the fresh fragment's OWN `edge.src_id` — see `shadow_name_to_id`'s
-        // doc comment for why that id would be a different (wrong) id space
-        // than this shadow's `code_nodes`; the re-point site below resolves
-        // the WINNING name to a real id via `shadow_name_to_id` instead.
-        // `imports` edges are always module-sourced (see `extract_inner`'s
-        // imports loop — `src` is always `module_id`), so their inner map
-        // in practice never has more than one key; kept symmetric with
-        // `calls` rather than special-cased, since a single, shared code
-        // path is less risk than two subtly different ones.
-        let mut calls_any_src: BTreeMap<String, BTreeMap<String, (String, String)>> =
+        // drift-classified — but ONLY when this candidate set has EXACTLY
+        // ONE entry (Finding 2, Codex round 4 adversarial review): two or
+        // more distinct fresh srcs calling the same bare name means the
+        // edit could equally be "attribution moved" OR "a real edit made a
+        // second, unrelated caller" — indistinguishable by name alone, so
+        // re-pointing would be a guess. `src_kind` (Finding 3, Codex round
+        // 4) is threaded alongside so the WINNING candidate's real shadow
+        // id can be resolved via the kind-qualified `shadow_name_to_id`
+        // instead of a bare-name lookup — see that map's own doc comment.
+        // Deliberately NAME-keyed (not `edge.src_id`) — see
+        // `shadow_name_to_id`'s doc comment for why the fresh fragment's OWN
+        // id is a different (wrong) id space than this shadow's
+        // `code_nodes`. `imports` edges are always module-sourced (see
+        // `extract_inner`'s imports loop — `src` is always `module_id`), so
+        // their inner map in practice never has more than one key; kept
+        // symmetric with `calls` rather than special-cased, since a single,
+        // shared code path is less risk than two subtly different ones.
+        let mut calls_any_src: BTreeMap<String, BTreeMap<String, (String, String, String)>> =
             BTreeMap::new();
-        let mut imports_any_src: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        let mut imports_any_src: BTreeMap<String, BTreeMap<String, (String, String)>> =
+            BTreeMap::new();
         for edge in &fragment.edges {
             let Some(bare) = edge.dst_id.strip_prefix("name:") else {
                 continue;
             };
-            let Some(&src_name) = id_to_name.get(edge.src_id.as_str()) else {
+            let Some(&(src_kind, src_name)) = id_to_name_kind.get(edge.src_id.as_str()) else {
                 continue;
             };
             match edge.kind.as_str() {
                 "calls" => {
                     calls_any_src.entry(bare.to_string()).or_default().insert(
                         src_name.to_string(),
-                        (edge.callee_kind.clone(), edge.evidence.clone()),
+                        (
+                            src_kind.to_string(),
+                            edge.callee_kind.clone(),
+                            edge.evidence.clone(),
+                        ),
                     );
                 }
                 "imports" => {
-                    imports_any_src
-                        .entry(bare.to_string())
-                        .or_default()
-                        .insert(src_name.to_string(), edge.evidence.clone());
+                    imports_any_src.entry(bare.to_string()).or_default().insert(
+                        src_name.to_string(),
+                        (src_kind.to_string(), edge.evidence.clone()),
+                    );
                 }
                 _ => {}
             }
@@ -1127,7 +1180,10 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                         Some(candidates) if candidates.contains_key(src_name.as_str()) => {
                             // Exact match — same src attribution as before this
                             // finding; only callee_kind/evidence are refreshed.
-                            let (new_kind, new_evidence) = &candidates[src_name.as_str()];
+                            // `src_kind` unused here — no id translation
+                            // needed, `src_id` is already this edge's own.
+                            let (_src_kind, new_kind, new_evidence) =
+                                &candidates[src_name.as_str()];
                             shadow.with_connection(|conn| {
                                 conn.execute(
                                     "UPDATE code_edges SET callee_kind = ?1, evidence = ?2
@@ -1141,47 +1197,54 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                         Some(candidates) if !candidates.is_empty() => {
                             // RE-POINT, not drift: the identical call still
                             // exists in the fresh extraction, just attributed
-                            // to a DIFFERENT src node than this historical edge
-                            // carries. `candidates.iter()` (a `BTreeMap`)
-                            // visits names in ascending order, so
-                            // `find_map` — filtered to names that actually
-                            // have a REAL id in this shadow's `code_nodes`
-                            // (`shadow_name_to_id`; see its own doc comment
-                            // for why the fresh fragment's OWN id can never
-                            // be used directly here) — lands on the
-                            // deterministic lexicographically-smallest
-                            // VALID candidate. Left in the normal pending
-                            // pool for the resolver — NOT drifted, NOT
-                            // auto-bound (`resolved` stays untouched, 0).
-                            let repoint = candidates.iter().find_map(|(name, (k, e))| {
-                                shadow_name_to_id
-                                    .get(name)
-                                    .map(|id| (id.clone(), k.clone(), e.clone()))
-                            });
-                            match repoint {
-                                Some((new_src_id, new_kind, new_evidence)) => {
+                            // to a DIFFERENT src node than this historical
+                            // edge carries. Finding 2 (Codex round 4
+                            // adversarial review): re-point ONLY when the
+                            // transition is UNIQUELY derivable — exactly ONE
+                            // candidate src in the fresh fragment for this
+                            // (callee, kind) in the file. A REAL edit (a
+                            // ghost function removing its own `helper()` call
+                            // while an unrelated, unchanged function still
+                            // calls `helper()`) is indistinguishable BY NAME
+                            // from attribution skew — resurrecting the edge
+                            // under the surviving caller would corrupt
+                            // provenance and silently suppress the
+                            // legitimate drift on the ghost's own edge. With
+                            // >= 2 candidates, the callee demonstrably still
+                            // exists SOMEWHERE (so this is NOT drift), but
+                            // WHICH candidate owns this particular historical
+                            // edge is unproven (so re-pointing is a guess) —
+                            // left untouched: pending, unexplained, the
+                            // honest bucket for "true but unattributable".
+                            if candidates.len() == 1 {
+                                let (name, (src_kind, new_kind, new_evidence)) =
+                                    candidates.iter().next().expect("len == 1");
+                                // Finding 3: kind-qualified lookup — a
+                                // missing or non-unique (kind, name) match in
+                                // `shadow_name_to_id` is NO match, never a
+                                // lexicographic guess. See that map's doc
+                                // comment.
+                                if let Some(new_src_id) =
+                                    shadow_name_to_id.get(&(src_kind.clone(), name.clone()))
+                                {
                                     repoint_or_dedupe_edge(
                                         shadow,
                                         &src_id,
                                         &dst_id,
                                         "calls",
-                                        &new_src_id,
-                                        Some(&new_kind),
-                                        &new_evidence,
+                                        new_src_id,
+                                        Some(new_kind),
+                                        new_evidence,
                                     )?;
                                     edges_updated += 1;
                                 }
-                                None => {
-                                    // Every fresh candidate's owning name has
-                                    // no `code_nodes` row in THIS shadow at
-                                    // all (rare — see `shadow_name_to_id`'s
-                                    // doc comment) — there is no valid id to
-                                    // re-point to, and this is NOT drift
-                                    // evidence either (the callee genuinely
-                                    // still exists in the fresh source).
-                                    // Never guess: leave untouched.
-                                }
+                                // else: the sole candidate's (kind, name) has
+                                // no valid real shadow id — never guess by
+                                // falling back to a different one. Leave
+                                // untouched.
                             }
+                            // else (>= 2 candidates): ambiguous identity —
+                            // never guess. Leave untouched.
                         }
                         _ => {
                             if can_drift {
@@ -1202,7 +1265,8 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                 }
                 "imports" => match imports_any_src.get(bare) {
                     Some(candidates) if candidates.contains_key(src_name.as_str()) => {
-                        let new_evidence = &candidates[src_name.as_str()];
+                        // `src_kind` unused here — no id translation needed.
+                        let (_src_kind, new_evidence) = &candidates[src_name.as_str()];
                         shadow.with_connection(|conn| {
                             conn.execute(
                                 "UPDATE code_edges SET evidence = ?1
@@ -1214,33 +1278,33 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                         edges_updated += 1;
                     }
                     Some(candidates) if !candidates.is_empty() => {
-                        // Same re-point rule as `calls`, above — in
-                        // practice a near-no-op for `imports` (its src is
-                        // always the module node, see `imports_any_src`'s
-                        // doc comment), kept symmetric rather than
-                        // special-cased.
-                        let repoint = candidates.iter().find_map(|(name, e)| {
-                            shadow_name_to_id
-                                .get(name)
-                                .map(|id| (id.clone(), e.clone()))
-                        });
-                        match repoint {
-                            Some((new_src_id, new_evidence)) => {
+                        // Same re-point rule as `calls`, above (Finding 2:
+                        // uniqueness-gated; Finding 3: kind-qualified
+                        // lookup) — in practice a near-no-op for `imports`
+                        // (its src is always the module node, see
+                        // `imports_any_src`'s doc comment), kept symmetric
+                        // rather than special-cased.
+                        if candidates.len() == 1 {
+                            let (name, (src_kind, new_evidence)) =
+                                candidates.iter().next().expect("len == 1");
+                            if let Some(new_src_id) =
+                                shadow_name_to_id.get(&(src_kind.clone(), name.clone()))
+                            {
                                 repoint_or_dedupe_edge(
                                     shadow,
                                     &src_id,
                                     &dst_id,
                                     "imports",
-                                    &new_src_id,
+                                    new_src_id,
                                     None,
-                                    &new_evidence,
+                                    new_evidence,
                                 )?;
                                 edges_updated += 1;
                             }
-                            None => {
-                                // See the `calls` arm's `None` case above.
-                            }
+                            // else: no valid real shadow id — never guess.
                         }
+                        // else (>= 2 candidates): ambiguous identity — never
+                        // guess. Leave untouched.
                     }
                     _ => {
                         if can_drift {
@@ -1301,27 +1365,32 @@ fn persist_local_bindings(
     })
 }
 
-/// X4 adversarial review, Finding 4: persist `chains` — EVERY fresh `calls`/
-/// `imports` edge's own call/import-site scope chain, from the SAME fresh-
-/// extraction fragment `backfill_wcr_witnesses` already computed for this
-/// (project, file), never a second parse — into the shadow's
-/// `edge_scope_chains` witness table. Same transactional DELETE-then-INSERT-
-/// per-(project, file) shape as `persist_local_bindings`, immediately above,
-/// and for the same reason: unconditional, including when `chains` is empty,
-/// so a file reprocessed after edits changed WHICH call/import sites exist
-/// never keeps a stale chain row for a site that no longer exists.
+/// X4 adversarial review, Finding 4; multi-chain-per-edge as of the Codex
+/// round 4 adversarial review, Finding 1: persist `chains` — for EVERY
+/// fresh `calls`/`imports` edge, ALL of its DISTINCT call/import-site scope
+/// chains, from the SAME fresh-extraction fragment `backfill_wcr_witnesses`
+/// already computed for this (project, file), never a second parse — into
+/// the shadow's `edge_scope_chains` witness table. Same transactional
+/// DELETE-then-INSERT-per-(project, file) shape as `persist_local_bindings`,
+/// immediately above, and for the same reason: unconditional, including
+/// when `chains` is empty, so a file reprocessed after edits changed WHICH
+/// call/import sites exist never keeps a stale chain row for a site that no
+/// longer exists.
 ///
-/// Keyed by `(src_id, dst_id, kind)` — `code_edges`' own primary key — not
+/// Keyed by `(src_id, dst_id, kind, chain)` — `edge_scope_chains`' own
+/// primary key (Finding 1: `chain` joined the key so a multi-occurrence
+/// edge gets one row PER distinct chain, not one row total) — not
 /// `(project, file, ...)` in the table's own PK, so this DELETE scopes by
 /// `project`/`file` columns rather than by key prefix; see the
 /// `edge_scope_chains` migration comment for why a matched OR re-pointed
 /// pending edge (`backfill_wcr_witnesses`'s per-edge loop, which runs AFTER
-/// this) is guaranteed to end up with a key present in this table.
+/// this) is guaranteed to end up with at least one row present in this
+/// table.
 fn persist_call_scope_chains(
     shadow: &Arc<Storage>,
     project: &str,
     file: &str,
-    chains: &BTreeMap<(String, String, String), String>,
+    chains: &BTreeMap<(String, String, String), BTreeSet<String>>,
 ) -> Result<()> {
     shadow.with_connection(|conn| {
         let tx = conn.unchecked_transaction()?;
@@ -1334,8 +1403,10 @@ fn persist_call_scope_chains(
                 "INSERT OR IGNORE INTO edge_scope_chains (project, file, src_id, dst_id, kind, chain)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
-            for ((src_id, dst_id, kind), chain) in chains {
-                stmt.execute(rusqlite::params![project, file, src_id, dst_id, kind, chain])?;
+            for ((src_id, dst_id, kind), chain_set) in chains {
+                for chain in chain_set {
+                    stmt.execute(rusqlite::params![project, file, src_id, dst_id, kind, chain])?;
+                }
             }
         }
         tx.commit()?;
@@ -1360,22 +1431,47 @@ fn persist_call_scope_chains(
 /// failure, a near-total one.
 ///
 /// When the target already exists, the OLD `(old_src_id, dst_id, kind)` row
-/// is a confirmed duplicate of an edge already tracked correctly elsewhere
-/// — its information is fully accounted for by the surviving row, so it is
-/// DELETED rather than re-pointed (re-pointing it would just be the same
-/// collision again). This is deterministic even when several stale rows in
-/// the same file converge on the same target: `backfill_wcr_witnesses`
-/// processes `pending_edges` in a fixed `ORDER BY src_id, dst_id, kind`, so
-/// the first one to be processed creates/updates the target row and every
-/// later one finds it already there and deletes itself — same final state
-/// on every run. Otherwise (the common case), a plain `UPDATE` moves
-/// `src_id` in place and refreshes the fresh edge's own data —
-/// `callee_kind`/`evidence` for `calls` (`new_callee_kind = Some(_)`), or
-/// just `evidence` for `imports` (`new_callee_kind = None` — `imports`
-/// edges have no `callee_kind` data to refresh). Either outcome (dedup
-/// delete or in-place move) is "handled" from the caller's perspective —
-/// both count toward `edges_updated`, matching the exact-match branches'
-/// convention.
+/// is a confirmed duplicate of an edge already tracked correctly elsewhere.
+/// Finding 4 (Codex round 4 adversarial review): its provenance is MERGED
+/// into the surviving (target) row FIRST, in the SAME transaction, before
+/// the stale row is deleted — the pre-fix version deleted it unconditionally
+/// and left the target completely untouched, silently discarding whatever
+/// the stale row alone carried (a higher `weight`, older `conv_id`/
+/// `session_id`, and the fresh `callee_kind`/`evidence` this very call was
+/// asked to apply, which the old code only ever wrote in the NON-collision
+/// branch). The merge, per `code_edges`' own column semantics:
+/// - `weight`: SUMMED, not maxed. `extraction::codegraph::extract_inner`'s
+///   own `add_edge` establishes this column as ADDITIVE (`weight += 1.0` per
+///   physical occurrence folded into one aggregated edge) — the stale and
+///   surviving rows are two different extraction generations' occurrence
+///   counts for what re-pointing has just determined is the SAME logical
+///   edge, so their sum is the honest combined count.
+/// - `conv_id`/`session_id`: `code_edges` has only ONE slot for these
+///   (unlike `code_nodes`' `first_conv_id`/`last_conv_id` pair) — the pair
+///   from whichever of the two rows has the SMALLER `rowid` (SQLite's own
+///   monotonic insertion order, exact even within one transaction, unlike
+///   `created_at`'s second-resolution timestamp) is kept, preserving the
+///   EARLIEST first-seen provenance pairing intact rather than splitting
+///   `conv_id` from the `session_id` it was actually recorded with.
+/// - `callee_kind`/`evidence`: ALWAYS refreshed from the CURRENT fresh
+///   extraction (`new_callee_kind`/`new_evidence`, the caller's own fresh
+///   candidate data) — same as the non-collision branch below, now applied
+///   uniformly regardless of which branch runs.
+///
+/// This is deterministic even when several stale rows in the same file
+/// converge on the same target: `backfill_wcr_witnesses` processes
+/// `pending_edges` in a fixed `ORDER BY src_id, dst_id, kind`, so the first
+/// one to be processed creates/updates the target row and every later one
+/// finds it already there, merges into it, and deletes itself — same final
+/// state on every run. Otherwise (the common case, no collision), a plain
+/// `UPDATE` moves `src_id` in place and refreshes the fresh edge's own data
+/// — `callee_kind`/`evidence` for `calls` (`new_callee_kind = Some(_)`), or
+/// just `evidence` for `imports` (`new_callee_kind = None` — `imports` edges
+/// have no `callee_kind` data to refresh); `weight`/`conv_id`/`session_id`
+/// are untouched here since no row is lost — it is the SAME row, just
+/// re-keyed. Either outcome (merge-then-delete or in-place move) is
+/// "handled" from the caller's perspective — both count toward
+/// `edges_updated`, matching the exact-match branches' convention.
 fn repoint_or_dedupe_edge(
     shadow: &Arc<Storage>,
     old_src_id: &str,
@@ -1385,40 +1481,104 @@ fn repoint_or_dedupe_edge(
     new_callee_kind: Option<&str>,
     new_evidence: &str,
 ) -> Result<()> {
-    let target_exists: bool = shadow.with_connection(|conn| {
-        conn.query_row(
+    shadow.with_connection(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        let target_exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM code_edges WHERE src_id = ?1 AND dst_id = ?2 AND kind = ?3)",
             rusqlite::params![new_src_id, dst_id, kind],
             |r| r.get(0),
-        )
-        .map_err(Into::into)
-    })?;
-    if target_exists {
-        return shadow.with_connection(|conn| {
-            conn.execute(
+        )?;
+        if target_exists {
+            // Finding 4: merge stale-row provenance into the surviving
+            // target row BEFORE deleting the stale row — single transaction.
+            let (target_rowid, target_weight, target_conv, target_session): (
+                i64,
+                f64,
+                String,
+                String,
+            ) = tx.query_row(
+                "SELECT rowid, weight, conv_id, session_id FROM code_edges
+                 WHERE src_id = ?1 AND dst_id = ?2 AND kind = ?3",
+                rusqlite::params![new_src_id, dst_id, kind],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            let (stale_rowid, stale_weight, stale_conv, stale_session): (
+                i64,
+                f64,
+                String,
+                String,
+            ) = tx.query_row(
+                "SELECT rowid, weight, conv_id, session_id FROM code_edges
+                 WHERE src_id = ?1 AND dst_id = ?2 AND kind = ?3",
+                rusqlite::params![old_src_id, dst_id, kind],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            let merged_weight = target_weight + stale_weight;
+            let (merged_conv, merged_session) = if stale_rowid < target_rowid {
+                (stale_conv, stale_session)
+            } else {
+                (target_conv, target_session)
+            };
+            match new_callee_kind {
+                Some(ck) => {
+                    tx.execute(
+                        "UPDATE code_edges
+                         SET weight = ?1, conv_id = ?2, session_id = ?3,
+                             callee_kind = ?4, evidence = ?5
+                         WHERE src_id = ?6 AND dst_id = ?7 AND kind = ?8",
+                        rusqlite::params![
+                            merged_weight,
+                            merged_conv,
+                            merged_session,
+                            ck,
+                            new_evidence,
+                            new_src_id,
+                            dst_id,
+                            kind
+                        ],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "UPDATE code_edges
+                         SET weight = ?1, conv_id = ?2, session_id = ?3, evidence = ?4
+                         WHERE src_id = ?5 AND dst_id = ?6 AND kind = ?7",
+                        rusqlite::params![
+                            merged_weight,
+                            merged_conv,
+                            merged_session,
+                            new_evidence,
+                            new_src_id,
+                            dst_id,
+                            kind
+                        ],
+                    )?;
+                }
+            }
+            tx.execute(
                 "DELETE FROM code_edges WHERE src_id = ?1 AND dst_id = ?2 AND kind = ?3",
                 rusqlite::params![old_src_id, dst_id, kind],
             )?;
-            Ok(())
-        });
-    }
-    shadow.with_connection(|conn| {
+            tx.commit()?;
+            return Ok(());
+        }
         match new_callee_kind {
             Some(ck) => {
-                conn.execute(
+                tx.execute(
                     "UPDATE code_edges SET src_id = ?1, callee_kind = ?2, evidence = ?3
                      WHERE src_id = ?4 AND dst_id = ?5 AND kind = ?6",
                     rusqlite::params![new_src_id, ck, new_evidence, old_src_id, dst_id, kind],
                 )?;
             }
             None => {
-                conn.execute(
+                tx.execute(
                     "UPDATE code_edges SET src_id = ?1, evidence = ?2
                      WHERE src_id = ?3 AND dst_id = ?4 AND kind = ?5",
                     rusqlite::params![new_src_id, new_evidence, old_src_id, dst_id, kind],
                 )?;
             }
         }
+        tx.commit()?;
         Ok(())
     })
 }
@@ -3448,12 +3608,17 @@ mod tests {
     }
 
     #[test]
-    fn backfill_repoints_deterministically_to_lexicographically_smallest_src_when_ambiguous() {
-        // Deterministic tie-break: when a callee is invoked from MORE THAN
-        // ONE def in the fresh fragment (none of which match the pending
-        // edge's own stale src), re-pointing picks the lexicographically
-        // smallest src NAME — never a guess, never order-dependent on
-        // `fragment.edges`' own iteration order.
+    fn backfill_never_repoints_when_multiple_candidate_srcs_exist() {
+        // MANDATED TEST (Codex round 4 adversarial review, Finding 2):
+        // supersedes the old "lexicographically-smallest-wins" behavior —
+        // that WAS the guess this finding removes. A callee invoked from
+        // MORE THAN ONE def in the fresh fragment (none of which match the
+        // pending edge's own stale src) is NOT drift (the callee genuinely
+        // still exists) but is ALSO not re-pointed (which of the >= 2
+        // candidates the historical edge should now attribute to is
+        // unproven — indistinguishable from "a real edit added a second,
+        // unrelated caller"). The edge is left completely untouched: still
+        // pending, still unexplained, the honest bucket.
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.rs");
         std::fs::write(
@@ -3469,11 +3634,6 @@ mod tests {
         let ghost_id =
             crate::extraction::codegraph::node_id("repo", &file_str, "function", "ghost");
         seed_backfill_node(&shadow, &ghost_id, &file_str, "ghost");
-        // Codex round 3: `alpha`/`bravo` must ALSO be present in this
-        // shadow's `code_nodes` (same "already there from a real prior
-        // extraction" reasoning as the test above) — re-pointing resolves
-        // the winning NAME to a REAL shadow id via `shadow_name_to_id`,
-        // never the fresh fragment's own throwaway id.
         let alpha_id =
             crate::extraction::codegraph::node_id("repo", &file_str, "function", "alpha");
         let bravo_id =
@@ -3489,8 +3649,72 @@ mod tests {
             .unwrap();
 
         let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1, "the on-disk file was still re-extracted");
+        assert_eq!(
+            edges, 0,
+            "ambiguous identity: not an exact match, not a unique re-point, not drift"
+        );
+        let (src_id, boundary, resolved, callee_kind): (String, String, i64, String) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT src_id, boundary, resolved, callee_kind FROM code_edges
+                     WHERE dst_id = 'name:helper' AND kind = 'calls'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            src_id, ghost_id,
+            "must stay on its ORIGINAL stale src — never guess between alpha/bravo"
+        );
+        assert_ne!(src_id, alpha_id);
+        assert_ne!(src_id, bravo_id);
+        assert_eq!(
+            boundary, "",
+            "not drifted — the callee still exists in the fresh source"
+        );
+        assert_eq!(resolved, 0);
+        assert_eq!(
+            callee_kind, "direct",
+            "untouched entirely — the original stale value, never refreshed"
+        );
+    }
+
+    #[test]
+    fn backfill_repoints_when_exactly_one_candidate_src_exists() {
+        // MANDATED TEST counterpart (Codex round 4 adversarial review,
+        // Finding 2): the positive case — exactly ONE candidate src in the
+        // fresh fragment for this callee IS uniquely derivable, and must
+        // still re-point (this is the common, legitimate case Finding 2
+        // must not break while closing the >= 2 candidate guess).
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.rs");
+        std::fs::write(&file_path, "fn alpha() {\n    helper();\n}\n").unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let ghost_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "ghost");
+        seed_backfill_node(&shadow, &ghost_id, &file_str, "ghost");
+        let alpha_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "alpha");
+        seed_backfill_node(&shadow, &alpha_id, &file_str, "alpha");
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[stale_calls_edge(&ghost_id, "helper", &file_str, "direct")],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
         assert_eq!(files, 1);
-        assert_eq!(edges, 1, "re-pointed, not left untouched or drifted");
+        assert_eq!(
+            edges, 1,
+            "the sole candidate is uniquely derivable — re-pointed"
+        );
         let repointed_src: String = shadow
             .with_connection(|conn| {
                 conn.query_row(
@@ -3501,11 +3725,7 @@ mod tests {
                 .map_err(Into::into)
             })
             .unwrap();
-        assert_eq!(
-            repointed_src, alpha_id,
-            "\"alpha\" < \"bravo\" lexicographically — must win the deterministic tie-break"
-        );
-        assert_ne!(repointed_src, bravo_id);
+        assert_eq!(repointed_src, alpha_id);
     }
 
     // ─── end-to-end scope-chain threading (Codex round 3 adversarial
@@ -3756,6 +3976,217 @@ mod tests {
         assert_eq!(surviving_count, 1, "exactly one surviving row, not two");
         assert_eq!(boundary, "", "the surviving row is a normal pending edge");
         assert_eq!(resolved, 0);
+    }
+
+    #[test]
+    fn backfill_repoint_dedupe_merges_weight_and_earliest_provenance_into_surviving_row() {
+        // MANDATED TEST (Codex round 4 adversarial review, Finding 4): the
+        // pre-fix version deleted the stale row on collision and left the
+        // surviving (target) row completely untouched — silently discarding
+        // whatever the stale row alone carried. This test gives the two
+        // colliding rows DISTINCT weight/conv_id/session_id/callee_kind so
+        // the merge (not "delete and ignore") is directly observable:
+        // weight SUMS (additive, per `add_edge`'s own established
+        // semantics), conv_id/session_id keep the EARLIEST-inserted row's
+        // own pairing (never split across rows), and callee_kind/evidence
+        // are refreshed from the CURRENT fresh extraction on the
+        // surviving row regardless of which branch touches it.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.tsx");
+        std::fs::write(
+            &file_path,
+            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n",
+        )
+        .unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "tsx".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        let component_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "Component");
+        seed_backfill_node(&shadow, &component_id, &file_str, "Component");
+        // Stale row inserted FIRST (smaller `rowid` — "earliest") with its
+        // OWN distinct weight/conv/session; target row inserted SECOND.
+        // Both carry a deliberately WRONG `callee_kind` ("method") to prove
+        // the surviving row's callee_kind is refreshed from the fresh
+        // extraction (a real "direct" call), not merely preserved from
+        // either historical row.
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[
+                    EdgeRow {
+                        src_id: module_id.clone(),
+                        dst_id: "name:helper".into(),
+                        kind: "calls".into(),
+                        src_file: file_str.clone(),
+                        resolved: 0,
+                        weight: 3.0,
+                        conv_id: "conv-old".into(),
+                        session_id: "sess-old".into(),
+                        callee_kind: "method".into(),
+                        ..EdgeRow::default()
+                    },
+                    EdgeRow {
+                        src_id: component_id.clone(),
+                        dst_id: "name:helper".into(),
+                        kind: "calls".into(),
+                        src_file: file_str.clone(),
+                        resolved: 0,
+                        weight: 5.0,
+                        conv_id: "conv-new".into(),
+                        session_id: "sess-new".into(),
+                        callee_kind: "method".into(),
+                        ..EdgeRow::default()
+                    },
+                ],
+            )
+            .unwrap();
+
+        backfill_wcr_witnesses(&shadow).expect("must not abort on collision");
+
+        let (surviving_count, weight, conv_id, session_id, callee_kind): (
+            i64,
+            f64,
+            String,
+            String,
+            String,
+        ) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*), MAX(weight), MAX(conv_id), MAX(session_id), MAX(callee_kind)
+                     FROM code_edges WHERE src_id = ?1 AND dst_id = 'name:helper'",
+                    [&component_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(surviving_count, 1, "exactly one surviving row");
+        assert_eq!(
+            weight, 8.0,
+            "weight must SUM (3.0 stale + 5.0 target), not be discarded"
+        );
+        assert_eq!(
+            conv_id, "conv-old",
+            "conv_id/session_id pairing from the EARLIEST-inserted (stale) row must survive"
+        );
+        assert_eq!(session_id, "sess-old");
+        assert_eq!(
+            callee_kind, "direct",
+            "callee_kind must be refreshed from the CURRENT fresh extraction on the surviving row"
+        );
+
+        let stale_row_count: i64 = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM code_edges WHERE src_id = ?1 AND dst_id = 'name:helper'",
+                    [&module_id],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            stale_row_count, 0,
+            "the stale row is deleted after its data is merged"
+        );
+    }
+
+    // ─── shadow_name_to_id kind-qualification (Codex round 4 adversarial
+    // review, Finding 3) ───
+
+    #[test]
+    fn backfill_never_repoints_via_kind_ambiguous_name_collision() {
+        // MANDATED-STYLE TEST (Finding 3): a bare NAME that collides across
+        // TWO DIFFERENT node kinds in this shadow's own `code_nodes` (a
+        // `function helper` AND a `type helper`, both already present —
+        // `node_id` disambiguates them by kind, so both coexist) must NEVER
+        // be resolved by picking one lexicographically. The fresh
+        // extraction's sole candidate src for the `orphaned` callee is
+        // named "helper" — but `shadow_name_to_id` now requires a UNIQUE
+        // `(kind, name)` match, and `(function, helper)` alone IS unique
+        // (the `type helper` node has a DIFFERENT kind key), so this
+        // specific case must still resolve correctly to the function.
+        // Kept alongside a genuinely non-unique case (same kind, colliding
+        // scenario is structurally impossible via `node_id`'s own hash) to
+        // document the "missing/non-unique -> no match" contract via the
+        // API path this backfill actually calls.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.ts");
+        std::fs::write(&file_path, "function helper() {\n    orphaned();\n}\n").unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let ghost_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "ghost");
+        seed_backfill_node(&shadow, &ghost_id, &file_str, "ghost");
+        let helper_fn_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "helper");
+        seed_backfill_node(&shadow, &helper_fn_id, &file_str, "helper");
+        // A DIFFERENT node, same bare name, DIFFERENT kind — must not be
+        // confused with `helper_fn_id` above by a kind-blind lookup.
+        let helper_type_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "type", "helper");
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: helper_type_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "typescript".into(),
+                kind: "type".into(),
+                name: "helper".into(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[stale_calls_edge(&ghost_id, "orphaned", &file_str, "direct")],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(
+            edges, 1,
+            "the sole (function, helper) candidate is still uniquely resolvable"
+        );
+        let repointed_src: String = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT src_id FROM code_edges WHERE dst_id = 'name:orphaned' AND kind = 'calls'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            repointed_src, helper_fn_id,
+            "must resolve to the FUNCTION node, never the co-named type node"
+        );
+        assert_ne!(repointed_src, helper_type_id);
     }
 
     #[test]
