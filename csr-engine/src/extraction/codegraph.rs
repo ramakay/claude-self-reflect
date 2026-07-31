@@ -1481,6 +1481,18 @@ fn extract_inner(
     // never a second pass.
     let mut call_attribution_pairs: Vec<(String, String, String, String)> = Vec::new();
 
+    // Whole-file content hash (WCR truth pass, Codex round 7 adversarial
+    // review): computed ONCE per extraction and stamped onto EVERY edge this
+    // parse produces (`add_edge`, below) as `EdgeRow::src_content_hash` —
+    // immutable write-time provenance for the WCR re-point gate
+    // (`eval::codegraph::historical_src_content_unchanged`), deliberately
+    // independent of `code_nodes.body_hash` (which a later `upsert_node`
+    // call can refresh out from under a stale edge, in a separate
+    // transaction — see that gate's doc comment for the full finding).
+    // Reuses the SAME hash computed for the module node's own `body_hash`,
+    // immediately below — never a second hashing scheme.
+    let file_hash = body_hash(source);
+
     // Synthetic module node anchoring the file.
     let module_id = node_id(repo, file, "module", file);
     nodes.insert(
@@ -1494,7 +1506,7 @@ fn extract_inner(
             kind: "module".into(),
             name: file.into(),
             fqname: file.into(),
-            body_hash: body_hash(source),
+            body_hash: file_hash.clone(),
             span_start: 0,
             span_end: 0,
             first_conv_id: conv_id.into(),
@@ -1560,6 +1572,7 @@ fn extract_inner(
                     callee_kind: callee_kind.into(),
                     boundary: String::new(),
                     evidence: evidence.into(),
+                    src_content_hash: file_hash.clone(),
                 });
         };
 

@@ -279,6 +279,31 @@ pub fn run(conn: &Connection) -> Result<()> {
         }
     }
 
+    // Migration: src_content_hash on code_edges (WCR truth pass, Codex round 7
+    // adversarial review). Immutable per-edge write-time provenance: the
+    // whole-file content hash (`extraction::codegraph::body_hash` of the SAME
+    // source that produced this edge), stamped once by `extract_inner`'s
+    // `add_edge` closure and never independently refreshed — unlike
+    // `code_nodes.body_hash`, which `upsert_node` refreshes on every sighting
+    // in a SEPARATE transaction from the edge replace. That mutability +
+    // transaction split is exactly what let a partial write (nodes refreshed,
+    // edge replace failed or simply never ran) falsely authenticate a stale
+    // edge for re-pointing — see
+    // `eval::codegraph::historical_src_content_unchanged`'s doc comment for
+    // the full finding. DEFAULT '' means "absent" (a legacy edge written
+    // before this column existed, or by a path that hasn't re-extracted
+    // since) — categorically ineligible for re-pointing, never a guess.
+    {
+        let has_src_content_hash: bool = conn
+            .prepare("SELECT src_content_hash FROM code_edges LIMIT 0")
+            .is_ok();
+        if !has_src_content_hash {
+            let _ = conn.execute_batch(
+                "ALTER TABLE code_edges ADD COLUMN src_content_hash TEXT DEFAULT '';",
+            );
+        }
+    }
+
     // repo_defs (v9.5 Phase 1): per-file symbol inventory (name/kind/lang) feeding
     // witness-closure resolution (Phase 2+). Populated by a repo scan; replace-per-file
     // semantics mirror code_edges (see upsert_repo_defs in storage/codegraph.rs).
@@ -583,6 +608,11 @@ mod tests {
             conn.prepare("SELECT callee_kind, boundary, evidence FROM code_edges LIMIT 0")
                 .is_ok(),
             "callee_kind, boundary, evidence columns must exist on code_edges after migration"
+        );
+        assert!(
+            conn.prepare("SELECT src_content_hash FROM code_edges LIMIT 0")
+                .is_ok(),
+            "src_content_hash column must exist on code_edges after migration (Codex round 7)"
         );
         assert!(
             conn.prepare(

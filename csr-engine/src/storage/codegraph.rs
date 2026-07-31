@@ -55,6 +55,21 @@ pub struct EdgeRow {
     pub boundary: String,
     /// Resolver evidence for the edge's resolution decision (Phase 2+); '' until then.
     pub evidence: String,
+    /// Immutable per-edge write-time provenance (WCR truth pass, Codex round
+    /// 7 adversarial review): the whole-file content hash
+    /// (`extraction::codegraph::body_hash` of the SAME source that produced
+    /// this edge), stamped once at extraction time by `extract_inner`'s
+    /// `add_edge` closure. Deliberately independent of `code_nodes.body_hash`
+    /// — that column is refreshed by every `upsert_node` call, in a SEPARATE
+    /// transaction from the edge replace, so it can silently drift out of
+    /// sync with a stale edge that never got re-extracted (a partial write —
+    /// nodes refreshed, edge replace failed or simply never ran — falsely
+    /// "authenticates" the stale edge if the gate trusts node state instead
+    /// of the edge's own). '' means absent — a legacy edge written before
+    /// this column existed. The WCR re-point gate
+    /// (`eval::codegraph::historical_src_content_unchanged`) treats '' as
+    /// categorically ineligible for re-pointing, never a guess.
+    pub src_content_hash: String,
 }
 
 /// One neighbour edge in a `query_neighbors` result.
@@ -171,6 +186,23 @@ pub fn upsert_node(conn: &Connection, n: &NodeRow) -> Result<()> {
 
 /// Per-file edge replace (Codex #3): delete every edge extracted from `src_file`,
 /// then bulk-insert the fresh set. Single transaction — no stale fan-out.
+///
+/// Codex round 7 adversarial review (WCR truth pass): this transaction is
+/// what makes `EdgeRow::src_content_hash` a sound re-point-eligibility
+/// signal — every edge in `edges` (already stamped by `extract_inner` with
+/// the SAME whole-file hash) is deleted-and-reinserted atomically with that
+/// stamp, so the gate that reads it back never observes a half-written
+/// state. This call is still a SEPARATE transaction from any preceding
+/// `upsert_node` calls for the same file (every caller — `hooks::
+/// post_tool_use::update_code_graph`, `import::backfill`,
+/// `eval::codegraph::extract_and_store` — upserts nodes first, then calls
+/// this), so `code_nodes.body_hash` can still drift out of sync with a
+/// stale edge on a partial failure between the two calls. The fix does not
+/// unify those two transactions (Codex's stated minimum bar): the gate
+/// simply never reads `code_nodes.body_hash` for re-point eligibility any
+/// more — `src_content_hash` lives ON the edge row itself, written
+/// atomically with it right here, so a node-vs-edge transaction split can no
+/// longer produce a false positive regardless of ordering.
 pub fn replace_file_edges(
     conn: &Connection,
     _project: &str,
@@ -186,8 +218,8 @@ pub fn replace_file_edges(
         let mut stmt = tx.prepare(
             "INSERT OR REPLACE INTO code_edges
                 (src_id, dst_id, kind, src_file, resolved, weight, conv_id, session_id,
-                 callee_kind, boundary, evidence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 callee_kind, boundary, evidence, src_content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )?;
         for e in edges {
             stmt.execute(params![
@@ -202,6 +234,7 @@ pub fn replace_file_edges(
                 e.callee_kind,
                 e.boundary,
                 e.evidence,
+                e.src_content_hash,
             ])?;
         }
     }

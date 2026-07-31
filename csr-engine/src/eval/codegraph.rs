@@ -517,7 +517,7 @@ fn snapshot(storage: &Arc<Storage>) -> Result<GraphSnapshot> {
         let edges = {
             let mut stmt = conn.prepare(
                 "SELECT src_id, dst_id, kind, src_file, resolved, weight, conv_id, session_id,
-                        callee_kind
+                        callee_kind, src_content_hash
                  FROM code_edges ORDER BY src_id, dst_id, kind",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -539,6 +539,16 @@ fn snapshot(storage: &Arc<Storage>) -> Result<GraphSnapshot> {
                     // it reprocesses, so a stale snapshot value would only ever
                     // be immediately overwritten.
                     callee_kind: row.get(8)?,
+                    // `src_content_hash` (Codex round 7 adversarial review):
+                    // UNLIKE `boundary`/`evidence`, this is NEVER recomputed by
+                    // the resolver — it is write-time provenance that must
+                    // survive the snapshot -> shadow round-trip unchanged, or
+                    // `historical_src_content_unchanged`'s re-point gate would
+                    // see every live-DB edge as freshly stamp-less inside the
+                    // shadow regardless of what the real `code_edges` row
+                    // carries, silently reintroducing a "drops the sweep"
+                    // instance of the exact bug class this fix closes.
+                    src_content_hash: row.get(9)?,
                     ..EdgeRow::default()
                 })
             })?;
@@ -773,42 +783,59 @@ const BACKFILL_MAX_FILE_BYTES: u64 = 512 * 1024;
 /// Re-pointing on correspondence alone credits gate closure that the
 /// evidence does not support.
 ///
-/// This gate makes the re-point DEDUCTIVE instead of inferential: sound only
-/// when the historical src node's OWN CONTENT is provably unchanged since
-/// the edge was recorded — its stored `body_hash` (last written to
-/// `code_nodes` for that exact `(kind, name)`) equals the body_hash of the
-/// SAME node recomputed from CURRENT on-disk content by this fresh re-parse
-/// (`fresh_hash_by_kind_name`, built once per file in `backfill_wcr_witnesses`,
-/// covers both shapes uniformly — the module node's hash is the whole-file
-/// hash for module-src edges, a named def's own body-span hash for
-/// named-src edges; no special-casing by kind). Equal hash is a mechanical
-/// proof, not a guess: the OLD attribution rule, applied to content
-/// byte-identical to today's, is what produced the historical edge — so the
-/// historical edge and the fresh legacy-corresponding site are the same
-/// physical call, full stop.
+/// Codex round 7 adversarial review (this gate's OWN round-6 implementation
+/// was itself unsound): the round-6 version compared `code_nodes.body_hash`
+/// — the SRC NODE's stored hash — against a fresh re-parse. That column is
+/// MUTABLE: `storage::codegraph::upsert_node` refreshes it on every sighting,
+/// and does so in a SEPARATE transaction from `replace_file_edges` (every
+/// live write path — `hooks::post_tool_use::update_code_graph`,
+/// `import::backfill`, `eval::codegraph::extract_and_store` — upserts nodes
+/// FIRST, then replaces edges), with import continuing past per-file
+/// failures. A partial failure (nodes refreshed to CURRENT content, edge
+/// replace failed or simply never ran) left a STALE edge joined to a FRESH
+/// node hash — the gate would see "content unchanged" and authenticate a
+/// re-point the evidence never supported. The node's content identity says
+/// nothing about whether THIS edge was ever re-examined against it.
 ///
-/// A missing historical hash (`stored_body_hash` empty — never recorded, or
-/// pre-dates this column) or a missing fresh hash (`fresh_hash_by_kind_name`
-/// has no entry — the historical `(kind, name)` node doesn't exist at all in
-/// the fresh fragment, e.g. it was itself removed) are both treated
-/// IDENTICALLY to a mismatch: `false`, never a guess. `body_hash` (a sha256
-/// digest) is never the empty string for any real text, so an empty stored
-/// hash can never coincidentally equal a real fresh one — this is checked
-/// explicitly anyway so the "missing never guesses" invariant is documented,
-/// not merely accidental. A `false` result here means the pending edge falls
-/// through to the SAME honest classification path as when no legacy
-/// correspondence exists at all — the ordinary drift guard (`can_drift`), or
-/// untouched/pending when that also fails. Never a separate, weaker outcome.
-fn historical_src_content_unchanged(
-    fresh_hash_by_kind_name: &HashMap<(&str, &str), &str>,
-    src_kind: &str,
-    src_name: &str,
-    stored_body_hash: &str,
-) -> bool {
-    !stored_body_hash.is_empty()
-        && fresh_hash_by_kind_name
-            .get(&(src_kind, src_name))
-            .is_some_and(|fresh_hash| *fresh_hash == stored_body_hash)
+/// The fix moves the hash onto the EDGE itself: `EdgeRow::src_content_hash`
+/// is stamped by `extract_inner`'s `add_edge` closure at the SAME moment
+/// (same extraction, same whole-file hash) the edge is created, and written
+/// atomically with it by `replace_file_edges`'s single delete+insert
+/// transaction — see that function's doc comment. The gate is now sound
+/// regardless of `code_nodes` state: it never reads `code_nodes.body_hash`
+/// at all. `edge_src_content_hash` is the PENDING edge's own stored stamp
+/// (from the `code_edges.src_content_hash` column, read by
+/// `backfill_wcr_witnesses`'s `pending_edges` query); `fresh_file_hash` is
+/// the SAME hash (`extraction::codegraph::body_hash`) recomputed from the
+/// file's CURRENT on-disk content by this backfill pass, once per file.
+/// Equal hashes are a mechanical proof, not a guess: the OLD attribution
+/// rule, applied to content byte-identical to today's, is what produced the
+/// historical edge — so the historical edge and the fresh
+/// legacy-corresponding site are the same physical call, full stop.
+///
+/// An empty `edge_src_content_hash` — never stamped (a legacy edge written
+/// before this column existed) or stamped by a path that dropped it — is
+/// categorically INELIGIBLE, never a guess: `body_hash` (a sha256 digest) is
+/// never the empty string for any real text, so an empty stored hash can
+/// never coincidentally equal a real fresh one. This is checked explicitly
+/// anyway so the "missing never guesses" invariant is documented, not merely
+/// accidental.
+///
+/// This function alone cannot distinguish WHY it returned `false` — empty
+/// (no evidence at all) and non-empty-but-mismatched (positive evidence of
+/// change) both come back `false` — but its two callers, in
+/// `backfill_wcr_witnesses`, deliberately do NOT treat those two shapes the
+/// same (WCR truth pass, Codex round 7, item 3): an EMPTY hash means the
+/// pending edge is left COMPLETELY untouched (pending/unexplained forever,
+/// never a guessed drift — the call may still exist under the new
+/// attribution, this backfill simply never re-examined it), while a
+/// MISMATCHED hash falls through to the ordinary drift guard (`can_drift`) —
+/// the Alpha/Beta scenario, where the historical edge's own stamp proves the
+/// file's content genuinely changed since it was recorded, so an absent
+/// fresh site really is drift, not merely unproven. See each call site's own
+/// comment for the split.
+fn historical_src_content_unchanged(edge_src_content_hash: &str, fresh_file_hash: &str) -> bool {
+    !edge_src_content_hash.is_empty() && edge_src_content_hash == fresh_file_hash
 }
 
 /// Witness backfill (WCR Phase 5, TASK 2; evidence propagation extended WCR
@@ -906,6 +933,13 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
             Ok(s) => s,
             Err(_) => continue,
         };
+        // Codex round 7 adversarial review: the SAME whole-file hash
+        // `extract_inner` would stamp onto every fresh edge from this file
+        // (`extraction::codegraph::body_hash`) — recomputed here, once per
+        // file, as the "current on-disk content" side of the re-point
+        // eligibility gate (`historical_src_content_unchanged`, below).
+        // Never a second hashing scheme.
+        let fresh_file_hash = crate::extraction::codegraph::body_hash(&source);
 
         let fragment = extract_graph_fragment_for_file(
             &source,
@@ -1057,27 +1091,17 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
             .map(|n| n.name.as_str())
             .collect();
 
-        // Codex round 6 adversarial review (legacy-attribution correspondence
-        // is NOT cross-version site identity — see
-        // `historical_src_content_unchanged`'s doc comment for the full
-        // finding): `(kind, name) -> body_hash`, from THIS SAME fresh
-        // fragment, for EVERY node including the module node — the content
-        // the re-point gate below compares the historical, previously-stored
-        // hash against. Duplicate `(kind, name)` keys (should not normally
-        // happen — `node_id`'s own hash already disambiguates by kind+name
-        // within a file) are removed entirely, same "ambiguous, never guess"
-        // convention `shadow_name_to_id` already uses, above.
-        let fresh_hash_by_kind_name: HashMap<(&str, &str), &str> = {
-            let mut counts: HashMap<(&str, &str), u32> = HashMap::new();
-            let mut map: HashMap<(&str, &str), &str> = HashMap::new();
-            for n in &fragment.nodes {
-                let key = (n.kind.as_str(), n.name.as_str());
-                *counts.entry(key).or_insert(0) += 1;
-                map.entry(key).or_insert(n.body_hash.as_str());
-            }
-            map.retain(|key, _| counts.get(key) == Some(&1));
-            map
-        };
+        // Codex round 7 adversarial review: the code_nodes-hash-based
+        // content-identity map this comment used to describe (keyed
+        // `(kind, name) -> code_nodes.body_hash`) is REMOVED — it is the
+        // refuted mechanism (see `historical_src_content_unchanged`'s doc
+        // comment for the full finding: `code_nodes.body_hash` is mutable
+        // and refreshed in a transaction separate from the edge replace, so
+        // it cannot soundly authenticate a specific pending EDGE). The
+        // re-point gate now reads `fresh_file_hash` (computed once per file,
+        // above) against each pending edge's own stored
+        // `code_edges.src_content_hash`, fetched by the `pending_edges`
+        // query below — no per-(kind, name) map needed.
 
         // WCR Phase 7: `(callee_kind, evidence)` — the `evidence` half is
         // the `via:<qualifier>` data captured at extraction time (WCR Phase
@@ -1204,16 +1228,16 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
         // never classified" IS the correct outcome for it, not a shortcut
         // to take before checking.
 
-        // Codex round 6 adversarial review: `n.kind` (the SRC node's OWN
-        // kind, distinct from `e.kind`, the edge kind calls/imports) and
-        // `n.body_hash` (the HISTORICAL, previously-stored content hash for
-        // that exact node) are pulled alongside `n.name` now — both required
-        // by the re-point content-identity gate below (see
-        // `historical_src_content_unchanged`'s doc comment).
-        let pending_edges: Vec<(String, String, String, String, String, String)> =
+        // Codex round 7 adversarial review: `e.src_content_hash` — the
+        // pending EDGE's OWN stamped hash, not `n.body_hash` (the SRC NODE's
+        // mutable, separately-refreshed hash — the refuted round-6
+        // mechanism; see `historical_src_content_unchanged`'s doc comment for
+        // the full finding) — is pulled alongside `n.name` now, required by
+        // the re-point content-identity gate below.
+        let pending_edges: Vec<(String, String, String, String, String)> =
             shadow.with_connection(|conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT e.src_id, e.dst_id, e.kind, n.name, n.kind, n.body_hash
+                    "SELECT e.src_id, e.dst_id, e.kind, n.name, e.src_content_hash
                      FROM code_edges e JOIN code_nodes n ON n.id = e.src_id
                      WHERE e.resolved = 0 AND e.dst_id LIKE 'name:%' AND e.kind IN ('calls', 'imports')
                        AND e.src_file = ?1 AND n.project = ?2
@@ -1226,14 +1250,13 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
                     ))
                 })?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(Into::into)
             })?;
 
-        for (src_id, dst_id, kind, src_name, src_node_kind, src_body_hash) in pending_edges {
+        for (src_id, dst_id, kind, src_name, edge_src_content_hash) in pending_edges {
             let Some(bare) = dst_id.strip_prefix("name:") else {
                 continue;
             };
@@ -1346,15 +1369,16 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                                     // call and an unrelated added closure-Beta
                                     // call both legacy-attribute to this same
                                     // historical src). Gated DEDUCTIVELY on the
-                                    // historical src node's content being
-                                    // provably unchanged since this edge was
-                                    // recorded, checked BEFORE trusting the
-                                    // correspondence to re-point at all.
+                                    // PENDING EDGE's own stamped content hash
+                                    // being provably unchanged since it was
+                                    // recorded (Codex round 7: not the src
+                                    // node's mutable hash — see that same doc
+                                    // comment for why), checked BEFORE
+                                    // trusting the correspondence to re-point
+                                    // at all.
                                     if historical_src_content_unchanged(
-                                        &fresh_hash_by_kind_name,
-                                        &src_node_kind,
-                                        &src_name,
-                                        &src_body_hash,
+                                        &edge_src_content_hash,
+                                        &fresh_file_hash,
                                     ) {
                                         if let Some((src_kind, new_kind, new_evidence)) =
                                             candidates.get(winning)
@@ -1391,16 +1415,35 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                                         // produced a `fragment.edges` entry at its
                                         // own current src), but never guess if it
                                         // somehow is. Leave untouched.
+                                    } else if edge_src_content_hash.is_empty() {
+                                        // WCR truth pass, Codex round 7, item 3:
+                                        // an EMPTY edge hash is a legacy row —
+                                        // never stamped, so there is NO EVIDENCE
+                                        // either way about whether this file's
+                                        // content changed since the edge was
+                                        // recorded. Drifting it would claim
+                                        // positive knowledge ("the call is
+                                        // gone") this backfill does not have —
+                                        // the call may still exist under the new
+                                        // attribution, just unprovably so. Left
+                                        // COMPLETELY untouched: pending,
+                                        // unexplained — never a guess in either
+                                        // direction. Distinct from the mismatch
+                                        // case immediately below, which DOES have
+                                        // positive evidence.
                                     } else if can_drift {
-                                        // Content-identity gate failed: the
-                                        // historical src's own content changed
-                                        // (or was never hashed) since this edge
-                                        // was recorded — cross-version site
-                                        // identity is unprovable. Fall through to
-                                        // the SAME honest drift classification a
-                                        // missing legacy correspondence gets,
-                                        // immediately below — never a guessed
-                                        // re-point.
+                                        // Content-identity gate failed on a
+                                        // NON-EMPTY, MISMATCHED hash: the
+                                        // historical edge's own stamped content
+                                        // provably changed since it was recorded
+                                        // — cross-version site identity is
+                                        // unprovable, but genuine drift evidence
+                                        // DOES exist (the Alpha/Beta case — see
+                                        // `historical_src_content_unchanged`'s
+                                        // doc comment). Fall through to the SAME
+                                        // honest drift classification a missing
+                                        // legacy correspondence gets, immediately
+                                        // below — never a guessed re-point.
                                         mark_drifted(shadow, &src_id, &dst_id, "calls")?;
                                     }
                                 }
@@ -1476,15 +1519,14 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                         match call_legacy_correspondence.get(&legacy_key) {
                             Some(current_srcs) if current_srcs.len() == 1 => {
                                 let winning = current_srcs.iter().next().expect("len == 1");
-                                // Codex round 6 adversarial review: same
-                                // content-identity gate as the `calls` arm
-                                // above — see `historical_src_content_unchanged`'s
-                                // doc comment.
+                                // Codex round 6/7 adversarial review: same
+                                // edge-hash content-identity gate as the
+                                // `calls` arm above — see
+                                // `historical_src_content_unchanged`'s doc
+                                // comment.
                                 if historical_src_content_unchanged(
-                                    &fresh_hash_by_kind_name,
-                                    &src_node_kind,
-                                    &src_name,
-                                    &src_body_hash,
+                                    &edge_src_content_hash,
+                                    &fresh_file_hash,
                                 ) {
                                     if let Some((src_kind, new_evidence)) = candidates.get(winning)
                                     {
@@ -1504,8 +1546,14 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                                         }
                                         // else: no valid real shadow id — never guess.
                                     }
+                                } else if edge_src_content_hash.is_empty() {
+                                    // WCR truth pass, Codex round 7, item 3:
+                                    // empty edge hash — no evidence either way,
+                                    // left completely untouched. Same reasoning
+                                    // as the `calls` arm above.
                                 } else if can_drift {
-                                    // Content-identity gate failed — same fall
+                                    // Content-identity gate failed on a
+                                    // non-empty, MISMATCHED hash — same fall
                                     // through as the `calls` arm above.
                                     mark_drifted(shadow, &src_id, &dst_id, "imports")?;
                                 }
@@ -3699,12 +3747,15 @@ mod tests {
         // module node) and the edge would wrongly drift, manufacturing
         // gate credit while silently discarding the call/import site.
         //
-        // Codex round 6 adversarial review: re-pointing now additionally
-        // requires the historical module node's stored `body_hash` to equal
-        // the fresh re-parse's module hash — i.e. this file's content must be
-        // PROVABLY UNCHANGED since the edge was recorded. This is exactly
+        // Codex round 7 adversarial review: re-pointing now additionally
+        // requires the historical EDGE's own stamped `src_content_hash` to
+        // equal the fresh re-parse's whole-file hash — i.e. this file's
+        // content must be PROVABLY UNCHANGED since the edge was recorded,
+        // proven from the edge's own stamp, never the src node's mutable
+        // `body_hash` (round 6's refuted mechanism — see
+        // `historical_src_content_unchanged`'s doc comment). This is exactly
         // that positive case: `source` below is BOTH what's on disk AND what
-        // the historical node's hash was computed from, so the gate must
+        // the historical edge's stamp was computed from, so the gate must
         // pass and this MANDATED regression must stay green.
         let source =
             "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
@@ -3728,11 +3779,6 @@ mod tests {
                 lang: "tsx".into(),
                 kind: "module".into(),
                 name: file_str.clone(),
-                // Content-identity gate (Codex round 6): the historical
-                // module node's hash must match `source`'s own hash — same
-                // content, computed the same way `extract_inner`'s module
-                // node does (`body_hash(source)`, the WHOLE-FILE text).
-                body_hash: crate::extraction::codegraph::body_hash(source),
                 first_conv_id: "c".into(),
                 last_conv_id: "c".into(),
                 ..NodeRow::default()
@@ -3777,6 +3823,12 @@ mod tests {
                     resolved: 0,
                     weight: 1.0,
                     callee_kind: "direct".into(),
+                    // Content-identity gate (Codex round 7): the historical
+                    // EDGE's own stamped hash must match `source`'s hash —
+                    // same content, computed the same way `extract_inner`
+                    // stamps every edge (`body_hash(source)`, the
+                    // WHOLE-FILE text).
+                    src_content_hash: crate::extraction::codegraph::body_hash(source),
                     ..EdgeRow::default()
                 }],
             )
@@ -3958,15 +4010,17 @@ mod tests {
         );
     }
 
-    // ─── content-identity gate on legacy-attribution re-point (Codex round 6
-    // adversarial review): correspondence alone proves NAME/KIND attribution
-    // under the frozen old rule, never cross-version SITE identity — see
-    // `historical_src_content_unchanged`'s doc comment for the full finding. ───
+    // ─── content-identity gate on legacy-attribution re-point (Codex round
+    // 6/7 adversarial review): correspondence alone proves NAME/KIND
+    // attribution under the frozen old rule, never cross-version SITE
+    // identity — see `historical_src_content_unchanged`'s doc comment for
+    // the full finding. ───
 
     #[test]
-    fn backfill_never_repoints_when_historical_module_hash_mismatches_current_content() {
+    fn backfill_never_repoints_when_historical_edge_hash_mismatches_current_content() {
         // MANDATED REGRESSION TEST (Codex round 6 adversarial review,
-        // verbatim scenario): the historical module-src `helper` edge was
+        // verbatim scenario; upgraded to the round-7 edge-level hash by this
+        // test's own rewrite): the historical module-src `helper` edge was
         // recorded from a PRIOR version of this file where a closure inside
         // `Alpha` called `helper()`. Since then the file was edited:
         // `Alpha`'s call was REMOVED, and an unrelated closure inside a
@@ -3977,14 +4031,14 @@ mod tests {
         // correspondence rule alone would wrongly re-point the historical
         // edge to Beta, crediting gate closure the evidence does not
         // support: Beta's call was never proven to be the SAME physical call
-        // Alpha's was. The module node's stored `body_hash` (computed from
-        // the OLD, Alpha-containing content) does NOT match the fresh
-        // module hash (computed from the CURRENT, Beta-containing content on
-        // disk) — the content-identity gate must refuse the re-point. The
-        // edge must fall through to the ordinary drift guard exactly as if
-        // no legacy correspondence existed at all (module-src edges always
-        // satisfy `can_drift`'s condition (c)), never silently guessed onto
-        // Beta.
+        // Alpha's was. The historical EDGE's own stamped `src_content_hash`
+        // (computed from the OLD, Alpha-containing content) does NOT match
+        // the fresh whole-file hash (computed from the CURRENT,
+        // Beta-containing content on disk) — the content-identity gate must
+        // refuse the re-point. The edge must fall through to the ordinary
+        // drift guard exactly as if no legacy correspondence existed at all
+        // (module-src edges always satisfy `can_drift`'s condition (c)),
+        // never silently guessed onto Beta.
         let old_content =
             "function Alpha() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
         let current_content =
@@ -4006,10 +4060,6 @@ mod tests {
                 lang: "tsx".into(),
                 kind: "module".into(),
                 name: file_str.clone(),
-                // Historical hash from the OLD (Alpha) content — deliberately
-                // DIFFERENT from what a fresh re-parse of `current_content`
-                // (Beta) will produce.
-                body_hash: crate::extraction::codegraph::body_hash(old_content),
                 first_conv_id: "c".into(),
                 last_conv_id: "c".into(),
                 ..NodeRow::default()
@@ -4034,6 +4084,11 @@ mod tests {
                     resolved: 0,
                     weight: 1.0,
                     callee_kind: "direct".into(),
+                    // Historical EDGE hash from the OLD (Alpha) content —
+                    // deliberately DIFFERENT from what a fresh re-parse of
+                    // `current_content` (Beta) will produce. Real, non-empty
+                    // — isolates "mismatched" from "missing" (the next test).
+                    src_content_hash: crate::extraction::codegraph::body_hash(old_content),
                     ..EdgeRow::default()
                 }],
             )
@@ -4075,18 +4130,140 @@ mod tests {
     }
 
     #[test]
-    fn backfill_never_repoints_when_historical_module_hash_is_missing() {
-        // MANDATED TEST (Codex round 6 adversarial review): a historical
-        // module node whose `body_hash` was never recorded (empty string —
-        // e.g. a row from before this column existed, or a shadow/copy path
-        // that dropped it) must NEVER be treated as a match by accident.
-        // `body_hash` is a sha256 digest and is never the empty string for
-        // any real text, so an empty stored hash can never coincidentally
-        // equal a real fresh one — this test locks that invariant in
-        // directly rather than relying on it being merely accidental.
-        // Content is otherwise UNCHANGED (same shape as the hash-match
-        // positive test) — the only difference is the missing historical
-        // hash — so this isolates "missing" from "mismatched".
+    fn backfill_never_repoints_on_partial_write_skew_node_hash_ahead_of_edge_hash() {
+        // MANDATED REGRESSION (Codex round 7 adversarial review, verbatim
+        // scenario — the finding this whole fix responds to): a partial live
+        // write left `code_nodes.body_hash` refreshed to CURRENT content
+        // (simulating a real `upsert_node` that ran successfully) while the
+        // `code_edges` row for an old Alpha-closure call was never
+        // re-extracted (simulating `replace_file_edges` failing, or simply
+        // not having run yet, in its SEPARATE transaction — see
+        // `storage::codegraph::replace_file_edges`'s doc comment). Same
+        // Alpha/Beta shape as the mismatch test above: the historical edge
+        // was recorded when a closure inside `Alpha` called `helper()`;
+        // since then `Alpha`'s call was REMOVED and an unrelated closure
+        // inside a NEWLY ADDED `Beta` was added that ALSO calls `helper()`,
+        // so Beta is the sole legacy-correspondence candidate. The OLD
+        // (round-6) gate compared the src NODE's hash — which here DOES
+        // match current content (the node was refreshed) — and would have
+        // wrongly authenticated the re-point onto Beta. The round-7 gate
+        // reads the EDGE's own hash instead, which is absent/stale — never
+        // refreshed by the node upsert — so it correctly refuses regardless
+        // of what `code_nodes.body_hash` says. An EMPTY edge hash (item 3 of
+        // the fix) also means NO evidence either way, so the edge is left
+        // completely untouched rather than drifted — see the assertion
+        // below.
+        let current_content =
+            "function Beta() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.tsx");
+        std::fs::write(&file_path, current_content).unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "tsx".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                // The NODE's hash is CURRENT — refreshed to match
+                // `current_content` (Beta), exactly as a real `upsert_node`
+                // call would leave it after re-extracting this file. This is
+                // the partial-write skew: node state says "fresh", edge
+                // state (below) says otherwise.
+                body_hash: crate::extraction::codegraph::body_hash(current_content),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        let beta_id = crate::extraction::codegraph::node_id("repo", &file_str, "function", "Beta");
+        seed_backfill_node(&shadow, &beta_id, &file_str, "Beta");
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[EdgeRow {
+                    src_id: module_id.clone(),
+                    dst_id: "name:helper".into(),
+                    kind: "calls".into(),
+                    src_file: file_str.clone(),
+                    resolved: 0,
+                    weight: 1.0,
+                    callee_kind: "direct".into(),
+                    // The EDGE's own hash is ABSENT — never stamped, exactly
+                    // what a stale row that missed a `replace_file_edges`
+                    // pass looks like. Deliberately NOT set to the OLD
+                    // (Alpha) content either — "absent/stale" per the
+                    // mandated scenario; the missing-hash test above already
+                    // covers this exact shape, so this test's own distinct
+                    // contribution is the node hash being CURRENT, not the
+                    // edge hash being missing.
+                    ..EdgeRow::default()
+                }],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(
+            files, 1,
+            "the on-disk (current, Beta-containing) file was re-extracted"
+        );
+        assert_eq!(
+            edges, 0,
+            "partial write skew (node hash current, edge hash absent) refuses the \
+             re-point — the gate must never trust code_nodes.body_hash"
+        );
+
+        let (src_id, boundary, resolved): (String, String, i64) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT src_id, boundary, resolved FROM code_edges
+                     WHERE dst_id = 'name:helper' AND kind = 'calls'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            src_id, module_id,
+            "must NOT re-point to Beta merely because the SRC NODE's hash looks current"
+        );
+        assert_ne!(src_id, beta_id);
+        assert_eq!(
+            boundary, "",
+            "item 3 of the fix: an EMPTY edge hash is NO evidence either way — left \
+             completely untouched, never drifted (drift would overclaim positive \
+             knowledge this backfill does not have)"
+        );
+        assert_eq!(resolved, 0);
+    }
+
+    #[test]
+    fn backfill_never_repoints_when_historical_edge_hash_is_missing() {
+        // MANDATED TEST (Codex round 6 adversarial review; edge-level, and
+        // "stays pending rather than drifts", as of round 7's item 3 — see
+        // `historical_src_content_unchanged`'s doc comment): a historical
+        // EDGE whose `src_content_hash` was never recorded (empty string —
+        // a legacy edge written before this column existed) must NEVER be
+        // treated as a match by accident, AND must NOT be drift-classified
+        // either — an empty hash is NO evidence either way about whether
+        // this file changed, so claiming "the call is gone" (drift) would
+        // overclaim. `body_hash` is a sha256 digest and is never the empty
+        // string for any real text, so an empty stored hash can never
+        // coincidentally equal a real fresh one — this test locks that
+        // invariant in directly rather than relying on it being merely
+        // accidental. Content is otherwise UNCHANGED (same shape as the
+        // hash-match positive test) — the only difference is the missing
+        // historical hash — so this isolates "missing" from "mismatched"
+        // (the sibling test, immediately above, which DOES drift).
         let source =
             "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
         let tmp = tempfile::tempdir().unwrap();
@@ -4106,8 +4283,6 @@ mod tests {
                 lang: "tsx".into(),
                 kind: "module".into(),
                 name: file_str.clone(),
-                // Deliberately MISSING — `NodeRow::default()`'s body_hash is
-                // "", never overwritten here.
                 first_conv_id: "c".into(),
                 last_conv_id: "c".into(),
                 ..NodeRow::default()
@@ -4128,6 +4303,8 @@ mod tests {
                     resolved: 0,
                     weight: 1.0,
                     callee_kind: "direct".into(),
+                    // Deliberately MISSING — `EdgeRow::default()`'s
+                    // `src_content_hash` is "", never overwritten here.
                     ..EdgeRow::default()
                 }],
             )
@@ -4140,13 +4317,13 @@ mod tests {
             "a missing historical hash refuses the re-point, same as a mismatched one"
         );
 
-        let (src_id, boundary): (String, String) = shadow
+        let (src_id, boundary, resolved): (String, String, i64) = shadow
             .with_connection(|conn| {
                 conn.query_row(
-                    "SELECT src_id, boundary FROM code_edges
+                    "SELECT src_id, boundary, resolved FROM code_edges
                      WHERE dst_id = 'name:helper' AND kind = 'calls'",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .map_err(Into::into)
             })
@@ -4157,65 +4334,40 @@ mod tests {
         );
         assert_ne!(src_id, component_id);
         assert_eq!(
-            boundary, "drifted",
-            "falls through to the ordinary drift guard, same as a content mismatch"
+            boundary, "",
+            "item 3 of the fix: a missing edge hash leaves the edge completely \
+             untouched — pending, unexplained — never drifted, unlike a genuine \
+             content mismatch (the sibling test, immediately above)"
         );
+        assert_eq!(resolved, 0);
     }
 
     #[test]
-    fn historical_src_content_unchanged_gates_module_and_named_def_hashes_uniformly() {
-        // MANDATED TEST (Codex round 6 adversarial review): direct unit
-        // coverage of the gate function itself, for BOTH shapes the fix
-        // must handle — module-src (the only shape actually reachable
-        // through `backfill_wcr_witnesses`'s real `legacy_src_attribution`
-        // vs `nearest_def_node` divergence, since the two rules provably
-        // never disagree on a NAMED first ancestor — see
-        // `legacy_src_attribution`'s doc comment) and named-def-src (the
-        // general case the gate is written to handle uniformly, with no
-        // module special-casing, even though today's extractor cannot
-        // itself produce a named-src legacy-correspondence edge). Matching
-        // hash allows; mismatched, and missing, hashes refuse — never a
-        // guess either way.
-        let mut fresh: HashMap<(&str, &str), &str> = HashMap::new();
-        fresh.insert(("module", "a.tsx"), "abc123");
-        fresh.insert(("function", "helper2"), "def456");
+    fn historical_src_content_unchanged_gates_on_edge_hash_not_node_hash() {
+        // MANDATED TEST (Codex round 7 adversarial review — supersedes the
+        // round-6 version of this test, which exercised a `(kind, name) ->
+        // code_nodes.body_hash` map; that mechanism is REMOVED, see
+        // `historical_src_content_unchanged`'s doc comment for the full
+        // finding): direct unit coverage of the gate function itself, now a
+        // plain two-string comparison between a pending EDGE's own stamped
+        // `src_content_hash` and the file's freshly recomputed content hash.
+        // Matching hash allows; mismatched, and missing (empty), hashes
+        // refuse — never a guess either way.
+        let fresh_file_hash = "abc123";
 
-        // Module-src: matching hash -> allowed.
-        assert!(historical_src_content_unchanged(
-            &fresh, "module", "a.tsx", "abc123"
-        ));
-        // Module-src: mismatched hash -> refused.
-        assert!(!historical_src_content_unchanged(
-            &fresh, "module", "a.tsx", "zzz999"
-        ));
-        // Module-src: missing historical hash -> refused.
-        assert!(!historical_src_content_unchanged(
-            &fresh, "module", "a.tsx", ""
-        ));
-        // Module-src: no fresh node at all for this (kind, name) -> refused.
-        assert!(!historical_src_content_unchanged(
-            &fresh, "module", "gone.tsx", "abc123"
-        ));
-
-        // Named-def-src: matching hash -> allowed.
-        assert!(historical_src_content_unchanged(
-            &fresh, "function", "helper2", "def456"
-        ));
-        // Named-def-src: mismatched hash -> refused.
-        assert!(!historical_src_content_unchanged(
-            &fresh, "function", "helper2", "stale000"
-        ));
-        // Named-def-src: missing historical hash -> refused.
-        assert!(!historical_src_content_unchanged(
-            &fresh, "function", "helper2", ""
-        ));
-        // Named-def-src: right name, WRONG kind (e.g. a `type` node sharing
-        // the bare name) -> refused — kind-blind matching is exactly the
-        // guess this gate (and `shadow_name_to_id`, elsewhere) must never
-        // make.
-        assert!(!historical_src_content_unchanged(
-            &fresh, "type", "helper2", "def456"
-        ));
+        // Matching edge hash -> allowed.
+        assert!(historical_src_content_unchanged("abc123", fresh_file_hash));
+        // Mismatched edge hash -> refused.
+        assert!(!historical_src_content_unchanged("zzz999", fresh_file_hash));
+        // Missing (empty) edge hash -> refused — never a guess, even though
+        // an empty string trivially can't equal a real sha256 digest; this
+        // locks the invariant in directly rather than relying on it being
+        // merely accidental.
+        assert!(!historical_src_content_unchanged("", fresh_file_hash));
+        // Missing (empty) FRESH hash is not a real reachable shape (`body_hash`
+        // never returns "" for real content), but must refuse rather than
+        // vacuously match two empty strings.
+        assert!(!historical_src_content_unchanged("", ""));
     }
 
     #[test]
@@ -4610,10 +4762,10 @@ mod tests {
         // aborting the ENTIRE backfill pass (no per-file catch) and
         // silently leaving every file after the collision un-backfilled.
         //
-        // Codex round 6: content unchanged since recording (`source` is both
-        // on disk and the historical module hash's source), so the
-        // content-identity gate must pass and this dedupe path must still
-        // exercise a real re-point.
+        // Codex round 7: content unchanged since recording (`source` is both
+        // on disk and the historical stale EDGE's own stamped hash's
+        // source), so the content-identity gate must pass and this dedupe
+        // path must still exercise a real re-point.
         let source =
             "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
         let tmp = tempfile::tempdir().unwrap();
@@ -4633,7 +4785,6 @@ mod tests {
                 lang: "tsx".into(),
                 kind: "module".into(),
                 name: file_str.clone(),
-                body_hash: crate::extraction::codegraph::body_hash(source),
                 first_conv_id: "c".into(),
                 last_conv_id: "c".into(),
                 ..NodeRow::default()
@@ -4658,6 +4809,7 @@ mod tests {
                         resolved: 0,
                         weight: 1.0,
                         callee_kind: "direct".into(),
+                        src_content_hash: crate::extraction::codegraph::body_hash(source),
                         ..EdgeRow::default()
                     },
                     EdgeRow {
@@ -4728,8 +4880,9 @@ mod tests {
         // are refreshed from the CURRENT fresh extraction on the
         // surviving row regardless of which branch touches it.
         //
-        // Codex round 6: content unchanged since recording — same
-        // content-identity gate note as the dedupe test above.
+        // Codex round 7: content unchanged since recording — same
+        // content-identity gate note as the dedupe test above (this test's
+        // stale edge now carries its OWN stamped hash, not the src node's).
         let source =
             "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
         let tmp = tempfile::tempdir().unwrap();
@@ -4749,7 +4902,6 @@ mod tests {
                 lang: "tsx".into(),
                 kind: "module".into(),
                 name: file_str.clone(),
-                body_hash: crate::extraction::codegraph::body_hash(source),
                 first_conv_id: "c".into(),
                 last_conv_id: "c".into(),
                 ..NodeRow::default()
@@ -4779,6 +4931,7 @@ mod tests {
                         conv_id: "conv-old".into(),
                         session_id: "sess-old".into(),
                         callee_kind: "method".into(),
+                        src_content_hash: crate::extraction::codegraph::body_hash(source),
                         ..EdgeRow::default()
                     },
                     EdgeRow {
@@ -4868,8 +5021,10 @@ mod tests {
         // (kind, name) pair to the FUNCTION node, never the co-named TYPE
         // node.
         //
-        // Codex round 6: content unchanged since recording — same
-        // content-identity gate note as the dedupe tests above.
+        // Codex round 7: content unchanged since recording — same
+        // content-identity gate note as the dedupe tests above (the
+        // historical edge below carries its OWN stamped hash, not the src
+        // node's).
         let source =
             "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n";
         let tmp = tempfile::tempdir().unwrap();
@@ -4889,7 +5044,6 @@ mod tests {
                 lang: "typescript".into(),
                 kind: "module".into(),
                 name: file_str.clone(),
-                body_hash: crate::extraction::codegraph::body_hash(source),
                 first_conv_id: "c".into(),
                 last_conv_id: "c".into(),
                 ..NodeRow::default()
@@ -4928,6 +5082,7 @@ mod tests {
                     resolved: 0,
                     weight: 1.0,
                     callee_kind: "direct".into(),
+                    src_content_hash: crate::extraction::codegraph::body_hash(source),
                     ..EdgeRow::default()
                 }],
             )
