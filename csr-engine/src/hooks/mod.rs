@@ -17,7 +17,7 @@ pub mod session_start;
 pub mod stop;
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -150,6 +150,59 @@ fn hook_input_from(read: StdinRead) -> HookInput {
     }
 }
 
+/// Resolve the directory a hook operates on. Prefers the cwd Claude Code sent,
+/// falls back to the process cwd, and **never fails**.
+///
+/// Every step here used to abort the whole hook with `?`: `canonicalize` fails if
+/// the directory is renamed or removed between `is_dir()` and the call, and
+/// `current_dir` fails outright once the process's own working directory is gone.
+/// Aborting is the failure this module keeps having to fix — it silently disables
+/// both context injection and live transcript import — so each step now degrades to
+/// the next best path and says so, rather than taking the session down with it.
+///
+/// Also performs the S-3 home-directory check (Windows-fixed: `canonicalize()`
+/// returns a `\\?\`-prefixed path, so the raw `home_dir()` never prefix-matched and
+/// this bailed on EVERY hook that carried a cwd — compare canonical vs canonical).
+/// Outside-`$HOME` is a warning, not an error: projects legitimately live on other
+/// drives.
+fn resolve_hook_cwd(input_cwd: Option<&str>) -> PathBuf {
+    if let Some(dir) = input_cwd {
+        let p = PathBuf::from(dir);
+        if p.is_dir() {
+            let resolved = match p.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(e) => {
+                    crate::telemetry::append_timing_line(&format!(
+                        "CSR cwd: canonicalize({}) failed ({}) — using the path as given",
+                        p.display(),
+                        e
+                    ));
+                    p
+                }
+            };
+            let home_ok = dirs::home_dir()
+                .and_then(|h| h.canonicalize().ok())
+                .map(|h| resolved.starts_with(&h))
+                .unwrap_or(false);
+            if !home_ok {
+                eprintln!("CSR: cwd {} outside home (allowed)", resolved.display());
+            }
+            return resolved;
+        }
+    }
+
+    std::env::current_dir().unwrap_or_else(|e| {
+        // The process cwd itself is unreadable (deleted out from under us). A
+        // relative path keeps the hook alive; whatever it touches will fail on its
+        // own terms instead of killing the session here.
+        crate::telemetry::append_timing_line(&format!(
+            "CSR cwd: current_dir() failed ({}) — falling back to \".\"",
+            e
+        ));
+        PathBuf::from(".")
+    })
+}
+
 /// Shared helper: import the current transcript incrementally.
 /// Used by stop, precompact, prompt_submit, and session_end hooks.
 pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: &Path) {
@@ -214,32 +267,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
         input.session_id.is_some(),
     ));
 
-    // Determine CWD: prefer input.cwd, fall back to process CWD
-    // Validate that cwd is a real directory under $HOME (S-3 fix)
-    let cwd = if let Some(ref dir) = input.cwd {
-        let p = std::path::PathBuf::from(dir);
-        if p.is_dir() {
-            let canonical = p.canonicalize()?;
-            // S-3 check, Windows-fixed: canonicalize() returns a \\?\-prefixed
-            // path, so the raw home_dir() never prefix-matched and this bailed
-            // on EVERY hook that carried a cwd — compare canonical vs canonical.
-            // And outside-home is a warning, not an error: projects legitimately
-            // live on other drives (D:\...), and a hook that dies here silently
-            // disables both injection and live transcript import.
-            let home_ok = dirs::home_dir()
-                .and_then(|h| h.canonicalize().ok())
-                .map(|h| canonical.starts_with(&h))
-                .unwrap_or(false);
-            if !home_ok {
-                eprintln!("CSR: cwd {} outside home (allowed)", canonical.display());
-            }
-            canonical
-        } else {
-            std::env::current_dir()?
-        }
-    } else {
-        std::env::current_dir()?
-    };
+    let cwd = resolve_hook_cwd(input.cwd.as_deref());
 
     let t_setup = t0.elapsed();
 
@@ -322,6 +350,26 @@ mod tests {
             matches!(outcome, StdinRead::Empty),
             "whitespace-only input is empty, not a payload"
         );
+    }
+
+    #[test]
+    fn resolve_hook_cwd_never_fails() {
+        // A real directory is taken and canonicalized.
+        let real = std::env::temp_dir();
+        assert_eq!(
+            resolve_hook_cwd(Some(&real.to_string_lossy())),
+            real.canonicalize().unwrap()
+        );
+
+        // A cwd that is not a directory, and no cwd at all, both fall back to the
+        // process directory instead of aborting the hook.
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(
+            resolve_hook_cwd(Some("/definitely/not/a/directory/csr-test")),
+            here
+        );
+        assert_eq!(resolve_hook_cwd(None), here);
+        assert_eq!(resolve_hook_cwd(Some("")), here);
     }
 
     #[test]
