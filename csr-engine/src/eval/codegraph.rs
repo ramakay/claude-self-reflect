@@ -2135,6 +2135,38 @@ fn wcr_dump_write(
         .with_context(|| format!("CSR_WCR_DUMP: writing {path}"))
 }
 
+/// CSR_EVAL_DUMP_SHADOW diagnostic (off by default, zero effect otherwise):
+/// copies the WCR shadow's `repo_defs`, `code_edges`, `code_nodes` tables —
+/// post-backfill, post-resolve, so `code_edges.boundary` carries the final
+/// fine-grained classification (bound/external/method/stale/local/
+/// internal_module/unexplained/ambiguous/drifted) and `repo_defs` carries
+/// the whole-repo scan — into a fresh on-disk SQLite file at `path` for
+/// external (H3) inspection. Read-only on `shadow`: ATTACH/copy/DETACH,
+/// never a write back into the shadow's own tables. Any pre-existing file
+/// at `path` is removed first so re-runs don't collide with a stale dump.
+/// Callers must treat failure as soft (log + continue) — a dump error must
+/// never fail the eval gate.
+fn dump_shadow_tables(shadow: &Arc<Storage>, path: &str) -> Result<()> {
+    let _ = fs::remove_file(path);
+    shadow
+        .with_connection(|conn| {
+            conn.execute("ATTACH DATABASE ?1 AS csr_eval_dump", [path])?;
+            let copied = (|| -> Result<()> {
+                for table in ["repo_defs", "code_edges", "code_nodes"] {
+                    conn.execute_batch(&format!(
+                        "CREATE TABLE csr_eval_dump.{table} AS SELECT * FROM main.{table}"
+                    ))?;
+                }
+                Ok(())
+            })();
+            // DETACH regardless of copy outcome — never leave the shadow
+            // connection holding an attached handle on a failed copy.
+            conn.execute_batch("DETACH DATABASE csr_eval_dump")?;
+            copied
+        })
+        .with_context(|| format!("CSR_EVAL_DUMP_SHADOW: dumping shadow tables to {path}"))
+}
+
 fn ranked_top_20(storage: &Arc<Storage>) -> Result<Vec<String>> {
     storage.with_connection(|conn| {
         let mut stmt = conn.prepare(
@@ -2782,6 +2814,20 @@ pub fn run_codegraph_live(storage: &Arc<Storage>) -> Result<EvalReport> {
                             closure
                                 .detail
                                 .push_str(&format!("; CSR_WCR_DUMP error: {error:#}"));
+                        }
+                    }
+                    // CSR_EVAL_DUMP_SHADOW diagnostic (off by default, zero
+                    // effect otherwise): H3 measurement needs the shadow's
+                    // final post-backfill, post-resolve tables intact
+                    // on-disk for external inspection. Fails soft — a dump
+                    // error must never fail the eval gate.
+                    if let Ok(dump_path) = env::var("CSR_EVAL_DUMP_SHADOW") {
+                        if let Err(error) = dump_shadow_tables(&wcr_shadow, &dump_path) {
+                            tracing::warn!(
+                                error = %error,
+                                path = %dump_path,
+                                "CSR_EVAL_DUMP_SHADOW: failed to dump shadow tables"
+                            );
                         }
                     }
                     results.push(closure);
