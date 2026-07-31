@@ -248,14 +248,25 @@ struct Pending {
     /// already-classified, and every tier is skipped for it.
     boundary: String,
     name: String,
-    /// X4 adversarial review, Finding 1: the `code_nodes.name` of `src_id` —
-    /// the edge's own calling def (a function/method/const name), or, for a
-    /// module-level `calls`/`imports` edge, the synthetic module node's own
-    /// name, which IS the file path (`extract_inner`'s `mk_node`: `name:
-    /// file.into()`). The X4 tier's scope-equality check needs this to tell
-    /// "which function is this edge inside" apart from "no function at all
-    /// (module scope)" — see `classify_only`'s X4 block.
-    src_name: String,
+    /// Second X4 adversarial review, Finding 4: this edge's own call/import-
+    /// site scope CHAIN — `edge_scope_chains.chain` for this edge's
+    /// `(src_id, dst_id, kind)` when `eval::codegraph::backfill_wcr_witnesses`
+    /// populated a row (LEFT JOINed in the query that builds `Pending`, see
+    /// `resolve_edges`), or, when no such row exists (this edge was outside
+    /// the backfill pass's scope — e.g. every resolve pass that isn't the
+    /// WCR live gate, since only `backfill_wcr_witnesses` ever populates
+    /// `edge_scope_chains`, exactly the same silence-by-construction
+    /// convention as `local_bindings`), the pre-chain fallback (computed in
+    /// `resolve_edges`'s Pass 2, from `code_nodes.name` of `src_id` — the
+    /// edge's own calling def, or the synthetic module node's own name,
+    /// which IS the file path, for a module-level edge): `""` when that
+    /// calling "def" IS the file itself, else the calling def's bare name —
+    /// i.e. "act as if this call/import sits directly in its calling def,
+    /// no closure nesting known", the X4 adversarial review Finding 1
+    /// behavior this replaces. `classify_only`'s X4 block prefix-matches
+    /// each `local_bindings` witness's own chain against THIS field, never
+    /// `src_name` directly — see `chain_prefix_matches`'s doc comment.
+    call_scope_chain: String,
 }
 
 /// Resolve all `name:<symbol>` placeholder edges within `project` (empty =
@@ -365,18 +376,19 @@ pub fn resolve_edges(
     }
 
     // Pass 1d (WCR truth pass, TASK 2); scope-qualified by the X4
-    // adversarial review (Finding 1): per (project, file) set of
+    // adversarial review (Finding 1), CHAIN-qualified by the second X4
+    // adversarial review (Finding 4): per (project, file) set of
     // `(scope, name)` local-binding pairs — the X4 tier's witness table,
     // populated only by `eval::codegraph::backfill_wcr_witnesses` (see
     // `extraction::codegraph::collect_local_bindings`). Empty on every DB
     // this table hasn't been backfilled into — the X4 tier is then silent
     // by construction (an empty/missing `BTreeMap` entry never matches),
-    // not an error. `scope` is the nearest enclosing named def's name (or
-    // `""` for a module-level binding) — WITHOUT it, a flat name-only set
-    // per (project, file) let a parameter named `handler` in one function
-    // wrongly classify an unrelated sibling function's own `handler()` call
-    // as local; see `classify_only`'s X4 block for the scope-equality check
-    // this feeds.
+    // not an error. `scope` is the nearest enclosing named def's full scope
+    // CHAIN (or `""` for a module-level binding) — WITHOUT it, a flat
+    // name-only set per (project, file) let a parameter named `handler` in
+    // one function (or one anonymous closure) wrongly classify an unrelated
+    // sibling scope's own `handler()` call as local; see `classify_only`'s
+    // X4 block and `chain_prefix_matches` for the prefix check this feeds.
     let mut local_bindings: BTreeMap<(String, String), BTreeSet<(String, String)>> =
         BTreeMap::new();
     {
@@ -401,11 +413,18 @@ pub fn resolve_edges(
     }
 
     // Pass 2: collect placeholder edges (calls + imports), deterministically.
+    // Second X4 adversarial review, Finding 4: LEFT JOIN `edge_scope_chains`
+    // (never an INNER JOIN — most resolve passes outside the WCR live gate
+    // have no rows there at all, and even within it not every pending edge
+    // has one; see `Pending::call_scope_chain`'s doc comment for the
+    // fallback this feeds).
     let mut pending: Vec<Pending> = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT e.src_id, e.dst_id, e.kind, n.file, n.project, e.callee_kind, e.evidence, e.boundary, n.name
+            "SELECT e.src_id, e.dst_id, e.kind, n.file, n.project, e.callee_kind, e.evidence, e.boundary, n.name, esc.chain
              FROM code_edges e JOIN code_nodes n ON n.id = e.src_id
+             LEFT JOIN edge_scope_chains esc
+               ON esc.src_id = e.src_id AND esc.dst_id = e.dst_id AND esc.kind = e.kind
              WHERE e.resolved = 0 AND e.dst_id LIKE 'name:%'
                AND (?1 = '' OR n.project = ?1)
              ORDER BY e.src_id, e.dst_id, e.kind",
@@ -421,6 +440,7 @@ pub fn resolve_edges(
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         for r in rows {
@@ -434,8 +454,22 @@ pub fn resolve_edges(
                 evidence,
                 boundary,
                 src_name,
+                chain,
             ) = r?;
             let name = dst_id.strip_prefix("name:").unwrap_or(&dst_id).to_string();
+            // Fallback mirrors the pre-chain `caller_scope` computation that
+            // used to live in `classify_only` itself: module-level (this
+            // edge's own calling "def" IS the synthetic module node, whose
+            // `code_nodes.name` is the file path) maps to `""`; otherwise
+            // the bare calling-def name, unchanged from before chains
+            // existed — see `Pending::call_scope_chain`'s doc comment.
+            let call_scope_chain = chain.unwrap_or_else(|| {
+                if src_name == src_file {
+                    String::new()
+                } else {
+                    src_name.clone()
+                }
+            });
             pending.push(Pending {
                 src_id,
                 dst_id,
@@ -446,7 +480,7 @@ pub fn resolve_edges(
                 evidence,
                 boundary,
                 name,
-                src_name,
+                call_scope_chain,
             });
         }
     }
@@ -908,27 +942,30 @@ fn classify_only(
     // (project, src_file) per `local_bindings` — real, disk-verified AST
     // evidence, not a name-shape guess.
     //
-    // Scope-qualified as of the X4 adversarial review (Finding 1): a
-    // witness only counts when its SCOPE matches this edge's own calling
-    // symbol — `p.src_name` — not merely "some binding of this name exists
-    // somewhere in the file". Without this, a parameter named `handler` in
-    // one function would classify an unrelated sibling function's own
-    // `handler()` call as local, purely because both live in the same file.
-    // `caller_scope` mirrors `backfill_wcr_witnesses`'s own module-vs-
-    // function distinction (`src_name == src_file` — the synthetic module
-    // node's `code_nodes.name` IS the file path): a module-level edge's
-    // effective scope is `""`, matching only a module-level (`scope == ""`)
-    // binding witness; a function-scoped edge's effective scope is its own
-    // calling function's name, matching only a binding recorded with that
-    // SAME scope.
+    // Scope-qualified as of the X4 adversarial review (Finding 1), and
+    // CHAIN-qualified (prefix match, not exact) as of the second X4
+    // adversarial review (Finding 4): a witness only counts when its scope
+    // CHAIN is this edge's own call-site chain (`p.call_scope_chain`) OR AN
+    // OUTER PREFIX OF IT — never merely "some binding of this name exists
+    // somewhere in the file", and never merely "same enclosing NAMED def"
+    // either. Finding 1 alone (flat scope-equality on the enclosing named
+    // def's bare name) was still too coarse: `nearest_def_node` deliberately
+    // flattens every anonymous closure onto the outer named def for GRAPH
+    // attribution, so a parameter named `handler` bound in one anonymous
+    // closure and an unrelated `handler()` call in a SIBLING anonymous
+    // closure — both nested in the SAME named function — reported the SAME
+    // bare scope and wrongly matched. `chain_prefix_matches` fixes this:
+    // "outer bindings flow inward" (a binding declared directly in a
+    // function's body is visible to every closure nested inside it) but
+    // "never sideways" (a binding declared inside one closure is invisible
+    // to an unrelated sibling closure, even though both share the same
+    // outer named def). See `chain_prefix_matches`'s own doc comment.
     if zero_defs_anywhere {
         if let Some(pairs) = local_bindings.get(&(p.project.clone(), p.src_file.clone())) {
-            let caller_scope: &str = if p.src_name == p.src_file {
-                ""
-            } else {
-                p.src_name.as_str()
-            };
-            if pairs.contains(&(caller_scope.to_string(), p.name.clone())) {
+            let hit = pairs.iter().any(|(binding_chain, name)| {
+                name == &p.name && chain_prefix_matches(binding_chain, &p.call_scope_chain)
+            });
+            if hit {
                 classify_edge(conn, p, "local", &format!("local_scope:{}", p.name))?;
                 return Ok(Some("local"));
             }
@@ -938,6 +975,35 @@ fn classify_only(
         return Ok(Some("stale"));
     }
     Ok(None)
+}
+
+/// Second X4 adversarial review, Finding 4 (sibling anonymous-closure
+/// conflation): `true` iff `binding_chain` is `call_chain` itself, OR a
+/// strict OUTER PREFIX of it on `>`-delimited chain-segment boundaries (see
+/// `extraction::codegraph::scope_chain`'s doc comment for the chain
+/// format) — "outer bindings flow inward, a binding can never witness a
+/// sibling closure it doesn't enclose".
+///
+/// Segment-boundary-safe: a plain `str::starts_with` would wrongly match
+/// `"Component"` against `"ComponentX>anon1"` (a different function that
+/// merely shares a name prefix) — `strip_prefix` followed by requiring the
+/// remainder start with `'>'` rules that out; only a REAL chain-segment
+/// boundary counts as "nested inside".
+///
+/// `binding_chain == ""` (module-level, per `scope_chain`'s convention) is
+/// the one deliberate non-generalization: kept as an EXACT match against
+/// `call_chain == ""` only, not extended to "module scope encloses
+/// everything so it should prefix-match every chain" — unchanged behavior
+/// from before chains existed (WCR truth pass, Finding B spec), and out of
+/// scope for this fix.
+fn chain_prefix_matches(binding_chain: &str, call_chain: &str) -> bool {
+    if binding_chain.is_empty() {
+        return call_chain.is_empty();
+    }
+    binding_chain == call_chain
+        || call_chain
+            .strip_prefix(binding_chain)
+            .is_some_and(|rest| rest.starts_with('>'))
 }
 
 /// Memoized `repo_scan::project_roots` lookup shared by `external_ns_for`
@@ -3369,13 +3435,38 @@ mod tests {
 
     // ─── X4 local-binding witness tier (WCR truth pass, TASK 2) ───
 
-    /// `scope` (X4 adversarial review, Finding 1): the nearest enclosing
-    /// named def's name, or `""` for a module-level binding — see
-    /// `Pending::src_name`'s doc comment and `classify_only`'s X4 block.
+    /// `scope` (X4 adversarial review, Finding 1; a full chain as of Finding
+    /// 4, though every EXISTING test below still passes a bare name — a
+    /// bare name is a valid degenerate chain, zero `>anon<idx>` segments —
+    /// see `chain_prefix_matches`'s doc comment) — the nearest enclosing
+    /// named def's name/chain, or `""` for a module-level binding.
     fn insert_local_binding(conn: &Connection, project: &str, file: &str, scope: &str, name: &str) {
         conn.execute(
             "INSERT OR IGNORE INTO local_bindings (project, file, scope, name) VALUES (?1, ?2, ?3, ?4)",
             params![project, file, scope, name],
+        )
+        .unwrap();
+    }
+
+    /// Second X4 adversarial review, Finding 4: seeds an `edge_scope_chains`
+    /// row directly — the shape `eval::codegraph::backfill_wcr_witnesses`
+    /// would have written for a `(src_id, dst_id, kind)` edge whose call/
+    /// import site sits at `chain` (see `Pending::call_scope_chain`'s doc
+    /// comment). `project`/`file` are fixed at `"proj"`/the edge's own
+    /// `src_file` convention used throughout this test module (`def`/
+    /// `call_edge` above all hardcode `project = "proj"`).
+    fn insert_edge_scope_chain(
+        conn: &Connection,
+        file: &str,
+        src_id: &str,
+        dst_name: &str,
+        kind: &str,
+        chain: &str,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO edge_scope_chains (project, file, src_id, dst_id, kind, chain)
+             VALUES ('proj', ?1, ?2, ?3, ?4, ?5)",
+            params![file, src_id, format!("name:{dst_name}"), kind, chain],
         )
         .unwrap();
     }
@@ -3656,5 +3747,247 @@ mod tests {
         assert_eq!(boundary_of("foo", "ghostGlobal"), "", "E2");
         assert_eq!(boundary_of("mod_a", "onlyInFoo"), "", "E3");
         assert_eq!(boundary_of("foo", "onlyInFoo"), "local", "E4");
+    }
+
+    // ─── X4 scope CHAINS (second X4 adversarial review, Finding 4:
+    // sibling anonymous-closure conflation) ───
+
+    #[test]
+    fn chain_prefix_matches_unit_cases() {
+        // Direct unit coverage of the matcher itself, decoupled from the DB.
+        assert!(
+            chain_prefix_matches("Component", "Component"),
+            "equal chains match"
+        );
+        assert!(
+            chain_prefix_matches("Component", "Component>anon7"),
+            "an outer chain is a prefix of a chain nested inside it"
+        );
+        assert!(
+            chain_prefix_matches("Component>anon3", "Component>anon3>anon9"),
+            "flows further inward within the same closure lineage"
+        );
+        assert!(
+            !chain_prefix_matches("Component>anon3", "Component>anon9"),
+            "sibling closures at the same depth must NOT match each other"
+        );
+        assert!(
+            !chain_prefix_matches("Component>anon3", "Component"),
+            "an inner binding must NOT flow OUTWARD to the enclosing function body"
+        );
+        assert!(
+            !chain_prefix_matches("Component", "Other"),
+            "unrelated named defs must never match"
+        );
+        assert!(
+            chain_prefix_matches("", ""),
+            "module-level binding matches a module-level call chain"
+        );
+        assert!(
+            !chain_prefix_matches("", "Component"),
+            "module-level chain ('') is NOT generalized into a universal prefix"
+        );
+        assert!(
+            !chain_prefix_matches("Component", ""),
+            "a function-scoped binding must not match a module-level call"
+        );
+        assert!(
+            !chain_prefix_matches("Component", "ComponentX>anon1"),
+            "segment-boundary-safe: a name-prefix collision is not a chain-prefix match"
+        );
+    }
+
+    #[test]
+    fn x4_chain_sibling_anonymous_closures_do_not_conflate() {
+        // MANDATED TEST (Finding 4): the core regression this fix addresses.
+        // `handler` is bound as a param inside one anonymous closure
+        // (`Component>anon3`) and an UNRELATED `handler()` call sits inside
+        // a SIBLING anonymous closure (`Component>anon9`) — both closures
+        // are nested in the SAME named function `Component`, so BEFORE this
+        // fix (flat scope-equality on the bare enclosing-def name) both
+        // reported scope `"Component"` and wrongly matched. No def anywhere
+        // for `handler`.
+        let conn = mem();
+        upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.tsx",
+            &[call_edge("Component", "handler", "a.tsx")],
+        )
+        .unwrap();
+        insert_edge_scope_chain(
+            &conn,
+            "a.tsx",
+            "Component",
+            "handler",
+            "calls",
+            "Component>anon9",
+        );
+        insert_local_binding(&conn, "proj", "a.tsx", "Component>anon3", "handler");
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(
+            stats.local, 0,
+            "a binding in one closure must never witness a call in a sibling closure"
+        );
+        assert_eq!(stats.unexplained, 1);
+
+        let boundary: String = conn
+            .query_row(
+                "SELECT boundary FROM code_edges WHERE src_id = 'Component' AND kind = 'calls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(boundary, "", "sibling-closure call must stay unexplained");
+    }
+
+    #[test]
+    fn x4_chain_outer_binding_flows_into_nested_closure() {
+        // MANDATED TEST (Finding 4): "outer bindings flow inward". A
+        // component-level binding (`const playTrack = useCallback(...)`,
+        // chain == the bare enclosing-def name, no closure nesting of its
+        // own) IS visible to a call made from inside a NESTED closure
+        // (`Component>anon7`) — the real-world shape `nearest_def_node`'s
+        // own doc comment describes (`anukriti-mvp-expo`'s radio-context.tsx).
+        let conn = mem();
+        upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.tsx",
+            &[call_edge("Component", "playTrack", "a.tsx")],
+        )
+        .unwrap();
+        insert_edge_scope_chain(
+            &conn,
+            "a.tsx",
+            "Component",
+            "playTrack",
+            "calls",
+            "Component>anon7",
+        );
+        insert_local_binding(&conn, "proj", "a.tsx", "Component", "playTrack");
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(
+            stats.local, 1,
+            "an outer, non-closure-nested binding must witness a call from a nested closure"
+        );
+
+        let boundary: String = conn
+            .query_row(
+                "SELECT boundary FROM code_edges WHERE src_id = 'Component' AND kind = 'calls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(boundary, "local");
+    }
+
+    #[test]
+    fn x4_chain_nested_shadowing_flows_inward_not_outward_or_sideways() {
+        // MANDATED TEST (Finding 4): "nested shadowing sanity" — a binding
+        // declared inside ONE closure (`Component>anon1`) must: (E_inner)
+        // witness a call nested EVEN DEEPER inside that SAME closure
+        // lineage (`Component>anon1>anon5`); (E_outer) NOT witness a call
+        // made directly in the enclosing function's own body, OUTSIDE the
+        // closure that declared it (`Component`); (E_sibling) NOT witness a
+        // call in an unrelated SIBLING closure at the same depth
+        // (`Component>anon2`).
+        let conn = mem();
+        upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.tsx",
+            &[
+                call_edge("Component", "innerCall", "a.tsx"),
+                call_edge("Component", "outerCall", "a.tsx"),
+                call_edge("Component", "siblingCall", "a.tsx"),
+            ],
+        )
+        .unwrap();
+        insert_edge_scope_chain(
+            &conn,
+            "a.tsx",
+            "Component",
+            "innerCall",
+            "calls",
+            "Component>anon1>anon5",
+        );
+        insert_edge_scope_chain(
+            &conn,
+            "a.tsx",
+            "Component",
+            "outerCall",
+            "calls",
+            "Component",
+        );
+        insert_edge_scope_chain(
+            &conn,
+            "a.tsx",
+            "Component",
+            "siblingCall",
+            "calls",
+            "Component>anon2",
+        );
+        insert_local_binding(&conn, "proj", "a.tsx", "Component>anon1", "innerCall");
+        insert_local_binding(&conn, "proj", "a.tsx", "Component>anon1", "outerCall");
+        insert_local_binding(&conn, "proj", "a.tsx", "Component>anon1", "siblingCall");
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(
+            stats.local, 1,
+            "only the call nested DEEPER inside the same closure lineage classifies local"
+        );
+
+        let boundary_of = |dst_name: &str| -> String {
+            conn.query_row(
+                "SELECT boundary FROM code_edges WHERE src_id = 'Component' AND dst_id = ?1 AND kind = 'calls'",
+                params![format!("name:{dst_name}")],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(boundary_of("innerCall"), "local", "flows further inward");
+        assert_eq!(
+            boundary_of("outerCall"),
+            "",
+            "must not flow OUTWARD past the closure that declared it"
+        );
+        assert_eq!(
+            boundary_of("siblingCall"),
+            "",
+            "must not flow SIDEWAYS into an unrelated sibling closure"
+        );
+    }
+
+    #[test]
+    fn x4_chain_falls_back_to_bare_scope_when_no_edge_scope_chains_row() {
+        // No `edge_scope_chains` row for this edge (e.g. outside a
+        // `backfill_wcr_witnesses` pass) — `call_scope_chain` must fall back
+        // to the pre-chain bare enclosing-def name, preserving the ORIGINAL
+        // X4 adversarial review (Finding 1) exact-match behavior exactly.
+        // This is also implicitly covered by every OTHER X4 test in this
+        // module (none of them insert an `edge_scope_chains` row), but this
+        // test names the fallback path directly.
+        let conn = mem();
+        upsert_node(&conn, &def("Component", "a.ts", "Component")).unwrap();
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.ts",
+            &[call_edge("Component", "playTrack", "a.ts")],
+        )
+        .unwrap();
+        insert_local_binding(&conn, "proj", "a.ts", "Component", "playTrack");
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(
+            stats.local, 1,
+            "bare-name fallback still matches a bare-name binding"
+        );
     }
 }

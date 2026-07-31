@@ -434,18 +434,23 @@ pub fn run(conn: &Connection) -> Result<()> {
     )?;
 
     // local_bindings (WCR truth pass, TASK 2; scope-qualified by the X4
-    // adversarial-review truth pass, Finding 1): the X4 `local` classify
+    // adversarial-review truth pass, Finding 1; CHAIN-qualified by the
+    // second X4 adversarial review, Finding 4): the X4 `local` classify
     // tier's witness table — per (project, file, scope), the set of names
     // bound as function/closure parameters or local (non-top-level) variable
     // declarations, as gathered by
-    // `extraction::codegraph::collect_local_bindings`. `scope` is the name
-    // of the nearest enclosing NAMED definition the binding sits inside, or
-    // '' for module-level bindings — without it, a single flat name-set per
-    // (project, file) let a parameter named `handler` in one function
-    // classify an unrelated sibling function's own `handler()` call as
-    // local. Populated by `eval::codegraph::backfill_wcr_witnesses` from the
-    // SAME parse it already does for callee_kind/evidence backfill — never a
-    // second parse. Read by `extraction::resolver::resolve_edges`'s X4 tier.
+    // `extraction::codegraph::collect_local_bindings`. `scope` is the FULL
+    // scope CHAIN of the nearest enclosing NAMED definition the binding sits
+    // inside (see `extraction::codegraph::scope_chain`'s doc comment — e.g.
+    // `"Component"`, `"Component>anon12"`), or '' for module-level bindings
+    // — without it, a single flat name-set per (project, file) let a
+    // parameter named `handler` in one function OR ONE ANONYMOUS CLOSURE
+    // classify an unrelated sibling scope's own `handler()` call as local.
+    // Populated by `eval::codegraph::backfill_wcr_witnesses` from the SAME
+    // parse it already does for callee_kind/evidence backfill — never a
+    // second parse. Read by `extraction::resolver::resolve_edges`'s X4 tier
+    // (prefix-matched against each pending edge's own chain — see
+    // `edge_scope_chains`, below).
     //
     // DROP+CREATE (Finding 1, X4 adversarial review): this table only ever
     // holds shadow/witness data, rebuilt from scratch by every
@@ -455,7 +460,10 @@ pub fn run(conn: &Connection) -> Result<()> {
     // also necessary — a pre-existing DB with the OLD 3-column
     // (project, file, name) schema would otherwise silently keep that
     // schema forever (`CREATE TABLE IF NOT EXISTS` is a no-op once the table
-    // exists), breaking every query below that now expects `scope`.
+    // exists), breaking every query below that now expects `scope`. The
+    // `scope` column's CONTENT changed from a bare enclosing-def name to a
+    // full chain string (Finding 4) without any column/shape change, so no
+    // further migration bump was needed for that step.
     conn.execute_batch(
         "DROP TABLE IF EXISTS local_bindings;
          CREATE TABLE local_bindings (
@@ -465,6 +473,40 @@ pub fn run(conn: &Connection) -> Result<()> {
             name    TEXT NOT NULL,
             PRIMARY KEY (project, file, scope, name)
         );",
+    )?;
+
+    // edge_scope_chains (X4 adversarial review, Finding 4): per pending
+    // `calls`/`imports` edge, the AST scope CHAIN of its own call/import
+    // site — keyed identically to `code_edges`' own primary key
+    // `(src_id, dst_id, kind)`. A brand-new table (no prior schema to
+    // migrate away from, unlike `local_bindings` above), so a plain
+    // `CREATE TABLE IF NOT EXISTS` is sufficient. Populated by
+    // `eval::codegraph::backfill_wcr_witnesses` for EVERY fresh `calls`/
+    // `imports` edge in a re-extracted file (`extraction::codegraph::
+    // GraphFragment::call_scope_chains`), unconditionally — same
+    // "persist everything this fresh pass saw" philosophy as
+    // `local_bindings`, never filtered down to only the edges some pending
+    // row happened to match. A pending edge that MATCHES or gets
+    // RE-POINTED (Finding: attribution-skewed re-point, see
+    // `backfill_wcr_witnesses`) to a fresh edge therefore ends this
+    // backfill pass with a `(src_id, dst_id, kind)` that IS a key in this
+    // table; an edge left untouched (no fresh counterpart found at all)
+    // has none — `extraction::resolver::resolve_edges`'s Pending query
+    // LEFT JOINs this table and falls back to the edge's own calling-def
+    // name when no row exists (see `Pending::call_scope_chain`'s doc
+    // comment), preserving the pre-chain exact-match behavior for edges
+    // this backfill pass has no fresh chain data for.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS edge_scope_chains (
+            project TEXT NOT NULL,
+            file    TEXT NOT NULL,
+            src_id  TEXT NOT NULL,
+            dst_id  TEXT NOT NULL,
+            kind    TEXT NOT NULL,
+            chain   TEXT NOT NULL,
+            PRIMARY KEY (src_id, dst_id, kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_edge_scope_chains_file ON edge_scope_chains(project, file);",
     )?;
 
     Ok(())

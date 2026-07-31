@@ -878,6 +878,73 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
             .map(|n| (n.id.as_str(), n.name.as_str()))
             .collect();
 
+        // Codex round 3 adversarial review (the SAME id-mismatch class the
+        // finding below is about): `fragment` is a THROWAWAY re-parse —
+        // `extract_graph_fragment_for_file` below is called with `repo = ""`
+        // (a fixed backfill placeholder), so every id in `fragment.nodes`/
+        // `fragment.edges` is `node_id("", file, kind, name)`. The LIVE
+        // pipeline (`hooks::post_tool_use`, `import::backfill`) calls the
+        // SAME extractor with `repo = project` (the real project name) —
+        // so a fresh fragment's own ids NEVER match this shadow's actual
+        // `code_nodes` rows (copied verbatim from the live DB) whenever
+        // `project` is non-empty, which is effectively always. Only NAMES
+        // are safe to compare across the two id spaces (`def_names`,
+        // `id_to_name`'s VALUES, `local_bindings`'s scope strings — none of
+        // those are ids). `shadow_name_to_id` is the bridge: the REAL,
+        // disk-verified `code_nodes.id` for a given name in THIS shadow —
+        // required any time this backfill needs to WRITE a node id into
+        // `code_edges`/`edge_scope_chains` (re-pointing `src_id`, and
+        // translating `fragment.call_scope_chains`' fresh-fragment keys
+        // into real ones before persisting), never for pure name-to-name
+        // comparisons, which never needed this in the first place. Smallest
+        // id wins deterministically on a rare same-file name collision
+        // across kinds (`ORDER BY name, id` + first-insert-wins below).
+        let shadow_name_to_id: HashMap<String, String> = {
+            let rows: Vec<(String, String)> = shadow.with_connection(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT name, id FROM code_nodes WHERE project = ?1 AND file = ?2
+                     ORDER BY name, id",
+                )?;
+                let mapped = stmt.query_map(rusqlite::params![project, src_file], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                mapped
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+            })?;
+            let mut map = HashMap::new();
+            for (name, id) in rows {
+                map.entry(name).or_insert(id);
+            }
+            map
+        };
+
+        // X4 adversarial review, Finding 4: persist EVERY fresh calls/
+        // imports edge's own scope chain, unconditionally — never filtered
+        // to only the edges some pending row happens to match (same
+        // philosophy as `persist_local_bindings`, immediately above). Keys
+        // are TRANSLATED from `fragment.call_scope_chains`'s fresh-fragment
+        // ids into real shadow ids (via `id_to_name` then
+        // `shadow_name_to_id`, per that map's own doc comment) before
+        // persisting — the raw fresh-fragment key would never match this
+        // shadow's `code_edges.src_id` at read time otherwise. A fresh call/
+        // import site whose owning name has no shadow `code_nodes` row at
+        // all (rare — see `shadow_name_to_id`'s doc comment) is skipped:
+        // no key exists for `resolve_edges`' LEFT JOIN to ever need anyway.
+        let translated_chains: BTreeMap<(String, String, String), String> = fragment
+            .call_scope_chains
+            .iter()
+            .filter_map(|((fresh_src_id, dst_id, kind), chain)| {
+                let fresh_name = id_to_name.get(fresh_src_id.as_str())?;
+                let real_id = shadow_name_to_id.get(*fresh_name)?;
+                Some((
+                    (real_id.clone(), dst_id.clone(), kind.clone()),
+                    chain.clone(),
+                ))
+            })
+            .collect();
+        persist_call_scope_chains(shadow, &project, &src_file, &translated_chains)?;
+
         // Finding 1 (WCR truth pass): def node names actually present in the
         // FRESH fragment — condition (b) from this function's doc comment,
         // "the parse actually produced structure". `kind != "module"`
@@ -906,8 +973,33 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
         // `qualifier_tier`/`qualifier_import_tier` get zero live-corpus
         // signal despite being fully exercised in the resolver's own unit
         // tests: real bug, not a hypothetical.
-        let mut callee_kind_by_pair: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
-        let mut module_by_pair: BTreeMap<(String, String), String> = BTreeMap::new();
+        //
+        // Finding (Codex round 3, attribution-skewed re-point): keyed by
+        // bare target name -> {src_name -> callee_kind/evidence} — EVERY
+        // fresh edge of this file, regardless of src attribution — rather
+        // than a flat `(src_name, bare)` -> value map. The inner `BTreeMap`
+        // gives two things: an exact-match lookup at a specific `src_name`
+        // key (the pre-existing behavior, unchanged), AND, when that
+        // misses, iteration in ascending (deterministic) src-name order for
+        // the re-point tie-break below — a pending edge whose OLD src no
+        // longer matches (because an attribution RULE changed, e.g. commit
+        // 92179d1 unifying closure-nested call src with binding-scope
+        // attribution — not because the call site itself changed) can
+        // still find the IDENTICAL call/import site under its NEW
+        // attribution and re-point to it, instead of being wrongly
+        // drift-classified. Deliberately NAME-keyed only, never carrying
+        // the fresh fragment's OWN `edge.src_id` — see `shadow_name_to_id`'s
+        // doc comment for why that id would be a different (wrong) id space
+        // than this shadow's `code_nodes`; the re-point site below resolves
+        // the WINNING name to a real id via `shadow_name_to_id` instead.
+        // `imports` edges are always module-sourced (see `extract_inner`'s
+        // imports loop — `src` is always `module_id`), so their inner map
+        // in practice never has more than one key; kept symmetric with
+        // `calls` rather than special-cased, since a single, shared code
+        // path is less risk than two subtly different ones.
+        let mut calls_any_src: BTreeMap<String, BTreeMap<String, (String, String)>> =
+            BTreeMap::new();
+        let mut imports_any_src: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         for edge in &fragment.edges {
             let Some(bare) = edge.dst_id.strip_prefix("name:") else {
                 continue;
@@ -917,16 +1009,16 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
             };
             match edge.kind.as_str() {
                 "calls" => {
-                    callee_kind_by_pair.insert(
-                        (src_name.to_string(), bare.to_string()),
+                    calls_any_src.entry(bare.to_string()).or_default().insert(
+                        src_name.to_string(),
                         (edge.callee_kind.clone(), edge.evidence.clone()),
                     );
                 }
                 "imports" => {
-                    module_by_pair.insert(
-                        (src_name.to_string(), bare.to_string()),
-                        edge.evidence.clone(),
-                    );
+                    imports_any_src
+                        .entry(bare.to_string())
+                        .or_default()
+                        .insert(src_name.to_string(), edge.evidence.clone());
                 }
                 _ => {}
             }
@@ -1020,35 +1112,97 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
             let can_drift = !def_names.is_empty()
                 && fragment.parse_clean
                 && (def_names.contains(src_name.as_str()) || src_name == src_file);
-            let key = (src_name, bare.to_string());
+            // Finding (Codex round 3, attribution-skewed re-point): checked
+            // BEFORE any drift decision, per kind below — an exact-key miss
+            // (`calls_any_src`/`imports_any_src` has no entry at THIS edge's
+            // own `src_name`) is not automatically drift when the callee
+            // exists SOMEWHERE ELSE in the fresh fragment. Only when the
+            // whole per-kind candidate map for this bare name is empty
+            // (the callee is absent from the file's ENTIRE fresh edge set,
+            // not just from this src) does the pre-existing `can_drift`
+            // gate (parse_clean + def_names, unchanged) get to run at all.
             match kind.as_str() {
                 "calls" => {
-                    if let Some((new_kind, new_evidence)) = callee_kind_by_pair.get(&key) {
-                        shadow.with_connection(|conn| {
-                            conn.execute(
-                                "UPDATE code_edges SET callee_kind = ?1, evidence = ?2
+                    match calls_any_src.get(bare) {
+                        Some(candidates) if candidates.contains_key(src_name.as_str()) => {
+                            // Exact match — same src attribution as before this
+                            // finding; only callee_kind/evidence are refreshed.
+                            let (new_kind, new_evidence) = &candidates[src_name.as_str()];
+                            shadow.with_connection(|conn| {
+                                conn.execute(
+                                    "UPDATE code_edges SET callee_kind = ?1, evidence = ?2
                                  WHERE src_id = ?3 AND dst_id = ?4 AND kind = 'calls'",
-                                rusqlite::params![new_kind, new_evidence, src_id, dst_id],
-                            )?;
-                            Ok(())
-                        })?;
-                        edges_updated += 1;
-                    } else if can_drift {
-                        // WCR Phase 8, TASK B (Finding 1 truth pass): fresh
-                        // extraction ran cleanly, the calling function
-                        // survived, but this exact (src name, kind, bare
-                        // target name) triple isn't in it anymore — the
-                        // call site drifted out of the source since this
-                        // edge was recorded.
-                        mark_drifted(shadow, &src_id, &dst_id, "calls")?;
+                                    rusqlite::params![new_kind, new_evidence, src_id, dst_id],
+                                )?;
+                                Ok(())
+                            })?;
+                            edges_updated += 1;
+                        }
+                        Some(candidates) if !candidates.is_empty() => {
+                            // RE-POINT, not drift: the identical call still
+                            // exists in the fresh extraction, just attributed
+                            // to a DIFFERENT src node than this historical edge
+                            // carries. `candidates.iter()` (a `BTreeMap`)
+                            // visits names in ascending order, so
+                            // `find_map` — filtered to names that actually
+                            // have a REAL id in this shadow's `code_nodes`
+                            // (`shadow_name_to_id`; see its own doc comment
+                            // for why the fresh fragment's OWN id can never
+                            // be used directly here) — lands on the
+                            // deterministic lexicographically-smallest
+                            // VALID candidate. Left in the normal pending
+                            // pool for the resolver — NOT drifted, NOT
+                            // auto-bound (`resolved` stays untouched, 0).
+                            let repoint = candidates.iter().find_map(|(name, (k, e))| {
+                                shadow_name_to_id
+                                    .get(name)
+                                    .map(|id| (id.clone(), k.clone(), e.clone()))
+                            });
+                            match repoint {
+                                Some((new_src_id, new_kind, new_evidence)) => {
+                                    repoint_or_dedupe_edge(
+                                        shadow,
+                                        &src_id,
+                                        &dst_id,
+                                        "calls",
+                                        &new_src_id,
+                                        Some(&new_kind),
+                                        &new_evidence,
+                                    )?;
+                                    edges_updated += 1;
+                                }
+                                None => {
+                                    // Every fresh candidate's owning name has
+                                    // no `code_nodes` row in THIS shadow at
+                                    // all (rare — see `shadow_name_to_id`'s
+                                    // doc comment) — there is no valid id to
+                                    // re-point to, and this is NOT drift
+                                    // evidence either (the callee genuinely
+                                    // still exists in the fresh source).
+                                    // Never guess: leave untouched.
+                                }
+                            }
+                        }
+                        _ => {
+                            if can_drift {
+                                // WCR Phase 8, TASK B (Finding 1 truth pass):
+                                // fresh extraction ran cleanly, the calling
+                                // function survived, but this callee isn't in
+                                // the fresh fragment AT ALL (any src) — the
+                                // call site genuinely drifted out of the source
+                                // since this edge was recorded.
+                                mark_drifted(shadow, &src_id, &dst_id, "calls")?;
+                            }
+                            // else: leave untouched — (b) or (c) failed, so an
+                            // unmatched edge is not trustworthy drift evidence.
+                            // Stays pending and unexplained (honest), not
+                            // misclassified.
+                        }
                     }
-                    // else: leave untouched — (b) or (c) failed, so an
-                    // unmatched edge is not trustworthy drift evidence.
-                    // Stays pending and unexplained (honest), not
-                    // misclassified.
                 }
-                "imports" => {
-                    if let Some(new_evidence) = module_by_pair.get(&key) {
+                "imports" => match imports_any_src.get(bare) {
+                    Some(candidates) if candidates.contains_key(src_name.as_str()) => {
+                        let new_evidence = &candidates[src_name.as_str()];
                         shadow.with_connection(|conn| {
                             conn.execute(
                                 "UPDATE code_edges SET evidence = ?1
@@ -1058,11 +1212,43 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                             Ok(())
                         })?;
                         edges_updated += 1;
-                    } else if can_drift {
-                        mark_drifted(shadow, &src_id, &dst_id, "imports")?;
                     }
-                    // else: leave untouched — see the `calls` arm above.
-                }
+                    Some(candidates) if !candidates.is_empty() => {
+                        // Same re-point rule as `calls`, above — in
+                        // practice a near-no-op for `imports` (its src is
+                        // always the module node, see `imports_any_src`'s
+                        // doc comment), kept symmetric rather than
+                        // special-cased.
+                        let repoint = candidates.iter().find_map(|(name, e)| {
+                            shadow_name_to_id
+                                .get(name)
+                                .map(|id| (id.clone(), e.clone()))
+                        });
+                        match repoint {
+                            Some((new_src_id, new_evidence)) => {
+                                repoint_or_dedupe_edge(
+                                    shadow,
+                                    &src_id,
+                                    &dst_id,
+                                    "imports",
+                                    &new_src_id,
+                                    None,
+                                    &new_evidence,
+                                )?;
+                                edges_updated += 1;
+                            }
+                            None => {
+                                // See the `calls` arm's `None` case above.
+                            }
+                        }
+                    }
+                    _ => {
+                        if can_drift {
+                            mark_drifted(shadow, &src_id, &dst_id, "imports")?;
+                        }
+                        // else: leave untouched — see the `calls` arm above.
+                    }
+                },
                 _ => {}
             }
         }
@@ -1111,6 +1297,128 @@ fn persist_local_bindings(
             }
         }
         tx.commit()?;
+        Ok(())
+    })
+}
+
+/// X4 adversarial review, Finding 4: persist `chains` — EVERY fresh `calls`/
+/// `imports` edge's own call/import-site scope chain, from the SAME fresh-
+/// extraction fragment `backfill_wcr_witnesses` already computed for this
+/// (project, file), never a second parse — into the shadow's
+/// `edge_scope_chains` witness table. Same transactional DELETE-then-INSERT-
+/// per-(project, file) shape as `persist_local_bindings`, immediately above,
+/// and for the same reason: unconditional, including when `chains` is empty,
+/// so a file reprocessed after edits changed WHICH call/import sites exist
+/// never keeps a stale chain row for a site that no longer exists.
+///
+/// Keyed by `(src_id, dst_id, kind)` — `code_edges`' own primary key — not
+/// `(project, file, ...)` in the table's own PK, so this DELETE scopes by
+/// `project`/`file` columns rather than by key prefix; see the
+/// `edge_scope_chains` migration comment for why a matched OR re-pointed
+/// pending edge (`backfill_wcr_witnesses`'s per-edge loop, which runs AFTER
+/// this) is guaranteed to end up with a key present in this table.
+fn persist_call_scope_chains(
+    shadow: &Arc<Storage>,
+    project: &str,
+    file: &str,
+    chains: &BTreeMap<(String, String, String), String>,
+) -> Result<()> {
+    shadow.with_connection(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM edge_scope_chains WHERE project = ?1 AND file = ?2",
+            rusqlite::params![project, file],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO edge_scope_chains (project, file, src_id, dst_id, kind, chain)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for ((src_id, dst_id, kind), chain) in chains {
+                stmt.execute(rusqlite::params![project, file, src_id, dst_id, kind, chain])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+/// Codex round 3 adversarial review: re-point a pending edge's `src_id`
+/// from `old_src_id` to `new_src_id`, safe against the case where a row
+/// ALREADY EXISTS at the target `(new_src_id, dst_id, kind)` key — a REAL
+/// live-corpus scenario, not a hypothetical: a file can carry BOTH a stale,
+/// old-attribution edge AND an already-correctly-attributed edge for the
+/// SAME callee simultaneously, if only some of its call/import sites were
+/// touched by a live re-extraction since commit 92179d1 (which unified
+/// closure-nested call src attribution with binding-scope attribution) —
+/// confirmed against the live gate, which hit exactly this: a blind
+/// `UPDATE ... SET src_id = ?` collided with `code_edges`' own PRIMARY KEY
+/// `(src_id, dst_id, kind)`, and the resulting SQLite constraint error
+/// propagated all the way out of `backfill_wcr_witnesses` (a single `?` per
+/// per-edge write, no per-file catch), silently leaving EVERY file after
+/// the collision entirely un-backfilled for that run — not a partial
+/// failure, a near-total one.
+///
+/// When the target already exists, the OLD `(old_src_id, dst_id, kind)` row
+/// is a confirmed duplicate of an edge already tracked correctly elsewhere
+/// — its information is fully accounted for by the surviving row, so it is
+/// DELETED rather than re-pointed (re-pointing it would just be the same
+/// collision again). This is deterministic even when several stale rows in
+/// the same file converge on the same target: `backfill_wcr_witnesses`
+/// processes `pending_edges` in a fixed `ORDER BY src_id, dst_id, kind`, so
+/// the first one to be processed creates/updates the target row and every
+/// later one finds it already there and deletes itself — same final state
+/// on every run. Otherwise (the common case), a plain `UPDATE` moves
+/// `src_id` in place and refreshes the fresh edge's own data —
+/// `callee_kind`/`evidence` for `calls` (`new_callee_kind = Some(_)`), or
+/// just `evidence` for `imports` (`new_callee_kind = None` — `imports`
+/// edges have no `callee_kind` data to refresh). Either outcome (dedup
+/// delete or in-place move) is "handled" from the caller's perspective —
+/// both count toward `edges_updated`, matching the exact-match branches'
+/// convention.
+fn repoint_or_dedupe_edge(
+    shadow: &Arc<Storage>,
+    old_src_id: &str,
+    dst_id: &str,
+    kind: &str,
+    new_src_id: &str,
+    new_callee_kind: Option<&str>,
+    new_evidence: &str,
+) -> Result<()> {
+    let target_exists: bool = shadow.with_connection(|conn| {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM code_edges WHERE src_id = ?1 AND dst_id = ?2 AND kind = ?3)",
+            rusqlite::params![new_src_id, dst_id, kind],
+            |r| r.get(0),
+        )
+        .map_err(Into::into)
+    })?;
+    if target_exists {
+        return shadow.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM code_edges WHERE src_id = ?1 AND dst_id = ?2 AND kind = ?3",
+                rusqlite::params![old_src_id, dst_id, kind],
+            )?;
+            Ok(())
+        });
+    }
+    shadow.with_connection(|conn| {
+        match new_callee_kind {
+            Some(ck) => {
+                conn.execute(
+                    "UPDATE code_edges SET src_id = ?1, callee_kind = ?2, evidence = ?3
+                     WHERE src_id = ?4 AND dst_id = ?5 AND kind = ?6",
+                    rusqlite::params![new_src_id, ck, new_evidence, old_src_id, dst_id, kind],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "UPDATE code_edges SET src_id = ?1, evidence = ?2
+                     WHERE src_id = ?3 AND dst_id = ?4 AND kind = ?5",
+                    rusqlite::params![new_src_id, new_evidence, old_src_id, dst_id, kind],
+                )?;
+            }
+        }
         Ok(())
     })
 }
@@ -2998,6 +3306,456 @@ mod tests {
             })
             .unwrap();
         assert_eq!(boundary, "", "a matched edge must never be marked drifted");
+    }
+
+    // ─── attribution-skewed re-point (Codex round 3 adversarial review) ───
+
+    #[test]
+    fn backfill_repoints_closure_call_from_stale_module_src_instead_of_drifting() {
+        // MANDATED REGRESSION TEST (Codex round 3): an UNCHANGED closure-
+        // nested call whose historical edge carries the OLD module-src
+        // attribution (pre-commit-92179d1 behavior, when a closure-nested
+        // call fell back to the synthetic module node rather than walking
+        // out to its enclosing named def) must be RE-POINTED to the fresh,
+        // correctly-attributed def-node src — never drift-classified. The
+        // call site itself never changed; only the RULE deciding which
+        // node "owns" it did. Before this fix, `can_drift` would have been
+        // satisfied here (def_names non-empty, parse_clean, and
+        // `src_name == src_file` since the stale edge's own src IS the
+        // module node) and the edge would wrongly drift, manufacturing
+        // gate credit while silently discarding the call/import site.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.tsx");
+        std::fs::write(
+            &file_path,
+            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n",
+        )
+        .unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        // OLD (pre-92179d1) attribution: the historical edge's src is the
+        // MODULE node, not `Component` — exactly the shape 1480 live-corpus
+        // edges carry per the truth-pass finding.
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "tsx".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        // The `Component` FUNCTION node itself — unaffected by the
+        // closure-attribution rule this finding is about (node creation
+        // never depended on `nearest_def_node`'s edge-src walk), so it was
+        // ALREADY correctly present in the live DB from whenever this file
+        // was last extracted, same as `module_id` above. Codex round 3: the
+        // re-point target MUST be resolved against this REAL, disk-verified
+        // shadow id — never the throwaway fresh-fragment id
+        // `extract_graph_fragment_for_file`'s OWN `repo = ""` backfill call
+        // computes internally (see `shadow_name_to_id`'s doc comment) —
+        // omitting this node from the shadow is exactly what would have
+        // hidden the id-mismatch bug this test now guards against.
+        let component_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "Component");
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: component_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "tsx".into(),
+                kind: "function".into(),
+                name: "Component".into(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[EdgeRow {
+                    src_id: module_id.clone(),
+                    dst_id: "name:helper".into(),
+                    kind: "calls".into(),
+                    src_file: file_str.clone(),
+                    resolved: 0,
+                    weight: 1.0,
+                    callee_kind: "direct".into(),
+                    ..EdgeRow::default()
+                }],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1, "the on-disk file was re-extracted");
+        assert_eq!(
+            edges, 1,
+            "a re-pointed edge counts as updated, same as a matched one"
+        );
+
+        // The stale (module_id, "name:helper") row must be GONE — re-pointed
+        // in place, never left behind as a duplicate or a drifted ghost.
+        let stale_row_count: i64 = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM code_edges WHERE src_id = ?1 AND dst_id = 'name:helper'",
+                    [&module_id],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            stale_row_count, 0,
+            "re-pointing must move the edge, not leave a stale module-src copy behind"
+        );
+
+        // Re-pointed to the REAL `Component` node already present in this
+        // shadow's `code_nodes` (seeded above) — resolved via
+        // `shadow_name_to_id`, never via the fresh fragment's own id.
+        let (boundary, resolved, callee_kind, dst_id): (String, i64, String, String) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT boundary, resolved, callee_kind, dst_id FROM code_edges
+                     WHERE src_id = ?1 AND kind = 'calls'",
+                    [&component_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            boundary, "",
+            "re-pointed edge is NOT drifted — it stays in the normal pending pool for the resolver"
+        );
+        assert_eq!(resolved, 0, "re-pointing never binds by itself");
+        assert_eq!(
+            callee_kind, "direct",
+            "re-pointed edge's evidence is refreshed from the fresh edge"
+        );
+        assert_eq!(dst_id, "name:helper", "dst_id stays the placeholder");
+    }
+
+    #[test]
+    fn backfill_repoints_deterministically_to_lexicographically_smallest_src_when_ambiguous() {
+        // Deterministic tie-break: when a callee is invoked from MORE THAN
+        // ONE def in the fresh fragment (none of which match the pending
+        // edge's own stale src), re-pointing picks the lexicographically
+        // smallest src NAME — never a guess, never order-dependent on
+        // `fragment.edges`' own iteration order.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.rs");
+        std::fs::write(
+            &file_path,
+            "fn bravo() {\n    helper();\n}\nfn alpha() {\n    helper();\n}\n",
+        )
+        .unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        // Stale src is a THIRD name, absent from the fresh fragment
+        // entirely — never a candidate itself, forcing the ambiguity.
+        let ghost_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "ghost");
+        seed_backfill_node(&shadow, &ghost_id, &file_str, "ghost");
+        // Codex round 3: `alpha`/`bravo` must ALSO be present in this
+        // shadow's `code_nodes` (same "already there from a real prior
+        // extraction" reasoning as the test above) — re-pointing resolves
+        // the winning NAME to a REAL shadow id via `shadow_name_to_id`,
+        // never the fresh fragment's own throwaway id.
+        let alpha_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "alpha");
+        let bravo_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "bravo");
+        seed_backfill_node(&shadow, &alpha_id, &file_str, "alpha");
+        seed_backfill_node(&shadow, &bravo_id, &file_str, "bravo");
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[stale_calls_edge(&ghost_id, "helper", &file_str, "direct")],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(edges, 1, "re-pointed, not left untouched or drifted");
+        let repointed_src: String = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT src_id FROM code_edges WHERE dst_id = 'name:helper' AND kind = 'calls'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            repointed_src, alpha_id,
+            "\"alpha\" < \"bravo\" lexicographically — must win the deterministic tie-break"
+        );
+        assert_ne!(repointed_src, bravo_id);
+    }
+
+    // ─── end-to-end scope-chain threading (Codex round 3 adversarial
+    // review): backfill -> resolve, through the REAL id-translation path
+    // (`shadow_name_to_id`), not synthetic `insert_edge_scope_chain` rows —
+    // this is exactly the class of bug the id-space mismatch was: every
+    // resolver-level X4 chain test used HAND-SEEDED `edge_scope_chains`
+    // rows and passed regardless, while the real backfill-produced rows
+    // (keyed by the fresh-fragment's OWN `repo = ""` ids) silently never
+    // matched `code_edges.src_id` (keyed by the live pipeline's real
+    // `repo = project` ids) at read time. These two tests exercise the
+    // FULL pipeline — `backfill_wcr_witnesses` then
+    // `resolve_code_edges_with_fs_check` — so a regression in the
+    // translation step itself (not just the matching logic) fails a test. ───
+
+    #[test]
+    fn backfill_then_resolve_sibling_closures_do_not_conflate_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.tsx");
+        std::fs::write(
+            &file_path,
+            "function Component() {\n\
+             \x20   useCallback((handler) => {\n\
+             \x20       return handler;\n\
+             \x20   }, []);\n\
+             \x20   useCallback(() => {\n\
+             \x20       handler();\n\
+             \x20   }, []);\n\
+             }\n",
+        )
+        .unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        // `Component` already present in the shadow's `code_nodes` — same
+        // "already there from a real prior extraction" convention as the
+        // re-point tests above; this is what `shadow_name_to_id` resolves
+        // against when translating `fragment.call_scope_chains`.
+        let component_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "Component");
+        seed_backfill_node(&shadow, &component_id, &file_str, "Component");
+        // Already correctly attributed (GRAPH src == Component) — this
+        // test isolates CHAIN threading, not re-pointing (covered above).
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[stale_calls_edge(
+                    &component_id,
+                    "handler",
+                    &file_str,
+                    "direct",
+                )],
+            )
+            .unwrap();
+
+        backfill_wcr_witnesses(&shadow).unwrap();
+        let stats = shadow
+            .resolve_code_edges_with_fs_check("proj", &|_: &str| true)
+            .unwrap();
+        assert_eq!(
+            stats.local, 0,
+            "a param bound in one closure must never witness a call in a sibling \
+             closure, end-to-end through real backfill-produced (translated) chain data"
+        );
+
+        let boundary: String = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT boundary FROM code_edges WHERE src_id = ?1 AND dst_id = 'name:handler'",
+                    [&component_id],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_ne!(boundary, "local");
+    }
+
+    #[test]
+    fn backfill_then_resolve_outer_binding_flows_into_nested_closure_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.tsx");
+        std::fs::write(
+            &file_path,
+            "function Component() {\n\
+             \x20   const playTrack = useCallback((track) => {\n\
+             \x20       doPlay(track);\n\
+             \x20   }, []);\n\
+             \x20   useCallback(() => {\n\
+             \x20       playTrack();\n\
+             \x20   }, [playTrack]);\n\
+             }\n",
+        )
+        .unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let component_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "Component");
+        seed_backfill_node(&shadow, &component_id, &file_str, "Component");
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[stale_calls_edge(
+                    &component_id,
+                    "playTrack",
+                    &file_str,
+                    "direct",
+                )],
+            )
+            .unwrap();
+
+        backfill_wcr_witnesses(&shadow).unwrap();
+        let stats = shadow
+            .resolve_code_edges_with_fs_check("proj", &|_: &str| true)
+            .unwrap();
+        assert_eq!(
+            stats.local, 1,
+            "an outer, non-closure-nested binding must witness a call from a nested \
+             sibling closure, end-to-end through real backfill-produced (translated) chain data"
+        );
+
+        let boundary: String = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT boundary FROM code_edges WHERE src_id = ?1 AND dst_id = 'name:playTrack'",
+                    [&component_id],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(boundary, "local");
+    }
+
+    #[test]
+    fn backfill_repoint_dedupes_instead_of_colliding_when_target_already_exists() {
+        // MANDATED REGRESSION (found live, not hypothetical): a file can
+        // carry BOTH a stale, old-attribution `helper` edge (src = the
+        // module node, pre-92179d1 shape) AND an ALREADY-correctly-
+        // attributed `helper` edge (src = `Component`, e.g. from a live
+        // watcher re-extraction that already ran post-fix) for the SAME
+        // callee simultaneously. A blind re-point `UPDATE` on the stale one
+        // would collide with `code_edges`' own PRIMARY KEY
+        // `(src_id, dst_id, kind)` — this is EXACTLY what the live gate hit
+        // running this fix against the real corpus (`UNIQUE constraint
+        // failed: code_edges.src_id, code_edges.dst_id, code_edges.kind`),
+        // aborting the ENTIRE backfill pass (no per-file catch) and
+        // silently leaving every file after the collision un-backfilled.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.tsx");
+        std::fs::write(
+            &file_path,
+            "function Component() {\n    useEffect(() => {\n        helper();\n    }, []);\n}\n",
+        )
+        .unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "tsx".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        let component_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "Component");
+        seed_backfill_node(&shadow, &component_id, &file_str, "Component");
+        // TWO pending edges for the SAME callee: one stale (module_id, the
+        // bug this whole finding is about), one ALREADY correct
+        // (component_id — an exact match against the fresh extraction).
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[
+                    EdgeRow {
+                        src_id: module_id.clone(),
+                        dst_id: "name:helper".into(),
+                        kind: "calls".into(),
+                        src_file: file_str.clone(),
+                        resolved: 0,
+                        weight: 1.0,
+                        callee_kind: "direct".into(),
+                        ..EdgeRow::default()
+                    },
+                    EdgeRow {
+                        src_id: component_id.clone(),
+                        dst_id: "name:helper".into(),
+                        kind: "calls".into(),
+                        src_file: file_str.clone(),
+                        resolved: 0,
+                        weight: 1.0,
+                        callee_kind: "direct".into(),
+                        ..EdgeRow::default()
+                    },
+                ],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).expect(
+            "must not abort with a PRIMARY KEY collision — dedup, don't crash the whole pass",
+        );
+        assert_eq!(files, 1);
+        assert_eq!(
+            edges, 2,
+            "both edges are handled — the exact match AND the dedup-delete"
+        );
+
+        let stale_row_count: i64 = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM code_edges WHERE src_id = ?1 AND dst_id = 'name:helper'",
+                    [&module_id],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            stale_row_count, 0,
+            "the confirmed-duplicate stale row must be deleted, not left as a collision retry"
+        );
+
+        let (surviving_count, boundary, resolved): (i64, String, i64) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*), MAX(boundary), MAX(resolved) FROM code_edges
+                     WHERE src_id = ?1 AND dst_id = 'name:helper'",
+                    [&component_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(surviving_count, 1, "exactly one surviving row, not two");
+        assert_eq!(boundary, "", "the surviving row is a normal pending edge");
+        assert_eq!(resolved, 0);
     }
 
     #[test]

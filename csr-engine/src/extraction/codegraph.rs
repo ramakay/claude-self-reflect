@@ -29,21 +29,42 @@ pub struct GraphFragment {
     pub nodes: Vec<NodeRow>,
     pub edges: Vec<EdgeRow>,
     /// TASK 2 (WCR truth pass X4 tier); scope-qualified as of the X4
-    /// adversarial-review truth pass (Finding 1): `(scope, name)` pairs for
-    /// every local-binding name declared in this file — function/closure
-    /// parameters, catch clause params, and local (non-top-level) variable
-    /// declarations/destructuring targets. `scope` is the name of the
-    /// nearest enclosing NAMED definition (function/method/top-level const
-    /// fn) the binding sits inside, or `""` for a binding outside any named
-    /// def (module-level block scopes, e.g. inside a top-level `if`/`try`).
-    /// See `collect_local_bindings`'s and `nearest_named_scope`'s doc
-    /// comments. Without scope, a single flat name-set per (project, file)
-    /// let a parameter named `handler` in one function classify a sibling
+    /// adversarial-review truth pass (Finding 1), and CHAIN-qualified as of
+    /// Finding 4: `(scope, name)` pairs for every local-binding name
+    /// declared in this file — function/closure parameters, catch clause
+    /// params, and local (non-top-level) variable declarations/destructuring
+    /// targets. `scope` is the FULL scope CHAIN (see `scope_chain`'s doc
+    /// comment) of the nearest enclosing NAMED definition (function/method/
+    /// top-level const fn) the binding sits inside, or `""` for a binding
+    /// outside any named def (module-level block scopes, e.g. inside a
+    /// top-level `if`/`try`). See `collect_local_bindings`'s and
+    /// `scope_chain`'s doc comments. Without scope, a single flat name-set
+    /// per (project, file) let a parameter named `handler` in one function
+    /// (or one anonymous closure) classify a sibling
     /// function's unrelated `handler()` call as local — the bug this
     /// qualification fixes. Populated from the SAME parse as `nodes`/`edges`
     /// (`extract_inner` calls the shared `collect_local_bindings_from_root`
     /// on its own already-parsed `root`), never a second, separate parse.
     pub local_bindings: BTreeSet<(String, String)>,
+    /// X4 adversarial review, Finding 4 (sibling anonymous-closure
+    /// conflation): the AST scope CHAIN of each `calls`/`imports` call/
+    /// import site — keyed identically to `edges`, `(src_id, dst_id, kind)`
+    /// — from the SAME parse as `nodes`/`edges`/`local_bindings`, never a
+    /// second one. A chain is the nearest enclosing NAMED def's name
+    /// followed by `>anon<idx>` for each anonymous function-kind ancestor
+    /// between that named def and the site (outer to inner), `<idx>` a
+    /// deterministic within-parse preorder index over every func-kind node
+    /// in the file (see `func_node_preorder_index`/`scope_chain`) — e.g.
+    /// `"Component"` / `"Component>anon12"` / `"Component>anon12>anon15"`.
+    /// `""` for a module-level site. Witness machinery ONLY for the X4
+    /// resolver tier's prefix match (see `local_bindings`'s doc comment and
+    /// `nearest_def_node`'s Finding 4 note) — GRAPH src attribution
+    /// (`edges[..].src_id`, still from `nearest_def_node` alone) is
+    /// unaffected. Chains are only ever compared within a single re-
+    /// extraction of the SAME file content (`local_bindings` and this map
+    /// are recomputed together from the same fresh parse) — never persist
+    /// one across different file versions as if directly comparable.
+    pub call_scope_chains: BTreeMap<(String, String, String), String>,
     /// Finding 3 (X4 adversarial review): `true` iff the tree-sitter parse
     /// of this file produced NO `ERROR`/`MISSING` node anywhere in the tree
     /// (see `tree_has_error`). A degraded/partial parse can still recover
@@ -737,8 +758,9 @@ fn canonical_kind(ast_kind: &str, lang: SupportLang) -> &'static str {
 // `_ => {}` arm never fabricates a name).
 
 /// The set of `(scope, name)` local-binding pairs declared in `source` — see
-/// this section's module-doc-comment-style header above, and
-/// `nearest_named_scope` for what `scope` means. Independently parses
+/// this section's module-doc-comment-style header above, and `scope_chain`
+/// for what `scope` means (as of the X4 adversarial review, Finding 4: a
+/// full scope CHAIN, not a bare enclosing-def name). Independently parses
 /// `source` (unlike `collect_local_bindings_from_root`, which reuses an
 /// already-parsed root — see that function's doc comment for the
 /// single-parse production path via `extract_inner`/`GraphFragment`); this
@@ -751,31 +773,38 @@ pub fn collect_local_bindings(source: &str, lang: SupportLang) -> BTreeSet<(Stri
         return BTreeSet::new();
     }
     let grep = lang.ast_grep(source);
-    return collect_local_bindings_from_root(&grep.root(), lang);
+    let root = grep.root();
+    let func_index = func_node_preorder_index(&root, lang);
+    return collect_local_bindings_from_root(&root, lang, &func_index);
     #[allow(unreachable_code)]
     let result = catch_unwind(AssertUnwindSafe(|| {
         let grep = lang.ast_grep(source);
-        collect_local_bindings_from_root(&grep.root(), lang)
+        let root = grep.root();
+        let func_index = func_node_preorder_index(&root, lang);
+        collect_local_bindings_from_root(&root, lang, &func_index)
     }));
     result.unwrap_or_default()
 }
 
 /// Shared by `collect_local_bindings` (standalone parse, for unit tests) and
-/// `extract_inner` (reuses its own already-parsed `root` — no second parse).
+/// `extract_inner` (reuses its own already-parsed `root` AND `func_index` —
+/// no second parse, no second index pass; see `scope_chain`'s doc comment on
+/// why bindings and call/import-site chains must share ONE `func_index`).
 fn collect_local_bindings_from_root<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     lang: SupportLang,
+    func_index: &BTreeMap<usize, usize>,
 ) -> BTreeSet<(String, String)> {
     let mut out = BTreeSet::new();
     match lang {
         SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => {
-            collect_ts_js_local_bindings(root, lang, &mut out);
+            collect_ts_js_local_bindings(root, lang, func_index, &mut out);
         }
         SupportLang::Python => {
-            collect_python_local_bindings(root, lang, &mut out);
+            collect_python_local_bindings(root, lang, func_index, &mut out);
         }
         SupportLang::Rust => {
-            collect_rust_local_bindings(root, lang, &mut out);
+            collect_rust_local_bindings(root, lang, func_index, &mut out);
         }
         _ => {}
     }
@@ -796,7 +825,7 @@ fn collect_local_bindings_from_root<D: ast_grep_core::Doc>(
 /// (module-level code, including inside a top-level `if`/`try` block).
 ///
 /// Single source of truth for "which def node does this AST position belong
-/// to", shared by BOTH `nearest_named_scope` (X4 local-binding scope
+/// to", shared by BOTH `scope_chain` (X4 local-binding/call-site scope
 /// tagging, below) and `extract_inner`'s own `calls`-edge source-symbol
 /// walk. Before this fix the two had subtly different rules: the edges walk
 /// broke at the FIRST function-kind ancestor even when it was anonymous,
@@ -834,21 +863,97 @@ fn nearest_def_node<D: ast_grep_core::Doc>(
     None
 }
 
-/// The name half of `nearest_def_node`, or `""` when `node` is not inside
-/// any named def (module-level code) — see that function's doc comment for
-/// what "nearest enclosing definition" means and why the two walks (this
-/// one, and `extract_inner`'s `calls`-edge source-symbol walk) must share
-/// one rule. This is what makes "nested closures inside function F attribute
-/// to scope F" hold: a `reject` param bound in an anonymous `(resolve,
-/// reject) => {...}` deep inside named function `loadTrack` scopes to
-/// `"loadTrack"`, not `""`.
-fn nearest_named_scope<D: ast_grep_core::Doc>(
+/// Assigns a stable preorder index to EVERY `func_kinds` node in this parse
+/// (named or anonymous alike) — the deterministic within-parse identity
+/// `scope_chain` uses to name an otherwise-nameless anonymous closure
+/// (`anon<idx>`). Built once per fragment/parse (`extract_inner` builds one
+/// from its own `root` and shares it across the calls-edge loop AND the
+/// local-binding collectors — never a second, separately-indexed pass) via
+/// `root.dfs()` — `ast_grep_core`'s preorder traversal (visits a node
+/// before its children), so sibling closures at the same nesting depth are
+/// indexed in left-to-right source order, deterministically. Keyed by
+/// `Node::node_id()` (tree-sitter's own per-node identity, stable for the
+/// lifetime of THIS parse tree — see that method's doc comment) rather than
+/// a byte range, though either would work here.
+fn func_node_preorder_index<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    lang: SupportLang,
+) -> BTreeMap<usize, usize> {
+    let mut out = BTreeMap::new();
+    let mut idx = 0usize;
+    for n in root.dfs() {
+        if func_kinds(lang).contains(&n.kind().as_ref()) {
+            out.insert(n.node_id(), idx);
+            idx += 1;
+        }
+    }
+    out
+}
+
+/// X4 adversarial review, Finding 4 (sibling anonymous-closure conflation):
+/// the full scope CHAIN for `node` — the nearest enclosing NAMED def's name
+/// (via the SAME walk as `nearest_def_node`), followed by `>anon<idx>` for
+/// each anonymous function-kind ancestor encountered strictly BETWEEN that
+/// named def and `node` (outer to inner), `<idx>` from `func_index` (see
+/// `func_node_preorder_index`). `""` when `node` is not inside any named def
+/// (module-level code) — same "no named def" case `nearest_def_node`
+/// returns `None` for.
+///
+/// `nearest_def_node` (GRAPH src attribution, and the bare-name X4 scope
+/// this chain replaces) deliberately flattens every anonymous closure onto
+/// the outer named def — correct for graph attribution (many closures
+/// really do belong to one component/function), but it means a binding
+/// declared in anonymous closure A and a call in an unrelated SIBLING
+/// closure B both report the SAME bare scope name, so a flat scope-equality
+/// match (the X4 tier before this fix) cannot tell them apart — see
+/// `ResolveStats::local`'s doc comment and `classify_only`'s X4 block. This
+/// chain is witness machinery ONLY: `nearest_def_node` itself, and the
+/// GRAPH `calls`-edge src attribution built from it, are UNCHANGED.
+///
+/// Chains are only ever compared within a single `backfill_wcr_witnesses`
+/// re-extraction of the SAME file content — bindings and pending-edge
+/// chains are recomputed together from the SAME fresh parse — so a
+/// within-parse `func_index` is stable enough for that purpose. Never
+/// persist a chain across different file versions (a different parse) as
+/// if directly comparable — the `anon<idx>` values have no meaning outside
+/// the parse that produced them.
+fn scope_chain<D: ast_grep_core::Doc>(
     node: &ast_grep_core::Node<'_, D>,
     lang: SupportLang,
+    func_index: &BTreeMap<usize, usize>,
 ) -> String {
-    nearest_def_node(node, lang)
-        .map(|(_, name)| name)
-        .unwrap_or_default()
+    let mut anon_indices: Vec<usize> = Vec::new();
+    for anc in node.ancestors() {
+        if !func_kinds(lang).contains(&anc.kind().as_ref()) {
+            continue;
+        }
+        if let Some(name) = child_name(&anc) {
+            return assemble_chain(name, anon_indices);
+        }
+        if let Some(name) = top_level_const_fn_name(&anc) {
+            return assemble_chain(name, anon_indices);
+        }
+        // Anonymous, non-top-level-const function-kind ancestor: record its
+        // within-parse index (innermost-first, reversed by `assemble_chain`
+        // into outer-to-inner reading order) and keep walking up for the
+        // named def, exactly like `nearest_def_node`.
+        if let Some(&idx) = func_index.get(&anc.node_id()) {
+            anon_indices.push(idx);
+        }
+    }
+    String::new()
+}
+
+/// Outer-to-inner chain string: `name` followed by `>anon<idx>` for each
+/// entry in `anon_indices` (which arrives innermost-first from the
+/// ancestor walk — reversed here before assembly).
+fn assemble_chain(name: String, mut anon_indices: Vec<usize>) -> String {
+    anon_indices.reverse();
+    let mut chain = name;
+    for idx in anon_indices {
+        chain.push_str(&format!(">anon{idx}"));
+    }
+    chain
 }
 
 /// X4 adversarial review, Finding 1: `Some(name)` when `anc` (a function-kind
@@ -861,8 +966,10 @@ fn nearest_named_scope<D: ast_grep_core::Doc>(
 /// for the resolver's scope-equality match to have anything to match against.
 /// A NON-top-level `const helper = () => {}` (nested inside another function)
 /// deliberately returns `None` here — it is not a def node, so it must not be
-/// treated as a named scope either; `nearest_named_scope` keeps walking
-/// upward past it instead, attributing to the enclosing named function.
+/// treated as a named scope either; `scope_chain`/`nearest_def_node` keep
+/// walking upward past it instead, attributing to the enclosing named
+/// function (recording an `>anon<idx>` chain segment for it, in
+/// `scope_chain`'s case).
 fn top_level_const_fn_name<D: ast_grep_core::Doc>(
     anc: &ast_grep_core::Node<'_, D>,
 ) -> Option<String> {
@@ -905,16 +1012,17 @@ fn insert_binding_name(out: &mut BTreeSet<(String, String)>, scope: &str, name: 
 fn collect_ts_js_local_bindings<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     lang: SupportLang,
+    func_index: &BTreeMap<usize, usize>,
     out: &mut BTreeSet<(String, String)>,
 ) {
     let params_matcher = KindMatcher::new("formal_parameters", lang);
     for params in root.find_all(&params_matcher) {
         // `params` is always a direct child of the function/method/arrow
-        // node it belongs to, so the nearest named scope FROM `params`
-        // itself is exactly that function's own scope (or the outer named
-        // def if it's anonymous) — computed once per parameter list, not
-        // per name.
-        let scope = nearest_named_scope(&params, lang);
+        // node it belongs to, so the scope chain FROM `params` itself is
+        // exactly that function's own chain (or the outer named def's chain
+        // plus this closure's own `>anon<idx>` segment, if it's anonymous)
+        // — computed once per parameter list, not per name.
+        let scope = scope_chain(&params, lang, func_index);
         for child in params.children() {
             if child.is_named() {
                 ts_js_pattern_names(&child, &scope, out);
@@ -923,7 +1031,7 @@ fn collect_ts_js_local_bindings<D: ast_grep_core::Doc>(
     }
     let catch_matcher = KindMatcher::new("catch_clause", lang);
     for clause in root.find_all(&catch_matcher) {
-        let scope = nearest_named_scope(&clause, lang);
+        let scope = scope_chain(&clause, lang, func_index);
         if let Some(param) = clause.field("parameter") {
             ts_js_pattern_names(&param, &scope, out);
         }
@@ -937,7 +1045,7 @@ fn collect_ts_js_local_bindings<D: ast_grep_core::Doc>(
                 // symbol as a "local" one.
                 continue;
             }
-            let scope = nearest_named_scope(&decl, lang);
+            let scope = scope_chain(&decl, lang, func_index);
             for child in decl.children() {
                 if child.is_named() && child.kind().as_ref() == "variable_declarator" {
                     if let Some(name) = child.field("name") {
@@ -1013,11 +1121,12 @@ fn ts_js_pattern_names<D: ast_grep_core::Doc>(
 fn collect_python_local_bindings<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     lang: SupportLang,
+    func_index: &BTreeMap<usize, usize>,
     out: &mut BTreeSet<(String, String)>,
 ) {
     let params_matcher = KindMatcher::new("parameters", lang);
     for params in root.find_all(&params_matcher) {
-        let scope = nearest_named_scope(&params, lang);
+        let scope = scope_chain(&params, lang, func_index);
         for child in params.children() {
             if child.is_named() {
                 python_pattern_names(&child, &scope, out);
@@ -1029,7 +1138,7 @@ fn collect_python_local_bindings<D: ast_grep_core::Doc>(
         if !is_inside_python_function(&assign) {
             continue;
         }
-        let scope = nearest_named_scope(&assign, lang);
+        let scope = scope_chain(&assign, lang, func_index);
         if let Some(left) = assign.field("left") {
             python_pattern_names(&left, &scope, out);
         }
@@ -1089,12 +1198,13 @@ fn python_pattern_names<D: ast_grep_core::Doc>(
 fn collect_rust_local_bindings<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     lang: SupportLang,
+    func_index: &BTreeMap<usize, usize>,
     out: &mut BTreeSet<(String, String)>,
 ) {
     for kind in ["let_declaration", "let_condition"] {
         let matcher = KindMatcher::new(kind, lang);
         for decl in root.find_all(&matcher) {
-            let scope = nearest_named_scope(&decl, lang);
+            let scope = scope_chain(&decl, lang, func_index);
             if let Some(pattern) = decl.field("pattern") {
                 rust_pattern_names(&pattern, &scope, out);
             }
@@ -1103,10 +1213,11 @@ fn collect_rust_local_bindings<D: ast_grep_core::Doc>(
     let closure_matcher = KindMatcher::new("closure_parameters", lang);
     for params in root.find_all(&closure_matcher) {
         // Closures are not `func_kinds` themselves (Rust's `func_kinds` is
-        // only `function_item`), so `nearest_named_scope` walks straight
-        // past the closure to the enclosing named function — exactly the
-        // "nested closures attribute to F" rule.
-        let scope = nearest_named_scope(&params, lang);
+        // only `function_item`), so `scope_chain` walks straight past the
+        // closure to the enclosing named function with no `>anon<idx>`
+        // segment at all — exactly the "nested closures attribute to F"
+        // rule, unchanged from before chains existed.
+        let scope = scope_chain(&params, lang, func_index);
         for child in params.children() {
             if !child.is_named() {
                 continue;
@@ -1253,6 +1364,13 @@ fn extract_inner(
     let lang_name = lang_name(lang);
     let mut nodes: BTreeMap<String, NodeRow> = BTreeMap::new();
     let mut edges: BTreeMap<(String, String, String), EdgeRow> = BTreeMap::new();
+    // X4 adversarial review, Finding 4: keyed identically to `edges`
+    // — `(src_id, dst_id, kind)` — see `GraphFragment::call_scope_chains`'s
+    // doc comment. First-wins on a repeat key, same convention as `edges`'
+    // own `and_modify` (only bumps weight, never overwrites callee_kind/
+    // evidence on a dedup hit) — every physical occurrence of a given
+    // (src, callee, kind) triple is treated as equivalent.
+    let mut call_scope_chains: BTreeMap<(String, String, String), String> = BTreeMap::new();
 
     // Synthetic module node anchoring the file.
     let module_id = node_id(repo, file, "module", file);
@@ -1280,6 +1398,11 @@ fn extract_inner(
 
     let grep = lang.ast_grep(source);
     let root = grep.root();
+    // Built ONCE from this file's own `root` and shared by the calls/imports
+    // loop below AND `collect_local_bindings_from_root` at the end of this
+    // function — see `scope_chain`'s doc comment on why bindings and
+    // call/import-site chains must agree on the SAME within-parse indices.
+    let func_index = func_node_preorder_index(&root, lang);
 
     let mk_node = |kind: &str, name: &str, text: &str, start: i64, end: i64| -> NodeRow {
         let id = node_id(repo, file, kind, name);
@@ -1384,6 +1507,13 @@ fn extract_inner(
     for kind in import_kinds(lang) {
         let matcher = KindMatcher::new(kind, lang);
         for n in root.find_all(&matcher) {
+            // Finding 4 (X4 adversarial review): one chain per import
+            // STATEMENT node — every symbol in `import { a, b } from 'x'`
+            // shares it. Import statements are always module-level in
+            // every supported language's grammar today, so this is `""` in
+            // practice, but computed generically (never assumed) for the
+            // same reason `calls` computes its own per-site chain below.
+            let import_chain = scope_chain(&n, lang, &func_index);
             for (sym, module) in import_symbols(&n, lang) {
                 if is_noise_callee(&sym) {
                     continue;
@@ -1393,14 +1523,11 @@ fn extract_inner(
                 } else {
                     format!("from:{}", truncate_chars(&module, MODULE_EVIDENCE_MAX_LEN))
                 };
-                add_edge(
-                    module_id.clone(),
-                    format!("name:{sym}"),
-                    "imports",
-                    0,
-                    "",
-                    &evidence,
-                );
+                let dst = format!("name:{sym}");
+                add_edge(module_id.clone(), dst.clone(), "imports", 0, "", &evidence);
+                call_scope_chains
+                    .entry((module_id.clone(), dst, "imports".to_string()))
+                    .or_insert_with(|| import_chain.clone());
             }
         }
     }
@@ -1459,20 +1586,26 @@ fn extract_inner(
                 }
                 _ => String::new(),
             };
-            add_edge(
-                src,
-                format!("name:{callee}"),
-                "calls",
-                0,
-                callee_kind,
-                &evidence,
-            );
+            let dst = format!("name:{callee}");
+            add_edge(src.clone(), dst.clone(), "calls", 0, callee_kind, &evidence);
+            // Finding 4 (X4 adversarial review): the call SITE's own scope
+            // chain — deliberately independent of `src` above (which is the
+            // coarse, closures-flattened GRAPH attribution from
+            // `nearest_def_node`). `scope_chain` walks the SAME ancestors
+            // but also records each anonymous closure crossed along the
+            // way, so two calls that share `src` (same enclosing named def)
+            // but sit in different sibling closures still get DIFFERENT
+            // chains — see `GraphFragment::call_scope_chains`'s doc comment.
+            call_scope_chains
+                .entry((src, dst, "calls".to_string()))
+                .or_insert_with(|| scope_chain(&n, lang, &func_index));
         }
     }
 
     // TASK 2 (WCR truth pass X4 tier): local-binding names, from the SAME
-    // parsed `root` above — never a second parse.
-    let local_bindings = collect_local_bindings_from_root(&root, lang);
+    // parsed `root` above and the SAME `func_index` the calls loop just
+    // used — never a second parse, never a second index pass.
+    let local_bindings = collect_local_bindings_from_root(&root, lang, &func_index);
     // Finding 3 (X4 adversarial review): computed from the SAME parsed
     // `root` — see `tree_has_error`'s doc comment.
     let parse_clean = !tree_has_error(&root);
@@ -1481,6 +1614,7 @@ fn extract_inner(
         nodes: nodes.into_values().collect(),
         edges: edges.into_values().collect(),
         local_bindings,
+        call_scope_chains,
         parse_clean,
     }
 }
@@ -2517,11 +2651,17 @@ mod tests {
             "c",
             "s",
         );
+        // Second X4 adversarial review, Finding 4: `reject` is a closure
+        // param nested (anonymously, via the non-top-level `const cb = ...`
+        // arrow function) inside named function `f` — its scope is now a
+        // CHAIN rooted at "f" (`"f>anon<idx>"`), not the bare "f" this
+        // assertion checked before chains existed, and not `""`/`"cb"`.
         assert!(
             frag.local_bindings
-                .contains(&("f".to_string(), "reject".to_string())),
+                .iter()
+                .any(|(scope, name)| name == "reject" && scope.starts_with("f>anon")),
             "reject is a closure param nested (anonymously) inside named function f, \
-             so its scope must be \"f\", not \"\" or \"cb\": {:?}",
+             so its scope must be a chain rooted at \"f\", not \"\" or \"cb\": {:?}",
             frag.local_bindings
         );
     }
@@ -2580,8 +2720,15 @@ mod tests {
         // `insert_binding_name`.
         let src = "function outer() {\n  const helper = () => {\n    let inner = 1;\n    return inner;\n  };\n  return helper();\n}\n";
         let bindings = collect_local_bindings(src, SupportLang::TypeScript);
+        // Second X4 adversarial review, Finding 4: `inner` sits inside the
+        // anonymous `helper` closure, so its scope is now a CHAIN rooted at
+        // "outer" (`"outer>anon<idx>"`), not the bare "outer" this assertion
+        // checked before chains existed — it still attributes to the NAMED
+        // ancestor `outer`, never to `helper` itself (checked below).
         assert!(
-            bindings.contains(&("outer".to_string(), "inner".to_string())),
+            bindings
+                .iter()
+                .any(|(scope, name)| name == "inner" && scope.starts_with("outer>anon")),
             "{bindings:?}"
         );
         assert!(
@@ -2785,6 +2932,126 @@ function Screen() {\n\
             src_name, "Screen",
             "a call from inside a useEffect closure must attribute to the enclosing \
              named component, not fall back to module scope: {frag:?}"
+        );
+    }
+
+    // ─── scope CHAINS (second X4 adversarial review, Finding 4: sibling
+    // anonymous-closure conflation) ───
+
+    #[test]
+    fn scope_chain_gives_sibling_anonymous_closures_different_chains() {
+        // Extraction-level proof of the mechanism `resolver::classify_only`'s
+        // prefix match depends on: a `handler` param bound inside ONE
+        // anonymous closure, and an UNRELATED `handler()` call inside a
+        // SIBLING anonymous closure — both nested in the SAME named
+        // function `Component`, so `nearest_def_node`'s GRAPH attribution
+        // (unchanged by this finding) flattens both to `Component`. Their
+        // scope CHAINS must nonetheless differ.
+        let src = "\
+function Component() {\n\
+    useCallback((handler) => {\n\
+        return handler;\n\
+    }, []);\n\
+    useCallback(() => {\n\
+        handler();\n\
+    }, []);\n\
+}\n";
+        let bindings = collect_local_bindings(src, SupportLang::Tsx);
+        let (handler_scope, _) = bindings
+            .iter()
+            .find(|(_, name)| name == "handler")
+            .expect("handler param must be a witnessed local binding");
+        assert!(
+            handler_scope.starts_with("Component>anon"),
+            "a param bound inside an anonymous closure must carry a nested chain, \
+             not the bare enclosing-def name: {bindings:?}"
+        );
+
+        let frag = extract_graph_fragment(src, SupportLang::Tsx, "a.tsx", "repo", "proj", "c", "s");
+        let call = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:handler")
+            .expect("handler() calls edge present");
+        // GRAPH src attribution is UNCHANGED by this finding: the call
+        // still rolls up to the SAME enclosing named node as the binding.
+        let src_name = frag
+            .nodes
+            .iter()
+            .find(|n| n.id == call.src_id)
+            .map(|n| n.name.as_str());
+        assert_eq!(
+            src_name,
+            Some("Component"),
+            "GRAPH attribution must stay flattened to the named def: {frag:?}"
+        );
+
+        let call_chain = frag
+            .call_scope_chains
+            .get(&(
+                call.src_id.clone(),
+                call.dst_id.clone(),
+                "calls".to_string(),
+            ))
+            .expect("a calls edge must have a recorded scope chain");
+        assert!(
+            call_chain.starts_with("Component>anon"),
+            "the call site is itself inside an anonymous closure: {call_chain}"
+        );
+        assert_ne!(
+            handler_scope, call_chain,
+            "sibling closures must get DIFFERENT chains — same bare enclosing def, \
+             different within-parse anon index: binding={handler_scope} call={call_chain}"
+        );
+    }
+
+    #[test]
+    fn scope_chain_flows_outer_binding_into_nested_closure_chain() {
+        // Counterpart to the sibling test above: a binding declared
+        // directly in the named def's OWN body (no closure nesting of its
+        // own — chain == the bare name) IS a chain-prefix of a call made
+        // from inside a NESTED closure. This is the extraction-level half
+        // of `resolver::chain_prefix_matches`'s "outer flows inward" rule.
+        let src = "\
+function Component() {\n\
+    const playTrack = useCallback((track) => {\n\
+        doPlay(track);\n\
+    }, []);\n\
+    useCallback(() => {\n\
+        playTrack();\n\
+    }, [playTrack]);\n\
+}\n";
+        let bindings = collect_local_bindings(src, SupportLang::Tsx);
+        assert!(
+            bindings.contains(&("Component".to_string(), "playTrack".to_string())),
+            "playTrack itself is declared directly in Component's body, not inside a \
+             closure — its chain must be the bare name: {bindings:?}"
+        );
+
+        let frag = extract_graph_fragment(src, SupportLang::Tsx, "a.tsx", "repo", "proj", "c", "s");
+        let call = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:playTrack")
+            .expect("playTrack() calls edge present");
+        let call_chain = frag
+            .call_scope_chains
+            .get(&(
+                call.src_id.clone(),
+                call.dst_id.clone(),
+                "calls".to_string(),
+            ))
+            .expect("a calls edge must have a recorded scope chain");
+        assert!(
+            call_chain.starts_with("Component>anon"),
+            "the call is made from inside a sibling useCallback closure: {call_chain}"
+        );
+        assert!(
+            call_chain
+                .strip_prefix("Component")
+                .is_some_and(|rest| rest.starts_with('>')),
+            "the call's chain must be nested strictly inside the outer \"Component\" \
+             binding's chain (a real chain-segment boundary, not just a text prefix): {call_chain}"
         );
     }
 }
