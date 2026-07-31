@@ -782,39 +782,73 @@ fn collect_local_bindings_from_root<D: ast_grep_core::Doc>(
     out
 }
 
-/// X4 adversarial review, Finding 1: the name of the nearest enclosing NAMED
-/// definition (function/method/top-level const-assigned function expression)
-/// `node` sits inside, or `""` when `node` is not inside any named def
-/// (module-level code, including a top-level `if`/`try` block). Walks
-/// ancestors exactly like `extract_inner`'s own `calls`-edge source-symbol
-/// walk, EXCEPT it does not stop at the first function-kind ancestor: an
-/// ANONYMOUS function-kind ancestor (a closure, or a `const`-assigned arrow
-/// function that isn't itself a direct top-level declaration — see
-/// `top_level_const_fn_name`) is not a named scope in its own right, so the
-/// walk continues past it to find the nearest OUTER named definition. This is
-/// what makes "nested closures inside function F attribute to scope F" hold:
-/// a `reject` param bound in an anonymous `(resolve, reject) => {...}` deep
-/// inside named function `loadTrack` scopes to `"loadTrack"`, not `""`.
-fn nearest_named_scope<D: ast_grep_core::Doc>(
+/// WCR truth-pass X4 remediation (real-world TSX repro session): the nearest
+/// enclosing DEFINITION ancestor of `node` — a NAMED function/method (any
+/// `func_kinds` ancestor with a `child_name`) or a top-level const-assigned
+/// function expression (`top_level_const_fn_name`) — walking PAST anonymous
+/// function-kind ancestors (closures, or a non-top-level `const helper = ()
+/// => {}` nested inside another function) to find it. Returns
+/// `(canonical_kind, name)`: `canonical_kind(anc.kind(), lang)` (always
+/// `"function"` today — see that function) for a real `func_kinds` match, or
+/// the literal `"const"` kind — matching the def-node kind `extract_inner`'s
+/// top-level-const loop creates — for a top-level const-assigned function
+/// expression. `None` when `node` is not inside any such definition
+/// (module-level code, including inside a top-level `if`/`try` block).
+///
+/// Single source of truth for "which def node does this AST position belong
+/// to", shared by BOTH `nearest_named_scope` (X4 local-binding scope
+/// tagging, below) and `extract_inner`'s own `calls`-edge source-symbol
+/// walk. Before this fix the two had subtly different rules: the edges walk
+/// broke at the FIRST function-kind ancestor even when it was anonymous,
+/// silently falling back to the MODULE node instead of continuing outward —
+/// so a `playTrack()` call sitting inside a sibling `useCallback` closure
+/// and the `const playTrack = useCallback(...)` binding it targets ended up
+/// disagreeing on scope (`""`/module vs the enclosing component's name) even
+/// though both plainly belong to the same component, and the X4 tier's
+/// scope-equality check (`resolver::classify_only`) could never match them.
+/// Confirmed against real-world TSX (`anukriti-mvp-expo/src/context/
+/// radio-context.tsx`, `app/radio-player.tsx`): every call from inside a
+/// `useCallback`/`useEffect`/`useFocusEffect` closure — i.e. nearly every
+/// call site in idiomatic React hook code — was mis-attributed to module
+/// scope this way, which is why `had_local_binding` was `false` for the
+/// entire WCR unexplained residual despite obvious component-local names.
+fn nearest_def_node<D: ast_grep_core::Doc>(
     node: &ast_grep_core::Node<'_, D>,
     lang: SupportLang,
-) -> String {
+) -> Option<(&'static str, String)> {
     for anc in node.ancestors() {
         if !func_kinds(lang).contains(&anc.kind().as_ref()) {
             continue;
         }
         if let Some(name) = child_name(&anc) {
-            return name;
+            return Some((canonical_kind(anc.kind().as_ref(), lang), name));
         }
         if let Some(name) = top_level_const_fn_name(&anc) {
-            return name;
+            return Some(("const", name));
         }
         // Anonymous, non-top-level-const function-kind ancestor (e.g. a bare
         // closure, or a `const helper = () => {}` nested inside another
-        // function): not a named scope itself — keep walking up for an outer
-        // named ancestor rather than stopping here.
+        // function): not a definition itself — keep walking up for an outer
+        // one rather than stopping here.
     }
-    String::new()
+    None
+}
+
+/// The name half of `nearest_def_node`, or `""` when `node` is not inside
+/// any named def (module-level code) — see that function's doc comment for
+/// what "nearest enclosing definition" means and why the two walks (this
+/// one, and `extract_inner`'s `calls`-edge source-symbol walk) must share
+/// one rule. This is what makes "nested closures inside function F attribute
+/// to scope F" hold: a `reject` param bound in an anonymous `(resolve,
+/// reject) => {...}` deep inside named function `loadTrack` scopes to
+/// `"loadTrack"`, not `""`.
+fn nearest_named_scope<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    lang: SupportLang,
+) -> String {
+    nearest_def_node(node, lang)
+        .map(|(_, name)| name)
+        .unwrap_or_default()
 }
 
 /// X4 adversarial review, Finding 1: `Some(name)` when `anc` (a function-kind
@@ -1404,21 +1438,21 @@ fn extract_inner(
             if is_noise_callee(&callee) {
                 continue;
             }
-            // Walk ancestors for the nearest function-like definition.
-            let mut src = module_id.clone();
-            for anc in n.ancestors() {
-                if func_kinds(lang).contains(&anc.kind().as_ref()) {
-                    if let Some(def_name) = child_name(&anc) {
-                        src = node_id(
-                            repo,
-                            file,
-                            canonical_kind(anc.kind().as_ref(), lang),
-                            &def_name,
-                        );
-                    }
-                    break;
-                }
-            }
+            // Walk ancestors for the nearest DEFINITION node (WCR truth-pass
+            // X4 remediation): shares `nearest_def_node` with the
+            // local-binding scope tagger below it in this file, so a call
+            // made from inside a closure (the overwhelmingly common shape in
+            // idiomatic React hook code — `useCallback`/`useEffect`/
+            // `useFocusEffect` bodies) attributes to the SAME enclosing
+            // definition its sibling local-binding witnesses are scoped to,
+            // rather than silently falling back to module scope the moment
+            // the nearest function-kind ancestor happens to be anonymous —
+            // see `nearest_def_node`'s doc comment for the real-world TSX
+            // repro this fixes.
+            let src = match nearest_def_node(&n, lang) {
+                Some((kind, def_name)) => node_id(repo, file, kind, &def_name),
+                None => module_id.clone(),
+            };
             let evidence = match qualifier {
                 Some(q) if !q.is_empty() => {
                     format!("via:{}", truncate_chars(&q, MODULE_EVIDENCE_MAX_LEN))
@@ -2610,6 +2644,147 @@ mod tests {
         assert!(
             !frag.parse_clean,
             "a tree containing ERROR/MISSING nodes anywhere must not report clean"
+        );
+    }
+
+    // ─── WCR truth-pass X4 remediation: calls-edge src / local-binding scope
+    // agreement (real-world TSX repro session) ───
+    //
+    // Minimal inline fixtures reproducing the confirmed real-world break:
+    // `anukriti-mvp-expo/src/context/radio-context.tsx` (`const playTrack =
+    // useCallback(...)`, called from sibling `useCallback` closures) and
+    // `app/radio-player.tsx` (multiline object-destructure of a hook's
+    // return value, and `useState` array-destructured setters, both called
+    // from inside a `useCallback`/`useFocusEffect` closure). Before the fix,
+    // `extract_inner`'s calls-edge source-symbol walk broke at the FIRST
+    // function-kind ancestor even when it was an anonymous closure, falling
+    // back to the MODULE node instead of continuing outward to the named
+    // component — while `nearest_named_scope` (backing `local_bindings`)
+    // already did continue outward. The two disagreed on scope for every
+    // call made from inside a hook closure (`""`/module vs the component's
+    // name), so the X4 tier's scope-equality check could never match real,
+    // disk-verified component-local bindings — see `nearest_def_node`'s doc
+    // comment, now shared by both walks.
+
+    #[test]
+    fn calls_edge_src_matches_local_binding_scope_for_usecallback_const() {
+        // `playTrack` is a component-scoped `const` whose initializer is a
+        // CALL expression (`useCallback(...)`), not a bare arrow function —
+        // and it is called from a SIBLING `useCallback` closure, not from
+        // its own body. Both the binding and the calling edge must resolve
+        // to the SAME scope (`Component`), not disagree (module vs
+        // `Component`).
+        let src = "\
+function Component() {\n\
+    const playTrack = useCallback((track) => {\n\
+        doPlay(track);\n\
+    }, []);\n\
+    const selectStation = useCallback((category) => {\n\
+        playTrack(category);\n\
+    }, [playTrack]);\n\
+    return selectStation;\n\
+}\n";
+        let bindings = collect_local_bindings(src, SupportLang::Tsx);
+        assert!(
+            bindings.contains(&("Component".to_string(), "playTrack".to_string())),
+            "playTrack must be a witnessed local binding scoped to Component: {bindings:?}"
+        );
+
+        let frag = extract_graph_fragment(src, SupportLang::Tsx, "a.tsx", "repo", "proj", "c", "s");
+        let call = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:playTrack")
+            .expect("playTrack calls edge present");
+        let src_name = frag
+            .nodes
+            .iter()
+            .find(|n| n.id == call.src_id)
+            .map(|n| n.name.as_str())
+            .unwrap_or("<unknown>");
+        assert_eq!(
+            src_name, "Component",
+            "a call from inside a sibling useCallback closure must attribute to the \
+             enclosing named component, not fall back to module scope: {frag:?}"
+        );
+    }
+
+    #[test]
+    fn calls_edge_src_matches_local_binding_scope_for_multiline_object_destructure() {
+        // Multiline object-destructure of a hook's return value
+        // (`app/radio-player.tsx`'s `const { ..., playTrack } = useRadio();`
+        // shape), called from inside a `useFocusEffect(useCallback(...))`
+        // closure.
+        let src = "\
+function Screen() {\n\
+    const {\n\
+        currentTrack,\n\
+        playTrack,\n\
+    } = useRadio();\n\
+    useFocusEffect(\n\
+        useCallback(() => {\n\
+            if (currentTrack) playTrack(currentTrack);\n\
+        }, [currentTrack, playTrack]),\n\
+    );\n\
+}\n";
+        let bindings = collect_local_bindings(src, SupportLang::Tsx);
+        assert!(
+            bindings.contains(&("Screen".to_string(), "playTrack".to_string())),
+            "playTrack must be a witnessed local binding scoped to Screen: {bindings:?}"
+        );
+
+        let frag = extract_graph_fragment(src, SupportLang::Tsx, "a.tsx", "repo", "proj", "c", "s");
+        let call = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:playTrack")
+            .expect("playTrack calls edge present");
+        let src_name = frag
+            .nodes
+            .iter()
+            .find(|n| n.id == call.src_id)
+            .map(|n| n.name.as_str())
+            .unwrap_or("<unknown>");
+        assert_eq!(
+            src_name, "Screen",
+            "a call from inside useFocusEffect(useCallback(...)) must attribute to the \
+             enclosing named component, not fall back to module scope: {frag:?}"
+        );
+    }
+
+    #[test]
+    fn calls_edge_src_matches_local_binding_scope_for_usestate_array_destructure() {
+        // `useState` array destructure (`const [x, setX] = useState(...)`) —
+        // the setter is called from inside a `useEffect` closure.
+        let src = "\
+function Screen() {\n\
+    const [purchasing, setPurchasing] = useState(false);\n\
+    useEffect(() => {\n\
+        setPurchasing(true);\n\
+    }, []);\n\
+}\n";
+        let bindings = collect_local_bindings(src, SupportLang::Tsx);
+        assert!(
+            bindings.contains(&("Screen".to_string(), "setPurchasing".to_string())),
+            "setPurchasing must be a witnessed local binding scoped to Screen: {bindings:?}"
+        );
+
+        let frag = extract_graph_fragment(src, SupportLang::Tsx, "a.tsx", "repo", "proj", "c", "s");
+        let call = frag
+            .edges
+            .iter()
+            .find(|e| e.kind == "calls" && e.dst_id == "name:setPurchasing")
+            .expect("setPurchasing calls edge present");
+        let src_name = frag
+            .nodes
+            .iter()
+            .find(|n| n.id == call.src_id)
+            .map(|n| n.name.as_str())
+            .unwrap_or("<unknown>");
+        assert_eq!(
+            src_name, "Screen",
+            "a call from inside a useEffect closure must attribute to the enclosing \
+             named component, not fall back to module scope: {frag:?}"
         );
     }
 }
