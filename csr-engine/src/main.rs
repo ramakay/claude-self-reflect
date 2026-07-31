@@ -175,6 +175,20 @@ enum CodegraphAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Backfill `repo_root` (git toplevel) on existing code_nodes /
+    /// code_evolution rows that predate the column (WP2 Stage 1, H8 finding).
+    BackfillRepoRoot {
+        /// Count what would be resolved, but make no changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Backfill two-channel symbol attribution (transcript + git) on every
+    /// existing code_nodes row (WP2 Stage 2, H4 remediation).
+    BackfillAttribution {
+        /// Count what would be attributed, but make no changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn default_db_path() -> PathBuf {
@@ -384,6 +398,32 @@ async fn main() -> Result<()> {
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
         let stats =
             csr_engine::import::backfill::backfill_code_graph(&eng, &args.projects_dir, dry_run)?;
+        print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
+    if let Some(Commands::Codegraph {
+        action: CodegraphAction::BackfillRepoRoot { dry_run },
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats = csr_engine::import::backfill::backfill_repo_root(&eng, dry_run)?;
+        print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
+    if let Some(Commands::Codegraph {
+        action: CodegraphAction::BackfillAttribution { dry_run },
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats = csr_engine::import::backfill::backfill_attribution(&eng, dry_run)?;
         print!("{}", stats.format_text(dry_run));
         return Ok(());
     }

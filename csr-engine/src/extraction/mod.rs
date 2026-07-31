@@ -14,6 +14,7 @@ pub mod patterns;
 pub mod provenance;
 pub mod quality;
 pub mod repo_path;
+pub mod repo_root;
 pub mod repo_scan;
 pub mod resolver;
 pub mod scoring;

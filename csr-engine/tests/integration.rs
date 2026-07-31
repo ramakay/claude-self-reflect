@@ -1745,6 +1745,7 @@ mod codegraph_roundtrip {
                 "[]",
                 "[]",
                 "[]",
+                None,
             )
             .unwrap();
         storage.resolve_code_edges(PROJECT).unwrap();

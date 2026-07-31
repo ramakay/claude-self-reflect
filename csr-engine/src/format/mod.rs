@@ -725,12 +725,22 @@ pub fn format_file_ledger(ledger: &crate::storage::codegraph::FileLedger) -> Str
         } else {
             format!(" lines='{}-{}'", s.span_start + 1, s.span_end + 1)
         };
+        // WP2 Stage 2: `attribution` (code_node_attribution, two channels)
+        // replaces `first_conv_id` as introduction evidence here —
+        // first_conv_id is a file-level projection (H4, receipt R2), never
+        // a per-symbol fact. `last_conv` stays: it is a "last touched"
+        // signal, not an introduction claim.
+        let attribution = if s.attribution.is_empty() {
+            "unattributed"
+        } else {
+            s.attribution.as_str()
+        };
         let _ = writeln!(
             out,
-            "    <symbol kind='{}' name='{}' first_conv='{}' last_conv='{}' body_hash='{}'{}/>",
+            "    <symbol kind='{}' name='{}' attribution='{}' last_conv='{}' body_hash='{}'{}/>",
             xml_escape(&s.kind),
             xml_escape(&s.name),
-            xml_escape(&s.first_conv_id),
+            xml_escape(attribution),
             xml_escape(&s.last_conv_id),
             xml_escape(&s.body_hash),
             lines_attr,
@@ -794,9 +804,14 @@ pub fn format_code_graph(
             out.push_str("  <message>No neighbors found</message>\n");
         }
         for ne in neighbors {
+            let attribution = if ne.node.attribution.is_empty() {
+                "unattributed"
+            } else {
+                ne.node.attribution.as_str()
+            };
             let _ = writeln!(
                 out,
-                "  <edge dir='{}' kind='{}' resolved='{}' name='{}' node_kind='{}' file='{}' last_conv='{}'/>",
+                "  <edge dir='{}' kind='{}' resolved='{}' name='{}' node_kind='{}' file='{}' last_conv='{}' attribution='{}'/>",
                 xml_escape(&ne.direction),
                 xml_escape(&ne.edge_kind),
                 ne.resolved,
@@ -804,6 +819,7 @@ pub fn format_code_graph(
                 xml_escape(&ne.node.kind),
                 xml_escape(&ne.node.file),
                 xml_escape(&ne.node.last_conv_id),
+                xml_escape(attribution),
             );
         }
     } else {
@@ -823,14 +839,20 @@ pub fn format_code_graph(
             } else {
                 format!(" lines='{}-{}'", n.span_start + 1, n.span_end + 1)
             };
+            let attribution = if n.attribution.is_empty() {
+                "unattributed"
+            } else {
+                n.attribution.as_str()
+            };
             let _ = writeln!(
                 out,
-                "  <node name='{}' kind='{}' file='{}' last_conv='{}' match='{}'{}/>",
+                "  <node name='{}' kind='{}' file='{}' last_conv='{}' match='{}' attribution='{}'{}/>",
                 xml_escape(&n.name),
                 xml_escape(&n.kind),
                 xml_escape(&n.file),
                 xml_escape(&n.last_conv_id),
                 match_attr,
+                xml_escape(attribution),
                 lines_attr,
             );
         }
@@ -1104,5 +1126,68 @@ mod tests {
         };
         let xml = format_code_graph("callers", "demo", &[module_node], &[]);
         assert!(!xml.contains("lines="), "got: {xml}");
+    }
+
+    #[test]
+    fn format_code_graph_renders_attribution_never_first_conv_id() {
+        // WP2 Stage 2: consumer surfaces must render the two-channel
+        // `attribution` field and must never present `first_conv_id` as
+        // introduction evidence.
+        use crate::storage::codegraph::NodeRow;
+        let attributed = NodeRow {
+            name: "foo".into(),
+            kind: "function".into(),
+            file: "a.rs".into(),
+            first_conv_id: "conv_should_not_appear".into(),
+            attribution: "transcript:70690eeb".into(),
+            ..NodeRow::default()
+        };
+        let unattributed = NodeRow {
+            name: "bar".into(),
+            kind: "function".into(),
+            file: "a.rs".into(),
+            first_conv_id: "conv_should_not_appear_either".into(),
+            attribution: String::new(),
+            ..NodeRow::default()
+        };
+        let xml = format_code_graph("callers", "foo", &[attributed, unattributed], &[]);
+        assert!(
+            xml.contains("attribution='transcript:70690eeb'"),
+            "got: {xml}"
+        );
+        assert!(
+            xml.contains("attribution='unattributed'"),
+            "empty attribution must render as the literal 'unattributed' state: {xml}"
+        );
+        assert!(
+            !xml.contains("conv_should_not_appear"),
+            "first_conv_id must never be presented as introduction evidence: {xml}"
+        );
+    }
+
+    #[test]
+    fn format_file_ledger_renders_attribution_never_first_conv() {
+        use crate::storage::codegraph::{FileLedger, NodeRow};
+        let ledger = FileLedger {
+            file: "a.rs".into(),
+            symbols: vec![NodeRow {
+                name: "foo".into(),
+                kind: "function".into(),
+                file: "a.rs".into(),
+                first_conv_id: "conv_should_not_appear".into(),
+                attribution: "git:624e7229".into(),
+                ..NodeRow::default()
+            }],
+            timeline: vec![],
+            callers: vec![],
+            indexed: true,
+        };
+        let xml = format_file_ledger(&ledger);
+        assert!(xml.contains("attribution='git:624e7229'"), "got: {xml}");
+        assert!(
+            !xml.contains("first_conv="),
+            "first_conv must no longer be rendered as introduction evidence: {xml}"
+        );
+        assert!(!xml.contains("conv_should_not_appear"), "got: {xml}");
     }
 }

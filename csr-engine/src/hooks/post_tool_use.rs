@@ -65,9 +65,28 @@ fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("no file_path in tool_input"))?;
 
+    // Repo/project identity is derivable from `file_path` alone (no lang
+    // needed), so compute it before the language gate — WP2 Stage 3 (H8
+    // innovation, receipt R4) wants an honest file-level row even for
+    // extensions the extractor doesn't parse, instead of the file vanishing
+    // silently.
+    let project = resolve_project_for_hook(Path::new(file_path).parent());
+    let stored_path = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path));
+    let stored_path_str = stored_path.to_string_lossy();
+
     let lang = match crate::extraction::ast_analysis::lang_from_path_str(file_path) {
         Some(l) => l,
-        None => return Ok(()), // unsupported language — skip
+        None => {
+            // Unsupported language — record file-level provenance instead of
+            // dropping the file entirely (best-effort; never blocks the hook).
+            if let Err(e) = engine
+                .storage()
+                .mark_code_file_unsupported(&project, &stored_path_str)
+            {
+                eprintln!("CSR: ast_status=unsupported record error (non-fatal): {e}");
+            }
+            return Ok(());
+        }
     };
 
     let meta = std::fs::metadata(file_path);
@@ -83,9 +102,6 @@ fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
         Err(_) => return Ok(()), // file gone/unreadable — skip silently
     };
 
-    let project = resolve_project_for_hook(Path::new(file_path).parent());
-    let stored_path = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path));
-    let stored_path_str = stored_path.to_string_lossy();
     let session_id = input.session_id.clone().unwrap_or_default();
     let conv_id = conv_id_for(input);
 
@@ -99,9 +115,15 @@ fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
         &session_id,
     );
 
+    // Repo identity (WP2 Stage 1, H8 finding): stable across cwd/session
+    // boundaries, unlike `project` — never overwrites it.
+    let repo_root = crate::extraction::repo_root::repo_root_for_file(&stored_path_str);
+
     let storage = engine.storage();
     for node in &fragment.nodes {
-        storage.upsert_code_node(node)?;
+        let mut node = node.clone();
+        node.repo_root = repo_root.clone();
+        storage.upsert_code_node(&node)?;
     }
     storage.replace_code_file_edges(&project, &stored_path_str, &fragment.edges)?;
 
@@ -231,6 +253,10 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
     let ia = serde_json::to_string(&diff.imports_added).unwrap_or_default();
     let ir = serde_json::to_string(&diff.imports_removed).unwrap_or_default();
 
+    // Repo identity (WP2 Stage 1, H8 finding): stable across cwd/session
+    // boundaries, unlike `project_name` — never overwrites it.
+    let repo_root = crate::extraction::repo_root::repo_root_for_file(file_path);
+
     engine.storage().insert_code_evolution(
         &conv_id,
         &project_name,
@@ -243,6 +269,7 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
         &tr,
         &ia,
         &ir,
+        repo_root.as_deref(),
     )?;
 
     eprintln!(

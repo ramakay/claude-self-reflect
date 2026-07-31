@@ -33,6 +33,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::SystemTime;
 
 use anyhow::Result;
@@ -282,6 +283,18 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
                 Some(l) => l,
                 None => {
                     stats.skipped_unsupported += 1;
+                    // WP2 Stage 3 (H8 innovation, receipt R4): file-level
+                    // provenance for a file the backfill SAW but can't
+                    // parse, instead of it vanishing silently. Best-effort;
+                    // never aborts the replay.
+                    if !dry_run {
+                        if let Err(e) = storage.mark_code_file_unsupported(project_name, file_path)
+                        {
+                            eprintln!(
+                                "CSR backfill: ast_status=unsupported record error for {file_path} ({e})"
+                            );
+                        }
+                    }
                     continue;
                 }
             };
@@ -304,10 +317,19 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
                 &session_id,
             );
 
+            // Repo identity (WP2 Stage 1, H8 finding): stable across
+            // cwd/session boundaries, unlike `project_name` — never
+            // overwrites it. `repo_root::repo_root_for_file` caches
+            // per-directory in-process, so this is cheap across the
+            // (frequently repeated) directories in a large replay.
+            let repo_root = crate::extraction::repo_root::repo_root_for_file(file_path);
+
             // Nodes: upsert as we go (oldest-first preserves first_conv_id).
             for node in &fragment.nodes {
                 if !dry_run {
-                    if let Err(e) = storage.upsert_code_node(node) {
+                    let mut node = node.clone();
+                    node.repo_root = repo_root.clone();
+                    if let Err(e) = storage.upsert_code_node(&node) {
                         eprintln!("CSR backfill: node upsert error for {file_path} ({e})");
                     }
                 }
@@ -433,6 +455,340 @@ pub fn backfill_saga_columns(engine: &Engine) -> Result<SagaBackfillStats> {
             }
         }
     }
+    Ok(stats)
+}
+
+/// Result of a `codegraph backfill-repo-root` run (also used for `--dry-run`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RepoRootBackfillStats {
+    /// Distinct `code_nodes.file` values that had no `repo_root` yet.
+    pub node_files_checked: usize,
+    /// Of those, how many resolved to a git repo root.
+    pub node_files_resolved: usize,
+    /// `code_nodes` rows updated (0 in dry-run).
+    pub node_rows_updated: usize,
+    /// Distinct `code_evolution.file_path` values that had no `repo_root` yet.
+    pub evolution_files_checked: usize,
+    /// Of those, how many resolved to a git repo root.
+    pub evolution_files_resolved: usize,
+    /// `code_evolution` rows updated (0 in dry-run).
+    pub evolution_rows_updated: usize,
+}
+
+impl RepoRootBackfillStats {
+    pub fn format_text(&self, dry_run: bool) -> String {
+        let mode = if dry_run { " (dry-run, no writes)" } else { "" };
+        format!(
+            "CSR repo_root backfill{mode}\n\
+             ────────────────────────────\n\
+             code_nodes:     files checked {}, resolved {}, rows updated {}\n\
+             code_evolution: files checked {}, resolved {}, rows updated {}\n",
+            self.node_files_checked,
+            self.node_files_resolved,
+            self.node_rows_updated,
+            self.evolution_files_checked,
+            self.evolution_files_resolved,
+            self.evolution_rows_updated,
+        )
+    }
+}
+
+/// Backfill `repo_root` (WP2 Stage 1, H8 finding — receipt R4) for every
+/// existing `code_nodes` / `code_evolution` row that predates the column.
+/// Purely additive: only ever sets a currently-NULL `repo_root`, never
+/// touches any other column, and is safe to re-run (idempotent — a second
+/// pass finds nothing left to update).
+///
+/// Resolution is per DISTINCT file path (not per row) via
+/// `extraction::repo_root::repo_root_for_file`, which itself tries `git -C
+/// <dir> rev-parse --show-toplevel` first and falls back to an ancestor
+/// `.git`-directory walk for files no longer on disk — exactly the fallback
+/// this backfill needs, since most historically-recorded files are still
+/// present but some are long gone (renamed/deleted since indexed).
+pub fn backfill_repo_root(engine: &Engine, dry_run: bool) -> Result<RepoRootBackfillStats> {
+    let storage = engine.storage();
+    let mut stats = RepoRootBackfillStats::default();
+
+    let node_files = storage.code_node_files_missing_repo_root()?;
+    stats.node_files_checked = node_files.len();
+    for file in &node_files {
+        if let Some(root) = crate::extraction::repo_root::repo_root_for_file(file) {
+            stats.node_files_resolved += 1;
+            if !dry_run {
+                match storage.set_repo_root_for_file(file, &root) {
+                    Ok(n) => stats.node_rows_updated += n,
+                    Err(e) => eprintln!(
+                        "CSR repo_root backfill: code_nodes update error for {file} ({e})"
+                    ),
+                }
+            }
+        }
+    }
+
+    let evolution_files = storage.code_evolution_files_missing_repo_root()?;
+    stats.evolution_files_checked = evolution_files.len();
+    for file in &evolution_files {
+        if let Some(root) = crate::extraction::repo_root::repo_root_for_file(file) {
+            stats.evolution_files_resolved += 1;
+            if !dry_run {
+                match storage.set_repo_root_for_evolution_file(file, &root) {
+                    Ok(n) => stats.evolution_rows_updated += n,
+                    Err(e) => eprintln!(
+                        "CSR repo_root backfill: code_evolution update error for {file} ({e})"
+                    ),
+                }
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Result of a `codegraph backfill-attribution` run (also used for `--dry-run`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AttributionBackfillStats {
+    /// `code_nodes` rows examined.
+    pub nodes_checked: usize,
+    /// Transcript-channel rows written (matched an earliest `code_evolution` event).
+    pub transcript_attributed: usize,
+    /// Rows skipped for the git channel because `span_start <= 0` (no real span).
+    pub git_invalid_span: usize,
+    /// Rows skipped because the file no longer exists on disk.
+    pub git_file_missing: usize,
+    /// Rows skipped because no git repo root (or relative-path) could be resolved.
+    pub git_no_repo: usize,
+    /// Rows where `git log -L` ran but returned no introducing commit.
+    pub git_no_commit: usize,
+    /// Git-channel rows written.
+    pub git_attributed: usize,
+}
+
+impl AttributionBackfillStats {
+    pub fn format_text(&self, dry_run: bool) -> String {
+        let mode = if dry_run { " (dry-run, no writes)" } else { "" };
+        format!(
+            "CSR attribution backfill{mode}\n\
+             ──────────────────────────────\n\
+             nodes checked          : {}\n\
+             transcript attributed  : {}\n\
+             git attributed         : {}\n\
+             git skipped: invalid_span={}  file_missing={}  no_repo={}  no_commit={}\n",
+            self.nodes_checked,
+            self.transcript_attributed,
+            self.git_attributed,
+            self.git_invalid_span,
+            self.git_file_missing,
+            self.git_no_repo,
+            self.git_no_commit,
+        )
+    }
+}
+
+/// Parse a `code_evolution.functions_added`/`types_added` JSON string array;
+/// empty vec on any parse error (never fatal — matches the rest of this
+/// module's fail-soft posture).
+fn parse_evolution_names(json: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(json).unwrap_or_default()
+}
+
+/// Build the transcript-channel index: `(file_path, symbol_name) -> (session_id,
+/// timestamp)` of the EARLIEST `code_evolution` event naming that symbol
+/// (H4 remediation, receipt R2 — "earliest by (timestamp, rowid)"). `events`
+/// must already be ordered oldest-first (`Storage::all_code_evolution_events_ordered`);
+/// `HashMap::entry().or_insert()` then keeps only the first (= earliest) sighting.
+fn build_transcript_index(
+    events: &[crate::storage::queries::CodeEvolutionEventRow],
+) -> BTreeMap<(String, String), (String, String)> {
+    let mut index: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+    for (_rowid, session_id, file_path, timestamp, functions_added, types_added) in events {
+        let names = parse_evolution_names(functions_added)
+            .into_iter()
+            .chain(parse_evolution_names(types_added));
+        for name in names {
+            index
+                .entry((file_path.clone(), name))
+                .or_insert_with(|| (session_id.clone(), timestamp.clone()));
+        }
+    }
+    index
+}
+
+/// Resolve `file`'s path relative to `repo_root`. `None` when `file` is not
+/// actually rooted under `repo_root` (e.g. a stale/mismatched `repo_root`
+/// value) — never a guess.
+fn relpath_in_repo(repo_root: &str, file: &str) -> Option<String> {
+    Path::new(file)
+        .strip_prefix(Path::new(repo_root))
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// `git -C <repo_root> log -L<start>,<end>:<relpath> --format='%H %cI' --reverse
+/// --no-patch`, first output line only. `start`/`end` are 1-based line numbers
+/// (git's `-L` convention — `code_nodes.span_start`/`span_end` are 0-based, so
+/// callers must pass `span_start + 1` / `span_end + 1`).
+///
+/// CRITICAL (receipt R8): never add `-1` / `-n` here. `git log -n 1 -L… --reverse`
+/// applies `-n` BEFORE `--reverse` and returns the NEWEST commit, not the
+/// introducing one — the exact trap this backfill exists to avoid. Reading only
+/// the first line of the full (un-limited) `--reverse` output is what makes this
+/// correct: the oldest commit touching the range is genuinely first.
+///
+/// `None` on any failure — no git repo at `repo_root`, `git` missing, the range
+/// has no history, non-UTF8 output, malformed output. Never a guess.
+fn git_log_introducing_commit(
+    repo_root: &str,
+    relpath: &str,
+    start: i64,
+    end: i64,
+) -> Option<(String, String)> {
+    if start < 1 || end < start {
+        return None;
+    }
+    let range_arg = format!("-L{start},{end}:{relpath}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("log")
+        .arg(&range_arg)
+        .arg("--format=%H %cI")
+        .arg("--reverse")
+        .arg("--no-patch")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let first_line = text.lines().next()?.trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    let (hash, ts) = first_line.split_once(' ')?;
+    if hash.is_empty() || ts.is_empty() {
+        return None;
+    }
+    Some((hash.to_string(), ts.to_string()))
+}
+
+/// Backfill `code_node_attribution` (WP2 Stage 2, H4 remediation fed by
+/// H5/H6 — receipts R2/R3/R8) for every existing `code_nodes` row.
+///
+/// Two independent passes, never merged:
+/// - **transcript**: joins each symbol (by name + file) against the
+///   earliest `code_evolution` event that names it (`build_transcript_index`).
+/// - **git**: for symbols with a real span (`span_start > 0`) whose file
+///   still exists on disk inside a resolvable git repo, walks
+///   `git log -L… --reverse` to find the introducing commit
+///   (`git_log_introducing_commit` — see its doc comment for the `-1`/`-n` trap).
+///
+/// Fail-soft per symbol throughout: a lookup/command failure is logged and
+/// skipped, never fatal, matching this module's existing posture
+/// (`backfill_code_graph`, `backfill_repo_root`). Idempotent — re-running
+/// simply recomputes and upserts the same (or freshly-discovered) rows.
+pub fn backfill_attribution(engine: &Engine, dry_run: bool) -> Result<AttributionBackfillStats> {
+    backfill_attribution_into(engine.storage(), dry_run)
+}
+
+/// Storage-level core of `backfill_attribution` (no embeddings needed —
+/// keeps unit tests light, same split as `backfill_into` above).
+fn backfill_attribution_into(storage: &Storage, dry_run: bool) -> Result<AttributionBackfillStats> {
+    let mut stats = AttributionBackfillStats::default();
+
+    let nodes = storage.all_code_nodes()?;
+    stats.nodes_checked = nodes.len();
+
+    // Transcript channel.
+    let events = storage.all_code_evolution_events_ordered()?;
+    let transcript_index = build_transcript_index(&events);
+
+    for node in &nodes {
+        let Some((session_id, ts)) = transcript_index.get(&(node.file.clone(), node.name.clone()))
+        else {
+            continue;
+        };
+        stats.transcript_attributed += 1;
+        if dry_run {
+            continue;
+        }
+        let row = crate::storage::codegraph::AttributionRow {
+            node_id: node.id.clone(),
+            channel: "transcript".to_string(),
+            source_id: session_id.clone(),
+            observed_ts: Some(ts.clone()),
+            evidence: "coedit_event".to_string(),
+        };
+        if let Err(e) = storage.upsert_code_attribution(&row) {
+            eprintln!(
+                "CSR attribution backfill: transcript upsert error for {} ({e})",
+                node.id
+            );
+        }
+    }
+
+    // Git channel.
+    for node in &nodes {
+        if node.span_start <= 0 {
+            stats.git_invalid_span += 1;
+            continue;
+        }
+        if !Path::new(&node.file).is_file() {
+            stats.git_file_missing += 1;
+            continue;
+        }
+        let repo_root = node
+            .repo_root
+            .clone()
+            .or_else(|| crate::extraction::repo_root::repo_root_for_file(&node.file));
+        let Some(repo_root) = repo_root else {
+            stats.git_no_repo += 1;
+            eprintln!(
+                "CSR attribution backfill: no repo root for {} (git skip)",
+                node.file
+            );
+            continue;
+        };
+        let Some(relpath) = relpath_in_repo(&repo_root, &node.file) else {
+            stats.git_no_repo += 1;
+            eprintln!(
+                "CSR attribution backfill: {} is not under resolved repo root {} (git skip)",
+                node.file, repo_root
+            );
+            continue;
+        };
+
+        match git_log_introducing_commit(
+            &repo_root,
+            &relpath,
+            node.span_start + 1,
+            node.span_end + 1,
+        ) {
+            Some((hash, ts)) => {
+                stats.git_attributed += 1;
+                if dry_run {
+                    continue;
+                }
+                let row = crate::storage::codegraph::AttributionRow {
+                    node_id: node.id.clone(),
+                    channel: "git".to_string(),
+                    source_id: hash,
+                    observed_ts: Some(ts),
+                    evidence: "git_log_L".to_string(),
+                };
+                if let Err(e) = storage.upsert_code_attribution(&row) {
+                    eprintln!(
+                        "CSR attribution backfill: git upsert error for {} ({e})",
+                        node.id
+                    );
+                }
+            }
+            None => {
+                stats.git_no_commit += 1;
+            }
+        }
+    }
+
     Ok(stats)
 }
 
@@ -595,5 +951,225 @@ mod tests {
         // But nothing was persisted: no `foo` node exists in the graph.
         let nodes = storage.code_nodes_by_name("foo", "", 10).unwrap();
         assert!(nodes.is_empty(), "dry-run must not write code_nodes");
+    }
+
+    // ─── WP2 Stage 2: attribution backfill ───
+
+    use crate::storage::codegraph::{upsert_node as codegraph_upsert_node, NodeRow};
+
+    fn attr_node(id: &str, file: &str, name: &str) -> NodeRow {
+        NodeRow {
+            id: id.into(),
+            repo: "repo".into(),
+            project: "proj".into(),
+            file: file.into(),
+            lang: "rust".into(),
+            kind: "function".into(),
+            name: name.into(),
+            first_conv_id: "legacy".into(),
+            last_conv_id: "legacy".into(),
+            ..NodeRow::default()
+        }
+    }
+
+    /// Insert a `code_evolution` row via the real production path
+    /// (`queries::insert_code_evolution`, timestamp = `Utc::now()` at call
+    /// time), acquiring the storage mutex itself. Sequential calls therefore
+    /// get non-decreasing timestamps, exactly like the live hook.
+    fn insert_evolution_event(
+        storage: &Storage,
+        session_id: &str,
+        file_path: &str,
+        functions_added: &str,
+        types_added: &str,
+    ) {
+        storage
+            .with_connection(|conn| {
+                crate::storage::queries::insert_code_evolution(
+                    conn,
+                    session_id,
+                    "proj",
+                    file_path,
+                    "rust",
+                    "Edit",
+                    functions_added,
+                    "[]",
+                    types_added,
+                    "[]",
+                    "[]",
+                    "[]",
+                    None,
+                )
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn transcript_channel_picks_the_earliest_event_not_the_latest() {
+        // Fixture for the earliest-event join (H4 remediation, receipt R2):
+        // two code_evolution events name the same symbol in the same file —
+        // the EARLIER one must win the transcript attribution, never the
+        // later one.
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                codegraph_upsert_node(conn, &attr_node("n1", "a.rs", "foo")).unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        insert_evolution_event(&storage, "sess-older", "a.rs", "[\"foo\"]", "[]");
+        insert_evolution_event(&storage, "sess-newer", "a.rs", "[\"foo\"]", "[]");
+
+        let stats = backfill_attribution_into(&storage, false).unwrap();
+        assert_eq!(stats.transcript_attributed, 1);
+
+        let rows = storage.code_attribution_rows("n1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].channel, "transcript");
+        assert_eq!(
+            rows[0].source_id, "sess-older",
+            "earliest-inserted event must win, not the later one: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_channel_join_requires_matching_file_and_name() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                codegraph_upsert_node(conn, &attr_node("n1", "a.rs", "foo")).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        // Names "foo", but in a DIFFERENT file — must not attribute a.rs's foo.
+        insert_evolution_event(&storage, "sess-1", "b.rs", "[\"foo\"]", "[]");
+
+        let stats = backfill_attribution_into(&storage, false).unwrap();
+        assert_eq!(
+            stats.transcript_attributed, 0,
+            "event naming 'foo' in a DIFFERENT file must not attribute a.rs's foo"
+        );
+        assert_eq!(
+            storage.code_attribution_for_node("n1").unwrap(),
+            "unattributed"
+        );
+    }
+
+    #[test]
+    fn nodes_with_no_matching_event_are_unattributed_not_falling_back_to_first_conv_id() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                codegraph_upsert_node(conn, &attr_node("n1", "a.rs", "orphan")).unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = backfill_attribution_into(&storage, false).unwrap();
+        assert_eq!(stats.transcript_attributed, 0);
+        assert_eq!(stats.nodes_checked, 1);
+        assert_eq!(
+            storage.code_attribution_for_node("n1").unwrap(),
+            "unattributed",
+            "no event and no git span must never fall back to first_conv_id"
+        );
+    }
+
+    #[test]
+    fn dry_run_attribution_backfill_writes_nothing() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                codegraph_upsert_node(conn, &attr_node("n1", "a.rs", "foo")).unwrap();
+                crate::storage::queries::insert_code_evolution(
+                    conn,
+                    "sess-1",
+                    "proj",
+                    "a.rs",
+                    "rust",
+                    "Edit",
+                    "[\"foo\"]",
+                    "[]",
+                    "[]",
+                    "[]",
+                    "[]",
+                    "[]",
+                    None,
+                )
+                .unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = backfill_attribution_into(&storage, true).unwrap();
+        assert_eq!(stats.transcript_attributed, 1, "counting still happens");
+        assert_eq!(
+            storage.code_attribution_for_node("n1").unwrap(),
+            "unattributed",
+            "dry-run must not write code_node_attribution"
+        );
+    }
+
+    #[test]
+    fn git_channel_skips_span_start_zero_as_invalid_span() {
+        let storage = Storage::open_memory().unwrap();
+        let mut n = attr_node("n1", "/nonexistent/a.rs", "foo");
+        n.span_start = 0;
+        n.span_end = 0;
+        storage
+            .with_connection(|conn| {
+                codegraph_upsert_node(conn, &n).unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = backfill_attribution_into(&storage, false).unwrap();
+        assert_eq!(stats.git_invalid_span, 1);
+        assert_eq!(stats.git_attributed, 0);
+    }
+
+    #[test]
+    fn git_log_introducing_commit_returns_the_oldest_commit_not_the_newest() {
+        // R8's exact trap: a naive `-1 --reverse` returns the NEWEST commit
+        // because `-n`/`-1` applies before `--reverse`. This test creates two
+        // commits touching the same line and asserts the FIRST (oldest) one
+        // is returned.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| Command::new("git").arg("-C").arg(repo).args(args).status();
+        if git(&["init", "-q"]).map(|s| !s.success()).unwrap_or(true) {
+            return; // git unavailable — fail-soft skip, matches repo_root.rs precedent
+        }
+        git(&["config", "user.email", "t@example.com"]).unwrap();
+        git(&["config", "user.name", "Test"]).unwrap();
+
+        let file = repo.join("lib.rs");
+        std::fs::write(&file, "fn foo() {\n    1\n}\n").unwrap();
+        git(&["add", "lib.rs"]).unwrap();
+        git(&["commit", "-q", "-m", "introduce foo"]).unwrap();
+        let oldest_hash = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // A second commit that also touches line 2 (same range).
+        std::fs::write(&file, "fn foo() {\n    2\n}\n").unwrap();
+        git(&["commit", "-q", "-am", "tweak foo"]).unwrap();
+
+        let got = git_log_introducing_commit(&repo.to_string_lossy(), "lib.rs", 1, 3);
+        let (hash, _ts) = got.expect("introducing commit must resolve");
+        assert_eq!(
+            hash, oldest_hash,
+            "must return the OLDEST commit touching the range, not the newest"
+        );
     }
 }

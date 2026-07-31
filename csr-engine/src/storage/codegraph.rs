@@ -28,10 +28,23 @@ pub struct NodeRow {
     pub first_conv_id: String,
     pub last_conv_id: String,
     pub last_session_id: String,
+    /// Git toplevel of `file` at write time (WP2 Stage 1, H8 finding — see
+    /// `extraction::repo_root::repo_root_for_file`). `None` for non-git
+    /// files or when the repo can no longer be resolved. Independent of
+    /// `project` (the session-cwd tag) — never overwrites it, never derived
+    /// from it.
+    pub repo_root: Option<String>,
     /// true when this row is an unverified name-collision guess (matched via
     /// the `name:<bare>` placeholder or an unresolved edge), false when it is
     /// backed by a real resolved `code_nodes` definition.
     pub name_only: bool,
+    /// Rendered two-channel attribution summary (WP2 Stage 2 — see
+    /// `format_attribution`): `"unattributed"`, `"transcript:<8>"`,
+    /// `"git:<8>"`, or both combined (optionally flagged as a disagreement).
+    /// Empty string means "not attached yet" — callers that render a node
+    /// must attach it explicitly (`attribution_for_node` / the MCP tool
+    /// layer); it is never derived from `first_conv_id`.
+    pub attribution: String,
 }
 
 /// A graph edge row (a relation between nodes).
@@ -112,7 +125,7 @@ pub struct FileLedger {
 
 /// All `code_nodes` columns, in a stable order shared by every read.
 const NODE_COLS: &str = "id, repo, project, file, lang, kind, name, fqname, body_hash, \
-     span_start, span_end, first_conv_id, last_conv_id, last_session_id";
+     span_start, span_end, first_conv_id, last_conv_id, last_session_id, repo_root";
 
 fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
     Ok(NodeRow {
@@ -130,7 +143,9 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
         first_conv_id: row.get(11)?,
         last_conv_id: row.get(12)?,
         last_session_id: row.get(13)?,
+        repo_root: row.get(14)?,
         name_only: false,
+        attribution: String::new(),
     })
 }
 
@@ -142,8 +157,8 @@ pub fn upsert_node(conn: &Connection, n: &NodeRow) -> Result<()> {
         "INSERT INTO code_nodes
             (id, repo, project, file, lang, kind, name, fqname, body_hash,
              span_start, span_end, first_conv_id, last_conv_id, last_session_id,
-             last_seen, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+             repo_root, last_seen, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                  datetime('now'), datetime('now'))
          ON CONFLICT(id) DO UPDATE SET
              repo = excluded.repo,
@@ -162,6 +177,10 @@ pub fn upsert_node(conn: &Connection, n: &NodeRow) -> Result<()> {
                  ELSE code_nodes.first_conv_id END,
              last_conv_id = excluded.last_conv_id,
              last_session_id = excluded.last_session_id,
+             -- repo_root: refresh when this sighting resolved one; keep the
+             -- prior value when it didn't (a transient `git` failure must
+             -- never silently blank out a previously-known repo identity).
+             repo_root = COALESCE(excluded.repo_root, code_nodes.repo_root),
              last_seen = datetime('now'),
              updated_at = datetime('now')",
         params![
@@ -179,6 +198,7 @@ pub fn upsert_node(conn: &Connection, n: &NodeRow) -> Result<()> {
             n.first_conv_id,
             n.last_conv_id,
             n.last_session_id,
+            n.repo_root,
         ],
     )?;
     Ok(())
@@ -285,7 +305,11 @@ pub fn lookup_repo_defs(
         .map_err(Into::into)
 }
 
-/// Upsert per-file extraction state (content hash + dirty flag).
+/// Upsert per-file extraction state (content hash + dirty flag). Every
+/// caller of this function has, by construction, just run a real extraction
+/// against `file` — so `ast_status` is always stamped `'supported'` here,
+/// overwriting any stale `'unsupported'` left by an earlier sighting of the
+/// same path under a different extension resolution (rare, but honest).
 pub fn upsert_file_state(
     conn: &Connection,
     project: &str,
@@ -294,12 +318,13 @@ pub fn upsert_file_state(
     dirty: bool,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO code_graph_file_state (project, file, content_hash, dirty, extracted_at)
-         VALUES (?1, ?2, ?3, ?4, datetime('now'))
+        "INSERT INTO code_graph_file_state (project, file, content_hash, dirty, extracted_at, ast_status)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'), 'supported')
          ON CONFLICT(project, file) DO UPDATE SET
              content_hash = excluded.content_hash,
              dirty = excluded.dirty,
-             extracted_at = datetime('now')",
+             extracted_at = datetime('now'),
+             ast_status = 'supported'",
         params![project, file, content_hash, dirty as i64],
     )?;
     Ok(())
@@ -311,6 +336,27 @@ pub fn mark_file_dirty(conn: &Connection, project: &str, file: &str) -> Result<(
         "INSERT INTO code_graph_file_state (project, file, dirty)
          VALUES (?1, ?2, 1)
          ON CONFLICT(project, file) DO UPDATE SET dirty = 1",
+        params![project, file],
+    )?;
+    Ok(())
+}
+
+/// Record that `file` was seen by an extraction write path (hook
+/// `update_code_graph`, `import::backfill`) but skipped because its
+/// extension is outside the six AST-supported languages (WP2 Stage 3, H8
+/// innovation — receipt R4 in
+/// `.plans/2026-07-31-codegraph-shipping-plan.md`). Never dirty (there is
+/// nothing to re-extract) and never touches `content_hash` — this is
+/// file-level provenance only ("we looked, it's out of scope"), not a
+/// pending-extraction marker.
+pub fn mark_file_unsupported(conn: &Connection, project: &str, file: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO code_graph_file_state (project, file, dirty, ast_status)
+         VALUES (?1, ?2, 0, 'unsupported')
+         ON CONFLICT(project, file) DO UPDATE SET
+             dirty = 0,
+             ast_status = 'unsupported',
+             extracted_at = datetime('now')",
         params![project, file],
     )?;
     Ok(())
@@ -460,7 +506,9 @@ pub fn query_callees(conn: &Connection, node_id: &str, limit: usize) -> Result<V
                 first_conv_id: row.get(13)?,
                 last_conv_id: row.get(14)?,
                 last_session_id: row.get(15)?,
+                repo_root: row.get(16)?,
                 name_only: resolved == 0,
+                attribution: String::new(),
             })
         } else {
             // Unresolved placeholder: surface the bare name. Both signals
@@ -570,7 +618,9 @@ fn shift2_node(row: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
         first_conv_id: row.get(13)?,
         last_conv_id: row.get(14)?,
         last_session_id: row.get(15)?,
+        repo_root: row.get(16)?,
         name_only: false,
+        attribution: String::new(),
     })
 }
 
@@ -655,6 +705,165 @@ pub fn file_ledger(conn: &Connection, project: &str, file: &str) -> Result<FileL
         callers,
         indexed,
     })
+}
+
+/// Distinct `code_nodes.file` values still missing `repo_root` — feeds the
+/// WP2 Stage 1 backfill (`import::backfill::backfill_repo_root`).
+pub fn code_node_files_missing_repo_root(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT file FROM code_nodes WHERE repo_root IS NULL AND file != ''")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Set `repo_root` on every `code_nodes` row matching `file` that is
+/// currently NULL. Never overwrites an already-resolved value (idempotent,
+/// re-runnable). Returns the number of rows changed.
+pub fn set_repo_root_for_file(conn: &Connection, file: &str, repo_root: &str) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE code_nodes SET repo_root = ?1 WHERE file = ?2 AND repo_root IS NULL",
+        params![repo_root, file],
+    )?;
+    Ok(n)
+}
+
+/// All `code_nodes` rows (WP2 Stage 2 attribution backfill —
+/// `import::backfill::backfill_attribution` needs the full symbol set to
+/// join against `code_evolution` and to walk `git log -L`). Ordered by `id`
+/// for a deterministic backfill pass.
+pub fn all_nodes(conn: &Connection) -> Result<Vec<NodeRow>> {
+    let sql = format!("SELECT {NODE_COLS} FROM code_nodes ORDER BY id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_node)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+// ─── Two-channel symbol attribution (WP2 Stage 2) ───
+//
+// H4 (receipt R2 in `.plans/2026-07-31-codegraph-shipping-plan.md`) measured
+// `code_nodes.first_conv_id` at 50.7% agreement with the evidence-bearing
+// join below — it is a file-level projection (the file's first-touching
+// conversation), not a real per-symbol fact. `code_node_attribution` records
+// two independent, NEVER-merged provenance channels instead:
+//   - `transcript`: the agent conversation whose `code_evolution` event
+//     first named this symbol (earliest by (timestamp, rowid) — H5,
+//     receipt R3). `source_id` = session id, `evidence` = "coedit_event".
+//   - `git`: the commit that introduced the symbol's current line span, via
+//     `git log -L<span>,<span>:<file> --reverse` (H6, receipt R8).
+//     `source_id` = commit hash, `evidence` = "git_log_L".
+// `first_conv_id` stays in the schema for compat but is no longer presented
+// as introduction evidence by any consumer surface (`csr_code_graph` /
+// `csr_search_by_file`) — they render `format_attribution`'s output instead.
+
+/// One provenance channel's evidence for a `code_nodes` symbol.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AttributionRow {
+    pub node_id: String,
+    /// "transcript" | "git" (DB-enforced by the `code_node_attribution.channel` CHECK).
+    pub channel: String,
+    /// Session id (transcript channel) or commit hash (git channel).
+    pub source_id: String,
+    /// ISO8601 event/commit timestamp, when known.
+    pub observed_ts: Option<String>,
+    /// Short machine tag naming the derivation ("coedit_event" | "git_log_L").
+    pub evidence: String,
+}
+
+/// Idempotent upsert of one attribution channel row. PRIMARY KEY(node_id,
+/// channel) means a re-run of the backfill (e.g. after a later, earlier-
+/// timestamped event is discovered) simply replaces the prior value for that
+/// channel — never accumulates duplicates.
+pub fn upsert_attribution(conn: &Connection, row: &AttributionRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO code_node_attribution (node_id, channel, source_id, observed_ts, evidence)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(node_id, channel) DO UPDATE SET
+             source_id = excluded.source_id,
+             observed_ts = excluded.observed_ts,
+             evidence = excluded.evidence",
+        params![
+            row.node_id,
+            row.channel,
+            row.source_id,
+            row.observed_ts,
+            row.evidence
+        ],
+    )?;
+    Ok(())
+}
+
+/// Fetch every attribution row for one node (0, 1, or 2 rows — one per channel).
+pub fn get_attribution(conn: &Connection, node_id: &str) -> Result<Vec<AttributionRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT node_id, channel, source_id, observed_ts, evidence
+         FROM code_node_attribution WHERE node_id = ?1 ORDER BY channel",
+    )?;
+    let rows = stmt.query_map(params![node_id], |row| {
+        Ok(AttributionRow {
+            node_id: row.get(0)?,
+            channel: row.get(1)?,
+            source_id: row.get(2)?,
+            observed_ts: row.get(3)?,
+            evidence: row.get(4)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Render the two-channel attribution state for one node's rows (WP2 Stage
+/// 2, plan section "Consumer surfaces"):
+///   - neither channel  -> "unattributed"
+///   - one channel only -> "transcript:<8>" or "git:<8>"
+///   - both, agreeing (or timestamps not comparable) -> "transcript:<8> + git:<8>"
+///   - both, timestamps >48h apart -> the same string plus a disagreement
+///     label — the two values are always shown side by side, never merged
+///     into one.
+///
+/// `<8>` is the first 8 characters of `source_id` (a session uuid or a
+/// commit hash), matching the receipt table's `transcript:<uuid8>` /
+/// `git:<commit8>` shorthand.
+pub fn format_attribution(rows: &[AttributionRow]) -> String {
+    let transcript = rows.iter().find(|r| r.channel == "transcript");
+    let git = rows.iter().find(|r| r.channel == "git");
+    let short = |s: &str| s.chars().take(8).collect::<String>();
+
+    match (transcript, git) {
+        (None, None) => "unattributed".to_string(),
+        (Some(t), None) => format!("transcript:{}", short(&t.source_id)),
+        (None, Some(g)) => format!("git:{}", short(&g.source_id)),
+        (Some(t), Some(g)) => {
+            let base = format!(
+                "transcript:{} + git:{}",
+                short(&t.source_id),
+                short(&g.source_id)
+            );
+            let gap_hours = match (
+                t.observed_ts
+                    .as_deref()
+                    .and_then(crate::temporal::parse_timestamp),
+                g.observed_ts
+                    .as_deref()
+                    .and_then(crate::temporal::parse_timestamp),
+            ) {
+                (Some(a), Some(b)) => Some((a - b).num_hours().abs()),
+                _ => None,
+            };
+            match gap_hours {
+                Some(h) if h > 48 => format!("{base} (disagreement, {h}h apart)"),
+                _ => base,
+            }
+        }
+    }
+}
+
+/// Fetch + render a node's attribution in one call — the render helper
+/// `csr_code_graph` / `csr_search_by_file` actually use.
+pub fn attribution_for_node(conn: &Connection, node_id: &str) -> Result<String> {
+    let rows = get_attribution(conn, node_id)?;
+    Ok(format_attribution(&rows))
 }
 
 /// Fetch a node's persisted rank: (rank, in_degree, out_degree).
@@ -762,6 +971,7 @@ mod tests {
             "[]",
             "[]",
             "[]",
+            None,
         )
         .unwrap();
         let ledger = file_ledger(&conn, "proj", "a.rs").unwrap();
@@ -972,5 +1182,119 @@ mod tests {
             vec![("b.rs".to_string(), "function".to_string())],
             "a.rs's foo def must be gone after replace: {hits:?}"
         );
+    }
+
+    // ─── WP2 Stage 2: two-channel attribution ───
+
+    fn attr(node_id: &str, channel: &str, source_id: &str, ts: Option<&str>) -> AttributionRow {
+        AttributionRow {
+            node_id: node_id.into(),
+            channel: channel.into(),
+            source_id: source_id.into(),
+            observed_ts: ts.map(|s| s.into()),
+            evidence: "test".into(),
+        }
+    }
+
+    #[test]
+    fn format_attribution_neither_channel_is_unattributed() {
+        assert_eq!(format_attribution(&[]), "unattributed");
+    }
+
+    #[test]
+    fn format_attribution_transcript_only() {
+        let rows = vec![attr("n1", "transcript", "70690eeb12345678", None)];
+        assert_eq!(format_attribution(&rows), "transcript:70690eeb");
+    }
+
+    #[test]
+    fn format_attribution_git_only() {
+        let rows = vec![attr("n1", "git", "624e7229abcdef", None)];
+        assert_eq!(format_attribution(&rows), "git:624e7229");
+    }
+
+    #[test]
+    fn format_attribution_both_channels_agree_no_disagreement_label() {
+        let rows = vec![
+            attr(
+                "n1",
+                "transcript",
+                "70690eeb12345678",
+                Some("2026-07-27T10:00:00Z"),
+            ),
+            attr("n1", "git", "624e7229abcdef", Some("2026-07-27T11:00:00Z")),
+        ];
+        let out = format_attribution(&rows);
+        assert_eq!(out, "transcript:70690eeb + git:624e7229");
+        assert!(!out.contains("disagreement"));
+    }
+
+    #[test]
+    fn format_attribution_both_channels_over_48h_apart_is_disagreement() {
+        // R8 example: git `624e7229` vs transcript 2026-07-27, labeled
+        // disagreement per the plan's acceptance spot-check.
+        let rows = vec![
+            attr(
+                "n1",
+                "transcript",
+                "70690eeb12345678",
+                Some("2026-07-27T10:00:00Z"),
+            ),
+            attr("n1", "git", "624e7229abcdef", Some("2026-08-01T10:00:00Z")),
+        ];
+        let out = format_attribution(&rows);
+        assert!(out.contains("transcript:70690eeb"), "got: {out}");
+        assert!(out.contains("git:624e7229"), "got: {out}");
+        assert!(out.contains("disagreement"), "got: {out}");
+        // Never merge into a single collapsed value — both must be visible.
+        assert!(out.contains('+') || out.contains("vs"), "got: {out}");
+    }
+
+    #[test]
+    fn format_attribution_both_channels_unparseable_timestamps_no_false_disagreement() {
+        // Missing/garbage timestamps must never be silently treated as a
+        // >48h gap — we can't prove disagreement we can't measure.
+        let rows = vec![
+            attr("n1", "transcript", "abc12345", None),
+            attr("n1", "git", "def67890", Some("not-a-timestamp")),
+        ];
+        let out = format_attribution(&rows);
+        assert_eq!(out, "transcript:abc12345 + git:def67890");
+    }
+
+    #[test]
+    fn upsert_and_get_attribution_round_trips_and_is_idempotent() {
+        let conn = mem();
+        upsert_node(&conn, &node("n1", "a.rs", "function", "foo", "conv_A")).unwrap();
+        let row = attr("n1", "transcript", "sess-1", Some("2026-07-27T10:00:00Z"));
+        upsert_attribution(&conn, &row).unwrap();
+        // Re-run with a different source_id for the same (node_id, channel):
+        // must replace, never duplicate (PK is node_id+channel).
+        let row2 = attr("n1", "transcript", "sess-2", Some("2026-07-28T10:00:00Z"));
+        upsert_attribution(&conn, &row2).unwrap();
+
+        let got = get_attribution(&conn, "n1").unwrap();
+        assert_eq!(got.len(), 1, "one row per channel: {got:?}");
+        assert_eq!(got[0].source_id, "sess-2");
+    }
+
+    #[test]
+    fn code_node_attribution_check_constraint_rejects_bad_channel() {
+        let conn = mem();
+        let bad = conn.execute(
+            "INSERT INTO code_node_attribution (node_id, channel, source_id) VALUES ('n1', 'guess', 's1')",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "CHECK(channel IN ('transcript','git')) must reject 'guess'"
+        );
+    }
+
+    #[test]
+    fn attribution_for_node_unattributed_when_neither_channel_present() {
+        let conn = mem();
+        upsert_node(&conn, &node("n1", "a.rs", "function", "foo", "conv_A")).unwrap();
+        assert_eq!(attribution_for_node(&conn, "n1").unwrap(), "unattributed");
     }
 }

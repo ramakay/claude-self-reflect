@@ -1512,8 +1512,16 @@ fn extract_inner(
             first_conv_id: conv_id.into(),
             last_conv_id: conv_id.into(),
             last_session_id: session_id.into(),
+            // Extraction doesn't know repo identity — populated by the
+            // write-path caller (WP2 Stage 1; see
+            // `extraction::repo_root::repo_root_for_file`), never guessed
+            // here.
+            repo_root: None,
             // Extracted definition node — always definition-backed.
             name_only: false,
+            // Extraction doesn't know attribution either — populated by
+            // the WP2 Stage 2 backfill/hook write path.
+            attribution: String::new(),
         },
     );
 
@@ -1542,8 +1550,14 @@ fn extract_inner(
             first_conv_id: conv_id.into(),
             last_conv_id: conv_id.into(),
             last_session_id: session_id.into(),
+            // Extraction doesn't know repo identity — populated by the
+            // write-path caller (WP2 Stage 1).
+            repo_root: None,
             // Extracted definition node — always definition-backed.
             name_only: false,
+            // Extraction doesn't know attribution either — populated by
+            // the WP2 Stage 2 backfill/hook write path.
+            attribution: String::new(),
         }
     };
 

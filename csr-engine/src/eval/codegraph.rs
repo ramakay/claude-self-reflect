@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -457,6 +458,17 @@ fn extract_and_store(
         conv_id,
         "codegraph-eval-session",
     );
+    // NOTE: deliberately does NOT populate `NodeRow::repo_root` here. This
+    // helper seeds synthetic in-memory eval fixtures using bare relative
+    // paths like "src/api.rs" — several of which happen to alias real
+    // subdirectories of the developer's own checkout (`csr-engine/src`).
+    // Running `extraction::repo_root::repo_root_for_file` against them would
+    // spawn `git -C src rev-parse --show-toplevel` and leak the REAL repo's
+    // absolute path into a supposedly hermetic fixture, making the eval gate
+    // depend on where it happens to be checked out. Fixture nodes stay
+    // `repo_root: None` (honest: these paths are not really inside a repo);
+    // real production writers (`hooks::post_tool_use`, `import::backfill`,
+    // `import::coedit_backfill`) populate it from the actual edited file.
     for node in &fragment.nodes {
         storage.upsert_code_node(node)?;
     }
@@ -506,9 +518,15 @@ fn snapshot(storage: &Arc<Storage>) -> Result<GraphSnapshot> {
                     first_conv_id: row.get(11)?,
                     last_conv_id: row.get(12)?,
                     last_session_id: row.get(13)?,
+                    // Not selected above — this snapshot compares graph
+                    // structure (nodes/edges), never repo identity.
+                    repo_root: None,
                     // Snapshot row read straight from code_nodes: a stored
                     // definition, never a name-only query match.
                     name_only: false,
+                    // Not selected above — this snapshot compares graph
+                    // structure, never attribution.
+                    attribution: String::new(),
                 })
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -2538,7 +2556,195 @@ fn is_worktree_path(file: &str) -> bool {
     file.contains("/.worktrees/") || file.contains("/.claude/worktrees/")
 }
 
-fn health_result(snapshot: &GraphSnapshot) -> EvalResult {
+/// Six languages `code_nodes` claims AST coverage for (H8's scope, receipt
+/// R4). Exactly the extension list from
+/// `.plans/2026-07-31-codegraph-shipping-plan.md` WP2 Stage 3 — do not widen
+/// or narrow without a new receipt.
+const STRUCTURAL_COVERAGE_EXTENSIONS: &[&str] = &["rs", "py", "ts", "tsx", "js", "go"];
+
+/// Path components that mark a file as vendored/generated/build output for
+/// structural-coverage purposes — exactly H8's exclusion list. Distinct from
+/// `repo_scan::HARD_SKIP_DIRS`: that list backs `repo_defs` (a different
+/// table with a different extension/exclusion contract); the two must not be
+/// conflated or unified without a receipt.
+const STRUCTURAL_COVERAGE_SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    "vendor",
+    "venv",
+    ".venv",
+    "__pycache__",
+    "coverage",
+];
+
+/// True when `rel` (a path relative to some repo root) is in scope for the
+/// H8 structural-coverage counter: one of the six supported extensions, no
+/// path component under a vendor/build/generated directory, and not a
+/// generated-file pattern (`*.min.js`, `*.d.ts`).
+fn structural_coverage_path_is_supported(rel: &Path) -> bool {
+    let ext_ok = rel
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            STRUCTURAL_COVERAGE_EXTENSIONS
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+        })
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let file_name = rel.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if file_name.ends_with(".min.js") || file_name.ends_with(".d.ts") {
+        return false;
+    }
+    rel.components().all(|component| match component {
+        std::path::Component::Normal(part) => {
+            let part = part.to_str().unwrap_or("");
+            !STRUCTURAL_COVERAGE_SKIP_DIRS.contains(&part)
+        }
+        _ => true,
+    })
+}
+
+/// Enumerate git-tracked plus non-ignored-untracked supported files under
+/// `repo_root` (H8's method: `git ls-files` + `git ls-files --others
+/// --exclude-standard`, never the `ignore`-crate walker `repo_scan` uses for
+/// `repo_defs`). Returns relative-path strings (git's own output form, never
+/// rewritten) filtered by `structural_coverage_path_is_supported`.
+///
+/// Fail-soft, by design (plan: "missing root → skip with count"): any git
+/// failure — root no longer a repo, directory gone, `git` unavailable,
+/// non-UTF8 output — yields `None`, never a guess and never a panic. Nothing
+/// here is cached; every call re-shells to `git`.
+fn structural_coverage_enumerate(repo_root: &str) -> Option<BTreeSet<String>> {
+    let mut files = BTreeSet::new();
+    for args in [
+        vec!["ls-files"],
+        vec!["ls-files", "--others", "--exclude-standard"],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(&args)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if structural_coverage_path_is_supported(Path::new(line)) {
+                files.insert(line.to_string());
+            }
+        }
+    }
+    Some(files)
+}
+
+/// H8 innovation (WP2 Stage 3, receipt R4): informational
+/// `structural_file_coverage` counters appended to the health block. **Not a
+/// gate** — `code_nodes` is edit-observed by design (v1 corpus contract);
+/// promotion to a pass/fail threshold is deferred to the next corpus version
+/// (plan: "pre-registered pair going forward = Internal binding + this").
+///
+/// Per distinct `repo_root` present in the live graph: AST-indexed supported
+/// files (distinct `code_nodes.file` under that root matching the six
+/// supported languages) ÷ enumerated supported files (`git ls-files` union,
+/// same filter, vendor/build/generated exclusions applied). Overall ratio and
+/// the top-5 repo_roots by enumerated count are reported; a repo_root whose
+/// enumeration fails (deleted, not a repo any more, `git` unavailable) is
+/// skipped and counted rather than guessed at.
+///
+/// Reads `code_nodes.repo_root` directly (`GraphSnapshot::nodes` doesn't
+/// carry it — `snapshot()` deliberately queries only graph-structure columns,
+/// see its comment — so this issues its own scoped `SELECT` against `storage`
+/// rather than repurposing that struct).
+fn structural_file_coverage_detail(storage: &Storage) -> String {
+    let file_repo_pairs: Vec<(String, String)> = storage
+        .with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT file, repo_root FROM code_nodes \
+                 WHERE repo_root IS NOT NULL AND repo_root != ''",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap_or_default();
+
+    let mut indexed_by_root: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (file, root) in &file_repo_pairs {
+        let Some(rel) = file.strip_prefix(root.as_str()) else {
+            continue;
+        };
+        let rel = rel.trim_start_matches('/');
+        if structural_coverage_path_is_supported(Path::new(rel)) {
+            indexed_by_root
+                .entry(root.clone())
+                .or_default()
+                .insert(rel.to_string());
+        }
+    }
+
+    let mut rows: Vec<(&str, usize, usize)> = Vec::new();
+    let mut skipped_roots = 0usize;
+    for (root, indexed_files) in &indexed_by_root {
+        match structural_coverage_enumerate(root) {
+            Some(enumerated) => rows.push((root.as_str(), indexed_files.len(), enumerated.len())),
+            None => skipped_roots += 1,
+        }
+    }
+
+    let total_indexed: usize = rows.iter().map(|(_, indexed, _)| *indexed).sum();
+    let total_enumerated: usize = rows.iter().map(|(_, _, enumerated)| *enumerated).sum();
+    let overall_pct = if total_enumerated == 0 {
+        0.0
+    } else {
+        total_indexed as f64 * 100.0 / total_enumerated as f64
+    };
+
+    // Top 5 by enumerated count (largest repos first) — compact reporting,
+    // not an exhaustive per-repo dump.
+    rows.sort_by_key(|(_, _, enumerated)| std::cmp::Reverse(*enumerated));
+    let top5: Vec<String> = rows
+        .iter()
+        .take(5)
+        .map(|(root, indexed, enumerated)| {
+            let pct = if *enumerated == 0 {
+                0.0
+            } else {
+                *indexed as f64 * 100.0 / *enumerated as f64
+            };
+            let label = root.rsplit('/').next().unwrap_or(root);
+            format!("{label}={indexed}/{enumerated} ({pct:.1}%)")
+        })
+        .collect();
+    let top5_display = if top5.is_empty() {
+        "none".to_string()
+    } else {
+        top5.join(", ")
+    };
+
+    format!(
+        "\nstructural_file_coverage (informational, H8 innovation, not gated): \
+         overall={total_indexed}/{total_enumerated} ({overall_pct:.1}%); \
+         repo_roots measured={}, skipped(enumeration failed)={skipped_roots}; \
+         top5 by enumerated count: {top5_display}",
+        rows.len(),
+    )
+}
+
+fn health_result(snapshot: &GraphSnapshot, storage: &Storage) -> EvalResult {
     let started = Instant::now();
     let files: BTreeSet<&str> = snapshot
         .nodes
@@ -2696,6 +2902,7 @@ fn health_result(snapshot: &GraphSnapshot) -> EvalResult {
         dirty,
         missing
     );
+    let detail = format!("{detail}{}", structural_file_coverage_detail(storage));
     EvalResult::pass(
         "Health counters (informational)",
         "codegraph-health",
@@ -2902,7 +3109,7 @@ pub fn run_codegraph_live(storage: &Arc<Storage>) -> Result<EvalReport> {
     results.push(import_key_sanity_gate(&live_snapshot));
     results.push(project_attribution_gate(&live_snapshot));
     results.push(placeholder_leak_gate());
-    results.push(health_result(&live_snapshot));
+    results.push(health_result(&live_snapshot, storage));
 
     Ok(EvalReport {
         results,

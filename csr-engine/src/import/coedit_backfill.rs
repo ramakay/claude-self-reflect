@@ -381,6 +381,11 @@ pub fn backfill_coedit(
                 continue;
             }
 
+            // Repo identity (WP2 Stage 1, H8 finding): stable across
+            // cwd/session boundaries, unlike `project_name` — never
+            // overwrites it.
+            let repo_root = crate::extraction::repo_root::repo_root_for_file(&ev.file_path);
+
             match storage.insert_code_evolution_backfill(
                 &id,
                 &ev.conv_id,
@@ -389,6 +394,7 @@ pub fn backfill_coedit(
                 ev.language,
                 &ev.tool_name,
                 &ev.timestamp,
+                repo_root.as_deref(),
             ) {
                 Ok(true) => entry.inserted += 1,
                 Ok(false) => entry.skipped += 1,

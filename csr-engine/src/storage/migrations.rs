@@ -319,6 +319,97 @@ pub fn run(conn: &Connection) -> Result<()> {
         );",
     )?;
 
+    // Migration: repo_root identity column on code_nodes + code_evolution
+    // (WP2 Stage 1, H8 finding — receipt R4). `project` is the session-cwd
+    // tag (its own signal, never overwritten here); `repo_root` is the git
+    // toplevel of the row's file at index/backfill time
+    // (`extraction::repo_root::repo_root_for_file`) — a stable identity that
+    // collapses two different session cwds checked out inside the SAME
+    // repository (e.g. `claude-self-reflect` and its `csr-engine`
+    // subdirectory opened as its own session) onto one label. Nullable:
+    // non-git files, or files whose repo can no longer be resolved (git
+    // missing, no `.git` found walking up), get NULL — never a guess.
+    {
+        let has_repo_root_nodes: bool = conn
+            .prepare("SELECT repo_root FROM code_nodes LIMIT 0")
+            .is_ok();
+        if !has_repo_root_nodes {
+            let _ = conn.execute_batch("ALTER TABLE code_nodes ADD COLUMN repo_root TEXT;");
+        }
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_code_nodes_repo_root ON code_nodes(repo_root);",
+        );
+
+        let has_repo_root_evolution: bool = conn
+            .prepare("SELECT repo_root FROM code_evolution LIMIT 0")
+            .is_ok();
+        if !has_repo_root_evolution {
+            let _ = conn.execute_batch("ALTER TABLE code_evolution ADD COLUMN repo_root TEXT;");
+        }
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_code_evolution_repo_root ON code_evolution(repo_root);",
+        );
+    }
+
+    // code_node_attribution (WP2 Stage 2, H4/H5/H6 remediation — receipts
+    // R2/R3/R8 in `.plans/2026-07-31-codegraph-shipping-plan.md`). Two
+    // independent, NEVER-merged provenance channels per symbol:
+    // `transcript` (the agent conversation whose `code_evolution` event
+    // first named the symbol) and `git` (the commit that introduced the
+    // symbol's current line span, via `git log -L … --reverse`). Replaces
+    // `code_nodes.first_conv_id` as the thing consumer surfaces present as
+    // "introduction evidence" — H4 measured `first_conv_id` at 50.7%
+    // agreement with the evidence-bearing join (file-level projection, not a
+    // real per-symbol fact); `first_conv_id` itself stays in the schema for
+    // compat, just no longer trusted for this purpose.
+    //
+    // `channel` CHECK constraint keeps the table from ever silently
+    // accepting a third pseudo-channel. `source_id` is a session id
+    // (transcript) or a commit hash (git); `observed_ts` is the event/commit
+    // timestamp, nullable because a channel can be written before a
+    // timestamp is known; `evidence` is a short machine tag
+    // (`coedit_event` | `git_log_L`) naming the derivation, not free text.
+    // PRIMARY KEY(node_id, channel) — at most one row per node per channel,
+    // so `code_node_attribution::upsert_attribution` is a pure idempotent
+    // replace, safe to re-run the backfill.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS code_node_attribution (
+            node_id     TEXT NOT NULL,
+            channel     TEXT NOT NULL CHECK(channel IN ('transcript','git')),
+            source_id   TEXT NOT NULL,
+            observed_ts TEXT,
+            evidence    TEXT,
+            PRIMARY KEY(node_id, channel)
+        );
+        CREATE INDEX IF NOT EXISTS idx_code_node_attribution_node
+            ON code_node_attribution(node_id);",
+    )?;
+
+    // Migration: ast_status column on code_graph_file_state (WP2 Stage 3, H8
+    // innovation — receipt R4 in
+    // `.plans/2026-07-31-codegraph-shipping-plan.md`). File-level provenance
+    // for files the extraction write paths (hook `update_code_graph`,
+    // `import::backfill`) SAW but could not parse because the extension is
+    // outside the six supported languages: instead of silently dropping the
+    // file (the pre-existing behavior), a row is written with
+    // `ast_status='unsupported'` so the file stays traversable at
+    // file-granularity rather than vanishing. Default `'supported'` — every
+    // pre-existing row (and every row `upsert_file_state` still writes after
+    // a real extraction) is, by construction, a file CSR actually parsed.
+    {
+        let has_ast_status: bool = conn
+            .prepare("SELECT ast_status FROM code_graph_file_state LIMIT 0")
+            .is_ok();
+        if !has_ast_status {
+            let _ = conn.execute_batch(
+                "ALTER TABLE code_graph_file_state ADD COLUMN ast_status TEXT NOT NULL DEFAULT 'supported';",
+            );
+        }
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_code_graph_file_state_ast_status ON code_graph_file_state(ast_status);",
+        );
+    }
+
     // Migration: add project_name to code_evolution if missing (v9 cross-project fix)
     {
         let has_project_col: bool = conn
@@ -635,6 +726,87 @@ mod tests {
             .is_ok(),
             "resolution_ledger table must exist after migration"
         );
+    }
+
+    #[test]
+    fn repo_root_columns_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare("SELECT repo_root FROM code_nodes LIMIT 0")
+                .is_ok(),
+            "repo_root column must exist on code_nodes after migration"
+        );
+        assert!(
+            conn.prepare("SELECT repo_root FROM code_evolution LIMIT 0")
+                .is_ok(),
+            "repo_root column must exist on code_evolution after migration"
+        );
+    }
+
+    #[test]
+    fn code_node_attribution_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare(
+                "SELECT node_id, channel, source_id, observed_ts, evidence FROM code_node_attribution LIMIT 0"
+            )
+            .is_ok(),
+            "code_node_attribution table must exist after migration"
+        );
+    }
+
+    #[test]
+    fn code_node_attribution_channel_check_constraint_rejects_third_channel() {
+        // WP2 Stage 2, receipt R2/R3/R8: only 'transcript' and 'git' are
+        // legitimate provenance channels — a third value must be rejected at
+        // the DB layer, not just by convention.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let ok = conn.execute(
+            "INSERT INTO code_node_attribution (node_id, channel, source_id) VALUES ('n1', 'transcript', 's1')",
+            [],
+        );
+        assert!(ok.is_ok(), "valid channel must be accepted: {ok:?}");
+        let bad = conn.execute(
+            "INSERT INTO code_node_attribution (node_id, channel, source_id) VALUES ('n1', 'guess', 's1')",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "channel CHECK constraint must reject a non-transcript/git value"
+        );
+    }
+
+    #[test]
+    fn ast_status_column_migration_idempotent_and_defaults_supported() {
+        // WP2 Stage 3, receipt R4: pre-existing rows (written before this
+        // migration existed) must default to 'supported' — they were, by
+        // construction, successfully parsed by the extractor.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare("SELECT ast_status FROM code_graph_file_state LIMIT 0")
+                .is_ok(),
+            "ast_status column must exist on code_graph_file_state after migration"
+        );
+        conn.execute(
+            "INSERT INTO code_graph_file_state (project, file) VALUES ('p1', 'f1')",
+            [],
+        )
+        .unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT ast_status FROM code_graph_file_state WHERE project = 'p1' AND file = 'f1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "supported");
     }
 
     #[test]
