@@ -806,6 +806,39 @@ impl Storage {
         )
     }
 
+    /// Insert a backfilled code-evolution row (`csr-engine backfill-coedit`).
+    /// Idempotent (`INSERT OR IGNORE` on the `id` PRIMARY KEY). Returns `true`
+    /// if a new row was written, `false` if `id` already existed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_code_evolution_backfill(
+        &self,
+        id: &str,
+        session_id: &str,
+        project_name: &str,
+        file_path: &str,
+        language: &str,
+        tool_name: &str,
+        timestamp: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::insert_code_evolution_backfill(
+            &conn,
+            id,
+            session_id,
+            project_name,
+            file_path,
+            language,
+            tool_name,
+            timestamp,
+        )
+    }
+
+    /// True if a `code_evolution` row with this `id` already exists.
+    pub fn code_evolution_id_exists(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::code_evolution_id_exists(&conn, id)
+    }
+
     pub fn get_recent_code_evolution(
         &self,
         file_path: &str,

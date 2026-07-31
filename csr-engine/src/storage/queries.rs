@@ -1763,6 +1763,58 @@ pub fn insert_code_evolution(
     Ok(())
 }
 
+/// Insert a backfilled code-evolution row with an explicit deterministic id
+/// and historical timestamp (`csr-engine backfill-coedit`). `functions_added`
+/// / `functions_removed` / `types_added` / `types_removed` / `imports_added`
+/// / `imports_removed` are left at their schema default (`'[]'`) — backfill
+/// reconstructs co-edit *ledger* signal only, not AST diffs.
+///
+/// `id` is the caller's deterministic id (`bf-<sha256 prefix>`); `INSERT OR
+/// IGNORE` against the `id` PRIMARY KEY makes repeated runs idempotent —
+/// never touches an existing row. Returns `true` if a new row was inserted,
+/// `false` if it already existed (no-op).
+#[allow(clippy::too_many_arguments)]
+pub fn insert_code_evolution_backfill(
+    conn: &Connection,
+    id: &str,
+    session_id: &str,
+    project_name: &str,
+    file_path: &str,
+    language: &str,
+    tool_name: &str,
+    timestamp: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO code_evolution
+             (id, session_id, project_name, file_path, language, tool_name, timestamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id,
+            session_id,
+            project_name,
+            file_path,
+            language,
+            tool_name,
+            timestamp
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// True if a `code_evolution` row with this `id` already exists. Used by
+/// `backfill-coedit --dry-run` to preview accurate would-insert counts
+/// without writing anything.
+pub fn code_evolution_id_exists(conn: &Connection, id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM code_evolution WHERE id = ?1 LIMIT 1",
+        params![id],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|r| r.is_some())
+    .map_err(Into::into)
+}
+
 /// Get recent code evolution for a file (most recent N entries).
 /// Scoped by project_name to prevent cross-project leakage (Codex M-3).
 /// Returns (session_id, timestamp, functions_added, functions_removed, tool_name).

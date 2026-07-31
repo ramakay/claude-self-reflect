@@ -123,7 +123,10 @@ fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
 }
 
 /// Detect programming language from file extension.
-fn detect_language(file_path: &str) -> &'static str {
+///
+/// Shared with `import::coedit_backfill` so historically replayed rows use
+/// the exact same language taxonomy as the live hook.
+pub(crate) fn detect_language(file_path: &str) -> &'static str {
     let ext = file_path.rsplit('.').next().unwrap_or("");
     match ext {
         "rs" => "rust",

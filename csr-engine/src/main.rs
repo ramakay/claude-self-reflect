@@ -131,6 +131,13 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Backfill the code_evolution co-edit ledger from JSONL conversation
+    /// history (feeds the B3 corpus-witness bind tier)
+    BackfillCoedit {
+        /// Preview would-insert counts per project; write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Code-graph operations (v9.4 conversation-provenance graph)
     Codegraph {
         #[command(subcommand)]
@@ -351,6 +358,20 @@ async fn main() -> Result<()> {
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
         return csr_engine::summarizer::backfill_stories_cli(&eng, dry_run).await;
+    }
+
+    if let Some(Commands::BackfillCoedit { dry_run }) = args.command {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats = csr_engine::import::coedit_backfill::backfill_coedit(
+            eng.storage(),
+            &args.projects_dir,
+            dry_run,
+        )?;
+        print!("{}", stats.format_text(dry_run));
+        return Ok(());
     }
 
     if let Some(Commands::Codegraph {
