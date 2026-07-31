@@ -45,9 +45,10 @@ const WITNESS_CLOSURE_MIN: f64 = 0.90;
 /// `resolver::ResolveStats::internal_binding_rate`.
 const INTERNAL_BINDING_MIN: f64 = 0.70;
 /// Cap on `code_evolution` rows copied into a WCR shadow (`shadow_for_wcr`).
-/// Rows are ordered by `timestamp DESC` before the cap applies, so the most
-/// recent — most behaviorally relevant — co-edit signal survives on large
-/// corpora.
+/// Rows are ordered by `timestamp DESC, id DESC` (the `id` tiebreaker keeps
+/// the cutoff deterministic across rebuilds — Finding 3, WCR truth pass)
+/// before the cap applies, so the most recent — most behaviorally relevant
+/// — co-edit signal survives on large corpora.
 const CODE_EVOLUTION_SHADOW_CAP: usize = 50_000;
 /// Cap on the number of projects `repo_scan::scan_all` is run against per WCR
 /// shadow build. Repo scanning reads the real filesystem per project; on a
@@ -628,10 +629,18 @@ fn copy_code_evolution_capped(
     cap: usize,
 ) -> Result<usize> {
     let placeholders = vec!["?"; projects.len()].join(", ");
+    // Finding 3 (WCR truth pass): `id` (TEXT PRIMARY KEY, so already unique
+    // per row — see the `code_evolution` table definition in
+    // `storage::migrations`) is a deterministic tiebreaker for rows sharing
+    // the same `timestamp`. Without it, `LIMIT` selects an
+    // implementation-defined subset among timestamp-tied rows at the cutoff
+    // — SQLite is free to return a different one across query plans/DB
+    // rebuilds, silently changing which `code_evolution` rows feed the B3
+    // co-edit-weight bind tier between otherwise-identical gate runs.
     let select_sql = format!(
         "SELECT {EVOLUTION_COLS} FROM code_evolution
          WHERE project_name IN ({placeholders})
-         ORDER BY timestamp DESC
+         ORDER BY timestamp DESC, id DESC
          LIMIT {cap}"
     );
     let project_params: Vec<&str> = projects.iter().copied().collect();
@@ -737,16 +746,40 @@ const BACKFILL_MAX_FILE_BYTES: u64 = 512 * 1024;
 /// kind, bare target name)` — name-based, not id-based, since a freshly
 /// re-extracted node's id may not equal the shadow's stale id.
 ///
-/// Edges with NO match in the fresh extraction — the exact (src name, kind,
-/// bare target name) triple is gone, the code drifted since the edge was
-/// recorded — are classified `boundary = 'drifted'`, `evidence =
-/// 'not_in_current_source'`, directly in the shadow (WCR Phase 8, TASK B).
-/// This is round-trip-consistent with the live pipeline: `replace_file_edges`
-/// would simply DELETE such an edge the next time this file is touched for
-/// real; the read-only gate's shadow can't delete (it never writes back to
-/// the live DB), so it classifies instead — honest, evidenced silence, not a
-/// guess and not simply left alone. `resolve_edges` recognizes a pre-set
-/// `boundary = 'drifted'` and skips every tier for it (see
+/// Edges with NO match in the fresh extraction are candidates for `boundary
+/// = 'drifted'`, `evidence = 'not_in_current_source'` (WCR Phase 8, TASK B)
+/// — but ONLY when the absence is trustworthy evidence that the call/import
+/// site itself genuinely vanished, not a symptom of extraction having
+/// failed on this file. Truth-pass invariant (Finding 1): drift requires a
+/// LIVE, PARSEABLE file whose CALLING SYMBOL SURVIVED re-extraction —
+/// concretely, both of:
+///   (b) the fresh fragment contains at least one def node (kind !=
+///       "module") — proof the parse actually produced structure. A
+///       fragment with zero def nodes is indistinguishable from an
+///       extractor regression/panic/unsupported-language/undersized-source
+///       short-circuit (`extract_graph_fragment` returns
+///       `GraphFragment::default()` in every one of those cases) — an
+///       extraction failure would otherwise unconditionally drift-classify
+///       EVERY pending edge of an otherwise-readable file, and the release
+///       gates would PASS precisely when extraction is broken.
+///   (c) the edge's SOURCE node name is present among the fresh fragment's
+///       def node names — the calling function itself still exists; only
+///       ITS call genuinely vanished. A renamed/deleted caller is not
+///       evidence that a specific call site inside it drifted — the whole
+///       function is gone, which is a different (unaddressed here) fact.
+/// (Extraction "returning successfully" is not checked separately: every
+/// failure mode above collapses to zero total nodes, which already fails
+/// (b).) When (b) or (c) fail, the edge is left COMPLETELY UNTOUCHED —
+/// stays pending, stays unexplained — rather than misclassified as drift;
+/// an extractor regression therefore cannot masquerade as drift and inflate
+/// the closure-rate gate.
+///
+/// A genuinely drifted edge is round-trip-consistent with the live
+/// pipeline: `replace_file_edges` would simply DELETE such an edge the next
+/// time this file is touched for real; the read-only gate's shadow can't
+/// delete (it never writes back to the live DB), so it classifies instead
+/// — honest, evidenced silence, not a guess. `resolve_edges` recognizes a
+/// pre-set `boundary = 'drifted'` and skips every tier for it (see
 /// `resolver::ResolveStats::drifted`). Drifted marking only ever touches
 /// edges this backfill did NOT match — a matched edge's `boundary` is left
 /// exactly as `replace_file_edges` originally wrote it (`''`), never
@@ -814,6 +847,24 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
             .map(|n| (n.id.as_str(), n.name.as_str()))
             .collect();
 
+        // Finding 1 (WCR truth pass): def node names actually present in the
+        // FRESH fragment — condition (b) from this function's doc comment,
+        // "the parse actually produced structure". `kind != "module"`
+        // because the synthetic module node is unconditionally present even
+        // when extraction found zero functions/types/consts (or panicked
+        // and fell back to `GraphFragment::default()`, which has no nodes
+        // at all — `def_names` is empty either way). Used below, per pending
+        // edge, to gate `mark_drifted`: an unmatched edge only drifts when
+        // this set is non-empty AND contains the edge's own calling
+        // function's name (condition (c)) — never on name identity of the
+        // TARGET, which is exactly what this backfill is trying to explain.
+        let def_names: HashSet<&str> = fragment
+            .nodes
+            .iter()
+            .filter(|n| n.kind != "module")
+            .map(|n| n.name.as_str())
+            .collect();
+
         // WCR Phase 7: `(callee_kind, evidence)` — the `evidence` half is
         // the `via:<qualifier>` data captured at extraction time (WCR Phase
         // 6, TASK A), added AFTER this backfill function was originally
@@ -851,8 +902,14 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
         }
         // No early bailout when both maps are empty (WCR Phase 8, TASK B):
         // that shape — fresh extraction found NO calls/imports at all in
-        // this file — means every one of this file's pending edges has
-        // drifted, and the loop below must still run to classify them.
+        // this file — is CONSISTENT WITH drift (every call/import site was
+        // removed) but is ALSO exactly what a broken extraction looks like;
+        // `def_names` (Finding 1, above) is what actually decides per edge
+        // whether that absence is trustworthy. The loop below must still
+        // run either way: an unmatched edge that fails the `def_names`
+        // check is left untouched, not skipped outright — "still pending,
+        // never classified" IS the correct outcome for it, not a shortcut
+        // to take before checking.
 
         let pending_edges: Vec<(String, String, String, String)> =
             shadow.with_connection(|conn| {
@@ -879,6 +936,16 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
             let Some(bare) = dst_id.strip_prefix("name:") else {
                 continue;
             };
+            // Finding 1 (WCR truth pass) conditions (b) + (c): drift is only
+            // trustworthy when the fresh fragment produced at least one def
+            // node at all AND this edge's OWN calling function is among
+            // them — i.e. the caller genuinely still exists, so its
+            // specific call/import site (not matched below) is what
+            // vanished, rather than the whole file having failed to parse
+            // into structure or the caller itself having been renamed/
+            // removed (a different, unaddressed fact — see this function's
+            // doc comment).
+            let can_drift = !def_names.is_empty() && def_names.contains(src_name.as_str());
             let key = (src_name, bare.to_string());
             match kind.as_str() {
                 "calls" => {
@@ -892,13 +959,19 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                             Ok(())
                         })?;
                         edges_updated += 1;
-                    } else {
-                        // WCR Phase 8, TASK B: fresh extraction ran cleanly
-                        // but this exact (src name, kind, bare target name)
-                        // triple isn't in it anymore — the call site drifted
-                        // out of the source since this edge was recorded.
+                    } else if can_drift {
+                        // WCR Phase 8, TASK B (Finding 1 truth pass): fresh
+                        // extraction ran cleanly, the calling function
+                        // survived, but this exact (src name, kind, bare
+                        // target name) triple isn't in it anymore — the
+                        // call site drifted out of the source since this
+                        // edge was recorded.
                         mark_drifted(shadow, &src_id, &dst_id, "calls")?;
                     }
+                    // else: leave untouched — (b) or (c) failed, so an
+                    // unmatched edge is not trustworthy drift evidence.
+                    // Stays pending and unexplained (honest), not
+                    // misclassified.
                 }
                 "imports" => {
                     if let Some(new_evidence) = module_by_pair.get(&key) {
@@ -911,9 +984,10 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                             Ok(())
                         })?;
                         edges_updated += 1;
-                    } else {
+                    } else if can_drift {
                         mark_drifted(shadow, &src_id, &dst_id, "imports")?;
                     }
+                    // else: leave untouched — see the `calls` arm above.
                 }
                 _ => {}
             }
@@ -926,12 +1000,18 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
 /// WCR Phase 8, TASK B: classify a pending edge `boundary = 'drifted'`,
 /// `evidence = 'not_in_current_source'` — see `backfill_wcr_witnesses`'s doc
 /// comment for the full rationale. Only ever called on an edge that did NOT
-/// match the fresh extraction fragment (the caller's `if`/`else` structure
-/// makes matched and drifted mutually exclusive per edge), so this never
-/// overwrites a `callee_kind`/`evidence` update `backfill_wcr_witnesses`
-/// just made. Leaves `resolved` at 0 and `dst_id` untouched — drifted edges
-/// never bind, they are classified, exactly like the resolver's `stale`
-/// tier.
+/// match the fresh extraction fragment AND that the caller has already
+/// verified passes the Finding 1 truth-pass invariant (`can_drift` in the
+/// caller): the edge's `src_file` re-extracted into a live, parseable
+/// fragment (at least one def node) whose def names include the edge's own
+/// calling symbol. Extraction failures/regressions never reach here — they
+/// produce zero def nodes, which fails that check before this function is
+/// ever called, so an extractor regression cannot masquerade as drift. The
+/// caller's `if`/`else if` structure also makes matched and drifted
+/// mutually exclusive per edge, so this never overwrites a
+/// `callee_kind`/`evidence` update `backfill_wcr_witnesses` just made.
+/// Leaves `resolved` at 0 and `dst_id` untouched — drifted edges never
+/// bind, they are classified, exactly like the resolver's `stale` tier.
 fn mark_drifted(shadow: &Arc<Storage>, src_id: &str, dst_id: &str, kind: &str) -> Result<()> {
     shadow.with_connection(|conn| {
         conn.execute(
@@ -2132,6 +2212,69 @@ mod tests {
     }
 
     #[test]
+    fn code_evolution_shadow_copy_cutoff_tiebreak_is_deterministic() {
+        // Finding 3 (WCR truth pass): `ORDER BY timestamp DESC` alone has no
+        // deterministic way to pick 2 of 3 rows sharing the exact cutoff
+        // timestamp — `ORDER BY timestamp DESC, id DESC` does (`id` is the
+        // table's TEXT PRIMARY KEY, already unique per row).
+        let live = Arc::new(Storage::open_memory().unwrap());
+        live.with_connection(|conn| {
+            // Two rows with distinct, always-included timestamps, plus
+            // three rows TIED at the exact cutoff timestamp.
+            for (id, ts) in [
+                ("e5", "2026-01-05T00:00:00Z"),
+                ("e4", "2026-01-04T00:00:00Z"),
+                ("e3c", "2026-01-03T00:00:00Z"),
+                ("e3a", "2026-01-03T00:00:00Z"),
+                ("e3b", "2026-01-03T00:00:00Z"),
+            ] {
+                conn.execute(
+                    "INSERT INTO code_evolution (id, session_id, project_name, file_path, timestamp)
+                     VALUES (?1, ?2, 'proj', 'a.rs', ?3)",
+                    rusqlite::params![id, format!("s-{id}"), ts],
+                )
+                .unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let projects: BTreeSet<&str> = ["proj"].into_iter().collect();
+        // cap=4 forces a choice between 2 of the 3 timestamp-tied rows;
+        // `id DESC` keeps the lexicographically largest ids: e3c, e3b
+        // (excludes e3a).
+        let expected: BTreeSet<String> = ["e5", "e4", "e3c", "e3b"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        // Build the shadow TWICE, independently, and assert the exact same
+        // rows (by id) were copied both times — a rebuild must never
+        // silently swap which tied-timestamp row survives the cap.
+        for attempt in 0..2 {
+            let shadow = Arc::new(Storage::open_memory().unwrap());
+            let copied = copy_code_evolution_capped(&live, &shadow, &projects, 4).unwrap();
+            assert_eq!(copied, 4, "cap of 4 respected (attempt {attempt})");
+
+            let ids: BTreeSet<String> = shadow
+                .with_connection(|conn| {
+                    let mut stmt = conn.prepare("SELECT id FROM code_evolution")?;
+                    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(Into::into)
+                })
+                .unwrap()
+                .into_iter()
+                .collect();
+            assert_eq!(
+                ids, expected,
+                "id DESC tiebreak deterministically picks e3c/e3b over e3a at the tied \
+                 cutoff timestamp (attempt {attempt})"
+            );
+        }
+    }
+
+    #[test]
     fn code_evolution_shadow_copy_only_pulls_snapshot_projects() {
         let live = Arc::new(Storage::open_memory().unwrap());
         live.with_connection(|conn| {
@@ -2313,6 +2456,11 @@ mod tests {
 
     #[test]
     fn backfill_marks_drifted_for_edges_vanished_from_fresh_extraction() {
+        // Finding 1 (WCR truth pass): the "genuine vanished-call, src fn
+        // still present, still drifts" case — `foo` has a live def node in
+        // the fresh fragment (condition (b) and (c) both hold), so
+        // `ghost_call` genuinely having no match is trustworthy drift
+        // evidence.
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.rs");
         // Fresh, on-disk truth: `foo` now only calls `helper` — the shadow
@@ -2385,15 +2533,27 @@ mod tests {
     }
 
     #[test]
-    fn backfill_marks_all_pending_drifted_when_fresh_extraction_has_no_calls_or_imports() {
+    fn backfill_leaves_pending_edges_unexplained_when_fresh_fragment_has_no_def_nodes() {
+        // Finding 1 (WCR truth pass) — this is the test that USED TO
+        // codify the vulnerability: it originally used `"fn foo() {}\n"`
+        // (which DOES have a def node, `foo`) and asserted the ghost edge
+        // drifted. Under the fix that assertion is still true for THAT
+        // fixture (see `backfill_marks_drifted_for_edges_vanished_from_fresh_extraction`,
+        // which now covers "genuine vanished-call, src fn present, still
+        // drifts"). The actually-dangerous shape — the one the finding is
+        // about — is a fresh fragment with ZERO def nodes at all: nothing
+        // but the synthetic module node, indistinguishable from an
+        // extractor regression/panic/undersized-source short-circuit (see
+        // `backfill_wcr_witnesses`'s doc comment). Before the fix, THIS
+        // shape also unconditionally drift-classified every pending edge —
+        // silently PASSING the release gates on broken extraction. A
+        // comment-only file re-extracts cleanly (condition (a) holds, this
+        // isn't a panic) but produces no def nodes (condition (b) fails),
+        // so `foo`'s pending `ghost_call` edge must be left completely
+        // untouched, not drift-classified.
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.rs");
-        // Fresh truth: the function body is now empty — zero calls/imports
-        // anywhere in the file — while the shadow still carries a pending
-        // edge for a call that no longer exists in this file at all. This is
-        // the "both maps empty" shape that used to bypass the match loop
-        // entirely (early bailout) before WCR Phase 8, TASK B.
-        std::fs::write(&file_path, "fn foo() {}\n").unwrap();
+        std::fs::write(&file_path, "// nothing here anymore\n").unwrap();
         let file_str = file_path.to_string_lossy().to_string();
 
         let shadow = Arc::new(Storage::open_memory().unwrap());
@@ -2410,26 +2570,93 @@ mod tests {
         let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
         assert_eq!(
             files, 1,
-            "file is still re-extracted even though it now has zero calls/imports"
+            "file is still re-extracted even though it now has zero def nodes"
         );
         assert_eq!(
             edges, 0,
             "nothing matched — the fresh fragment has no calls/imports at all"
         );
 
-        let (boundary, evidence): (String, String) = shadow
+        let (boundary, evidence, callee_kind, resolved): (String, String, String, i64) = shadow
             .with_connection(|conn| {
                 conn.query_row(
-                    "SELECT boundary, evidence FROM code_edges
+                    "SELECT boundary, evidence, callee_kind, resolved FROM code_edges
                      WHERE src_id = ?1 AND dst_id = 'name:ghost_call'",
                     [&foo_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .map_err(Into::into)
             })
             .unwrap();
-        assert_eq!(boundary, "drifted");
-        assert_eq!(evidence, "not_in_current_source");
+        assert_eq!(
+            boundary, "",
+            "a fragment with zero def nodes is not trustworthy drift evidence \
+             — an extraction failure/regression must never masquerade as drift"
+        );
+        assert_eq!(
+            evidence, "",
+            "left completely untouched, not merely un-drifted"
+        );
+        assert_eq!(callee_kind, "direct", "unmatched edge left exactly as-is");
+        assert_eq!(
+            resolved, 0,
+            "still pending — stays unexplained (honest), not silently dropped"
+        );
+    }
+
+    #[test]
+    fn backfill_leaves_pending_edges_unexplained_when_calling_symbol_vanished() {
+        // Finding 1 (WCR truth pass), condition (c): the fresh fragment DOES
+        // have a def node (`bar`) — extraction is healthy, condition (b)
+        // holds — but the EDGE'S OWN calling function (`foo`, per the
+        // shadow's stale `code_nodes` row) is not among the fresh def
+        // names. A renamed/deleted caller is not evidence that a specific
+        // call site inside it drifted — the whole function is gone, a
+        // different fact this backfill doesn't address — so `foo`'s
+        // pending edge must be left untouched, not drift-classified.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.rs");
+        std::fs::write(&file_path, "fn bar() {\n    helper();\n}\n").unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        // `foo_id` deliberately names a function that no longer exists in
+        // the fresh file at all — only `bar` is there now.
+        let foo_id = crate::extraction::codegraph::node_id("repo", &file_str, "function", "foo");
+        seed_backfill_node(&shadow, &foo_id, &file_str, "foo");
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[stale_calls_edge(&foo_id, "ghost_call", &file_str, "direct")],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1, "the on-disk file was re-extracted");
+        assert_eq!(
+            edges, 0,
+            "`foo`'s edge can't match `bar`'s calls — different caller name"
+        );
+
+        let (boundary, evidence, resolved): (String, String, i64) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT boundary, evidence, resolved FROM code_edges
+                     WHERE src_id = ?1 AND dst_id = 'name:ghost_call'",
+                    [&foo_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            boundary, "",
+            "the calling symbol itself vanished from the fresh extraction — \
+             not trustworthy drift evidence for its call sites"
+        );
+        assert_eq!(evidence, "");
+        assert_eq!(resolved, 0);
     }
 
     #[test]

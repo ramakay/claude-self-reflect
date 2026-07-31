@@ -377,12 +377,48 @@ pub fn resolve_edges(
             continue;
         }
 
+        // Finding 2 (WCR truth pass): receiver-aware method-call gating —
+        // see `method_bind_gate`'s doc comment. Computed before B0 since it
+        // decides whether B0 itself is even reachable.
+        let gate = method_bind_gate(p);
+
         // --- B0: same-file def, first (sorted) match wins. ---------------
         let defs = by_name.get(&p.name);
-        let same_file = defs.and_then(|d| d.iter().find(|(file, _)| file == &p.src_file));
-        if let Some((_, id)) = same_file {
-            bind(conn, p, id, "same_file")?;
-            resolved += 1;
+        if gate != MethodGate::NoBind {
+            let same_file = defs.and_then(|d| d.iter().find(|(file, _)| file == &p.src_file));
+            if let Some((_, id)) = same_file {
+                bind(conn, p, id, "same_file")?;
+                resolved += 1;
+                continue;
+            }
+        }
+
+        if gate != MethodGate::Unrestricted {
+            // SelfOnly's only allowed bind tier (B0) just failed above, or
+            // this is NoBind (no bind tier allowed at all): name identity is
+            // not binding evidence for a receiver call, so skip straight to
+            // the classify tiers — B1/B1b/B2/repo-scan-bind/B3 never run for
+            // this edge, regardless of whether `code_nodes`/`repo_defs` has a
+            // same-named def elsewhere in the project.
+            let module_evidence = module_for_pending(p, &imports_module_by_file);
+            let has_import = imports_by_file
+                .get(&p.src_file)
+                .is_some_and(|s| s.contains(&p.name));
+            match classify_only(
+                conn,
+                p,
+                has_import,
+                module_evidence,
+                &imports_module_by_file,
+                &mut roots_cache,
+                file_exists,
+            )? {
+                Some("external") => external += 1,
+                Some("method") => method += 1,
+                Some("internal_module") => internal_module += 1,
+                Some("stale") => stale += 1,
+                _ => {}
+            }
             continue;
         }
 
@@ -392,6 +428,10 @@ pub fn resolve_edges(
         // any ambiguity below is declared. No-ops (returns `None`) whenever
         // there is no relative/alias module evidence, the module doesn't
         // resolve to a real on-disk file, or that file has no def of `N`.
+        // Only reached for `gate == Unrestricted` (a non-method edge, or a
+        // legacy `callee_kind = ''` edge predating the extraction capture —
+        // see `MethodGate::Unrestricted`'s doc comment) — a receiver call
+        // never reaches a cross-file name-only tier like this one.
         let module_evidence = module_for_pending(p, &imports_module_by_file);
         if let Some((dst, evidence)) = module_bind_tier(
             conn,
@@ -435,54 +475,21 @@ pub fn resolve_edges(
                 } else {
                     ambiguous_remaining += 1;
                 }
-            } else if let Some((boundary, evidence)) = builtin_tier(p) {
-                // X0: language-defined prelude/builtin/global — runs before
-                // X1 since these names are never import-evidenced.
-                classify_edge(conn, p, &boundary, &evidence)?;
-                external += 1;
-            } else if let Some((boundary, evidence)) = qualifier_tier(conn, p)? {
-                // X1b (TASK B): `via:<qualifier>` evidence classifies purely
-                // from the qualifier's root, independent of import evidence.
-                classify_edge(conn, p, &boundary, &evidence)?;
-                external += 1;
             } else {
-                // Replay-safety (WCR Phase 7): `classify_tier`'s
-                // module-based branch below overwrites this edge's own
-                // evidence from `from:<module>` to `import:<module>` — the
-                // identical module string, just re-prefixed.
-                // `module_for_pending` recognizes `import:` as an equally
-                // valid prefix (alongside `from:`), so a second pass over an
-                // unchanged DB re-derives the SAME classification from the
-                // SAME module value instead of losing it. See
-                // `module_for_pending`'s own doc comment.
-                let module = module_evidence;
-                let ns = external_ns_for(conn, &p.src_file, &p.project, &mut roots_cache);
-                if let Some((boundary, evidence)) =
-                    qualifier_import_tier(p, &imports_module_by_file, &ns)
-                {
-                    // X1c (WCR Phase 7, TASK A): qualifier -> import two-hop
-                    // chain — the qualifier's root itself is an imported
-                    // symbol, join through its module.
-                    classify_edge(conn, p, &boundary, &evidence)?;
-                    external += 1;
-                } else if let Some((boundary, evidence)) = classify_tier(p, has_import, module, &ns)
-                {
-                    classify_edge(conn, p, &boundary, &evidence)?;
-                    if boundary == "method" {
-                        method += 1;
-                    } else {
-                        external += 1;
-                    }
-                } else if let Some((boundary, evidence)) =
-                    internal_module_tier(p, &project_roots_for(conn, &p.project, &mut roots_cache))
-                {
-                    // WCR Phase 7, TASK E: relative/alias import module
-                    // resolves to a real on-disk file — explained, but not a
-                    // symbol-level bind (see ResolveStats::internal_module).
-                    classify_edge(conn, p, &boundary, &evidence)?;
-                    internal_module += 1;
-                } else if resolve_stale_or_unexplained(conn, p, file_exists)? {
-                    stale += 1;
+                match classify_only(
+                    conn,
+                    p,
+                    has_import,
+                    module_evidence,
+                    &imports_module_by_file,
+                    &mut roots_cache,
+                    file_exists,
+                )? {
+                    Some("external") => external += 1,
+                    Some("method") => method += 1,
+                    Some("internal_module") => internal_module += 1,
+                    Some("stale") => stale += 1,
+                    _ => {}
                 }
             }
             continue;
@@ -673,11 +680,94 @@ fn classify_tier(
             }
         }
     }
-    // X2: a `calls` edge invoked off a receiver with no def anywhere.
+    // X2: a `calls` edge invoked off a receiver. Finding 2 (WCR truth pass):
+    // this is reached both from the historical "no def anywhere" path AND,
+    // as of `method_bind_gate`, directly for any gated method edge — a
+    // same-named def existing elsewhere in the project is not evidence for
+    // THIS receiver call, so "no def anywhere" is no longer a precondition
+    // for classifying `boundary = 'method'` here.
     if p.kind == "calls" && p.callee_kind == "method" {
         return Some(("method".to_string(), "receiver_call".to_string()));
     }
     None
+}
+
+/// Classify tiers only (X0 `builtin_tier` / X1b `qualifier_tier` / X1c
+/// `qualifier_import_tier` / X1+X2 `classify_tier` / `internal_module_tier` /
+/// `stale`-or-clear) — no bind tier runs here. Two callers:
+///
+/// - The historical "no `code_nodes` def anywhere AND no (or ambiguous)
+///   `repo_defs` candidate" path in `resolve_edges`'s `distinct.is_empty()`
+///   branch (unchanged behavior, just extracted into a function).
+/// - Finding 2 (WCR truth pass) `method_bind_gate`'s `SelfOnly`/`NoBind`
+///   edges: a receiver call (`obj.save()`) skips every bind tier and lands
+///   here directly, REGARDLESS of whether `code_nodes`/`repo_defs` has a
+///   same-named def — a shared bare name is not binding evidence for a
+///   receiver call, so `classify_tier`'s X2 method classification must be
+///   reachable even when such defs exist elsewhere in the project.
+///
+/// Performs the DB write itself (`classify_edge`, or `clear_edge` via
+/// `resolve_stale_or_unexplained`) and reports which `ResolveStats` bucket
+/// to increment; `None` means the edge ends this pass `unexplained` (no
+/// counter to bump — `unexplained` is derived arithmetically from `total`).
+#[allow(clippy::too_many_arguments)]
+fn classify_only(
+    conn: &Connection,
+    p: &Pending,
+    has_import: bool,
+    module: Option<&str>,
+    imports_module_by_file: &BTreeMap<String, BTreeMap<String, String>>,
+    roots_cache: &mut BTreeMap<String, Vec<PathBuf>>,
+    file_exists: &dyn Fn(&str) -> bool,
+) -> Result<Option<&'static str>> {
+    if let Some((boundary, evidence)) = builtin_tier(p) {
+        // X0: language-defined prelude/builtin/global — runs before X1
+        // since these names are never import-evidenced.
+        classify_edge(conn, p, &boundary, &evidence)?;
+        return Ok(Some("external"));
+    }
+    if let Some((boundary, evidence)) = qualifier_tier(conn, p)? {
+        // X1b (TASK B): `via:<qualifier>` evidence classifies purely from
+        // the qualifier's root, independent of import evidence.
+        classify_edge(conn, p, &boundary, &evidence)?;
+        return Ok(Some("external"));
+    }
+    // Replay-safety (WCR Phase 7): `classify_tier`'s module-based branch
+    // below overwrites this edge's own evidence from `from:<module>` to
+    // `import:<module>` — the identical module string, just re-prefixed.
+    // `module_for_pending` recognizes `import:` as an equally valid prefix
+    // (alongside `from:`), so a second pass over an unchanged DB re-derives
+    // the SAME classification from the SAME module value instead of losing
+    // it. See `module_for_pending`'s own doc comment.
+    let ns = external_ns_for(conn, &p.src_file, &p.project, roots_cache);
+    if let Some((boundary, evidence)) = qualifier_import_tier(p, imports_module_by_file, &ns) {
+        // X1c (WCR Phase 7, TASK A): qualifier -> import two-hop chain — the
+        // qualifier's root itself is an imported symbol, join through its
+        // module.
+        classify_edge(conn, p, &boundary, &evidence)?;
+        return Ok(Some("external"));
+    }
+    if let Some((boundary, evidence)) = classify_tier(p, has_import, module, &ns) {
+        classify_edge(conn, p, &boundary, &evidence)?;
+        return Ok(Some(if boundary == "method" {
+            "method"
+        } else {
+            "external"
+        }));
+    }
+    if let Some((boundary, evidence)) =
+        internal_module_tier(p, &project_roots_for(conn, &p.project, roots_cache))
+    {
+        // WCR Phase 7, TASK E: relative/alias import module resolves to a
+        // real on-disk file — explained, but not a symbol-level bind (see
+        // `ResolveStats::internal_module`).
+        classify_edge(conn, p, &boundary, &evidence)?;
+        return Ok(Some("internal_module"));
+    }
+    if resolve_stale_or_unexplained(conn, p, file_exists)? {
+        return Ok(Some("stale"));
+    }
+    Ok(None)
 }
 
 /// Memoized `repo_scan::project_roots` lookup shared by `external_ns_for`
@@ -725,6 +815,83 @@ fn qualifier_root(qualifier: &str) -> &str {
             Some(i) => &qualifier[..i],
             None => qualifier,
         },
+    }
+}
+
+/// Finding 2 (WCR truth pass): how far a `calls` edge is allowed to travel
+/// through the BIND tiers (B0/B1/B1b/B2/repo-scan-bind/B3) before name
+/// identity alone would be treated as binding evidence. See
+/// `method_bind_gate`'s doc comment for the receiver-evidence rule this
+/// encodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MethodGate {
+    /// Not a receiver call (`p.kind != "calls"`, or `callee_kind` is `""`
+    /// legacy/unset or `"direct"`) — the full, unrestricted tier order runs
+    /// exactly as before this finding.
+    Unrestricted,
+    /// A method call off `self`/`this`/`cls` — an instance/class method
+    /// calling its own class's method. Only the B0 same-file bind tier is
+    /// receiver-consistent with that; every cross-file name-only tier
+    /// (B1 onward) is skipped.
+    SelfOnly,
+    /// A method call off any other receiver, or a method call with no
+    /// `via:<qualifier>` evidence at all (e.g. Rust `field_expression`
+    /// receiver calls — `call_qualifier` never captures one for that AST
+    /// shape, see `extraction::codegraph::call_qualifier` — or any Go
+    /// `selector_expression` call, which `call_qualifier` doesn't handle at
+    /// all). No bind tier is receiver-consistent, including B0: two
+    /// unrelated types can each happen to define a same-named method, and a
+    /// same-file def with that bare name is no more this receiver's method
+    /// than a cross-file one. Every bind tier is skipped.
+    NoBind,
+}
+
+/// Receiver names that denote "this call targets a method on the object's
+/// OWN instance/class", not some other qualifier: Python/Rust/JS/TS `self`,
+/// JS/TS `this`, Python `cls`. Distinct from `PY_RECEIVER_NAMES` below (that
+/// list excludes these from X1b's *external-namespace* classification; this
+/// one governs the receiver-aware *bind*-tier gate, Finding 2).
+const METHOD_SELF_RECEIVERS: &[&str] = &["self", "this", "cls"];
+
+/// Finding 2 (WCR truth pass): `receiver.save()` binding to an unrelated
+/// same-named `save` purely because the bare callee names match is a real
+/// provenance-corrupting bug — name identity alone is never binding
+/// evidence for a receiver call — while flattering the internal-binding
+/// metric (a false bind counts as `bound`). Only a `self`/`this`/`cls`
+/// receiver is receiver-consistent with the existing B0 same-file tier (an
+/// instance method calling its own class's method); every other receiver,
+/// or a method call with no `via:<qualifier>` evidence captured at all,
+/// gets NO bind tier — it proceeds straight to the classify tiers
+/// (qualifier/external/method — see `classify_only`), where a `calls` edge
+/// with `callee_kind == "method"` and no other explanation lands on X2
+/// (`boundary = "method"`) regardless of whether same-named defs exist
+/// elsewhere in the project (they are not evidence for THIS receiver call).
+///
+/// Reads `p.evidence`'s `via:<qualifier>` (extraction-time capture) or,
+/// replay-safely, an already-classified `import:<qualifier>` (X1b/X1c may
+/// have rewritten it on a prior pass — same recognition convention as
+/// `module_for_pending`) to find the qualifier, then takes its ROOT segment
+/// (`qualifier_root`) — `self.x.run()`'s root is `self`, same as
+/// `self.run()`'s.
+fn method_bind_gate(p: &Pending) -> MethodGate {
+    if p.kind != "calls" || p.callee_kind != "method" {
+        return MethodGate::Unrestricted;
+    }
+    let Some(qualifier) = p
+        .evidence
+        .strip_prefix("via:")
+        .or_else(|| p.evidence.strip_prefix("import:"))
+    else {
+        return MethodGate::NoBind;
+    };
+    if qualifier.is_empty() {
+        return MethodGate::NoBind;
+    }
+    let root = qualifier_root(qualifier);
+    if METHOD_SELF_RECEIVERS.contains(&root) {
+        MethodGate::SelfOnly
+    } else {
+        MethodGate::NoBind
     }
 }
 
@@ -1534,6 +1701,131 @@ mod tests {
         assert_eq!(boundary, "method");
         assert_eq!(evidence, "receiver_call");
         assert_eq!(resolved, 0);
+    }
+
+    // ─── Finding 2: receiver-aware method-call bind gating (WCR truth pass) ───
+
+    #[test]
+    fn method_call_with_unrelated_receiver_does_not_bind_to_same_file_name_collision() {
+        // `receiver.save()` — a same-file, same-named `save` def exists,
+        // but it's an UNRELATED free function, not evidence about what
+        // `receiver` actually is. Before Finding 2, B0 bound purely on
+        // bare-name identity, corrupting provenance while flattering the
+        // internal-binding metric.
+        let conn = mem();
+        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
+        upsert_node(&conn, &def("save_a", "a.rs", "save")).unwrap();
+        let mut e = call_edge_via("foo", "save", "a.rs", "receiver");
+        e.callee_kind = "method".into();
+        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(
+            stats.resolved, 0,
+            "must not bind to the unrelated same-file `save`"
+        );
+        assert_eq!(stats.method, 1);
+
+        let (boundary, evidence, resolved, dst_id): (String, String, i64, String) = conn
+            .query_row(
+                "SELECT boundary, evidence, resolved, dst_id FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(boundary, "method");
+        assert_eq!(evidence, "receiver_call");
+        assert_eq!(resolved, 0);
+        assert_eq!(
+            dst_id, "name:save",
+            "dst_id stays the placeholder — never bound"
+        );
+    }
+
+    #[test]
+    fn method_call_with_self_receiver_binds_via_b0_same_file() {
+        // `self.save()` — an instance method calling its own class's
+        // method. The self/this/cls receiver IS consistent with B0's
+        // same-file assumption, so this must still bind.
+        let conn = mem();
+        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
+        upsert_node(&conn, &def("save_a", "a.rs", "save")).unwrap();
+        let mut e = call_edge_via("foo", "save", "a.rs", "self");
+        e.callee_kind = "method".into();
+        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(
+            stats.resolved, 1,
+            "self.save() binds to the same-file `save` def"
+        );
+        assert_eq!(stats.method, 0);
+
+        let (dst_id, resolved, evidence): (String, i64, String) = conn
+            .query_row(
+                "SELECT dst_id, resolved, evidence FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(dst_id, "save_a");
+        assert_eq!(resolved, 1);
+        assert_eq!(evidence, "same_file");
+    }
+
+    #[test]
+    fn method_call_with_non_self_receiver_does_not_bind_via_unique_def_elsewhere() {
+        // `obj.save()` — `save` has exactly ONE `code_nodes` def
+        // project-wide, but it's in a DIFFERENT file. B2 (`unique_def`) is
+        // a cross-file name-only bind tier; `obj` is not self/this/cls, so
+        // it must not reach B2 at all, classifying `method` instead.
+        let conn = mem();
+        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
+        upsert_node(&conn, &def("save_b", "b.rs", "save")).unwrap();
+        let mut e = call_edge_via("foo", "save", "a.rs", "obj");
+        e.callee_kind = "method".into();
+        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(
+            stats.resolved, 0,
+            "must not bind via B2 unique_def — obj isn't self/this/cls"
+        );
+        assert_eq!(stats.method, 1);
+
+        let (boundary, evidence, dst_id): (String, String, String) = conn
+            .query_row(
+                "SELECT boundary, evidence, dst_id FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(boundary, "method");
+        assert_eq!(evidence, "receiver_call");
+        assert_eq!(dst_id, "name:save");
+    }
+
+    #[test]
+    fn method_call_with_no_via_evidence_does_not_bind_to_same_file_name_collision() {
+        // Simulates a Rust `field_expression` receiver call
+        // (`r.map_err(handler)`), which never captures `via:` qualifier
+        // evidence at all (see `extraction::codegraph::call_qualifier`).
+        // `method_bind_gate` treats "no via: data" the same as "receiver
+        // isn't self/this/cls": skip every bind tier, including B0, even
+        // though a same-file same-named def exists.
+        let conn = mem();
+        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
+        upsert_node(&conn, &def("handler_a", "a.rs", "handler")).unwrap();
+        let mut e = call_edge("foo", "handler", "a.rs"); // no `via:` evidence
+        e.callee_kind = "method".into();
+        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(
+            stats.resolved, 0,
+            "no via: evidence -> NoBind, even with a same-file name collision"
+        );
+        assert_eq!(stats.method, 1);
     }
 
     #[test]
