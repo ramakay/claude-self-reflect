@@ -433,19 +433,37 @@ pub fn run(conn: &Connection) -> Result<()> {
          );",
     )?;
 
-    // local_bindings (WCR truth pass, TASK 2): the X4 `local` classify tier's
-    // witness table — per (project, file), the set of names bound as
-    // function/closure parameters or local (non-top-level) variable
-    // declarations, as gathered by `extraction::codegraph::collect_local_bindings`.
-    // Populated by `eval::codegraph::backfill_wcr_witnesses` from the SAME
-    // parse it already does for callee_kind/evidence backfill — never a
+    // local_bindings (WCR truth pass, TASK 2; scope-qualified by the X4
+    // adversarial-review truth pass, Finding 1): the X4 `local` classify
+    // tier's witness table — per (project, file, scope), the set of names
+    // bound as function/closure parameters or local (non-top-level) variable
+    // declarations, as gathered by
+    // `extraction::codegraph::collect_local_bindings`. `scope` is the name
+    // of the nearest enclosing NAMED definition the binding sits inside, or
+    // '' for module-level bindings — without it, a single flat name-set per
+    // (project, file) let a parameter named `handler` in one function
+    // classify an unrelated sibling function's own `handler()` call as
+    // local. Populated by `eval::codegraph::backfill_wcr_witnesses` from the
+    // SAME parse it already does for callee_kind/evidence backfill — never a
     // second parse. Read by `extraction::resolver::resolve_edges`'s X4 tier.
+    //
+    // DROP+CREATE (Finding 1, X4 adversarial review): this table only ever
+    // holds shadow/witness data, rebuilt from scratch by every
+    // `backfill_wcr_witnesses` pass (see `persist_local_bindings`'s
+    // transactional replace-per-file semantics — Finding 2), so an
+    // unconditional drop-and-recreate on every migration run is safe; it is
+    // also necessary — a pre-existing DB with the OLD 3-column
+    // (project, file, name) schema would otherwise silently keep that
+    // schema forever (`CREATE TABLE IF NOT EXISTS` is a no-op once the table
+    // exists), breaking every query below that now expects `scope`.
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS local_bindings (
+        "DROP TABLE IF EXISTS local_bindings;
+         CREATE TABLE local_bindings (
             project TEXT NOT NULL,
             file    TEXT NOT NULL,
+            scope   TEXT NOT NULL,
             name    TEXT NOT NULL,
-            PRIMARY KEY (project, file, name)
+            PRIMARY KEY (project, file, scope, name)
         );",
     )?;
 
@@ -521,20 +539,20 @@ mod tests {
         run(&conn).expect("first migrations::run");
         run(&conn).expect("second migrations::run (idempotent)");
         assert!(
-            conn.prepare("SELECT project, file, name FROM local_bindings LIMIT 0")
+            conn.prepare("SELECT project, file, scope, name FROM local_bindings LIMIT 0")
                 .is_ok(),
-            "local_bindings table must exist after migration"
+            "local_bindings table (with scope column) must exist after migration"
         );
-        // PRIMARY KEY(project, file, name) makes a repeat insert a no-op
-        // (INSERT OR IGNORE), not an error — the table is a plain
+        // PRIMARY KEY(project, file, scope, name) makes a repeat insert a
+        // no-op (INSERT OR IGNORE), not an error — the table is a plain
         // idempotent witness set, never accumulates duplicates.
         conn.execute(
-            "INSERT INTO local_bindings (project, file, name) VALUES ('p', 'f.ts', 'reject')",
+            "INSERT INTO local_bindings (project, file, scope, name) VALUES ('p', 'f.ts', 'foo', 'reject')",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO local_bindings (project, file, name) VALUES ('p', 'f.ts', 'reject')",
+            "INSERT OR IGNORE INTO local_bindings (project, file, scope, name) VALUES ('p', 'f.ts', 'foo', 'reject')",
             [],
         )
         .unwrap();
@@ -542,5 +560,29 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM local_bindings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn local_bindings_migration_drops_old_three_column_schema() {
+        // Finding 1/2 (X4 adversarial review): a DB migrated under the OLD
+        // (project, file, name) schema must not be left stuck on it —
+        // `run` must drop and recreate with the new `scope` column, not
+        // silently no-op via `CREATE TABLE IF NOT EXISTS`.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE local_bindings (
+                project TEXT NOT NULL,
+                file    TEXT NOT NULL,
+                name    TEXT NOT NULL,
+                PRIMARY KEY (project, file, name)
+            );",
+        )
+        .unwrap();
+        run(&conn).expect("migrations::run over a pre-existing old-schema table");
+        assert!(
+            conn.prepare("SELECT project, file, scope, name FROM local_bindings LIMIT 0")
+                .is_ok(),
+            "old 3-column table must be replaced with the new 4-column schema"
+        );
     }
 }

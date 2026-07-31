@@ -1001,7 +1001,24 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
             // drops it at extraction time — WCR Phase 7 TASK D, and this same
             // filter applied to `import_symbols`) were permanently stuck
             // `unexplained` because every one of them is module-scoped.
+            //
+            // Finding 3 (X4 adversarial review): `fragment.parse_clean` is
+            // now REQUIRED too, for BOTH module-level and function-level
+            // edges. Condition (b) alone (`!def_names.is_empty()`) only
+            // proves the parse recovered AT LEAST ONE real def — a partial
+            // extraction regression can still recover one function while
+            // silently dropping every module-level import/call capture
+            // elsewhere in the same degraded parse tree. Without this, such
+            // a regression would wrongly drift-classify every historical
+            // module-level edge (they'd all look like "genuinely removed"),
+            // which both inflates `closure_rate` and, since drift is
+            // excluded from `internal_binding_rate`'s denominator, masks the
+            // very breakage the release gates exist to catch. A genuinely
+            // clean re-parse (no ERROR/MISSING nodes anywhere) is the
+            // positive signal that the ABSENCE of a match is trustworthy —
+            // see `extraction::codegraph::tree_has_error`'s doc comment.
             let can_drift = !def_names.is_empty()
+                && fragment.parse_clean
                 && (def_names.contains(src_name.as_str()) || src_name == src_file);
             let key = (src_name, bare.to_string());
             match kind.as_str() {
@@ -1054,29 +1071,43 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
     Ok((files_touched, edges_updated))
 }
 
-/// TASK 2 (WCR truth pass, X4 tier): persist `names` — local-binding names
-/// from the SAME fresh-extraction fragment `backfill_wcr_witnesses` already
-/// computed for this (project, file), never a second parse — into the
-/// shadow's `local_bindings` witness table. `INSERT OR IGNORE`: the table's
-/// only columns ARE its primary key (project, file, name), so a repeat name
-/// is a true no-op, not a conflict to resolve.
+/// TASK 2 (WCR truth pass, X4 tier); transactional replace added by the X4
+/// adversarial review (Finding 2): persist `bindings` — `(scope, name)`
+/// local-binding pairs from the SAME fresh-extraction fragment
+/// `backfill_wcr_witnesses` already computed for this (project, file), never
+/// a second parse — into the shadow's `local_bindings` witness table.
+///
+/// DELETE-then-INSERT per (project, file), inside one transaction,
+/// UNCONDITIONALLY — including when `bindings` is empty (the DELETE still
+/// runs). Before this fix, an empty fresh set hit an early `return Ok(())`
+/// and a non-empty set only ever `INSERT OR IGNORE`d, so a file that used to
+/// have local bindings and no longer does (all renamed/removed) — or a file
+/// reprocessed after edits changed WHICH names are bound — would keep every
+/// STALE row from a prior backfill forever: witnesses for names that no
+/// longer exist in the file, silently misclassifying future edges. Today's
+/// eval path always rebuilds the shadow from scratch per run (so this was
+/// latent, not live-observable), but a planned future daemon persisting
+/// straight into the LIVE DB across repeated runs would make it a real
+/// landmine — this fix closes it at the source rather than relying on the
+/// caller to always start from an empty table.
 fn persist_local_bindings(
     shadow: &Arc<Storage>,
     project: &str,
     file: &str,
-    names: &BTreeSet<String>,
+    bindings: &BTreeSet<(String, String)>,
 ) -> Result<()> {
-    if names.is_empty() {
-        return Ok(());
-    }
     shadow.with_connection(|conn| {
         let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM local_bindings WHERE project = ?1 AND file = ?2",
+            rusqlite::params![project, file],
+        )?;
         {
             let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO local_bindings (project, file, name) VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO local_bindings (project, file, scope, name) VALUES (?1, ?2, ?3, ?4)",
             )?;
-            for name in names {
-                stmt.execute(rusqlite::params![project, file, name])?;
+            for (scope, name) in bindings {
+                stmt.execute(rusqlite::params![project, file, scope, name])?;
             }
         }
         tx.commit()?;
@@ -1190,18 +1221,29 @@ fn wcr_dump_write(
             by_name.entry(name).or_default().insert(file);
         }
 
-        // WCR truth pass, TASK 2: the same local_bindings witness set the X4
+        // WCR truth pass, TASK 2; scope-qualified by the X4 adversarial
+        // review (Finding 1): the same local_bindings witness set the X4
         // resolver tier reads, for the `had_local_binding` trip-wire field.
-        let mut local_bindings: BTreeSet<(String, String, String)> = BTreeSet::new();
-        let mut lb_stmt = conn.prepare("SELECT project, file, name FROM local_bindings")?;
-        for row in
-            lb_stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
-        {
+        let mut local_bindings: BTreeSet<(String, String, String, String)> = BTreeSet::new();
+        let mut lb_stmt = conn.prepare("SELECT project, file, scope, name FROM local_bindings")?;
+        for row in lb_stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })? {
             local_bindings.insert(row?);
         }
 
+        // `n.name` (Finding 1, X4 adversarial review): the edge's own
+        // calling-symbol name — needed to reconstruct the SAME
+        // scope-qualified match the resolver's X4 tier performs (caller
+        // scope = `""` for a module-level edge, i.e. `src_name == src_file`,
+        // else `src_name` itself).
         let mut stmt = conn.prepare(
-            "SELECT e.kind, e.dst_id, e.callee_kind, e.src_file, n.project
+            "SELECT e.kind, e.dst_id, e.callee_kind, e.src_file, n.project, n.name
              FROM code_edges e JOIN code_nodes n ON n.id = e.src_id
              WHERE e.resolved = 0 AND e.dst_id LIKE 'name:%' AND e.boundary = ''
              ORDER BY e.src_id, e.dst_id, e.kind",
@@ -1213,12 +1255,13 @@ fn wcr_dump_write(
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
             ))
         })?;
 
         let mut out = Vec::new();
         for row in edges {
-            let (kind, dst_id, callee_kind, src_file, project) = row?;
+            let (kind, dst_id, callee_kind, src_file, project, src_name) = row?;
             let name = dst_id.strip_prefix("name:").unwrap_or(&dst_id).to_string();
             let def_files = by_name.get(&name).map(BTreeSet::len).unwrap_or(0);
             let repo_files = if def_files == 0 {
@@ -1241,9 +1284,11 @@ fn wcr_dump_write(
                 .unwrap_or("")
                 .to_string();
             let had_import_module = import_modules.contains(&(src_file.clone(), name.clone()));
+            let caller_scope = if src_name == src_file { String::new() } else { src_name };
             let had_local_binding = local_bindings.contains(&(
                 project.clone(),
                 src_file.clone(),
+                caller_scope,
                 name.clone(),
             ));
             out.push(serde_json::json!({
@@ -3001,6 +3046,186 @@ mod tests {
             .unwrap();
         assert_eq!(boundary, "drifted");
         assert_eq!(evidence, "not_in_current_source");
+    }
+
+    // ─── persist_local_bindings transactional replace (X4 adversarial review, Finding 2) ───
+
+    #[test]
+    fn persist_local_bindings_replaces_stale_rows_on_reprocess() {
+        // Version A of a file has local bindings; version B (same file)
+        // renames/removes all of them. Before the fix, `persist_local_bindings`
+        // only ever `INSERT OR IGNORE`d, so version A's rows would survive
+        // forever alongside version B's — stale witnesses for names that no
+        // longer exist in the file. After the fix, re-persisting must leave
+        // ONLY version B's rows.
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let mut version_a = BTreeSet::new();
+        version_a.insert(("foo".to_string(), "oldName".to_string()));
+        version_a.insert(("foo".to_string(), "alsoOld".to_string()));
+        persist_local_bindings(&shadow, "proj", "a.ts", &version_a).unwrap();
+
+        let after_a: Vec<(String, String)> = shadow
+            .with_connection(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT scope, name FROM local_bindings WHERE project = 'proj' AND file = 'a.ts' ORDER BY name",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            after_a,
+            vec![
+                ("foo".to_string(), "alsoOld".to_string()),
+                ("foo".to_string(), "oldName".to_string()),
+            ]
+        );
+
+        // Version B: every old name renamed away, one new name bound.
+        let mut version_b = BTreeSet::new();
+        version_b.insert(("foo".to_string(), "newName".to_string()));
+        persist_local_bindings(&shadow, "proj", "a.ts", &version_b).unwrap();
+
+        let after_b: Vec<(String, String)> = shadow
+            .with_connection(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT scope, name FROM local_bindings WHERE project = 'proj' AND file = 'a.ts' ORDER BY name",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            after_b,
+            vec![("foo".to_string(), "newName".to_string())],
+            "only version B's rows must remain — version A's stale rows must be gone"
+        );
+
+        // Version C: file now has zero local bindings at all. The DELETE
+        // must still run even though the fresh set is empty.
+        persist_local_bindings(&shadow, "proj", "a.ts", &BTreeSet::new()).unwrap();
+        let count: i64 = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM local_bindings WHERE project = 'proj' AND file = 'a.ts'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "an empty fresh set must still clear out prior rows for this (project, file)"
+        );
+    }
+
+    #[test]
+    fn persist_local_bindings_does_not_touch_other_files_rows() {
+        // Transactional replace is scoped to (project, file) — a DIFFERENT
+        // file's rows must survive untouched.
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let mut a_bindings = BTreeSet::new();
+        a_bindings.insert(("foo".to_string(), "x".to_string()));
+        persist_local_bindings(&shadow, "proj", "a.ts", &a_bindings).unwrap();
+        let mut b_bindings = BTreeSet::new();
+        b_bindings.insert(("bar".to_string(), "y".to_string()));
+        persist_local_bindings(&shadow, "proj", "b.ts", &b_bindings).unwrap();
+
+        // Reprocess a.ts with an empty set.
+        persist_local_bindings(&shadow, "proj", "a.ts", &BTreeSet::new()).unwrap();
+
+        let b_count: i64 = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM local_bindings WHERE project = 'proj' AND file = 'b.ts'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(b_count, 1, "b.ts's row must be untouched by a.ts's replace");
+    }
+
+    // ─── parse_clean gates drift (X4 adversarial review, Finding 3) ───
+
+    #[test]
+    fn backfill_does_not_drift_module_edges_when_parse_has_errors() {
+        // Degraded parse: `foo` still extracts as a real def node (condition
+        // (b) holds, and (c) holds too — `foo` is the calling symbol), but
+        // trailing garbage makes the OVERALL tree contain an ERROR node.
+        // Before Finding 3's fix, a module-level `imports` edge here would
+        // wrongly drift (the absence of a match looks identical to a
+        // genuinely-removed import); after the fix, `parse_clean == false`
+        // blocks it — the edge must stay unexplained, not drifted.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.rs");
+        std::fs::write(
+            &file_path,
+            "fn foo() {\n    helper();\n}\nfn bar( {{{ !!! garbage not rust\n",
+        )
+        .unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "rust".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[EdgeRow {
+                    src_id: module_id.clone(),
+                    dst_id: "name:ghost_module".into(),
+                    kind: "imports".into(),
+                    src_file: file_str.clone(),
+                    resolved: 0,
+                    weight: 1.0,
+                    ..EdgeRow::default()
+                }],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(
+            files, 1,
+            "the on-disk (degraded-parse) file was re-extracted"
+        );
+        assert_eq!(edges, 0, "ghost_module has no match in the fresh fragment");
+
+        let (boundary, evidence, resolved): (String, String, i64) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT boundary, evidence, resolved FROM code_edges
+                     WHERE src_id = ?1 AND dst_id = 'name:ghost_module'",
+                    [&module_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            boundary, "",
+            "a degraded (ERROR-containing) parse must NEVER be trusted as drift \
+             evidence, even though `foo` still extracted as a real def node"
+        );
+        assert_eq!(evidence, "");
+        assert_eq!(resolved, 0);
     }
 
     #[test]

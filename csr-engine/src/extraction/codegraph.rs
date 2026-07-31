@@ -28,14 +28,34 @@ use crate::storage::codegraph::{EdgeRow, NodeRow};
 pub struct GraphFragment {
     pub nodes: Vec<NodeRow>,
     pub edges: Vec<EdgeRow>,
-    /// TASK 2 (WCR truth pass X4 tier): local-binding names declared in this
-    /// file — function/closure parameters, catch clause params, and local
-    /// (non-top-level) variable declarations/destructuring targets. See
-    /// `collect_local_bindings`'s doc comment. Populated from the SAME parse
-    /// as `nodes`/`edges` (`extract_inner` calls the shared
-    /// `collect_local_bindings_from_root` on its own already-parsed `root`),
-    /// never a second, separate parse.
-    pub local_bindings: BTreeSet<String>,
+    /// TASK 2 (WCR truth pass X4 tier); scope-qualified as of the X4
+    /// adversarial-review truth pass (Finding 1): `(scope, name)` pairs for
+    /// every local-binding name declared in this file — function/closure
+    /// parameters, catch clause params, and local (non-top-level) variable
+    /// declarations/destructuring targets. `scope` is the name of the
+    /// nearest enclosing NAMED definition (function/method/top-level const
+    /// fn) the binding sits inside, or `""` for a binding outside any named
+    /// def (module-level block scopes, e.g. inside a top-level `if`/`try`).
+    /// See `collect_local_bindings`'s and `nearest_named_scope`'s doc
+    /// comments. Without scope, a single flat name-set per (project, file)
+    /// let a parameter named `handler` in one function classify a sibling
+    /// function's unrelated `handler()` call as local — the bug this
+    /// qualification fixes. Populated from the SAME parse as `nodes`/`edges`
+    /// (`extract_inner` calls the shared `collect_local_bindings_from_root`
+    /// on its own already-parsed `root`), never a second, separate parse.
+    pub local_bindings: BTreeSet<(String, String)>,
+    /// Finding 3 (X4 adversarial review): `true` iff the tree-sitter parse
+    /// of this file produced NO `ERROR`/`MISSING` node anywhere in the tree
+    /// (see `tree_has_error`). A degraded/partial parse can still recover
+    /// one or more real def nodes while silently dropping others (e.g. every
+    /// module-level import) — without this flag, `backfill_wcr_witnesses`'s
+    /// drift gate would credit that partial recovery as if the file were
+    /// genuinely edited, wrongly drift-classifying (and thus hiding) every
+    /// vanished module-level edge. `false` on every `GraphFragment::default()`
+    /// fallback (unsupported language, undersized source, or a `catch_unwind`
+    /// panic) — the safe default, since those paths already produce zero def
+    /// nodes and must never be trusted as drift evidence either.
+    pub parse_clean: bool,
 }
 
 /// Stable node id: sha256(repo|file|kind|name), truncated to 40 hex chars.
@@ -716,19 +736,23 @@ fn canonical_kind(ast_kind: &str, lang: SupportLang) -> &'static str {
 // silently skipped (a false negative, never a false positive: `match`'s
 // `_ => {}` arm never fabricates a name).
 
-/// The set of local-binding names declared in `source` — see this section's
-/// module-doc-comment-style header above. Independently parses `source`
-/// (unlike `collect_local_bindings_from_root`, which reuses an
+/// The set of `(scope, name)` local-binding pairs declared in `source` — see
+/// this section's module-doc-comment-style header above, and
+/// `nearest_named_scope` for what `scope` means. Independently parses
+/// `source` (unlike `collect_local_bindings_from_root`, which reuses an
 /// already-parsed root — see that function's doc comment for the
 /// single-parse production path via `extract_inner`/`GraphFragment`); this
 /// entry point exists for standalone unit-testing per language and for any
 /// future caller that doesn't already have a parsed root at hand. Wrapped in
 /// `catch_unwind` (malformed input can panic mid-parse), same convention as
 /// `extract_graph_fragment`.
-pub fn collect_local_bindings(source: &str, lang: SupportLang) -> BTreeSet<String> {
+pub fn collect_local_bindings(source: &str, lang: SupportLang) -> BTreeSet<(String, String)> {
     if source.len() < 2 {
         return BTreeSet::new();
     }
+    let grep = lang.ast_grep(source);
+    return collect_local_bindings_from_root(&grep.root(), lang);
+    #[allow(unreachable_code)]
     let result = catch_unwind(AssertUnwindSafe(|| {
         let grep = lang.ast_grep(source);
         collect_local_bindings_from_root(&grep.root(), lang)
@@ -741,7 +765,7 @@ pub fn collect_local_bindings(source: &str, lang: SupportLang) -> BTreeSet<Strin
 fn collect_local_bindings_from_root<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     lang: SupportLang,
-) -> BTreeSet<String> {
+) -> BTreeSet<(String, String)> {
     let mut out = BTreeSet::new();
     match lang {
         SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => {
@@ -758,7 +782,73 @@ fn collect_local_bindings_from_root<D: ast_grep_core::Doc>(
     out
 }
 
-fn insert_binding_name(out: &mut BTreeSet<String>, name: impl Into<String>) {
+/// X4 adversarial review, Finding 1: the name of the nearest enclosing NAMED
+/// definition (function/method/top-level const-assigned function expression)
+/// `node` sits inside, or `""` when `node` is not inside any named def
+/// (module-level code, including a top-level `if`/`try` block). Walks
+/// ancestors exactly like `extract_inner`'s own `calls`-edge source-symbol
+/// walk, EXCEPT it does not stop at the first function-kind ancestor: an
+/// ANONYMOUS function-kind ancestor (a closure, or a `const`-assigned arrow
+/// function that isn't itself a direct top-level declaration — see
+/// `top_level_const_fn_name`) is not a named scope in its own right, so the
+/// walk continues past it to find the nearest OUTER named definition. This is
+/// what makes "nested closures inside function F attribute to scope F" hold:
+/// a `reject` param bound in an anonymous `(resolve, reject) => {...}` deep
+/// inside named function `loadTrack` scopes to `"loadTrack"`, not `""`.
+fn nearest_named_scope<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    lang: SupportLang,
+) -> String {
+    for anc in node.ancestors() {
+        if !func_kinds(lang).contains(&anc.kind().as_ref()) {
+            continue;
+        }
+        if let Some(name) = child_name(&anc) {
+            return name;
+        }
+        if let Some(name) = top_level_const_fn_name(&anc) {
+            return name;
+        }
+        // Anonymous, non-top-level-const function-kind ancestor (e.g. a bare
+        // closure, or a `const helper = () => {}` nested inside another
+        // function): not a named scope itself — keep walking up for an outer
+        // named ancestor rather than stopping here.
+    }
+    String::new()
+}
+
+/// X4 adversarial review, Finding 1: `Some(name)` when `anc` (a function-kind
+/// AST node with no identifier child of its own — i.e. `child_name` already
+/// returned `None`) is the `value` of a top-level `const`/`let`/`var`
+/// declarator, e.g. `const loadTrack = () => {...}` at module scope — the
+/// def-node infrastructure (`const_decl_kinds`/`is_program_level_declaration`/
+/// `const_decl_names`) already treats this shape as a real, named, repo-wide
+/// def, so the local-binding scope tagger must name it identically (`"loadTrack"`)
+/// for the resolver's scope-equality match to have anything to match against.
+/// A NON-top-level `const helper = () => {}` (nested inside another function)
+/// deliberately returns `None` here — it is not a def node, so it must not be
+/// treated as a named scope either; `nearest_named_scope` keeps walking
+/// upward past it instead, attributing to the enclosing named function.
+fn top_level_const_fn_name<D: ast_grep_core::Doc>(
+    anc: &ast_grep_core::Node<'_, D>,
+) -> Option<String> {
+    let declarator = anc.parent()?;
+    if declarator.kind().as_ref() != "variable_declarator" {
+        return None;
+    }
+    let declaration = declarator.parent()?;
+    if !is_program_level_declaration(&declaration) {
+        return None;
+    }
+    let name_node = declarator.field("name")?;
+    if name_node.kind().as_ref() == "identifier" {
+        Some(name_node.text().to_string())
+    } else {
+        None
+    }
+}
+
+fn insert_binding_name(out: &mut BTreeSet<(String, String)>, scope: &str, name: impl Into<String>) {
     let name = name.into();
     // Same len>=2 floor as `is_noise_callee`: a single-char name can never
     // be the target of a pending `calls`/`imports` placeholder edge in the
@@ -766,7 +856,7 @@ fn insert_binding_name(out: &mut BTreeSet<String>, name: impl Into<String>) {
     // a single-char local-binding entry could never be looked up by the X4
     // tier — skip recording it at all.
     if name.len() >= 2 {
-        out.insert(name);
+        out.insert((scope.to_string(), name));
     }
 }
 
@@ -781,20 +871,27 @@ fn insert_binding_name(out: &mut BTreeSet<String>, name: impl Into<String>) {
 fn collect_ts_js_local_bindings<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     lang: SupportLang,
-    out: &mut BTreeSet<String>,
+    out: &mut BTreeSet<(String, String)>,
 ) {
     let params_matcher = KindMatcher::new("formal_parameters", lang);
     for params in root.find_all(&params_matcher) {
+        // `params` is always a direct child of the function/method/arrow
+        // node it belongs to, so the nearest named scope FROM `params`
+        // itself is exactly that function's own scope (or the outer named
+        // def if it's anonymous) — computed once per parameter list, not
+        // per name.
+        let scope = nearest_named_scope(&params, lang);
         for child in params.children() {
             if child.is_named() {
-                ts_js_pattern_names(&child, out);
+                ts_js_pattern_names(&child, &scope, out);
             }
         }
     }
     let catch_matcher = KindMatcher::new("catch_clause", lang);
     for clause in root.find_all(&catch_matcher) {
+        let scope = nearest_named_scope(&clause, lang);
         if let Some(param) = clause.field("parameter") {
-            ts_js_pattern_names(&param, out);
+            ts_js_pattern_names(&param, &scope, out);
         }
     }
     for kind in const_decl_kinds(lang) {
@@ -806,10 +903,11 @@ fn collect_ts_js_local_bindings<D: ast_grep_core::Doc>(
                 // symbol as a "local" one.
                 continue;
             }
+            let scope = nearest_named_scope(&decl, lang);
             for child in decl.children() {
                 if child.is_named() && child.kind().as_ref() == "variable_declarator" {
                     if let Some(name) = child.field("name") {
-                        ts_js_pattern_names(&name, out);
+                        ts_js_pattern_names(&name, &scope, out);
                     }
                 }
             }
@@ -824,18 +922,23 @@ fn collect_ts_js_local_bindings<D: ast_grep_core::Doc>(
 /// forms), and the TS `required_parameter`/`optional_parameter` wrapper
 /// (whose `pattern` field holds the actual binding, `type`/`value` fields
 /// holding the type annotation / default value — neither a binding name).
+/// `scope` (X4 adversarial review, Finding 1) is the enclosing named def's
+/// name, precomputed once by the caller for the whole binding SITE (a
+/// parameter list, catch clause, or declaration) — every name found while
+/// recursing through one site shares that site's scope.
 fn ts_js_pattern_names<D: ast_grep_core::Doc>(
     node: &ast_grep_core::Node<'_, D>,
-    out: &mut BTreeSet<String>,
+    scope: &str,
+    out: &mut BTreeSet<(String, String)>,
 ) {
     match node.kind().as_ref() {
         "identifier" | "shorthand_property_identifier_pattern" => {
-            insert_binding_name(out, node.text().to_string());
+            insert_binding_name(out, scope, node.text().to_string());
         }
         "object_pattern" | "array_pattern" => {
             for child in node.children() {
                 if child.is_named() {
-                    ts_js_pattern_names(&child, out);
+                    ts_js_pattern_names(&child, scope, out);
                 }
             }
         }
@@ -843,13 +946,13 @@ fn ts_js_pattern_names<D: ast_grep_core::Doc>(
             // `{a: renamed}` — `key` is the source property name (not a
             // binding), `value` is the actual bound local name.
             if let Some(value) = node.field("value") {
-                ts_js_pattern_names(&value, out);
+                ts_js_pattern_names(&value, scope, out);
             }
         }
         "rest_pattern" => {
             for child in node.children() {
                 if child.is_named() {
-                    ts_js_pattern_names(&child, out);
+                    ts_js_pattern_names(&child, scope, out);
                 }
             }
         }
@@ -857,12 +960,12 @@ fn ts_js_pattern_names<D: ast_grep_core::Doc>(
             // `x = 1` / `{a = 1}` — `left` is the bound name, `right` the
             // default-value expression (not a binding).
             if let Some(left) = node.field("left") {
-                ts_js_pattern_names(&left, out);
+                ts_js_pattern_names(&left, scope, out);
             }
         }
         "required_parameter" | "optional_parameter" => {
             if let Some(pattern) = node.field("pattern") {
-                ts_js_pattern_names(&pattern, out);
+                ts_js_pattern_names(&pattern, scope, out);
             }
         }
         _ => {}
@@ -876,13 +979,14 @@ fn ts_js_pattern_names<D: ast_grep_core::Doc>(
 fn collect_python_local_bindings<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     lang: SupportLang,
-    out: &mut BTreeSet<String>,
+    out: &mut BTreeSet<(String, String)>,
 ) {
     let params_matcher = KindMatcher::new("parameters", lang);
     for params in root.find_all(&params_matcher) {
+        let scope = nearest_named_scope(&params, lang);
         for child in params.children() {
             if child.is_named() {
-                python_pattern_names(&child, out);
+                python_pattern_names(&child, &scope, out);
             }
         }
     }
@@ -891,8 +995,9 @@ fn collect_python_local_bindings<D: ast_grep_core::Doc>(
         if !is_inside_python_function(&assign) {
             continue;
         }
+        let scope = nearest_named_scope(&assign, lang);
         if let Some(left) = assign.field("left") {
-            python_pattern_names(&left, out);
+            python_pattern_names(&left, &scope, out);
         }
     }
 }
@@ -912,29 +1017,30 @@ fn is_inside_python_function<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'
 /// unpacking targets (`pattern_list`, e.g. `a, b = 1, 2`).
 fn python_pattern_names<D: ast_grep_core::Doc>(
     node: &ast_grep_core::Node<'_, D>,
-    out: &mut BTreeSet<String>,
+    scope: &str,
+    out: &mut BTreeSet<(String, String)>,
 ) {
     match node.kind().as_ref() {
         "identifier" => {
-            insert_binding_name(out, node.text().to_string());
+            insert_binding_name(out, scope, node.text().to_string());
         }
         "typed_parameter" => {
             if let Some(name) = node
                 .children()
                 .find(|c| c.is_named() && c.kind().as_ref() == "identifier")
             {
-                python_pattern_names(&name, out);
+                python_pattern_names(&name, scope, out);
             }
         }
         "default_parameter" | "typed_default_parameter" => {
             if let Some(name) = node.field("name") {
-                python_pattern_names(&name, out);
+                python_pattern_names(&name, scope, out);
             }
         }
         "list_splat_pattern" | "dictionary_splat_pattern" | "pattern_list" => {
             for child in node.children() {
                 if child.is_named() {
-                    python_pattern_names(&child, out);
+                    python_pattern_names(&child, scope, out);
                 }
             }
         }
@@ -949,28 +1055,34 @@ fn python_pattern_names<D: ast_grep_core::Doc>(
 fn collect_rust_local_bindings<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     lang: SupportLang,
-    out: &mut BTreeSet<String>,
+    out: &mut BTreeSet<(String, String)>,
 ) {
     for kind in ["let_declaration", "let_condition"] {
         let matcher = KindMatcher::new(kind, lang);
         for decl in root.find_all(&matcher) {
+            let scope = nearest_named_scope(&decl, lang);
             if let Some(pattern) = decl.field("pattern") {
-                rust_pattern_names(&pattern, out);
+                rust_pattern_names(&pattern, &scope, out);
             }
         }
     }
     let closure_matcher = KindMatcher::new("closure_parameters", lang);
     for params in root.find_all(&closure_matcher) {
+        // Closures are not `func_kinds` themselves (Rust's `func_kinds` is
+        // only `function_item`), so `nearest_named_scope` walks straight
+        // past the closure to the enclosing named function — exactly the
+        // "nested closures attribute to F" rule.
+        let scope = nearest_named_scope(&params, lang);
         for child in params.children() {
             if !child.is_named() {
                 continue;
             }
             if child.kind().as_ref() == "parameter" {
                 if let Some(pattern) = child.field("pattern") {
-                    rust_pattern_names(&pattern, out);
+                    rust_pattern_names(&pattern, &scope, out);
                 }
             } else {
-                rust_pattern_names(&child, out);
+                rust_pattern_names(&child, &scope, out);
             }
         }
     }
@@ -992,16 +1104,17 @@ fn collect_rust_local_bindings<D: ast_grep_core::Doc>(
 /// own `shorthand_field_identifier` kind IS the binding)).
 fn rust_pattern_names<D: ast_grep_core::Doc>(
     node: &ast_grep_core::Node<'_, D>,
-    out: &mut BTreeSet<String>,
+    scope: &str,
+    out: &mut BTreeSet<(String, String)>,
 ) {
     match node.kind().as_ref() {
         "identifier" | "shorthand_field_identifier" => {
-            insert_binding_name(out, node.text().to_string());
+            insert_binding_name(out, scope, node.text().to_string());
         }
         "tuple_pattern" | "mut_pattern" => {
             for child in node.children() {
                 if child.is_named() {
-                    rust_pattern_names(&child, out);
+                    rust_pattern_names(&child, scope, out);
                 }
             }
         }
@@ -1014,27 +1127,45 @@ fn rust_pattern_names<D: ast_grep_core::Doc>(
                 if Some(child.range()) == type_range {
                     continue;
                 }
-                rust_pattern_names(&child, out);
+                rust_pattern_names(&child, scope, out);
             }
         }
         "struct_pattern" => {
             for child in node.children() {
                 if child.is_named() && child.kind().as_ref() == "field_pattern" {
-                    rust_pattern_names(&child, out);
+                    rust_pattern_names(&child, scope, out);
                 }
             }
         }
         "field_pattern" => {
             if let Some(pattern) = node.field("pattern") {
-                rust_pattern_names(&pattern, out);
+                rust_pattern_names(&pattern, scope, out);
             } else if let Some(name) = node.field("name") {
                 if name.kind().as_ref() == "shorthand_field_identifier" {
-                    rust_pattern_names(&name, out);
+                    rust_pattern_names(&name, scope, out);
                 }
             }
         }
         _ => {}
     }
+}
+
+/// Finding 3 (X4 adversarial review): `true` iff `root` (and, transitively,
+/// every descendant) is free of `ERROR`/`MISSING` tree-sitter nodes — a
+/// genuinely clean parse, not a degraded/partial recovery. `ast_grep_core`'s
+/// `Node` does not expose a single aggregate "has any error in this subtree"
+/// call the way raw `tree_sitter::Node::has_error` does; the equivalent here
+/// is a full `dfs()` walk checking each node's own `is_error()`/`is_missing()`
+/// (an `ERROR`-kind node for genuinely unparseable text, a zero-width
+/// `MISSING` node the parser synthesized to recover from a truncated/invalid
+/// construct — tree-sitter's two distinct error-recovery signals, both
+/// checked). `dfs()` iterates ALL children (named and unnamed), so nothing is
+/// skipped. Used to gate `backfill_wcr_witnesses`'s drift classification: a
+/// partial extraction that still recovers one real def node must not be
+/// trusted as "this file was genuinely edited" when the parse tree it came
+/// from also contains error/missing nodes elsewhere.
+fn tree_has_error<D: ast_grep_core::Doc>(root: &ast_grep_core::Node<'_, D>) -> bool {
+    root.dfs().any(|n| n.is_error() || n.is_missing())
 }
 
 /// Path-driven convenience wrapper: derive the language from `file`'s extension.
@@ -1308,11 +1439,15 @@ fn extract_inner(
     // TASK 2 (WCR truth pass X4 tier): local-binding names, from the SAME
     // parsed `root` above — never a second parse.
     let local_bindings = collect_local_bindings_from_root(&root, lang);
+    // Finding 3 (X4 adversarial review): computed from the SAME parsed
+    // `root` — see `tree_has_error`'s doc comment.
+    let parse_clean = !tree_has_error(&root);
 
     GraphFragment {
         nodes: nodes.into_values().collect(),
         edges: edges.into_values().collect(),
         local_bindings,
+        parse_clean,
     }
 }
 
@@ -2206,10 +2341,20 @@ mod tests {
 
     // ─── collect_local_bindings (WCR truth pass, TASK 2, X4 tier) ───
 
+    /// Test-only projection: just the name half of every `(scope, name)`
+    /// pair — most of the existing local-binding tests predate scope
+    /// qualification (X4 adversarial review, Finding 1) and only care
+    /// whether a name was captured at all, not which scope it landed in.
+    /// The dedicated scope tests below check the `(scope, name)` pairs
+    /// directly.
+    fn names_of(bindings: &BTreeSet<(String, String)>) -> BTreeSet<String> {
+        bindings.iter().map(|(_, n)| n.clone()).collect()
+    }
+
     #[test]
     fn ts_local_bindings_cover_params_destructuring_and_catch() {
         let src = "function f({ playTrack, count = 1, ...rest }: Opts, [first, second]: number[]) {\n  const { solo, other: renamed } = obj;\n  const [head, ...tail] = arr;\n  try {} catch (caught) {}\n  const cb = (err) => { return err; };\n}\nconst TOP_LEVEL = 1;\n";
-        let names = collect_local_bindings(src, SupportLang::TypeScript);
+        let names = names_of(&collect_local_bindings(src, SupportLang::TypeScript));
         for expected in [
             "playTrack",
             "count",
@@ -2237,7 +2382,7 @@ mod tests {
         // Plain JS shape (no `required_parameter` TS wrapper): `assignment_pattern`
         // / `object_assignment_pattern` directly under `formal_parameters`.
         let src = "function f(width = 1, { height = 2 } = {}) {\n  return width + height;\n}\n";
-        let names = collect_local_bindings(src, SupportLang::JavaScript);
+        let names = names_of(&collect_local_bindings(src, SupportLang::JavaScript));
         assert!(names.contains("width"), "{names:?}");
         assert!(names.contains("height"), "{names:?}");
     }
@@ -2246,7 +2391,7 @@ mod tests {
     fn ts_local_bindings_arrow_closure_param_reject() {
         // The task's own motivating example: `new Promise((resolve, reject) => ...)`.
         let src = "function f() {\n  return new Promise((resolve, reject) => {\n    reject();\n  });\n}\n";
-        let names = collect_local_bindings(src, SupportLang::TypeScript);
+        let names = names_of(&collect_local_bindings(src, SupportLang::TypeScript));
         assert!(names.contains("resolve"), "{names:?}");
         assert!(names.contains("reject"), "{names:?}");
     }
@@ -2254,7 +2399,7 @@ mod tests {
     #[test]
     fn python_local_bindings_cover_params_and_body_assignments() {
         let src = "TOP_LEVEL = 1\n\ndef f(a, b=1, *args, **kwargs):\n    local_x = 1\n    local_y, local_z = 2, 3\n    return local_x\n";
-        let names = collect_local_bindings(src, SupportLang::Python);
+        let names = names_of(&collect_local_bindings(src, SupportLang::Python));
         for expected in ["args", "kwargs", "local_x", "local_y", "local_z"] {
             assert!(names.contains(expected), "missing {expected}: {names:?}");
         }
@@ -2269,7 +2414,7 @@ mod tests {
     #[test]
     fn python_local_bindings_typed_params() {
         let src = "def f(count: int, label: str = 'x'):\n    return count\n";
-        let names = collect_local_bindings(src, SupportLang::Python);
+        let names = names_of(&collect_local_bindings(src, SupportLang::Python));
         assert!(names.contains("count"), "{names:?}");
         assert!(names.contains("label"), "{names:?}");
         assert!(
@@ -2281,7 +2426,7 @@ mod tests {
     #[test]
     fn rust_local_bindings_cover_let_and_closures() {
         let src = "fn f() {\n    let simple_x = 1;\n    let (tuple_a, tuple_b) = (1, 2);\n    if let Some(cond_y) = opt {}\n    let closure = |param_p, param_q| param_p + param_q;\n    let Point { field_x: renamed_x, field_y } = pt;\n}\n";
-        let names = collect_local_bindings(src, SupportLang::Rust);
+        let names = names_of(&collect_local_bindings(src, SupportLang::Rust));
         for expected in [
             "simple_x",
             "tuple_a",
@@ -2309,7 +2454,7 @@ mod tests {
         // Deliberately out of scope for this tier (task spec: "Rust let
         // bindings + closure params").
         let src = "fn f(fn_param: i32) {\n    let _ = fn_param;\n}\n";
-        let names = collect_local_bindings(src, SupportLang::Rust);
+        let names = names_of(&collect_local_bindings(src, SupportLang::Rust));
         assert!(
             !names.contains("fn_param"),
             "regular fn params are out of scope for this tier: {names:?}"
@@ -2319,7 +2464,7 @@ mod tests {
     #[test]
     fn local_bindings_empty_for_source_with_no_local_scope() {
         let src = "pub fn top_level_only() -> usize { 1 }\n";
-        let names = collect_local_bindings(src, SupportLang::Rust);
+        let names = names_of(&collect_local_bindings(src, SupportLang::Rust));
         assert!(names.is_empty(), "{names:?}");
     }
 
@@ -2339,9 +2484,132 @@ mod tests {
             "s",
         );
         assert!(
-            frag.local_bindings.contains("reject"),
-            "{:?}",
             frag.local_bindings
+                .contains(&("f".to_string(), "reject".to_string())),
+            "reject is a closure param nested (anonymously) inside named function f, \
+             so its scope must be \"f\", not \"\" or \"cb\": {:?}",
+            frag.local_bindings
+        );
+    }
+
+    // ─── scope qualification (X4 adversarial review, Finding 1) ───
+
+    #[test]
+    fn ts_local_bindings_scope_isolates_sibling_functions() {
+        // The exact bug the fix addresses: a `handler` param bound in one
+        // function must not collapse into the same name-set as an unrelated
+        // sibling function's own (different) `handler` param — each must
+        // carry its OWN function's name as scope.
+        let src = "function foo(handler) {\n  return handler;\n}\nfunction bar(handler) {\n  return handler;\n}\n";
+        let bindings = collect_local_bindings(src, SupportLang::TypeScript);
+        assert!(
+            bindings.contains(&("foo".to_string(), "handler".to_string())),
+            "{bindings:?}"
+        );
+        assert!(
+            bindings.contains(&("bar".to_string(), "handler".to_string())),
+            "{bindings:?}"
+        );
+        // Exactly two entries, not one collapsed (scope, name) pair.
+        assert_eq!(bindings.len(), 2, "{bindings:?}");
+    }
+
+    #[test]
+    fn ts_local_bindings_top_level_const_arrow_fn_is_a_named_scope() {
+        // `const loadTrack = () => {...}` at module scope has no identifier
+        // CHILD of the arrow_function node itself (unlike `function foo(){}`),
+        // but the def-node infrastructure already treats it as a real named
+        // def (`const_decl_kinds`/`is_program_level_declaration`) — the scope
+        // tagger must name it identically for the resolver's exact-match to
+        // find anything. Binding name is deliberately 2+ chars (`value`, not
+        // `x`) — `insert_binding_name` has a documented `len >= 2` floor
+        // (mirrors `is_noise_callee`'s single-char skip) that would silently
+        // drop a single-char name and mask what this test is actually
+        // checking (scope attribution, not the length floor).
+        let src = "const loadTrack = () => {\n  let value = 1;\n  return value;\n};\n";
+        let bindings = collect_local_bindings(src, SupportLang::TypeScript);
+        assert!(
+            bindings.contains(&("loadTrack".to_string(), "value".to_string())),
+            "{bindings:?}"
+        );
+    }
+
+    #[test]
+    fn ts_local_bindings_nested_anonymous_const_attributes_to_enclosing_named_function() {
+        // `helper` is a `const`-assigned arrow function, but NOT a top-level
+        // one (nested inside named function `outer`) — per spec only a
+        // TOP-LEVEL const fn counts as a named scope, so `inner` must
+        // attribute to the nearest NAMED ancestor, `outer`, not to `helper`.
+        // Binding name is deliberately 2+ chars (`inner`, not `y`) — see the
+        // sibling test above for why a single-char name would mask this
+        // test's actual assertion behind the unrelated `len >= 2` floor in
+        // `insert_binding_name`.
+        let src = "function outer() {\n  const helper = () => {\n    let inner = 1;\n    return inner;\n  };\n  return helper();\n}\n";
+        let bindings = collect_local_bindings(src, SupportLang::TypeScript);
+        assert!(
+            bindings.contains(&("outer".to_string(), "inner".to_string())),
+            "{bindings:?}"
+        );
+        assert!(
+            !bindings.contains(&("helper".to_string(), "inner".to_string())),
+            "a non-top-level const-assigned closure is not a named scope: {bindings:?}"
+        );
+    }
+
+    #[test]
+    fn ts_local_bindings_module_level_block_scope_gets_empty_scope() {
+        // A `let` inside a top-level `if`/`try` block (not inside ANY named
+        // def) must scope to `""` — module-level, per spec.
+        let src =
+            "if (globalFlag) {\n  let moduleLevelThing = 1;\n  console.log(moduleLevelThing);\n}\n";
+        let bindings = collect_local_bindings(src, SupportLang::TypeScript);
+        assert!(
+            bindings.contains(&(String::new(), "moduleLevelThing".to_string())),
+            "{bindings:?}"
+        );
+    }
+
+    // ─── parse_clean (X4 adversarial review, Finding 3) ───
+
+    #[test]
+    fn parse_clean_true_for_well_formed_source() {
+        let frag = extract_graph_fragment(
+            "fn foo() {\n    helper();\n}\n",
+            SupportLang::Rust,
+            "a.rs",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        assert!(frag.parse_clean, "well-formed source must parse clean");
+    }
+
+    #[test]
+    fn parse_clean_false_for_source_with_syntax_error() {
+        // Malformed trailing content: tree-sitter's error recovery still
+        // extracts `foo` as a real def node (this is exactly the
+        // "one def still extracts despite an error elsewhere" shape Finding
+        // 3 is about), but the tree as a whole must NOT report clean.
+        let frag = extract_graph_fragment(
+            "fn foo() {\n    helper();\n}\nfn bar( {{{ !!! garbage not rust\n",
+            SupportLang::Rust,
+            "a.rs",
+            "repo",
+            "proj",
+            "c",
+            "s",
+        );
+        assert!(
+            frag.nodes
+                .iter()
+                .any(|n| n.name == "foo" && n.kind == "function"),
+            "the well-formed def must still extract despite the trailing error: {:?}",
+            frag.nodes
+        );
+        assert!(
+            !frag.parse_clean,
+            "a tree containing ERROR/MISSING nodes anywhere must not report clean"
         );
     }
 }

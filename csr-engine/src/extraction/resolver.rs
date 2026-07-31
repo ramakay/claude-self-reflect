@@ -248,6 +248,14 @@ struct Pending {
     /// already-classified, and every tier is skipped for it.
     boundary: String,
     name: String,
+    /// X4 adversarial review, Finding 1: the `code_nodes.name` of `src_id` —
+    /// the edge's own calling def (a function/method/const name), or, for a
+    /// module-level `calls`/`imports` edge, the synthetic module node's own
+    /// name, which IS the file path (`extract_inner`'s `mk_node`: `name:
+    /// file.into()`). The X4 tier's scope-equality check needs this to tell
+    /// "which function is this edge inside" apart from "no function at all
+    /// (module scope)" — see `classify_only`'s X4 block.
+    src_name: String,
 }
 
 /// Resolve all `name:<symbol>` placeholder edges within `project` (empty =
@@ -356,28 +364,39 @@ pub fn resolve_edges(
         }
     }
 
-    // Pass 1d (WCR truth pass, TASK 2): per (project, file) local-binding
-    // name set — the X4 tier's witness table, populated only by
-    // `eval::codegraph::backfill_wcr_witnesses` (see
+    // Pass 1d (WCR truth pass, TASK 2); scope-qualified by the X4
+    // adversarial review (Finding 1): per (project, file) set of
+    // `(scope, name)` local-binding pairs — the X4 tier's witness table,
+    // populated only by `eval::codegraph::backfill_wcr_witnesses` (see
     // `extraction::codegraph::collect_local_bindings`). Empty on every DB
     // this table hasn't been backfilled into — the X4 tier is then silent
     // by construction (an empty/missing `BTreeMap` entry never matches),
-    // not an error.
-    let mut local_bindings: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    // not an error. `scope` is the nearest enclosing named def's name (or
+    // `""` for a module-level binding) — WITHOUT it, a flat name-only set
+    // per (project, file) let a parameter named `handler` in one function
+    // wrongly classify an unrelated sibling function's own `handler()` call
+    // as local; see `classify_only`'s X4 block for the scope-equality check
+    // this feeds.
+    let mut local_bindings: BTreeMap<(String, String), BTreeSet<(String, String)>> =
+        BTreeMap::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT project, file, name FROM local_bindings WHERE (?1 = '' OR project = ?1)",
+            "SELECT project, file, scope, name FROM local_bindings WHERE (?1 = '' OR project = ?1)",
         )?;
         let rows = stmt.query_map(params![project], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         for r in rows {
-            let (proj, file, name) = r?;
-            local_bindings.entry((proj, file)).or_default().insert(name);
+            let (proj, file, scope, name) = r?;
+            local_bindings
+                .entry((proj, file))
+                .or_default()
+                .insert((scope, name));
         }
     }
 
@@ -385,7 +404,7 @@ pub fn resolve_edges(
     let mut pending: Vec<Pending> = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT e.src_id, e.dst_id, e.kind, n.file, n.project, e.callee_kind, e.evidence, e.boundary
+            "SELECT e.src_id, e.dst_id, e.kind, n.file, n.project, e.callee_kind, e.evidence, e.boundary, n.name
              FROM code_edges e JOIN code_nodes n ON n.id = e.src_id
              WHERE e.resolved = 0 AND e.dst_id LIKE 'name:%'
                AND (?1 = '' OR n.project = ?1)
@@ -401,11 +420,21 @@ pub fn resolve_edges(
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })?;
         for r in rows {
-            let (src_id, dst_id, kind, src_file, edge_project, callee_kind, evidence, boundary) =
-                r?;
+            let (
+                src_id,
+                dst_id,
+                kind,
+                src_file,
+                edge_project,
+                callee_kind,
+                evidence,
+                boundary,
+                src_name,
+            ) = r?;
             let name = dst_id.strip_prefix("name:").unwrap_or(&dst_id).to_string();
             pending.push(Pending {
                 src_id,
@@ -417,6 +446,7 @@ pub fn resolve_edges(
                 evidence,
                 boundary,
                 name,
+                src_name,
             });
         }
     }
@@ -824,7 +854,7 @@ fn classify_only(
     roots_cache: &mut BTreeMap<String, Vec<PathBuf>>,
     file_exists: &dyn Fn(&str) -> bool,
     zero_defs_anywhere: bool,
-    local_bindings: &BTreeMap<(String, String), BTreeSet<String>>,
+    local_bindings: &BTreeMap<(String, String), BTreeSet<(String, String)>>,
 ) -> Result<Option<&'static str>> {
     if let Some((boundary, evidence)) = builtin_tier(p) {
         // X0: language-defined prelude/builtin/global — runs before X1
@@ -877,9 +907,28 @@ fn classify_only(
     // parameter or local variable/destructuring target in the edge's own
     // (project, src_file) per `local_bindings` — real, disk-verified AST
     // evidence, not a name-shape guess.
+    //
+    // Scope-qualified as of the X4 adversarial review (Finding 1): a
+    // witness only counts when its SCOPE matches this edge's own calling
+    // symbol — `p.src_name` — not merely "some binding of this name exists
+    // somewhere in the file". Without this, a parameter named `handler` in
+    // one function would classify an unrelated sibling function's own
+    // `handler()` call as local, purely because both live in the same file.
+    // `caller_scope` mirrors `backfill_wcr_witnesses`'s own module-vs-
+    // function distinction (`src_name == src_file` — the synthetic module
+    // node's `code_nodes.name` IS the file path): a module-level edge's
+    // effective scope is `""`, matching only a module-level (`scope == ""`)
+    // binding witness; a function-scoped edge's effective scope is its own
+    // calling function's name, matching only a binding recorded with that
+    // SAME scope.
     if zero_defs_anywhere {
-        if let Some(names) = local_bindings.get(&(p.project.clone(), p.src_file.clone())) {
-            if names.contains(&p.name) {
+        if let Some(pairs) = local_bindings.get(&(p.project.clone(), p.src_file.clone())) {
+            let caller_scope: &str = if p.src_name == p.src_file {
+                ""
+            } else {
+                p.src_name.as_str()
+            };
+            if pairs.contains(&(caller_scope.to_string(), p.name.clone())) {
                 classify_edge(conn, p, "local", &format!("local_scope:{}", p.name))?;
                 return Ok(Some("local"));
             }
@@ -3320,10 +3369,13 @@ mod tests {
 
     // ─── X4 local-binding witness tier (WCR truth pass, TASK 2) ───
 
-    fn insert_local_binding(conn: &Connection, project: &str, file: &str, name: &str) {
+    /// `scope` (X4 adversarial review, Finding 1): the nearest enclosing
+    /// named def's name, or `""` for a module-level binding — see
+    /// `Pending::src_name`'s doc comment and `classify_only`'s X4 block.
+    fn insert_local_binding(conn: &Connection, project: &str, file: &str, scope: &str, name: &str) {
         conn.execute(
-            "INSERT OR IGNORE INTO local_bindings (project, file, name) VALUES (?1, ?2, ?3)",
-            params![project, file, name],
+            "INSERT OR IGNORE INTO local_bindings (project, file, scope, name) VALUES (?1, ?2, ?3, ?4)",
+            params![project, file, scope, name],
         )
         .unwrap();
     }
@@ -3341,7 +3393,8 @@ mod tests {
             &[call_edge("foo", "playTrack", "a.ts")],
         )
         .unwrap();
-        insert_local_binding(&conn, "proj", "a.ts", "playTrack");
+        // Scoped to "foo" — the SAME function the call site is inside.
+        insert_local_binding(&conn, "proj", "a.ts", "foo", "playTrack");
 
         let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
         assert_eq!(stats.local, 1);
@@ -3382,7 +3435,7 @@ mod tests {
             ],
         )
         .unwrap();
-        insert_local_binding(&conn, "proj", "a.ts", "playTrack");
+        insert_local_binding(&conn, "proj", "a.ts", "foo", "playTrack");
 
         let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
         assert_eq!(stats.total, 2);
@@ -3414,7 +3467,7 @@ mod tests {
         // "save" also happens to be a local binding name in a.rs itself —
         // must still not classify local, because a real def of "save"
         // exists (in b.rs).
-        insert_local_binding(&conn, "proj", "a.rs", "save");
+        insert_local_binding(&conn, "proj", "a.rs", "foo", "save");
 
         let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
         assert_eq!(stats.local, 0, "a real def elsewhere must block X4");
@@ -3442,7 +3495,7 @@ mod tests {
         upsert_node(&conn, &def("foo", "z.rs", "foo")).unwrap();
         codegraph::replace_file_edges(&conn, "proj", "z.rs", &[call_edge("foo", "bar", "z.rs")])
             .unwrap();
-        insert_local_binding(&conn, "proj", "z.rs", "bar");
+        insert_local_binding(&conn, "proj", "z.rs", "foo", "bar");
 
         let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
         assert_eq!(stats.local, 0);
@@ -3492,7 +3545,7 @@ mod tests {
             &[call_edge("foo", "playTrack", "a.ts")],
         )
         .unwrap();
-        insert_local_binding(&conn, "proj", "a.ts", "playTrack");
+        insert_local_binding(&conn, "proj", "a.ts", "foo", "playTrack");
 
         let first = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
         let second = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
@@ -3501,5 +3554,107 @@ mod tests {
             "local tier stays deterministic across repeated passes"
         );
         assert_eq!(first.local, 1);
+    }
+
+    // ─── X4 scope qualification (X4 adversarial review, Finding 1) ───
+
+    #[test]
+    fn x4_local_binding_scope_isolates_sibling_functions() {
+        // THE core Finding 1 regression: `handler` is bound only inside
+        // `sibling`, never inside `foo` — a flat, scope-blind name-set per
+        // (project, file) would wrongly classify BOTH edges below as local
+        // (the bug). Scope-qualified, only `sibling`'s own call may match.
+        let conn = mem();
+        upsert_node(&conn, &def("foo", "a.ts", "foo")).unwrap();
+        upsert_node(&conn, &def("sibling", "a.ts", "sibling")).unwrap();
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.ts",
+            &[
+                call_edge("foo", "handler", "a.ts"),
+                call_edge("sibling", "handler", "a.ts"),
+            ],
+        )
+        .unwrap();
+        insert_local_binding(&conn, "proj", "a.ts", "sibling", "handler");
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(stats.local, 1, "only sibling's own call may classify local");
+        assert_eq!(
+            stats.unexplained, 1,
+            "foo's call to a same-named but differently-scoped binding stays unexplained"
+        );
+
+        let foo_boundary: String = conn
+            .query_row(
+                "SELECT boundary FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            foo_boundary, "",
+            "foo must NOT classify local — the binding belongs to sibling, not foo"
+        );
+
+        let sibling_boundary: String = conn
+            .query_row(
+                "SELECT boundary FROM code_edges WHERE src_id = 'sibling' AND kind = 'calls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sibling_boundary, "local",
+            "sibling's own call, in its own scope, must classify local"
+        );
+    }
+
+    #[test]
+    fn x4_module_level_binding_matches_only_module_level_edges() {
+        // Both directions of the module-vs-function scope boundary in one
+        // deterministic test: a module-scope (`scope == ""`) binding must
+        // match only a module-level edge (src node name == src file), and a
+        // function-scope binding must match only its own function's edge —
+        // neither leaks into the other.
+        let conn = mem();
+        upsert_node(&conn, &module_node("mod_a", "a.ts")).unwrap();
+        upsert_node(&conn, &def("foo", "a.ts", "foo")).unwrap();
+        insert_local_binding(&conn, "proj", "a.ts", "", "ghostGlobal");
+        insert_local_binding(&conn, "proj", "a.ts", "foo", "onlyInFoo");
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            "a.ts",
+            &[
+                // E1: module edge -> module-scope binding. Must classify.
+                call_edge("mod_a", "ghostGlobal", "a.ts"),
+                // E2: function edge -> module-scope binding. Must NOT.
+                call_edge("foo", "ghostGlobal", "a.ts"),
+                // E3: module edge -> function-scope binding. Must NOT.
+                call_edge("mod_a", "onlyInFoo", "a.ts"),
+                // E4: function edge -> its OWN function-scope binding. Must.
+                call_edge("foo", "onlyInFoo", "a.ts"),
+            ],
+        )
+        .unwrap();
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(stats.local, 2, "only E1 and E4 classify local");
+        assert_eq!(stats.unexplained, 2, "E2 and E3 stay unexplained");
+
+        let boundary_of = |src: &str, dst_name: &str| -> String {
+            conn.query_row(
+                "SELECT boundary FROM code_edges WHERE src_id = ?1 AND dst_id = ?2 AND kind = 'calls'",
+                params![src, format!("name:{dst_name}")],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(boundary_of("mod_a", "ghostGlobal"), "local", "E1");
+        assert_eq!(boundary_of("foo", "ghostGlobal"), "", "E2");
+        assert_eq!(boundary_of("mod_a", "onlyInFoo"), "", "E3");
+        assert_eq!(boundary_of("foo", "onlyInFoo"), "local", "E4");
     }
 }
