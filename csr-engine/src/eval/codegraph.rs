@@ -1444,7 +1444,13 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                                         // honest drift classification a missing
                                         // legacy correspondence gets, immediately
                                         // below — never a guessed re-point.
-                                        mark_drifted(shadow, &src_id, &dst_id, "calls")?;
+                                        mark_drifted(
+                                            shadow,
+                                            &src_id,
+                                            &dst_id,
+                                            "calls",
+                                            &edge_src_content_hash,
+                                        )?;
                                     }
                                 }
                                 Some(_) => {
@@ -1467,9 +1473,24 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                                     // through to the ordinary drift guard —
                                     // honest classification, not permanently
                                     // stuck merely because the bare name
-                                    // survives SOMEWHERE ELSE.
+                                    // survives SOMEWHERE ELSE. NOTE: unlike
+                                    // the correspondence branch above, this
+                                    // arm has no legacy-correspondence match
+                                    // to gate on — `can_drift` alone would
+                                    // let an empty-stamped legacy edge earn
+                                    // drift credit (Codex round 8). The
+                                    // empty-stamp invariant is enforced
+                                    // structurally inside `mark_drifted`
+                                    // itself now, not here — see its doc
+                                    // comment.
                                     if can_drift {
-                                        mark_drifted(shadow, &src_id, &dst_id, "calls")?;
+                                        mark_drifted(
+                                            shadow,
+                                            &src_id,
+                                            &dst_id,
+                                            "calls",
+                                            &edge_src_content_hash,
+                                        )?;
                                     }
                                 }
                             }
@@ -1481,8 +1502,19 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                                 // function survived, but this callee isn't in
                                 // the fresh fragment AT ALL (any src) — the
                                 // call site genuinely drifted out of the source
-                                // since this edge was recorded.
-                                mark_drifted(shadow, &src_id, &dst_id, "calls")?;
+                                // since this edge was recorded. Codex round 8:
+                                // `can_drift` says nothing about the edge's
+                                // own content stamp — `mark_drifted` itself
+                                // is the structural guard against drifting an
+                                // empty-stamped legacy edge here; see its doc
+                                // comment.
+                                mark_drifted(
+                                    shadow,
+                                    &src_id,
+                                    &dst_id,
+                                    "calls",
+                                    &edge_src_content_hash,
+                                )?;
                             }
                             // else: leave untouched — (b) or (c) failed, so an
                             // unmatched edge is not trustworthy drift evidence.
@@ -1555,22 +1587,49 @@ fn backfill_wcr_witnesses(shadow: &Arc<Storage>) -> Result<(usize, usize)> {
                                     // Content-identity gate failed on a
                                     // non-empty, MISMATCHED hash — same fall
                                     // through as the `calls` arm above.
-                                    mark_drifted(shadow, &src_id, &dst_id, "imports")?;
+                                    mark_drifted(
+                                        shadow,
+                                        &src_id,
+                                        &dst_id,
+                                        "imports",
+                                        &edge_src_content_hash,
+                                    )?;
                                 }
                             }
                             Some(_) => {
                                 // ambiguous — never guess. Leave untouched.
                             }
                             None => {
+                                // Codex round 8: same empty-stamp exposure as
+                                // the `calls` `None` arm above — no
+                                // legacy-correspondence match to gate on
+                                // here, so `mark_drifted` itself is what
+                                // stops an empty-stamped legacy edge from
+                                // earning drift credit; see its doc comment.
                                 if can_drift {
-                                    mark_drifted(shadow, &src_id, &dst_id, "imports")?;
+                                    mark_drifted(
+                                        shadow,
+                                        &src_id,
+                                        &dst_id,
+                                        "imports",
+                                        &edge_src_content_hash,
+                                    )?;
                                 }
                             }
                         }
                     }
                     _ => {
+                        // Codex round 8: same as the `calls` catch-all arm
+                        // above — `mark_drifted` is the structural guard
+                        // against drifting an empty-stamped legacy edge.
                         if can_drift {
-                            mark_drifted(shadow, &src_id, &dst_id, "imports")?;
+                            mark_drifted(
+                                shadow,
+                                &src_id,
+                                &dst_id,
+                                "imports",
+                                &edge_src_content_hash,
+                            )?;
                         }
                         // else: leave untouched — see the `calls` arm above.
                     }
@@ -1860,7 +1919,43 @@ fn repoint_or_dedupe_edge(
 /// `callee_kind`/`evidence` update `backfill_wcr_witnesses` just made.
 /// Leaves `resolved` at 0 and `dst_id` untouched — drifted edges never
 /// bind, they are classified, exactly like the resolver's `stale` tier.
-fn mark_drifted(shadow: &Arc<Storage>, src_id: &str, dst_id: &str, kind: &str) -> Result<()> {
+///
+/// WCR truth pass, Codex round 8 (the empty-stamp invariant): `can_drift`
+/// alone is NOT sufficient to drift an edge — it says nothing about whether
+/// the edge's OWN `src_content_hash` stamp is present. An edge with an empty
+/// stamp is a legacy row, written before content stamping existed (see
+/// `historical_src_content_unchanged`'s doc comment): it carries no provable
+/// link to any recorded file state, so its absence from a fresh extraction
+/// proves nothing — the call may still exist, just unprovably so under the
+/// new attribution. Round 7 already established this for the two branches
+/// that check it explicitly (the re-point content-identity gate's
+/// `else if edge_src_content_hash.is_empty()` arms), but every OTHER path
+/// into this function — a missing legacy correspondence, an ambiguous bare
+/// name with zero candidates, a callee entirely absent from the fresh
+/// fragment — called this function on `can_drift` alone, with no
+/// content-hash check at all, and so COULD drift an unstamped edge. Rather
+/// than trust every present and future call site to repeat that check
+/// individually (the round-7 fix required exactly two call sites to
+/// remember it; round 8 found four more that hadn't), the guard now lives
+/// HERE, structurally, as a required parameter: no path — none, ever — can
+/// drift an edge without first supplying its own stamp, and an empty stamp
+/// is unconditionally a silent no-op (pending, unexplained, empty boundary
+/// — never a guess in either direction). A non-empty, MISMATCHED stamp is
+/// unaffected: that IS positive drift evidence (the file provably changed
+/// since the edge was recorded) and still drifts, exactly as before — this
+/// guard only ever blocks the empty case, never a matched or mismatched one.
+fn mark_drifted(
+    shadow: &Arc<Storage>,
+    src_id: &str,
+    dst_id: &str,
+    kind: &str,
+    edge_src_content_hash: &str,
+) -> Result<()> {
+    if edge_src_content_hash.is_empty() {
+        // No stamp, no evidence — leave pending/unexplained. See the doc
+        // comment above for the full invariant.
+        return Ok(());
+    }
     shadow.with_connection(|conn| {
         conn.execute(
             "UPDATE code_edges SET boundary = 'drifted', evidence = 'not_in_current_source'
@@ -3394,12 +3489,24 @@ mod tests {
         // the fresh fragment (condition (b) and (c) both hold), so
         // `ghost_call` genuinely having no match is trustworthy drift
         // evidence.
+        //
+        // POSITIVE CONTROL (Codex round 8, mandated): `ghost_call`'s edge is
+        // stamped with a hash that MATCHES the fresh file's own recomputed
+        // hash — proving the round-8 empty-stamp invariant (see
+        // `mark_drifted`'s doc comment) does not over-block: a genuinely
+        // stamped edge still drifts via the ordinary `can_drift` guard, even
+        // when the stamp happens to match current content, as long as it is
+        // non-empty. See
+        // `backfill_leaves_empty_stamped_calls_edge_unresolved_when_callee_absent_from_fresh_fragment`,
+        // immediately below, for the sibling regression test — same
+        // scenario, but with an EMPTY stamp, which must NOT drift.
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.rs");
         // Fresh, on-disk truth: `foo` now only calls `helper` — the shadow
         // below also carries a pending edge for `ghost_call`, which the
         // current source no longer contains at all.
-        std::fs::write(&file_path, "fn foo() {\n    helper();\n}\n").unwrap();
+        let source = "fn foo() {\n    helper();\n}\n";
+        std::fs::write(&file_path, source).unwrap();
         let file_str = file_path.to_string_lossy().to_string();
 
         let shadow = Arc::new(Storage::open_memory().unwrap());
@@ -3411,7 +3518,10 @@ mod tests {
                 &file_str,
                 &[
                     stale_calls_edge(&foo_id, "helper", &file_str, "direct"),
-                    stale_calls_edge(&foo_id, "ghost_call", &file_str, "direct"),
+                    EdgeRow {
+                        src_content_hash: crate::extraction::codegraph::body_hash(source),
+                        ..stale_calls_edge(&foo_id, "ghost_call", &file_str, "direct")
+                    },
                 ],
             )
             .unwrap();
@@ -3463,6 +3573,69 @@ mod tests {
             ghost_dst_id, "name:ghost_call",
             "dst_id stays the placeholder"
         );
+    }
+
+    #[test]
+    fn backfill_leaves_empty_stamped_calls_edge_unresolved_when_callee_absent_from_fresh_fragment()
+    {
+        // MANDATED REGRESSION (Codex round 8 adversarial review, item 2 —
+        // the empty-stamp invariant): same scenario as
+        // `backfill_marks_drifted_for_edges_vanished_from_fresh_extraction`
+        // immediately above (`ghost_call` absent from the fresh fragment
+        // entirely, `calls_any_src.get("ghost_call")` misses outright, hits
+        // the catch-all `_` arm), except `ghost_call`'s edge carries NO
+        // stamp at all (`stale_calls_edge`'s default empty
+        // `src_content_hash` — a legacy row, written before content
+        // stamping existed). Before this fix, the catch-all arm called
+        // `mark_drifted` on `can_drift` alone, with no content-hash check —
+        // an unstamped legacy edge could earn drift credit here even though
+        // there is no evidence either way about whether this file's content
+        // has changed since the edge was recorded. After the fix, the empty
+        // stamp is a structural precondition inside `mark_drifted` itself:
+        // the edge stays pending, unexplained, empty boundary — never a
+        // guess in either direction. See that function's doc comment for
+        // the full invariant.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.rs");
+        std::fs::write(&file_path, "fn foo() {\n    helper();\n}\n").unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let foo_id = crate::extraction::codegraph::node_id("repo", &file_str, "function", "foo");
+        seed_backfill_node(&shadow, &foo_id, &file_str, "foo");
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                // Deliberately unstamped — `stale_calls_edge`'s default
+                // `src_content_hash` is "".
+                &[stale_calls_edge(&foo_id, "ghost_call", &file_str, "direct")],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1, "the on-disk file was re-extracted");
+        assert_eq!(edges, 0, "an unstamped edge is never counted as updated");
+
+        let (boundary, evidence, resolved): (String, String, i64) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT boundary, evidence, resolved FROM code_edges
+                     WHERE src_id = ?1 AND dst_id = 'name:ghost_call'",
+                    [&foo_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            boundary, "",
+            "an empty-stamped legacy edge must NEVER earn drift credit, even when the \
+             callee is genuinely absent from the fresh fragment — no stamp means no \
+             provable link to any recorded file state"
+        );
+        assert_eq!(evidence, "", "left completely untouched, not just boundary");
+        assert_eq!(resolved, 0, "still pending, never classified either way");
     }
 
     #[test]
@@ -3605,11 +3778,95 @@ mod tests {
         // `calls` edges targeting the literal name `import` (predating the
         // noise filter that now drops it at extraction time) were
         // permanently stuck `unexplained` because every one is module-scoped.
+        //
+        // POSITIVE CONTROL (Codex round 8, mandated): the edge is stamped
+        // with a hash that MATCHES the fresh file's own recomputed hash —
+        // see `backfill_marks_drifted_for_edges_vanished_from_fresh_extraction`'s
+        // own positive-control comment, above, for the full rationale. See
+        // `backfill_leaves_empty_stamped_imports_edge_unresolved_when_callee_absent_from_fresh_fragment`,
+        // immediately below, for the sibling regression — same scenario,
+        // empty stamp, must NOT drift.
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.rs");
         // Fresh, on-disk truth: `foo` is defined (real structure exists —
         // condition (b) holds) but the file no longer imports `ghost_module`
         // at all.
+        let source = "fn foo() {}\n";
+        std::fs::write(&file_path, source).unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let module_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "module", &file_str);
+        shadow
+            .upsert_code_node(&NodeRow {
+                id: module_id.clone(),
+                repo: "repo".into(),
+                project: "proj".into(),
+                file: file_str.clone(),
+                lang: "rust".into(),
+                kind: "module".into(),
+                name: file_str.clone(),
+                first_conv_id: "c".into(),
+                last_conv_id: "c".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[EdgeRow {
+                    src_id: module_id.clone(),
+                    dst_id: "name:ghost_module".into(),
+                    kind: "imports".into(),
+                    src_file: file_str.clone(),
+                    resolved: 0,
+                    weight: 1.0,
+                    src_content_hash: crate::extraction::codegraph::body_hash(source),
+                    ..EdgeRow::default()
+                }],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1, "the on-disk file was re-extracted");
+        assert_eq!(edges, 0, "ghost_module has no match in the fresh fragment");
+
+        let (boundary, evidence, resolved): (String, String, i64) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT boundary, evidence, resolved FROM code_edges
+                     WHERE src_id = ?1 AND dst_id = 'name:ghost_module'",
+                    [&module_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            boundary, "drifted",
+            "a module-scoped edge must be drift-eligible too, not stuck unexplained forever"
+        );
+        assert_eq!(evidence, "not_in_current_source");
+        assert_eq!(resolved, 0);
+    }
+
+    #[test]
+    fn backfill_leaves_empty_stamped_imports_edge_unresolved_when_callee_absent_from_fresh_fragment(
+    ) {
+        // MANDATED REGRESSION (Codex round 8 adversarial review, item 4 —
+        // the empty-stamp invariant, imports side): same scenario as
+        // `backfill_marks_drifted_for_a_module_scoped_edge_when_import_symbol_vanishes`
+        // immediately above (`ghost_module` absent from the fresh fragment
+        // entirely, hits the `imports` catch-all `_` arm), except the edge
+        // carries NO stamp at all. Before this fix, the catch-all arm called
+        // `mark_drifted` on `can_drift` alone; after the fix, `mark_drifted`
+        // itself refuses an empty stamp structurally — the edge stays
+        // pending, unexplained, empty boundary. See `mark_drifted`'s doc
+        // comment for the full invariant.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.rs");
         std::fs::write(&file_path, "fn foo() {}\n").unwrap();
         let file_str = file_path.to_string_lossy().to_string();
 
@@ -3641,6 +3898,8 @@ mod tests {
                     src_file: file_str.clone(),
                     resolved: 0,
                     weight: 1.0,
+                    // Deliberately unstamped — `EdgeRow::default()`'s
+                    // `src_content_hash` is "".
                     ..EdgeRow::default()
                 }],
             )
@@ -3648,7 +3907,7 @@ mod tests {
 
         let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
         assert_eq!(files, 1, "the on-disk file was re-extracted");
-        assert_eq!(edges, 0, "ghost_module has no match in the fresh fragment");
+        assert_eq!(edges, 0, "an unstamped edge is never counted as updated");
 
         let (boundary, evidence, resolved): (String, String, i64) = shadow
             .with_connection(|conn| {
@@ -3662,11 +3921,85 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            boundary, "drifted",
-            "a module-scoped edge must be drift-eligible too, not stuck unexplained forever"
+            boundary, "",
+            "an empty-stamped legacy imports edge must NEVER earn drift credit, even when \
+             the imported symbol is genuinely absent from the fresh fragment"
         );
-        assert_eq!(evidence, "not_in_current_source");
-        assert_eq!(resolved, 0);
+        assert_eq!(evidence, "", "left completely untouched, not just boundary");
+        assert_eq!(resolved, 0, "still pending, never classified either way");
+    }
+
+    #[test]
+    fn backfill_leaves_empty_stamped_imports_edge_unresolved_when_legacy_correspondence_absent() {
+        // MANDATED REGRESSION (Codex round 8 adversarial review, item 3 —
+        // the empty-stamp invariant, imports `None`-correspondence arm):
+        // real `imports` edges are ALWAYS module-sourced (see
+        // `extract_inner`'s imports loop — `legacy_src_name` and
+        // `current_src_name` are both unconditionally `file`), so the
+        // `imports` `None`-correspondence arm is unreachable through
+        // ordinary extraction — but it exists in the code and must still be
+        // structurally guarded, so this test reaches it directly: the
+        // PENDING edge is deliberately constructed with a non-module
+        // `src_id` (`foo`, a real function) so its lookup misses the
+        // exact-match arm (candidates only ever key on the module's own
+        // name) and its legacy correspondence key, `(imports,
+        // "ghost_module", "foo")`, can never be found (every real
+        // `call_attribution_pairs` imports entry is keyed `(file, file,
+        // ...)`, never `(foo, ..., ...)`), hitting the `None` arm. `foo` is
+        // a live def in the fresh fragment, so `can_drift` is true via
+        // condition (b)/(c) — before this fix, that alone would have earned
+        // this empty-stamped legacy edge drift credit; after the fix,
+        // `mark_drifted` itself refuses. See that function's doc comment
+        // for the full invariant.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.rs");
+        std::fs::write(&file_path, "use crate::ghost_module;\nfn foo() {}\n").unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let foo_id = crate::extraction::codegraph::node_id("repo", &file_str, "function", "foo");
+        seed_backfill_node(&shadow, &foo_id, &file_str, "foo");
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                &[EdgeRow {
+                    src_id: foo_id.clone(),
+                    dst_id: "name:ghost_module".into(),
+                    kind: "imports".into(),
+                    src_file: file_str.clone(),
+                    resolved: 0,
+                    weight: 1.0,
+                    // Deliberately unstamped — `EdgeRow::default()`'s
+                    // `src_content_hash` is "".
+                    ..EdgeRow::default()
+                }],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1, "the on-disk file was re-extracted");
+        assert_eq!(edges, 0, "an unstamped edge is never counted as updated");
+
+        let (boundary, evidence, resolved): (String, String, i64) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT boundary, evidence, resolved FROM code_edges
+                     WHERE src_id = ?1 AND dst_id = 'name:ghost_module'",
+                    [&foo_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            boundary, "",
+            "an empty-stamped legacy imports edge must NEVER earn drift credit, even when \
+             no legacy correspondence exists to rescue it — no stamp means no provable link \
+             to any recorded file state"
+        );
+        assert_eq!(evidence, "", "left completely untouched, not just boundary");
+        assert_eq!(resolved, 0, "still pending, never classified either way");
     }
 
     #[test]
@@ -4450,13 +4783,18 @@ mod tests {
         // onto `alpha`, corrupting provenance and silently suppressing
         // this legitimate drift. After the fix, the edge correctly falls
         // through to the ordinary drift guard and drifts honestly.
+        //
+        // POSITIVE CONTROL (Codex round 8, mandated): stamped with a hash
+        // matching the fresh file's own recomputed hash — see
+        // `backfill_marks_drifted_for_edges_vanished_from_fresh_extraction`'s
+        // own positive-control comment for the full rationale. See
+        // `backfill_leaves_empty_stamped_calls_edge_unresolved_when_legacy_correspondence_absent`,
+        // immediately below, for the sibling regression — same scenario,
+        // empty stamp, must NOT drift.
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.rs");
-        std::fs::write(
-            &file_path,
-            "fn ghost() {}\nfn alpha() {\n    helper();\n}\n",
-        )
-        .unwrap();
+        let source = "fn ghost() {}\nfn alpha() {\n    helper();\n}\n";
+        std::fs::write(&file_path, source).unwrap();
         let file_str = file_path.to_string_lossy().to_string();
 
         let shadow = Arc::new(Storage::open_memory().unwrap());
@@ -4470,7 +4808,10 @@ mod tests {
             .replace_code_file_edges(
                 "proj",
                 &file_str,
-                &[stale_calls_edge(&ghost_id, "helper", &file_str, "direct")],
+                &[EdgeRow {
+                    src_content_hash: crate::extraction::codegraph::body_hash(source),
+                    ..stale_calls_edge(&ghost_id, "helper", &file_str, "direct")
+                }],
             )
             .unwrap();
 
@@ -4508,6 +4849,76 @@ mod tests {
     }
 
     #[test]
+    fn backfill_leaves_empty_stamped_calls_edge_unresolved_when_legacy_correspondence_absent() {
+        // MANDATED REGRESSION (Codex round 8 adversarial review, item 1 —
+        // the empty-stamp invariant): same scenario as
+        // `backfill_drifts_ghost_call_removal_despite_unrelated_direct_survivor`
+        // immediately above (`ghost`'s own call to `helper()` was removed;
+        // `alpha`'s unrelated direct call means `helper` bare-name survives
+        // but never legacy-corresponds to `ghost` — `call_legacy_correspondence`
+        // misses, hitting the `None` arm), except `ghost`'s edge carries NO
+        // stamp at all. Before this fix, the `None` arm called `mark_drifted`
+        // on `can_drift` alone, with no content-hash check — an unstamped
+        // legacy edge could earn drift credit here even though there is no
+        // evidence either way about whether this file's content has changed
+        // since the edge was recorded. After the fix, `mark_drifted` itself
+        // refuses an empty stamp structurally — the edge stays pending,
+        // unexplained, empty boundary. See that function's doc comment for
+        // the full invariant.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("a.rs");
+        std::fs::write(
+            &file_path,
+            "fn ghost() {}\nfn alpha() {\n    helper();\n}\n",
+        )
+        .unwrap();
+        let file_str = file_path.to_string_lossy().to_string();
+
+        let shadow = Arc::new(Storage::open_memory().unwrap());
+        let ghost_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "ghost");
+        seed_backfill_node(&shadow, &ghost_id, &file_str, "ghost");
+        let alpha_id =
+            crate::extraction::codegraph::node_id("repo", &file_str, "function", "alpha");
+        seed_backfill_node(&shadow, &alpha_id, &file_str, "alpha");
+        shadow
+            .replace_code_file_edges(
+                "proj",
+                &file_str,
+                // Deliberately unstamped — `stale_calls_edge`'s default
+                // `src_content_hash` is "".
+                &[stale_calls_edge(&ghost_id, "helper", &file_str, "direct")],
+            )
+            .unwrap();
+
+        let (files, edges) = backfill_wcr_witnesses(&shadow).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(edges, 0, "an unstamped edge is never counted as updated");
+
+        let (src_id, boundary, evidence, resolved): (String, String, String, i64) = shadow
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT src_id, boundary, evidence, resolved FROM code_edges
+                     WHERE dst_id = 'name:helper' AND kind = 'calls'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(src_id, ghost_id, "drift-or-not never moves src_id");
+        assert_ne!(src_id, alpha_id);
+        assert_eq!(
+            boundary, "",
+            "an empty-stamped legacy edge must NEVER earn drift credit, even when no \
+             legacy correspondence exists to rescue it — no stamp means no provable link \
+             to any recorded file state"
+        );
+        assert_eq!(evidence, "", "left completely untouched, not just boundary");
+        assert_eq!(resolved, 0, "still pending, never classified either way");
+    }
+
+    #[test]
     fn backfill_never_repoints_module_src_edge_when_closure_removed_and_unrelated_direct_survivor_exists(
     ) {
         // MANDATED TEST (Codex round 5 adversarial review, scenario 3): the
@@ -4525,9 +4936,18 @@ mod tests {
         // named ghost. The edge must fall through to the ordinary drift
         // guard, which — for a module-src edge — always drifts (condition
         // (c)'s `src_name == src_file` case).
+        //
+        // POSITIVE CONTROL (Codex round 8, mandated): stamped with a hash
+        // matching the fresh file's own recomputed hash so this test keeps
+        // exercising genuine drift under the empty-stamp invariant added to
+        // `mark_drifted` — see that function's doc comment, and
+        // `backfill_leaves_empty_stamped_calls_edge_unresolved_when_legacy_correspondence_absent`
+        // for the dedicated empty-stamp regression covering this same
+        // `None`-correspondence branch.
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.tsx");
-        std::fs::write(&file_path, "function Alpha() {\n    helper();\n}\n").unwrap();
+        let source = "function Alpha() {\n    helper();\n}\n";
+        std::fs::write(&file_path, source).unwrap();
         let file_str = file_path.to_string_lossy().to_string();
 
         let shadow = Arc::new(Storage::open_memory().unwrap());
@@ -4575,6 +4995,7 @@ mod tests {
                     resolved: 0,
                     weight: 1.0,
                     callee_kind: "direct".into(),
+                    src_content_hash: crate::extraction::codegraph::body_hash(source),
                     ..EdgeRow::default()
                 }],
             )
@@ -5115,7 +5536,8 @@ mod tests {
     fn backfill_drift_marking_is_deterministic_across_repeated_backfills() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("a.rs");
-        std::fs::write(&file_path, "fn foo() {\n    helper();\n}\n").unwrap();
+        let source = "fn foo() {\n    helper();\n}\n";
+        std::fs::write(&file_path, source).unwrap();
         let file_str = file_path.to_string_lossy().to_string();
 
         let shadow = Arc::new(Storage::open_memory().unwrap());
@@ -5127,7 +5549,14 @@ mod tests {
                 &file_str,
                 &[
                     stale_calls_edge(&foo_id, "helper", &file_str, "direct"),
-                    stale_calls_edge(&foo_id, "ghost_call", &file_str, "direct"),
+                    // Stamped (Codex round 8 empty-stamp invariant) so this
+                    // determinism test still exercises the genuine-drift
+                    // path, not the (also deterministic, but different)
+                    // empty-stamp no-op path.
+                    EdgeRow {
+                        src_content_hash: crate::extraction::codegraph::body_hash(source),
+                        ..stale_calls_edge(&foo_id, "ghost_call", &file_str, "direct")
+                    },
                 ],
             )
             .unwrap();
