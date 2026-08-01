@@ -21,8 +21,27 @@
 //! Run (required env):
 //!   CSR_ABLATION_DB=... CSR_ABLATION_PROJECTS=... CSR_ABLATION_OUT=... \
 //!     cargo run --release --example codegraph_ablation
+//!
+//! Query set (optional — external gold/query file):
+//!   By default this harness runs the hardcoded 20-query set below (Q1-Q12 + A1-A8),
+//!   byte-identical to prior runs. To run a different query set (e.g. eval-kit/ag's
+//!   Anukriti gold), pass its path as CLI arg 1 or via CSR_ABLATION_QUERIES:
+//!
+//!   CSR_ABLATION_DB=... CSR_ABLATION_PROJECTS=... CSR_ABLATION_OUT=... \
+//!     cargo run --release --example codegraph_ablation -- /path/to/queries_or_gold.json
+//!
+//!   Accepted shapes (mirrors eval-kit/e2's queries.json representation):
+//!     - a top-level JSON array of {"id": "...", "text": "..."} objects ("query" is
+//!       accepted as an alias for "text", so a combined gold file's own query field
+//!       name doesn't need renaming), OR
+//!     - a JSON object with a top-level "queries" array of the same item shape (so a
+//!       combined gold.json with sibling keys like "mapped"/"grades" can be pointed at
+//!       directly — this harness only reads the "queries" array out of it; scoring
+//!       reads the rest via eval-kit/ag/score.py).
+//!   The frozen-snapshot + sha256 verification workflow is unchanged — CSR_ABLATION_DB
+//!   still names the frozen read-only clone; only the query set is parameterized here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -231,6 +250,19 @@ fn select_seed_indexes(hit_contents: &[Option<&str>], query_lower: &str, n: usiz
     let (non_echo, echo): (Vec<usize>, Vec<usize>) = (0..hit_contents.len())
         .partition(|&i| !hit_contents[i].is_some_and(|c| is_query_echo(c, query_lower)));
     non_echo.into_iter().chain(echo).take(n).collect()
+}
+
+/// Total order for ranking candidates: score descending, id ascending as a tie-break.
+/// Every candidate pool in this harness is built via a `HashMap<String, Candidate>`
+/// (dedup by id) or a `HashSet<String>` (dedup by conv), and both have per-process
+/// random iteration order — without a deterministic tie-break, candidates with equal
+/// scores land in different relative order run-to-run even though the *set* of
+/// candidates and their scores is identical. `total_cmp` is used for the score compare
+/// (NaN-safe, matches the harness's existing float-ordering convention) and `id` is
+/// compared lexicographically as specified — never leave a HashMap/HashSet iteration
+/// order to decide output order.
+fn cmp_candidates(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
 }
 
 fn push_candidate(pool: &mut HashMap<String, Candidate>, c: Candidate) {
@@ -480,7 +512,11 @@ fn ast_neighbor_convs(graph: &AstGraph, edges: &EdgeIndex, seed_conv: &str) -> V
     let Some(seed_nodes) = graph.convs_to_nodes.get(seed_conv) else {
         return Vec::new();
     };
-    let mut candidates: HashSet<String> = HashSet::new();
+    // BTreeSet, not HashSet: this collects into a Vec below, and HashSet iteration order
+    // is per-process random. cmp_candidates re-sorts every downstream candidate list by
+    // (score, id) so this ordering can't leak into final output today, but keeping the
+    // dedup step itself deterministic removes the dependency on that downstream re-sort.
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
     let mut collect = |neighbor_id: &str| {
         if let Some((fc, lc)) = graph.node_convs.get(neighbor_id) {
             if !fc.is_empty() && fc != seed_conv {
@@ -552,7 +588,7 @@ async fn walk_knn(engine: &Engine, query_vec: &[f32]) -> Result<Vec<Candidate>> 
         }
     }
     let mut fused: Vec<Candidate> = pool.into_values().collect();
-    fused.sort_by(|a, b| b.score.total_cmp(&a.score));
+    fused.sort_by(cmp_candidates);
     fused.truncate(K);
     Ok(fused)
 }
@@ -683,7 +719,7 @@ async fn walk_common_base(
                     }
                 }
             }
-            graph_cands.sort_by(|a, b| b.score.total_cmp(&a.score));
+            graph_cands.sort_by(cmp_candidates);
             graph_cands.truncate(GRAPH_CAP_PER_SEED);
             for c in graph_cands {
                 push_candidate(&mut pool, c);
@@ -712,7 +748,7 @@ async fn walk_common_base(
                     });
                 }
             }
-            ast_cands.sort_by(|a, b| b.score.total_cmp(&a.score));
+            ast_cands.sort_by(cmp_candidates);
             ast_cands.truncate(GRAPH_CAP_PER_SEED);
             for c in ast_cands {
                 push_candidate(&mut pool, c);
@@ -736,7 +772,7 @@ async fn walk_common_base(
     }
 
     let mut fused: Vec<Candidate> = pool.into_values().collect();
-    fused.sort_by(|a, b| b.score.total_cmp(&a.score));
+    fused.sort_by(cmp_candidates);
 
     // Whole-pool detail (not top-K only) so rerank can promote lower raw-score origins.
     let chunk_pool_ids: Vec<String> = fused
@@ -762,8 +798,72 @@ async fn walk_common_base(
     Ok((fused, ast_fired))
 }
 
+/// Resolves the query set: CLI arg 1, else env var `CSR_ABLATION_QUERIES`, else the
+/// hardcoded `QUERIES` default (byte-identical output path — nothing reads a file, and
+/// the returned tuples are the same id/text pairs in the same order). Returns the loaded
+/// pairs plus a human-readable source description for the startup log line only (never
+/// written to the output JSONL, so the default path's output bytes are unaffected by this
+/// function's existence).
+fn load_queries() -> Result<(Vec<(String, String)>, String)> {
+    let path = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("CSR_ABLATION_QUERIES").ok());
+
+    let Some(path) = path else {
+        let defaults = QUERIES
+            .iter()
+            .map(|(id, text)| (id.to_string(), text.to_string()))
+            .collect();
+        return Ok((defaults, "hardcoded 20-query default".to_string()));
+    };
+
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("read queries file {path}"))?;
+    let val: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse queries JSON {path}"))?;
+    let arr: Vec<serde_json::Value> = match &val {
+        serde_json::Value::Array(a) => a.clone(),
+        serde_json::Value::Object(o) => o
+            .get("queries")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{path}: expected a top-level array or an object with a \"queries\" array"
+                )
+            })?,
+        _ => anyhow::bail!(
+            "{path}: expected a top-level JSON array or an object with a \"queries\" key"
+        ),
+    };
+
+    let mut out = Vec::with_capacity(arr.len());
+    for item in &arr {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("{path}: query item missing string \"id\": {item}"))?
+            .to_string();
+        let text = item
+            .get("text")
+            .or_else(|| item.get("query"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("{path}: query item {id} missing string \"text\"/\"query\"")
+            })?
+            .to_string();
+        out.push((id, text));
+    }
+    anyhow::ensure!(!out.is_empty(), "{path}: no queries found");
+    let n = out.len();
+    Ok((out, format!("{path} (n={n})")))
+}
+
 fn distinct_convs_in_order(cands: &[Candidate]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
+    // HashSet is safe here: it's used only as a seen-before membership test, never
+    // iterated — the output order comes entirely from `cands`' own (already
+    // deterministic, post-cmp_candidates-sort) order below.
+    let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
     for c in cands {
         if seen.insert(c.conversation_id.clone()) {
@@ -848,8 +948,10 @@ async fn main() -> Result<()> {
     });
     writeln!(out, "{meta}")?;
 
-    let n_queries = QUERIES.len();
-    for (qi, (qid, text)) in QUERIES.iter().enumerate() {
+    let (queries, queries_source) = load_queries()?;
+    eprintln!("queries: {} loaded from {}", queries.len(), queries_source);
+    let n_queries = queries.len();
+    for (qi, (qid, text)) in queries.iter().enumerate() {
         let query_vec = engine.embeddings().embed_single(text)?;
         for (arm_name, flags) in ARMS {
             let (cands, ast_fired) =
