@@ -49,19 +49,37 @@ gold_queries = (
     if isinstance(gold_raw, dict) and "queries" in gold_raw
     else gold_raw
 )
-if not isinstance(gold_queries, list):
-    sys.exit(
-        f"{gold_path}: expected a top-level array or an object with a \"queries\" array"
-    )
 
 G = {}  # qid -> {"items": {conv: {"grade": n}}}  (same shape as e2/grades.json's ["grades"])
 ORIGIN = {}  # qid -> origin conv id or None
-for item in gold_queries:
-    qid = item["id"]
-    grades = item.get("grades") or item.get("graded") or item.get("relevant") or {}
-    G[qid] = {"items": {conv: {"grade": g} for conv, g in grades.items()}}
-    origin = item["origin"] if "origin" in item else item.get("origin_conv_id")
-    ORIGIN[qid] = origin or None
+
+if isinstance(gold_queries, dict):
+    # Anukriti-gold shape (Lane A builder, gold['queries'] keyed by qid) per
+    # meta.score_py_adapter_note: 'items' is grades.json's per-key-compatible field
+    # name for 'grades', and 'origin' is mapping.json's M['mapped'][qid]['origin']
+    # folded in directly (no separate mapping file to fall back on).
+    for qid, item in gold_queries.items():
+        grades = item.get("items") or item.get("grades") or item.get("graded") or item.get("relevant") or {}
+        G[qid] = {
+            "items": {
+                conv: {"grade": g["grade"] if isinstance(g, dict) else g}
+                for conv, g in grades.items()
+            }
+        }
+        origin = item["origin"] if "origin" in item else item.get("origin_conv_id")
+        ORIGIN[qid] = origin or None
+elif isinstance(gold_queries, list):
+    for item in gold_queries:
+        qid = item["id"]
+        grades = item.get("grades") or item.get("graded") or item.get("relevant") or {}
+        G[qid] = {"items": {conv: {"grade": g} for conv, g in grades.items()}}
+        origin = item["origin"] if "origin" in item else item.get("origin_conv_id")
+        ORIGIN[qid] = origin or None
+else:
+    sys.exit(
+        f"{gold_path}: expected a top-level array, an object with a \"queries\" array, "
+        'or an object with a "queries" dict keyed by qid'
+    )
 
 runs = defaultdict(dict)  # arm -> qid -> convs
 meta = None
