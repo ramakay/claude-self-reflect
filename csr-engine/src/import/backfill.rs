@@ -284,6 +284,10 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
             // both store `canonical_repo_path` output as the path key; this
             // replay path must produce the same spelling or the attribution
             // join on `(name, file)` silently misses across writers.
+            // Mirrors the hook's split exactly: the RAW path is the physical
+            // file the transcript edited (read from disk below — a
+            // linked-worktree file may differ from its main-checkout
+            // counterpart), the CANONICAL path is only the storage key.
             let file_path = &crate::extraction::repo_path::canonical_repo_path(Path::new(raw_path))
                 .to_string_lossy()
                 .to_string();
@@ -309,7 +313,10 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
 
             // Prefer the complete on-disk file (resolves callers↔callees);
             // fall back to the concatenated edit fragment only if it's gone.
-            let disk = disk_source(file_path, &mut disk_cache);
+            // Read the RAW path — the physical file the session edited —
+            // like the hook does; the canonical form may point at the main
+            // checkout whose content differs from the worktree branch.
+            let disk = disk_source(raw_path, &mut disk_cache);
             let source: &str = disk.as_deref().unwrap_or(fragment_src);
             if disk.is_some() {
                 from_disk_files.insert((project_name.clone(), file_path.clone()));

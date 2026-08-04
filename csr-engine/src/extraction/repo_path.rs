@@ -103,10 +103,21 @@ fn canonicalize_stable(path: &Path) -> PathBuf {
     if let Ok(resolved) = std::fs::canonicalize(path) {
         return resolved;
     }
-    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+    // Walk up to the deepest still-existing ancestor (a deleted file may sit
+    // under a deleted directory), canonicalize that, then re-append the
+    // removed components in order.
+    let mut removed: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path;
+    while let (Some(parent), Some(name)) = (cur.parent(), cur.file_name()) {
+        removed.push(name.to_os_string());
         if let Ok(resolved_parent) = std::fs::canonicalize(parent) {
-            return resolved_parent.join(name);
+            let mut out = resolved_parent;
+            for component in removed.iter().rev() {
+                out.push(component);
+            }
+            return out;
         }
+        cur = parent;
     }
     path.to_path_buf()
 }
@@ -207,6 +218,27 @@ mod tests {
         fs::remove_file(&file).unwrap();
         let gone = canonical_repo_path(&file);
         assert_eq!(live, gone, "path key must be stable across deletion");
+    }
+
+    #[test]
+    fn deleted_nested_directory_keeps_resolved_path_key() {
+        // CodeRabbit PR #279 round 2: a deleted file under a DELETED
+        // directory must also keep its resolved spelling — the walk must
+        // find the deepest existing ancestor, not give up at the parent.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("src").join("nested")).unwrap();
+        let file = repo.join("src").join("nested").join("d.rs");
+        fs::write(&file, b"fn d() {}").unwrap();
+
+        let live = canonical_repo_path(&file);
+        fs::remove_dir_all(repo.join("src")).unwrap();
+        let gone = canonical_repo_path(&file);
+        assert_eq!(
+            live, gone,
+            "path key must survive deletion of intermediate directories"
+        );
     }
 
     #[test]
