@@ -24,6 +24,40 @@ pub fn truncate_chars(s: &str, max: usize) -> &str {
     }
 }
 
+/// Abstention floor for `csr_quick_check`: below this top score the tool makes a
+/// negative existence claim instead of reporting a match.
+///
+/// Measured 2026-08-03 (`cargo run --release --example quick_check_floor`, exact
+/// cosine over all 141,964 chunk embeddings): 8 fabricated topics (never
+/// discussed on this machine) scored 0.308–0.605; 12 topics verified present in
+/// `chunks.content` scored 0.468–0.816. **The distributions overlap** — there is
+/// no floor that suppresses every fabricated probe without also suppressing real
+/// ones (a floor at 0.605 would lose 4 of 12 genuine topics). 0.45 is therefore
+/// the highest floor that misses no verified-genuine probe; it suppresses only
+/// the clearly-hopeless tail. The overlap band above it is handled by the `weak`
+/// label plus an explicit spurious-match warning, not by silent confidence.
+pub const QUICK_CHECK_FLOOR: f32 = 0.45;
+
+/// Top of the measured fabrication-overlap band (highest fabricated probe: 0.605,
+/// rounded up). At or above this, a match is at least `partial`; below it a match
+/// is `weak` and scores indistinguishable from never-discussed topics.
+pub const WEAK_BAND_TOP: f32 = 0.62;
+
+/// Band a similarity score into the relevance vocabulary shared by every result
+/// renderer. Single source of truth — `format_search_results` and
+/// `format_quick_check` must not drift apart on what a score means.
+pub fn relevance_label(score: f32) -> &'static str {
+    if score >= 0.85 {
+        "high"
+    } else if score >= 0.75 {
+        "good"
+    } else if score >= WEAK_BAND_TOP {
+        "partial"
+    } else {
+        "weak"
+    }
+}
+
 /// A search result enriched with chunk metadata.
 pub struct EnrichedResult {
     pub score: f32,
@@ -116,13 +150,7 @@ pub fn format_search_results(
         ));
     } else {
         let top_score = results[0].score;
-        let relevance = if top_score >= 0.85 {
-            "high"
-        } else if top_score >= 0.75 {
-            "good"
-        } else {
-            "partial"
-        };
+        let relevance = relevance_label(top_score);
         out.push_str(&format!(
             "🎯 RESULTS: {} matches ({} relevance, top score: {:.3})\n",
             results.len(),
@@ -140,13 +168,7 @@ pub fn format_search_results(
     // Summary
     if !results.is_empty() {
         let top_score = results[0].score;
-        let relevance = if top_score >= 0.85 {
-            "high"
-        } else if top_score >= 0.75 {
-            "good"
-        } else {
-            "partial"
-        };
+        let relevance = relevance_label(top_score);
 
         let preview = &results[0].chunk.content;
         let preview_short = if preview.chars().count() > 100 {
@@ -246,32 +268,74 @@ pub fn format_search_results(
     out
 }
 
-/// Format a quick check response matching the Python server output.
+/// Format a quick check response.
+///
+/// This surface must be able to say *no*. A nearest neighbour always exists, so
+/// reporting `count=1` plus a preview for any top score at all turned every probe
+/// — including topics that were never discussed — into an apparent confirmation.
+/// Below [`QUICK_CHECK_FLOOR`] the answer is a negative existence claim with no
+/// preview (weak-match preview text is exactly how fabrication presents); in the
+/// measured overlap band it is labelled `weak` and carries an explicit
+/// may-be-spurious warning.
 pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
     let mut out = String::new();
 
     out.push_str("<quick_search>\n");
+
+    let top = results.first().filter(|t| t.score >= QUICK_CHECK_FLOOR);
+
+    let Some(top) = top else {
+        // Nothing found, or nothing above the floor: negative existence claim.
+        out.push_str("  <found>false</found>\n");
+        out.push_str("  <count>0</count>\n");
+        out.push_str("  <collections_with_matches>0</collections_with_matches>\n");
+        out.push_str(
+            "  <message>no sufficiently similar past discussion — topic likely not discussed before</message>\n",
+        );
+        if let Some(rejected) = results.first() {
+            out.push_str(&format!(
+                "  <best_rejected_score>{:.3}</best_rejected_score>\n",
+                rejected.score
+            ));
+            out.push_str(&format!(
+                "  <floor>{:.2}</floor>\n  <note>nearest neighbour scored below the abstention floor; preview withheld because weak-match text reads as confirmation</note>\n",
+                QUICK_CHECK_FLOOR
+            ));
+        }
+        out.push_str("</quick_search>\n");
+        return out;
+    };
+
+    let relevance = relevance_label(top.score);
+
+    out.push_str("  <found>true</found>\n");
     out.push_str(&format!("  <count>{}</count>\n", results.len()));
+    out.push_str(&format!("  <relevance>{}</relevance>\n", relevance));
     out.push_str("  <collections_with_matches>1</collections_with_matches>\n");
 
-    if let Some(top) = results.first() {
-        out.push_str("  <top_result>\n");
-        out.push_str(&format!("    <score>{:.3}</score>\n", top.score));
+    if relevance == "weak" {
         out.push_str(&format!(
-            "    <timestamp>{}</timestamp>\n",
-            age_stamp(&top.chunk.timestamp)
+            "  <warning>weak match — may be spurious. Scores in {:.2}–{:.2} are not distinguishable from topics that were never discussed (fabricated probes measured 0.456–0.605). Read the preview before treating this as evidence the topic came up.</warning>\n",
+            QUICK_CHECK_FLOOR, WEAK_BAND_TOP,
         ));
-        let preview = if top.chunk.content.chars().count() > PREVIEW_CHARS {
-            format!("{}...", truncate_chars(&top.chunk.content, PREVIEW_CHARS))
-        } else {
-            top.chunk.content.clone()
-        };
-        out.push_str(&format!(
-            "    <preview>{}</preview>\n",
-            xml_escape(&preview)
-        ));
-        out.push_str("  </top_result>\n");
     }
+
+    out.push_str("  <top_result>\n");
+    out.push_str(&format!("    <score>{:.3}</score>\n", top.score));
+    out.push_str(&format!(
+        "    <timestamp>{}</timestamp>\n",
+        age_stamp(&top.chunk.timestamp)
+    ));
+    let preview = if top.chunk.content.chars().count() > PREVIEW_CHARS {
+        format!("{}...", truncate_chars(&top.chunk.content, PREVIEW_CHARS))
+    } else {
+        top.chunk.content.clone()
+    };
+    out.push_str(&format!(
+        "    <preview>{}</preview>\n",
+        xml_escape(&preview)
+    ));
+    out.push_str("  </top_result>\n");
 
     out.push_str("</quick_search>\n");
     out
@@ -1189,5 +1253,121 @@ mod tests {
             "first_conv must no longer be rendered as introduction evidence: {xml}"
         );
         assert!(!xml.contains("conv_should_not_appear"), "got: {xml}");
+    }
+
+    // ─── quick_check abstention (fabrication defect, measured 2026-08-03) ───
+
+    fn quick_result(score: f32, content: &str) -> EnrichedResult {
+        EnrichedResult {
+            score,
+            chunk: make_chunk("qc1", "conv-qc", content),
+            resolution: None,
+        }
+    }
+
+    #[test]
+    fn quick_check_empty_reports_not_found() {
+        let xml = format_quick_check(&[], "never discussed anything");
+        assert!(xml.contains("<found>false</found>"), "got: {xml}");
+        assert!(xml.contains("<count>0</count>"), "got: {xml}");
+        assert!(
+            xml.contains("topic likely not discussed before"),
+            "got: {xml}"
+        );
+        assert!(!xml.contains("<preview>"), "got: {xml}");
+        // No candidate at all: nothing to disclose as rejected.
+        assert!(!xml.contains("<best_rejected_score>"), "got: {xml}");
+    }
+
+    #[test]
+    fn quick_check_below_floor_suppresses_preview_and_count() {
+        // Literal score of the weakest measured fabricated probe:
+        // "onboarding call with the new backend contractor about payroll access"
+        // matched Clerk SMS OTP cost discussion at 0.456 — pre-fix this rendered
+        // count=1 with a confident preview.
+        let results = vec![quick_result(
+            0.44,
+            "Clerk SMS OTP costs per verification in India",
+        )];
+        let xml = format_quick_check(&results, "onboarding call about payroll access");
+        assert!(xml.contains("<found>false</found>"), "got: {xml}");
+        assert!(xml.contains("<count>0</count>"), "got: {xml}");
+        assert!(!xml.contains("<count>1</count>"), "got: {xml}");
+        assert!(!xml.contains("<preview>"), "got: {xml}");
+        assert!(!xml.contains("Clerk SMS OTP"), "got: {xml}");
+        assert!(
+            xml.contains("<best_rejected_score>0.440</best_rejected_score>"),
+            "got: {xml}"
+        );
+    }
+
+    #[test]
+    fn quick_check_weak_band_labels_and_warns() {
+        // The four fabricated probes measured 2026-08-03 all land in the weak
+        // band: no floor separates them from genuine topics (genuine minimum was
+        // 0.468), so they are labelled and warned about rather than suppressed.
+        for score in [0.456_f32, 0.461, 0.583, 0.588] {
+            let results = vec![quick_result(
+                score,
+                "unrelated content that merely looks close",
+            )];
+            let xml = format_quick_check(&results, "fabricated topic");
+            assert!(
+                xml.contains("<relevance>weak</relevance>"),
+                "{score}: {xml}"
+            );
+            assert!(xml.contains("may be spurious"), "{score}: {xml}");
+            assert!(xml.contains("<found>true</found>"), "{score}: {xml}");
+            assert!((QUICK_CHECK_FLOOR..WEAK_BAND_TOP).contains(&score));
+        }
+    }
+
+    #[test]
+    fn quick_check_mid_band_is_labelled_partial() {
+        let results = vec![quick_result(0.673, "npm OIDC trusted publisher workflow")];
+        let xml = format_quick_check(&results, "npm OIDC trusted publisher");
+        assert!(xml.contains("<found>true</found>"), "got: {xml}");
+        assert!(xml.contains("<relevance>partial</relevance>"), "got: {xml}");
+        assert!(!xml.contains("may be spurious"), "got: {xml}");
+        assert!(
+            xml.contains("npm OIDC trusted publisher workflow"),
+            "got: {xml}"
+        );
+    }
+
+    #[test]
+    fn quick_check_strong_match_keeps_preview_and_count() {
+        let results = vec![quick_result(
+            0.816,
+            "SessionStart memory manifest injection fix",
+        )];
+        let xml = format_quick_check(&results, "SessionStart memory manifest injection");
+        assert!(xml.contains("<found>true</found>"), "got: {xml}");
+        assert!(xml.contains("<count>1</count>"), "got: {xml}");
+        assert!(xml.contains("<score>0.816</score>"), "got: {xml}");
+        assert!(xml.contains("<relevance>good</relevance>"), "got: {xml}");
+        assert!(
+            xml.contains("SessionStart memory manifest injection fix"),
+            "got: {xml}"
+        );
+        assert!(!xml.contains("may be spurious"), "got: {xml}");
+    }
+
+    #[test]
+    fn relevance_label_bands_are_shared_with_search() {
+        assert_eq!(relevance_label(0.90), "high");
+        assert_eq!(relevance_label(0.80), "good");
+        assert_eq!(relevance_label(0.62), "partial");
+        assert_eq!(relevance_label(0.619), "weak");
+        assert_eq!(relevance_label(0.30), "weak");
+        // Same banding drives the search renderer's summary attribute.
+        let xml = format_search_results(
+            &[quick_result(0.50, "borderline content")],
+            "q",
+            "proj",
+            1,
+            1,
+        );
+        assert!(xml.contains("relevance=\"weak\""), "got: {xml}");
     }
 }
