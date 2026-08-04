@@ -957,8 +957,10 @@ pub(crate) fn format_code_map(ep: &crate::hooks::stop::Episode, age: &str) -> Op
 }
 
 /// Build compact code-graph slices for files/symbols named in the prompt.
-/// Returns at most 2 short lines, each carrying last-change provenance.
-fn build_graph_slices(
+/// Returns at most 2 short lines. Callee names that come from an unresolved
+/// placeholder edge (no verified definition) are rendered under an explicit
+/// `unverified` label — never mixed silently into the plain call list.
+pub(crate) fn build_graph_slices(
     storage: &crate::storage::Storage,
     prompt: &str,
     current_files: &[String],
@@ -967,6 +969,9 @@ fn build_graph_slices(
     let mut slices = Vec::new();
 
     // File-anchored slice: symbols + callers of files named in the prompt.
+    // `ledger.callers` is already filtered to resolved=1 edges upstream
+    // (src/storage/codegraph.rs file_ledger callers query), so these names
+    // are verified already and do not need the unverified label.
     for file in current_files.iter().take(1) {
         if let Ok(ledger) = storage.code_file_ledger(project, file) {
             if !ledger.symbols.is_empty() {
@@ -1000,23 +1005,56 @@ fn build_graph_slices(
         if token.len() < 6 {
             continue;
         }
-        if let Ok(nodes) = storage.code_nodes_by_name(&token, project, 1) {
-            if let Some(node) = nodes.into_iter().next() {
-                if let Ok(callees) = storage.code_query_callees(&node.id, 6) {
-                    if !callees.is_empty() {
-                        let names: Vec<String> = callees.iter().map(|c| c.name.clone()).collect();
-                        let line = format!(
-                            "{} calls → {} (last changed {})",
-                            node.name,
-                            names.join(", "),
-                            node.last_conv_id
-                        );
-                        slices.push(formatter::truncate_item(&line, 280));
-                        break; // one symbol slice is enough for the budget
-                    }
-                }
-            }
+        // Ask for 2 so an ambiguous name (multiple definitions sharing the
+        // same name) is detectable instead of silently picking one.
+        let nodes = match storage.code_nodes_by_name(&token, project, 2) {
+            Ok(nodes) => nodes,
+            Err(_) => continue,
+        };
+        if nodes.len() != 1 {
+            // 0 matches: nothing to say. >1 matches: ambiguous name —
+            // do not present one arbitrary definition as authoritative.
+            continue;
         }
+        let Some(node) = nodes.into_iter().next() else {
+            continue;
+        };
+        let callees = match storage.code_query_callees(&node.id, 6) {
+            Ok(callees) => callees,
+            Err(_) => continue,
+        };
+        if callees.is_empty() {
+            continue;
+        }
+        // A callee is verified only when it is backed by a real definition
+        // node: not the `unresolved` placeholder sentinel, and not a
+        // name-only match (see storage::codegraph::query_callees).
+        let (verified, unverified): (Vec<_>, Vec<_>) = callees
+            .iter()
+            .partition(|c| c.kind != "unresolved" && !c.name_only);
+        let verified_names: Vec<&str> = verified.iter().map(|c| c.name.as_str()).collect();
+        let unverified_names: Vec<&str> = unverified.iter().map(|c| c.name.as_str()).collect();
+
+        let line = if verified_names.is_empty() {
+            // Every callee is an unresolved guess — say so explicitly
+            // instead of presenting a bare list that looks like fact.
+            format!(
+                "{} — no verified callees; unverified guesses: {}",
+                node.name,
+                unverified_names.join(", ")
+            )
+        } else if unverified_names.is_empty() {
+            format!("{} calls → {}", node.name, verified_names.join(", "))
+        } else {
+            format!(
+                "{} calls → {} · unverified: {}",
+                node.name,
+                verified_names.join(", "),
+                unverified_names.join(", ")
+            )
+        };
+        slices.push(formatter::truncate_item(&line, 280));
+        break; // one symbol slice is enough for the budget
     }
 
     slices
@@ -1472,6 +1510,168 @@ mod tests {
         assert!(
             sheet_line.contains("1 anchor"),
             "boundary match across abs/rel paths must still count: {sheet_line}"
+        );
+    }
+
+    #[test]
+    fn graph_slice_labels_unresolved_callees_separately() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let project = "proj";
+
+        storage
+            .upsert_code_node(&crate::storage::codegraph::NodeRow {
+                id: "n_source".into(),
+                repo: "repo".into(),
+                project: project.into(),
+                file: "src/lib.rs".into(),
+                lang: "rust".into(),
+                kind: "function".into(),
+                name: "handleRequest".into(),
+                fqname: "handleRequest".into(),
+                body_hash: "h1".into(),
+                first_conv_id: "conv1".into(),
+                last_conv_id: "conv1".into(),
+                last_session_id: "sess1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .upsert_code_node(&crate::storage::codegraph::NodeRow {
+                id: "n_callee".into(),
+                repo: "repo".into(),
+                project: project.into(),
+                file: "src/lib.rs".into(),
+                lang: "rust".into(),
+                kind: "function".into(),
+                name: "verifiedCallee".into(),
+                fqname: "verifiedCallee".into(),
+                body_hash: "h2".into(),
+                first_conv_id: "conv1".into(),
+                last_conv_id: "conv1".into(),
+                last_session_id: "sess1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .replace_code_file_edges(
+                project,
+                "src/lib.rs",
+                &[
+                    crate::storage::codegraph::EdgeRow {
+                        src_id: "n_source".into(),
+                        dst_id: "n_callee".into(),
+                        kind: "calls".into(),
+                        src_file: "src/lib.rs".into(),
+                        resolved: 1,
+                        weight: 1.0,
+                        conv_id: "conv1".into(),
+                        session_id: "sess1".into(),
+                        ..Default::default()
+                    },
+                    crate::storage::codegraph::EdgeRow {
+                        src_id: "n_source".into(),
+                        dst_id: "name:ghostCallee".into(),
+                        kind: "calls".into(),
+                        src_file: "src/lib.rs".into(),
+                        resolved: 0,
+                        weight: 1.0,
+                        conv_id: "conv1".into(),
+                        session_id: "sess1".into(),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .unwrap();
+
+        let slices = build_graph_slices(&storage, "explain handleRequest please", &[], project);
+        let symbol_slice = slices
+            .iter()
+            .find(|s| s.contains("handleRequest"))
+            .expect("symbol slice present");
+
+        assert!(
+            symbol_slice.contains("verifiedCallee"),
+            "verified callee must be named: {symbol_slice}"
+        );
+        let unverified_pos = symbol_slice
+            .find("unverified")
+            .expect("unverified label present");
+        let verified_pos = symbol_slice.find("verifiedCallee").unwrap();
+        assert!(
+            verified_pos < unverified_pos,
+            "verified name must render outside/before the unverified label: {symbol_slice}"
+        );
+        assert!(
+            symbol_slice.contains("ghostCallee"),
+            "unresolved callee name still surfaced: {symbol_slice}"
+        );
+        let ghost_pos = symbol_slice.find("ghostCallee").unwrap();
+        assert!(
+            ghost_pos > unverified_pos,
+            "unresolved name must render inside/after the unverified label: {symbol_slice}"
+        );
+    }
+
+    #[test]
+    fn graph_slice_all_unresolved_callees_have_no_bare_verified_claim() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let project = "proj";
+
+        storage
+            .upsert_code_node(&crate::storage::codegraph::NodeRow {
+                id: "n_source2".into(),
+                repo: "repo".into(),
+                project: project.into(),
+                file: "src/lib.rs".into(),
+                lang: "rust".into(),
+                kind: "function".into(),
+                name: "processPayload".into(),
+                fqname: "processPayload".into(),
+                body_hash: "h3".into(),
+                first_conv_id: "conv2".into(),
+                last_conv_id: "conv2".into(),
+                last_session_id: "sess2".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .replace_code_file_edges(
+                project,
+                "src/lib.rs",
+                &[crate::storage::codegraph::EdgeRow {
+                    src_id: "n_source2".into(),
+                    dst_id: "name:phantomHelper".into(),
+                    kind: "calls".into(),
+                    src_file: "src/lib.rs".into(),
+                    resolved: 0,
+                    weight: 1.0,
+                    conv_id: "conv2".into(),
+                    session_id: "sess2".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+
+        let slices = build_graph_slices(&storage, "trace processPayload flow", &[], project);
+        let symbol_slice = slices
+            .iter()
+            .find(|s| s.contains("processPayload"))
+            .expect("symbol slice present");
+
+        assert!(
+            !symbol_slice.contains("calls → phantomHelper"),
+            "bare unverified name presented as a fact: {symbol_slice}"
+        );
+        assert!(
+            symbol_slice.contains("no verified callees"),
+            "must explicitly say there are no verified callees: {symbol_slice}"
+        );
+        assert!(
+            symbol_slice.contains("phantomHelper"),
+            "name still surfaced, but only under the label: {symbol_slice}"
         );
     }
 }

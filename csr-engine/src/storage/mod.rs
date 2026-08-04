@@ -21,6 +21,18 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Run an internal read or write operation while holding the SQLite mutex.
+    ///
+    /// Kept crate-private so diagnostics can take consistent multi-table
+    /// snapshots without exposing the raw connection as part of the public API.
+    pub(crate) fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        operation(&conn)
+    }
+
     /// Open (or create) the database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -776,6 +788,7 @@ impl Storage {
         types_removed: &str,
         imports_added: &str,
         imports_removed: &str,
+        repo_root: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::insert_code_evolution(
@@ -791,7 +804,43 @@ impl Storage {
             types_removed,
             imports_added,
             imports_removed,
+            repo_root,
         )
+    }
+
+    /// Insert a backfilled code-evolution row (`csr-engine backfill-coedit`).
+    /// Idempotent (`INSERT OR IGNORE` on the `id` PRIMARY KEY). Returns `true`
+    /// if a new row was written, `false` if `id` already existed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_code_evolution_backfill(
+        &self,
+        id: &str,
+        session_id: &str,
+        project_name: &str,
+        file_path: &str,
+        language: &str,
+        tool_name: &str,
+        timestamp: &str,
+        repo_root: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::insert_code_evolution_backfill(
+            &conn,
+            id,
+            session_id,
+            project_name,
+            file_path,
+            language,
+            tool_name,
+            timestamp,
+            repo_root,
+        )
+    }
+
+    /// True if a `code_evolution` row with this `id` already exists.
+    pub fn code_evolution_id_exists(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::code_evolution_id_exists(&conn, id)
     }
 
     pub fn get_recent_code_evolution(
@@ -903,6 +952,51 @@ impl Storage {
         codegraph::replace_file_edges(&conn, project, src_file, edges)
     }
 
+    /// Distinct `code_nodes.file` values still missing `repo_root` (WP2 Stage 1 backfill).
+    pub fn code_node_files_missing_repo_root(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::code_node_files_missing_repo_root(&conn)
+    }
+
+    /// Set `repo_root` on every `code_nodes` row matching `file` currently NULL.
+    pub fn set_repo_root_for_file(&self, file: &str, repo_root: &str) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::set_repo_root_for_file(&conn, file, repo_root)
+    }
+
+    /// Distinct `code_evolution.file_path` values still missing `repo_root` (WP2 Stage 1 backfill).
+    pub fn code_evolution_files_missing_repo_root(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::code_evolution_files_missing_repo_root(&conn)
+    }
+
+    /// Set `repo_root` on every `code_evolution` row matching `file_path` currently NULL.
+    pub fn set_repo_root_for_evolution_file(
+        &self,
+        file_path: &str,
+        repo_root: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::set_repo_root_for_evolution_file(&conn, file_path, repo_root)
+    }
+
+    /// Replace-per-file upsert of repo_defs (name, kind, lang) for `(project, file)`.
+    pub fn upsert_repo_defs(
+        &self,
+        project: &str,
+        file: &str,
+        defs: &[(String, String, String)],
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::upsert_repo_defs(&conn, project, file, defs)
+    }
+
+    /// Definition sites for `name` within `project`: `(file, kind)`.
+    pub fn lookup_repo_defs(&self, project: &str, name: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::lookup_repo_defs(&conn, project, name)
+    }
+
     pub fn upsert_code_file_state(
         &self,
         project: &str,
@@ -919,13 +1013,47 @@ impl Storage {
         codegraph::mark_file_dirty(&conn, project, file)
     }
 
+    /// Record that `file` was seen by an extraction write path but its
+    /// extension is outside the six AST-supported languages (WP2 Stage 3,
+    /// H8 innovation — receipt R4). See `codegraph::mark_file_unsupported`.
+    pub fn mark_code_file_unsupported(&self, project: &str, file: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::mark_file_unsupported(&conn, project, file)
+    }
+
     /// Re-resolve placeholder edges for a project (two-pass name resolution).
+    /// Uses a direct-stat default for the WCR Phase 6 TASK C stale-file
+    /// check (`canonical_repo_path(file).is_file()`), suitable for hooks and
+    /// backfill callers that resolve a handful of files at a time. Callers
+    /// that will check many distinct files in one pass (e.g. the live eval
+    /// gate, scanning the whole corpus) should precompute an existence set
+    /// once and call `resolve_code_edges_with_fs_check` instead — see that
+    /// method's doc comment.
     pub fn resolve_code_edges(
         &self,
         project: &str,
     ) -> Result<crate::extraction::resolver::ResolveStats> {
+        self.resolve_code_edges_with_fs_check(project, &|file: &str| {
+            crate::extraction::repo_path::canonical_repo_path(std::path::Path::new(file)).is_file()
+        })
+    }
+
+    /// Same as `resolve_code_edges`, but with the WCR Phase 6 TASK C
+    /// stale-file existence check supplied by the caller instead of
+    /// defaulted. `file_exists` receives a `Pending::src_file` as stored
+    /// (raw, not canonicalized) and must apply `canonical_repo_path` itself
+    /// before checking — see `extraction::resolver::resolve_edges`'s doc
+    /// comment. Exists so a caller resolving many projects/files in one pass
+    /// (the live eval gate) can precompute a canonicalized existence set
+    /// once up front and close over it, rather than re-stat'ing the
+    /// filesystem per pending edge.
+    pub fn resolve_code_edges_with_fs_check(
+        &self,
+        project: &str,
+        file_exists: &dyn Fn(&str) -> bool,
+    ) -> Result<crate::extraction::resolver::ResolveStats> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        crate::extraction::resolver::resolve_edges(&conn, project)
+        crate::extraction::resolver::resolve_edges(&conn, project, file_exists)
     }
 
     /// Recompute degree ranks for a project.
@@ -981,6 +1109,37 @@ impl Storage {
     pub fn code_get_node_rank(&self, id: &str) -> Result<Option<(f64, i64, i64)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         codegraph::get_node_rank(&conn, id)
+    }
+
+    /// All `code_nodes` rows (WP2 Stage 2 attribution backfill).
+    pub fn all_code_nodes(&self) -> Result<Vec<codegraph::NodeRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::all_nodes(&conn)
+    }
+
+    /// Every `code_evolution` event, oldest-first (WP2 Stage 2 transcript-channel backfill).
+    pub fn all_code_evolution_events_ordered(&self) -> Result<Vec<queries::CodeEvolutionEventRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::all_code_evolution_events_ordered(&conn)
+    }
+
+    /// Upsert one attribution channel row (WP2 Stage 2).
+    pub fn upsert_code_attribution(&self, row: &codegraph::AttributionRow) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::upsert_attribution(&conn, row)
+    }
+
+    /// Raw attribution rows for a node (0-2 rows, one per channel).
+    pub fn code_attribution_rows(&self, node_id: &str) -> Result<Vec<codegraph::AttributionRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::get_attribution(&conn, node_id)
+    }
+
+    /// Rendered attribution summary for a node — what `csr_code_graph` /
+    /// `csr_search_by_file` display. Never falls back to `first_conv_id`.
+    pub fn code_attribution_for_node(&self, node_id: &str) -> Result<String> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::attribution_for_node(&conn, node_id)
     }
 
     // ─── Resolution ledger ───

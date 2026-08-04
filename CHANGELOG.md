@@ -5,6 +5,58 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.5.0] - 2026-08-03
+
+### Codegraph truth pass: evidence-tiered resolution, two-channel attribution, honest abstention
+
+Every code-graph edge and attribution claim now carries evidence or says it
+has none. No scalar confidence scores anywhere — ordinal evidence labels only.
+
+- **NEW: witness-closure resolution (WCR).** Call/import edges resolve only
+  through recorded witnesses (same-file, module-bind, import-bound,
+  unique-def, co-edit-margin, scope-chain local bindings) or carry a recorded
+  reason they cannot (`external`, `method`, `stale`, `drifted`, `local`).
+  Eight adversarial review rounds removed every inference path; re-pointing
+  requires content-identity (immutable per-edge content hash). Release gates:
+  witness closure ≥90%, internal binding ≥70%, drifted=0 — measured live by
+  `csr-engine eval --codegraph`.
+- **NEW: two-channel symbol attribution.** "Which conversation introduced this
+  function" was previously a file-level projection (`first_conv_id`) measured
+  wrong ~50% of the time on two independent corpora. Replaced by
+  `code_node_attribution`: a **transcript** channel (earliest recorded change
+  event naming the symbol) and a **git** channel (`git log -L` introducing
+  commit over the symbol's span), rendered separately, disagreements >48h
+  labeled — never merged — and symbols with neither channel shown as
+  `unattributed` instead of inheriting their file's first toucher.
+  User-visible in `csr_code_graph`, `csr_search_by_file`, and `csr_why`.
+- **NEW: `csr_quick_check` measured abstention.** Floor derived from fabricated
+  vs genuine probes over the full embedding corpus: below 0.45 the tool
+  returns `found=false` with the rejected score shown (previously it would
+  present a cosine-nearest chunk as if the topic had been discussed); scores
+  0.45–0.62 carry an explicit may-be-spurious warning quoting the measured
+  fabricated-probe range. Floor re-derivable via `examples/quick_check_floor.rs`.
+- **NEW: repo-identity labels.** `code_nodes.repo_root` records the git
+  toplevel at write time, stable across cwd/session boundaries; linked
+  worktree paths canonicalize onto the main checkout so one logical file has
+  one key.
+- **NEW: `csr-engine backfill-coedit`** — rebuilds the session↔file co-edit
+  ledger from the historical JSONL corpus (idempotent).
+- **FIX (review round): witness tables survived only until the next process
+  start** — a migration dropped `local_bindings`/`edge_scope_chains` on every
+  DB open (latent data destroyer; persistence is shadow-only today). Drops are
+  now shape-probed. Also from review: mixed timestamp formats no longer skew
+  earliest-event attribution; symbols defined on line 1 are no longer
+  unattributable; deleted files keep a stable path key; the ablation harness
+  opens the DB truly read-only.
+- **Eval kits.** Five-arm sham-controlled retrieval ablation
+  (`eval-kit/h1/`, sealed) and external-gold variant (`eval-kit/ag/`);
+  deterministic harness (byte-identical across processes). Findings are in
+  the paper: the AST channel is an integrity investment, not a ranking
+  signal — no expansion channel separated from zero against its own sham.
+- **Paper.** E1b sham-controlled follow-up folded into
+  `docs/plans/annaswamy-2026-similarity-drowns-intent.typ` (+ determinism
+  methods note, dual corroboration-rate disclosure).
+
 ## [9.4.1] - 2026-07-28
 
 ### Self-hosting hygiene: hook cancellation, recursion, and corpus contamination

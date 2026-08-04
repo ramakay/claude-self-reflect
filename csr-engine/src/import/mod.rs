@@ -1,4 +1,5 @@
 pub mod backfill;
+pub mod coedit_backfill;
 pub mod plans;
 pub mod registry;
 pub mod watcher;

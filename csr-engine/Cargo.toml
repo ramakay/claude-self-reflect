@@ -1,6 +1,6 @@
 [package]
 name = "csr-engine"
-version = "9.4.1"
+version = "9.5.0"
 edition = "2021"
 description = "Claude Self-Reflect: Rust MCP server with embedded vector search"
 
@@ -38,6 +38,8 @@ ast-grep-language = { version = "0.42", default-features = false, features = [
 ] }
 ratatui = "0.30"
 crossterm = "0.29"
+ignore = "0.4"
+toml = "0.9"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

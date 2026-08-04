@@ -17,13 +17,55 @@ Semantic search across all past conversations.
 | min_score | float | 0.3 | Minimum similarity (0-1) |
 
 ### csr_quick_check
-Fast existence check — count + top match only.
+Fast existence check — count + top match only, with measured abstention (v9.5).
+
+The score floor is derived from probing topics that were never discussed
+against the full corpus. Below the floor the tool refuses rather than
+fabricates:
+
+```xml
+<quick_search>
+  <found>false</found>
+  <count>0</count>
+  <best_rejected_score>0.31</best_rejected_score>
+  <floor>0.45</floor>
+</quick_search>
+```
+
+Scores in the weak band (0.45–0.62) are returned but carry an explicit
+warning — matches there are not distinguishable from never-discussed topics,
+so the preview is the evidence, not the score:
+
+```xml
+<relevance>weak</relevance>
+<warning>weak match — may be spurious. Scores in 0.45–0.62 are not
+distinguishable from topics that were never discussed. Read the preview
+before treating this as evidence the topic came up.</warning>
+```
 
 ### search_by_recency
 Time-constrained search. Supports: "today", "last week", "last 3 months", etc.
 
 ### csr_search_by_file
 Find conversations that discussed or modified a file. Uses 2-component matching (parent + filename).
+
+For code files with graph coverage, returns a per-symbol ledger with
+two-channel attribution (v9.5) — each symbol shows *how* its origin is known,
+never a guess:
+
+```xml
+<symbol kind='function' name='rerank_pool'
+        attribution='transcript:bb1688ad + git:7dd95a7b'
+        body_hash='a469aec4' lines='158-193'/>
+<symbol kind='function' name='blend'
+        attribution='git:33559079' .../>
+```
+
+`transcript:` = earliest recorded change event naming the symbol;
+`git:` = the introducing commit from `git log -L` over the symbol's span.
+Channels that disagree by more than 48h are shown labeled, never merged.
+Symbols with no evidence in either channel render `unattributed` — they do
+not inherit their file's first toucher.
 
 ### csr_search_by_concept
 Theme-based cross-project search. E.g., "security patterns", "error handling".
@@ -36,6 +78,12 @@ Pagination for additional results.
 
 ### csr_code_graph
 Conversation-provenance code graph. Query which conversations touched a function or file — AST anchors link code symbols to the sessions that shaped them.
+
+Since v9.5, every edge and origin claim is evidence-labeled: call/import
+edges resolve only through recorded witnesses (or state why they cannot —
+`external`, `method-dispatched`, `stale`, `local`), symbol origins come from
+the two-channel attribution described under `csr_search_by_file`, and the
+system abstains visibly (`unattributed`, `unverified:`) instead of guessing.
 
 ## Activity Tools
 
