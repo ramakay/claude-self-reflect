@@ -1748,18 +1748,139 @@ pub fn insert_code_evolution(
     types_removed: &str,
     imports_added: &str,
     imports_removed: &str,
+    repo_root: Option<&str>,
 ) -> Result<()> {
     let id = format!(
         "evo_{}_{}",
         &uuid::Uuid::new_v4().to_string()[..8],
         chrono::Utc::now().timestamp_millis()
     );
+    let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO code_evolution (id, session_id, project_name, file_path, language, tool_name, functions_added, functions_removed, types_added, types_removed, imports_added, imports_removed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![id, session_id, project_name, file_path, language, tool_name, functions_added, functions_removed, types_added, types_removed, imports_added, imports_removed],
+        "INSERT INTO code_evolution (id, session_id, project_name, file_path, language, tool_name, functions_added, functions_removed, types_added, types_removed, imports_added, imports_removed, repo_root, timestamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![id, session_id, project_name, file_path, language, tool_name, functions_added, functions_removed, types_added, types_removed, imports_added, imports_removed, repo_root, now],
     )?;
     Ok(())
+}
+
+/// Insert a backfilled code-evolution row with an explicit deterministic id
+/// and historical timestamp (`csr-engine backfill-coedit`). `functions_added`
+/// / `functions_removed` / `types_added` / `types_removed` / `imports_added`
+/// / `imports_removed` are left at their schema default (`'[]'`) — backfill
+/// reconstructs co-edit *ledger* signal only, not AST diffs.
+///
+/// `id` is the caller's deterministic id (`bf-<sha256 prefix>`); `INSERT OR
+/// IGNORE` against the `id` PRIMARY KEY makes repeated runs idempotent —
+/// never touches an existing row. Returns `true` if a new row was inserted,
+/// `false` if it already existed (no-op).
+#[allow(clippy::too_many_arguments)]
+pub fn insert_code_evolution_backfill(
+    conn: &Connection,
+    id: &str,
+    session_id: &str,
+    project_name: &str,
+    file_path: &str,
+    language: &str,
+    tool_name: &str,
+    timestamp: &str,
+    repo_root: Option<&str>,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO code_evolution
+             (id, session_id, project_name, file_path, language, tool_name, timestamp, repo_root)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            id,
+            session_id,
+            project_name,
+            file_path,
+            language,
+            tool_name,
+            timestamp,
+            repo_root,
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Distinct `code_evolution.file_path` values still missing `repo_root` —
+/// feeds the WP2 Stage 1 backfill (`import::backfill::backfill_repo_root`).
+pub fn code_evolution_files_missing_repo_root(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT file_path FROM code_evolution WHERE repo_root IS NULL AND file_path != ''",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Set `repo_root` on every `code_evolution` row matching `file_path` that
+/// is currently NULL. Never overwrites an already-resolved value
+/// (idempotent, re-runnable). Returns the number of rows changed.
+pub fn set_repo_root_for_evolution_file(
+    conn: &Connection,
+    file_path: &str,
+    repo_root: &str,
+) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE code_evolution SET repo_root = ?1 WHERE file_path = ?2 AND repo_root IS NULL",
+        params![repo_root, file_path],
+    )?;
+    Ok(n)
+}
+
+/// A row from `all_code_evolution_events_ordered`:
+/// (rowid, session_id, file_path, timestamp, functions_added, types_added).
+pub type CodeEvolutionEventRow = (i64, String, String, String, String, String);
+
+/// Every `code_evolution` row, oldest-first with a `rowid` tiebreak (WP2
+/// Stage 2 transcript-channel attribution backfill —
+/// `import::backfill::backfill_attribution`, receipt R2). Feeds the
+/// earliest-by-(timestamp, rowid) join: for a symbol named in more than one
+/// event, the FIRST row returned here is the one that wins. Loaded once into
+/// memory — the corpus is thousands of rows, not millions, so this stays
+/// cheap even at the backfill's documented "minutes-scale over ~6.7k
+/// symbols" cost.
+pub fn all_code_evolution_events_ordered(conn: &Connection) -> Result<Vec<CodeEvolutionEventRow>> {
+    // `timestamp` holds two shapes: the schema default `datetime('now')`
+    // (`YYYY-MM-DD HH:MM:SS`, legacy rows) and RFC 3339 (`YYYY-MM-DDT...`,
+    // `insert_code_evolution` / backfill rows). Lexically, ' ' < 'T', so a
+    // plain ORDER BY would put every legacy row of a given day before every
+    // RFC 3339 row of that day regardless of the real instant — and the
+    // attribution channel takes the FIRST row per symbol as the winner.
+    // Normalizing the separator makes the two shapes prefix-comparable.
+    let mut stmt = conn.prepare(
+        "SELECT rowid, session_id, file_path, timestamp, functions_added, types_added
+         FROM code_evolution
+         ORDER BY replace(timestamp, 'T', ' ') ASC, rowid ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// True if a `code_evolution` row with this `id` already exists. Used by
+/// `backfill-coedit --dry-run` to preview accurate would-insert counts
+/// without writing anything.
+pub fn code_evolution_id_exists(conn: &Connection, id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM code_evolution WHERE id = ?1 LIMIT 1",
+        params![id],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|r| r.is_some())
+    .map_err(Into::into)
 }
 
 /// Get recent code evolution for a file (most recent N entries).
@@ -2557,6 +2678,7 @@ mod tests {
             "[]",
             "[]",
             "[]",
+            None,
         )
         .unwrap();
         insert_code_evolution(
@@ -2572,6 +2694,7 @@ mod tests {
             "[]",
             "[]",
             "[]",
+            None,
         )
         .unwrap();
     }

@@ -560,6 +560,23 @@ pub async fn get_timeline(
     Ok(format::format_timeline(&groups, &time_desc))
 }
 
+/// Attach the WP2 Stage 2 two-channel attribution render string
+/// (`Storage::code_attribution_for_node`) onto every node in `nodes`, in
+/// place. Per-node lookup errors fail soft to "unattributed" — a single
+/// storage hiccup must never blank an entire result set or fall back to
+/// `first_conv_id`.
+fn attach_attribution(storage: &Arc<Storage>, nodes: &mut [crate::storage::codegraph::NodeRow]) {
+    for n in nodes.iter_mut() {
+        if n.id.is_empty() {
+            n.attribution = "unattributed".to_string();
+            continue;
+        }
+        n.attribution = storage
+            .code_attribution_for_node(&n.id)
+            .unwrap_or_else(|_| "unattributed".to_string());
+    }
+}
+
 /// File ledger (§8b) — deterministic, immutable per-file dossier built from the
 /// code graph + code_evolution. FTS5 is only a secondary fallback when the file
 /// has no graph/evolution history.
@@ -572,14 +589,23 @@ pub async fn search_by_file(
     let (effective_project, _) = cross_project::normalize_project_scope(project);
     let proj = effective_project.unwrap_or_default();
 
-    let ledger = storage.code_file_ledger(&proj, file_path)?;
+    let mut ledger = storage.code_file_ledger(&proj, file_path)?;
     if !ledger.symbols.is_empty() || !ledger.timeline.is_empty() {
+        attach_attribution(storage, &mut ledger.symbols);
         return Ok(format::format_file_ledger(&ledger));
     }
 
-    // Secondary enrichment: fall back to FTS5 over chunk content.
+    // Secondary enrichment: fall back to FTS5 over chunk content. The ledger
+    // is empty here, but that is not the same as "never extracted": a
+    // supported-language file with no definitions and no recorded edits is
+    // indexed and legitimately empty. Report the real state so the caller can
+    // tell a coverage gap from an honest absence.
     let chunks = storage.fts5_search(file_path, limit, project)?;
-    Ok(format::format_file_results(&chunks, file_path))
+    Ok(format::format_file_results(
+        &chunks,
+        file_path,
+        ledger.indexed,
+    ))
 }
 
 /// Code-graph query: neighbors | callers | callees (no transitive impact in v1).
@@ -599,7 +625,8 @@ pub async fn code_graph(
                 Some(s) if !s.is_empty() => s,
                 _ => return Ok(format::format_code_graph(mode, &target_label, &[], &[])),
             };
-            let nodes = storage.code_query_callers(name, &project, limit)?;
+            let mut nodes = storage.code_query_callers(name, &project, limit)?;
+            attach_attribution(storage, &mut nodes);
             Ok(format::format_code_graph(mode, &target_label, &nodes, &[]))
         }
         "callees" => {
@@ -607,7 +634,8 @@ pub async fn code_graph(
                 Some(id) => id,
                 None => return Ok(format::format_code_graph(mode, &target_label, &[], &[])),
             };
-            let nodes = storage.code_query_callees(&node_id, limit)?;
+            let mut nodes = storage.code_query_callees(&node_id, limit)?;
+            attach_attribution(storage, &mut nodes);
             Ok(format::format_code_graph(mode, &target_label, &nodes, &[]))
         }
         _ => {
@@ -623,7 +651,16 @@ pub async fn code_graph(
                     ))
                 }
             };
-            let neighbors = storage.code_query_neighbors(&node_id, None, limit)?;
+            let mut neighbors = storage.code_query_neighbors(&node_id, None, limit)?;
+            for ne in neighbors.iter_mut() {
+                ne.node.attribution = if ne.node.id.is_empty() {
+                    "unattributed".to_string()
+                } else {
+                    storage
+                        .code_attribution_for_node(&ne.node.id)
+                        .unwrap_or_else(|_| "unattributed".to_string())
+                };
+            }
             Ok(format::format_code_graph(
                 "neighbors",
                 &target_label,

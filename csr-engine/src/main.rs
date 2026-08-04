@@ -118,10 +118,23 @@ enum Commands {
         /// Phase 1 WS2). LOCAL opt-in only — never part of default eval/--full, never CI.
         #[arg(long)]
         provenance: bool,
+        /// Run the deterministic code-graph release gate
+        #[arg(long)]
+        codegraph: bool,
+        /// Measure the code-graph gate against the live database
+        #[arg(long)]
+        live: bool,
     },
     /// Backfill session stories from V3/heuristic data (zero cost)
     BackfillStories {
         /// Preview without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Backfill the code_evolution co-edit ledger from JSONL conversation
+    /// history (feeds the B3 corpus-witness bind tier)
+    BackfillCoedit {
+        /// Preview would-insert counts per project; write nothing
         #[arg(long)]
         dry_run: bool,
     },
@@ -159,6 +172,20 @@ enum CodegraphAction {
     /// Reconstruct the code graph from all existing conversation JSONL history.
     Backfill {
         /// Parse + count what would be written, but make no changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Backfill `repo_root` (git toplevel) on existing code_nodes /
+    /// code_evolution rows that predate the column (WP2 Stage 1, H8 finding).
+    BackfillRepoRoot {
+        /// Count what would be resolved, but make no changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Backfill two-channel symbol attribution (transcript + git) on every
+    /// existing code_nodes row (WP2 Stage 2, H4 remediation).
+    BackfillAttribution {
+        /// Count what would be attributed, but make no changes.
         #[arg(long)]
         dry_run: bool,
     },
@@ -270,6 +297,8 @@ async fn main() -> Result<()> {
         continuity,
         continuity_live,
         provenance,
+        codegraph,
+        live,
     }) = args.command
     {
         if let Some(parent) = args.db_path.parent() {
@@ -304,6 +333,18 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
+        if codegraph {
+            let report = if live {
+                csr_engine::eval::codegraph::run_codegraph_live(eng.storage())?
+            } else {
+                csr_engine::eval::codegraph::run_codegraph(eng.storage())?
+            };
+            print!("{}", report.format_text());
+            if report.results.iter().any(|result| !result.passed) {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         let report = if full {
             csr_engine::eval::run_full(
                 eng.storage(),
@@ -333,6 +374,20 @@ async fn main() -> Result<()> {
         return csr_engine::summarizer::backfill_stories_cli(&eng, dry_run).await;
     }
 
+    if let Some(Commands::BackfillCoedit { dry_run }) = args.command {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats = csr_engine::import::coedit_backfill::backfill_coedit(
+            eng.storage(),
+            &args.projects_dir,
+            dry_run,
+        )?;
+        print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
     if let Some(Commands::Codegraph {
         action: CodegraphAction::Backfill { dry_run },
     }) = args.command
@@ -343,6 +398,32 @@ async fn main() -> Result<()> {
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
         let stats =
             csr_engine::import::backfill::backfill_code_graph(&eng, &args.projects_dir, dry_run)?;
+        print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
+    if let Some(Commands::Codegraph {
+        action: CodegraphAction::BackfillRepoRoot { dry_run },
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats = csr_engine::import::backfill::backfill_repo_root(&eng, dry_run)?;
+        print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
+    if let Some(Commands::Codegraph {
+        action: CodegraphAction::BackfillAttribution { dry_run },
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats = csr_engine::import::backfill::backfill_attribution(&eng, dry_run)?;
         print!("{}", stats.format_text(dry_run));
         return Ok(());
     }

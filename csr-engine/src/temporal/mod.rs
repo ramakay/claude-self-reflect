@@ -19,6 +19,10 @@ pub fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
         return Some(naive.and_utc());
     }
+    // SQLite datetime('now') shape: space separator, no zone (still UTC).
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(naive.and_utc());
+    }
     None
 }
 
@@ -350,9 +354,13 @@ mod tests {
     fn test_parse_last_n_months() {
         let (start, end) = parse_time_expression("last 6 months").unwrap();
         assert!(start < end);
-        // Should be roughly 180 days (varies 150-210 depending on month lengths)
+        // `start` is the 1st of the month 6 months back; `end` is `now`, so the
+        // range = 6 full calendar months (181-184 days depending on which months)
+        // + elapsed days into the current month (0-30). Verified min/max across a
+        // full leap and non-leap year is 181-214 days; use a wider margin (220) so
+        // this isn't fragile to which day of the month the suite happens to run on.
         let diff = end - start;
-        assert!(diff.num_days() > 150 && diff.num_days() <= 210);
+        assert!(diff.num_days() > 150 && diff.num_days() <= 220);
     }
 
     #[test]
@@ -396,6 +404,16 @@ mod tests {
     fn test_parse_timestamp_invalid() {
         assert!(parse_timestamp("not a timestamp").is_none());
         assert!(parse_timestamp("").is_none());
+    }
+
+    #[test]
+    fn test_parse_timestamp_sqlite_datetime() {
+        // SQLite `datetime('now')` uses a space separator and no zone marker.
+        // Must parse as UTC (same instant as the RFC 3339 Z form), not local time.
+        let sqlite = parse_timestamp("2026-07-29 20:25:33");
+        assert!(sqlite.is_some());
+        let rfc = parse_timestamp("2026-07-29T20:25:33Z").unwrap();
+        assert_eq!(sqlite.unwrap(), rfc);
     }
 
     #[test]

@@ -1,0 +1,234 @@
+{
+ "S_A-S": {
+  "label": "H1: AST spread vs no expansion",
+  "mrr": {
+   "n": 12,
+   "qids": [
+    "A3",
+    "A5",
+    "A6",
+    "A7",
+    "A8",
+    "Q10",
+    "Q12",
+    "Q4",
+    "Q5",
+    "Q6",
+    "Q8",
+    "Q9"
+   ],
+   "mean_delta": 0.0,
+   "ci95": [
+    0.0,
+    0.0
+   ],
+   "ci_excludes_0": false
+  },
+  "ndcg10": {
+   "n": 20,
+   "qids": [
+    "A1",
+    "A2",
+    "A3",
+    "A4",
+    "A5",
+    "A6",
+    "A7",
+    "A8",
+    "Q1",
+    "Q10",
+    "Q11",
+    "Q12",
+    "Q2",
+    "Q3",
+    "Q4",
+    "Q5",
+    "Q6",
+    "Q7",
+    "Q8",
+    "Q9"
+   ],
+   "mean_delta": 0.0076,
+   "ci95": [
+    -0.0041,
+    0.024
+   ],
+   "ci_excludes_0": false
+  }
+ },
+ "S_A-S_Asham": {
+  "label": "H1: AST spread vs shuffled-edge control",
+  "mrr": {
+   "n": 12,
+   "qids": [
+    "A3",
+    "A5",
+    "A6",
+    "A7",
+    "A8",
+    "Q10",
+    "Q12",
+    "Q4",
+    "Q5",
+    "Q6",
+    "Q8",
+    "Q9"
+   ],
+   "mean_delta": 0.0,
+   "ci95": [
+    0.0,
+    0.0
+   ],
+   "ci_excludes_0": false
+  },
+  "ndcg10": {
+   "n": 20,
+   "qids": [
+    "A1",
+    "A2",
+    "A3",
+    "A4",
+    "A5",
+    "A6",
+    "A7",
+    "A8",
+    "Q1",
+    "Q10",
+    "Q11",
+    "Q12",
+    "Q2",
+    "Q3",
+    "Q4",
+    "Q5",
+    "Q6",
+    "Q7",
+    "Q8",
+    "Q9"
+   ],
+   "mean_delta": 0.0002,
+   "ci95": [
+    -0.0132,
+    0.0139
+   ],
+   "ci_excludes_0": false
+  }
+ },
+ "S_F-S": {
+  "label": "H2: file spread vs no expansion",
+  "mrr": {
+   "n": 12,
+   "qids": [
+    "A3",
+    "A5",
+    "A6",
+    "A7",
+    "A8",
+    "Q10",
+    "Q12",
+    "Q4",
+    "Q5",
+    "Q6",
+    "Q8",
+    "Q9"
+   ],
+   "mean_delta": 0.0167,
+   "ci95": [
+    0.0,
+    0.05
+   ],
+   "ci_excludes_0": false
+  },
+  "ndcg10": {
+   "n": 20,
+   "qids": [
+    "A1",
+    "A2",
+    "A3",
+    "A4",
+    "A5",
+    "A6",
+    "A7",
+    "A8",
+    "Q1",
+    "Q10",
+    "Q11",
+    "Q12",
+    "Q2",
+    "Q3",
+    "Q4",
+    "Q5",
+    "Q6",
+    "Q7",
+    "Q8",
+    "Q9"
+   ],
+   "mean_delta": 0.0264,
+   "ci95": [
+    -0.0058,
+    0.0713
+   ],
+   "ci_excludes_0": false
+  }
+ },
+ "S_FA-S_F": {
+  "label": "AST marginal gain on top of file spread",
+  "mrr": {
+   "n": 12,
+   "qids": [
+    "A3",
+    "A5",
+    "A6",
+    "A7",
+    "A8",
+    "Q10",
+    "Q12",
+    "Q4",
+    "Q5",
+    "Q6",
+    "Q8",
+    "Q9"
+   ],
+   "mean_delta": 0.0,
+   "ci95": [
+    0.0,
+    0.0
+   ],
+   "ci_excludes_0": false
+  },
+  "ndcg10": {
+   "n": 20,
+   "qids": [
+    "A1",
+    "A2",
+    "A3",
+    "A4",
+    "A5",
+    "A6",
+    "A7",
+    "A8",
+    "Q1",
+    "Q10",
+    "Q11",
+    "Q12",
+    "Q2",
+    "Q3",
+    "Q4",
+    "Q5",
+    "Q6",
+    "Q7",
+    "Q8",
+    "Q9"
+   ],
+   "mean_delta": 0.0011,
+   "ci95": [
+    -0.0005,
+    0.0039
+   ],
+   "ci_excludes_0": false
+  }
+ },
+ "verdicts": {
+  "h1": "FAIL",
+  "h2": "FAIL"
+ }
+}

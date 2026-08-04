@@ -251,6 +251,165 @@ pub fn run(conn: &Connection) -> Result<()> {
         );
     }
 
+    // Migration: witness-closure resolution columns on code_edges (v9.5 Phase 1).
+    // callee_kind is captured at extraction time (before bare_callee() strips the
+    // receiver); boundary + evidence are populated later by the resolver (Phase 2+).
+    // Same idempotent ALTER-guard pattern as the src_file migration above.
+    {
+        let has_callee_kind: bool = conn
+            .prepare("SELECT callee_kind FROM code_edges LIMIT 0")
+            .is_ok();
+        if !has_callee_kind {
+            let _ = conn
+                .execute_batch("ALTER TABLE code_edges ADD COLUMN callee_kind TEXT DEFAULT '';");
+        }
+        let has_boundary: bool = conn
+            .prepare("SELECT boundary FROM code_edges LIMIT 0")
+            .is_ok();
+        if !has_boundary {
+            let _ =
+                conn.execute_batch("ALTER TABLE code_edges ADD COLUMN boundary TEXT DEFAULT '';");
+        }
+        let has_evidence: bool = conn
+            .prepare("SELECT evidence FROM code_edges LIMIT 0")
+            .is_ok();
+        if !has_evidence {
+            let _ =
+                conn.execute_batch("ALTER TABLE code_edges ADD COLUMN evidence TEXT DEFAULT '';");
+        }
+    }
+
+    // Migration: src_content_hash on code_edges (WCR truth pass, Codex round 7
+    // adversarial review). Immutable per-edge write-time provenance: the
+    // whole-file content hash (`extraction::codegraph::body_hash` of the SAME
+    // source that produced this edge), stamped once by `extract_inner`'s
+    // `add_edge` closure and never independently refreshed — unlike
+    // `code_nodes.body_hash`, which `upsert_node` refreshes on every sighting
+    // in a SEPARATE transaction from the edge replace. That mutability +
+    // transaction split is exactly what let a partial write (nodes refreshed,
+    // edge replace failed or simply never ran) falsely authenticate a stale
+    // edge for re-pointing — see
+    // `eval::codegraph::historical_src_content_unchanged`'s doc comment for
+    // the full finding. DEFAULT '' means "absent" (a legacy edge written
+    // before this column existed, or by a path that hasn't re-extracted
+    // since) — categorically ineligible for re-pointing, never a guess.
+    {
+        let has_src_content_hash: bool = conn
+            .prepare("SELECT src_content_hash FROM code_edges LIMIT 0")
+            .is_ok();
+        if !has_src_content_hash {
+            let _ = conn.execute_batch(
+                "ALTER TABLE code_edges ADD COLUMN src_content_hash TEXT DEFAULT '';",
+            );
+        }
+    }
+
+    // repo_defs (v9.5 Phase 1): per-file symbol inventory (name/kind/lang) feeding
+    // witness-closure resolution (Phase 2+). Populated by a repo scan; replace-per-file
+    // semantics mirror code_edges (see upsert_repo_defs in storage/codegraph.rs).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS repo_defs (
+            project    TEXT NOT NULL,
+            file       TEXT NOT NULL,
+            name       TEXT NOT NULL,
+            kind       TEXT NOT NULL,
+            lang       TEXT NOT NULL DEFAULT '',
+            scanned_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (project, file, name, kind)
+        );",
+    )?;
+
+    // Migration: repo_root identity column on code_nodes + code_evolution
+    // (WP2 Stage 1, H8 finding — receipt R4). `project` is the session-cwd
+    // tag (its own signal, never overwritten here); `repo_root` is the git
+    // toplevel of the row's file at index/backfill time
+    // (`extraction::repo_root::repo_root_for_file`) — a stable identity that
+    // collapses two different session cwds checked out inside the SAME
+    // repository (e.g. `claude-self-reflect` and its `csr-engine`
+    // subdirectory opened as its own session) onto one label. Nullable:
+    // non-git files, or files whose repo can no longer be resolved (git
+    // missing, no `.git` found walking up), get NULL — never a guess.
+    {
+        let has_repo_root_nodes: bool = conn
+            .prepare("SELECT repo_root FROM code_nodes LIMIT 0")
+            .is_ok();
+        if !has_repo_root_nodes {
+            let _ = conn.execute_batch("ALTER TABLE code_nodes ADD COLUMN repo_root TEXT;");
+        }
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_code_nodes_repo_root ON code_nodes(repo_root);",
+        );
+
+        let has_repo_root_evolution: bool = conn
+            .prepare("SELECT repo_root FROM code_evolution LIMIT 0")
+            .is_ok();
+        if !has_repo_root_evolution {
+            let _ = conn.execute_batch("ALTER TABLE code_evolution ADD COLUMN repo_root TEXT;");
+        }
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_code_evolution_repo_root ON code_evolution(repo_root);",
+        );
+    }
+
+    // code_node_attribution (WP2 Stage 2, H4/H5/H6 remediation — receipts
+    // R2/R3/R8 in `.plans/2026-07-31-codegraph-shipping-plan.md`). Two
+    // independent, NEVER-merged provenance channels per symbol:
+    // `transcript` (the agent conversation whose `code_evolution` event
+    // first named the symbol) and `git` (the commit that introduced the
+    // symbol's current line span, via `git log -L … --reverse`). Replaces
+    // `code_nodes.first_conv_id` as the thing consumer surfaces present as
+    // "introduction evidence" — H4 measured `first_conv_id` at 50.7%
+    // agreement with the evidence-bearing join (file-level projection, not a
+    // real per-symbol fact); `first_conv_id` itself stays in the schema for
+    // compat, just no longer trusted for this purpose.
+    //
+    // `channel` CHECK constraint keeps the table from ever silently
+    // accepting a third pseudo-channel. `source_id` is a session id
+    // (transcript) or a commit hash (git); `observed_ts` is the event/commit
+    // timestamp, nullable because a channel can be written before a
+    // timestamp is known; `evidence` is a short machine tag
+    // (`coedit_event` | `git_log_L`) naming the derivation, not free text.
+    // PRIMARY KEY(node_id, channel) — at most one row per node per channel,
+    // so `code_node_attribution::upsert_attribution` is a pure idempotent
+    // replace, safe to re-run the backfill.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS code_node_attribution (
+            node_id     TEXT NOT NULL,
+            channel     TEXT NOT NULL CHECK(channel IN ('transcript','git')),
+            source_id   TEXT NOT NULL,
+            observed_ts TEXT,
+            evidence    TEXT,
+            PRIMARY KEY(node_id, channel)
+        );
+        CREATE INDEX IF NOT EXISTS idx_code_node_attribution_node
+            ON code_node_attribution(node_id);",
+    )?;
+
+    // Migration: ast_status column on code_graph_file_state (WP2 Stage 3, H8
+    // innovation — receipt R4 in
+    // `.plans/2026-07-31-codegraph-shipping-plan.md`). File-level provenance
+    // for files the extraction write paths (hook `update_code_graph`,
+    // `import::backfill`) SAW but could not parse because the extension is
+    // outside the six supported languages: instead of silently dropping the
+    // file (the pre-existing behavior), a row is written with
+    // `ast_status='unsupported'` so the file stays traversable at
+    // file-granularity rather than vanishing. Default `'supported'` — every
+    // pre-existing row (and every row `upsert_file_state` still writes after
+    // a real extraction) is, by construction, a file CSR actually parsed.
+    {
+        let has_ast_status: bool = conn
+            .prepare("SELECT ast_status FROM code_graph_file_state LIMIT 0")
+            .is_ok();
+        if !has_ast_status {
+            let _ = conn.execute_batch(
+                "ALTER TABLE code_graph_file_state ADD COLUMN ast_status TEXT NOT NULL DEFAULT 'supported';",
+            );
+        }
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_code_graph_file_state_ast_status ON code_graph_file_state(ast_status);",
+        );
+    }
+
     // Migration: add project_name to code_evolution if missing (v9 cross-project fix)
     {
         let has_project_col: bool = conn
@@ -390,6 +549,140 @@ pub fn run(conn: &Connection) -> Result<()> {
          );",
     )?;
 
+    // local_bindings (WCR truth pass, TASK 2; scope-qualified by the X4
+    // adversarial-review truth pass, Finding 1; CHAIN-qualified by the
+    // second X4 adversarial review, Finding 4): the X4 `local` classify
+    // tier's witness table — per (project, file, scope), the set of names
+    // bound as function/closure parameters or local (non-top-level) variable
+    // declarations, as gathered by
+    // `extraction::codegraph::collect_local_bindings`. `scope` is the FULL
+    // scope CHAIN of the nearest enclosing NAMED definition the binding sits
+    // inside (see `extraction::codegraph::scope_chain`'s doc comment — e.g.
+    // `"Component"`, `"Component>anon12"`), or '' for module-level bindings
+    // — without it, a single flat name-set per (project, file) let a
+    // parameter named `handler` in one function OR ONE ANONYMOUS CLOSURE
+    // classify an unrelated sibling scope's own `handler()` call as local.
+    // Populated by `eval::codegraph::backfill_wcr_witnesses` from the SAME
+    // parse it already does for callee_kind/evidence backfill — never a
+    // second parse. Read by `extraction::resolver::resolve_edges`'s X4 tier
+    // (prefix-matched against each pending edge's own chain — see
+    // `edge_scope_chains`, below).
+    //
+    // DROP+CREATE (Finding 1, X4 adversarial review): this table only ever
+    // holds shadow/witness data, rebuilt from scratch by every
+    // `backfill_wcr_witnesses` pass (see `persist_local_bindings`'s
+    // transactional replace-per-file semantics — Finding 2), so an
+    // a shape-probed drop-and-recreate is needed — a pre-existing DB with
+    // the OLD 3-column (project, file, name) schema would otherwise silently
+    // keep that schema forever (`CREATE TABLE IF NOT EXISTS` is a no-op once
+    // the table exists), breaking every query below that now expects `scope`. The
+    // `scope` column's CONTENT changed from a bare enclosing-def name to a
+    // full chain string (Finding 4) without any column/shape change, so no
+    // further migration bump was needed for that step.
+    // Shape-probed drop (CodeRabbit PR #279): `run` executes on EVERY
+    // `Storage::open`, so an unconditional drop here is not a one-time schema
+    // upgrade — it wiped the witness rows persisted by the last
+    // `backfill_wcr_witnesses` pass on every subsequent hook/MCP process
+    // start, silently disabling the X4 `local` tier in live use. Drop only
+    // when the table exists in the pre-`scope` legacy shape.
+    let lb_has_scope_in_pk: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('local_bindings')
+         WHERE name = 'scope' AND pk > 0",
+        [],
+        |r| r.get(0),
+    )?;
+    if lb_has_scope_in_pk == 0 {
+        conn.execute_batch("DROP TABLE IF EXISTS local_bindings;")?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS local_bindings (
+            project TEXT NOT NULL,
+            file    TEXT NOT NULL,
+            scope   TEXT NOT NULL,
+            name    TEXT NOT NULL,
+            PRIMARY KEY (project, file, scope, name)
+        );",
+    )?;
+
+    // edge_scope_chains (X4 adversarial review, Finding 4; multi-row-per-
+    // edge as of the Codex round 4 adversarial review, Finding 1): per
+    // pending `calls`/`imports` edge, the AST scope CHAIN of EVERY DISTINCT
+    // physical call/import site `code_edges` aggregated into that one
+    // `(src_id, dst_id, kind)` row. Before Finding 1, this table kept only
+    // the FIRST site's chain per edge key (`INSERT OR IGNORE` against a PK
+    // that didn't include `chain`), so an edge aggregating calls from two
+    // DIFFERENT sibling closures silently discarded every occurrence but
+    // one — order-dependent, and able to both falsely witness an aggregate
+    // via an unrelated sibling closure's chain and hide a valid witness.
+    // `chain` is now part of the PRIMARY KEY, so every distinct chain for
+    // the same edge gets its own row (identical chains from repeat physical
+    // sites still collapse to one row — `INSERT OR IGNORE` dedup, same as
+    // before). `extraction::resolver::resolve_edges`'s X4 tier reads ALL
+    // rows for an edge and requires a witness's binding chain to be a
+    // prefix of EVERY one of them (conservative universal quantification —
+    // see `Pending::call_scope_chains`' doc comment) rather than any single
+    // one, matching the true "this edge only reduces to ONE call site"
+    // semantics only when there genuinely is only one.
+    //
+    // Shape-probed DROP+CREATE (same reasoning as `local_bindings`,
+    // immediately above): this table holds shadow/witness data rebuilt
+    // per-file by `backfill_wcr_witnesses` passes (see
+    // `persist_call_scope_chains`'s transactional replace-per-file
+    // semantics); the drop is needed only for legacy shapes — a
+    // pre-existing DB with the OLD
+    // 5-column `(src_id, dst_id, kind)`-only-PK schema would otherwise
+    // silently keep that schema forever (`CREATE TABLE IF NOT EXISTS` is a
+    // no-op once the table exists), breaking every query below that now
+    // expects `chain` to be part of the key (a stale single-row-per-edge DB
+    // would silently drop every occurrence past the first on the next
+    // `INSERT OR IGNORE`, reintroducing the exact bug this migration fixes).
+    //
+    // Populated by `eval::codegraph::backfill_wcr_witnesses` for EVERY
+    // fresh `calls`/`imports` call/import site in a re-extracted file
+    // (`extraction::codegraph::GraphFragment::call_scope_chains`),
+    // unconditionally — same "persist everything this fresh pass saw"
+    // philosophy as `local_bindings`, never filtered down to only the
+    // edges some pending row happened to match. A pending edge that
+    // MATCHES or gets RE-POINTED (Finding: attribution-skewed re-point,
+    // see `backfill_wcr_witnesses`) to a fresh edge therefore ends this
+    // backfill pass with a `(src_id, dst_id, kind)` that has at least one
+    // row in this table; an edge left untouched (no fresh counterpart
+    // found at all) has none — `extraction::resolver::resolve_edges`
+    // fetches this table as a separate `(src_id, dst_id, kind) -> Vec<chain>`
+    // map (never a JOIN against the main Pending query — a JOIN would fan
+    // out into one Pending row per chain for a multi-occurrence edge,
+    // corrupting the one-Pending-per-DB-row invariant every stat bucket
+    // relies on) and falls back to the edge's own calling-def name when no
+    // row exists (see `Pending::call_scope_chains`'s doc comment),
+    // preserving the pre-chain exact-match behavior for edges this
+    // backfill pass has no fresh chain data for.
+    // Shape-probed drop, same reasoning as `local_bindings` above: the legacy
+    // shape is detected by `chain` being absent from the PRIMARY KEY (the
+    // pre-Finding-1 table either lacked the column or keyed only on
+    // `(src_id, dst_id, kind)`); the current shape survives re-open with its
+    // rows intact.
+    let esc_has_chain_in_pk: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('edge_scope_chains')
+         WHERE name = 'chain' AND pk > 0",
+        [],
+        |r| r.get(0),
+    )?;
+    if esc_has_chain_in_pk == 0 {
+        conn.execute_batch("DROP TABLE IF EXISTS edge_scope_chains;")?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS edge_scope_chains (
+            project TEXT NOT NULL,
+            file    TEXT NOT NULL,
+            src_id  TEXT NOT NULL,
+            dst_id  TEXT NOT NULL,
+            kind    TEXT NOT NULL,
+            chain   TEXT NOT NULL,
+            PRIMARY KEY (src_id, dst_id, kind, chain)
+        );
+        CREATE INDEX IF NOT EXISTS idx_edge_scope_chains_file ON edge_scope_chains(project, file);",
+    )?;
+
     Ok(())
 }
 
@@ -424,6 +717,30 @@ mod tests {
     }
 
     #[test]
+    fn witness_closure_columns_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare("SELECT callee_kind, boundary, evidence FROM code_edges LIMIT 0")
+                .is_ok(),
+            "callee_kind, boundary, evidence columns must exist on code_edges after migration"
+        );
+        assert!(
+            conn.prepare("SELECT src_content_hash FROM code_edges LIMIT 0")
+                .is_ok(),
+            "src_content_hash column must exist on code_edges after migration (Codex round 7)"
+        );
+        assert!(
+            conn.prepare(
+                "SELECT project, file, name, kind, lang, scanned_at FROM repo_defs LIMIT 0"
+            )
+            .is_ok(),
+            "repo_defs table must exist after migration"
+        );
+    }
+
+    #[test]
     fn resolution_ledger_migration_idempotent() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         run(&conn).expect("first migrations::run");
@@ -435,5 +752,168 @@ mod tests {
             .is_ok(),
             "resolution_ledger table must exist after migration"
         );
+    }
+
+    #[test]
+    fn repo_root_columns_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare("SELECT repo_root FROM code_nodes LIMIT 0")
+                .is_ok(),
+            "repo_root column must exist on code_nodes after migration"
+        );
+        assert!(
+            conn.prepare("SELECT repo_root FROM code_evolution LIMIT 0")
+                .is_ok(),
+            "repo_root column must exist on code_evolution after migration"
+        );
+    }
+
+    #[test]
+    fn code_node_attribution_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare(
+                "SELECT node_id, channel, source_id, observed_ts, evidence FROM code_node_attribution LIMIT 0"
+            )
+            .is_ok(),
+            "code_node_attribution table must exist after migration"
+        );
+    }
+
+    #[test]
+    fn code_node_attribution_channel_check_constraint_rejects_third_channel() {
+        // WP2 Stage 2, receipt R2/R3/R8: only 'transcript' and 'git' are
+        // legitimate provenance channels — a third value must be rejected at
+        // the DB layer, not just by convention.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let ok = conn.execute(
+            "INSERT INTO code_node_attribution (node_id, channel, source_id) VALUES ('n1', 'transcript', 's1')",
+            [],
+        );
+        assert!(ok.is_ok(), "valid channel must be accepted: {ok:?}");
+        let bad = conn.execute(
+            "INSERT INTO code_node_attribution (node_id, channel, source_id) VALUES ('n1', 'guess', 's1')",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "channel CHECK constraint must reject a non-transcript/git value"
+        );
+    }
+
+    #[test]
+    fn ast_status_column_migration_idempotent_and_defaults_supported() {
+        // WP2 Stage 3, receipt R4: pre-existing rows (written before this
+        // migration existed) must default to 'supported' — they were, by
+        // construction, successfully parsed by the extractor.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare("SELECT ast_status FROM code_graph_file_state LIMIT 0")
+                .is_ok(),
+            "ast_status column must exist on code_graph_file_state after migration"
+        );
+        conn.execute(
+            "INSERT INTO code_graph_file_state (project, file) VALUES ('p1', 'f1')",
+            [],
+        )
+        .unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT ast_status FROM code_graph_file_state WHERE project = 'p1' AND file = 'f1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "supported");
+    }
+
+    #[test]
+    fn local_bindings_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare("SELECT project, file, scope, name FROM local_bindings LIMIT 0")
+                .is_ok(),
+            "local_bindings table (with scope column) must exist after migration"
+        );
+        // PRIMARY KEY(project, file, scope, name) makes a repeat insert a
+        // no-op (INSERT OR IGNORE), not an error — the table is a plain
+        // idempotent witness set, never accumulates duplicates.
+        conn.execute(
+            "INSERT INTO local_bindings (project, file, scope, name) VALUES ('p', 'f.ts', 'foo', 'reject')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO local_bindings (project, file, scope, name) VALUES ('p', 'f.ts', 'foo', 'reject')",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_bindings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn local_bindings_migration_drops_old_three_column_schema() {
+        // Finding 1/2 (X4 adversarial review): a DB migrated under the OLD
+        // (project, file, name) schema must not be left stuck on it —
+        // `run` must drop and recreate with the new `scope` column, not
+        // silently no-op via `CREATE TABLE IF NOT EXISTS`.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE local_bindings (
+                project TEXT NOT NULL,
+                file    TEXT NOT NULL,
+                name    TEXT NOT NULL,
+                PRIMARY KEY (project, file, name)
+            );",
+        )
+        .unwrap();
+        run(&conn).expect("migrations::run over a pre-existing old-schema table");
+        assert!(
+            conn.prepare("SELECT project, file, scope, name FROM local_bindings LIMIT 0")
+                .is_ok(),
+            "old 3-column table must be replaced with the new 4-column schema"
+        );
+    }
+
+    #[test]
+    fn witness_tables_survive_reopen_with_rows_intact() {
+        // CodeRabbit PR #279: `run` executes on every `Storage::open`, so a
+        // current-shape table must NOT be dropped again — that wiped every
+        // `backfill_wcr_witnesses` result on the next process start and
+        // silently disabled the X4 `local` tier in live use.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        conn.execute(
+            "INSERT INTO local_bindings (project, file, scope, name) VALUES ('p', 'f.ts', 'foo', 'reject')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edge_scope_chains (project, file, src_id, dst_id, kind, chain) \
+             VALUES ('p', 'f.ts', 's', 'd', 'calls', 'foo>bar')",
+            [],
+        )
+        .unwrap();
+        run(&conn).expect("second migrations::run (simulated re-open)");
+        let lb: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_bindings", [], |r| r.get(0))
+            .unwrap();
+        let esc: i64 = conn
+            .query_row("SELECT COUNT(*) FROM edge_scope_chains", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((lb, esc), (1, 1), "witness rows must survive re-open");
     }
 }
