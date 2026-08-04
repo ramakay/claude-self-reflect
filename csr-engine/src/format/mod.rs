@@ -601,7 +601,8 @@ pub fn format_file_results(chunks: &[ConversationChunk], file_path: &str, indexe
     if chunks.is_empty() {
         return format!(
             "<file_search indexed='{}'><message>No conversations found analyzing {}</message></file_search>",
-            indexed, file_path
+            indexed,
+            xml_escape(file_path)
         );
     }
 

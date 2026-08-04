@@ -40,6 +40,13 @@ if len(sys.argv) < 2:
     sys.exit("usage: score.py <gold.json> [ablation.jsonl]")
 gold_path = sys.argv[1]
 ablation_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(AG, "ablation.jsonl")
+if not os.path.isfile(ablation_path):
+    sys.exit(
+        f"ablation file not found: {ablation_path}\n"
+        "AG run outputs are private (not committed) — generate one with "
+        "examples/codegraph_ablation.rs (CSR_ABLATION_DB/CSR_ABLATION_OUT) and pass its "
+        "path as the second argument."
+    )
 
 with open(gold_path) as f:
     gold_raw = json.load(f)
@@ -72,7 +79,15 @@ elif isinstance(gold_queries, list):
     for item in gold_queries:
         qid = item["id"]
         grades = item.get("grades") or item.get("graded") or item.get("relevant") or {}
-        G[qid] = {"items": {conv: {"grade": g} for conv, g in grades.items()}}
+        # Same normalization as the dict branch: a grade may be a bare int or
+        # {"grade": n} — storing the raw dict would make recall2's `>=` and
+        # ndcg's exponentiation fail with TypeError.
+        G[qid] = {
+            "items": {
+                conv: {"grade": g["grade"] if isinstance(g, dict) else g}
+                for conv, g in grades.items()
+            }
+        }
         origin = item["origin"] if "origin" in item else item.get("origin_conv_id")
         ORIGIN[qid] = origin or None
 else:

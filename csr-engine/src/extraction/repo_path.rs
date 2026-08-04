@@ -41,7 +41,7 @@ pub fn canonical_repo_path(path: &Path) -> PathBuf {
     match cached {
         Some(None) => {
             // Plain repo / no rewrite — canonicalize if possible.
-            return std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            return canonicalize_stable(path);
         }
         Some(Some((worktree_root, main_repo_root))) => {
             return rewrite_worktree_path(path, &worktree_root, &main_repo_root);
@@ -59,7 +59,7 @@ pub fn canonical_repo_path(path: &Path) -> PathBuf {
                 if let Ok(mut guard) = cache().lock() {
                     guard.insert(parent_key, None);
                 }
-                return std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                return canonicalize_stable(path);
             }
             if git_entry.is_file() {
                 // Linked worktree: parse gitdir and recover main repo root.
@@ -87,6 +87,26 @@ pub fn canonical_repo_path(path: &Path) -> PathBuf {
     // No `.git` found — cache as plain so we don't re-walk, return input as-is.
     if let Ok(mut guard) = cache().lock() {
         guard.insert(parent_key, None);
+    }
+    path.to_path_buf()
+}
+
+/// Canonicalize with a stable fallback for missing files (CodeRabbit PR
+/// #279): `fs::canonicalize` fails once the file is deleted or moved, and a
+/// raw-path fallback would make the SAME logical file yield two different
+/// key strings over time (symlink-resolved while it exists, raw after) —
+/// `code_nodes.file` / `code_evolution.file_path` are keyed on this string,
+/// so the attribution join would silently miss. Resolving the (still
+/// existing) parent directory and re-appending the file name keeps the
+/// resolved spelling even after deletion.
+fn canonicalize_stable(path: &Path) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(resolved_parent) = std::fs::canonicalize(parent) {
+            return resolved_parent.join(name);
+        }
     }
     path.to_path_buf()
 }
@@ -169,6 +189,24 @@ mod tests {
         let missing = wt.join("src").join("does_not_exist.rs");
         let got_missing = canonical_repo_path(&missing);
         assert_eq!(got_missing, missing);
+    }
+
+    #[test]
+    fn deleted_file_keeps_resolved_path_key() {
+        // CodeRabbit PR #279: the key for a logical file must not change
+        // spelling when the file is deleted — live writers (hook) and replay
+        // writers (backfill) may observe it at different times.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let file = repo.join("src").join("c.rs");
+        fs::write(&file, b"fn c() {}").unwrap();
+
+        let live = canonical_repo_path(&file);
+        fs::remove_file(&file).unwrap();
+        let gone = canonical_repo_path(&file);
+        assert_eq!(live, gone, "path key must be stable across deletion");
     }
 
     #[test]

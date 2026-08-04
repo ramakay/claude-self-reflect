@@ -290,6 +290,21 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
 /// 3. `MCP_CLIENT_CWD` via `resolve_current_project` (MCP tool path)
 /// 4. empty string
 fn resolve_project_for_hook(file_path_parent: Option<&Path>) -> String {
+    resolve_project_for_hook_with(
+        file_path_parent,
+        std::env::var("CLAUDE_PROJECT_DIR").ok(),
+        crate::search::cross_project::resolve_current_project(),
+    )
+}
+
+/// Env-free core of `resolve_project_for_hook`: fallback values are passed
+/// in so tests never mutate process-global env vars (CodeRabbit PR #279 —
+/// `remove_var` in one test races other tests reading the same vars).
+fn resolve_project_for_hook_with(
+    file_path_parent: Option<&Path>,
+    claude_project_dir: Option<String>,
+    current_project: Option<String>,
+) -> String {
     if let Some(parent) = file_path_parent {
         let parent_str = parent.to_string_lossy();
         if let Some(p) = crate::search::cross_project::resolve_project_from_cwd(&parent_str) {
@@ -298,14 +313,14 @@ fn resolve_project_for_hook(file_path_parent: Option<&Path>) -> String {
             }
         }
     }
-    if let Ok(dir) = std::env::var("CLAUDE_PROJECT_DIR") {
+    if let Some(dir) = claude_project_dir {
         if let Some(p) = crate::search::cross_project::resolve_project_from_cwd(&dir) {
             if !p.is_empty() {
                 return p;
             }
         }
     }
-    if let Some(p) = crate::search::cross_project::resolve_current_project() {
+    if let Some(p) = current_project {
         if !p.is_empty() {
             return p;
         }
@@ -319,12 +334,10 @@ mod tests {
 
     #[test]
     fn resolve_project_for_hook_from_file_parent() {
-        // Isolate from any MCP/Claude env set by other tests in this process.
-        std::env::remove_var("MCP_CLIENT_CWD");
-        std::env::remove_var("CLAUDE_PROJECT_DIR");
-
+        // Env-free variant — passing None for both fallbacks isolates the
+        // parent-directory chain without mutating process-global env vars.
         let parent = Path::new("/Users/x/projects/my-repo/src/main.rs").parent();
-        let project = resolve_project_for_hook(parent);
+        let project = resolve_project_for_hook_with(parent, None, None);
         assert_eq!(project, "my-repo");
         assert!(!project.is_empty());
     }

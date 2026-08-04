@@ -405,11 +405,13 @@ fn placeholder_leak_gate() -> EvalResult {
         let rendered = slices.join("\n");
 
         let mut leaked: Vec<String> = Vec::new();
+        let mut parsed_call_lines = 0usize;
         for line in rendered.lines() {
             let parts: Vec<&str> = line.splitn(2, "calls → ").collect();
             if parts.len() != 2 {
                 continue;
             }
+            parsed_call_lines += 1;
             let after_arrow = parts[1];
             let token_list = after_arrow
                 .split(" (last changed")
@@ -423,8 +425,20 @@ fn placeholder_leak_gate() -> EvalResult {
             }
         }
 
+        // Vacuous-pass guard (CodeRabbit PR #279, same shape the fixture
+        // comment above protects the WCR gates from): if the renderer's
+        // "calls → " separator changes or the outbound-calls line vanishes,
+        // zero lines parse and `leaked` stays empty while asserting nothing.
+        // Require at least one parsed call-target line for a PASS.
+        if parsed_call_lines == 0 {
+            let detail = format!(
+                "vacuous: no 'calls → ' line parsed from injection render — separator changed or \
+                 outbound-calls line missing; rendered={rendered:?}"
+            );
+            return Ok((false, detail));
+        }
         let detail = format!(
-            "unresolved callees={unresolved_names:?}; rendered={rendered:?}; leaked as bare undecorated tokens={leaked:?}"
+            "parsed_call_lines={parsed_call_lines}; unresolved callees={unresolved_names:?}; rendered={rendered:?}; leaked as bare undecorated tokens={leaked:?}"
         );
         Ok((leaked.is_empty(), detail))
     })();
@@ -2511,11 +2525,15 @@ fn representative_live_source(
 
     let mut readable = Vec::new();
     for (file, (repo, project)) in files {
-        let path = Path::new(file);
+        // Resolve through canonical_repo_path like build_file_exists_set does
+        // (CodeRabbit PR #279) — a stored path that is not in resolved form
+        // would otherwise be probed against the process cwd and skipped as
+        // missing even though the file exists.
+        let path = crate::extraction::repo_path::canonical_repo_path(Path::new(file));
         if !path.is_file() {
             continue;
         }
-        let metadata = fs::metadata(path)?;
+        let metadata = fs::metadata(&path)?;
         readable.push((metadata.len(), file, repo, project));
     }
     readable.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
@@ -2523,8 +2541,10 @@ fn representative_live_source(
         .get(readable.len() / 2)
         .copied()
         .context("no readable Rust file represented in the live code graph")?;
-    let source = fs::read_to_string(file)
-        .with_context(|| format!("read representative live source {file}"))?;
+    let source = fs::read_to_string(crate::extraction::repo_path::canonical_repo_path(
+        Path::new(file),
+    ))
+    .with_context(|| format!("read representative live source {file}"))?;
     let lang =
         lang_from_path_str(file).context("representative live file has unsupported language")?;
     let symbol = snapshot
@@ -2872,7 +2892,12 @@ fn health_result(snapshot: &GraphSnapshot, storage: &Storage) -> EvalResult {
     let missing = snapshot
         .file_states
         .iter()
-        .filter(|(_, file, _)| !Path::new(file).exists())
+        .filter(|(_, file, _)| {
+            // canonical_repo_path before the disk probe (CodeRabbit PR #279)
+            // so the missing-on-disk counter cannot over-report for stored
+            // paths that need worktree/symlink resolution.
+            !crate::extraction::repo_path::canonical_repo_path(Path::new(file)).exists()
+        })
         .count();
 
     let detail = format!(

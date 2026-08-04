@@ -3,7 +3,7 @@
   "ast_real_edges": 4092,
   "built_at_unix": 1785523530,
   "chunks_indexed": 136327,
-  "db": "/private/tmp/claude-501/-Users-ramakrishnanannaswamy-projects-claude-self-reflect-csr-engine/cce6e815-f696-4ae4-b25e-e0559ee9cd67/scratchpad/frozen_h1.db"
+  "db": "frozen_h1.db"
  },
  "arms": {
   "S": {

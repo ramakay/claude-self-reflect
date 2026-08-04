@@ -278,7 +278,15 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
             collect_edits(msg, &mut file_code);
         }
 
-        for (file_path, fragment_src) in &file_code {
+        for (raw_path, fragment_src) in &file_code {
+            // Canonicalize before storing (CodeRabbit PR #279): the hook
+            // (`post_tool_use`) and the co-edit backfill (`coedit_backfill`)
+            // both store `canonical_repo_path` output as the path key; this
+            // replay path must produce the same spelling or the attribution
+            // join on `(name, file)` silently misses across writers.
+            let file_path = &crate::extraction::repo_path::canonical_repo_path(Path::new(raw_path))
+                .to_string_lossy()
+                .to_string();
             let lang = match lang_from_path_str(file_path) {
                 Some(l) => l,
                 None => {
@@ -551,7 +559,8 @@ pub struct AttributionBackfillStats {
     pub nodes_checked: usize,
     /// Transcript-channel rows written (matched an earliest `code_evolution` event).
     pub transcript_attributed: usize,
-    /// Rows skipped for the git channel because `span_start <= 0` (no real span).
+    /// Rows skipped for the git channel because they have no blameable span:
+    /// negative/inverted spans, or the module sentinel (kind='module', 0/0).
     pub git_invalid_span: usize,
     /// Rows skipped because the file no longer exists on disk.
     pub git_file_missing: usize,
@@ -678,7 +687,8 @@ fn git_log_introducing_commit(
 /// Two independent passes, never merged:
 /// - **transcript**: joins each symbol (by name + file) against the
 ///   earliest `code_evolution` event that names it (`build_transcript_index`).
-/// - **git**: for symbols with a real span (`span_start > 0`) whose file
+/// - **git**: for symbols with a blameable span (0-based, non-inverted,
+///   excluding the kind='module' 0/0 sentinel) whose file
 ///   still exists on disk inside a resolvable git repo, walks
 ///   `git log -L… --reverse` to find the introducing commit
 ///   (`git_log_introducing_commit` — see its doc comment for the `-1`/`-n` trap).
@@ -729,7 +739,13 @@ fn backfill_attribution_into(storage: &Storage, dry_run: bool) -> Result<Attribu
 
     // Git channel.
     for node in &nodes {
-        if node.span_start <= 0 {
+        // `span_start` is 0-based (format/mod.rs renders `span_start + 1`),
+        // so a real definition on line 1 of a file legitimately has
+        // `span_start == 0` — common for JS/TS/Python files whose first line
+        // is the definition. Only the module-sentinel shape (kind='module',
+        // hardcoded 0/0 span covering no real lines) has no blameable span.
+        let module_sentinel = node.kind == "module" && node.span_start == 0 && node.span_end == 0;
+        if node.span_start < 0 || node.span_end < node.span_start || module_sentinel {
             stats.git_invalid_span += 1;
             continue;
         }
@@ -1112,20 +1128,31 @@ mod tests {
     }
 
     #[test]
-    fn git_channel_skips_span_start_zero_as_invalid_span() {
+    fn git_channel_skips_module_sentinel_but_not_line_one_symbols() {
+        // CodeRabbit PR #279: `span_start` is 0-based, so a real symbol
+        // defined on line 1 also has `span_start == 0`. Only the module
+        // sentinel (kind='module', 0/0 span) is span-invalid; a line-1
+        // function must proceed past the span gate (here it then falls to
+        // git_file_missing, proving it was NOT counted as invalid span).
         let storage = Storage::open_memory().unwrap();
-        let mut n = attr_node("n1", "/nonexistent/a.rs", "foo");
-        n.span_start = 0;
-        n.span_end = 0;
+        let mut sentinel = attr_node("n1", "/nonexistent/a.rs", "a.rs");
+        sentinel.kind = "module".into();
+        sentinel.span_start = 0;
+        sentinel.span_end = 0;
+        let mut line_one_fn = attr_node("n2", "/nonexistent/b.rs", "foo");
+        line_one_fn.span_start = 0;
+        line_one_fn.span_end = 3;
         storage
             .with_connection(|conn| {
-                codegraph_upsert_node(conn, &n).unwrap();
+                codegraph_upsert_node(conn, &sentinel).unwrap();
+                codegraph_upsert_node(conn, &line_one_fn).unwrap();
                 Ok(())
             })
             .unwrap();
 
         let stats = backfill_attribution_into(&storage, false).unwrap();
-        assert_eq!(stats.git_invalid_span, 1);
+        assert_eq!(stats.git_invalid_span, 1, "only the module sentinel");
+        assert_eq!(stats.git_file_missing, 1, "line-1 fn passed the span gate");
         assert_eq!(stats.git_attributed, 0);
     }
 

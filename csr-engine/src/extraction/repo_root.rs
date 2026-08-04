@@ -105,7 +105,13 @@ fn walk_up_for_git_dir(dir: &Path) -> Option<String> {
     let mut cur = Some(dir.to_path_buf());
     while let Some(d) = cur {
         if d.join(".git").exists() {
-            return Some(d.to_string_lossy().to_string());
+            // Canonicalize (CodeRabbit PR #279): `git_toplevel` returns the
+            // symlink-resolved spelling and `node.file` is stored resolved
+            // (`repo_path::canonical_repo_path`); an unresolved root here
+            // would fail `strip_prefix` in `relpath_in_repo` and count the
+            // symbol as `git_no_repo` instead of attributing it.
+            let resolved = std::fs::canonicalize(&d).unwrap_or(d);
+            return Some(resolved.to_string_lossy().to_string());
         }
         cur = d.parent().map(|p| p.to_path_buf());
     }

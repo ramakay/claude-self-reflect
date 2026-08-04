@@ -1843,10 +1843,17 @@ pub type CodeEvolutionEventRow = (i64, String, String, String, String, String);
 /// cheap even at the backfill's documented "minutes-scale over ~6.7k
 /// symbols" cost.
 pub fn all_code_evolution_events_ordered(conn: &Connection) -> Result<Vec<CodeEvolutionEventRow>> {
+    // `timestamp` holds two shapes: the schema default `datetime('now')`
+    // (`YYYY-MM-DD HH:MM:SS`, legacy rows) and RFC 3339 (`YYYY-MM-DDT...`,
+    // `insert_code_evolution` / backfill rows). Lexically, ' ' < 'T', so a
+    // plain ORDER BY would put every legacy row of a given day before every
+    // RFC 3339 row of that day regardless of the real instant — and the
+    // attribution channel takes the FIRST row per symbol as the winner.
+    // Normalizing the separator makes the two shapes prefix-comparable.
     let mut stmt = conn.prepare(
         "SELECT rowid, session_id, file_path, timestamp, functions_added, types_added
          FROM code_evolution
-         ORDER BY timestamp ASC, rowid ASC",
+         ORDER BY replace(timestamp, 'T', ' ') ASC, rowid ASC",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((

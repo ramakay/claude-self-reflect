@@ -924,8 +924,14 @@ async fn main() -> Result<()> {
         .unwrap_or(0);
 
     eprintln!("loading AST graph (code_nodes/code_edges, read-only connection)...");
-    let ast_conn = Connection::open(&db_path)
-        .with_context(|| format!("open read-only AST connection on {}", db_path.display()))?;
+    // Enforce the documented read-only guarantee (CodeRabbit PR #279):
+    // `Connection::open` is read-write and creates -wal/-shm sidecars — if
+    // CSR_ABLATION_DB points at a live database this harness could mutate it.
+    let ast_conn = Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("open read-only AST connection on {}", db_path.display()))?;
     let ast_graph = load_ast_graph(&ast_conn)?;
     eprintln!(
         "AST graph: {} conv/session keys, {} nodes indexed, {} real resolved edges (calls+imports, no self-edges)",
@@ -940,7 +946,11 @@ async fn main() -> Result<()> {
 
     let meta = json!({
         "meta": {
-            "db": db_path.to_string_lossy(),
+            // Basename only (CodeRabbit PR #279): the full path embeds a
+            // home-directory account name + session UUID, and this meta line
+            // ships inside committed result artifacts.
+            "db": db_path.file_name().map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".into()),
             "chunks_indexed": chunks_indexed,
             "built_at_unix": built_at_unix,
             "ast_real_edges": ast_graph.real.by_src.values().map(|v| v.len()).sum::<usize>(),

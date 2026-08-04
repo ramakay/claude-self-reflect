@@ -572,17 +572,30 @@ pub fn run(conn: &Connection) -> Result<()> {
     // holds shadow/witness data, rebuilt from scratch by every
     // `backfill_wcr_witnesses` pass (see `persist_local_bindings`'s
     // transactional replace-per-file semantics — Finding 2), so an
-    // unconditional drop-and-recreate on every migration run is safe; it is
-    // also necessary — a pre-existing DB with the OLD 3-column
-    // (project, file, name) schema would otherwise silently keep that
-    // schema forever (`CREATE TABLE IF NOT EXISTS` is a no-op once the table
-    // exists), breaking every query below that now expects `scope`. The
+    // a shape-probed drop-and-recreate is needed — a pre-existing DB with
+    // the OLD 3-column (project, file, name) schema would otherwise silently
+    // keep that schema forever (`CREATE TABLE IF NOT EXISTS` is a no-op once
+    // the table exists), breaking every query below that now expects `scope`. The
     // `scope` column's CONTENT changed from a bare enclosing-def name to a
     // full chain string (Finding 4) without any column/shape change, so no
     // further migration bump was needed for that step.
+    // Shape-probed drop (CodeRabbit PR #279): `run` executes on EVERY
+    // `Storage::open`, so an unconditional drop here is not a one-time schema
+    // upgrade — it wiped the witness rows persisted by the last
+    // `backfill_wcr_witnesses` pass on every subsequent hook/MCP process
+    // start, silently disabling the X4 `local` tier in live use. Drop only
+    // when the table exists in the pre-`scope` legacy shape.
+    let lb_has_scope_in_pk: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('local_bindings')
+         WHERE name = 'scope' AND pk > 0",
+        [],
+        |r| r.get(0),
+    )?;
+    if lb_has_scope_in_pk == 0 {
+        conn.execute_batch("DROP TABLE IF EXISTS local_bindings;")?;
+    }
     conn.execute_batch(
-        "DROP TABLE IF EXISTS local_bindings;
-         CREATE TABLE local_bindings (
+        "CREATE TABLE IF NOT EXISTS local_bindings (
             project TEXT NOT NULL,
             file    TEXT NOT NULL,
             scope   TEXT NOT NULL,
@@ -611,12 +624,12 @@ pub fn run(conn: &Connection) -> Result<()> {
     // one, matching the true "this edge only reduces to ONE call site"
     // semantics only when there genuinely is only one.
     //
-    // DROP+CREATE (same reasoning as `local_bindings`, immediately above):
-    // this table only ever holds shadow/witness data, rebuilt from scratch
-    // by every `backfill_wcr_witnesses` pass (see
+    // Shape-probed DROP+CREATE (same reasoning as `local_bindings`,
+    // immediately above): this table holds shadow/witness data rebuilt
+    // per-file by `backfill_wcr_witnesses` passes (see
     // `persist_call_scope_chains`'s transactional replace-per-file
-    // semantics), so an unconditional drop-and-recreate on every migration
-    // run is safe; it is also necessary — a pre-existing DB with the OLD
+    // semantics); the drop is needed only for legacy shapes — a
+    // pre-existing DB with the OLD
     // 5-column `(src_id, dst_id, kind)`-only-PK schema would otherwise
     // silently keep that schema forever (`CREATE TABLE IF NOT EXISTS` is a
     // no-op once the table exists), breaking every query below that now
@@ -643,9 +656,22 @@ pub fn run(conn: &Connection) -> Result<()> {
     // row exists (see `Pending::call_scope_chains`'s doc comment),
     // preserving the pre-chain exact-match behavior for edges this
     // backfill pass has no fresh chain data for.
+    // Shape-probed drop, same reasoning as `local_bindings` above: the legacy
+    // shape is detected by `chain` being absent from the PRIMARY KEY (the
+    // pre-Finding-1 table either lacked the column or keyed only on
+    // `(src_id, dst_id, kind)`); the current shape survives re-open with its
+    // rows intact.
+    let esc_has_chain_in_pk: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('edge_scope_chains')
+         WHERE name = 'chain' AND pk > 0",
+        [],
+        |r| r.get(0),
+    )?;
+    if esc_has_chain_in_pk == 0 {
+        conn.execute_batch("DROP TABLE IF EXISTS edge_scope_chains;")?;
+    }
     conn.execute_batch(
-        "DROP TABLE IF EXISTS edge_scope_chains;
-         CREATE TABLE edge_scope_chains (
+        "CREATE TABLE IF NOT EXISTS edge_scope_chains (
             project TEXT NOT NULL,
             file    TEXT NOT NULL,
             src_id  TEXT NOT NULL,
@@ -860,5 +886,34 @@ mod tests {
                 .is_ok(),
             "old 3-column table must be replaced with the new 4-column schema"
         );
+    }
+
+    #[test]
+    fn witness_tables_survive_reopen_with_rows_intact() {
+        // CodeRabbit PR #279: `run` executes on every `Storage::open`, so a
+        // current-shape table must NOT be dropped again — that wiped every
+        // `backfill_wcr_witnesses` result on the next process start and
+        // silently disabled the X4 `local` tier in live use.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        conn.execute(
+            "INSERT INTO local_bindings (project, file, scope, name) VALUES ('p', 'f.ts', 'foo', 'reject')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edge_scope_chains (project, file, src_id, dst_id, kind, chain) \
+             VALUES ('p', 'f.ts', 's', 'd', 'calls', 'foo>bar')",
+            [],
+        )
+        .unwrap();
+        run(&conn).expect("second migrations::run (simulated re-open)");
+        let lb: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_bindings", [], |r| r.get(0))
+            .unwrap();
+        let esc: i64 = conn
+            .query_row("SELECT COUNT(*) FROM edge_scope_chains", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((lb, esc), (1, 1), "witness rows must survive re-open");
     }
 }

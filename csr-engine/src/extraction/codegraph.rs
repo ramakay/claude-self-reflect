@@ -824,11 +824,6 @@ pub fn collect_local_bindings(source: &str, lang: SupportLang) -> BTreeSet<(Stri
     if source.len() < 2 {
         return BTreeSet::new();
     }
-    let grep = lang.ast_grep(source);
-    let root = grep.root();
-    let func_index = func_node_preorder_index(&root, lang);
-    return collect_local_bindings_from_root(&root, lang, &func_index);
-    #[allow(unreachable_code)]
     let result = catch_unwind(AssertUnwindSafe(|| {
         let grep = lang.ast_grep(source);
         let root = grep.root();
