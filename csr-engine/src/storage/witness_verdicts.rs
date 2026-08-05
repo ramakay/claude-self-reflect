@@ -325,6 +325,144 @@ pub fn symbol_verdict_state(
     }))
 }
 
+/// One `witness_verdicts` event joined to its witness's anchor identity —
+/// the row shape `dream::report`'s timeline walks. Ordered newest-first by
+/// the caller (`all_events_with_anchor`'s `ORDER BY v.id DESC`), so grouping
+/// by day (`created_at`'s date prefix) needs no re-sort.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DreamEventRow {
+    pub event_id: i64,
+    pub project: String,
+    pub file: String,
+    pub symbol: Option<String>,
+    pub verdict: VerdictKind,
+    pub successor_witness_id: Option<i64>,
+    pub receipt_oid: Option<String>,
+    pub observed_head_oid: String,
+    /// `datetime('now')` string, `"YYYY-MM-DD HH:MM:SS"` (UTC) — see
+    /// `storage::migrations`'s `witness_verdicts` table default.
+    pub created_at: String,
+}
+
+/// Every `witness_verdicts` event ever recorded, newest-first, joined to its
+/// witness's `(project, file, symbol)` identity. This is EVERY event, not
+/// just the latest per witness — the dream report's timeline is a journal of
+/// conclusions drawn over time, not just current state (that's
+/// `all_demoted_symbols`/`symbol_verdict_state`).
+pub fn all_events_with_anchor(conn: &Connection) -> Result<Vec<DreamEventRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT v.id, wl.project, wl.file, wl.symbol, v.verdict, v.successor_witness_id,
+                v.receipt_oid, v.observed_head_oid, v.created_at
+         FROM witness_verdicts v
+         JOIN witness_ledger wl ON wl.id = v.witness_id
+         ORDER BY v.id DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            let verdict_str: String = row.get(4)?;
+            Ok(DreamEventRow {
+                event_id: row.get(0)?,
+                project: row.get(1)?,
+                file: row.get(2)?,
+                symbol: row.get(3)?,
+                verdict: VerdictKind::parse(&verdict_str).unwrap_or(VerdictKind::AnchorObsolete),
+                successor_witness_id: row.get(5)?,
+                receipt_oid: row.get(6)?,
+                observed_head_oid: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The most recent dream cycle observed anywhere in the ledger: the globally
+/// newest event's `(observed_head_oid, created_at)`. `None` if no dream
+/// cycle has ever written an event (a fresh install, or `dream` never run).
+pub fn last_dream_run(conn: &Connection) -> Result<Option<(String, String)>> {
+    conn.query_row(
+        "SELECT observed_head_oid, created_at FROM witness_verdicts ORDER BY id DESC LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Totals `(obsolete, superseded, reinstated)` across EVERY event ever
+/// recorded (not latest-per-witness) — the report header's "totals by
+/// verdict type" and `status`'s `by_verdict` block.
+pub fn event_totals_by_verdict(conn: &Connection) -> Result<(i64, i64, i64)> {
+    let mut stmt =
+        conn.prepare("SELECT verdict, COUNT(*) FROM witness_verdicts GROUP BY verdict")?;
+    let mut obsolete = 0i64;
+    let mut superseded = 0i64;
+    let mut reinstated = 0i64;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for r in rows {
+        let (verdict, count) = r?;
+        match verdict.as_str() {
+            "anchor_obsolete" => obsolete = count,
+            "superseded_by" => superseded = count,
+            "anchor_reinstated" => reinstated = count,
+            _ => {}
+        }
+    }
+    Ok((obsolete, superseded, reinstated))
+}
+
+/// A `(project, file, symbol)` anchor CURRENTLY on the `Demote` channel —
+/// "what CSR forgot": truly gone or fully stale at current truth. Pairs the
+/// anchor identity with the same [`SymbolVerdictState`] `symbol_verdict_state`
+/// would return for it, so a report/status caller never has to re-derive the
+/// channel itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DemotedSymbol {
+    pub project: String,
+    pub file: String,
+    pub symbol: Option<String>,
+    pub state: SymbolVerdictState,
+}
+
+/// Every anchor whose current state resolves to [`VerdictChannel::Demote`].
+/// Two passes: first a single query finds every DISTINCT `(project, file,
+/// symbol)` anchor with an uncancelled negative latest event (a cheap
+/// candidate filter — `Annotate` anchors are excluded from consideration
+/// here too, since they also have a negative latest event, so this pass
+/// over-selects and the second pass narrows); then each candidate is
+/// resolved through `symbol_verdict_state` itself, so this can never disagree
+/// with the single-anchor query chunk binding uses. Not a hot path — this is
+/// a report/status call, not per-search.
+pub fn all_demoted_symbols(conn: &Connection) -> Result<Vec<DemotedSymbol>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT wl.project, wl.file, wl.symbol
+         FROM witness_verdicts v
+         JOIN witness_ledger wl ON wl.id = v.witness_id
+         WHERE v.verdict IN ('anchor_obsolete','superseded_by')
+           AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2 WHERE v2.witness_id = v.witness_id)",
+    )?;
+    let anchors: Vec<(String, String, Option<String>)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut out = Vec::new();
+    for (project, file, symbol) in anchors {
+        if let Some(state) = symbol_verdict_state(conn, &project, &file, symbol.as_deref())? {
+            if state.channel == VerdictChannel::Demote {
+                out.push(DemotedSymbol {
+                    project,
+                    file,
+                    symbol,
+                    state,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,5 +843,199 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count_after, 3);
+    }
+
+    #[test]
+    fn all_events_with_anchor_joins_and_orders_newest_first() {
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        witness_ledger::insert_witness(&conn, &ledger_row("bbb", "b3:2")).unwrap();
+        let old_id: i64 = conn
+            .query_row(
+                "SELECT id FROM witness_ledger WHERE at_oid = 'aaa'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let new_id: i64 = conn
+            .query_row(
+                "SELECT id FROM witness_ledger WHERE at_oid = 'bbb'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id: old_id,
+                verdict: VerdictKind::SupersededBy,
+                successor_witness_id: Some(new_id),
+                receipt_oid: Some("bbb".into()),
+                observed_head_oid: "bbb".into(),
+            },
+        )
+        .unwrap();
+        insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id: old_id,
+                verdict: VerdictKind::AnchorReinstated,
+                successor_witness_id: None,
+                receipt_oid: Some("ccc".into()),
+                observed_head_oid: "ccc".into(),
+            },
+        )
+        .unwrap();
+        let events = all_events_with_anchor(&conn).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].verdict,
+            VerdictKind::AnchorReinstated,
+            "newest event first"
+        );
+        assert_eq!(events[0].project, "proj");
+        assert_eq!(events[0].symbol.as_deref(), Some("foo"));
+        assert_eq!(events[1].verdict, VerdictKind::SupersededBy);
+    }
+
+    #[test]
+    fn all_events_with_anchor_empty_db_returns_empty() {
+        let conn = open();
+        assert!(all_events_with_anchor(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn last_dream_run_reports_the_globally_newest_event() {
+        let conn = open();
+        assert!(
+            last_dream_run(&conn).unwrap().is_none(),
+            "no events ever recorded"
+        );
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        let wid: i64 = conn
+            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id: wid,
+                verdict: VerdictKind::AnchorObsolete,
+                successor_witness_id: None,
+                receipt_oid: Some("head1".into()),
+                observed_head_oid: "head1".into(),
+            },
+        )
+        .unwrap();
+        let (head_oid, created_at) = last_dream_run(&conn).unwrap().unwrap();
+        assert_eq!(head_oid, "head1");
+        assert!(!created_at.is_empty());
+    }
+
+    #[test]
+    fn event_totals_by_verdict_counts_every_event_not_just_latest() {
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        let wid: i64 = conn
+            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id: wid,
+                verdict: VerdictKind::SupersededBy,
+                successor_witness_id: Some(42),
+                receipt_oid: Some("head1".into()),
+                observed_head_oid: "head1".into(),
+            },
+        )
+        .unwrap();
+        insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id: wid,
+                verdict: VerdictKind::AnchorReinstated,
+                successor_witness_id: None,
+                receipt_oid: Some("head2".into()),
+                observed_head_oid: "head2".into(),
+            },
+        )
+        .unwrap();
+        let (obsolete, superseded, reinstated) = event_totals_by_verdict(&conn).unwrap();
+        assert_eq!(obsolete, 0);
+        assert_eq!(
+            superseded, 1,
+            "counts the event even though it's no longer latest"
+        );
+        assert_eq!(reinstated, 1);
+    }
+
+    #[test]
+    fn all_demoted_symbols_finds_only_the_demote_channel_anchor() {
+        let conn = open();
+        // Anchor 1 ("foo"): vanished symbol -> Demote.
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        let foo_id: i64 = conn
+            .query_row(
+                "SELECT id FROM witness_ledger WHERE stamp = 'b3:1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id: foo_id,
+                verdict: VerdictKind::AnchorObsolete,
+                successor_witness_id: None,
+                receipt_oid: Some("headoid".into()),
+                observed_head_oid: "headoid".into(),
+            },
+        )
+        .unwrap();
+
+        // Anchor 2 ("bar"): plain A -> B evolution -> Annotate, never Demote.
+        let mut bar_a = ledger_row("bbb", "b3:bar-a");
+        bar_a.symbol = Some("bar".into());
+        let mut bar_b = ledger_row("ccc", "b3:bar-b");
+        bar_b.symbol = Some("bar".into());
+        witness_ledger::insert_witness(&conn, &bar_a).unwrap();
+        witness_ledger::insert_witness(&conn, &bar_b).unwrap();
+        let bar_a_id: i64 = conn
+            .query_row(
+                "SELECT id FROM witness_ledger WHERE stamp = 'b3:bar-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let bar_b_id: i64 = conn
+            .query_row(
+                "SELECT id FROM witness_ledger WHERE stamp = 'b3:bar-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id: bar_a_id,
+                verdict: VerdictKind::SupersededBy,
+                successor_witness_id: Some(bar_b_id),
+                receipt_oid: Some("ccc".into()),
+                observed_head_oid: "ccc".into(),
+            },
+        )
+        .unwrap();
+
+        let demoted = all_demoted_symbols(&conn).unwrap();
+        assert_eq!(demoted.len(), 1, "only the vanished 'foo' anchor demotes");
+        assert_eq!(demoted[0].symbol.as_deref(), Some("foo"));
+        assert_eq!(demoted[0].state.channel, VerdictChannel::Demote);
+    }
+
+    #[test]
+    fn all_demoted_symbols_empty_when_no_negative_events() {
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        assert!(all_demoted_symbols(&conn).unwrap().is_empty());
     }
 }

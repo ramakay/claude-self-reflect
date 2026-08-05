@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSR Dream Journal</title>
+<style>
+  :root {
+    --bg: #f7f7f8;
+    --bg-card: #ffffff;
+    --fg: #1b1d21;
+    --fg-muted: #6b7280;
+    --border: #e2e4e8;
+    --accent: #4f5bd5;
+    --red: #b3261e;
+    --red-bg: #fdecea;
+    --amber: #8a5a00;
+    --amber-bg: #fff3d6;
+    --green: #1a7f37;
+    --green-bg: #e7f7ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --bg-card: #1c1f24;
+      --fg: #e7e9ee;
+      --fg-muted: #9aa1ac;
+      --border: #2c3038;
+      --accent: #8f9bff;
+      --red: #ff8781;
+      --red-bg: #3a1f1e;
+      --amber: #f2c14e;
+      --amber-bg: #3a2f10;
+      --green: #6fdc9a;
+      --green-bg: #17301f;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 2.5rem 1.5rem 4rem;
+  }
+  header.hero {
+    margin-bottom: 2rem;
+  }
+  header.hero h1 {
+    font-size: 1.65rem;
+    margin: 0 0 0.35rem;
+    letter-spacing: -0.01em;
+  }
+  header.hero .subtitle {
+    color: var(--fg-muted);
+    font-size: 0.9rem;
+    margin: 0;
+  }
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 1rem;
+    font-size: 0.82rem;
+    color: var(--fg-muted);
+  }
+  .meta-row code {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.05rem 0.4rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .totals {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.75rem;
+    margin: 1.5rem 0 2rem;
+  }
+  .totals .stat {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.9rem 0.75rem;
+    text-align: center;
+  }
+  .totals .stat .n {
+    font-size: 1.5rem;
+    font-weight: 600;
+    display: block;
+  }
+  .totals .stat .label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--fg-muted);
+  }
+  .totals .stat.obsolete .n { color: var(--red); }
+  .totals .stat.superseded .n { color: var(--amber); }
+  .totals .stat.reinstated .n { color: var(--green); }
+
+  section {
+    margin-bottom: 2.5rem;
+  }
+  section > h2 {
+    font-size: 1.05rem;
+    margin: 0 0 0.9rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .day-group {
+    margin-bottom: 1.5rem;
+  }
+  .day-heading {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 0 0 0.5rem;
+  }
+  .event, .forgotten-row {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.75rem 0.9rem;
+    margin-bottom: 0.55rem;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.5rem 0.65rem;
+  }
+  .badge {
+    display: inline-block;
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 0.18rem 0.55rem;
+    border-radius: 999px;
+    flex-shrink: 0;
+  }
+  .badge.obsolete { color: var(--red); background: var(--red-bg); }
+  .badge.superseded { color: var(--amber); background: var(--amber-bg); }
+  .badge.reinstated { color: var(--green); background: var(--green-bg); }
+  .symbol {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-weight: 600;
+    font-size: 0.92rem;
+  }
+  .file {
+    color: var(--fg-muted);
+    font-size: 0.82rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    word-break: break-all;
+  }
+  .oids {
+    margin-left: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.76rem;
+    color: var(--fg-muted);
+    white-space: nowrap;
+  }
+  .successor-line {
+    flex: 1 0 100%;
+    font-size: 0.8rem;
+    color: var(--fg-muted);
+  }
+  .successor-line code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .empty-state {
+    background: var(--bg-card);
+    border: 1px dashed var(--border);
+    border-radius: 12px;
+    padding: 2.2rem 1.5rem;
+    text-align: center;
+    color: var(--fg-muted);
+  }
+  .empty-state .glyph {
+    font-size: 1.8rem;
+    display: block;
+    margin-bottom: 0.5rem;
+  }
+  footer {
+    text-align: center;
+    font-size: 0.75rem;
+    color: var(--fg-muted);
+    margin-top: 3rem;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>☾ CSR Dream Journal</h1>
+    <p class="subtitle">Deterministic supersession verdicts drawn from content-hash stamps and git ancestry — zero LLM, zero guessing.</p>
+    <div class="meta-row">
+      {% if data.has_run %}
+        <span>Last dream: <code>{{ data.last_run_at }}</code> at HEAD <code>{{ data.last_run_head_short }}</code></span>
+      {% else %}
+        <span>No dream cycle has run yet.</span>
+      {% endif %}
+      <span>Generated {{ data.generated_at }}</span>
+    </div>
+  </header>
+
+  <div class="totals">
+    <div class="stat obsolete">
+      <span class="n">{{ data.totals.obsolete }}</span>
+      <span class="label">Obsolete</span>
+    </div>
+    <div class="stat superseded">
+      <span class="n">{{ data.totals.superseded }}</span>
+      <span class="label">Superseded</span>
+    </div>
+    <div class="stat reinstated">
+      <span class="n">{{ data.totals.reinstated }}</span>
+      <span class="label">Reinstated</span>
+    </div>
+    <div class="stat">
+      <span class="n">{{ data.totals.total }}</span>
+      <span class="label">Total events</span>
+    </div>
+  </div>
+
+  {% if data.is_empty %}
+  <div class="empty-state">
+    <span class="glyph">☾</span>
+    No dreams yet. Run <code>csr-engine dream</code> to audit the witness ledger against current HEAD.
+  </div>
+  {% else %}
+
+  <section>
+    <h2>Timeline</h2>
+    {% for day in data.days %}
+    <div class="day-group">
+      <p class="day-heading">{{ day.date }}</p>
+      {% for event in day.events %}
+      <div class="event">
+        <span class="badge {{ event.verdict_slug }}">{{ event.verdict_label }}</span>
+        <span class="symbol">{{ event.symbol }}</span>
+        <span class="file">{{ event.file_relative }}</span>
+        <span class="oids">receipt {{ event.receipt_short | default("—") }} · HEAD {{ event.observed_head_short }} · {{ event.time }}</span>
+        {% if event.successor_line %}
+        <span class="successor-line">{{ event.successor_line }}</span>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% endfor %}
+  </section>
+
+  <section>
+    <h2>What CSR forgot</h2>
+    {% if data.forgotten %}
+      {% for item in data.forgotten %}
+      <div class="forgotten-row">
+        <span class="badge obsolete">Demoted</span>
+        <span class="symbol">{{ item.symbol }}</span>
+        <span class="file">{{ item.file_relative }}</span>
+        <span class="oids">{{ item.verdict_label }} · receipt {{ item.receipt_short | default("—") }} · HEAD {{ item.observed_head_short }}</span>
+      </div>
+      {% endfor %}
+    {% else %}
+      <div class="empty-state">Nothing is currently demoted — every audited symbol is either intact or annotated, never fully stale.</div>
+    {% endif %}
+  </section>
+
+  {% endif %}
+
+  <footer>csr-engine dream --report · self-contained, zero network requests</footer>
+</div>
+</body>
+</html>

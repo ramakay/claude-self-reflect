@@ -85,6 +85,8 @@
 //! `dream` at an unchanged HEAD with an unchanged conclusion writes
 //! nothing (see that module's idempotency doc).
 
+pub mod report;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::Result;

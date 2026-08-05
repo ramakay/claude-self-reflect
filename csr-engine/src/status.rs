@@ -30,6 +30,31 @@ pub struct StatusReport {
     pub healthy: bool,
     /// Aux corpus coverage (session_registry vs chunks) — never injected into search.
     pub aux: AuxStatus,
+    /// v10 "dreaming" summary (`crate::dream`) — witness_verdicts totals and
+    /// current demoted-symbol count. See `gather_dream`.
+    pub dream: DreamStatus,
+}
+
+/// Totals by verdict kind across every `witness_verdicts` event ever
+/// recorded (not latest-per-witness — see
+/// `storage::witness_verdicts::event_totals_by_verdict`).
+#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+pub struct DreamVerdictTotals {
+    pub obsolete: i64,
+    pub superseded: i64,
+    pub reinstated: i64,
+}
+
+/// v10 "dreaming" summary block. `last_run` is the `created_at` timestamp of
+/// the globally newest `witness_verdicts` event (`None` if `dream` has never
+/// run). `demoted_symbols` is the count on the `Demote` channel right now —
+/// see `storage::witness_verdicts::all_demoted_symbols`.
+#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+pub struct DreamStatus {
+    pub last_run: Option<String>,
+    pub events_total: i64,
+    pub by_verdict: DreamVerdictTotals,
+    pub demoted_symbols: i64,
 }
 
 #[derive(Serialize, Default, Debug, PartialEq, Eq)]
@@ -153,6 +178,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             db_path: db_path.to_string_lossy().to_string(),
             healthy: false,
             aux: AuxStatus::default(),
+            dream: DreamStatus::default(),
         });
     }
 
@@ -201,6 +227,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     }
 
     let aux = gather_aux(&storage, projects_dir);
+    let dream = gather_dream(&storage);
 
     Ok(StatusReport {
         conversations,
@@ -218,7 +245,33 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         db_path: db_path.to_string_lossy().to_string(),
         healthy,
         aux,
+        dream,
     })
+}
+
+/// Assemble the v10 "dreaming" status block. Fail-soft to defaults —
+/// `status` opens SQLite directly and must never fail on a pre-migration
+/// schema gap (mirrors `gather_narratives`).
+fn gather_dream(storage: &Storage) -> DreamStatus {
+    let last_run = storage
+        .last_dream_run()
+        .unwrap_or(None)
+        .map(|(_head_oid, created_at)| created_at);
+    let (obsolete, superseded, reinstated) = storage.dream_event_totals().unwrap_or((0, 0, 0));
+    let demoted_symbols = storage
+        .all_demoted_symbols()
+        .map(|v| v.len() as i64)
+        .unwrap_or(0);
+    DreamStatus {
+        last_run,
+        events_total: obsolete + superseded + reinstated,
+        by_verdict: DreamVerdictTotals {
+            obsolete,
+            superseded,
+            reinstated,
+        },
+        demoted_symbols,
+    }
 }
 
 /// Assemble aux coverage / file-history / transcript gap stats. Fail-soft to zeros.
@@ -525,6 +578,13 @@ fn format_age(timestamp: &str) -> String {
 
 /// Print compact one-line status for statusline integration.
 fn print_compact(report: &StatusReport) {
+    print!("{}", format_compact(report));
+}
+
+/// Pure formatter for the compact one-line statusline — separated from
+/// `print_compact` so tests can assert on the string directly (same split
+/// `format_narrative_segment` uses).
+fn format_compact(report: &StatusReport) -> String {
     // Format: [████████░░ 82%] [✓ 909c 54r] [3 projects]
     let bar_filled = (report.import_percent / 10.0).round() as usize;
     let bar_empty = 10_usize.saturating_sub(bar_filled);
@@ -532,7 +592,7 @@ fn print_compact(report: &StatusReport) {
 
     let health = if report.healthy { "ok" } else { "!!" };
 
-    print!(
+    let mut out = format!(
         "[{} {:.0}%] [{}] {}c {}r | {}p | {}",
         bar,
         report.import_percent,
@@ -542,6 +602,12 @@ fn print_compact(report: &StatusReport) {
         report.projects,
         format_narrative_segment(&report.narratives),
     );
+    // v10 "dreaming": only speak up when there's something to forget —
+    // terse by design, matching the rest of this line's style.
+    if report.dream.demoted_symbols > 0 {
+        out.push_str(&format!(" | ☾ {} forgotten", report.dream.demoted_symbols));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -585,9 +651,8 @@ mod tests {
         assert_eq!(report.import_percent, 0.0);
     }
 
-    #[test]
-    fn test_compact_format() {
-        let report = StatusReport {
+    fn base_report() -> StatusReport {
+        StatusReport {
             conversations: 909,
             projects: 3,
             chunks: 5000,
@@ -603,9 +668,45 @@ mod tests {
             db_path: "/tmp/test.db".to_string(),
             healthy: true,
             aux: AuxStatus::default(),
-        };
+            dream: DreamStatus::default(),
+        }
+    }
+
+    #[test]
+    fn test_compact_format() {
         // Just verify it doesn't panic
-        print_compact(&report);
+        print_compact(&base_report());
+    }
+
+    #[test]
+    fn test_compact_omits_dream_suffix_when_nothing_forgotten() {
+        let report = base_report();
+        assert_eq!(report.dream.demoted_symbols, 0);
+        let line = format_compact(&report);
+        assert!(
+            !line.contains('☾'),
+            "no demoted symbols means no dream suffix: {line:?}"
+        );
+    }
+
+    #[test]
+    fn test_compact_includes_dream_suffix_when_symbols_forgotten() {
+        let mut report = base_report();
+        report.dream = DreamStatus {
+            last_run: Some("2026-08-05 10:00:00".into()),
+            events_total: 3,
+            by_verdict: DreamVerdictTotals {
+                obsolete: 2,
+                superseded: 1,
+                reinstated: 0,
+            },
+            demoted_symbols: 3,
+        };
+        let line = format_compact(&report);
+        assert!(
+            line.contains("☾ 3 forgotten"),
+            "must surface the demoted count: {line:?}"
+        );
     }
 
     #[test]
@@ -638,5 +739,70 @@ mod tests {
         assert_eq!(report.aux.coverage, CoverageStats::default());
         assert_eq!(report.aux.file_history_sessions, 0);
         assert_eq!(report.aux.transcripts_unindexed, 0);
+    }
+
+    #[test]
+    fn status_dream_block_defaults_to_empty_on_fresh_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let _storage = Storage::open(&db_path).unwrap();
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert_eq!(report.dream, DreamStatus::default());
+        assert_eq!(report.dream.demoted_symbols, 0);
+        assert!(report.dream.last_run.is_none());
+    }
+
+    #[test]
+    fn status_dream_block_reflects_recorded_events_and_demotions() {
+        use crate::storage::witness_ledger::WitnessLedgerRow;
+        use crate::storage::witness_verdicts::{VerdictKind, WitnessVerdictRow};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .insert_witness(&WitnessLedgerRow {
+                id: 0,
+                project: "proj".into(),
+                file: "/repo/src/gone.rs".into(),
+                symbol: Some("vanished".into()),
+                span_start: Some(1),
+                span_end: Some(3),
+                stamp: "b3:1".into(),
+                tier: "committed".into(),
+                at_oid: Some("aaa".into()),
+                source_kind: "backfill".into(),
+                source_id: Some("aaa".into()),
+            })
+            .unwrap();
+        let w = storage
+            .witnesses_for_file("proj", "/repo/src/gone.rs")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        storage
+            .insert_witness_verdict(&WitnessVerdictRow {
+                witness_id: w.id,
+                verdict: VerdictKind::AnchorObsolete,
+                successor_witness_id: None,
+                receipt_oid: Some("headoid".into()),
+                observed_head_oid: "headoid".into(),
+            })
+            .unwrap();
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert_eq!(report.dream.events_total, 1);
+        assert_eq!(report.dream.by_verdict.obsolete, 1);
+        assert_eq!(report.dream.by_verdict.superseded, 0);
+        assert_eq!(report.dream.demoted_symbols, 1);
+        assert!(report.dream.last_run.is_some());
     }
 }

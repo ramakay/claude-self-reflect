@@ -967,6 +967,15 @@ impl Storage {
         codegraph::set_repo_root_for_file(&conn, file, repo_root)
     }
 
+    /// The `code_nodes`-stored `repo_root` for `file`, if any resolved node
+    /// exists for it. `None` does not mean unresolvable — callers typically
+    /// fall back to `extraction::repo_root::repo_root_for_file` (a live git
+    /// walk) when this returns `None`, same as `dream`'s own join.
+    pub fn stored_repo_root_for_file(&self, file: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::stored_repo_root_for_file(&conn, file)
+    }
+
     /// Distinct `code_evolution.file_path` values still missing `repo_root` (WP2 Stage 1 backfill).
     pub fn code_evolution_files_missing_repo_root(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
@@ -1295,6 +1304,36 @@ impl Storage {
     ) -> Result<Option<witness_verdicts::SymbolVerdictState>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         witness_verdicts::symbol_verdict_state(&conn, project, file, symbol)
+    }
+
+    /// Every `witness_verdicts` event ever recorded, newest-first, joined to
+    /// its witness's anchor identity — the dream report's timeline. See
+    /// `witness_verdicts::all_events_with_anchor`.
+    pub fn all_dream_events(&self) -> Result<Vec<witness_verdicts::DreamEventRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::all_events_with_anchor(&conn)
+    }
+
+    /// The most recent dream cycle observed anywhere in the ledger:
+    /// `(observed_head_oid, created_at)` of the globally newest event.
+    /// `None` if `dream` has never written an event.
+    pub fn last_dream_run(&self) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::last_dream_run(&conn)
+    }
+
+    /// Totals `(obsolete, superseded, reinstated)` across every event ever
+    /// recorded — feeds `status`'s `dream.by_verdict` and the report header.
+    pub fn dream_event_totals(&self) -> Result<(i64, i64, i64)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::event_totals_by_verdict(&conn)
+    }
+
+    /// Every `(project, file, symbol)` anchor currently on the `Demote`
+    /// channel — "what CSR forgot". See `witness_verdicts::all_demoted_symbols`.
+    pub fn all_demoted_symbols(&self) -> Result<Vec<witness_verdicts::DemotedSymbol>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::all_demoted_symbols(&conn)
     }
 
     /// Given chunk/conversation identifiers appearing in search results,
