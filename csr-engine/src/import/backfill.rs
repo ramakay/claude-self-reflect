@@ -40,7 +40,9 @@ use anyhow::Result;
 
 use crate::engine::Engine;
 use crate::extraction::ast_analysis::lang_from_path_str;
-use crate::extraction::codegraph::{extract_graph_fragment, extract_graph_fragment_for_file};
+use crate::extraction::codegraph::{
+    container_spans, extract_graph_fragment, extract_graph_fragment_for_file, ContainerSpan,
+};
 use crate::import::{
     discover_projects, list_jsonl_files, normalize_project_name, parse_jsonl_file,
     parse_jsonl_messages,
@@ -879,6 +881,16 @@ pub struct StampSpansStats {
     /// repo actually visited — printed as the `at_commit:` line(s) in
     /// [`Self::format_text`]. Empty in HEAD-tracking mode.
     pub at_commits: Vec<(String, String)>,
+    /// Symbol-identity collision safety net (type-qualified symbol
+    /// identity fix): a `witness_ledger` row whose qualified symbol still
+    /// collided with an earlier row from the SAME `(file, at_oid)` batch
+    /// after container qualification (see `qualify_witness_symbols`'s doc
+    /// comment) and was disambiguated with a deterministic `#2`/`#3`/...
+    /// suffix rather than silently joining. Should be rare in practice —
+    /// container qualification resolves the overwhelming majority of
+    /// same-name collisions (e.g. `is_empty` in two different `impl`
+    /// blocks) on its own.
+    pub disambiguated_symbols: usize,
 }
 
 impl StampSpansStats {
@@ -892,7 +904,8 @@ impl StampSpansStats {
              files processed      : {}\n\
              spans stamped        : {}\n\
              whole-file witnesses : {}\n\
-             skipped: no_repo_root={}  file_missing={}  non_git={}  outside_repo_root={}  stamp_error={}  span_out_of_range={}  rev_unresolved={}  non_utf8={}\n",
+             skipped: no_repo_root={}  file_missing={}  non_git={}  outside_repo_root={}  stamp_error={}  span_out_of_range={}  rev_unresolved={}  non_utf8={}\n\
+             disambiguated symbols : {}\n",
             self.files_checked,
             self.files_processed,
             self.spans_stamped,
@@ -905,6 +918,7 @@ impl StampSpansStats {
             self.skipped_span_out_of_range,
             self.skipped_rev_unresolved,
             self.skipped_non_utf8,
+            self.disambiguated_symbols,
         );
         // Single repo (the common case, especially with `--repo`): the
         // exact `at_commit: <oid>` form. Multiple repos (the `--at`
@@ -920,6 +934,100 @@ impl StampSpansStats {
             }
         }
         out
+    }
+}
+
+/// Type-qualify a file's function/method definitions for `witness_ledger`
+/// symbol identity (adversarial-gate audit: `(file, kind, name)` extraction
+/// identity — see `extraction::codegraph::node_id`'s doc comment — has no
+/// receiver/type scoping, so two unrelated same-named methods in different
+/// `impl`/class bodies join as if they were the same symbol across
+/// commits). Returns, in the SAME order/length as `defs`, the symbol string
+/// to mint for each definition — NEVER written back to `NodeRow::name` or
+/// `code_nodes` (SCOPE DECISION: this is `witness_ledger`-only
+/// disambiguation, shared byte-for-byte between [`stamp_spans_into`] (HEAD
+/// mode) and [`stamp_spans_historical_into`] (`--at` mode) so a symbol
+/// minted by one mode is joinable — by `(file, symbol)` — with the same
+/// method's row minted by the other).
+///
+/// `defs` is `(kind, name, span_start, span_end)` per definition, matching
+/// `NodeRow`'s own fields — one entry per node the caller is about to
+/// consider stamping (module-kind sentinels included is harmless: `kind !=
+/// "function"` leaves them bare, and they're skipped before insertion by
+/// both callers anyway).
+///
+/// Qualification, in order:
+/// 1. A `kind == "function"` node whose span is fully CONTAINED in an
+///    impl/class container span (`containers`, from
+///    `extraction::codegraph::container_spans`) is prefixed
+///    `<Container><separator><name>`; the INNERMOST (smallest-span)
+///    containing container wins if containers ever nest. Non-function kinds
+///    (`type`, `const`) and functions with no containing container are left
+///    bare.
+/// 2. Collision safety net: qualification can still leave two definitions
+///    on the identical string (a genuine duplicate/cfg-gated redefinition,
+///    or a container this function couldn't name) — the 2nd/3rd/...
+///    occurrence, by deterministic SPAN order (`(span_start, span_end,
+///    name)` — never `defs`' own input order, which for both callers comes
+///    from a hash-keyed source: `code_nodes.id`/`BTreeMap<node_id, _>`, not
+///    source position), gets a `#2`/`#3`/... suffix. This guarantees no two
+///    rows from the same `(file, at_oid)` batch ever mint an identical
+///    `symbol` to `witness_ledger`, closing the collision even when static
+///    qualification cannot.
+fn qualify_witness_symbols(
+    defs: &[(String, String, i64, i64)],
+    containers: &[ContainerSpan],
+) -> (Vec<String>, usize) {
+    let mut order: Vec<usize> = (0..defs.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (_, na, sa, ea) = &defs[a];
+        (sa, ea, na).cmp(&{
+            let (_, nb, sb, eb) = &defs[b];
+            (sb, eb, nb)
+        })
+    });
+
+    let mut qualified = vec![String::new(); defs.len()];
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut disambiguated = 0usize;
+    for i in order {
+        let (kind, name, start, end) = &defs[i];
+        let base = if kind == "function" {
+            qualify_one_symbol(containers, *start, *end, name)
+        } else {
+            name.clone()
+        };
+        let count = seen.entry(base.clone()).or_insert(0);
+        *count += 1;
+        qualified[i] = if *count == 1 {
+            base
+        } else {
+            disambiguated += 1;
+            format!("{base}#{count}")
+        };
+    }
+    (qualified, disambiguated)
+}
+
+/// Container-qualify a single definition's name by span containment —
+/// the innermost (smallest-span) containing `ContainerSpan` wins when
+/// containers nest.
+fn qualify_one_symbol(containers: &[ContainerSpan], start: i64, end: i64, name: &str) -> String {
+    let mut best: Option<&ContainerSpan> = None;
+    for c in containers {
+        if c.start <= start && end <= c.end {
+            let better = match best {
+                None => true,
+                Some(b) => (c.end - c.start) < (b.end - b.start),
+            };
+            if better {
+                best = Some(c);
+            }
+        }
+    }
+    match best {
+        Some(c) => format!("{}{}{}", c.name, c.separator, name),
+        None => name.to_string(),
     }
 }
 
@@ -1025,8 +1133,28 @@ fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats>
             .unwrap_or_default();
         let at_oid_str = head_oid.to_string();
 
+        // Type-qualified symbol identity for witness-ledger minting (see
+        // `qualify_witness_symbols`'s doc comment): re-walk the file's
+        // CURRENT on-disk AST for impl/class container spans — `code_nodes`
+        // deliberately carries no such container rows (SCOPE DECISION), and
+        // `stamp_spans_into` already requires the file to exist on disk
+        // (checked above), so this is the one extra, acceptable-cost parse
+        // per file. A read/lang-detection failure degrades to "no
+        // containers" (every symbol stays bare) rather than aborting the
+        // file — same fail-soft posture as the rest of this module.
+        let containers = lang_from_path_str(&file)
+            .and_then(|lang| std::fs::read_to_string(&file).ok().map(|src| (lang, src)))
+            .map(|(lang, src)| container_spans(&src, lang))
+            .unwrap_or_default();
+        let defs: Vec<(String, String, i64, i64)> = file_nodes
+            .iter()
+            .map(|n| (n.kind.clone(), n.name.clone(), n.span_start, n.span_end))
+            .collect();
+        let (qualified_symbols, disambiguated) = qualify_witness_symbols(&defs, &containers);
+        stats.disambiguated_symbols += disambiguated;
+
         let mut any_span = false;
-        for node in &file_nodes {
+        for (idx, node) in file_nodes.iter().enumerate() {
             // The synthetic module sentinel (kind='module', 0/0 span) isn't a
             // real span-level symbol — same exclusion as the git-channel
             // attribution backfill's `module_sentinel` check.
@@ -1053,8 +1181,9 @@ fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats>
             };
             any_span = true;
 
+            let symbol = &qualified_symbols[idx];
             let anchor = codewitness::Anchor::new(relpath.clone())
-                .with_symbol(node.name.clone())
+                .with_symbol(symbol.clone())
                 .with_span(start_line, end_line);
 
             match auditor.stamp_at(&anchor, head_oid) {
@@ -1066,7 +1195,7 @@ fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats>
                     let row = WitnessLedgerRow {
                         project: project.clone(),
                         file: file.clone(),
-                        symbol: Some(node.name.clone()),
+                        symbol: Some(symbol.clone()),
                         span_start: Some(node.span_start),
                         span_end: Some(node.span_end),
                         stamp: witness.stamp().as_str().to_string(),
@@ -1293,8 +1422,26 @@ fn stamp_spans_historical_into(
                 &at_oid_str,
             );
 
+            // Type-qualified symbol identity (see `qualify_witness_symbols`'s
+            // doc comment) — SAME algorithm as `stamp_spans_into`, applied
+            // here to the historical blob `source` already read above
+            // (never a second, separate re-read/re-extraction) and the
+            // `lang` already confirmed `Some` by the `continue` above, so a
+            // row minted `--at <rev>` and a row minted at HEAD stay joinable
+            // by `(file, symbol)` for the SAME method.
+            let lang = lang_from_path_str(&relpath_str)
+                .expect("checked Some above via the lang_from_path_str continue-guard");
+            let containers = container_spans(&source, lang);
+            let defs: Vec<(String, String, i64, i64)> = fragment
+                .nodes
+                .iter()
+                .map(|n| (n.kind.clone(), n.name.clone(), n.span_start, n.span_end))
+                .collect();
+            let (qualified_symbols, disambiguated) = qualify_witness_symbols(&defs, &containers);
+            stats.disambiguated_symbols += disambiguated;
+
             let mut any_span = false;
-            for node in &fragment.nodes {
+            for (idx, node) in fragment.nodes.iter().enumerate() {
                 // Synthetic module sentinel — not a real span-level symbol,
                 // same exclusion as `stamp_spans_into`.
                 if node.kind == "module" {
@@ -1317,8 +1464,9 @@ fn stamp_spans_historical_into(
                 };
                 any_span = true;
 
+                let symbol = &qualified_symbols[idx];
                 let anchor = codewitness::Anchor::new(relpath.clone())
-                    .with_symbol(node.name.clone())
+                    .with_symbol(symbol.clone())
                     .with_span(start_line, end_line);
 
                 match auditor.stamp_at(&anchor, commit) {
@@ -1330,7 +1478,7 @@ fn stamp_spans_historical_into(
                         let row = WitnessLedgerRow {
                             project: project.clone(),
                             file: file_abs.clone(),
-                            symbol: Some(node.name.clone()),
+                            symbol: Some(symbol.clone()),
                             span_start: Some(node.span_start),
                             span_end: Some(node.span_end),
                             stamp: witness.stamp().as_str().to_string(),
@@ -1824,6 +1972,180 @@ mod tests {
         .to_string()
     }
 
+    /// Fixture source: two `impl` blocks, each defining a same-named
+    /// `is_empty` method — the adversarial-gate audit's proven false
+    /// positive (`CodeContext::is_empty` joined to `AstDiff::is_empty` under
+    /// the old bare-name identity). 0-based line numbers (matching
+    /// `NodeRow::span_start`/`span_end`'s convention): the first
+    /// `is_empty` spans lines 3-5 inside `impl CodeContext` (lines 2-6); the
+    /// second spans lines 11-13 inside `impl AstDiff` (lines 10-14).
+    fn dup_impl_fixture_src() -> &'static str {
+        "struct CodeContext;\n\nimpl CodeContext {\n    fn is_empty(&self) -> bool {\n        true\n    }\n}\n\nstruct AstDiff;\n\nimpl AstDiff {\n    fn is_empty(&self) -> bool {\n        false\n    }\n}\n"
+    }
+
+    #[test]
+    fn qualify_witness_symbols_disambiguates_residual_collisions_by_span_order() {
+        // Two defs that land on the identical bare symbol (empty
+        // `containers` — qualification cannot resolve them, e.g. two free
+        // functions or a container this pass couldn't name) must be
+        // disambiguated deterministically by SPAN order, never silently
+        // joined — and never by `defs`' own input order (index 0 here is
+        // the span-LATER occurrence, deliberately, to prove the sort is by
+        // span, not position in the input slice).
+        let defs = vec![
+            ("function".to_string(), "orphan".to_string(), 10i64, 12i64),
+            ("function".to_string(), "orphan".to_string(), 1i64, 3i64),
+        ];
+        let (qualified, disambiguated) = qualify_witness_symbols(&defs, &[]);
+        assert_eq!(disambiguated, 1);
+        assert_eq!(
+            qualified[1], "orphan",
+            "span-earliest occurrence stays bare"
+        );
+        assert_eq!(
+            qualified[0], "orphan#2",
+            "span-later occurrence gets the safety-net suffix"
+        );
+    }
+
+    #[test]
+    fn qualify_witness_symbols_leaves_non_function_kinds_bare() {
+        // `type`/`const` rows are never container-qualified — only
+        // `kind == "function"` is (methods are the only shape that can
+        // collide across impl/class bodies).
+        let defs = vec![("type".to_string(), "Thing".to_string(), 0i64, 2i64)];
+        let containers = vec![ContainerSpan {
+            name: "Outer".into(),
+            separator: "::",
+            start: 0,
+            end: 5,
+        }];
+        let (qualified, disambiguated) = qualify_witness_symbols(&defs, &containers);
+        assert_eq!(disambiguated, 0);
+        assert_eq!(qualified[0], "Thing");
+    }
+
+    #[test]
+    fn stamp_spans_into_qualifies_symbol_identity_by_impl_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("dup.rs");
+        std::fs::write(&file, dup_impl_fixture_src()).unwrap();
+        git_in(repo).args(["add", "dup.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "init"])
+            .status()
+            .unwrap();
+
+        let file_path = file.to_string_lossy().to_string();
+        let repo_root = repo.to_string_lossy().to_string();
+
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                let mut ctx_is_empty = attr_node("n-ctx", &file_path, "is_empty");
+                ctx_is_empty.repo_root = Some(repo_root.clone());
+                ctx_is_empty.span_start = 3;
+                ctx_is_empty.span_end = 5;
+                codegraph_upsert_node(conn, &ctx_is_empty).unwrap();
+
+                let mut diff_is_empty = attr_node("n-diff", &file_path, "is_empty");
+                diff_is_empty.repo_root = Some(repo_root.clone());
+                diff_is_empty.span_start = 11;
+                diff_is_empty.span_end = 13;
+                codegraph_upsert_node(conn, &diff_is_empty).unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = stamp_spans_into(&storage, false).unwrap();
+        assert_eq!(stats.spans_stamped, 2);
+        assert_eq!(
+            stats.disambiguated_symbols, 0,
+            "container qualification alone resolves this — no residual collision"
+        );
+
+        let rows = storage.witnesses_for_file("proj", &file_path).unwrap();
+        assert_eq!(rows.len(), 2);
+        let symbols: BTreeSet<_> = rows.iter().map(|r| r.symbol.clone()).collect();
+        assert_eq!(
+            symbols,
+            BTreeSet::from([
+                Some("CodeContext::is_empty".to_string()),
+                Some("AstDiff::is_empty".to_string()),
+            ]),
+            "the two impl-block methods must resolve to DISTINCT container-qualified \
+             symbols, never both landing on bare 'is_empty'"
+        );
+    }
+
+    #[test]
+    fn stamp_spans_into_disambiguates_residual_bare_name_collision() {
+        // A collision qualification alone can't resolve (no impl/class
+        // container at all — e.g. two free-function `code_nodes` rows that
+        // happen to share a name) must fall back to the `#2` safety net
+        // rather than silently colliding into one `witness_ledger` symbol.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("dup2.rs");
+        std::fs::write(
+            &file,
+            "fn orphan() {\n    1\n}\n\nfn orphan_two() {\n    2\n}\n",
+        )
+        .unwrap();
+        git_in(repo).args(["add", "dup2.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "init"])
+            .status()
+            .unwrap();
+
+        let file_path = file.to_string_lossy().to_string();
+        let repo_root = repo.to_string_lossy().to_string();
+
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                let mut a = attr_node("n-a", &file_path, "orphan");
+                a.repo_root = Some(repo_root.clone());
+                a.span_start = 0;
+                a.span_end = 2;
+                codegraph_upsert_node(conn, &a).unwrap();
+
+                // Same name, different span — qualification has no
+                // container to disambiguate by (this file has none), so
+                // the safety net alone must keep them apart.
+                let mut b = attr_node("n-b", &file_path, "orphan");
+                b.repo_root = Some(repo_root.clone());
+                b.span_start = 4;
+                b.span_end = 6;
+                codegraph_upsert_node(conn, &b).unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = stamp_spans_into(&storage, false).unwrap();
+        assert_eq!(stats.spans_stamped, 2);
+        assert_eq!(
+            stats.disambiguated_symbols, 1,
+            "second occurrence gets the #2 safety-net suffix"
+        );
+
+        let rows = storage.witnesses_for_file("proj", &file_path).unwrap();
+        let symbols: BTreeSet<_> = rows.iter().map(|r| r.symbol.clone()).collect();
+        assert_eq!(
+            symbols,
+            BTreeSet::from([Some("orphan".to_string()), Some("orphan#2".to_string())]),
+        );
+    }
+
     #[test]
     fn stamp_spans_mints_committed_witnesses_matching_head_and_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2090,6 +2412,146 @@ mod tests {
     }
 
     // ─── historical mode: `stamp-spans --at <rev>` ───
+
+    #[test]
+    fn stamp_spans_at_qualifies_symbol_identity_by_impl_container() {
+        // A single `impl` block's method alongside an unrelated free
+        // function — through the `--at <rev>` (fresh re-extraction from the
+        // commit's own blob) path — proves the SAME qualification the
+        // HEAD-mode test exercises also applies when the source is a
+        // historical blob, not a persisted `code_nodes` row (a
+        // precondition for `(file, symbol)` joins across HEAD-mode and
+        // historical-mode rows). Deliberately only ONE `impl`-block method
+        // per commit here (not two same-named ones, as in the HEAD-mode
+        // fixture): `extract_inner`'s own per-parse node collection keys
+        // solely on `(repo, file, kind, name)` (`node_id`, unaffected by
+        // this fix — see its doc comment / the SCOPE DECISION) and already
+        // collapses two same-named `function_item`s in ONE file to a
+        // single survivor before witness minting ever sees them; that
+        // pre-existing, out-of-scope collision is exercised across
+        // COMMITS instead, below.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("dup.rs");
+        let src = "struct CodeContext;\n\nimpl CodeContext {\n    fn is_empty(&self) -> bool {\n        true\n    }\n}\n\nfn helper() -> i32 {\n    42\n}\n";
+        std::fs::write(&file, src).unwrap();
+        git_in(repo).args(["add", "dup.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "init"])
+            .status()
+            .unwrap();
+        let commit = git_head(repo);
+
+        let file_abs = file.to_string_lossy().to_string();
+        let repo_root = repo.to_string_lossy().to_string();
+        let storage = Storage::open_memory().unwrap();
+
+        let stats =
+            stamp_spans_historical_into(&storage, &commit, Some(&repo_root), false).unwrap();
+        // Struct decl (type) + is_empty (method) + helper (free fn).
+        assert_eq!(stats.spans_stamped, 3);
+        assert_eq!(stats.disambiguated_symbols, 0);
+
+        let rows = storage.witnesses_for_file("", &file_abs).unwrap();
+        assert_eq!(rows.len(), 3);
+        let symbols: BTreeSet<_> = rows.iter().map(|r| r.symbol.clone()).collect();
+        assert_eq!(
+            symbols,
+            BTreeSet::from([
+                // The struct decl itself is `kind == "type"` — qualification
+                // only ever applies to `kind == "function"` (methods).
+                Some("CodeContext".to_string()),
+                Some("CodeContext::is_empty".to_string()),
+                Some("helper".to_string()),
+            ]),
+            "the impl-block method is container-qualified; the free function \
+             and the struct decl itself stay bare"
+        );
+    }
+
+    #[test]
+    fn stamp_spans_at_cross_commit_join_does_not_collide_across_impl_blocks() {
+        // The exact scenario the adversarial-gate audit flagged: two
+        // UNRELATED `is_empty` methods, in two DIFFERENT `impl` blocks,
+        // whose historical witnesses must never look like "the same
+        // symbol's history" just because they share a bare name. Modeled
+        // across commits (each commit has only ONE `is_empty` definition,
+        // so this never touches the separate, out-of-scope `NodeRow`
+        // collision `extract_inner`'s own per-parse node collection has
+        // for TWO same-named methods co-existing in a SINGLE parse — see
+        // `stamp_spans_at_qualifies_symbol_identity_by_impl_container`'s
+        // doc comment): commit1 has `CodeContext::is_empty`; commit2
+        // REPLACES it with an unrelated `AstDiff::is_empty`. Before this
+        // fix, both would mint the identical bare `is_empty` symbol and a
+        // naive `(file, symbol)` lookup across the two commits would read
+        // as one method's evolution — nonsensical, since they are two
+        // unrelated types' methods.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("dup.rs");
+        let src1 = "struct CodeContext;\n\nimpl CodeContext {\n    fn is_empty(&self) -> bool {\n        true\n    }\n}\n";
+        std::fs::write(&file, src1).unwrap();
+        git_in(repo).args(["add", "dup.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "c1"])
+            .status()
+            .unwrap();
+        let commit1 = git_head(repo);
+
+        // Commit2 replaces CodeContext's impl entirely with AstDiff's —
+        // only one `is_empty` definition exists in the file AT EACH commit.
+        let src2 = "struct AstDiff;\n\nimpl AstDiff {\n    fn is_empty(&self) -> bool {\n        false\n    }\n}\n";
+        std::fs::write(&file, src2).unwrap();
+        git_in(repo).args(["add", "dup.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "c2"])
+            .status()
+            .unwrap();
+        let commit2 = git_head(repo);
+
+        let repo_root = repo.to_string_lossy().to_string();
+        let file_abs = file.to_string_lossy().to_string();
+        let storage = Storage::open_memory().unwrap();
+
+        stamp_spans_historical_into(&storage, &commit1, Some(&repo_root), false).unwrap();
+        stamp_spans_historical_into(&storage, &commit2, Some(&repo_root), false).unwrap();
+
+        let rows = storage.witnesses_for_file("", &file_abs).unwrap();
+        // Each commit's file has 1 struct decl (type) + 1 impl method
+        // (function) = 2 rows/commit x 2 commits.
+        assert_eq!(
+            rows.len(),
+            4,
+            "struct decl + is_empty witness per commit, correctly qualified by ITS OWN container"
+        );
+
+        let ctx_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.symbol.as_deref() == Some("CodeContext::is_empty"))
+            .collect();
+        let diff_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.symbol.as_deref() == Some("AstDiff::is_empty"))
+            .collect();
+        assert_eq!(ctx_rows.len(), 1, "commit1's witness");
+        assert_eq!(diff_rows.len(), 1, "commit2's witness");
+        assert_eq!(ctx_rows[0].at_oid.as_deref(), Some(commit1.as_str()));
+        assert_eq!(diff_rows[0].at_oid.as_deref(), Some(commit2.as_str()));
+        assert!(
+            rows.iter().all(|r| r.symbol.as_deref() != Some("is_empty")),
+            "no row should ever mint the collision-prone bare symbol for a method \
+             defined inside an impl block — a bare-symbol join here would incoherently \
+             treat two unrelated types' methods as one symbol's history"
+        );
+    }
 
     #[test]
     fn stamp_spans_at_differs_for_changed_symbol_and_matches_for_unchanged_across_two_commits() {

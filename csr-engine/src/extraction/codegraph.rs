@@ -1410,6 +1410,120 @@ fn tree_has_error<D: ast_grep_core::Doc>(root: &ast_grep_core::Node<'_, D>) -> b
     root.dfs().any(|n| n.is_error() || n.is_missing())
 }
 
+/// One impl/class-like container span, computed SOLELY to qualify method
+/// symbol identity in the `witness_ledger` minting path (see
+/// `import::backfill::stamp_spans_into`/`stamp_spans_historical_into`) —
+/// deliberately NEVER written to `NodeRow`/`code_nodes`. Extraction identity
+/// there stays exactly `(file, kind, name)` (see `node_id`'s doc comment);
+/// this is a witness-ledger-only disambiguation layer added after an
+/// adversarial-gate audit found that identity collides two unrelated
+/// same-named methods in different `impl`/class bodies into one cross-commit
+/// witness join (e.g. `CodeContext::is_empty` and `AstDiff::is_empty`, both
+/// bare `is_empty` under the old rule).
+///
+/// Rust `impl Type { .. }` / `impl Trait for Type { .. }` containers use the
+/// `Type` name (never the trait) with a `::` separator — matching Rust's own
+/// `Type::method` call syntax. TS/JS/TSX class bodies and Python class
+/// bodies use the class name with a `.` separator.
+#[derive(Debug, Clone)]
+pub struct ContainerSpan {
+    pub name: String,
+    pub separator: &'static str,
+    pub start: i64,
+    pub end: i64,
+}
+
+/// Impl/class-like container spans in `source`, for method qualification
+/// only (see `ContainerSpan`'s doc comment). Empty for languages with no
+/// cheaply-available parent-type context (Go method receivers are a
+/// materially different shape from Rust `impl` blocks / TS-JS-Python
+/// classes — deliberately out of scope here, free functions AND Go methods
+/// stay unqualified) or when the source is too small to parse meaningfully.
+/// Wrapped in `catch_unwind` for the same reason `extract_graph_fragment`
+/// is: malformed input can panic inside tree-sitter/ast-grep.
+pub fn container_spans(source: &str, lang: SupportLang) -> Vec<ContainerSpan> {
+    if source.len() < 4 {
+        return Vec::new();
+    }
+    catch_unwind(AssertUnwindSafe(|| container_spans_inner(source, lang))).unwrap_or_default()
+}
+
+fn container_spans_inner(source: &str, lang: SupportLang) -> Vec<ContainerSpan> {
+    let (kind, separator): (&str, &'static str) = match lang {
+        SupportLang::Rust => ("impl_item", "::"),
+        SupportLang::Python => ("class_definition", "."),
+        SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => {
+            ("class_declaration", ".")
+        }
+        _ => return Vec::new(),
+    };
+    let grep = lang.ast_grep(source);
+    let root = grep.root();
+    let matcher = KindMatcher::new(kind, lang);
+    let mut out = Vec::new();
+    for n in root.find_all(&matcher) {
+        let Some(name) = container_name(&n, lang) else {
+            continue;
+        };
+        // Same min-length guard `extract_inner`'s def loop applies: never
+        // useful provenance, only orphan cruft from a misparsed fragment.
+        if name.len() < 2 {
+            continue;
+        }
+        let text = n.text().to_string();
+        let start = n.start_pos().line() as i64;
+        let end = start + text.lines().count().saturating_sub(1) as i64;
+        out.push(ContainerSpan {
+            name,
+            separator,
+            start,
+            end,
+        });
+    }
+    out
+}
+
+/// A container node's own name. Rust `impl_item` needs dedicated handling
+/// (never `extract_name_from_def`'s generic first-identifier-child scan):
+/// for `impl Trait for Type { .. }`, that scan's first identifier-like
+/// child is `Trait` (the `trait` field, which appears before `for` in the
+/// grammar), not `Type` — precisely the receiver/trait confusion this
+/// module exists to avoid. The `type` field (present on every `impl_item`,
+/// trait impl or not) is always the type actually being implemented, so it
+/// alone gives the right name; TS/JS/Python container names are ordinary
+/// class-name identifiers, handled by the same shared helper every other
+/// def node in this module uses.
+fn container_name<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::NodeMatch<'_, D>,
+    lang: SupportLang,
+) -> Option<String> {
+    if lang == SupportLang::Rust {
+        let field = node.field("type")?;
+        return first_type_identifier(&field);
+    }
+    extract_name_from_def(node, lang)
+}
+
+/// Base type identifier under a Rust `impl` block's `type` field,
+/// recursing past generic/reference wrappers: `impl<T> Foo<T>` and
+/// `impl<'a> &'a Foo` both resolve to `Foo`, matching how the type is
+/// referred to at call sites (`Foo::method(..)`), never `Foo<T>::method` or
+/// `&Foo::method`. First DFS-order `type_identifier` wins — a bounded walk
+/// over one type expression's subtree, not the whole file.
+fn first_type_identifier<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> Option<String> {
+    if node.kind().as_ref() == "type_identifier" {
+        return Some(node.text().to_string());
+    }
+    for child in node.children() {
+        if let Some(name) = first_type_identifier(&child) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Path-driven convenience wrapper: derive the language from `file`'s extension.
 /// Returns an empty fragment for unsupported file types.
 pub fn extract_graph_fragment_for_file(
@@ -1800,6 +1914,83 @@ fn lang_name(lang: SupportLang) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_spans_rust_distinguishes_two_impl_blocks_same_method_name() {
+        // Reproduces the adversarial-gate audit's proven false positive:
+        // two unrelated `is_empty` methods in different `impl` blocks in
+        // the same file. Without container qualification these collide on
+        // bare `is_empty`; with it, they must resolve to distinct
+        // container-qualified names.
+        let src = "struct CodeContext;\nimpl CodeContext {\n    fn is_empty(&self) -> bool { true }\n}\nstruct AstDiff;\nimpl AstDiff {\n    fn is_empty(&self) -> bool { false }\n}\n";
+        let containers = container_spans(src, SupportLang::Rust);
+        assert_eq!(containers.len(), 2, "containers: {containers:?}");
+        let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"CodeContext"), "names: {names:?}");
+        assert!(names.contains(&"AstDiff"), "names: {names:?}");
+        for c in &containers {
+            assert_eq!(c.separator, "::");
+        }
+    }
+
+    #[test]
+    fn container_spans_rust_trait_impl_uses_type_not_trait() {
+        // `impl Trait for Type` must qualify by `Type`, never `Trait` — the
+        // generic first-identifier-child scan (`extract_name_from_def`)
+        // would wrongly pick `Trait` here since it appears first in the
+        // grammar.
+        let src = "struct Foo;\ntrait Greet { fn hello(&self); }\nimpl Greet for Foo {\n    fn hello(&self) {}\n}\n";
+        let containers = container_spans(src, SupportLang::Rust);
+        assert_eq!(containers.len(), 1, "containers: {containers:?}");
+        assert_eq!(containers[0].name, "Foo");
+    }
+
+    #[test]
+    fn container_spans_rust_strips_generics_and_references() {
+        let src = "struct Foo<T> { _t: T }\nimpl<T> Foo<T> {\n    fn is_empty(&self) -> bool { true }\n}\n";
+        let containers = container_spans(src, SupportLang::Rust);
+        assert_eq!(containers.len(), 1, "containers: {containers:?}");
+        assert_eq!(containers[0].name, "Foo");
+    }
+
+    #[test]
+    fn container_spans_typescript_class_methods() {
+        let src = "class Foo {\n  isEmpty() { return true; }\n}\nclass Bar {\n  isEmpty() { return false; }\n}\n";
+        let containers = container_spans(src, SupportLang::TypeScript);
+        assert_eq!(containers.len(), 2, "containers: {containers:?}");
+        let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"Foo"));
+        assert!(names.contains(&"Bar"));
+        for c in &containers {
+            assert_eq!(c.separator, ".");
+        }
+    }
+
+    #[test]
+    fn container_spans_python_class_methods() {
+        let src = "class Foo:\n    def is_empty(self):\n        return True\n\nclass Bar:\n    def is_empty(self):\n        return False\n";
+        let containers = container_spans(src, SupportLang::Python);
+        assert_eq!(containers.len(), 2, "containers: {containers:?}");
+        let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"Foo"));
+        assert!(names.contains(&"Bar"));
+    }
+
+    #[test]
+    fn container_spans_free_function_has_no_container() {
+        let src = "fn free_fn() -> bool { true }\n";
+        let containers = container_spans(src, SupportLang::Rust);
+        assert!(containers.is_empty(), "containers: {containers:?}");
+    }
+
+    #[test]
+    fn container_spans_go_is_out_of_scope() {
+        // Go is deliberately not covered (method receivers are a different
+        // shape from impl/class bodies) — must return empty, never panic.
+        let src = "package main\nfunc (r *Receiver) Method() {}\n";
+        let containers = container_spans(src, SupportLang::Go);
+        assert!(containers.is_empty(), "containers: {containers:?}");
+    }
 
     #[test]
     fn extracts_nodes_and_call_edge_from_rust() {
