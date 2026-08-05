@@ -1178,6 +1178,23 @@ impl Storage {
         queries::get_resolutions_batch(&conn, chunk_ids)
     }
 
+    // ─── Dream verdicts (v10) ───
+
+    /// Batch-resolve dream-verdict hits for a set of conversation ids — see
+    /// `chunk_binding::witness_verdict_for_chunks`'s two-channel contract.
+    /// Consumed by the search validity partition (`mcp::tools`) to
+    /// demote/annotate chunks whose underlying code claim the `dream` cycle
+    /// has determined is stale (`Demote`) or has evolved (`Annotate`). One
+    /// batched query per call — zero git access, purely a read over
+    /// precomputed `witness_verdicts` events.
+    pub fn witness_verdicts_for_conversations(
+        &self,
+        conversation_ids: &[String],
+    ) -> Result<std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        chunk_binding::witness_verdict_for_chunks(&conn, conversation_ids)
+    }
+
     // ─── Session registry / aux coverage ───
 
     /// Runs `f` with the raw connection inside a single SQLite transaction.

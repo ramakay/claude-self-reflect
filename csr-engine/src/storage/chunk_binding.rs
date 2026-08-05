@@ -77,7 +77,7 @@
 //! verdict.
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use std::collections::BTreeMap;
 
 use super::codegraph::{self, NodeRow};
@@ -108,17 +108,53 @@ pub struct ChunkWitnessVerdict {
 /// comment on the suffix fallback.
 const CONTAINER_SEPARATORS: [&str; 2] = ["::", "."];
 
-/// DISTINCT non-NULL `witness_ledger.symbol` values recorded for
-/// `(project, file)`. Small (one row per symbol ever stamped for that
-/// file), and hits `idx_witness_ledger_lookup(project, file, symbol)`.
-fn witness_symbols_for_file(conn: &Connection, project: &str, file: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT symbol FROM witness_ledger
-         WHERE project = ?1 AND file = ?2 AND symbol IS NOT NULL",
-    )?;
-    let rows = stmt.query_map(params![project, file], |row| row.get::<_, String>(0))?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+/// DISTINCT non-NULL `witness_ledger.symbol` values recorded for every
+/// given `(project, file)` pair, keyed by pair — ONE query per ≤400-pair
+/// batch (this used to be one query per file, all under the storage mutex).
+/// Small (one row per symbol ever stamped per file), and hits
+/// `idx_witness_ledger_lookup(project, file, symbol)`.
+fn witness_symbols_for_files(
+    conn: &Connection,
+    files: &[(String, String)],
+) -> Result<BTreeMap<(String, String), Vec<String>>> {
+    let mut out: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    if files.is_empty() {
+        return Ok(out);
+    }
+    // ≤400 pairs (800 bind variables) per statement — same
+    // SQLITE_MAX_VARIABLE_NUMBER reasoning as `codegraph::nodes_for_conversations`.
+    const BATCH: usize = 400;
+    for batch in files.chunks(BATCH) {
+        let pair_filter: Vec<String> = (0..batch.len())
+            .map(|i| format!("(project = ?{} AND file = ?{})", 2 * i + 1, 2 * i + 2))
+            .collect();
+        let sql = format!(
+            "SELECT DISTINCT project, file, symbol FROM witness_ledger
+             WHERE symbol IS NOT NULL AND ({})",
+            pair_filter.join(" OR ")
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = batch
+            .iter()
+            .flat_map(|(p, f)| {
+                [
+                    p as &dyn rusqlite::types::ToSql,
+                    f as &dyn rusqlite::types::ToSql,
+                ]
+            })
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (key, symbol) = row?;
+            out.entry(key).or_default().push(symbol);
+        }
+    }
+    Ok(out)
 }
 
 /// `true` iff `s` is a `#N` collision variant (`base#2`, `base#3`, ...)
@@ -215,56 +251,49 @@ pub fn witness_verdict_for_chunks(
         }
     }
 
-    // Cache witness symbols per (project, file) — several nodes typically
-    // share a file, so this avoids re-querying the same file repeatedly.
-    let mut symbol_cache: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
-    // Cache the resolved state per (project, file, bound_symbol) too — two
-    // nodes can bind to the same symbol via different conv_ids.
-    let mut verdict_cache: BTreeMap<
-        (String, String, String),
-        Option<witness_verdicts::SymbolVerdictState>,
-    > = BTreeMap::new();
+    // Batch the whole read path: 2 batched queries typical (+1 per 400 file
+    // pairs, plus the pre-existing node lookup above). This used to loop
+    // one witness-symbols query per file plus one `symbol_verdict_state`
+    // query per bound symbol, all while holding the storage mutex:
+    // (a) witness symbols for ALL distinct (project, file) pairs at once;
+    // (b) verdict states for every symbol-level anchor in those same pairs.
+    // Binding itself (`resolve_bound_symbol` — exact match, suffix fallback,
+    // ambiguity abstention, #N collision poisoning) is unchanged and runs
+    // in-memory against (a)'s per-file symbol sets.
+    let mut file_keys: Vec<(String, String)> = Vec::new();
+    {
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for (idx, _) in &node_convs {
+            let node = &nodes[*idx];
+            let key = (node.project.clone(), node.file.clone());
+            if seen.insert(key.clone()) {
+                file_keys.push(key);
+            }
+        }
+    }
+    let symbols_by_file = witness_symbols_for_files(conn, &file_keys)?;
+    let states = witness_verdicts::symbol_verdict_states_for_files(conn, &file_keys)?;
 
     for (idx, convs) in &node_convs {
         let node = &nodes[*idx];
         let key = (node.project.clone(), node.file.clone());
-        let symbols = match symbol_cache.get(&key) {
-            Some(s) => s,
-            None => {
-                let fetched = witness_symbols_for_file(conn, &node.project, &node.file)?;
-                symbol_cache.insert(key.clone(), fetched);
-                symbol_cache.get(&key).expect("just inserted")
-            }
-        };
+        let empty: Vec<String> = Vec::new();
+        let symbols = symbols_by_file.get(&key).unwrap_or(&empty);
         let Some(bound_symbol) = resolve_bound_symbol(symbols, &node.name) else {
             continue; // never stamped, or ambiguous — abstain.
         };
 
-        let vkey = (
+        let Some(state) = states.get(&(
             node.project.clone(),
             node.file.clone(),
             bound_symbol.clone(),
-        );
-        let state = match verdict_cache.get(&vkey) {
-            Some(v) => v.clone(),
-            None => {
-                let fetched = witness_verdicts::symbol_verdict_state(
-                    conn,
-                    &node.project,
-                    &node.file,
-                    Some(bound_symbol.as_str()),
-                )?;
-                verdict_cache.insert(vkey.clone(), fetched.clone());
-                fetched
-            }
-        };
-
-        let Some(state) = state else {
+        )) else {
             continue; // never audited, or fully reinstated — nothing to report.
         };
         debug_assert!(
             state.representative.verdict.is_negative(),
-            "symbol_verdict_state only surfaces negative representatives"
+            "symbol_verdict_states_for_files only surfaces negative representatives"
         );
 
         let hit = ChunkWitnessVerdict {

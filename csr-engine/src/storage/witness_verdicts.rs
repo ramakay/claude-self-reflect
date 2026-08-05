@@ -463,6 +463,121 @@ pub fn all_demoted_symbols(conn: &Connection) -> Result<Vec<DemotedSymbol>> {
     Ok(out)
 }
 
+/// Bulk variant of [`symbol_verdict_state`]: resolve the CURRENT state of
+/// EVERY symbol-level anchor recorded for the given `(project, file)` pairs,
+/// in ONE query per ≤400-pair batch (chunk binding previously issued one
+/// `symbol_verdict_state` round-trip per bound symbol, all under the storage
+/// mutex). Returns a map keyed by `(project, file, symbol)`; anchors with no
+/// negative-latest witness are simply absent (exactly the single-symbol
+/// fn's `None`).
+///
+/// Semantics are identical to [`symbol_verdict_state`] per key, restated:
+/// rows are latest-event-per-witness (`MAX(id)` scoped to `witness_id`),
+/// ordered newest-first; the representative is the newest negative one; the
+/// channel is Annotate iff a ledger row for the key exists at the newest
+/// event's `observed_head_oid` (the single-symbol fn's stamp-lookup +
+/// EXISTS pair reduces to exactly that check — the row that supplies
+/// `head_stamp` always satisfies its own EXISTS), else Demote. Whole-file
+/// witnesses (`symbol IS NULL`) are out of scope here — chunk binding only
+/// ever binds named symbols; the single-symbol fn remains the entry point
+/// for those.
+pub fn symbol_verdict_states_for_files(
+    conn: &Connection,
+    files: &[(String, String)],
+) -> Result<std::collections::BTreeMap<(String, String, String), SymbolVerdictState>> {
+    let mut out = std::collections::BTreeMap::new();
+    if files.is_empty() {
+        return Ok(out);
+    }
+    // ≤400 pairs (800 bind variables) per statement — same
+    // SQLITE_MAX_VARIABLE_NUMBER reasoning as `codegraph::nodes_for_conversations`.
+    const BATCH: usize = 400;
+    for batch in files.chunks(BATCH) {
+        let pair_filter: Vec<String> = (0..batch.len())
+            .map(|i| format!("(wl.project = ?{} AND wl.file = ?{})", 2 * i + 1, 2 * i + 2))
+            .collect();
+        let sql = format!(
+            "SELECT wl.project, wl.file, wl.symbol,
+                    v.witness_id, v.verdict, v.successor_witness_id,
+                    v.receipt_oid, v.observed_head_oid,
+                    EXISTS(SELECT 1 FROM witness_ledger wl2
+                           WHERE wl2.project = wl.project AND wl2.file = wl.file
+                             AND wl2.symbol IS wl.symbol
+                             AND wl2.at_oid = v.observed_head_oid)
+             FROM witness_verdicts v
+             JOIN witness_ledger wl ON wl.id = v.witness_id
+             WHERE wl.symbol IS NOT NULL
+               AND ({})
+               AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
+                           WHERE v2.witness_id = v.witness_id)
+             ORDER BY v.id DESC",
+            pair_filter.join(" OR ")
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = batch
+            .iter()
+            .flat_map(|(p, f)| {
+                [
+                    p as &dyn rusqlite::types::ToSql,
+                    f as &dyn rusqlite::types::ToSql,
+                ]
+            })
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        // (key, latest-per-witness event, intact-at-this-event's-HEAD),
+        // newest-first globally and therefore newest-first within each key.
+        let rows: Vec<((String, String, String), WitnessVerdictRow, bool)> = stmt
+            .query_map(params.as_slice(), |row| {
+                let verdict_str: String = row.get(4)?;
+                Ok((
+                    (row.get(0)?, row.get(1)?, row.get(2)?),
+                    WitnessVerdictRow {
+                        witness_id: row.get(3)?,
+                        verdict: VerdictKind::parse(&verdict_str)
+                            .unwrap_or(VerdictKind::AnchorObsolete),
+                        successor_witness_id: row.get(5)?,
+                        receipt_oid: row.get(6)?,
+                        observed_head_oid: row.get(7)?,
+                    },
+                    row.get(8)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Group per key, preserving the newest-first row order.
+        let mut grouped: std::collections::BTreeMap<
+            (String, String, String),
+            Vec<(WitnessVerdictRow, bool)>,
+        > = std::collections::BTreeMap::new();
+        for (key, event, intact) in rows {
+            grouped.entry(key).or_default().push((event, intact));
+        }
+        for (key, events) in grouped {
+            // Newest-first, so `find` picks the same deterministic
+            // representative as the single-symbol fn.
+            let Some((representative, _)) = events.iter().find(|(e, _)| e.verdict.is_negative())
+            else {
+                continue; // no negative-latest witness — same as `None`.
+            };
+            // events[0] is the globally newest event for the key: its
+            // `observed_head_oid` is the head the intact check must use, and
+            // its per-row EXISTS was computed against exactly that oid.
+            let intact_at_head = events[0].1;
+            out.insert(
+                key,
+                SymbolVerdictState {
+                    channel: if intact_at_head {
+                        VerdictChannel::Annotate
+                    } else {
+                        VerdictChannel::Demote
+                    },
+                    representative: representative.clone(),
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

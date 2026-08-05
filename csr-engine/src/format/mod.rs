@@ -64,6 +64,14 @@ pub struct EnrichedResult {
     pub chunk: ConversationChunk,
     /// Resolution-ledger annotation, when a verdict has been recorded for this chunk.
     pub resolution: Option<String>,
+    /// Set ONLY by `mcp::tools::apply_validity_partition` when the v10 dream
+    /// verdict structurally sank this result (Demote channel). The footer
+    /// count reads THIS flag, never a substring of `resolution` — ledger
+    /// evidence text that happens to contain "[stale anchor]" must not fire
+    /// the dream-verdict note, and with `CSR_NO_VALIDITY_PARTITION=1` the
+    /// flag is never set, so output is byte-identical to pre-partition
+    /// behavior.
+    pub validity_demoted: bool,
 }
 
 /// Drop multi-route and near-duplicate results, keeping first occurrence.
@@ -260,6 +268,22 @@ pub fn format_search_results(
         out.push_str(&format!(
             "  <note>{} resolved item(s) demoted within page — matched but verified addressed</note>\n",
             resolved_count
+        ));
+    }
+
+    // v10 dream verdicts: chunks whose bound code symbol is gone/fully stale
+    // at the observed HEAD are sunk below every non-demoted result (never
+    // dropped) by the search validity partition — see
+    // `mcp::tools::apply_validity_partition`, the only writer of
+    // `validity_demoted`. The flag (not a substring of `resolution`) drives
+    // this count: ledger evidence text containing "[stale anchor]" must not
+    // fire it, and with the kill switch on the flag is never set, so this
+    // block contributes nothing (byte-identical pre-partition output).
+    let demoted_count = results.iter().filter(|r| r.validity_demoted).count();
+    if demoted_count > 0 {
+        out.push_str(&format!(
+            "  <note>{} item(s) demoted within page — bound code anchor no longer current (dream verdict)</note>\n",
+            demoted_count
         ));
     }
 
@@ -959,6 +983,7 @@ mod tests {
             score: 0.9,
             chunk: make_chunk(id, conv, "shared decision text"),
             resolution: None,
+            validity_demoted: false,
         };
         // Correlated plan + its origin conversation both matched: plan drops.
         let mut results = vec![mk("p1", "plan:witty"), mk("c1", "conv-a")];
@@ -1013,11 +1038,13 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("same-id", "conv-a", "content A"),
                 resolution: None,
+                validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.5,
                 chunk: make_chunk("same-id", "conv-b", "content B"),
                 resolution: None,
+                validity_demoted: false,
             },
         ];
         dedupe_results(&mut results);
@@ -1034,11 +1061,13 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("id-1", "conv-1", content),
                 resolution: None,
+                validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.7,
                 chunk: make_chunk("id-2", "conv-1", content),
                 resolution: None,
+                validity_demoted: false,
             },
         ];
         dedupe_results(&mut results);
@@ -1054,11 +1083,13 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("id-1", "conv-1", content),
                 resolution: None,
+                validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.8,
                 chunk: make_chunk("id-2", "conv-2", content),
                 resolution: None,
+                validity_demoted: false,
             },
         ];
         dedupe_results(&mut results);
@@ -1072,11 +1103,13 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("id-1", "conv-1", "Hello   World"),
                 resolution: None,
+                validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.7,
                 chunk: make_chunk("id-2", "conv-1", "hello world"),
                 resolution: None,
+                validity_demoted: false,
             },
         ];
         dedupe_results(&mut results);
@@ -1114,6 +1147,7 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("id-open", "conv-1", "open item"),
                 resolution: None,
+                validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.8,
@@ -1123,6 +1157,7 @@ mod tests {
                     "verified in prod",
                     "2026-07-20T10:00:00Z",
                 )),
+                validity_demoted: false,
             },
         ];
         let xml = format_search_results(&results, "q", "all", 1, 1);
@@ -1142,10 +1177,82 @@ mod tests {
             score: 0.9,
             chunk: make_chunk("id-1", "conv-1", "plain item"),
             resolution: None,
+            validity_demoted: false,
         }];
         let xml = format_search_results(&results, "q", "all", 1, 1);
         assert!(!xml.contains("<resolution>"), "got: {xml}");
         assert!(!xml.contains("<note>"), "got: {xml}");
+    }
+
+    #[test]
+    fn kill_switch_output_is_byte_identical_to_pre_partition_behavior() {
+        // With CSR_NO_VALIDITY_PARTITION=1 the partition never sets
+        // `validity_demoted` and never appends a note — so the formatter must
+        // produce the exact pre-lane output, byte for byte, even when a
+        // resolution-ledger evidence string happens to CONTAIN the literal
+        // "[stale anchor]". The old substring sniff fired the dream-verdict
+        // footer on exactly this fixture; the flag must not.
+        let chunk = ConversationChunk {
+            id: "c-1".into(),
+            conversation_id: "conv-1".into(),
+            project_name: "test-project".into(),
+            // Deliberately unparseable so age_stamp echoes it verbatim —
+            // keeps the expected string deterministic across runs.
+            timestamp: "ts-fixed".into(),
+            content: "hello world".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let results = vec![EnrichedResult {
+            score: 0.9,
+            chunk,
+            resolution: Some(
+                "resolved — evidence cites [stale anchor] old_fn wording (verified 2026-01-01)"
+                    .to_string(),
+            ),
+            validity_demoted: false, // kill switch on: the partition never set it
+        }];
+        let xml = format_search_results(&results, "q", "all", 5, 3);
+        let expected = "\u{1f3af} RESULTS: 1 matches (high relevance, top score: 0.900)\n\
+\u{26a1} PERFORMANCE: 8ms (1 collection searched)\n\
+\n\
+<search>\n\
+\x20 <summary count=\"1\" relevance=\"high\" top-score=\"0.900\">\n\
+\x20   <preview>hello world</preview>\n\
+\x20 </summary>\n\
+\x20 <meta>\n\
+\x20   <q>q</q>\n\
+\x20   <scope>all</scope>\n\
+\x20   <count>1</count>\n\
+\x20   <range>0.900-0.900</range>\n\
+\x20   <perf>\n\
+\x20     <ttl>8</ttl>\n\
+\x20     <emb>3</emb>\n\
+\x20     <srch>5</srch>\n\
+\x20     <cols>1</cols>\n\
+\x20   </perf>\n\
+\x20 </meta>\n\
+\x20 <results>\n\
+\x20   <r rank=\"1\">\n\
+\x20     <s>0.900</s>\n\
+\x20     <p>test-project</p>\n\
+\x20     <t>ts-fixed</t>\n\
+\x20     <excerpt><![CDATA[hello world]]></excerpt>\n\
+\x20     <cid>conv-1</cid>\n\
+\x20     <id>c-1</id>\n\
+\x20     <resolution>resolved \u{2014} evidence cites [stale anchor] old_fn wording (verified 2026-01-01)</resolution>\n\
+\x20   </r>\n\
+\x20 </results>\n\
+\x20 <note>1 resolved item(s) demoted within page \u{2014} matched but verified addressed</note>\n\
+</search>\n";
+        assert_eq!(xml, expected, "kill-switch output must be byte-identical");
+        assert!(
+            !xml.contains("dream verdict"),
+            "'[stale anchor]' inside ledger evidence must not fire the dream-verdict footer"
+        );
     }
 
     #[test]
@@ -1263,6 +1370,7 @@ mod tests {
             score,
             chunk: make_chunk("qc1", "conv-qc", content),
             resolution: None,
+            validity_demoted: false,
         }
     }
 
