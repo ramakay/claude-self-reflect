@@ -335,7 +335,9 @@ pub async fn reflect_on_past(
         })
         .collect();
     format::dedupe_plan_origins(&mut enriched, &origin_of);
-    enriched.truncate(limit);
+    // Sink resolved chunks BEFORE the limit cut so stale results do not occupy
+    // slots that should go to unresolved chunks ranked below them.
+    apply_resolutions_before_limit(&mut enriched, storage, limit);
 
     // TAD: log each RETURNED memory as an MCP-search retrieval event — after the
     // limit cut, so telemetry agrees with what the caller actually saw.
@@ -343,8 +345,6 @@ pub async fn reflect_on_past(
     for e in &enriched {
         let _ = storage.log_retrieval_event(&e.chunk.id, "chunk", "mcp_search", "mcp");
     }
-
-    apply_resolutions(&mut enriched, storage);
 
     Ok(format::format_search_results(
         &enriched,
@@ -1009,9 +1009,61 @@ pub fn apply_resolutions(enriched: &mut Vec<EnrichedResult>, storage: &Arc<Stora
     *enriched = unresolved;
 }
 
+fn apply_resolutions_before_limit(
+    enriched: &mut Vec<EnrichedResult>,
+    storage: &Arc<Storage>,
+    limit: usize,
+) {
+    apply_resolutions(enriched, storage);
+    enriched.truncate(limit);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn enriched_result(id: &str, score: f32, seq: usize) -> EnrichedResult {
+        EnrichedResult {
+            score,
+            chunk: crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: "conv-1".into(),
+                project_name: "test".into(),
+                timestamp: "2026-01-15T10:00:00Z".into(),
+                content: format!("{id} claim"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::ToolResult,
+                seq,
+                is_sidechain: false,
+            },
+            resolution: None,
+        }
+    }
+
+    #[test]
+    fn resolved_results_sink_before_limit_cut() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        storage
+            .insert_resolutions(
+                &["resolved".to_string()],
+                "resolved",
+                "shipped and verified",
+                None,
+                "agent",
+            )
+            .unwrap();
+        let mut enriched = vec![
+            enriched_result("resolved", 0.9, 0),
+            enriched_result("unresolved-1", 0.8, 1),
+            enriched_result("unresolved-2", 0.7, 2),
+        ];
+
+        apply_resolutions_before_limit(&mut enriched, &storage, 2);
+
+        let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
+        assert_eq!(ids, ["unresolved-1", "unresolved-2"]);
+    }
 
     // --- exact conv-tag lookup (episode-index handle fix) ---
     // Live failure 2026-07-08: csr_reflect_on_past("conv_0b68eace-…") went
