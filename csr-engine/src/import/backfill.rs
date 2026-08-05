@@ -45,7 +45,8 @@ use crate::import::{
     discover_projects, list_jsonl_files, normalize_project_name, parse_jsonl_file,
     parse_jsonl_messages,
 };
-use crate::storage::codegraph::EdgeRow;
+use crate::storage::codegraph::{EdgeRow, NodeRow};
+use crate::storage::witness_ledger::WitnessLedgerRow;
 use crate::storage::Storage;
 
 /// Log progress every N conversations.
@@ -640,6 +641,23 @@ fn relpath_in_repo(repo_root: &str, file: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// A `git -C <repo_root>` command with any ambient `GIT_*` environment
+/// stripped. When the calling process itself runs inside a git hook (git
+/// exports `GIT_DIR`/`GIT_INDEX_FILE`/... to hooks — absolute paths in a
+/// linked worktree), an inherited `GIT_DIR` would silently override `-C`
+/// and point the command at the WRONG repository. This backfill always
+/// targets the explicit `repo_root` it resolved — never ambient state.
+fn git_at(repo_root: &str) -> Command {
+    let mut cmd = Command::new("git");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.arg("-C").arg(repo_root);
+    cmd
+}
+
 /// `git -C <repo_root> log -L<start>,<end>:<relpath> --format='%H %cI' --reverse
 /// --no-patch`, first output line only. `start`/`end` are 1-based line numbers
 /// (git's `-L` convention — `code_nodes.span_start`/`span_end` are 0-based, so
@@ -663,9 +681,7 @@ fn git_log_introducing_commit(
         return None;
     }
     let range_arg = format!("-L{start},{end}:{relpath}");
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let output = git_at(repo_root)
         .arg("log")
         .arg(&range_arg)
         .arg("--format=%H %cI")
@@ -808,6 +824,276 @@ fn backfill_attribution_into(storage: &Storage, dry_run: bool) -> Result<Attribu
             }
             None => {
                 stats.git_no_commit += 1;
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Result of a `codegraph stamp-spans` run (also used for `--dry-run`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StampSpansStats {
+    /// Distinct files seen in `code_nodes` that resolved to a repo_root.
+    pub files_checked: usize,
+    /// Of those, how many were actually stamped (file on disk, repo
+    /// discoverable, HEAD resolvable, path relative to its own repo_root).
+    pub files_processed: usize,
+    /// Function/type/const-level witnesses minted (symbol-level, span-scoped).
+    pub spans_stamped: usize,
+    /// Whole-file witnesses minted (`symbol` NULL) — only for files where
+    /// span extraction found no function/type/const-level node.
+    pub whole_files_stamped: usize,
+    /// No `repo_root` could be resolved for the file (neither stored on any
+    /// of its `code_nodes` rows nor re-derivable live) — non-git file, or a
+    /// repo that can no longer be found.
+    pub skipped_no_repo_root: usize,
+    /// The file no longer exists on disk.
+    pub skipped_file_missing: usize,
+    /// `repo_root` does not open/discover as a git repository, or has no
+    /// resolvable HEAD (empty/unborn repo).
+    pub skipped_non_git: usize,
+    /// The file's path does not resolve to a path relative to its own
+    /// `repo_root` (a stale/mismatched `repo_root` value — never a guess).
+    pub skipped_outside_repo_root: usize,
+    /// `codewitness::Auditor::stamp_at` itself failed for a specific anchor
+    /// (e.g. the anchor's content vanished from the commit tree between
+    /// extraction time and stamping time).
+    pub skipped_stamp_error: usize,
+    /// The node's 0-based span could not be converted to the 1-based `u32`
+    /// line range `codewitness::Anchor` expects (overflow on `+1` or value
+    /// outside `u32`) — corrupt span data, skipped rather than panicking
+    /// (debug) or truncating (release).
+    pub skipped_span_out_of_range: usize,
+}
+
+impl StampSpansStats {
+    /// Human-readable one-block summary.
+    pub fn format_text(&self, dry_run: bool) -> String {
+        let mode = if dry_run { " (dry-run, no writes)" } else { "" };
+        format!(
+            "CSR stamp-spans backfill{mode}\n\
+             ──────────────────────────────\n\
+             files checked        : {}\n\
+             files processed      : {}\n\
+             spans stamped        : {}\n\
+             whole-file witnesses : {}\n\
+             skipped: no_repo_root={}  file_missing={}  non_git={}  outside_repo_root={}  stamp_error={}  span_out_of_range={}\n",
+            self.files_checked,
+            self.files_processed,
+            self.spans_stamped,
+            self.whole_files_stamped,
+            self.skipped_no_repo_root,
+            self.skipped_file_missing,
+            self.skipped_non_git,
+            self.skipped_outside_repo_root,
+            self.skipped_stamp_error,
+            self.skipped_span_out_of_range,
+        )
+    }
+}
+
+/// Open (discover) the git repository at `repo_root` and resolve its HEAD
+/// commit, once. `None` on any failure — not a git repository, `repo_root`
+/// no longer exists, or the repo has no commits yet (unborn HEAD) — the
+/// caller folds this into `skipped_non_git`, never a hard failure (matches
+/// this module's existing fail-soft posture).
+fn open_repo_head(repo_root: &str) -> Option<(codewitness::Auditor, codewitness::ObjectId)> {
+    let auditor = codewitness::Auditor::discover(repo_root).ok()?;
+    let head = auditor.repo().head_id().ok()?.detach();
+    Some((auditor, head))
+}
+
+/// Backfill `witness_ledger` (v10 "dreaming" substrate — see
+/// `storage::witness_ledger`'s module doc) with committed-tier
+/// `codewitness` stamps for every function/type/const span the code graph
+/// already knows about, plus a whole-file fallback witness for files whose
+/// span extraction yielded nothing.
+///
+/// Reuses `code_nodes` exactly as `backfill_attribution_into`'s git channel
+/// does: no new parser, no new AST pass — `code_nodes.span_start`/`span_end`
+/// (0-based, tree-sitter row numbers; see `extraction::codegraph::extract_inner`)
+/// are the SAME spans that channel already walks with `git log -L`, converted
+/// here to the 1-based inclusive range `codewitness::Anchor::with_span`
+/// expects (`+1`, matching `git_log_introducing_commit`'s own `span_start + 1`
+/// convention).
+///
+/// `repo_root` resolution mirrors `backfill_attribution_into`'s git channel:
+/// prefer the value already stored on the node, falling back to a live
+/// `extraction::repo_root::repo_root_for_file` lookup so this backfill still
+/// works on a DB that predates (or raced) `codegraph backfill-repo-root`.
+///
+/// Fail-soft per file throughout, mirroring the rest of this module: a
+/// missing file, a non-git (or HEAD-less) repository, a path that doesn't
+/// resolve under its own `repo_root`, or a specific anchor's stamp failing
+/// is logged and counted in a reason bucket on `StampSpansStats`, never
+/// fatal. Idempotent by construction: `Storage::insert_witness` is
+/// `INSERT OR IGNORE` against the ledger's `idx_witness_ledger_identity`
+/// UNIQUE index, whose `COALESCE`-normalized key columns dedupe symbol-level
+/// AND whole-file (NULL-key) rows atomically at the DB level — see
+/// `storage::witness_ledger`'s module doc.
+pub fn backfill_stamp_spans(engine: &Engine, dry_run: bool) -> Result<StampSpansStats> {
+    stamp_spans_into(engine.storage(), dry_run)
+}
+
+/// Storage-level core of `backfill_stamp_spans` (no embeddings needed —
+/// keeps unit tests light, same split as `backfill_into` / `backfill_attribution_into`).
+fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats> {
+    let mut stats = StampSpansStats::default();
+
+    // Group by file first: repo access (discover + HEAD resolution) and the
+    // whole-file-witness decision both happen per file, not per node.
+    let nodes = storage.all_code_nodes()?;
+    let mut by_file: BTreeMap<String, Vec<NodeRow>> = BTreeMap::new();
+    for node in nodes {
+        by_file.entry(node.file.clone()).or_default().push(node);
+    }
+
+    // Cache Auditor + HEAD oid per repo_root — discovery + HEAD resolution
+    // happen once per distinct repo, not once per file in that repo.
+    let mut repo_cache: BTreeMap<String, Option<(codewitness::Auditor, codewitness::ObjectId)>> =
+        BTreeMap::new();
+
+    for (file, file_nodes) in by_file {
+        // Same fallback order as `backfill_attribution_into`'s git channel:
+        // prefer a stored repo_root, else resolve live.
+        let repo_root = file_nodes
+            .iter()
+            .find_map(|n| n.repo_root.clone())
+            .or_else(|| crate::extraction::repo_root::repo_root_for_file(&file));
+        let Some(repo_root) = repo_root else {
+            stats.skipped_no_repo_root += 1;
+            continue;
+        };
+
+        if !Path::new(&file).is_file() {
+            stats.skipped_file_missing += 1;
+            continue;
+        }
+
+        let cached = repo_cache
+            .entry(repo_root.clone())
+            .or_insert_with(|| open_repo_head(&repo_root));
+        let Some((auditor, head_oid)) = cached.as_ref() else {
+            stats.skipped_non_git += 1;
+            continue;
+        };
+        let head_oid = *head_oid;
+
+        let Some(relpath) = relpath_in_repo(&repo_root, &file) else {
+            stats.skipped_outside_repo_root += 1;
+            eprintln!("CSR stamp-spans: {file} is not under resolved repo root {repo_root} (skip)");
+            continue;
+        };
+
+        stats.files_checked += 1;
+        stats.files_processed += 1;
+        let project = file_nodes
+            .iter()
+            .find(|n| !n.project.is_empty())
+            .map(|n| n.project.clone())
+            .unwrap_or_default();
+        let at_oid_str = head_oid.to_string();
+
+        let mut any_span = false;
+        for node in &file_nodes {
+            // The synthetic module sentinel (kind='module', 0/0 span) isn't a
+            // real span-level symbol — same exclusion as the git-channel
+            // attribution backfill's `module_sentinel` check.
+            if node.kind == "module" {
+                continue;
+            }
+            if node.span_start < 0 || node.span_end < node.span_start {
+                continue;
+            }
+
+            // Checked 0-based → 1-based conversion: a corrupt span near
+            // i64::MAX (or one that simply doesn't fit u32) must be skipped
+            // and counted, never panic (debug) or silently truncate (release).
+            let checked_line = |span: i64| u32::try_from(span.checked_add(1)?).ok();
+            let (Some(start_line), Some(end_line)) =
+                (checked_line(node.span_start), checked_line(node.span_end))
+            else {
+                stats.skipped_span_out_of_range += 1;
+                eprintln!(
+                    "CSR stamp-spans: span {}..{} for {file}::{} does not fit a 1-based u32 line (skip)",
+                    node.span_start, node.span_end, node.name
+                );
+                continue;
+            };
+            any_span = true;
+
+            let anchor = codewitness::Anchor::new(relpath.clone())
+                .with_symbol(node.name.clone())
+                .with_span(start_line, end_line);
+
+            match auditor.stamp_at(&anchor, head_oid) {
+                Ok(witness) => {
+                    stats.spans_stamped += 1;
+                    if dry_run {
+                        continue;
+                    }
+                    let row = WitnessLedgerRow {
+                        project: project.clone(),
+                        file: file.clone(),
+                        symbol: Some(node.name.clone()),
+                        span_start: Some(node.span_start),
+                        span_end: Some(node.span_end),
+                        stamp: witness.stamp().as_str().to_string(),
+                        tier: "committed".to_string(),
+                        at_oid: Some(at_oid_str.clone()),
+                        source_kind: "backfill".to_string(),
+                        source_id: Some(at_oid_str.clone()),
+                    };
+                    if let Err(e) = storage.insert_witness(&row) {
+                        eprintln!(
+                            "CSR stamp-spans: ledger insert error for {file}::{} ({e})",
+                            node.name
+                        );
+                    }
+                }
+                Err(e) => {
+                    stats.skipped_stamp_error += 1;
+                    eprintln!(
+                        "CSR stamp-spans: stamp error for {file}::{} ({e})",
+                        node.name
+                    );
+                }
+            }
+        }
+
+        if any_span {
+            continue;
+        }
+
+        // No function/type/const span in this file — whole-file fallback
+        // witness (symbol = NULL).
+        let anchor = codewitness::Anchor::new(relpath.clone());
+        match auditor.stamp_at(&anchor, head_oid) {
+            Ok(witness) => {
+                stats.whole_files_stamped += 1;
+                if dry_run {
+                    continue;
+                }
+                let row = WitnessLedgerRow {
+                    project,
+                    file: file.clone(),
+                    symbol: None,
+                    span_start: None,
+                    span_end: None,
+                    stamp: witness.stamp().as_str().to_string(),
+                    tier: "committed".to_string(),
+                    at_oid: Some(at_oid_str.clone()),
+                    source_kind: "backfill".to_string(),
+                    source_id: Some(at_oid_str),
+                };
+                if let Err(e) = storage.insert_witness(&row) {
+                    eprintln!("CSR stamp-spans: ledger insert error for {file} (whole-file) ({e})");
+                }
+            }
+            Err(e) => {
+                stats.skipped_stamp_error += 1;
+                eprintln!("CSR stamp-spans: whole-file stamp error for {file} ({e})");
             }
         }
     }
@@ -1171,7 +1457,7 @@ mod tests {
         // is returned.
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
-        let git = |args: &[&str]| Command::new("git").arg("-C").arg(repo).args(args).status();
+        let git = |args: &[&str]| git_in(repo).args(args).status();
         if git(&["init", "-q"]).map(|s| !s.success()).unwrap_or(true) {
             return; // git unavailable — fail-soft skip, matches repo_root.rs precedent
         }
@@ -1182,18 +1468,7 @@ mod tests {
         std::fs::write(&file, "fn foo() {\n    1\n}\n").unwrap();
         git(&["add", "lib.rs"]).unwrap();
         git(&["commit", "-q", "-m", "introduce foo"]).unwrap();
-        let oldest_hash = String::from_utf8(
-            Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
+        let oldest_hash = git_head(repo);
 
         // A second commit that also touches line 2 (same range).
         std::fs::write(&file, "fn foo() {\n    2\n}\n").unwrap();
@@ -1204,6 +1479,314 @@ mod tests {
         assert_eq!(
             hash, oldest_hash,
             "must return the OLDEST commit touching the range, not the newest"
+        );
+    }
+
+    // ─── stamp-spans backfill (v10 "dreaming" substrate) ───
+
+    /// A `git -C <repo>` command with the hook-time environment stripped.
+    /// When this suite runs under a `git commit` hook (our pre-commit runs
+    /// `cargo test --lib`), git exports `GIT_DIR`/`GIT_INDEX_FILE`/... —
+    /// absolute paths in a linked worktree — which would silently redirect
+    /// these temp-repo commands at the REAL repository (staging test files
+    /// into the actual index). Strip every `GIT_*` var so the command only
+    /// ever sees the temp repo.
+    fn git_in(repo: &Path) -> Command {
+        let mut cmd = Command::new("git");
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("GIT_") {
+                cmd.env_remove(&k);
+            }
+        }
+        cmd.arg("-C").arg(repo);
+        cmd
+    }
+
+    fn init_git_repo(repo: &Path) -> bool {
+        let git = |args: &[&str]| git_in(repo).args(args).status();
+        if git(&["init", "-q"]).map(|s| !s.success()).unwrap_or(true) {
+            return false; // git unavailable — fail-soft skip, matches repo_root.rs precedent
+        }
+        git(&["config", "user.email", "t@example.com"]).unwrap();
+        git(&["config", "user.name", "Test"]).unwrap();
+        true
+    }
+
+    fn git_head(repo: &Path) -> String {
+        String::from_utf8(
+            git_in(repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
+    #[test]
+    fn stamp_spans_mints_committed_witnesses_matching_head_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("lib.rs");
+        std::fs::write(&file, "fn foo() {\n    1\n}\n\nfn bar() {\n    2\n}\n").unwrap();
+        git_in(repo).args(["add", "lib.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "init"])
+            .status()
+            .unwrap();
+        let head = git_head(repo);
+
+        let file_path = file.to_string_lossy().to_string();
+        let repo_root = repo.to_string_lossy().to_string();
+
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                let mut foo = attr_node("n-foo", &file_path, "foo");
+                foo.repo_root = Some(repo_root.clone());
+                foo.span_start = 0;
+                foo.span_end = 2;
+                codegraph_upsert_node(conn, &foo).unwrap();
+
+                let mut bar = attr_node("n-bar", &file_path, "bar");
+                bar.repo_root = Some(repo_root.clone());
+                bar.span_start = 4;
+                bar.span_end = 6;
+                codegraph_upsert_node(conn, &bar).unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = stamp_spans_into(&storage, false).unwrap();
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.spans_stamped, 2, "foo + bar");
+        assert_eq!(
+            stats.whole_files_stamped, 0,
+            "spans exist, no whole-file fallback"
+        );
+
+        let rows = storage.witnesses_for_file("proj", &file_path).unwrap();
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            assert_eq!(r.tier, "committed");
+            assert_eq!(r.at_oid.as_deref(), Some(head.as_str()));
+            assert_eq!(r.source_kind, "backfill");
+        }
+
+        // Stamps must match codewitness's own `stamp_at` output exactly.
+        let auditor = codewitness::Auditor::discover(&repo_root).unwrap();
+        let head_oid: codewitness::ObjectId = head.parse().unwrap();
+        let foo_anchor = codewitness::Anchor::new("lib.rs")
+            .with_symbol("foo")
+            .with_span(1, 3);
+        let expected_foo = auditor.stamp_at(&foo_anchor, head_oid).unwrap();
+        let foo_row = rows
+            .iter()
+            .find(|r| r.symbol.as_deref() == Some("foo"))
+            .unwrap();
+        assert_eq!(foo_row.stamp, expected_foo.stamp().as_str());
+        assert_eq!(foo_row.span_start, Some(0));
+        assert_eq!(foo_row.span_end, Some(2));
+
+        // Idempotency: rerunning must add zero new rows.
+        let stats2 = stamp_spans_into(&storage, false).unwrap();
+        assert_eq!(stats2.spans_stamped, 2, "same 2 spans re-attempted");
+        let rows_after = storage.witnesses_for_file("proj", &file_path).unwrap();
+        assert_eq!(rows_after.len(), 2, "rerun must not add new rows");
+    }
+
+    #[test]
+    fn stamp_spans_falls_back_to_whole_file_witness_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("data.rs");
+        std::fs::write(&file, "// just a comment, no functions\n").unwrap();
+        git_in(repo).args(["add", "data.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "init"])
+            .status()
+            .unwrap();
+        let head = git_head(repo);
+
+        let file_path = file.to_string_lossy().to_string();
+        let repo_root = repo.to_string_lossy().to_string();
+
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                // Only the synthetic module sentinel — no function/type/const spans.
+                let mut module = attr_node("n-mod", &file_path, &file_path);
+                module.kind = "module".into();
+                module.repo_root = Some(repo_root.clone());
+                module.span_start = 0;
+                module.span_end = 0;
+                codegraph_upsert_node(conn, &module).unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = stamp_spans_into(&storage, false).unwrap();
+        assert_eq!(stats.spans_stamped, 0);
+        assert_eq!(stats.whole_files_stamped, 1);
+
+        let rows = storage.witnesses_for_file("proj", &file_path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol, None);
+        assert_eq!(rows[0].at_oid.as_deref(), Some(head.as_str()));
+
+        // Idempotent: whole-file rows are NULL-keyed, and the COALESCE-based
+        // `idx_witness_ledger_identity` UNIQUE index (+ INSERT OR IGNORE)
+        // dedupes them at the DB level — see `storage::witness_ledger`'s
+        // module doc.
+        let stats2 = stamp_spans_into(&storage, false).unwrap();
+        assert_eq!(stats2.whole_files_stamped, 1, "re-attempted, not net-new");
+        let rows_after = storage.witnesses_for_file("proj", &file_path).unwrap();
+        assert_eq!(
+            rows_after.len(),
+            1,
+            "whole-file rerun must not duplicate (identity index)"
+        );
+    }
+
+    #[test]
+    fn stamp_spans_skips_span_that_overflows_u32_line_range() {
+        // A corrupt span near i64::MAX (or merely > u32::MAX) must be
+        // counted in `skipped_span_out_of_range` — never panic (debug
+        // overflow) or silently truncate (release `as u32`). With no other
+        // valid span in the file, the whole-file fallback still fires.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("lib.rs");
+        std::fs::write(&file, "fn foo() {\n    1\n}\n").unwrap();
+        git_in(repo).args(["add", "lib.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "init"])
+            .status()
+            .unwrap();
+
+        let file_path = file.to_string_lossy().to_string();
+        let repo_root = repo.to_string_lossy().to_string();
+
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                // `span_end + 1` would overflow i64; also exercises the
+                // u32::try_from bound via span_start > u32::MAX.
+                let mut corrupt = attr_node("n-corrupt", &file_path, "corrupt");
+                corrupt.repo_root = Some(repo_root.clone());
+                corrupt.span_start = i64::from(u32::MAX) + 1;
+                corrupt.span_end = i64::MAX;
+                codegraph_upsert_node(conn, &corrupt).unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = stamp_spans_into(&storage, false).expect("must never panic or fail");
+        assert_eq!(stats.skipped_span_out_of_range, 1);
+        assert_eq!(stats.spans_stamped, 0);
+        assert_eq!(
+            stats.whole_files_stamped, 1,
+            "no valid span survived, so the whole-file fallback applies"
+        );
+        let rows = storage.witnesses_for_file("proj", &file_path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol, None, "only the whole-file witness lands");
+    }
+
+    #[test]
+    fn stamp_spans_skips_missing_file_and_non_git_repo_without_failing() {
+        let storage = Storage::open_memory().unwrap();
+
+        // (a) file no longer exists on disk.
+        storage
+            .with_connection(|conn| {
+                let mut ghost = attr_node("n-ghost", "/nonexistent/ghost.rs", "ghost_fn");
+                ghost.repo_root = Some("/tmp".into());
+                ghost.span_start = 0;
+                ghost.span_end = 1;
+                codegraph_upsert_node(conn, &ghost).unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        // (b) file exists, but its repo_root has no discoverable git repository.
+        let tmp = tempfile::tempdir().unwrap();
+        let non_git_dir = tmp.path().join("not-a-repo");
+        std::fs::create_dir_all(&non_git_dir).unwrap();
+        let plain_file = non_git_dir.join("plain.rs");
+        std::fs::write(&plain_file, "fn plain() {}\n").unwrap();
+        let plain_path = plain_file.to_string_lossy().to_string();
+        storage
+            .with_connection(|conn| {
+                let mut plain = attr_node("n-plain", &plain_path, "plain");
+                plain.repo_root = Some(non_git_dir.to_string_lossy().to_string());
+                plain.span_start = 0;
+                plain.span_end = 0;
+                codegraph_upsert_node(conn, &plain).unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = stamp_spans_into(&storage, false).expect("must never fail the run");
+        assert_eq!(stats.skipped_file_missing, 1);
+        assert_eq!(stats.skipped_non_git, 1);
+        assert_eq!(stats.spans_stamped, 0);
+        assert_eq!(stats.whole_files_stamped, 0);
+    }
+
+    #[test]
+    fn stamp_spans_dry_run_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("lib.rs");
+        std::fs::write(&file, "fn foo() {\n    1\n}\n").unwrap();
+        git_in(repo).args(["add", "lib.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "init"])
+            .status()
+            .unwrap();
+
+        let file_path = file.to_string_lossy().to_string();
+        let repo_root = repo.to_string_lossy().to_string();
+
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                let mut foo = attr_node("n-foo", &file_path, "foo");
+                foo.repo_root = Some(repo_root.clone());
+                foo.span_start = 0;
+                foo.span_end = 2;
+                codegraph_upsert_node(conn, &foo).unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = stamp_spans_into(&storage, true).unwrap();
+        assert_eq!(stats.spans_stamped, 1, "counting still happens");
+        assert!(
+            storage
+                .witnesses_for_file("proj", &file_path)
+                .unwrap()
+                .is_empty(),
+            "dry-run must not write witness_ledger"
         );
     }
 }

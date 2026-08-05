@@ -1,6 +1,7 @@
 pub mod codegraph;
 pub mod migrations;
 pub mod queries;
+pub mod witness_ledger;
 
 pub use queries::{
     NarrativeUsageRow, NarrativeUsageSummary, RatificationScoreRow, ResolutionEntry,
@@ -1198,6 +1199,47 @@ impl Storage {
     ) -> anyhow::Result<std::collections::HashSet<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::known_session_ids(&conn, candidates)
+    }
+
+    // ─── Witness ledger (v10 "dreaming" substrate) ───
+    //
+    // APPEND-ONLY: insert + query only, no update/delete — see
+    // `witness_ledger`'s module doc for the full invariant.
+
+    /// Append one witness row. Duplicates (symbol-level AND whole-file
+    /// NULL-key rows alike) are a silent no-op: `INSERT OR IGNORE` against
+    /// the COALESCE-based `idx_witness_ledger_identity` UNIQUE index.
+    pub fn insert_witness(&self, row: &witness_ledger::WitnessLedgerRow) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_ledger::insert_witness(&conn, row)
+    }
+
+    /// Full append-only history of witnesses for `(project, file)`, oldest-first.
+    pub fn witnesses_for_file(
+        &self,
+        project: &str,
+        file: &str,
+    ) -> Result<Vec<witness_ledger::WitnessLedgerRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_ledger::witnesses_for_file(&conn, project, file)
+    }
+
+    /// Most recently inserted witness for `(project, file, symbol)`;
+    /// `symbol = None` selects the whole-file witness.
+    pub fn latest_witness_for_symbol(
+        &self,
+        project: &str,
+        file: &str,
+        symbol: Option<&str>,
+    ) -> Result<Option<witness_ledger::WitnessLedgerRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_ledger::latest_witness_for_symbol(&conn, project, file, symbol)
+    }
+
+    /// Count of ledger rows for `(project, file)` (idempotency checks).
+    pub fn count_witnesses_for_file(&self, project: &str, file: &str) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_ledger::count_witnesses_for_file(&conn, project, file)
     }
 }
 

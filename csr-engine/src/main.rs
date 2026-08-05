@@ -189,6 +189,15 @@ enum CodegraphAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Mint `codewitness` committed-tier witnesses for every function/type/
+    /// const span (and whole-file fallback) known to the code graph — the
+    /// append-only evidence substrate for v10 "dreaming" (evidence-grounded
+    /// forgetting). Idempotent: safe to re-run.
+    StampSpans {
+        /// Count what would be stamped, but make no changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn default_db_path() -> PathBuf {
@@ -424,6 +433,19 @@ async fn main() -> Result<()> {
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
         let stats = csr_engine::import::backfill::backfill_attribution(&eng, dry_run)?;
+        print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
+    if let Some(Commands::Codegraph {
+        action: CodegraphAction::StampSpans { dry_run },
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats = csr_engine::import::backfill::backfill_stamp_spans(&eng, dry_run)?;
         print!("{}", stats.format_text(dry_run));
         return Ok(());
     }

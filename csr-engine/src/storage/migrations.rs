@@ -683,6 +683,50 @@ pub fn run(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_edge_scope_chains_file ON edge_scope_chains(project, file);",
     )?;
 
+    // witness_ledger (v10 "dreaming" substrate): append-only ledger of
+    // `codewitness` content-hash stamps anchored to a file/symbol/span at a
+    // specific git commit (or worktree). This is the evidence substrate for
+    // future evidence-grounded forgetting — a claim gets a witness once, and
+    // later audits (`codewitness::Auditor::try_audit`) check whether that
+    // witness still holds, rather than re-deriving the claim from scratch or
+    // trusting a wall-clock staleness heuristic.
+    //
+    // APPEND-ONLY INVARIANT: `storage::witness_ledger` exposes INSERT and
+    // QUERY functions ONLY — there is no UPDATE or DELETE for this table. A
+    // witness that no longer holds is superseded by inserting a NEW row (a
+    // fresh stamp at a later commit), never by mutating or removing the old
+    // one; see `storage::witness_ledger`'s module doc for the full rationale.
+    //
+    // Identity dedupe: `idx_witness_ledger_identity` (a UNIQUE expression
+    // index, below) makes a repeat insert of an identical claim (e.g. an
+    // idempotent `codegraph stamp-spans` re-run) conflict, and
+    // `storage::witness_ledger::insert_witness` uses `INSERT OR IGNORE` so
+    // the duplicate is a silent no-op. SQLite (like standard SQL) treats
+    // every NULL in a plain UNIQUE constraint as distinct from every other
+    // NULL, which is why this is an expression index over
+    // `COALESCE(...)`-normalized key columns rather than an inline
+    // `UNIQUE(...)` on the table: whole-file witnesses (`symbol`/
+    // `span_start`/`span_end` all NULL) dedupe atomically at the DB level
+    // too — see the
+    // `witness_ledger_identity_index_dedupes_null_symbol_rows` test below.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS witness_ledger (
+            id INTEGER PRIMARY KEY,
+            project TEXT NOT NULL,
+            file TEXT NOT NULL,
+            symbol TEXT,
+            span_start INTEGER, span_end INTEGER,
+            stamp TEXT NOT NULL,
+            tier TEXT NOT NULL CHECK (tier IN ('worktree','committed')),
+            at_oid TEXT,
+            source_kind TEXT NOT NULL,
+            source_id TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_witness_ledger_identity ON witness_ledger (project, file, COALESCE(symbol,''), COALESCE(span_start,-1), COALESCE(span_end,-1), stamp, tier, COALESCE(at_oid,''), source_kind, COALESCE(source_id,''));
+        CREATE INDEX IF NOT EXISTS idx_witness_ledger_lookup ON witness_ledger(project, file, symbol);",
+    )?;
+
     Ok(())
 }
 
@@ -915,5 +959,100 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM edge_scope_chains", [], |r| r.get(0))
             .unwrap();
         assert_eq!((lb, esc), (1, 1), "witness rows must survive re-open");
+    }
+
+    #[test]
+    fn witness_ledger_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        // Insert BEFORE the rerun: idempotency means existing ledger rows
+        // survive a second migration pass (guards against the PR #279-class
+        // table-wipe regression, where a rerun recreated the table).
+        conn.execute(
+            "INSERT INTO witness_ledger (project, file, stamp, tier, source_kind) \
+             VALUES ('p', 'f.rs', 'b3:abc', 'committed', 'backfill')",
+            [],
+        )
+        .unwrap();
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare(
+                "SELECT id, project, file, symbol, span_start, span_end, stamp, tier, at_oid, \
+                 source_kind, source_id, created_at FROM witness_ledger LIMIT 0"
+            )
+            .is_ok(),
+            "witness_ledger table must exist after migration"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "ledger rows must survive a migration rerun");
+    }
+
+    #[test]
+    fn witness_ledger_tier_check_constraint_rejects_invalid_tier() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let ok = conn.execute(
+            "INSERT INTO witness_ledger (project, file, stamp, tier, source_kind) \
+             VALUES ('p', 'f', 'b3:abc', 'committed', 'backfill')",
+            [],
+        );
+        assert!(ok.is_ok(), "valid tier must be accepted: {ok:?}");
+        let bad = conn.execute(
+            "INSERT INTO witness_ledger (project, file, stamp, tier, source_kind) \
+             VALUES ('p', 'f', 'b3:abc', 'guess', 'backfill')",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "tier CHECK constraint must reject a non-worktree/committed value"
+        );
+    }
+
+    #[test]
+    fn witness_ledger_identity_index_dedupes_duplicate_symbol_row() {
+        // Symbol-level rows conflict on `idx_witness_ledger_identity`, so
+        // `INSERT OR IGNORE` (what `storage::witness_ledger::insert_witness`
+        // issues) must dedupe them (see the append-only invariant doc above `run`).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let insert = "INSERT OR IGNORE INTO witness_ledger
+            (project, file, symbol, span_start, span_end, stamp, tier, at_oid, source_kind, source_id)
+            VALUES ('p', 'f.rs', 'foo', 1, 3, 'b3:abc', 'committed', 'deadbeef', 'backfill', 'deadbeef')";
+        conn.execute(insert, []).unwrap();
+        conn.execute(insert, []).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "duplicate symbol-level witness must be ignored, not duplicated"
+        );
+    }
+
+    #[test]
+    fn witness_ledger_identity_index_dedupes_null_symbol_rows() {
+        // The reason `idx_witness_ledger_identity` is a COALESCE expression
+        // index rather than an inline UNIQUE(...) constraint: SQLite treats
+        // every NULL as distinct in a plain UNIQUE index, but COALESCE
+        // normalizes the NULL key columns, so two whole-file witnesses
+        // (`symbol`/`span_start`/`span_end` all NULL) with identical
+        // non-NULL columns dedupe atomically at the DB level — one row, no
+        // application-level guard needed.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let insert = "INSERT OR IGNORE INTO witness_ledger
+            (project, file, stamp, tier, at_oid, source_kind, source_id)
+            VALUES ('p', 'f.rs', 'b3:abc', 'committed', 'deadbeef', 'backfill', 'deadbeef')";
+        conn.execute(insert, []).unwrap();
+        conn.execute(insert, []).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "identical whole-file (NULL-key) witnesses must dedupe to one row via the identity index"
+        );
     }
 }

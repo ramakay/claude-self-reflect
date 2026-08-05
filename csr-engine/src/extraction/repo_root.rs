@@ -69,11 +69,23 @@ fn repo_root_for_dir(dir: &Path) -> Option<String> {
 /// Spawn `git -C <dir> rev-parse --show-toplevel`. `None` on any failure —
 /// `git` missing, `dir` outside a work tree, `dir` doesn't exist, non-UTF8
 /// output, etc. Never panics.
+///
+/// Ambient `GIT_*` environment is stripped: when this process itself runs
+/// inside a git hook (git exports `GIT_DIR`/`GIT_INDEX_FILE`/... to hooks),
+/// an inherited `GIT_DIR` would override `-C` and report the HOOK's
+/// repository toplevel for any `dir` — this resolver answers for the
+/// explicit path it was given, never for ambient state.
 fn git_toplevel(dir: &Path) -> Option<String> {
     if !dir.is_dir() {
         return None;
     }
-    let output = Command::new("git")
+    let mut cmd = Command::new("git");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(&k);
+        }
+    }
+    let output = cmd
         .arg("-C")
         .arg(dir)
         .arg("rev-parse")
@@ -128,11 +140,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         fs::create_dir_all(repo.join("src")).unwrap();
-        let status = Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .arg(&repo)
-            .status();
+        // Strip ambient GIT_* env (present when the test suite runs under a
+        // git hook, e.g. pre-commit): an inherited GIT_DIR would make this
+        // `git init` target the REAL repository's gitdir, not the temp repo.
+        let mut init = Command::new("git");
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("GIT_") {
+                init.env_remove(&k);
+            }
+        }
+        let status = init.arg("init").arg("-q").arg(&repo).status();
         if status.map(|s| !s.success()).unwrap_or(true) {
             return; // git unavailable in this environment — fail-soft test skip
         }
