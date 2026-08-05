@@ -5,8 +5,7 @@ edition = "2021"
 description = "Claude Self-Reflect: Rust MCP server with embedded vector search"
 
 [dependencies]
-# ~1.6: rmcp 1.7 moved Content/RawResource and made structs non-exhaustive — migration deferred (see #203)
-rmcp = { version = "~1.6", features = ["server", "transport-io", "macros", "elicitation"] }
+rmcp = { version = "3.1", features = ["server", "transport-io", "macros", "elicitation"] }
 fastembed = "5.9"
 hnsw_rs = "0.3"
 rusqlite = { version = "0.40", features = ["bundled", "vtab"] }

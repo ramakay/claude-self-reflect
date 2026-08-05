@@ -8,10 +8,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
-use rmcp::{tool, tool_handler, tool_router, RoleServer, ServerHandler};
+use rmcp::task_manager::{TaskExit, TaskManager, TaskOptions};
+use rmcp::{tool, tool_router, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -200,7 +202,7 @@ pub struct CsrServer {
     projects_dir: PathBuf,
     index_dir: PathBuf,
     db_path: String,
-    task_manager: tasks::TaskManager,
+    task_manager: TaskManager,
 }
 
 #[tool_router]
@@ -226,7 +228,7 @@ impl CsrServer {
             projects_dir,
             index_dir,
             db_path,
-            task_manager: tasks::TaskManager::new(),
+            task_manager: TaskManager::new(),
         }
     }
 
@@ -304,7 +306,7 @@ impl CsrServer {
         if elicitation::needs_confirmation(&p.content)
             && !elicitation::request_confirmation(&p.content, &context).await
         {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "Reflection storage declined by user.",
             )]));
         }
@@ -580,7 +582,7 @@ impl CsrServer {
             &p.conversation_id,
             p.project.as_deref(),
         );
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(
@@ -695,12 +697,11 @@ impl CsrServer {
 /// Helper to convert Result<String> to tool result.
 fn tool_result(result: anyhow::Result<String>) -> Result<CallToolResult, rmcp::ErrorData> {
     match result {
-        Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
+        Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
         Err(e) => Err(rmcp::ErrorData::internal_error(format!("{e}"), None)),
     }
 }
 
-#[tool_handler]
 impl ServerHandler for CsrServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
@@ -728,80 +729,80 @@ impl ServerHandler for CsrServer {
         completions::handle_complete(&request, &self.storage)
     }
 
-    async fn enqueue_task(
-        &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CreateTaskResult, rmcp::ErrorData> {
-        let tool_name = request.name.to_string();
-
-        if !tasks::is_taskable(&tool_name) {
-            return Err(rmcp::ErrorData::invalid_request(
-                format!("Tool '{}' does not support async task execution", tool_name),
-                None,
-            ));
-        }
-
-        // Clone what we need for the spawned task
-        let server = self.clone();
-        let ctx = context;
-
-        let task = self
-            .task_manager
-            .enqueue(&tool_name, async move {
-                // Delegate to the normal call_tool handler
-                server.call_tool(request, ctx).await
-            })
-            .await;
-
-        Ok(CreateTaskResult::new(task))
-    }
-
-    async fn list_tasks(
+    async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListTasksResult, rmcp::ErrorData> {
-        // Clean up expired tasks on each list call
-        self.task_manager.cleanup_expired().await;
-        let tasks = self.task_manager.list_tasks().await;
-        Ok(ListTasksResult::new(tasks))
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        Ok(ListToolsResult::with_all_items(
+            Self::tool_router().list_all(),
+        ))
     }
 
-    async fn get_task_info(
+    async fn call_tool(
         &self,
-        request: GetTaskInfoParams,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        let client_supports_tasks = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
+
+        if tasks::is_taskable(request.name.as_ref()) && client_supports_tasks {
+            let server = self.clone();
+            let task_options = TaskOptions::default()
+                .with_ttl_ms(30_000)
+                .with_poll_interval_ms(500)
+                .with_status_message(format!("Running {}", request.name));
+            let task = self.task_manager.spawn(task_options, move |task_context| {
+                Box::pin(async move {
+                    let tool_call = ToolCallContext::new(&server, request, context);
+                    let tool_router = CsrServer::tool_router();
+                    tokio::select! {
+                        _ = task_context.cancelled() => Err(TaskExit::Cancelled),
+                        result = tool_router.call(tool_call) => match result {
+                            Ok(CallToolResponse::Complete(result)) => Ok(result),
+                            Ok(_) => Err(TaskExit::Error(rmcp::ErrorData::internal_error(
+                                "Tool returned an unsupported response while executing as a task",
+                                None,
+                            ))),
+                            Err(error) => Err(TaskExit::Error(error)),
+                        }
+                    }
+                })
+            });
+            return Ok(CallToolResponse::Task(CreateTaskResult::new(task)));
+        }
+
+        let tool_call = ToolCallContext::new(self, request, context);
+        Self::tool_router().call(tool_call).await
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, rmcp::ErrorData> {
-        let task = self
-            .task_manager
-            .get_task_info(&request.task_id)
-            .await
-            .ok_or_else(|| {
-                rmcp::ErrorData::invalid_request(
-                    format!("Task '{}' not found", request.task_id),
-                    None,
-                )
-            })?;
-        Ok(GetTaskResult { meta: None, task })
+        Ok(GetTaskResult::new(
+            self.task_manager.get_task(&request.task_id)?,
+        ))
     }
 
-    async fn get_task_result(
+    async fn update_task(
         &self,
-        request: GetTaskResultParams,
+        request: UpdateTaskParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetTaskPayloadResult, rmcp::ErrorData> {
-        let value = self
-            .task_manager
-            .get_task_result(&request.task_id)
-            .await
-            .ok_or_else(|| {
-                rmcp::ErrorData::invalid_request(
-                    format!("Task '{}' not found or not completed", request.task_id),
-                    None,
-                )
-            })?;
-        Ok(GetTaskPayloadResult::new(value))
+    ) -> Result<(), rmcp::ErrorData> {
+        self.task_manager
+            .update_task(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), rmcp::ErrorData> {
+        self.task_manager.cancel_task(&request.task_id)
     }
 
     async fn list_resources(
@@ -809,20 +810,18 @@ impl ServerHandler for CsrServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, rmcp::ErrorData> {
-        let health = RawResource::new("status://system-health", "System Health")
+        let health = Resource::new("status://system-health", "System Health")
             .with_description("Current system health: index stats, cache status, version")
             .with_mime_type("application/json");
 
-        Ok(ListResourcesResult::with_all_items(vec![
-            health.no_annotation()
-        ]))
+        Ok(ListResourcesResult::with_all_items(vec![health]))
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, rmcp::ErrorData> {
+    ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
         match request.uri.as_str() {
             "status://system-health" => {
                 let text = resources::system_health(
@@ -832,10 +831,10 @@ impl ServerHandler for CsrServer {
                     &self.index_dir.to_string_lossy(),
                 )
                 .await;
-                Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    text,
-                    &request.uri,
-                )]))
+                Ok(
+                    ReadResourceResult::new(vec![ResourceContents::text(text, &request.uri)])
+                        .into(),
+                )
             }
             _ => Err(rmcp::ErrorData::resource_not_found(
                 format!("Unknown resource: {}", request.uri),
