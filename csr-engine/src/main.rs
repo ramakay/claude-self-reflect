@@ -193,10 +193,28 @@ enum CodegraphAction {
     /// const span (and whole-file fallback) known to the code graph — the
     /// append-only evidence substrate for v10 "dreaming" (evidence-grounded
     /// forgetting). Idempotent: safe to re-run.
+    ///
+    /// With `--at <rev>`, stamps spans AS THEY EXISTED at that historical
+    /// commit instead of at each repo's live HEAD — the substrate for the
+    /// S3 time-travel precision gate. Extraction runs directly against the
+    /// commit's own tree (not the code graph's node list), so it can see
+    /// files the graph never observed.
     StampSpans {
         /// Count what would be stamped, but make no changes.
         #[arg(long)]
         dry_run: bool,
+
+        /// Stamp spans as they existed at this historical revision (commit
+        /// SHA, tag, branch, `HEAD~N`, ...) instead of each repo's live
+        /// HEAD. Resolved independently per repo; a repo where `rev` doesn't
+        /// resolve is skipped, never guessed. One rev per invocation.
+        #[arg(long)]
+        at: Option<String>,
+
+        /// Restrict to this one repo root instead of every repo root the
+        /// code graph already knows about.
+        #[arg(long)]
+        repo: Option<String>,
     },
 }
 
@@ -438,14 +456,22 @@ async fn main() -> Result<()> {
     }
 
     if let Some(Commands::Codegraph {
-        action: CodegraphAction::StampSpans { dry_run },
+        action: CodegraphAction::StampSpans { dry_run, at, repo },
     }) = args.command
     {
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-        let stats = csr_engine::import::backfill::backfill_stamp_spans(&eng, dry_run)?;
+        let stats = match at {
+            Some(rev) => csr_engine::import::backfill::backfill_stamp_spans_at(
+                &eng,
+                &rev,
+                repo.as_deref(),
+                dry_run,
+            )?,
+            None => csr_engine::import::backfill::backfill_stamp_spans(&eng, dry_run)?,
+        };
         print!("{}", stats.format_text(dry_run));
         return Ok(());
     }

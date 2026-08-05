@@ -1,5 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
+use crate::anchor::to_git_path;
 use crate::verdict::SupersededReceipt;
 use crate::{causal, Anchor, CausalOrder, Error, StampKind, Tier, Verdict, Witness};
 
@@ -261,7 +262,76 @@ impl Auditor {
         anchor: &Anchor,
         commit: gix::ObjectId,
     ) -> Result<Vec<u8>, Error> {
-        reject_escaping_anchor(&anchor.path)?;
+        let bytes = self.blob_bytes_at_path(&anchor.path, commit)?;
+        apply_span(bytes, anchor.span, &anchor.path)
+    }
+
+    /// Full, unspanned content of `path` (repo-relative) as it existed at
+    /// `commit` — the historical-mode counterpart to reading a live worktree
+    /// file with [`std::fs::read`]. Public so callers extracting
+    /// function/type/const spans from historical source text (rather than
+    /// auditing a single already-known span) don't have to duplicate
+    /// [`Self::stamp_at`]'s blob-lookup internals — see `csr-engine`'s
+    /// `codegraph stamp-spans --at <rev>`.
+    ///
+    /// Same failure modes as [`Self::stamp_at`]'s own lookup: [`Error::AnchorMissing`]
+    /// if `path` isn't present in `commit`'s tree, `Error::NotABlob` if it names a
+    /// tree/submodule/symlink instead of a regular file.
+    pub fn file_content_at(&self, path: &Path, commit: gix::ObjectId) -> Result<Vec<u8>, Error> {
+        self.blob_bytes_at_path(path, commit)
+    }
+
+    /// Every blob path present in `commit`'s tree, relative to the
+    /// repository root (forward-slash separated, matching [`to_git_path`]'s
+    /// convention) — directories, submodule commit
+    /// pointers, and symlinks are excluded; only plain and executable blobs
+    /// are returned. Used by historical `stamp-spans --at <rev>` to
+    /// discover which files existed at a past commit: that set can differ
+    /// from both the live working tree and the code graph's own node list
+    /// (a historical commit may contain files the graph never saw, or omit
+    /// files the graph still remembers).
+    pub fn files_at(&self, commit: gix::ObjectId) -> Result<Vec<PathBuf>, Error> {
+        let tree = self.tree_at(commit)?;
+        let entries = tree
+            .traverse()
+            .breadthfirst
+            .files()
+            .map_err(|source| Error::TreeWalk {
+                commit,
+                source: Box::new(source),
+            })?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| entry.mode.is_blob())
+            .map(|entry| PathBuf::from(entry.filepath.to_string()))
+            .collect())
+    }
+
+    /// Resolve `rev` (branch, tag, short/long SHA, `HEAD~2`, ... — anything
+    /// `git rev-parse` accepts) to the commit it names, following annotated
+    /// tags. Every failure mode — the spec doesn't parse, the object it
+    /// names can't be found, or it resolves to something that isn't (and
+    /// doesn't peel to) a commit, e.g. a bare tree or blob SHA — folds into
+    /// a single [`Error::RevParse`]: historical `stamp-spans --at <rev>`
+    /// treats all of them identically ("this repo doesn't have that
+    /// revision, skip it"), never guesses a substitute commit.
+    pub fn resolve_commit(&self, rev: &str) -> Result<gix::ObjectId, Error> {
+        let wrap = |source: Box<dyn std::error::Error + Send + Sync + 'static>| Error::RevParse {
+            rev: rev.to_string(),
+            source,
+        };
+        let id = self
+            .repo
+            .rev_parse_single(rev)
+            .map_err(|source| wrap(Box::new(source)))?;
+        let object = id.object().map_err(|source| wrap(Box::new(source)))?;
+        let commit = object
+            .peel_to_commit()
+            .map_err(|source| wrap(Box::new(source)))?;
+        Ok(commit.id)
+    }
+
+    fn tree_at(&self, commit: gix::ObjectId) -> Result<gix::Tree<'_>, Error> {
         let found = self
             .repo
             .find_commit(commit)
@@ -269,40 +339,45 @@ impl Auditor {
                 commit,
                 source: Box::new(source),
             })?;
-        let tree = found.tree().map_err(|source| Error::Tree {
+        found.tree().map_err(|source| Error::Tree {
             commit,
             source: Box::new(source),
-        })?;
+        })
+    }
+
+    fn blob_bytes_at_path(&self, path: &Path, commit: gix::ObjectId) -> Result<Vec<u8>, Error> {
+        reject_escaping_anchor(path)?;
+        let tree = self.tree_at(commit)?;
         let entry = tree
-            .lookup_entry_by_path(git_path_as_std_path(&anchor.git_path()))
+            .lookup_entry_by_path(git_path_as_std_path(&to_git_path(path)))
             .map_err(|source| Error::TreeLookup {
                 commit,
-                path: anchor.path.clone(),
+                path: path.to_path_buf(),
                 source: Box::new(source),
             })?
             .ok_or_else(|| Error::AnchorMissing {
-                path: anchor.path.clone(),
+                path: path.to_path_buf(),
                 commit: Some(commit),
             })?;
         let object = entry.object().map_err(|source| Error::TreeLookup {
             commit,
-            path: anchor.path.clone(),
+            path: path.to_path_buf(),
             source: Box::new(source),
         })?;
         let mut blob = object.try_into_blob().map_err(|source| Error::NotABlob {
             commit,
-            path: anchor.path.clone(),
+            path: path.to_path_buf(),
             source: Box::new(source),
         })?;
         // `Blob` implements `Drop`, so `blob.data` cannot be moved out
         // directly (E0509) — `take_data()` exists precisely for this.
-        apply_span(blob.take_data(), anchor.span, &anchor.path)
+        Ok(blob.take_data())
     }
 }
 
-/// `lookup_entry_by_path` wants a `Path`; anchors already normalize to
-/// forward slashes internally, so this is a cheap re-wrap, not a second
-/// normalization pass.
+/// `lookup_entry_by_path` wants a `Path`; callers already normalize to
+/// forward slashes internally via [`to_git_path`], so this is a cheap
+/// re-wrap, not a second normalization pass.
 fn git_path_as_std_path(git_path: &str) -> &Path {
     Path::new(git_path)
 }

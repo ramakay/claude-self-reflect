@@ -40,7 +40,7 @@ use anyhow::Result;
 
 use crate::engine::Engine;
 use crate::extraction::ast_analysis::lang_from_path_str;
-use crate::extraction::codegraph::extract_graph_fragment;
+use crate::extraction::codegraph::{extract_graph_fragment, extract_graph_fragment_for_file};
 use crate::import::{
     discover_projects, list_jsonl_files, normalize_project_name, parse_jsonl_file,
     parse_jsonl_messages,
@@ -865,20 +865,34 @@ pub struct StampSpansStats {
     /// outside `u32`) — corrupt span data, skipped rather than panicking
     /// (debug) or truncating (release).
     pub skipped_span_out_of_range: usize,
+    /// Historical mode (`--at <rev>`) only: `rev` did not resolve to a
+    /// commit in a given repo (wrong repo, typo'd SHA, a rev that only
+    /// exists in a sibling repository) — that repo is skipped entirely.
+    /// Always 0 in HEAD-tracking mode.
+    pub skipped_rev_unresolved: usize,
+    /// Historical mode only: a blob at the historical commit was not valid
+    /// UTF-8, so it cannot be handed to the (text-based) span extractor.
+    /// Always 0 in HEAD-tracking mode (which never decodes file content —
+    /// `codewitness` hashes raw bytes directly).
+    pub skipped_non_utf8: usize,
+    /// Historical mode only: `(repo_root, resolved commit oid)` for every
+    /// repo actually visited — printed as the `at_commit:` line(s) in
+    /// [`Self::format_text`]. Empty in HEAD-tracking mode.
+    pub at_commits: Vec<(String, String)>,
 }
 
 impl StampSpansStats {
     /// Human-readable one-block summary.
     pub fn format_text(&self, dry_run: bool) -> String {
         let mode = if dry_run { " (dry-run, no writes)" } else { "" };
-        format!(
+        let mut out = format!(
             "CSR stamp-spans backfill{mode}\n\
              ──────────────────────────────\n\
              files checked        : {}\n\
              files processed      : {}\n\
              spans stamped        : {}\n\
              whole-file witnesses : {}\n\
-             skipped: no_repo_root={}  file_missing={}  non_git={}  outside_repo_root={}  stamp_error={}  span_out_of_range={}\n",
+             skipped: no_repo_root={}  file_missing={}  non_git={}  outside_repo_root={}  stamp_error={}  span_out_of_range={}  rev_unresolved={}  non_utf8={}\n",
             self.files_checked,
             self.files_processed,
             self.spans_stamped,
@@ -889,7 +903,23 @@ impl StampSpansStats {
             self.skipped_outside_repo_root,
             self.skipped_stamp_error,
             self.skipped_span_out_of_range,
-        )
+            self.skipped_rev_unresolved,
+            self.skipped_non_utf8,
+        );
+        // Single repo (the common case, especially with `--repo`): the
+        // exact `at_commit: <oid>` form. Multiple repos (the `--at`
+        // default of "every known root"): one prefixed line per repo, still
+        // grep-able on the `at_commit:` prefix.
+        match self.at_commits.as_slice() {
+            [] => {}
+            [(_, oid)] => out.push_str(&format!("at_commit: {oid}\n")),
+            many => {
+                for (repo_root, oid) in many {
+                    out.push_str(&format!("at_commit[{repo_root}]: {oid}\n"));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1094,6 +1124,275 @@ fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats>
             Err(e) => {
                 stats.skipped_stamp_error += 1;
                 eprintln!("CSR stamp-spans: whole-file stamp error for {file} ({e})");
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Historical counterpart to [`backfill_stamp_spans`]: mint `witness_ledger`
+/// rows for function/type/const spans (plus whole-file fallback) AS THEY
+/// EXISTED at `rev`, not at each repo's live HEAD — the substrate for the
+/// S3 time-travel precision gate (v10 "dreaming").
+///
+/// `repo_filter`: when `Some`, restrict to that one repo root. `None` visits
+/// every repo root already known to the code graph (mirrors
+/// [`backfill_stamp_spans`]'s default footprint) — `rev` is resolved
+/// independently in each one, and a repo where it doesn't resolve is
+/// skipped (`skipped_rev_unresolved`), never fatal.
+pub fn backfill_stamp_spans_at(
+    engine: &Engine,
+    rev: &str,
+    repo_filter: Option<&str>,
+    dry_run: bool,
+) -> Result<StampSpansStats> {
+    stamp_spans_historical_into(engine.storage(), rev, repo_filter, dry_run)
+}
+
+/// Storage-level core of [`backfill_stamp_spans_at`] (no embeddings needed,
+/// same split as every other backfill in this module).
+///
+/// Unlike [`stamp_spans_into`] (which walks `code_nodes` — files the code
+/// graph has already seen via JSONL replay or the live hook), this walks
+/// the COMMIT'S OWN tree: a historical commit can contain files the graph
+/// never saw, or omit files the graph still remembers, so the graph's node
+/// list is the wrong source of "which files" here (see this function's
+/// module-level design doc). `code_nodes` is consulted only to answer two
+/// narrower questions: which repo roots to visit by default, and which
+/// `project` tag to stamp each repo's rows with (the closest historical
+/// mode can get to `stamp_spans_into`'s per-file JSONL-derived project,
+/// since there is no JSONL context for a bare historical commit).
+///
+/// Extraction reuses the exact same text-based extractor
+/// (`extraction::codegraph::extract_graph_fragment_for_file`) every other
+/// write path uses, applied to blob content read at `rev` instead of a
+/// JSONL fragment or an on-disk file — so `symbol` (`NodeRow::name`) carries
+/// the identical convention across every mode, and rows minted from
+/// different commits stay joinable by `(file, symbol)`.
+fn stamp_spans_historical_into(
+    storage: &Storage,
+    rev: &str,
+    repo_filter: Option<&str>,
+    dry_run: bool,
+) -> Result<StampSpansStats> {
+    let mut stats = StampSpansStats::default();
+
+    // Which repo roots to visit, and a representative `project` tag for
+    // each — the first non-empty `code_nodes.project` seen for that root
+    // (repo-level affinity; historical extraction has no per-file JSONL
+    // context to draw a per-file project from the way `stamp_spans_into`
+    // does).
+    let nodes = storage.all_code_nodes()?;
+    let mut roots: BTreeMap<String, String> = BTreeMap::new();
+    for node in &nodes {
+        let Some(root) = node.repo_root.clone() else {
+            continue;
+        };
+        if let Some(filter) = repo_filter {
+            if root != filter {
+                continue;
+            }
+        }
+        let project = roots.entry(root).or_default();
+        if project.is_empty() && !node.project.is_empty() {
+            *project = node.project.clone();
+        }
+    }
+    // An explicit `--repo` the graph has never touched is still worth
+    // trying directly: extraction reads straight from the commit's blob
+    // content, not from `code_nodes`, so the graph's root set is a
+    // convenience default here, not a correctness gate. No project tag to
+    // infer for it.
+    if let Some(filter) = repo_filter {
+        roots.entry(filter.to_string()).or_default();
+    }
+
+    for (repo_root, project) in roots {
+        let auditor = match codewitness::Auditor::discover(&repo_root) {
+            Ok(a) => a,
+            Err(_) => {
+                stats.skipped_non_git += 1;
+                continue;
+            }
+        };
+        let commit = match auditor.resolve_commit(rev) {
+            Ok(c) => c,
+            Err(e) => {
+                stats.skipped_rev_unresolved += 1;
+                eprintln!(
+                    "CSR stamp-spans --at {rev}: does not resolve in {repo_root} (skip) ({e})"
+                );
+                continue;
+            }
+        };
+        let at_oid_str = commit.to_string();
+        stats
+            .at_commits
+            .push((repo_root.clone(), at_oid_str.clone()));
+
+        let relpaths = match auditor.files_at(commit) {
+            Ok(v) => v,
+            Err(e) => {
+                stats.skipped_non_git += 1;
+                eprintln!(
+                    "CSR stamp-spans --at {rev}: failed to walk tree of {at_oid_str} in {repo_root} (skip) ({e})"
+                );
+                continue;
+            }
+        };
+
+        for relpath in relpaths {
+            let relpath_str = relpath.to_string_lossy().to_string();
+            if lang_from_path_str(&relpath_str).is_none() {
+                continue;
+            }
+            stats.files_checked += 1;
+
+            let bytes = match auditor.file_content_at(&relpath, commit) {
+                Ok(b) => b,
+                Err(e) => {
+                    stats.skipped_stamp_error += 1;
+                    eprintln!(
+                        "CSR stamp-spans --at {rev}: blob read error for {repo_root}/{relpath_str} ({e})"
+                    );
+                    continue;
+                }
+            };
+            let source = match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    stats.skipped_non_utf8 += 1;
+                    continue;
+                }
+            };
+            stats.files_processed += 1;
+
+            // Absolute path, matching the `repo_root`-joined convention
+            // every other `file` column in this module uses — keeps a
+            // historical row joinable with a future HEAD-mode row for the
+            // same file/symbol via `witness_ledger`'s `(project, file,
+            // symbol)` key.
+            let file_abs = Path::new(&repo_root)
+                .join(&relpath)
+                .to_string_lossy()
+                .to_string();
+
+            // `repo`/`project`/`conv_id`/`session_id` only affect
+            // `NodeRow::id` (never consulted here) and `.repo`/`.project`
+            // (ditto) — never `.name`/`.kind`/`.span_start`/`.span_end`,
+            // which is all this loop reads. Passing the resolved commit as
+            // the conv/session placeholders keeps them non-empty without
+            // implying any real conversation provenance.
+            let fragment = extract_graph_fragment_for_file(
+                &source,
+                &file_abs,
+                &repo_root,
+                &project,
+                &at_oid_str,
+                &at_oid_str,
+            );
+
+            let mut any_span = false;
+            for node in &fragment.nodes {
+                // Synthetic module sentinel — not a real span-level symbol,
+                // same exclusion as `stamp_spans_into`.
+                if node.kind == "module" {
+                    continue;
+                }
+                if node.span_start < 0 || node.span_end < node.span_start {
+                    continue;
+                }
+
+                let checked_line = |span: i64| u32::try_from(span.checked_add(1)?).ok();
+                let (Some(start_line), Some(end_line)) =
+                    (checked_line(node.span_start), checked_line(node.span_end))
+                else {
+                    stats.skipped_span_out_of_range += 1;
+                    eprintln!(
+                        "CSR stamp-spans --at {rev}: span {}..{} for {file_abs}::{} does not fit a 1-based u32 line (skip)",
+                        node.span_start, node.span_end, node.name
+                    );
+                    continue;
+                };
+                any_span = true;
+
+                let anchor = codewitness::Anchor::new(relpath.clone())
+                    .with_symbol(node.name.clone())
+                    .with_span(start_line, end_line);
+
+                match auditor.stamp_at(&anchor, commit) {
+                    Ok(witness) => {
+                        stats.spans_stamped += 1;
+                        if dry_run {
+                            continue;
+                        }
+                        let row = WitnessLedgerRow {
+                            project: project.clone(),
+                            file: file_abs.clone(),
+                            symbol: Some(node.name.clone()),
+                            span_start: Some(node.span_start),
+                            span_end: Some(node.span_end),
+                            stamp: witness.stamp().as_str().to_string(),
+                            tier: "committed".to_string(),
+                            at_oid: Some(at_oid_str.clone()),
+                            source_kind: "backfill".to_string(),
+                            source_id: Some(at_oid_str.clone()),
+                        };
+                        if let Err(e) = storage.insert_witness(&row) {
+                            eprintln!(
+                                "CSR stamp-spans --at {rev}: ledger insert error for {file_abs}::{} ({e})",
+                                node.name
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        stats.skipped_stamp_error += 1;
+                        eprintln!(
+                            "CSR stamp-spans --at {rev}: stamp error for {file_abs}::{} ({e})",
+                            node.name
+                        );
+                    }
+                }
+            }
+
+            if any_span {
+                continue;
+            }
+
+            // No function/type/const span in this file at this commit —
+            // whole-file fallback witness (symbol = NULL).
+            let anchor = codewitness::Anchor::new(relpath.clone());
+            match auditor.stamp_at(&anchor, commit) {
+                Ok(witness) => {
+                    stats.whole_files_stamped += 1;
+                    if dry_run {
+                        continue;
+                    }
+                    let row = WitnessLedgerRow {
+                        project: project.clone(),
+                        file: file_abs.clone(),
+                        symbol: None,
+                        span_start: None,
+                        span_end: None,
+                        stamp: witness.stamp().as_str().to_string(),
+                        tier: "committed".to_string(),
+                        at_oid: Some(at_oid_str.clone()),
+                        source_kind: "backfill".to_string(),
+                        source_id: Some(at_oid_str.clone()),
+                    };
+                    if let Err(e) = storage.insert_witness(&row) {
+                        eprintln!(
+                            "CSR stamp-spans --at {rev}: ledger insert error for {file_abs} (whole-file) ({e})"
+                        );
+                    }
+                }
+                Err(e) => {
+                    stats.skipped_stamp_error += 1;
+                    eprintln!(
+                        "CSR stamp-spans --at {rev}: whole-file stamp error for {file_abs} ({e})"
+                    );
+                }
             }
         }
     }
@@ -1784,6 +2083,209 @@ mod tests {
         assert!(
             storage
                 .witnesses_for_file("proj", &file_path)
+                .unwrap()
+                .is_empty(),
+            "dry-run must not write witness_ledger"
+        );
+    }
+
+    // ─── historical mode: `stamp-spans --at <rev>` ───
+
+    #[test]
+    fn stamp_spans_at_differs_for_changed_symbol_and_matches_for_unchanged_across_two_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("lib.rs");
+        std::fs::write(&file, "fn foo() {\n    1\n}\n\nfn bar() {\n    2\n}\n").unwrap();
+        git_in(repo).args(["add", "lib.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "c1"])
+            .status()
+            .unwrap();
+        let commit1 = git_head(repo);
+
+        // Change ONLY foo's body between commits; bar is byte-identical.
+        std::fs::write(&file, "fn foo() {\n    999\n}\n\nfn bar() {\n    2\n}\n").unwrap();
+        git_in(repo).args(["add", "lib.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "c2"])
+            .status()
+            .unwrap();
+        let commit2 = git_head(repo);
+
+        let repo_root = repo.to_string_lossy().to_string();
+        let file_abs = file.to_string_lossy().to_string();
+        let storage = Storage::open_memory().unwrap();
+
+        // Repo the graph has never seen (no `code_nodes` seeded): `--repo`
+        // targets it directly, project tag falls back to "".
+        let stats1 =
+            stamp_spans_historical_into(&storage, &commit1, Some(&repo_root), false).unwrap();
+        assert_eq!(stats1.spans_stamped, 2, "foo + bar at commit1");
+        assert_eq!(stats1.skipped_rev_unresolved, 0);
+        assert_eq!(
+            stats1.at_commits,
+            vec![(repo_root.clone(), commit1.clone())]
+        );
+        assert!(stats1
+            .format_text(false)
+            .contains(&format!("at_commit: {commit1}")));
+
+        let stats2 =
+            stamp_spans_historical_into(&storage, &commit2, Some(&repo_root), false).unwrap();
+        assert_eq!(stats2.spans_stamped, 2, "foo + bar at commit2");
+
+        let rows = storage.witnesses_for_file("", &file_abs).unwrap();
+        assert_eq!(rows.len(), 4, "foo+bar at each of 2 commits");
+
+        let foo_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.symbol.as_deref() == Some("foo"))
+            .collect();
+        let bar_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.symbol.as_deref() == Some("bar"))
+            .collect();
+        assert_eq!(foo_rows.len(), 2, "foo stamped at both commits");
+        assert_eq!(bar_rows.len(), 2, "bar stamped at both commits");
+        for r in rows.iter() {
+            assert_eq!(r.tier, "committed");
+            assert_eq!(r.source_kind, "backfill");
+        }
+
+        assert_ne!(
+            foo_rows[0].stamp, foo_rows[1].stamp,
+            "foo's body changed between commits — stamps must differ"
+        );
+        assert_eq!(
+            bar_rows[0].stamp, bar_rows[1].stamp,
+            "bar is byte-identical across commits — stamps must match"
+        );
+        let foo_oids: BTreeSet<_> = foo_rows.iter().map(|r| r.at_oid.clone()).collect();
+        assert_eq!(
+            foo_oids,
+            BTreeSet::from([Some(commit1.clone()), Some(commit2.clone())]),
+            "each commit's foo row is pinned to its own at_oid"
+        );
+
+        // Idempotency: rerunning `--at commit1` must not add new rows.
+        let stats1_again =
+            stamp_spans_historical_into(&storage, &commit1, Some(&repo_root), false).unwrap();
+        assert_eq!(stats1_again.spans_stamped, 2, "re-attempted, not net-new");
+        let rows_after = storage.witnesses_for_file("", &file_abs).unwrap();
+        assert_eq!(
+            rows_after.len(),
+            rows.len(),
+            "rerun of commit1 must not duplicate rows"
+        );
+    }
+
+    #[test]
+    fn stamp_spans_at_default_visits_known_repo_roots_and_tags_project_from_code_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("lib.rs");
+        std::fs::write(&file, "fn only() {}\n").unwrap();
+        git_in(repo).args(["add", "lib.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "c1"])
+            .status()
+            .unwrap();
+        let commit1 = git_head(repo);
+
+        let repo_root = repo.to_string_lossy().to_string();
+        let file_path = file.to_string_lossy().to_string();
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                let mut n = attr_node("n-only", &file_path, "only");
+                n.repo_root = Some(repo_root.clone());
+                n.span_start = 0;
+                n.span_end = 0;
+                codegraph_upsert_node(conn, &n).unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        // No `--repo`: the historical backfill must discover this root the
+        // same way `stamp_spans_into` discovers its default footprint — via
+        // `code_nodes.repo_root` — and tag rows with that root's project.
+        let stats = stamp_spans_historical_into(&storage, &commit1, None, false).unwrap();
+        assert_eq!(stats.spans_stamped, 1);
+        assert_eq!(stats.at_commits, vec![(repo_root.clone(), commit1.clone())]);
+
+        let rows = storage.witnesses_for_file("proj", &file_path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol.as_deref(), Some("only"));
+        assert_eq!(rows[0].project, "proj");
+        assert_eq!(rows[0].at_oid.as_deref(), Some(commit1.as_str()));
+    }
+
+    #[test]
+    fn stamp_spans_at_skips_repo_where_rev_does_not_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("lib.rs");
+        std::fs::write(&file, "fn only() {}\n").unwrap();
+        git_in(repo).args(["add", "lib.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "c1"])
+            .status()
+            .unwrap();
+
+        let repo_root = repo.to_string_lossy().to_string();
+        let storage = Storage::open_memory().unwrap();
+
+        let bogus_rev = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let stats =
+            stamp_spans_historical_into(&storage, bogus_rev, Some(&repo_root), false).unwrap();
+        assert_eq!(
+            stats.skipped_rev_unresolved, 1,
+            "a SHA absent from the object database must be a soft skip, never a hard failure"
+        );
+        assert_eq!(stats.spans_stamped, 0);
+        assert!(stats.at_commits.is_empty());
+    }
+
+    #[test]
+    fn stamp_spans_at_dry_run_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("lib.rs");
+        std::fs::write(&file, "fn foo() {\n    1\n}\n").unwrap();
+        git_in(repo).args(["add", "lib.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "c1"])
+            .status()
+            .unwrap();
+        let commit1 = git_head(repo);
+
+        let repo_root = repo.to_string_lossy().to_string();
+        let file_abs = file.to_string_lossy().to_string();
+        let storage = Storage::open_memory().unwrap();
+
+        let stats =
+            stamp_spans_historical_into(&storage, &commit1, Some(&repo_root), true).unwrap();
+        assert_eq!(stats.spans_stamped, 1, "counting still happens in dry-run");
+        assert!(
+            storage
+                .witnesses_for_file("", &file_abs)
                 .unwrap()
                 .is_empty(),
             "dry-run must not write witness_ledger"

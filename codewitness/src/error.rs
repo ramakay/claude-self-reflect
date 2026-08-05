@@ -108,6 +108,29 @@ pub enum Error {
         #[source]
         source: Box<gix::repository::merge_base::Error>,
     },
+
+    /// Covers every failure mode of resolving a revision spec to a commit:
+    /// the spec itself doesn't parse (`rev_parse_single`), the object it
+    /// names can't be found or decoded (`Id::object`), or it resolves to
+    /// something that isn't (and doesn't peel to) a commit — a bare tree or
+    /// blob SHA (`Object::peel_to_commit`). All three are boxed behind one
+    /// `dyn Error` rather than three separate variants: every caller (the
+    /// historical `stamp-spans --at <rev>` resolver) treats them identically
+    /// — "this repo doesn't have that revision, skip it" — so splitting them
+    /// would only add match arms nobody needs to distinguish.
+    #[error("revision {rev:?} does not resolve to a commit in this repository: {source}")]
+    RevParse {
+        rev: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    #[error("failed to walk the tree of commit {commit}: {source}")]
+    TreeWalk {
+        commit: gix::ObjectId,
+        #[source]
+        source: Box<gix::traverse::tree::breadthfirst::Error>,
+    },
 }
 
 impl From<gix::reference::head_id::Error> for Error {

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A location inside a repository that a claim is anchored to.
 ///
@@ -44,13 +44,17 @@ impl Anchor {
         self.span = Some((start_line, end_line));
         self
     }
+}
 
-    /// The path rendered with forward slashes, as git stores it internally.
-    pub(crate) fn git_path(&self) -> String {
-        self.path
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/")
-    }
+/// Render any repo-relative `path` (an [`Anchor::path`] or a bare path from
+/// a tree walk) with forward slashes, as git stores paths internally —
+/// regardless of the OS's own separator. Free function, shared by every
+/// committed-tree blob lookup in [`crate::Auditor`] (symbol-anchored or
+/// whole-file), so there is exactly one normalization rule instead of one
+/// per call site.
+pub(crate) fn to_git_path(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
