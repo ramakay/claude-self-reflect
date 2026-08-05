@@ -1,7 +1,9 @@
+pub mod chunk_binding;
 pub mod codegraph;
 pub mod migrations;
 pub mod queries;
 pub mod witness_ledger;
+pub mod witness_verdicts;
 
 pub use queries::{
     NarrativeUsageRow, NarrativeUsageSummary, RatificationScoreRow, ResolutionEntry,
@@ -1240,6 +1242,73 @@ impl Storage {
     pub fn count_witnesses_for_file(&self, project: &str, file: &str) -> Result<i64> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         witness_ledger::count_witnesses_for_file(&conn, project, file)
+    }
+
+    /// Every `tier = 'committed'` witness row, grouped by `(project, file,
+    /// symbol)`. Feeds `dream`'s successor join.
+    pub fn all_committed_witnesses(&self) -> Result<Vec<witness_ledger::WitnessLedgerRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_ledger::all_committed_witnesses(&conn)
+    }
+
+    /// A single witness row by its primary key.
+    pub fn witness_by_id(&self, id: i64) -> Result<Option<witness_ledger::WitnessLedgerRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_ledger::witness_by_id(&conn, id)
+    }
+
+    // ─── Witness verdicts (v10 "dreaming" — see `crate::dream`) ───
+    //
+    // APPEND-ONLY: insert + query only, no update/delete — see
+    // `witness_verdicts`'s module doc for the full invariant.
+
+    /// The latest recorded verdict event for a specific `witness_ledger.id`.
+    pub fn latest_witness_verdict(
+        &self,
+        witness_id: i64,
+    ) -> Result<Option<witness_verdicts::WitnessVerdictRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::latest_event(&conn, witness_id)
+    }
+
+    /// Insert a verdict event unless it is identical to the latest recorded
+    /// event for that witness (see `witness_verdicts::is_new_event`).
+    /// Returns whether a new row was actually written.
+    pub fn insert_witness_verdict(
+        &self,
+        row: &witness_verdicts::WitnessVerdictRow,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::insert_verdict_if_changed(&conn, row)
+    }
+
+    /// Order-independent symbol-level current state: the resolved
+    /// `Demote`/`Annotate` channel plus representative negative event iff
+    /// the `(project, file, symbol)` anchor carries an uncancelled negative
+    /// verdict — see `witness_verdicts`'s "Symbol-level current state"
+    /// module doc for the two-channel rule chunk binding relies on.
+    pub fn symbol_verdict_state(
+        &self,
+        project: &str,
+        file: &str,
+        symbol: Option<&str>,
+    ) -> Result<Option<witness_verdicts::SymbolVerdictState>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::symbol_verdict_state(&conn, project, file, symbol)
+    }
+
+    /// Given chunk/conversation identifiers appearing in search results,
+    /// resolve their bound witnesses via the code graph and return only
+    /// those with a CURRENT negative verdict. See
+    /// `storage::chunk_binding::witness_verdict_for_chunks` for the full
+    /// binding algorithm (including the unqualified-symbol suffix-match
+    /// fallback).
+    pub fn witness_verdict_for_chunks(
+        &self,
+        conversation_ids: &[String],
+    ) -> Result<std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        chunk_binding::witness_verdict_for_chunks(&conn, conversation_ids)
     }
 }
 

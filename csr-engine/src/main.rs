@@ -155,6 +155,25 @@ enum Commands {
         #[arg(long)]
         tui: bool,
     },
+    /// Run one v10 "dreaming" cycle: HEAD stamp-spans, then the
+    /// deterministic successor join over the witness ledger, emitting
+    /// `witness_verdicts` events (anchor_obsolete / superseded_by /
+    /// anchor_reinstated). Idempotent: re-running at an unchanged HEAD with
+    /// unchanged conclusions writes nothing new.
+    Dream {
+        /// Compute and print the summary without writing verdict events.
+        /// The prerequisite HEAD stamp-spans pass still runs FOR REAL
+        /// (append-only witness_ledger evidence, harmless and idempotent) —
+        /// only witness_verdicts insertion is suppressed, so a dry run and
+        /// a subsequent real run compute identical verdicts.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Restrict the join to anchors whose file resolves to this one
+        /// repo root instead of every repo root the code graph knows about.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Generate a Haiku-curated session story (fire-and-forget from SessionEnd)
     GenerateStory {
         /// Path to the session transcript JSONL
@@ -472,6 +491,16 @@ async fn main() -> Result<()> {
             )?,
             None => csr_engine::import::backfill::backfill_stamp_spans(&eng, dry_run)?,
         };
+        print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
+    if let Some(Commands::Dream { dry_run, ref repo }) = args.command {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats = csr_engine::dream::run_dream(&eng, repo.as_deref(), dry_run)?;
         print!("{}", stats.format_text(dry_run));
         return Ok(());
     }

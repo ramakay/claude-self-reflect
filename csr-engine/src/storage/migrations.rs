@@ -727,6 +727,62 @@ pub fn run(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_witness_ledger_lookup ON witness_ledger(project, file, symbol);",
     )?;
 
+    // witness_verdicts (v10 "dreaming" — see `dream` module +
+    // `storage::witness_verdicts`'s module doc): append-only EVENTS describing
+    // how a `witness_ledger` row's claim relates to git history, minted by the
+    // deterministic successor join (`dream::run_dream`), never by hand. Same
+    // append-only discipline as `witness_ledger` itself — INSERT + QUERY only,
+    // no UPDATE/DELETE. Events are per-witness history: the LATEST event
+    // (highest `id`) for a given `witness_id` is that witness's current state;
+    // a reinstatement (the A -> B -> A revert case) is a NEW `anchor_reinstated`
+    // event layered on top, never an update of the prior negative verdict.
+    //
+    // `verdict` CHECK constraint keeps the table from ever silently accepting a
+    // fourth pseudo-verdict — mirrors `code_node_attribution.channel`'s CHECK
+    // (both close the same class of "accidental new state, never validated"
+    // bug at the DB layer, not just by convention). `successor_witness_id` is
+    // set only for `superseded_by` (the OLDER witness's replacement); NULL for
+    // `anchor_obsolete`/`anchor_reinstated`. `receipt_oid` is the commit proving
+    // the verdict (the successor's `at_oid` for `superseded_by`, else the HEAD
+    // oid observed when the dream cycle ran). `observed_head_oid` is NOT NULL —
+    // every event is anchored to the HEAD commit the dream cycle that minted it
+    // saw (per-repo HEAD when a run visits multiple repos), never wall-clock
+    // time.
+    //
+    // Idempotency is APP-SIDE ONLY (`witness_verdicts::insert_verdict_if_changed`):
+    // before inserting, the writer reads the LATEST event for that witness and
+    // skips iff the candidate is identical in (verdict, successor_witness_id,
+    // receipt_oid, observed_head_oid). There is deliberately NO UNIQUE identity
+    // index on this table: event history legitimately re-visits earlier states
+    // (B -> A -> B: superseded, reinstated, superseded again with the exact
+    // same fields as the first event) and a UNIQUE index would silently swallow
+    // the third event via `INSERT OR IGNORE`, freezing the witness's state at
+    // "reinstated" forever. Only the LATEST event per witness matters, so
+    // "skip iff identical to latest" is the whole idempotency contract.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS witness_verdicts (
+            id INTEGER PRIMARY KEY,
+            witness_id INTEGER NOT NULL,
+            verdict TEXT NOT NULL CHECK (verdict IN ('anchor_obsolete','anchor_reinstated','superseded_by')),
+            successor_witness_id INTEGER,
+            receipt_oid TEXT,
+            observed_head_oid TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_witness_verdicts_witness ON witness_verdicts(witness_id);
+        DROP INDEX IF EXISTS idx_witness_verdicts_identity;",
+    )?;
+
+    // code_nodes conversation-attribution indexes (v10 "dreaming" chunk
+    // binding — `storage::chunk_binding::witness_verdict_for_chunks`):
+    // `first_conv_id`/`last_conv_id` had no index before this, so every
+    // search-time chunk-binding lookup would otherwise full-scan `code_nodes`.
+    // Purely additive, cheap to (re)create on existing DBs.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_code_nodes_first_conv ON code_nodes(first_conv_id);
+         CREATE INDEX IF NOT EXISTS idx_code_nodes_last_conv ON code_nodes(last_conv_id);",
+    )?;
+
     Ok(())
 }
 
@@ -1053,6 +1109,104 @@ mod tests {
         assert_eq!(
             count, 1,
             "identical whole-file (NULL-key) witnesses must dedupe to one row via the identity index"
+        );
+    }
+
+    #[test]
+    fn witness_verdicts_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        // Insert BEFORE the rerun — idempotency means existing verdict events
+        // survive a second migration pass (same PR #279-class table-wipe
+        // regression guard as `witness_ledger_migration_idempotent`).
+        conn.execute(
+            "INSERT INTO witness_verdicts (witness_id, verdict, observed_head_oid) \
+             VALUES (1, 'anchor_obsolete', 'deadbeef')",
+            [],
+        )
+        .unwrap();
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare(
+                "SELECT id, witness_id, verdict, successor_witness_id, receipt_oid, \
+                 observed_head_oid, created_at FROM witness_verdicts LIMIT 0"
+            )
+            .is_ok(),
+            "witness_verdicts table must exist after migration"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "verdict events must survive a migration rerun");
+    }
+
+    #[test]
+    fn witness_verdicts_verdict_check_constraint_rejects_invalid_verdict() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let ok = conn.execute(
+            "INSERT INTO witness_verdicts (witness_id, verdict, observed_head_oid) \
+             VALUES (1, 'superseded_by', 'deadbeef')",
+            [],
+        );
+        assert!(ok.is_ok(), "valid verdict must be accepted: {ok:?}");
+        let bad = conn.execute(
+            "INSERT INTO witness_verdicts (witness_id, verdict, observed_head_oid) \
+             VALUES (1, 'guess', 'deadbeef')",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "verdict CHECK constraint must reject a non-enumerated value"
+        );
+    }
+
+    #[test]
+    fn witness_verdicts_has_no_unique_identity_index() {
+        // Idempotency for verdict events is APP-SIDE ONLY (compare against the
+        // LATEST event per witness — see `witness_verdicts::is_new_event`). A
+        // UNIQUE identity index would silently swallow legitimate state
+        // re-visits (B -> A -> B) via `INSERT OR IGNORE`, so the migration
+        // must not create one — and must drop it from pre-release dev DBs.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_witness_verdicts_identity'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "no UNIQUE identity index on witness_verdicts");
+        // The same row twice must therefore insert twice at the raw SQL layer
+        // (the app-side latest-event check is the only dedupe).
+        let insert = "INSERT INTO witness_verdicts \
+            (witness_id, verdict, successor_witness_id, receipt_oid, observed_head_oid) \
+            VALUES (1, 'superseded_by', 2, 'cafebabe', 'deadbeef')";
+        conn.execute(insert, []).unwrap();
+        conn.execute(insert, []).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "raw inserts are never DB-deduped");
+    }
+
+    #[test]
+    fn code_nodes_conv_indexes_exist() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name IN ('idx_code_nodes_first_conv','idx_code_nodes_last_conv')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            idx_count, 2,
+            "both code_nodes conversation-attribution indexes must exist"
         );
     }
 }

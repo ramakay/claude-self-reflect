@@ -1036,7 +1036,13 @@ fn qualify_one_symbol(containers: &[ContainerSpan], start: i64, end: i64, name: 
 /// no longer exists, or the repo has no commits yet (unborn HEAD) — the
 /// caller folds this into `skipped_non_git`, never a hard failure (matches
 /// this module's existing fail-soft posture).
-fn open_repo_head(repo_root: &str) -> Option<(codewitness::Auditor, codewitness::ObjectId)> {
+///
+/// `pub(crate)`: `dream`'s successor join reuses this exact resolution
+/// (rather than duplicating it) since it needs the identical live-HEAD
+/// concept `stamp_spans_into` already establishes for a repo.
+pub(crate) fn open_repo_head(
+    repo_root: &str,
+) -> Option<(codewitness::Auditor, codewitness::ObjectId)> {
     let auditor = codewitness::Auditor::discover(repo_root).ok()?;
     let head = auditor.repo().head_id().ok()?.detach();
     Some((auditor, head))
@@ -1193,6 +1199,7 @@ fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats>
                         continue;
                     }
                     let row = WitnessLedgerRow {
+                        id: 0,
                         project: project.clone(),
                         file: file.clone(),
                         symbol: Some(symbol.clone()),
@@ -1235,6 +1242,7 @@ fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats>
                     continue;
                 }
                 let row = WitnessLedgerRow {
+                    id: 0,
                     project,
                     file: file.clone(),
                     symbol: None,
@@ -1476,6 +1484,7 @@ fn stamp_spans_historical_into(
                             continue;
                         }
                         let row = WitnessLedgerRow {
+                            id: 0,
                             project: project.clone(),
                             file: file_abs.clone(),
                             symbol: Some(symbol.clone()),
@@ -1518,6 +1527,7 @@ fn stamp_spans_historical_into(
                         continue;
                     }
                     let row = WitnessLedgerRow {
+                        id: 0,
                         project: project.clone(),
                         file: file_abs.clone(),
                         symbol: None,

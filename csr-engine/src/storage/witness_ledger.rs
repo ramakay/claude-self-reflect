@@ -35,6 +35,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// (optionally a symbol/span) at a specific tier/commit.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WitnessLedgerRow {
+    /// `witness_ledger.id` (the DB primary key). `0` on a not-yet-inserted
+    /// row constructed for [`insert_witness`] — that call's `INSERT` never
+    /// references this field, so it is safe to leave at its `Default`.
+    /// Populated (non-zero) on every row read back via a query function in
+    /// this module — `dream`'s successor join uses it as the foreign key it
+    /// stamps into `witness_verdicts.witness_id`.
+    pub id: i64,
     pub project: String,
     /// Absolute path, consistent with `code_edges.src_file` convention.
     pub file: String,
@@ -87,21 +94,22 @@ pub fn insert_witness(conn: &Connection, row: &WitnessLedgerRow) -> Result<()> {
 
 fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<WitnessLedgerRow> {
     Ok(WitnessLedgerRow {
-        project: row.get(0)?,
-        file: row.get(1)?,
-        symbol: row.get(2)?,
-        span_start: row.get(3)?,
-        span_end: row.get(4)?,
-        stamp: row.get(5)?,
-        tier: row.get(6)?,
-        at_oid: row.get(7)?,
-        source_kind: row.get(8)?,
-        source_id: row.get(9)?,
+        id: row.get(0)?,
+        project: row.get(1)?,
+        file: row.get(2)?,
+        symbol: row.get(3)?,
+        span_start: row.get(4)?,
+        span_end: row.get(5)?,
+        stamp: row.get(6)?,
+        tier: row.get(7)?,
+        at_oid: row.get(8)?,
+        source_kind: row.get(9)?,
+        source_id: row.get(10)?,
     })
 }
 
 const SELECT_COLUMNS: &str =
-    "project, file, symbol, span_start, span_end, stamp, tier, at_oid, source_kind, source_id";
+    "id, project, file, symbol, span_start, span_end, stamp, tier, at_oid, source_kind, source_id";
 
 /// All witness rows recorded for `(project, file)`, oldest-first (`id ASC`)
 /// — the full append-only history for that anchor, not just the latest claim.
@@ -154,6 +162,37 @@ pub fn count_witnesses_for_file(conn: &Connection, project: &str, file: &str) ->
     .map_err(Into::into)
 }
 
+/// Every `tier = 'committed'` witness row, ordered so that all rows sharing
+/// `(project, file, symbol)` are contiguous (`ORDER BY project, file,
+/// COALESCE(symbol,''), id`) — the grouping order `dream`'s successor join
+/// needs to walk each anchor's history without a second sort pass.
+/// `tier = 'worktree'` rows are excluded: only committed history can support
+/// a supersession claim (mirrors `codewitness::Auditor::audit_against_successor`'s
+/// own tier gate).
+pub fn all_committed_witnesses(conn: &Connection) -> Result<Vec<WitnessLedgerRow>> {
+    let sql = format!(
+        "SELECT {SELECT_COLUMNS} FROM witness_ledger
+         WHERE tier = 'committed'
+         ORDER BY project, file, COALESCE(symbol,''), id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], row_from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// A single witness row by its primary key — `dream`'s successor join uses
+/// this to re-fetch a candidate successor's full row (stamp, at_oid) when
+/// only the `witness_id` is at hand. `None` if the id doesn't exist (should
+/// not happen for a real foreign reference, but never assumed).
+pub fn witness_by_id(conn: &Connection, id: i64) -> Result<Option<WitnessLedgerRow>> {
+    let sql = format!("SELECT {SELECT_COLUMNS} FROM witness_ledger WHERE id = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let row = stmt.query_row(params![id], row_from_sql).optional()?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +205,7 @@ mod tests {
 
     fn row(symbol: Option<&str>, stamp: &str) -> WitnessLedgerRow {
         WitnessLedgerRow {
+            id: 0,
             project: "proj".into(),
             file: "/repo/src/lib.rs".into(),
             symbol: symbol.map(|s| s.to_string()),
@@ -261,5 +301,59 @@ mod tests {
         assert!(witnesses_for_file(&conn, "proj", "/nope.rs")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn all_committed_witnesses_excludes_worktree_tier() {
+        let conn = open();
+        insert_witness(&conn, &row(Some("foo"), "b3:aaa")).unwrap();
+        let mut worktree_row = row(Some("bar"), "b3:bbb");
+        worktree_row.tier = "worktree".into();
+        worktree_row.at_oid = None;
+        insert_witness(&conn, &worktree_row).unwrap();
+
+        let committed = all_committed_witnesses(&conn).unwrap();
+        assert_eq!(committed.len(), 1, "worktree-tier row must be excluded");
+        assert_eq!(committed[0].symbol.as_deref(), Some("foo"));
+        assert_ne!(committed[0].id, 0, "a row read back must carry its real id");
+    }
+
+    #[test]
+    fn all_committed_witnesses_groups_same_symbol_contiguously() {
+        let conn = open();
+        insert_witness(&conn, &row(Some("foo"), "b3:aaa")).unwrap();
+        insert_witness(&conn, &row(Some("foo"), "b3:bbb")).unwrap();
+        insert_witness(&conn, &row(Some("zzz"), "b3:ccc")).unwrap();
+        let rows = all_committed_witnesses(&conn).unwrap();
+        assert_eq!(rows.len(), 3);
+        // Both "foo" rows must be adjacent (grouping order), regardless of
+        // where "zzz" sorts.
+        let foo_positions: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.symbol.as_deref() == Some("foo"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            foo_positions,
+            vec![0, 1],
+            "foo rows must be contiguous and stamp-ordered"
+        );
+    }
+
+    #[test]
+    fn witness_by_id_round_trips() {
+        let conn = open();
+        insert_witness(&conn, &row(Some("foo"), "b3:aaa")).unwrap();
+        let id = all_committed_witnesses(&conn).unwrap()[0].id;
+        let fetched = witness_by_id(&conn, id).unwrap().unwrap();
+        assert_eq!(fetched.stamp, "b3:aaa");
+        assert_eq!(fetched.id, id);
+    }
+
+    #[test]
+    fn witness_by_id_missing_returns_none() {
+        let conn = open();
+        assert!(witness_by_id(&conn, 99999).unwrap().is_none());
     }
 }
