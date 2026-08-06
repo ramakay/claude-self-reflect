@@ -63,6 +63,8 @@ pub struct DreamStatus {
     pub events_total: i64,
     pub by_verdict: DreamVerdictTotals,
     pub demoted_symbols: i64,
+    /// Total durable witnesses available for a first dream cycle.
+    pub witnesses_ledgered: i64,
     /// RFC3339 timestamp of the daemon's last COMPLETED dream cycle. `None`
     /// if the daemon dream loop has never completed one (never started,
     /// disabled via `CSR_NO_DREAMING`, or still waiting on its first
@@ -84,6 +86,7 @@ impl Default for DreamStatus {
             events_total: 0,
             by_verdict: DreamVerdictTotals::default(),
             demoted_symbols: 0,
+            witnesses_ledgered: 0,
             last_daemon_run: None,
             next_due: None,
         }
@@ -295,10 +298,18 @@ fn gather_dream(storage: &Storage) -> DreamStatus {
         .all_demoted_symbols()
         .map(|v| v.len() as i64)
         .unwrap_or(0);
-
     let last_daemon_run_dt = crate::daemon::dream_cadence::read_last_run(storage);
     let last_daemon_run = last_daemon_run_dt.map(|t| t.to_rfc3339());
     let daemon_enabled = !crate::daemon::dream_cadence::dreaming_disabled();
+    // The TUI only renders this count for the enabled/never-run state, so keep
+    // the extra COUNT query off the steady-state refresh path.
+    let witnesses_ledgered = if daemon_enabled && last_daemon_run_dt.is_none() {
+        storage
+            .with_connection(crate::storage::witness_ledger::count_all)
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let next_due = daemon_enabled
         .then(|| {
             crate::daemon::dream_cadence::next_due(
@@ -319,6 +330,7 @@ fn gather_dream(storage: &Storage) -> DreamStatus {
             reinstated,
         },
         demoted_symbols,
+        witnesses_ledgered,
         last_daemon_run,
         next_due,
     }
@@ -752,6 +764,7 @@ mod tests {
                 reinstated: 0,
             },
             demoted_symbols: 3,
+            witnesses_ledgered: 0,
             last_daemon_run: None,
             next_due: None,
         };
@@ -856,6 +869,7 @@ mod tests {
         assert_eq!(report.dream.by_verdict.obsolete, 1);
         assert_eq!(report.dream.by_verdict.superseded, 0);
         assert_eq!(report.dream.demoted_symbols, 1);
+        assert_eq!(report.dream.witnesses_ledgered, 1);
         assert!(report.dream.last_run.is_some());
     }
 

@@ -151,7 +151,38 @@ fn parse_dynamic_expression(
 /// Format a timestamp as relative time (e.g., "2 hours ago", "yesterday").
 pub fn format_relative_time(ts: &DateTime<Utc>) -> String {
     let now = Utc::now();
-    let diff = now - *ts;
+    format_relative_time_at(ts, &now)
+}
+
+/// Format a timestamp relative to an injected clock. Future timestamps are
+/// rendered as `in 2h`; past timestamps retain the established `2h ago` form.
+pub(crate) fn format_relative_time_at(ts: &DateTime<Utc>, now: &DateTime<Utc>) -> String {
+    if *ts > *now {
+        let diff = *ts - *now;
+        let hours = diff.num_hours();
+        let days = diff.num_days();
+
+        return if hours < 1 {
+            let mins = diff.num_minutes();
+            if mins < 1 {
+                "just now".to_string()
+            } else {
+                format!("in {}m", mins)
+            }
+        } else if hours < 24 {
+            format!("in {}h", hours)
+        } else if days == 1 {
+            "tomorrow".to_string()
+        } else if days < 7 {
+            format!("in {}d", days)
+        } else if days < 30 {
+            format!("in {}w", days / 7)
+        } else {
+            format!("in {}mo", days / 30)
+        };
+    }
+
+    let diff = *now - *ts;
     let hours = diff.num_hours();
     let days = diff.num_days();
 
