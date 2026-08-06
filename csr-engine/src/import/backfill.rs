@@ -1149,7 +1149,7 @@ fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats>
         // containers" (every symbol stays bare) rather than aborting the
         // file — same fail-soft posture as the rest of this module.
         let containers = lang_from_path_str(&file)
-            .and_then(|lang| std::fs::read_to_string(&file).ok().map(|src| (lang, src)))
+            .zip(std::fs::read_to_string(&file).ok())
             .map(|(lang, src)| container_spans(&src, lang))
             .unwrap_or_default();
         let defs: Vec<(String, String, i64, i64)> = file_nodes
