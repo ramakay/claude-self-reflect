@@ -21,6 +21,9 @@ gix = { version = "0.86", default-features = false, features = ["revision", "blo
 blake3 = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde_json = "1"
+sha2 = "0.10"
 
 [features]
 default = []
