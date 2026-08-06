@@ -1,12 +1,15 @@
 //! Daemon module — background processing for progressive enrichment.
 //!
-//! Runs four background tasks:
+//! Runs five background tasks:
 //! 1. File watcher (existing) — auto-import new JSONL files
 //! 2. Extraction loop (Layer 2) — V3 extraction on imported conversations
 //! 3. Narrator loop (Layer 3) — AI batch narrative generation (if API key set)
 //! 4. Consolidation loop (Layer 4) — Dreamer v1 typed fact extraction from narratives
+//! 5. Dream loop (v10) — periodic `dream_cadence::dream_loop` cycle over the
+//!    witness ledger (see that module for cadence/persistence/cost-discipline)
 
 pub mod consolidation;
+pub mod dream_cadence;
 pub mod ratification;
 
 use std::path::{Path, PathBuf};
@@ -15,7 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::api::types::BatchRequest;
 use crate::api::{AnthropicClient, BatchClient};
@@ -122,6 +125,10 @@ impl Daemon {
         // Shared shutdown flag for graceful termination (D-8)
         let shutdown = Arc::new(AtomicBool::new(false));
 
+        // Shared one-owner permit for watcher batches, plan imports, and
+        // dream cycles. Owned permits provide RAII release on every exit.
+        let heavy_work = Arc::new(Semaphore::new(1));
+
         // Start file watcher
         let watcher = crate::import::watcher::FileWatcher::new(
             self.projects_dir.clone(),
@@ -129,7 +136,8 @@ impl Daemon {
             self.embeddings.clone(),
             self.search.clone(),
             self.index_dir.clone(),
-        );
+        )
+        .with_heavy_work_permit(heavy_work.clone());
         let watcher_handle = watcher.spawn();
         tracing::info!("file watcher started");
 
@@ -269,6 +277,7 @@ impl Daemon {
                 self.projects_dir.clone(),
             ));
             let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
             tokio::spawn(async move {
                 loop {
                     for _ in 0..180 {
@@ -279,7 +288,12 @@ impl Daemon {
                     }
                     let eng = engine.clone();
                     let shutdown_inner = shutdown.clone();
+                    let permit = match heavy_work.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
                     let _ = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
                         let Some(home) = dirs::home_dir() else { return };
                         let plans_dir = home.join(".claude/plans");
                         let plans =
@@ -324,6 +338,25 @@ impl Daemon {
         };
         tracing::info!("ratification loop started");
 
+        // Dream loop (v10) — periodic cadence-gated `dream_cadence::dream_loop`
+        // cycle over the witness ledger. See that module's doc for cadence,
+        // persistence, cancellation, monotonic scheduling, and the heavy
+        // work permit it shares with the watcher and plans loop above.
+        let dream_handle = {
+            let engine = Arc::new(crate::engine::Engine::from_parts(
+                self.storage.clone(),
+                self.embeddings.clone(),
+                self.search.clone(),
+                self.projects_dir.clone(),
+            ));
+            let heavy_work = heavy_work.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                dream_cadence::dream_loop(engine, heavy_work, shutdown).await;
+            })
+        };
+        tracing::info!("dream loop started (v10 \"dreaming\")");
+
         // Wait for Ctrl+C
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down daemon gracefully");
@@ -347,6 +380,13 @@ impl Daemon {
         // flight: await it fully.
         let _ = plans_handle.await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
+        // The dream loop's tick awaits its `spawn_blocking` cycle directly
+        // (see `dream_cadence::tick`) and checks the shutdown flag between
+        // repos/anchors, so the timeout below bounds a cycle that ignores
+        // cancellation. Dream writes are single-statement inserts — an abrupt
+        // exit mid-cycle loses at most that cycle's remaining events, never
+        // corrupts state.
+        let _ = tokio::time::timeout(timeout, dream_handle).await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
 
         // Flush HNSW index to disk before exit

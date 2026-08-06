@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::embeddings::EmbeddingEngine;
 use crate::import;
@@ -24,6 +24,12 @@ pub struct FileWatcher {
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
     index_dir: PathBuf,
+    /// Optional shared one-owner permit, held while importing a debounced
+    /// batch of files. `None` for callers
+    /// that don't need the signal (e.g. the MCP-embedded watcher started by
+    /// `Engine::start_watcher`) — opt-in via [`Self::with_heavy_work_permit`] so
+    /// this stays additive for every existing caller.
+    heavy_work: Option<Arc<Semaphore>>,
 }
 
 impl FileWatcher {
@@ -40,7 +46,15 @@ impl FileWatcher {
             embeddings,
             search,
             index_dir,
+            heavy_work: None,
         }
+    }
+
+    /// Share the daemon's exclusive heavy-work semaphore. The watcher waits
+    /// for and retains an owned RAII permit across import and index flush.
+    pub fn with_heavy_work_permit(mut self, permit: Arc<Semaphore>) -> Self {
+        self.heavy_work = Some(permit);
+        self
     }
 
     /// Spawn the watcher as a background tokio task. Returns a JoinHandle.
@@ -114,6 +128,10 @@ impl FileWatcher {
 
             // Process all pending files
             if !pending.is_empty() {
+                let _heavy_permit = match &self.heavy_work {
+                    Some(heavy_work) => Some(acquire_heavy_work_permit(heavy_work.clone()).await),
+                    None => None,
+                };
                 tracing::info!(count = pending.len(), "processing new/modified JSONL files");
                 for file_path in &pending {
                     if let Err(e) = self.import_file(file_path).await {
@@ -134,6 +152,7 @@ impl FileWatcher {
                         tracing::warn!(error = %e, "failed to flush HNSW index after watcher batch");
                     }
                 }
+                drop(idx);
             }
         }
 
@@ -238,4 +257,13 @@ impl FileWatcher {
 
         Ok(())
     }
+}
+
+/// Wait for exclusive ownership of daemon heavy work. The owned RAII
+/// permit is held by the caller for the complete watcher batch.
+pub(crate) async fn acquire_heavy_work_permit(heavy_work: Arc<Semaphore>) -> OwnedSemaphorePermit {
+    heavy_work
+        .acquire_owned()
+        .await
+        .expect("daemon heavy-work semaphore must never be closed")
 }

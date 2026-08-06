@@ -162,6 +162,17 @@ pub fn count_witnesses_for_file(conn: &Connection, project: &str, file: &str) ->
     .map_err(Into::into)
 }
 
+/// Total ledger rows across every project/file/tier — a cheap
+/// "is there anything here at all" check the daemon's dream-cadence
+/// catch-up decision uses (`daemon::dream_cadence::should_catch_up`): a
+/// fresh install with an empty ledger has nothing to catch up on, so its
+/// first cycle follows the normal cadence interval instead of firing
+/// shortly after startup.
+pub fn count_all(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM witness_ledger", [], |r| r.get(0))
+        .map_err(Into::into)
+}
+
 /// Every `tier = 'committed'` witness row, ordered so that all rows sharing
 /// `(project, file, symbol)` are contiguous (`ORDER BY project, file,
 /// COALESCE(symbol,''), id`) — the grouping order `dream`'s successor join

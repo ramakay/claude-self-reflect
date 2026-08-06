@@ -1080,9 +1080,27 @@ pub fn backfill_stamp_spans(engine: &Engine, dry_run: bool) -> Result<StampSpans
     stamp_spans_into(engine.storage(), dry_run)
 }
 
+/// Cancellation-aware daemon variant. Checks between files and periodically
+/// within files; completed append-only stamps remain valid partial progress.
+pub(crate) fn backfill_stamp_spans_cancellable(
+    engine: &Engine,
+    dry_run: bool,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<StampSpansStats> {
+    stamp_spans_into_cancellable(engine.storage(), dry_run, Some(should_cancel))
+}
+
 /// Storage-level core of `backfill_stamp_spans` (no embeddings needed —
 /// keeps unit tests light, same split as `backfill_into` / `backfill_attribution_into`).
 fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats> {
+    stamp_spans_into_cancellable(storage, dry_run, None)
+}
+
+fn stamp_spans_into_cancellable(
+    storage: &Storage,
+    dry_run: bool,
+    should_cancel: Option<&dyn Fn() -> bool>,
+) -> Result<StampSpansStats> {
     let mut stats = StampSpansStats::default();
 
     // Group by file first: repo access (discover + HEAD resolution) and the
@@ -1099,6 +1117,9 @@ fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats>
         BTreeMap::new();
 
     for (file, file_nodes) in by_file {
+        if should_cancel.is_some_and(|cancel| cancel()) {
+            break;
+        }
         // Same fallback order as `backfill_attribution_into`'s git channel:
         // prefer a stored repo_root, else resolve live.
         let repo_root = file_nodes
@@ -1165,6 +1186,9 @@ fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats>
 
         let mut any_span = false;
         for (idx, node) in file_nodes.iter().enumerate() {
+            if idx % 64 == 0 && should_cancel.is_some_and(|cancel| cancel()) {
+                return Ok(stats);
+            }
             // The synthetic module sentinel (kind='module', 0/0 span) isn't a
             // real span-level symbol — same exclusion as the git-channel
             // attribution backfill's `module_sentinel` check.

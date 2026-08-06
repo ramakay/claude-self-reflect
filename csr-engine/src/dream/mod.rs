@@ -88,6 +88,8 @@
 pub mod report;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use codewitness::{causal, Auditor, CausalOrder, ObjectId};
@@ -181,6 +183,29 @@ impl DreamStats {
     }
 }
 
+/// Live cancellation shared by the daemon shutdown signal and the dreaming
+/// kill switch. The CLI path does not construct one.
+pub struct DreamCancellation {
+    shutdown: Arc<AtomicBool>,
+}
+
+impl DreamCancellation {
+    pub fn new(shutdown: Arc<AtomicBool>) -> Self {
+        Self { shutdown }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst) || crate::daemon::dream_cadence::dreaming_disabled()
+    }
+}
+
+/// A daemon dream cycle either completed or stopped at a cancellation
+/// checkpoint with partial stats. Cancellation is not an operational error.
+pub enum DreamRunResult {
+    Complete(DreamStats),
+    Cancelled(DreamStats),
+}
+
 /// Run one dream cycle: HEAD stamp-spans (prerequisite — see the module
 /// doc), then the successor join over the resulting `witness_ledger`.
 /// `repo_filter`, when `Some`, restricts the JOIN to anchors whose file
@@ -196,15 +221,53 @@ impl DreamStats {
 /// a dry run and a subsequent real run at the same HEAD compute identical
 /// verdicts: the dry run writes stamps but zero `witness_verdicts` rows.
 pub fn run_dream(engine: &Engine, repo_filter: Option<&str>, dry_run: bool) -> Result<DreamStats> {
-    let stamp_spans = backfill::backfill_stamp_spans(engine, false)?;
+    match run_dream_inner(engine, repo_filter, dry_run, None)? {
+        DreamRunResult::Complete(stats) | DreamRunResult::Cancelled(stats) => Ok(stats),
+    }
+}
+
+/// Daemon entry point with cancellation checks between stamp files,
+/// repositories/anchors, and periodically within large anchors.
+pub fn run_dream_with_cancellation(
+    engine: &Engine,
+    repo_filter: Option<&str>,
+    dry_run: bool,
+    cancellation: &DreamCancellation,
+) -> Result<DreamRunResult> {
+    run_dream_inner(engine, repo_filter, dry_run, Some(cancellation))
+}
+
+fn run_dream_inner(
+    engine: &Engine,
+    repo_filter: Option<&str>,
+    dry_run: bool,
+    cancellation: Option<&DreamCancellation>,
+) -> Result<DreamRunResult> {
+    if cancellation.is_some_and(DreamCancellation::is_cancelled) {
+        return Ok(DreamRunResult::Cancelled(DreamStats::default()));
+    }
+    let stamp_spans = match cancellation {
+        Some(cancel) => {
+            backfill::backfill_stamp_spans_cancellable(engine, false, &|| cancel.is_cancelled())?
+        }
+        None => backfill::backfill_stamp_spans(engine, false)?,
+    };
     let mut stats = DreamStats {
         stamp_spans,
         ..Default::default()
     };
-    engine
-        .storage()
-        .with_connection(|conn| dream_join(conn, repo_filter, dry_run, &mut stats))?;
-    Ok(stats)
+    if cancellation.is_some_and(DreamCancellation::is_cancelled) {
+        return Ok(DreamRunResult::Cancelled(stats));
+    }
+    let should_cancel = || cancellation.is_some_and(DreamCancellation::is_cancelled);
+    let cancelled = engine.storage().with_connection(|conn| {
+        dream_join_cancellable(conn, repo_filter, dry_run, &mut stats, Some(&should_cancel))
+    })?;
+    if cancelled {
+        Ok(DreamRunResult::Cancelled(stats))
+    } else {
+        Ok(DreamRunResult::Complete(stats))
+    }
 }
 
 /// A `(project, file, symbol)` anchor key.
@@ -270,12 +333,23 @@ fn compare_cached(
 /// full algorithm. Operates on an already-locked `&Connection` so a whole
 /// `dream` cycle (potentially many anchors) runs under one lock acquisition
 /// rather than one per query.
+#[cfg(test)]
 fn dream_join(
     conn: &Connection,
     repo_filter: Option<&str>,
     dry_run: bool,
     stats: &mut DreamStats,
 ) -> Result<()> {
+    dream_join_cancellable(conn, repo_filter, dry_run, stats, None).map(|_| ())
+}
+
+pub(crate) fn dream_join_cancellable(
+    conn: &Connection,
+    repo_filter: Option<&str>,
+    dry_run: bool,
+    stats: &mut DreamStats,
+    should_cancel: Option<&dyn Fn() -> bool>,
+) -> Result<bool> {
     let rows = witness_ledger::all_committed_witnesses(conn)?;
     let groups = group_by_anchor(rows);
 
@@ -291,6 +365,9 @@ fn dream_join(
     let mut causal_cache: CausalCache = HashMap::new();
 
     for (_key, group_rows) in groups {
+        if should_cancel.is_some_and(|cancel| cancel()) {
+            return Ok(true);
+        }
         let distinct_oids: BTreeSet<&str> = group_rows
             .iter()
             .filter_map(|r| r.at_oid.as_deref())
@@ -341,7 +418,10 @@ fn dream_join(
             None => Vec::new(),
         };
 
-        for w in &group_rows {
+        for (w_index, w) in group_rows.iter().enumerate() {
+            if w_index % 64 == 0 && should_cancel.is_some_and(|cancel| cancel()) {
+                return Ok(true);
+            }
             let w_is_head_row = w.at_oid.as_deref() == Some(head_oid_str.as_str());
             if !w_is_head_row {
                 // H itself is not "history to judge" — it never counts as a
@@ -444,7 +524,7 @@ fn dream_join(
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Search `head_stamp_rows` — the anchor's successor-candidate set,

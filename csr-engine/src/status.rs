@@ -49,12 +49,45 @@ pub struct DreamVerdictTotals {
 /// the globally newest `witness_verdicts` event (`None` if `dream` has never
 /// run). `demoted_symbols` is the count on the `Demote` channel right now —
 /// see `storage::witness_verdicts::all_demoted_symbols`.
-#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+///
+/// `last_daemon_run`/`next_due` are the DAEMON's own cadence bookkeeping
+/// (`daemon::dream_cadence`) — deliberately separate from `last_run`: a
+/// daemon cycle that runs and writes zero new events (re-running at an
+/// unchanged HEAD) still counts as "the daemon acted" and moves cadence
+/// forward, but would leave `last_run` frozen since no event was written.
+#[derive(Serialize, Debug, PartialEq, Eq)]
 pub struct DreamStatus {
+    /// Whether daemon dreaming is enabled by configuration.
+    pub daemon_enabled: bool,
     pub last_run: Option<String>,
     pub events_total: i64,
     pub by_verdict: DreamVerdictTotals,
     pub demoted_symbols: i64,
+    /// RFC3339 timestamp of the daemon's last COMPLETED dream cycle. `None`
+    /// if the daemon dream loop has never completed one (never started,
+    /// disabled via `CSR_NO_DREAMING`, or still waiting on its first
+    /// cadence/catch-up window).
+    pub last_daemon_run: Option<String>,
+    /// RFC3339 timestamp of the next expected daemon cycle
+    /// (`last_daemon_run + interval`). `None` when `last_daemon_run` is
+    /// `None` or `daemon_enabled` is false — the exact first-cycle timing
+    /// depends on daemon process-start state a stateless status read doesn't
+    /// have (see `daemon::dream_cadence::first_cycle_due_at`).
+    pub next_due: Option<String>,
+}
+
+impl Default for DreamStatus {
+    fn default() -> Self {
+        Self {
+            daemon_enabled: true,
+            last_run: None,
+            events_total: 0,
+            by_verdict: DreamVerdictTotals::default(),
+            demoted_symbols: 0,
+            last_daemon_run: None,
+            next_due: None,
+        }
+    }
 }
 
 #[derive(Serialize, Default, Debug, PartialEq, Eq)]
@@ -262,7 +295,22 @@ fn gather_dream(storage: &Storage) -> DreamStatus {
         .all_demoted_symbols()
         .map(|v| v.len() as i64)
         .unwrap_or(0);
+
+    let last_daemon_run_dt = crate::daemon::dream_cadence::read_last_run(storage);
+    let last_daemon_run = last_daemon_run_dt.map(|t| t.to_rfc3339());
+    let daemon_enabled = !crate::daemon::dream_cadence::dreaming_disabled();
+    let next_due = daemon_enabled
+        .then(|| {
+            crate::daemon::dream_cadence::next_due(
+                last_daemon_run_dt,
+                crate::daemon::dream_cadence::interval_secs(),
+            )
+        })
+        .flatten()
+        .map(|t| t.to_rfc3339());
+
     DreamStatus {
+        daemon_enabled,
         last_run,
         events_total: obsolete + superseded + reinstated,
         by_verdict: DreamVerdictTotals {
@@ -271,6 +319,8 @@ fn gather_dream(storage: &Storage) -> DreamStatus {
             reinstated,
         },
         demoted_symbols,
+        last_daemon_run,
+        next_due,
     }
 }
 
@@ -693,6 +743,7 @@ mod tests {
     fn test_compact_includes_dream_suffix_when_symbols_forgotten() {
         let mut report = base_report();
         report.dream = DreamStatus {
+            daemon_enabled: true,
             last_run: Some("2026-08-05 10:00:00".into()),
             events_total: 3,
             by_verdict: DreamVerdictTotals {
@@ -701,6 +752,8 @@ mod tests {
                 reinstated: 0,
             },
             demoted_symbols: 3,
+            last_daemon_run: None,
+            next_due: None,
         };
         let line = format_compact(&report);
         assert!(
@@ -804,5 +857,79 @@ mod tests {
         assert_eq!(report.dream.by_verdict.superseded, 0);
         assert_eq!(report.dream.demoted_symbols, 1);
         assert!(report.dream.last_run.is_some());
+    }
+
+    #[test]
+    fn status_dream_block_last_daemon_run_and_next_due_default_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let _storage = Storage::open(&db_path).unwrap();
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert!(
+            report.dream.last_daemon_run.is_none(),
+            "daemon dream loop has never completed a cycle on a fresh DB"
+        );
+        assert!(
+            report.dream.next_due.is_none(),
+            "next_due depends on last_daemon_run — must also be None"
+        );
+    }
+
+    #[test]
+    fn status_dream_block_surfaces_daemon_cadence_once_persisted() {
+        // `dream_cadence::env_test_guard` — shared with that module's own
+        // env-var tests — because `gather_dream` reads `interval_secs()`,
+        // which is process-global env state (see that guard's doc).
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::set_var("CSR_DREAM_INTERVAL_SECS", "3600");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let storage = Storage::open(&db_path).unwrap();
+        let last = chrono::Utc::now() - chrono::Duration::hours(1);
+        storage
+            .set_meta(
+                crate::daemon::dream_cadence::META_LAST_RUN_AT,
+                &last.to_rfc3339(),
+            )
+            .unwrap();
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        std::env::remove_var("CSR_DREAM_INTERVAL_SECS");
+
+        assert_eq!(
+            report.dream.last_daemon_run.as_deref(),
+            Some(last.to_rfc3339().as_str())
+        );
+        let expected_next_due = last + chrono::Duration::seconds(3600);
+        assert_eq!(
+            report.dream.next_due.as_deref(),
+            Some(expected_next_due.to_rfc3339().as_str())
+        );
+    }
+
+    #[test]
+    fn status_dream_block_hides_next_due_when_daemon_dreaming_is_disabled() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::set_var("CSR_NO_DREAMING", "1");
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .set_meta(
+                crate::daemon::dream_cadence::META_LAST_RUN_AT,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        let dream = gather_dream(&storage);
+        std::env::remove_var("CSR_NO_DREAMING");
+        assert!(!dream.daemon_enabled);
+        assert!(dream.next_due.is_none());
+        assert!(dream.last_daemon_run.is_some());
     }
 }
