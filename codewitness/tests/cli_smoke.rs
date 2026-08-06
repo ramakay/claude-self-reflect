@@ -8,6 +8,7 @@ use std::process::Command;
 
 use common::TempRepo;
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -68,6 +69,27 @@ fn labels_and_bench_run_deterministically_on_tiny_repo() {
             "missing {arm} metrics"
         );
     }
+}
+
+#[test]
+#[ignore = "CI runs this explicitly to emit byte-for-byte determinism evidence"]
+fn determinism_hashes_match_for_real_labels_and_bench_runs() {
+    let fixture = Fixture::new();
+    let (labels_first, labels_second, bench_first, bench_second) =
+        fixture.determinism_hashes(env!("CARGO_BIN_EXE_codewitness"));
+
+    println!("labels sha256: {labels_first}");
+    println!("labels sha256: {labels_second}");
+    println!("bench sha256:  {bench_first}");
+    println!("bench sha256:  {bench_second}");
+    assert_eq!(
+        labels_first, labels_second,
+        "labels output changed between runs"
+    );
+    assert_eq!(
+        bench_first, bench_second,
+        "bench output changed between runs"
+    );
 }
 
 #[test]
@@ -318,6 +340,28 @@ impl Fixture {
         assert_success(&output);
     }
 
+    fn determinism_hashes(&self, binary: &str) -> (String, String, String, String) {
+        let labels = || {
+            let output = Command::new(binary)
+                .args(["labels", "--repo"])
+                .arg(&self.repo.path)
+                .output()
+                .expect("run labels for determinism evidence");
+            assert_success(&output);
+            sha256_hex(&output.stdout)
+        };
+        let labels_first = labels();
+        let labels_second = labels();
+
+        let result_path = self.repo.path.join("determinism-results.json");
+        self.run_bench(binary, &result_path);
+        let bench_first = sha256_hex(&fs::read(&result_path).expect("read first bench result"));
+        self.run_bench(binary, &result_path);
+        let bench_second = sha256_hex(&fs::read(&result_path).expect("read second bench result"));
+
+        (labels_first, labels_second, bench_first, bench_second)
+    }
+
     fn bench_output(&self, binary: &str, mode: &str, out: &Path) -> std::process::Output {
         Command::new(binary)
             .args(["bench", "--repo"])
@@ -337,6 +381,10 @@ impl Fixture {
             .output()
             .expect("run bench")
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn create_ledger(path: &Path, file: &str, rows: &[(String, Vec<(&str, &str)>)]) {
