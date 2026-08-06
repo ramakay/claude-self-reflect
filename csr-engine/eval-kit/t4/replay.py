@@ -178,8 +178,9 @@ def main() -> int:
     )
     ap.add_argument(
         "--scratch-dir",
-        default=str(Path(tempfile.mkdtemp(prefix="csr-t4-")) ),
-        help="Scratch dir for the throwaway DB + projects-dir (NEVER ~/.claude-self-reflect).",
+        default=None,
+        help="Scratch dir for the throwaway DB + projects-dir (NEVER ~/.claude-self-reflect). "
+        "Default: a fresh csr-t4-* temp dir, removed on exit unless --keep-db.",
     )
     ap.add_argument("--tags-count", type=int, default=13)
     ap.add_argument("--out-dir", default=str(Path(__file__).resolve().parent))
@@ -187,10 +188,19 @@ def main() -> int:
     args = ap.parse_args()
 
     repo = os.path.abspath(args.repo)
-    if not os.path.isabs(args.binary) or not os.path.exists(args.binary):
-        raise SystemExit(f"binary not found: {args.binary} (run `cargo build --release` first)")
+    # Resolve to absolute first (the README documents a relative
+    # `--binary target/release/csr-engine` invocation), THEN require it to
+    # exist — the subprocess later runs with a different cwd.
+    binary = os.path.abspath(args.binary)
+    if not os.path.exists(binary):
+        raise SystemExit(f"binary not found: {binary} (run `cargo build --release` first)")
 
-    scratch_dir = Path(args.scratch_dir)
+    # Create the default scratch dir lazily, only when the caller omitted
+    # --scratch-dir (mkdtemp in the argparse default would also run for
+    # --help / argument errors / explicit --scratch-dir, and its root was
+    # never cleaned up).
+    owns_scratch_root = args.scratch_dir is None
+    scratch_dir = Path(args.scratch_dir or tempfile.mkdtemp(prefix="csr-t4-"))
     db_dir = scratch_dir / "scratch_db"
     projects_dir = scratch_dir / "scratch_projects"
     db_path = db_dir / "tierA.db"
@@ -207,7 +217,7 @@ def main() -> int:
     run_log = []
     for tag in sampled:
         expected_oid = resolve_commit(repo, tag)
-        info = stamp_at(args.binary, str(db_path), str(projects_dir), repo, tag)
+        info = stamp_at(binary, str(db_path), str(projects_dir), repo, tag)
         if info["at_oid"] != expected_oid:
             raise SystemExit(
                 f"stamp-spans resolved {tag} to {info['at_oid']}, expected {expected_oid}"
@@ -354,6 +364,10 @@ def main() -> int:
     if not args.keep_db:
         shutil.rmtree(db_dir, ignore_errors=True)
         shutil.rmtree(projects_dir, ignore_errors=True)
+        if owns_scratch_root:
+            # Only remove the root this script itself created — never a
+            # caller-provided --scratch-dir.
+            shutil.rmtree(scratch_dir, ignore_errors=True)
 
     return 0
 

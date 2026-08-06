@@ -457,6 +457,16 @@ fn resolve_worktree_path(workdir: &Path, anchor_path: &Path) -> Result<PathBuf, 
     }
 }
 
+/// Cut `bytes` down to the 1-based inclusive line `span` (identity when
+/// `span` is `None`).
+///
+/// Reconstruction appends `\n` after EVERY selected line, including the
+/// last — so a span that ends on the file's final line produces the same
+/// bytes whether or not that line had a terminator on disk. Both the
+/// worktree and committed paths share this function, so spanned stamps
+/// stay comparable across tiers; the trade-off is that a spanned stamp is
+/// deliberately insensitive to the presence of a final newline (unlike a
+/// whole-file [`crate::Stamp::from_bytes`], which normalizes nothing).
 fn apply_span(bytes: Vec<u8>, span: Option<(u32, u32)>, path: &Path) -> Result<Vec<u8>, Error> {
     let Some((start, end)) = span else {
         return Ok(bytes);
@@ -466,7 +476,13 @@ fn apply_span(bytes: Vec<u8>, span: Option<(u32, u32)>, path: &Path) -> Result<V
     }
 
     let ends_with_newline = bytes.ends_with(b"\n");
-    let mut lines: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
+    // `split` on empty input yields one empty slice, but an empty file has
+    // zero lines — no span may resolve against it (`available: 0` below).
+    let mut lines: Vec<&[u8]> = if bytes.is_empty() {
+        Vec::new()
+    } else {
+        bytes.split(|&b| b == b'\n').collect()
+    };
     if ends_with_newline {
         lines.pop();
     }

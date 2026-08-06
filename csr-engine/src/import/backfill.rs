@@ -1109,6 +1109,11 @@ fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats>
             stats.skipped_no_repo_root += 1;
             continue;
         };
+        // Counted as soon as a repo_root resolves (the doc contract on
+        // `StampSpansStats::files_checked`) — BEFORE the remaining skip
+        // gates, so the summary's denominator includes skipped files and
+        // `files_processed` can actually differ from it in HEAD mode.
+        stats.files_checked += 1;
 
         if !Path::new(&file).is_file() {
             stats.skipped_file_missing += 1;
@@ -1130,7 +1135,6 @@ fn stamp_spans_into(storage: &Storage, dry_run: bool) -> Result<StampSpansStats>
             continue;
         };
 
-        stats.files_checked += 1;
         stats.files_processed += 1;
         let project = file_nodes
             .iter()

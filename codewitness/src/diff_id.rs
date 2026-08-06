@@ -32,6 +32,14 @@ const CONTEXT: usize = 3;
 /// whole (line-ending-normalized) buffers directly (see
 /// `hash_whole_buffers`) instead of line-diffing them at all.
 const MAX_LCS_CELLS: usize = 4_000_000;
+/// Per-side line cap, closing the gap `MAX_LCS_CELLS` alone leaves open:
+/// the product collapses to 0 when one side has no lines (whole-file
+/// creation or deletion — ordinary inputs for a witness backfill) and to
+/// `n` when one side is a single line, so a multi-million-line side would
+/// still reach [`diff_lines`] and allocate one DP row per old-side line.
+/// Either side exceeding this cap diverts to `hash_whole_buffers`, exactly
+/// as an oversized product does.
+const MAX_LINES_PER_SIDE: usize = 100_000;
 
 /// A content-only identity for a change between two byte buffers:
 /// `"b3d:<64 hex chars>"`. Two diffs with the same [`DiffId`] made the same
@@ -68,14 +76,18 @@ impl fmt::Display for DiffId {
 /// identical produces the same [`DiffId`] (see the CRLF test below).
 ///
 /// When the line-count product `old_lines * new_lines` exceeds
-/// `MAX_LCS_CELLS`, this skips line-diffing entirely and falls back to
-/// hashing the two whole buffers (see `hash_whole_buffers`) — see that
-/// function's docs for why.
+/// `MAX_LCS_CELLS`, or either side alone exceeds `MAX_LINES_PER_SIDE`,
+/// this skips line-diffing entirely and falls back to hashing the two
+/// whole buffers (see `hash_whole_buffers`) — see those constants' docs
+/// for why.
 pub fn normalized_diff_id(old: &[u8], new: &[u8]) -> DiffId {
     let old_lines = split_lines(old);
     let new_lines = split_lines(new);
 
-    if old_lines.len().saturating_mul(new_lines.len()) > MAX_LCS_CELLS {
+    if old_lines.len() > MAX_LINES_PER_SIDE
+        || new_lines.len() > MAX_LINES_PER_SIDE
+        || old_lines.len().saturating_mul(new_lines.len()) > MAX_LCS_CELLS
+    {
         return hash_whole_buffers(old, new);
     }
 
@@ -337,6 +349,26 @@ mod tests {
         new2.extend_from_slice(b"a-different-trailing-edit\n");
         let third = normalized_diff_id(&old, &new2);
         assert_ne!(first, third);
+    }
+
+    #[test]
+    fn oversized_one_sided_deletion_falls_back_instead_of_allocating() {
+        // Whole-file deletion: the old side is huge, the new side empty.
+        // The cell product is 0, so the product cap alone would admit a
+        // per-old-line DP row allocation — the per-side cap must divert
+        // to the whole-buffer fallback instead.
+        let mut old = Vec::new();
+        for i in 0..(MAX_LINES_PER_SIDE + 1) {
+            old.extend_from_slice(format!("line-{i}\n").as_bytes());
+        }
+        let id = normalized_diff_id(&old, b"");
+        assert!(
+            id.as_str().starts_with(&format!("{FALLBACK_PREFIX}:")),
+            "one-sided oversized input must use the fallback prefix, got {id}"
+        );
+        // Deterministic, and distinct from the reverse direction (creation).
+        assert_eq!(id, normalized_diff_id(&old, b""));
+        assert_ne!(id, normalized_diff_id(b"", &old));
     }
 
     #[test]

@@ -727,7 +727,8 @@ pub fn code_node_files_missing_repo_root(conn: &Connection) -> Result<Vec<String
 /// `stamp_spans_into` does).
 pub fn stored_repo_root_for_file(conn: &Connection, file: &str) -> Result<Option<String>> {
     conn.query_row(
-        "SELECT repo_root FROM code_nodes WHERE file = ?1 AND repo_root IS NOT NULL LIMIT 1",
+        "SELECT repo_root FROM code_nodes WHERE file = ?1 AND repo_root IS NOT NULL
+         ORDER BY id LIMIT 1",
         params![file],
         |row| row.get(0),
     )

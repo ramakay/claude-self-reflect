@@ -108,6 +108,12 @@ def find_reverts(repo: str, all_shas: set[str]) -> set[str]:
                 matches = [s for s in all_shas if s.lower().startswith(target_prefix)]
                 if len(matches) == 1:
                     reverted.add(matches[0])
+                elif len(matches) > 1:
+                    print(
+                        f"[labels] WARNING: revert {sha[:12]} names ambiguous prefix "
+                        f"{target_prefix} ({len(matches)} candidates); original not relabeled",
+                        file=sys.stderr,
+                    )
     return reverted
 
 
@@ -189,7 +195,10 @@ def main() -> int:
         )
 
     n_total = len(rows)
-    n_labeled = sum(1 for r in rows if r["release_tag"] is not None)
+    # "shipped or reverted" literally: the union of the two labels. NOT
+    # "has a release tag" — a revert commit that never shipped carries
+    # label='reverted' with release_tag=None and must still count here.
+    n_labeled = sum(1 for r in rows if r["label"] in ("shipped", "reverted"))
     n_shipped = sum(1 for r in rows if r["label"] == "shipped")
     n_reverted = sum(1 for r in rows if r["label"] == "reverted")
     n_unreleased = sum(1 for r in rows if r["label"] == "unreleased")

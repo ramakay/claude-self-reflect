@@ -2,7 +2,7 @@
 name = "codewitness"
 version = "0.1.0-alpha.1"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 description = "Deterministic, evidence-grounded staleness detection for code-anchored claims. Zero LLM, zero wall-clock time — causal ordering via git ancestry only."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ramakay/claude-self-reflect"

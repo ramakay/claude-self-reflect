@@ -248,8 +248,10 @@ enum CodegraphAction {
         at: Option<String>,
 
         /// Restrict to this one repo root instead of every repo root the
-        /// code graph already knows about.
-        #[arg(long)]
+        /// code graph already knows about. Requires `--at` — HEAD-mode
+        /// stamping (`backfill_stamp_spans`) has no repo filter, and
+        /// silently ignoring the flag would stamp every known repo.
+        #[arg(long, requires = "at")]
         repo: Option<String>,
     },
 }

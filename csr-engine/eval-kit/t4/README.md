@@ -94,8 +94,9 @@ revert-noise failure mode to catch. The 1.0/1.0 result is not a tautology
 of the metric (FP could be nonzero; it happens to be zero for this corpus)
 but it does mean this run alone can't demonstrate the precision gap the
 rule is designed to expose — a repo with real reverts would show
-precision < 1.0 on some tags. Survival declines monotonically from 0.843
-(oldest sampled tag) toward 1.0 (final tag), as expected.
+precision < 1.0 on some tags. Survival rises monotonically with tag
+recency, from 0.843 at the oldest sampled tag to 1.0 at the final tag —
+i.e. the older the belief, the less of it survives, as expected.
 
 Output: `tierA_results.json` (full detail incl. per-tag `gt_counts`/
 `pred_counts` 3-way breakdowns and the survival curve), `tierA_results.csv`

@@ -37,4 +37,4 @@ much unrelated history surrounds it.
 
 No tokio, no async, no network. Built on [`gix`](https://docs.rs/gix).
 
-MSRV: 1.75 (edition 2021).
+MSRV: 1.85 (edition 2021; floor set by the `gix` 0.86 dependency).

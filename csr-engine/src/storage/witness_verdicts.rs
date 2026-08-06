@@ -431,10 +431,19 @@ pub struct DemotedSymbol {
 /// symbol)` anchor with an uncancelled negative latest event (a cheap
 /// candidate filter — `Annotate` anchors are excluded from consideration
 /// here too, since they also have a negative latest event, so this pass
-/// over-selects and the second pass narrows); then each candidate is
-/// resolved through `symbol_verdict_state` itself, so this can never disagree
-/// with the single-anchor query chunk binding uses. Not a hot path — this is
-/// a report/status call, not per-search.
+/// over-selects and the second pass narrows); then the candidates are
+/// resolved through the SAME state logic chunk binding uses, so this can
+/// never disagree with it.
+///
+/// This IS a hot path: `status` (including the `--compact` statusline) calls
+/// it on every poll via `gather_dream`, so the second pass batches named
+/// symbols through [`symbol_verdict_states_for_files`] (one query per ≤400
+/// `(project, file)` pairs, documented-identical semantics per key) instead
+/// of issuing 2-3 `symbol_verdict_state` round trips per candidate — the
+/// same hot-path discipline as `Storage::integrity_check_cached`. Whole-file
+/// anchors (`symbol IS NULL`) stay on the single-anchor resolver, which the
+/// batched fn deliberately excludes; they are the rare case (minted only for
+/// files with no symbol-level nodes).
 pub fn all_demoted_symbols(conn: &Connection) -> Result<Vec<DemotedSymbol>> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT wl.project, wl.file, wl.symbol
@@ -447,9 +456,24 @@ pub fn all_demoted_symbols(conn: &Connection) -> Result<Vec<DemotedSymbol>> {
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    let mut pairs: Vec<(String, String)> = anchors
+        .iter()
+        .filter(|(_, _, symbol)| symbol.is_some())
+        .map(|(project, file, _)| (project.clone(), file.clone()))
+        .collect();
+    pairs.sort();
+    pairs.dedup();
+    let named_states = symbol_verdict_states_for_files(conn, &pairs)?;
+
     let mut out = Vec::new();
     for (project, file, symbol) in anchors {
-        if let Some(state) = symbol_verdict_state(conn, &project, &file, symbol.as_deref())? {
+        let state = match &symbol {
+            Some(sym) => named_states
+                .get(&(project.clone(), file.clone(), sym.clone()))
+                .cloned(),
+            None => symbol_verdict_state(conn, &project, &file, None)?,
+        };
+        if let Some(state) = state {
             if state.channel == VerdictChannel::Demote {
                 out.push(DemotedSymbol {
                     project,

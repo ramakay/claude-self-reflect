@@ -1352,20 +1352,6 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         witness_verdicts::all_demoted_symbols(&conn)
     }
-
-    /// Given chunk/conversation identifiers appearing in search results,
-    /// resolve their bound witnesses via the code graph and return only
-    /// those with a CURRENT negative verdict. See
-    /// `storage::chunk_binding::witness_verdict_for_chunks` for the full
-    /// binding algorithm (including the unqualified-symbol suffix-match
-    /// fallback).
-    pub fn witness_verdict_for_chunks(
-        &self,
-        conversation_ids: &[String],
-    ) -> Result<std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        chunk_binding::witness_verdict_for_chunks(&conn, conversation_ids)
-    }
 }
 
 #[cfg(test)]
