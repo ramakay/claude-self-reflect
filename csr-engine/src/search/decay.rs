@@ -20,10 +20,27 @@ pub fn apply_decay(
     decay_weight: Option<f64>,
     scale_days: Option<f64>,
 ) -> f32 {
+    apply_decay_with_age_multiplier(score, timestamp, now, decay_weight, scale_days, 1.0)
+}
+
+/// Apply time-based decay after multiplying the memory's effective age.
+///
+/// `age_multiplier` must be finite and at least `1.0`. Invalid values trip a
+/// debug assertion and fall back to `1.0` in release builds. A multiplier of
+/// `1.0` is identical to [`apply_decay`].
+pub fn apply_decay_with_age_multiplier(
+    score: f32,
+    timestamp: &DateTime<Utc>,
+    now: &DateTime<Utc>,
+    decay_weight: Option<f64>,
+    scale_days: Option<f64>,
+    age_multiplier: f64,
+) -> f32 {
+    let age_multiplier = validate_age_multiplier(age_multiplier);
     let weight = decay_weight.unwrap_or(DEFAULT_DECAY_WEIGHT);
     let scale = scale_days.unwrap_or(DEFAULT_SCALE_DAYS);
 
-    let age_days = (*now - *timestamp).num_seconds() as f64 / 86400.0;
+    let age_days = (*now - *timestamp).num_seconds() as f64 / 86400.0 * age_multiplier;
     if age_days <= 0.0 {
         return score;
     }
@@ -97,10 +114,28 @@ pub fn apply_tad(
     retrieval_events: &[RetrievalEvent],
     config: &DecayConfig,
 ) -> f32 {
+    apply_tad_with_age_multiplier(score, timestamp, now, retrieval_events, config, 1.0)
+}
+
+/// Apply TAD after multiplying the memory's effective age. Reinforcement
+/// still changes the half-life exactly as before; only elapsed age is scaled.
+///
+/// `age_multiplier` must be finite and at least `1.0`. Invalid values trip a
+/// debug assertion and fall back to `1.0` in release builds. A multiplier of
+/// `1.0` is identical to [`apply_tad`].
+pub fn apply_tad_with_age_multiplier(
+    score: f32,
+    timestamp: &DateTime<Utc>,
+    now: &DateTime<Utc>,
+    retrieval_events: &[RetrievalEvent],
+    config: &DecayConfig,
+    age_multiplier: f64,
+) -> f32 {
+    let age_multiplier = validate_age_multiplier(age_multiplier);
     let reinforcement = compute_reinforcement(retrieval_events, now);
     let effective_half_life = config.base_half_life_days * 2.0_f64.powf(reinforcement);
 
-    let age_days = (*now - *timestamp).num_seconds() as f64 / 86400.0;
+    let age_days = (*now - *timestamp).num_seconds() as f64 / 86400.0 * age_multiplier;
     if age_days <= 0.0 {
         return score;
     }
@@ -109,6 +144,19 @@ pub fn apply_tad(
     let adjusted =
         (score as f64) * ((1.0 - config.decay_weight) + config.decay_weight * time_factor);
     adjusted as f32
+}
+
+fn validate_age_multiplier(age_multiplier: f64) -> f64 {
+    let valid = age_multiplier.is_finite() && age_multiplier >= 1.0;
+    debug_assert!(
+        valid,
+        "age_multiplier must be finite and at least 1.0, got {age_multiplier:?}"
+    );
+    if valid {
+        age_multiplier
+    } else {
+        1.0
+    }
 }
 
 /// Compute reinforcement score from retrieval events.
@@ -195,6 +243,89 @@ mod tests {
             tad,
             original
         );
+    }
+
+    #[test]
+    fn age_multiplier_one_is_bit_identical_to_existing_tad() {
+        let now = Utc::now();
+        let past = now - Duration::days(90);
+        let config = DecayConfig::for_search();
+
+        let current = apply_tad(0.91, &past, &now, &[], &config);
+        let multiplied = apply_tad_with_age_multiplier(0.91, &past, &now, &[], &config, 1.0);
+
+        assert_eq!(multiplied.to_bits(), current.to_bits());
+    }
+
+    #[test]
+    fn larger_age_multiplier_decays_faster() {
+        let now = Utc::now();
+        let past = now - Duration::days(90);
+        let config = DecayConfig::for_search();
+
+        let standard = apply_tad_with_age_multiplier(1.0, &past, &now, &[], &config, 1.0);
+        let accelerated = apply_tad_with_age_multiplier(1.0, &past, &now, &[], &config, 3.0);
+
+        assert!(
+            accelerated < standard,
+            "accelerated={accelerated} should be < standard={standard}"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn invalid_age_multipliers_trigger_debug_assertions() {
+        let now = Utc::now();
+        let past = now - Duration::days(90);
+
+        for multiplier in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let decay_panicked = std::panic::catch_unwind(|| {
+                apply_decay_with_age_multiplier(1.0, &past, &now, None, None, multiplier)
+            });
+            assert!(
+                decay_panicked.is_err(),
+                "invalid multiplier {multiplier:?} must trip the debug assertion"
+            );
+
+            let tad_panicked = std::panic::catch_unwind(|| {
+                apply_tad_with_age_multiplier(
+                    1.0,
+                    &past,
+                    &now,
+                    &[],
+                    &DecayConfig::for_search(),
+                    multiplier,
+                )
+            });
+            assert!(
+                tad_panicked.is_err(),
+                "invalid multiplier {multiplier:?} must trip the TAD debug assertion"
+            );
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn invalid_age_multipliers_fall_back_to_one_in_release() {
+        let now = Utc::now();
+        let past = now - Duration::days(90);
+        let config = DecayConfig::for_search();
+        let expected_decay = apply_decay(1.0, &past, &now, None, None);
+        let expected_tad = apply_tad(1.0, &past, &now, &[], &config);
+
+        for multiplier in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            assert_eq!(
+                apply_decay_with_age_multiplier(1.0, &past, &now, None, None, multiplier,)
+                    .to_bits(),
+                expected_decay.to_bits(),
+                "invalid multiplier {multiplier:?} must behave like 1.0"
+            );
+            assert_eq!(
+                apply_tad_with_age_multiplier(1.0, &past, &now, &[], &config, multiplier).to_bits(),
+                expected_tad.to_bits(),
+                "invalid TAD multiplier {multiplier:?} must behave like 1.0"
+            );
+        }
     }
 
     // --- TAD tests ---

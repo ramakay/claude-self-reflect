@@ -16,6 +16,13 @@ use crate::storage::witness_verdicts::VerdictChannel;
 use crate::storage::Storage;
 use crate::temporal;
 
+/// Demote-channel memories age three times faster when active forgetting is
+/// enabled. This models synaptic downscaling: disproven code memories weaken
+/// through the existing decay mechanism rather than being deleted. The T4
+/// evidence gate limits the multiplier to symbols proven gone at HEAD;
+/// Annotate-channel evolution remains rank-neutral.
+const ACTIVE_FORGETTING_DECAY_FACTOR: f64 = 3.0;
+
 /// Extract a conversation UUID from a query that is (or contains) a
 /// `conv_<uuid>` retrieval handle, or that is a bare UUID. Injection blocks
 /// hand out `csr_reflect_on_past("conv_<id>")` handles — those must resolve
@@ -64,6 +71,7 @@ fn lookup_by_conv_tag(
     query: &str,
     limit: usize,
     partition_enabled: bool,
+    active_forgetting: bool,
 ) -> Result<Option<String>> {
     let start = Instant::now();
     let rows = storage.get_reflections_by_tag(&format!("conv_{}", conv_id), limit)?;
@@ -110,7 +118,7 @@ fn lookup_by_conv_tag(
     // path returned without ever consulting dream verdicts). One batched
     // query for the single conversation id.
     let validity = resolve_validity_with(storage, &[conv_id.to_string()], partition_enabled);
-    apply_validity_partition(&mut enriched, &validity);
+    apply_validity_partition(&mut enriched, &validity, active_forgetting);
     let search_ms = start.elapsed().as_millis() as u64;
     Ok(Some(format::format_search_results(
         &enriched,
@@ -132,13 +140,19 @@ pub async fn reflect_on_past(
     project: Option<&str>,
 ) -> Result<String> {
     let partition_enabled = validity_partition_enabled();
+    let active_forgetting = active_forgetting_enabled();
     // Retrieval-handle fast path: `conv_<uuid>` (or a bare UUID) resolves by
     // exact tag. Falls through to semantic search only when the tag matches
     // nothing, so a stale handle still gets a best-effort answer.
     if let Some(conv_id) = extract_conv_id(query) {
-        if let Some(result) =
-            lookup_by_conv_tag(storage, conv_id, query, limit.max(5), partition_enabled)?
-        {
+        if let Some(result) = lookup_by_conv_tag(
+            storage,
+            conv_id,
+            query,
+            limit.max(5),
+            partition_enabled,
+            active_forgetting,
+        )? {
             return Ok(result);
         }
     }
@@ -157,6 +171,7 @@ pub async fn reflect_on_past(
         project,
         embed_ms,
         partition_enabled,
+        active_forgetting,
     )
     .await
 }
@@ -177,6 +192,7 @@ async fn reflect_on_past_with_vec(
     project: Option<&str>,
     embed_ms: u64,
     partition_enabled: bool,
+    active_forgetting: bool,
 ) -> Result<String> {
     let (effective_project, scope_label) = cross_project::normalize_project_scope(project);
 
@@ -195,6 +211,7 @@ async fn reflect_on_past_with_vec(
         min_score,
         effective_project.as_deref(),
         partition_enabled,
+        active_forgetting,
     )
     .await?;
     let mut search_ms = pass.search_ms;
@@ -222,6 +239,7 @@ async fn reflect_on_past_with_vec(
                 min_score,
                 effective_project.as_deref(),
                 partition_enabled,
+                active_forgetting,
             )
             .await?;
             search_ms += pass.search_ms;
@@ -232,7 +250,13 @@ async fn reflect_on_past_with_vec(
     // Sink resolved chunks AND dream-verdict-demoted chunks BEFORE the limit
     // cut so stale results do not occupy slots that should go to
     // unresolved/non-demoted chunks ranked below them.
-    apply_resolutions_before_limit(&mut enriched, storage, &pass.validity, limit);
+    apply_resolutions_before_limit(
+        &mut enriched,
+        storage,
+        &pass.validity,
+        limit,
+        active_forgetting,
+    );
 
     // TAD: log each RETURNED memory as an MCP-search retrieval event — after the
     // limit cut, so telemetry agrees with what the caller actually saw.
@@ -278,6 +302,7 @@ async fn reflect_gather_pass(
     min_score: f32,
     effective_project: Option<&str>,
     partition_enabled: bool,
+    active_forgetting: bool,
 ) -> Result<GatherPass> {
     let search_start = Instant::now();
 
@@ -303,8 +328,9 @@ async fn reflect_gather_pass(
     // v10 dream-verdict validity partition: resolve ONCE, early — one
     // batched query for the whole semantic candidate set (perf requirement)
     // — so both the TAD/decay scoring below and the rerank step further down
-    // can skip their own demotion for Demote-channel chunks (NO STACKING;
-    // see `apply_validity_partition`'s doc). `mut` because the FTS fallback
+    // can preserve the v10 no-stacking path for Demote-channel chunks when
+    // active forgetting is off (see `apply_validity_partition`'s doc). `mut`
+    // because the FTS fallback
     // below merges in verdicts for conversations the semantic pass never
     // saw. The final sink/annotate step (mirroring
     // `apply_resolutions_before_limit`) reuses this same map.
@@ -321,23 +347,31 @@ async fn reflect_gather_pass(
         .unwrap_or_default();
     let tad_config = decay::DecayConfig::for_search();
 
+    // The FTS decision must use the score this candidate had before the
+    // opt-in multiplier. Otherwise accelerated decay can pull new valid FTS
+    // candidates into the result set even though active forgetting is only
+    // allowed to reorder the already-demoted section.
+    let mut semantic_top_score = 0.0f32;
     let mut enriched: Vec<EnrichedResult> = chunk_results
         .iter()
         .filter_map(|r| {
             chunks.iter().find(|c| c.id == r.id).map(|c| {
-                let decayed_score = if is_demote_channel(&validity, &c.conversation_id) {
-                    // NO STACKING: this chunk is about to be structurally
-                    // sunk below every non-demoted result in
-                    // `apply_validity_partition` — applying TAD/decay on top
-                    // would compound a soft penalty with that hard sink for
-                    // the same staleness signal.
-                    r.score
-                } else if let Ok(ts) = c.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
-                    let events = tad_events.get(&c.id).map(|v| v.as_slice()).unwrap_or(&[]);
-                    decay::apply_tad(r.score, &ts, &now, events, &tad_config)
-                } else {
-                    r.score
-                };
+                let decayed_score =
+                    if let Ok(ts) = c.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
+                        let events = tad_events.get(&c.id).map(|v| v.as_slice()).unwrap_or(&[]);
+                        apply_chunk_decay(
+                            r.score,
+                            &ts,
+                            &now,
+                            events,
+                            &tad_config,
+                            &validity,
+                            &c.conversation_id,
+                            active_forgetting,
+                        )
+                    } else {
+                        r.score
+                    };
                 // Cross-project multiplicative penalty
                 let final_score = if let Some(p) = effective_project {
                     if c.project_name != p {
@@ -348,6 +382,17 @@ async fn reflect_gather_pass(
                 } else {
                     decayed_score
                 };
+                let fallback_score =
+                    if active_forgetting && is_demote_channel(&validity, &c.conversation_id) {
+                        if effective_project.is_some_and(|p| c.project_name != p) {
+                            r.score * 0.3
+                        } else {
+                            r.score
+                        }
+                    } else {
+                        final_score
+                    };
+                semantic_top_score = semantic_top_score.max(fallback_score);
                 EnrichedResult {
                     score: final_score,
                     chunk: c.clone(),
@@ -393,6 +438,7 @@ async fn reflect_gather_pass(
             } else {
                 decayed_score
             };
+            semantic_top_score = semantic_top_score.max(final_score);
             let tag_prefix = if tags.iter().any(|t| t == "session_episode") {
                 "[episode] "
             } else if tags.iter().any(|t| t == "session_story") {
@@ -426,7 +472,6 @@ async fn reflect_gather_pass(
 
     // FTS5 hybrid fallback: if semantic results are weak (top score < 0.5)
     // or empty, supplement with keyword search results
-    let semantic_top_score = enriched.iter().map(|e| e.score).fold(0.0f32, f32::max);
     if semantic_top_score < 0.5 {
         if let Ok(fts_chunks) = storage.fts5_search(query, fetch, effective_project) {
             let existing_ids: HashSet<String> =
@@ -438,7 +483,7 @@ async fn reflect_gather_pass(
             // Validity was resolved over the SEMANTIC candidate set only —
             // FTS-appended chunks can carry conversation ids that set never
             // saw, and those must not slip past the partition (or past the
-            // no-stacking decay skip below). Re-resolve for just the new
+            // active-forgetting decay decision below). Re-resolve for just the new
             // conversation ids and merge the maps.
             let extra_convs: Vec<String> = distinct_conversation_ids_of_chunks(&appended)
                 .into_iter()
@@ -452,15 +497,31 @@ async fn reflect_gather_pass(
             for chunk in appended {
                 // FTS5 results get a synthetic score slightly below semantic threshold
                 // so they rank after good semantic matches but above nothing
-                let fts_score = if is_demote_channel(&validity, &chunk.conversation_id) {
-                    // NO STACKING: same rule as the semantic loop above —
-                    // this chunk is about to be structurally sunk, so no
-                    // decay on top of the hard sink.
+                let demoted = is_demote_channel(&validity, &chunk.conversation_id);
+                let fts_score = if demoted && !active_forgetting {
+                    // Default-off byte fidelity: preserve the v10 no-stacking
+                    // path exactly unless active forgetting is opted in.
                     0.45
                 } else if let Ok(ts) = chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
-                    decay::apply_decay(0.45, &ts, &now, None, None) // base 0.45 + decay
+                    let age_multiplier = if demoted {
+                        ACTIVE_FORGETTING_DECAY_FACTOR
+                    } else {
+                        1.0
+                    };
+                    decay::apply_decay_with_age_multiplier(
+                        0.45,
+                        &ts,
+                        &now,
+                        None,
+                        None,
+                        age_multiplier,
+                    )
                 } else {
-                    0.40
+                    if demoted {
+                        0.45
+                    } else {
+                        0.40
+                    }
                 };
                 let final_fts_score = if let Some(p) = effective_project {
                     if chunk.project_name != p {
@@ -1031,19 +1092,37 @@ pub async fn get_more_results(
     min_score: f32,
     project: Option<&str>,
 ) -> Result<String> {
+    let partition_enabled = validity_partition_enabled();
+    let active_forgetting = active_forgetting_enabled();
     let query_vec = embed_query(embeddings, query).await?;
-    get_more_results_with_vec(
-        storage,
-        search,
-        &query_vec,
-        query,
-        offset,
-        limit,
-        min_score,
-        project,
-        validity_partition_enabled(),
-    )
-    .await
+    if active_forgetting {
+        get_more_results_with_vec_active(
+            storage,
+            search,
+            &query_vec,
+            query,
+            offset,
+            limit,
+            min_score,
+            project,
+            partition_enabled,
+            true,
+        )
+        .await
+    } else {
+        get_more_results_with_vec(
+            storage,
+            search,
+            &query_vec,
+            query,
+            offset,
+            limit,
+            min_score,
+            project,
+            partition_enabled,
+        )
+        .await
+    }
 }
 
 /// Hard cap on the pagination candidate window — see
@@ -1078,6 +1157,34 @@ async fn get_more_results_with_vec(
     project: Option<&str>,
     partition_enabled: bool,
 ) -> Result<String> {
+    get_more_results_with_vec_active(
+        storage,
+        search,
+        query_vec,
+        query,
+        offset,
+        limit,
+        min_score,
+        project,
+        partition_enabled,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn get_more_results_with_vec_active(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query_vec: &[f32],
+    query: &str,
+    offset: usize,
+    limit: usize,
+    min_score: f32,
+    project: Option<&str>,
+    partition_enabled: bool,
+    active_forgetting: bool,
+) -> Result<String> {
     let (effective_project, _) = cross_project::normalize_project_scope(project);
 
     let all_results = if let Some(ref p) = effective_project {
@@ -1091,7 +1198,12 @@ async fn get_more_results_with_vec(
 
     // Enrich + resolution sink + validity partition ONCE over the FULL
     // fixed window, THEN slice the page.
-    let enriched = enrich_results_with(storage, &all_results, partition_enabled)?;
+    let enriched = enrich_results_with_active_forgetting(
+        storage,
+        &all_results,
+        partition_enabled,
+        active_forgetting,
+    )?;
     let total = enriched.len();
     let page: Vec<EnrichedResult> = enriched.into_iter().skip(offset).take(limit).collect();
     Ok(format::format_more_results(&page, query, offset, total))
@@ -1225,6 +1337,15 @@ fn enrich_results_with(
     results: &[crate::search::SearchResult],
     partition_enabled: bool,
 ) -> Result<Vec<EnrichedResult>> {
+    enrich_results_with_active_forgetting(storage, results, partition_enabled, false)
+}
+
+fn enrich_results_with_active_forgetting(
+    storage: &Arc<Storage>,
+    results: &[crate::search::SearchResult],
+    partition_enabled: bool,
+    active_forgetting: bool,
+) -> Result<Vec<EnrichedResult>> {
     let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
     let chunks = storage.get_chunks_by_ids(&ids)?;
 
@@ -1246,7 +1367,35 @@ fn enrich_results_with(
     apply_resolutions(&mut enriched_vec, storage);
     let conv_ids = distinct_conversation_ids(&enriched_vec);
     let validity = resolve_validity_with(storage, &conv_ids, partition_enabled);
-    apply_validity_partition(&mut enriched_vec, &validity);
+    if active_forgetting {
+        let chunk_ids: Vec<&str> = enriched_vec.iter().map(|e| e.chunk.id.as_str()).collect();
+        let tad_events = storage
+            .get_retrieval_events_batch(&chunk_ids)
+            .unwrap_or_default();
+        let tad_config = decay::DecayConfig::for_search();
+        let now = chrono::Utc::now();
+        for e in &mut enriched_vec {
+            if is_demote_channel(&validity, &e.chunk.conversation_id) {
+                if let Ok(timestamp) = e.chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
+                    let events = tad_events
+                        .get(&e.chunk.id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    e.score = apply_chunk_decay(
+                        e.score,
+                        &timestamp,
+                        &now,
+                        events,
+                        &tad_config,
+                        &validity,
+                        &e.chunk.conversation_id,
+                        true,
+                    );
+                }
+            }
+        }
+    }
+    apply_validity_partition(&mut enriched_vec, &validity, active_forgetting);
     Ok(enriched_vec)
 }
 
@@ -1342,6 +1491,18 @@ fn validity_partition_enabled() -> bool {
     std::env::var("CSR_NO_VALIDITY_PARTITION").ok().as_deref() != Some("1")
 }
 
+/// Opt-in active forgetting flag. Only the exact value `1` enables it;
+/// unset and every other value preserve the current ranking byte-for-byte.
+fn active_forgetting_enabled() -> bool {
+    active_forgetting_enabled_from(std::env::var("CSR_ACTIVE_FORGETTING").ok().as_deref())
+}
+
+/// Pure parsing seam for [`active_forgetting_enabled`], avoiding process-env
+/// mutation in parallel tests.
+fn active_forgetting_enabled_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 /// Resolve the v10 validity partition for a batch of conversation ids, with
 /// the kill switch's outcome passed in rather than read from the
 /// environment — every entry point evaluates
@@ -1408,7 +1569,7 @@ fn short_oid(oid: &str) -> &str {
 }
 
 /// `true` iff `conv_id` is Demote-channel per `validity`. The ONE predicate
-/// every no-stacking skip point shares — `reflect_on_past`'s TAD/decay loop,
+/// every validity-sensitive point shares — `reflect_on_past`'s TAD/decay loop,
 /// its rerank-candidate filter, and `apply_validity_partition`'s own sink
 /// all call this SAME function, so the three skip points cannot silently
 /// drift out of sync with each other (a literal single source of truth for
@@ -1419,12 +1580,45 @@ fn is_demote_channel(validity: &HashMap<String, ConvValidity>, conv_id: &str) ->
     validity.get(conv_id).is_some_and(|v| v.demote)
 }
 
+/// Apply the existing search TAD policy, with one opt-in exception: a
+/// Demote-channel chunk gets accelerated effective age. With the flag off,
+/// Demote keeps the exact v10 no-stacking score; Annotate follows the normal
+/// decay path in both modes because it is evolved-not-gone.
+#[allow(clippy::too_many_arguments)]
+fn apply_chunk_decay(
+    score: f32,
+    timestamp: &chrono::DateTime<chrono::Utc>,
+    now: &chrono::DateTime<chrono::Utc>,
+    events: &[decay::RetrievalEvent],
+    config: &decay::DecayConfig,
+    validity: &HashMap<String, ConvValidity>,
+    conv_id: &str,
+    active_forgetting: bool,
+) -> f32 {
+    if is_demote_channel(validity, conv_id) {
+        if !active_forgetting {
+            return score;
+        }
+        return decay::apply_tad_with_age_multiplier(
+            score,
+            timestamp,
+            now,
+            events,
+            config,
+            ACTIVE_FORGETTING_DECAY_FACTOR,
+        );
+    }
+    decay::apply_tad(score, timestamp, now, events, config)
+}
+
 /// Apply the resolved [`ConvValidity`] decision over already-scored/reranked
-/// `enriched`: Demote-channel chunks sink BELOW every non-demoted result
-/// (stable order preserved within each partition — mirrors
-/// `apply_resolutions`'s resolved-ledger sink exactly: pull out, append,
-/// never re-sort within a partition); Annotate-channel chunks are annotated
-/// IN PLACE, no rank change. Both channels' note is appended to
+/// `enriched`: Demote-channel chunks sink BELOW every non-demoted result.
+/// With active forgetting off, stable order is preserved within each
+/// partition, mirroring `apply_resolutions`'s resolved-ledger sink exactly.
+/// With active forgetting on, only the demoted partition is sorted by its
+/// accelerated-decay score; non-demoted ordering remains untouched.
+/// Annotate-channel chunks are annotated IN PLACE, no rank change. Both
+/// channels' note is appended to
 /// `e.resolution` — merged with any resolution-ledger note already present
 /// rather than overwriting it — so `format_search_results` and
 /// `format_more_results` render it via the existing `<resolution>` tag with
@@ -1433,17 +1627,15 @@ fn is_demote_channel(validity: &HashMap<String, ConvValidity>, conv_id: &str) ->
 /// `starts_with("resolved")`, and dream notes always start with
 /// `[stale anchor]`/`[evolved]`.
 ///
-/// NO STACKING (v10 contract): this function is the ONLY place a
-/// Demote-channel chunk's rank moves. Callers that score/rerank BEFORE this
-/// point (TAD/decay in `reflect_on_past`'s enrichment loop, the scaffold
-/// penalty inside `search::rerank`) must skip their own demotion for chunks
-/// this function will demote — see `reflect_on_past`'s `is_demoted` check
-/// and its exclusion of demoted chunk ids from the `rerank` candidate list.
-/// Compounding a soft score/rank penalty with this hard structural sink
-/// would double-punish the same staleness signal.
+/// NO STACKING by default (v10 contract): with active forgetting off, this
+/// function remains the ONLY place a Demote-channel chunk's rank moves.
+/// `CSR_ACTIVE_FORGETTING=1` adds accelerated temporal decay plus score order
+/// within the already-sunk demoted section; provenance reranking still
+/// excludes demoted chunks, so valid-section ranking cannot change.
 fn apply_validity_partition(
     enriched: &mut Vec<EnrichedResult>,
     validity: &HashMap<String, ConvValidity>,
+    active_forgetting: bool,
 ) {
     if validity.is_empty() {
         return;
@@ -1471,6 +1663,9 @@ fn apply_validity_partition(
         } else {
             kept.push(e);
         }
+    }
+    if active_forgetting {
+        demoted.sort_by(|a, b| b.score.total_cmp(&a.score));
     }
     kept.extend(demoted);
     *enriched = kept;
@@ -1531,9 +1726,10 @@ fn apply_resolutions_before_limit(
     storage: &Arc<Storage>,
     validity: &HashMap<String, ConvValidity>,
     limit: usize,
+    active_forgetting: bool,
 ) {
     apply_resolutions(enriched, storage);
-    apply_validity_partition(enriched, validity);
+    apply_validity_partition(enriched, validity, active_forgetting);
     enriched.truncate(limit);
 }
 
@@ -1579,7 +1775,7 @@ mod tests {
             enriched_result("unresolved-2", 0.7, 2),
         ];
 
-        apply_resolutions_before_limit(&mut enriched, &storage, &HashMap::new(), 2);
+        apply_resolutions_before_limit(&mut enriched, &storage, &HashMap::new(), 2, false);
 
         let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
         assert_eq!(ids, ["unresolved-1", "unresolved-2"]);
@@ -1622,6 +1818,128 @@ mod tests {
     }
 
     #[test]
+    fn active_forgetting_flag_parsing_is_opt_in_only() {
+        assert!(active_forgetting_enabled_from(Some("1")));
+        for value in [None, Some("0"), Some("true"), Some("yes"), Some("")] {
+            assert!(
+                !active_forgetting_enabled_from(value),
+                "value {value:?} must leave active forgetting off"
+            );
+        }
+    }
+
+    #[test]
+    fn active_forgetting_off_output_is_byte_identical_to_current_behavior() {
+        let now = "2026-04-15T10:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let timestamp = "2026-01-15T10:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let validity: HashMap<String, ConvValidity> =
+            [("conv-demoted".to_string(), demote_validity("stale"))]
+                .into_iter()
+                .collect();
+        let score = 0.91_f32;
+
+        let actual_score = apply_chunk_decay(
+            score,
+            &timestamp,
+            &now,
+            &[],
+            &decay::DecayConfig::for_search(),
+            &validity,
+            "conv-demoted",
+            false,
+        );
+
+        assert_eq!(actual_score.to_bits(), score.to_bits());
+
+        let mut actual = vec![enriched_result_conv(
+            "stale",
+            "conv-demoted",
+            actual_score,
+            0,
+        )];
+        let mut expected = vec![enriched_result_conv("stale", "conv-demoted", score, 0)];
+        apply_validity_partition(&mut actual, &validity, false);
+        apply_validity_partition(&mut expected, &validity, false);
+
+        assert_eq!(
+            format::format_search_results(&actual, "q", "all", 5, 3),
+            format::format_search_results(&expected, "q", "all", 5, 3)
+        );
+    }
+
+    #[test]
+    fn active_forgetting_demote_decays_faster_than_identical_clean_chunk() {
+        let now = chrono::Utc::now();
+        let timestamp = now - chrono::Duration::days(90);
+        let validity: HashMap<String, ConvValidity> =
+            [("conv-demoted".to_string(), demote_validity("stale"))]
+                .into_iter()
+                .collect();
+        let config = decay::DecayConfig::for_search();
+
+        let demoted = apply_chunk_decay(
+            1.0,
+            &timestamp,
+            &now,
+            &[],
+            &config,
+            &validity,
+            "conv-demoted",
+            true,
+        );
+        let clean = apply_chunk_decay(
+            1.0,
+            &timestamp,
+            &now,
+            &[],
+            &config,
+            &validity,
+            "conv-clean",
+            true,
+        );
+
+        assert!(demoted < clean, "demoted={demoted}, clean={clean}");
+    }
+
+    #[test]
+    fn active_forgetting_does_not_change_annotate_channel_decay() {
+        let now = chrono::Utc::now();
+        let timestamp = now - chrono::Duration::days(90);
+        let validity: HashMap<String, ConvValidity> =
+            [("conv-annotated".to_string(), annotate_validity("evolved"))]
+                .into_iter()
+                .collect();
+        let config = decay::DecayConfig::for_search();
+
+        let annotated = apply_chunk_decay(
+            1.0,
+            &timestamp,
+            &now,
+            &[],
+            &config,
+            &validity,
+            "conv-annotated",
+            true,
+        );
+        let clean = apply_chunk_decay(
+            1.0,
+            &timestamp,
+            &now,
+            &[],
+            &config,
+            &validity,
+            "conv-clean",
+            true,
+        );
+
+        assert_eq!(annotated.to_bits(), clean.to_bits());
+    }
+
+    #[test]
     fn demoted_chunk_sinks_below_non_demoted_stable_order_preserved() {
         let mut enriched = vec![
             enriched_result_conv("a", "conv-demoted", 0.95, 0),
@@ -1636,7 +1954,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        apply_validity_partition(&mut enriched, &validity);
+        apply_validity_partition(&mut enriched, &validity, false);
 
         let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
         // Non-demoted (b, d) keep their relative order, ahead of demoted
@@ -1657,7 +1975,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        apply_validity_partition(&mut enriched, &validity);
+        apply_validity_partition(&mut enriched, &validity, false);
         enriched.truncate(2); // both fit — demoted is sunk, not dropped
 
         let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
@@ -1674,7 +1992,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        apply_validity_partition(&mut enriched, &validity);
+        apply_validity_partition(&mut enriched, &validity, false);
 
         assert_eq!(
             enriched[0].resolution.as_deref(),
@@ -1695,7 +2013,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        apply_validity_partition(&mut enriched, &validity);
+        apply_validity_partition(&mut enriched, &validity, false);
 
         // Order untouched — "a" (lower score) was already below "b" and
         // stays there; Annotate never moves rank.
@@ -1719,7 +2037,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        apply_validity_partition(&mut enriched, &validity);
+        apply_validity_partition(&mut enriched, &validity, false);
 
         assert_eq!(
             enriched[0].resolution.as_deref(),
@@ -1733,7 +2051,7 @@ mod tests {
             enriched_result_conv("a", "conv-1", 0.95, 0),
             enriched_result_conv("b", "conv-2", 0.90, 1),
         ];
-        apply_validity_partition(&mut enriched, &HashMap::new());
+        apply_validity_partition(&mut enriched, &HashMap::new(), false);
         let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
         assert!(enriched.iter().all(|e| e.resolution.is_none()));
@@ -1871,7 +2189,7 @@ mod tests {
         assert!(!is_demote_channel(&validity, "conv-clean-1"));
         assert!(!is_demote_channel(&validity, "conv-clean-2"));
 
-        apply_validity_partition(&mut enriched, &validity);
+        apply_validity_partition(&mut enriched, &validity, false);
 
         let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
         assert_eq!(
@@ -1899,7 +2217,7 @@ mod tests {
             enriched_result_conv("stale", "conv-demoted", 0.95, 0),
             enriched_result_conv("valid-1", "conv-clean-1", 0.90, 1),
         ];
-        apply_validity_partition(&mut enriched_off, &validity_off);
+        apply_validity_partition(&mut enriched_off, &validity_off, false);
         let ids_off: Vec<&str> = enriched_off.iter().map(|e| e.chunk.id.as_str()).collect();
         assert_eq!(
             ids_off,
@@ -2133,6 +2451,300 @@ mod tests {
             .unwrap_or_else(|| panic!("expected '{needle}' in output:\n{haystack}"))
     }
 
+    fn active_forgetting_e2e_fixture() -> (Arc<Storage>, Arc<RwLock<SearchEngine>>) {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        install_demote_verdict(&storage);
+
+        let mk = |id: &str,
+                  conv: &str,
+                  timestamp: &str,
+                  content: &str,
+                  seq: usize|
+         -> crate::import::ConversationChunk {
+            crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conv.into(),
+                project_name: "testproj".into(),
+                timestamp: timestamp.into(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq,
+                is_sidechain: false,
+            }
+        };
+        // Timestamps are relative to the real clock the production scoring
+        // path reads (`Utc::now()`): a fixed calendar date here would let the
+        // old/new decay curves cross over as wall time advances and silently
+        // flip the ordering assertions below.
+        let fmt_days_ago = |days: i64| {
+            (chrono::Utc::now() - chrono::Duration::days(days))
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        };
+        let old_ts = fmt_days_ago(600);
+        let new_ts = fmt_days_ago(5);
+        let rows = [
+            (
+                mk(
+                    "chunk-demoted-old",
+                    "conv-demoted",
+                    &old_ts,
+                    "old stale old_fn claim",
+                    0,
+                ),
+                vec![0.55, 0.835_164_67, 0.0, 0.0],
+            ),
+            (
+                mk(
+                    "chunk-demoted-new",
+                    "conv-demoted",
+                    &new_ts,
+                    "recent stale old_fn claim",
+                    1,
+                ),
+                vec![0.50, 0.866_025_4, 0.0, 0.0],
+            ),
+            (
+                mk(
+                    "chunk-valid-a",
+                    "conv-valid-a",
+                    "2099-01-01T00:00:00Z",
+                    "valid alpha claim",
+                    2,
+                ),
+                vec![0.49, 0.871_722_43, 0.0, 0.0],
+            ),
+            (
+                mk(
+                    "chunk-valid-b",
+                    "conv-valid-b",
+                    "2099-01-01T00:00:00Z",
+                    "valid beta claim",
+                    3,
+                ),
+                vec![0.48, 0.877_268_5, 0.0, 0.0],
+            ),
+            (
+                mk(
+                    "chunk-fts-valid",
+                    "conv-fts-valid",
+                    "2099-01-01T00:00:00Z",
+                    "zebraquark fallback-only valid claim",
+                    4,
+                ),
+                vec![0.0, 0.0, 1.0, 0.0],
+            ),
+        ];
+
+        let mut engine = SearchEngine::new(16);
+        for (chunk, vector) in &rows {
+            storage.insert_chunk(chunk, vector).unwrap();
+            engine.insert_chunk(chunk.id.clone(), vector.clone());
+        }
+        (storage, Arc::new(RwLock::new(engine)))
+    }
+
+    fn rendered_result<'a>(output: &'a str, id: &str) -> &'a str {
+        let id_marker = format!("<id>{id}</id>");
+        let id_pos = output
+            .find(&id_marker)
+            .unwrap_or_else(|| panic!("expected {id_marker} in output:\n{output}"));
+        let start = output[..id_pos]
+            .rfind("    <r rank=")
+            .expect("result opening tag before id");
+        let relative_end = output[id_pos..]
+            .find("    </r>\n")
+            .expect("result closing tag after id");
+        let end = id_pos + relative_end + "    </r>\n".len();
+        &output[start..end]
+    }
+
+    #[tokio::test]
+    async fn e2e_active_forgetting_reorders_only_demoted_section_and_preserves_fallback_set() {
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+        let (off_storage, off_search) = active_forgetting_e2e_fixture();
+        let off = reflect_on_past_with_vec(
+            &off_storage,
+            &off_search,
+            &q,
+            "zebraquark",
+            4,
+            0.1,
+            Some("all"),
+            0,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let off_ids = [
+            "chunk-valid-a",
+            "chunk-valid-b",
+            "chunk-demoted-old",
+            "chunk-demoted-new",
+        ];
+        assert!(off_ids.windows(2).all(|pair| {
+            pos_of(&off, &format!("<id>{}</id>", pair[0]))
+                < pos_of(&off, &format!("<id>{}</id>", pair[1]))
+        }));
+        assert!(
+            !off.contains("chunk-fts-valid"),
+            "the pre-feature raw top score is above the FTS threshold:\n{off}"
+        );
+
+        let (on_storage, on_search) = active_forgetting_e2e_fixture();
+        let on = reflect_on_past_with_vec(
+            &on_storage,
+            &on_search,
+            &q,
+            "zebraquark",
+            4,
+            0.1,
+            Some("all"),
+            0,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            pos_of(&on, "<id>chunk-valid-a</id>") < pos_of(&on, "<id>chunk-valid-b</id>")
+                && pos_of(&on, "<id>chunk-valid-b</id>")
+                    < pos_of(&on, "<id>chunk-demoted-new</id>")
+                && pos_of(&on, "<id>chunk-demoted-new</id>")
+                    < pos_of(&on, "<id>chunk-demoted-old</id>"),
+            "active forgetting must reorder only the demoted section by accelerated score:\n{on}"
+        );
+        assert!(
+            !on.contains("chunk-fts-valid"),
+            "accelerated decay must not change FTS fallback activation or valid candidates:\n{on}"
+        );
+        for id in ["chunk-valid-a", "chunk-valid-b"] {
+            assert_eq!(
+                rendered_result(&on, id),
+                rendered_result(&off, id),
+                "valid result {id} must remain byte-identical"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_active_forgetting_pagination_is_disjoint_exhaustive_and_repeatable() {
+        let (storage, search) = active_forgetting_e2e_fixture();
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+
+        // The initial page ends inside the demoted section. Its accelerated
+        // order is [new, old], so get_more must continue with old rather than
+        // repeat new from the raw-score order [old, new].
+        let page1 = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &q,
+            "topic",
+            3,
+            0.1,
+            Some("all"),
+            0,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        let page2 = get_more_results_with_vec_active(
+            &storage,
+            &search,
+            &q,
+            "topic",
+            3,
+            1,
+            0.1,
+            Some("all"),
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let expected = [
+            ("chunk-valid-a", "valid alpha claim"),
+            ("chunk-valid-b", "valid beta claim"),
+            ("chunk-demoted-new", "recent stale old_fn claim"),
+            ("chunk-demoted-old", "old stale old_fn claim"),
+        ];
+        assert!(expected[..3].windows(2).all(|pair| {
+            pos_of(&page1, &format!("<id>{}</id>", pair[0].0))
+                < pos_of(&page1, &format!("<id>{}</id>", pair[1].0))
+        }));
+        assert!(
+            page2.contains("old stale old_fn claim"),
+            "get_more must continue the initial active-forgetting order:\n{page2}"
+        );
+
+        for (id, marker) in &expected[..3] {
+            assert!(
+                page1.contains(&format!("<id>{id}</id>")) && !page2.contains(marker),
+                "{id} must appear only on page 1"
+            );
+        }
+        assert!(
+            !page1.contains("<id>chunk-demoted-old</id>")
+                && page2.contains("old stale old_fn claim"),
+            "chunk-demoted-old must appear only on page 2"
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|(id, marker)| {
+                    page1.contains(&format!("<id>{id}</id>")) || page2.contains(marker)
+                })
+                .count(),
+            expected.len(),
+            "pages must exhaust the active-forgetting candidate set"
+        );
+
+        let demoted_page = get_more_results_with_vec_active(
+            &storage,
+            &search,
+            &q,
+            "topic",
+            2,
+            2,
+            0.1,
+            Some("all"),
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            pos_of(&demoted_page, "recent stale old_fn claim")
+                < pos_of(&demoted_page, "old stale old_fn claim"),
+            "get_more must preserve accelerated ordering within the demoted section:\n{demoted_page}"
+        );
+        let demoted_page_again = get_more_results_with_vec_active(
+            &storage,
+            &search,
+            &q,
+            "topic",
+            2,
+            2,
+            0.1,
+            Some("all"),
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            demoted_page, demoted_page_again,
+            "repeated get_more requests must return identical ordering"
+        );
+    }
+
     #[tokio::test]
     async fn e2e_partition_through_real_reflect_and_get_more_paths() {
         let (storage, search) = e2e_fixture();
@@ -2140,10 +2752,20 @@ mod tests {
 
         // 1) Demoted chunk sinks below BOTH valid ones and carries the exact
         //    annotation + footer, on the real reflect path.
-        let out =
-            reflect_on_past_with_vec(&storage, &search, &q, "topic", 3, 0.3, Some("all"), 0, true)
-                .await
-                .unwrap();
+        let out = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &q,
+            "topic",
+            3,
+            0.3,
+            Some("all"),
+            0,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
         let p_v1 = pos_of(&out, "<id>chunk-valid-1</id>");
         let p_v2 = pos_of(&out, "<id>chunk-valid-2</id>");
         let p_stale = pos_of(&out, "<id>chunk-stale</id>");
@@ -2163,10 +2785,20 @@ mod tests {
         // 2) OVERFETCH: at limit=2 the valid N+1 candidate (valid-2, never
         //    fetched under the old exactly-limit fetch) takes the slot the
         //    demoted top hit vacated.
-        let out =
-            reflect_on_past_with_vec(&storage, &search, &q, "topic", 2, 0.3, Some("all"), 0, true)
-                .await
-                .unwrap();
+        let out = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &q,
+            "topic",
+            2,
+            0.3,
+            Some("all"),
+            0,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             out.contains("<id>chunk-valid-2</id>"),
             "overfetch must surface the valid N+1 candidate:\n{out}"
@@ -2187,6 +2819,7 @@ mod tests {
             0.3,
             Some("all"),
             0,
+            false,
             false,
         )
         .await
@@ -2277,6 +2910,7 @@ mod tests {
             Some("all"),
             0,
             true,
+            false,
         )
         .await
         .unwrap();
@@ -2350,10 +2984,20 @@ mod tests {
         let search = Arc::new(RwLock::new(engine));
         let q = [1.0f32, 0.0, 0.0, 0.0];
 
-        let out =
-            reflect_on_past_with_vec(&storage, &search, &q, "topic", 2, 0.3, Some("all"), 0, true)
-                .await
-                .unwrap();
+        let out = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &q,
+            "topic",
+            2,
+            0.3,
+            Some("all"),
+            0,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             out.contains("<id>chunk-valid-a</id>") && out.contains("<id>chunk-valid-b</id>"),
             "adaptive refetch must backfill valid chunks from beyond the all-demoted first window:\n{out}"
