@@ -719,6 +719,7 @@ mod tests {
 
     #[test]
     fn test_status_nonexistent_db() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let report = gather_status(
             Path::new("/tmp/nonexistent-csr-test.db"),
             Path::new("/tmp/nonexistent-projects"),
@@ -798,6 +799,7 @@ mod tests {
 
     #[test]
     fn test_status_with_empty_db() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let projects_dir = dir.path().join("projects");
@@ -815,6 +817,7 @@ mod tests {
 
     #[test]
     fn status_aux_block_assembles_with_missing_dirs() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let projects_dir = dir.path().join("projects");
@@ -830,6 +833,7 @@ mod tests {
 
     #[test]
     fn status_surfaces_split_csr_suppression_counters_and_sum() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let projects_dir = dir.path().join("projects");
@@ -847,6 +851,10 @@ mod tests {
 
     #[test]
     fn status_dream_block_defaults_to_empty_on_fresh_db() {
+        // gather_dream reads the process-global CSR_NO_DREAMING kill switch;
+        // hold the shared env lock so parallel kill-switch tests can't flip
+        // daemon_enabled mid-assertion.
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let projects_dir = dir.path().join("projects");
@@ -861,6 +869,7 @@ mod tests {
 
     #[test]
     fn status_dream_block_surfaces_ancestry_cache_count() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let projects_dir = dir.path().join("projects");
@@ -888,6 +897,7 @@ mod tests {
 
     #[test]
     fn status_dream_block_reflects_recorded_events_and_demotions() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         use crate::storage::witness_ledger::WitnessLedgerRow;
         use crate::storage::witness_verdicts::{VerdictKind, WitnessVerdictRow};
 
@@ -940,6 +950,7 @@ mod tests {
 
     #[test]
     fn status_dream_block_last_daemon_run_and_next_due_default_to_none() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let projects_dir = dir.path().join("projects");

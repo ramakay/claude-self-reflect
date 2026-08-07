@@ -793,7 +793,9 @@ mod tests {
     // ── single-flight skip ──
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn decide_skips_when_already_running() {
+        let _guard = env_guard();
         let dream_running = AtomicBool::new(true); // a cycle is already mid-flight.
         let heavy = Arc::new(tokio::sync::Semaphore::new(1));
         let shutdown = AtomicBool::new(false);
@@ -806,7 +808,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn decide_claims_the_flag_on_success() {
+        let _guard = env_guard();
         let dream_running = AtomicBool::new(false);
         let heavy = Arc::new(Semaphore::new(1));
         let shutdown = AtomicBool::new(false);
@@ -819,7 +823,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn decide_waits_for_heavy_pass_without_claiming_single_flight_early() {
+        let _guard = env_guard();
         let dream_running = Arc::new(AtomicBool::new(false));
         let heavy = Arc::new(Semaphore::new(1));
         let held = heavy.clone().try_acquire_owned().unwrap();
@@ -843,7 +849,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn decide_not_due_leaves_flag_untouched() {
+        let _guard = env_guard();
         let dream_running = AtomicBool::new(false);
         let heavy = Arc::new(tokio::sync::Semaphore::new(1));
         let shutdown = AtomicBool::new(false);
@@ -869,7 +877,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn overdue_dream_joins_fair_queue_under_watcher_churn() {
+        // decide() reads the process-global CSR_NO_DREAMING kill switch; hold
+        // the env lock so a parallel kill-switch test can't flip it mid-run
+        // (this is exactly the CI failure mode: Disabled returned instead of
+        // a permit).
+        let _guard = env_guard();
         let heavy = Arc::new(Semaphore::new(1));
         let initial_watcher =
             crate::import::watcher::acquire_heavy_work_permit(heavy.clone()).await;
