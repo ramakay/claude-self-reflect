@@ -4,10 +4,11 @@ Two eval tiers that get staleness/provenance ground truth for free from git
 history instead of hand-labeling — the harness for the v10 "dreaming"
 (evidence-grounded forgetting) design's precision claims. Runs against the
 outer `claude-self-reflect` repo's own history (read-only); writes only to a
-scratch DB and this directory. Requires the `witness_ledger` +
-`stamp-spans --at` substrate from `feat/rmcp-3.1` (commit `dbc8dcf`).
+scratch DB and this directory. Both tiers are implemented as subcommands of
+the `codewitness` binary (`codewitness labels`, `codewitness bench`) — no
+Python, no LLM, fully deterministic.
 
-## Tier A — symbol time-travel replay (`replay.py`)
+## Tier A — symbol time-travel replay (`codewitness bench`)
 
 **Question**: given a `codewitness` stamp for `(file, symbol)` recorded at an
 old release tag, can a simple SQL rule — "did a later snapshot see a
@@ -15,7 +16,7 @@ different stamp for this symbol?" — correctly predict whether that belief
 is still true today, without re-deriving anything?
 
 **Method**:
-1. Build the release binary; every DB write goes to a scratch SQLite file
+1. Build the release binaries; every DB write goes to a scratch SQLite file
    under `--scratch-dir` (never `~/.claude-self-reflect`).
 2. List `v*` tags between `v8.0.0` and `v9.5.0` (17 in-range), sample 13
    evenly by an integer linspace-index formula — deterministic, no RNG,
@@ -52,32 +53,34 @@ one empirically meaningful number here.
 ### Invocation
 
 ```bash
-cd csr-engine
-cargo build --release --bin csr-engine
-python3 eval-kit/t4/replay.py \
-  --binary target/release/csr-engine \
-  --scratch-dir /path/to/scratch   # NEVER ~/.claude-self-reflect
+cd csr-engine && cargo build --release --bin csr-engine
+cd ../codewitness && cargo build --release
+target/release/codewitness bench \
+  --repo /path/to/claude-self-reflect \
+  --binary ../csr-engine/target/release/csr-engine \
+  --scratch-dir /path/to/scratch \
+  --out eval-kit/t4/results.json   # scratch dir: NEVER ~/.claude-self-reflect
 ```
 
-### Results (this run, `/Users/ramakrishnanannaswamy/projects/claude-self-reflect`, 17 tags in range → 13 sampled)
+### Results (run at `5d2bd81`, 17 tags in range → 13 sampled)
 
 | tag | beliefs | TP | FP | FN | TN | precision(stale) | recall(stale) | survival→v9.5.0 |
 |---|---|---|---|---|---|---|---|---|
-| v8.0.1 | 890 | 140 | 0 | 0 | 750 | 1.000 | 1.000 | 0.843 |
-| v8.0.3 | 890 | 140 | 0 | 0 | 750 | 1.000 | 1.000 | 0.843 |
-| v8.0.4 | 890 | 140 | 0 | 0 | 750 | 1.000 | 1.000 | 0.843 |
-| v8.0.5 | 890 | 140 | 0 | 0 | 750 | 1.000 | 1.000 | 0.843 |
-| v8.2.0 | 937 | 137 | 0 | 0 | 800 | 1.000 | 1.000 | 0.854 |
-| v8.3.0 | 995 | 125 | 0 | 0 | 870 | 1.000 | 1.000 | 0.874 |
-| v9.0.0 | 1076 | 104 | 0 | 0 | 972 | 1.000 | 1.000 | 0.903 |
-| v9.2.0 | 1535 | 121 | 0 | 0 | 1414 | 1.000 | 1.000 | 0.921 |
-| v9.3.0 | 1584 | 107 | 0 | 0 | 1477 | 1.000 | 1.000 | 0.932 |
-| v9.3.1 | 1892 | 69 | 0 | 0 | 1823 | 1.000 | 1.000 | 0.964 |
-| v9.4.1 | 1996 | 52 | 0 | 0 | 1944 | 1.000 | 1.000 | 0.974 |
+| v8.0.1 | 894 | 139 | 0 | 0 | 755 | 1.000 | 1.000 | 0.845 |
+| v8.0.3 | 894 | 139 | 0 | 0 | 755 | 1.000 | 1.000 | 0.845 |
+| v8.0.4 | 894 | 139 | 0 | 0 | 755 | 1.000 | 1.000 | 0.845 |
+| v8.0.5 | 894 | 139 | 0 | 0 | 755 | 1.000 | 1.000 | 0.845 |
+| v8.2.0 | 941 | 136 | 0 | 0 | 805 | 1.000 | 1.000 | 0.855 |
+| v8.3.0 | 999 | 124 | 0 | 0 | 875 | 1.000 | 1.000 | 0.876 |
+| v9.0.0 | 1081 | 104 | 0 | 0 | 977 | 1.000 | 1.000 | 0.904 |
+| v9.2.0 | 1540 | 120 | 0 | 0 | 1420 | 1.000 | 1.000 | 0.922 |
+| v9.3.0 | 1589 | 106 | 0 | 0 | 1483 | 1.000 | 1.000 | 0.933 |
+| v9.3.1 | 1898 | 68 | 0 | 0 | 1830 | 1.000 | 1.000 | 0.964 |
+| v9.4.1 | 2002 | 51 | 0 | 0 | 1951 | 1.000 | 1.000 | 0.975 |
 
 (v8.0.0 and v9.5.0 are the endpoints — excluded from the metrics table by
 definition, since "later tag" / "final tag" are undefined or trivial for
-them; both appear in the survival curve in `tierA_results.json`.)
+them; both appear in the survival curve in `results.json`.)
 
 Sampled tags → resolved commits: v8.0.0→624e7229, v8.0.1→34c541a6,
 v8.0.3→b06ea0ef, v8.0.4→fb9a8248, v8.0.5→e6ab788b, v8.2.0→366c51ca,
@@ -86,8 +89,7 @@ v9.3.1→f9a1997f, v9.4.1→10e894a5, v9.5.0→ef6d5d9d.
 
 **Reading it**: precision is 1.000 everywhere in this run — i.e. in this
 repo's actual history, no symbol's stamp changed at an intermediate sampled
-tag and then reverted to its original value by `v9.5.0`. That is a
-substantive (if convenient) empirical finding on its own: it is consistent
+tag and then reverted to its original value by `v9.5.0`. That is consistent
 with Tier B finding **zero** `Revert`-subject commits anywhere in this
 repo's reachable history (see below) — there is nothing here for the
 revert-noise failure mode to catch. The 1.0/1.0 result is not a tautology
@@ -95,14 +97,82 @@ of the metric (FP could be nonzero; it happens to be zero for this corpus)
 but it does mean this run alone can't demonstrate the precision gap the
 rule is designed to expose — a repo with real reverts would show
 precision < 1.0 on some tags. Survival rises monotonically with tag
-recency, from 0.843 at the oldest sampled tag to 1.0 at the final tag —
+recency, from 0.845 at the oldest sampled tag to 1.0 at the final tag —
 i.e. the older the belief, the less of it survives, as expected.
 
-Output: `tierA_results.json` (full detail incl. per-tag `gt_counts`/
-`pred_counts` 3-way breakdowns and the survival curve), `tierA_results.csv`
-(flat per-tag row).
+### H1 rematch — dream rule vs grep/recency baselines
 
-## Tier B — episode ancestry labels (`labels.py`)
+The rematch scores five classifiers on the **same 13,626 beliefs** from the
+11 intermediate tags and the same final-tag ground truth. The ground-truth
+vector is computed once; every arm consumes it through the same confusion-
+matrix scorer, with no arm-specific filtering. Beliefs, files, tags, and
+symbols are iterated in sorted order, and no LLM is used anywhere.
+
+- **dream/CSR** is the prediction rule above, unchanged.
+- **grep** predicts stale when the source-level symbol name is not a plain
+  substring of its file at `v9.5.0`, or when that file is gone. File content
+  comes only from `git show v9.5.0:<repo-relative-file>`, never the working
+  tree. Ledger-qualified methods use their final declared-name component for
+  both `Container::method` and `Container.method` forms, with any deterministic
+  `#N` collision suffix removed before matching.
+- **recency-N** predicts stale when the belief tag's committed date is
+  strictly more than N × 86,400 seconds before the final tag's committed
+  date. Dates are integer `%ct` commit timestamps from git; N is 30, 90, or
+  180.
+
+| arm | beliefs | TP | FP | TN | FN | precision(stale) | recall(stale) | F1(stale) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| dream/CSR | 13,626 | 1,265 | 0 | 12,361 | 0 | 1.000 | 1.000 | 1.000 |
+| grep | 13,626 | 20 | 0 | 12,361 | 1,245 | 1.000 | 0.016 | 0.031 |
+| recency-30 | 13,626 | 920 | 5,677 | 6,684 | 345 | 0.139 | 0.727 | 0.234 |
+| recency-90 | 13,626 | 556 | 3,020 | 9,341 | 709 | 0.155 | 0.440 | 0.230 |
+| recency-180 | 13,626 | 0 | 0 | 12,361 | 1,265 | 0.000 | 0.000 | 0.000 |
+
+**Corrections and honest reading.** Two defects in earlier runs of this
+harness were found by adversarial audit and are corrected here:
+
+1. *Unfair grep normalization* (withdrawn earlier): the original grep arm
+   handled `::`-qualified symbols but not dot-qualified Python/TypeScript/
+   JavaScript symbols; all 66 originally-reported grep false positives
+   disappear under fair normalization. The once-claimed dream-over-grep
+   *precision* gap is withdrawn.
+2. *Ground-truth extractor collision* (fixed at `5d2bd81`): the extractor
+   that mints witnessed symbols previously collapsed coexisting same-named
+   definitions (e.g. two `is_empty` methods on different types in one file)
+   into a single key before qualification, so both prediction and ground
+   truth were derived from partially-wrong labels. The fix keys extraction
+   by `(node, span, AST ordinal)`; this run's belief population grew from
+   13,575 to 13,626 and the stale count moved from 1,275 to 1,265. The
+   numbers above are from the corrected extractor.
+
+Grep is **precise but blind** here: its 20 stale predictions are all correct
+(precision 1.000), but it finds only 20 of 1,265 stale beliefs (recall
+0.016). The dream arm's later-snapshot scan includes the final tag, so its
+predicted-stale set is a superset of final-tag staleness and recall 1.000 is
+guaranteed **by construction**, not established empirically. F1 inherits
+that advantage; **precision is the real H1 comparison column**. Dream
+precision is also 1.000 in this corpus, but the corpus has zero observed
+revert commits, so the revert-driven false-positive mode never occurs. The
+honest conclusion is therefore that dream precision 1.000 is **unfalsified,
+not proven** by this run; meanwhile grep trades away nearly all recall to
+remain precise.
+
+Run baselines by default; pass `--skip-baselines` to retain only the
+dream/CSR arm in `arm_metrics`.
+
+### Determinism and provenance
+
+- `results.json` carries a `provenance` block: `repo_head_at_run` (the
+  benched repo's HEAD commit at run time), `binary_sha256` (exact stamper
+  binary), and per-tag stamping stats including captured stderr.
+- Rerunning the bench back-to-back produces **identical metrics**: hashing
+  the results with the `provenance` block removed gives the same SHA-256
+  across runs. The only bytes that differ between runs are the captured
+  stderr timing strings inside `provenance` (retained deliberately — the
+  subprocess contract requires stderr be kept, and startup timings vary).
+- `codewitness labels` output is byte-identical across runs.
+
+## Tier B — episode ancestry labels (`codewitness labels`)
 
 **Question**: of the commits that make up this repo's history, how many can
 be tied to a release, a revert, or a CSR conversation session — for free,
@@ -131,57 +201,29 @@ from git and the existing attribution tables, no new labeling?
 ### Invocation
 
 ```bash
-python3 eval-kit/t4/labels.py \
-  --repo /Users/ramakrishnanannaswamy/projects/claude-self-reflect \
-  --csr-db /Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db
+codewitness labels \
+  --repo /path/to/claude-self-reflect \
+  --csr-db ~/.claude-self-reflect/csr-engine.db \
+  --out eval-kit/t4/labels.json
 ```
 
-### Coverage (this run)
+### Coverage (run at `5d2bd81`)
 
 | metric | value |
 |---|---|
 | release tags | 140 (v1.0.0 → v9.5.0) |
-| commits reachable from HEAD | 546 |
-| labeled shipped or reverted | 540 (98.9%) |
+| commits reachable from HEAD | 558 |
+| labeled shipped or reverted | 540 (96.8%) |
 | — shipped | 540 |
 | — reverted | 0 |
-| — unreleased | 6 |
-| commits with session linkage | 60 (10.99%) |
+| — unreleased | 18 |
+| commits with session linkage | 60 (10.75%) |
 | commits with >1 candidate session (fan-out) | 40 |
 
-Output: `labels.csv` (`commit, release_tag, label, session_id`, one row per
-commit reachable from HEAD, in `git rev-list HEAD`'s deterministic order),
-`labels_summary.json` (coverage stats + full per-tag shipped-commit-count
-table for all 140 tags).
+The 18 unreleased commits are the open `feat/rmcp-3.1` branch work not yet
+claimed by any tag — expected while the branch is open; they will be
+claimed by the next release tag.
 
-## Caveats
-
-- **Zero reverts in this history**: this repo has no `Revert`-subject
-  commits, so Tier B's `reverted` label and Tier A's precision-gap failure
-  mode are both exercised by the code path but not by real data here — a
-  repo with actual reverts would be a better stress test for both.
-- **Session linkage denominator**: 10.99% of *all* reachable commits get a
-  session, not 10.99% of commits that plausibly could — docs-only, config,
-  CI, and vendored-file commits never touch a `code_nodes` span and so can
-  never join through `code_node_attribution`, whatever the DB's actual
-  attribution quality is. The honest number to trust for "how good is
-  attribution" is elsewhere (H4/H5/H6, see repo history); this just reports
-  what fraction of *raw git log* got linked.
-- **`git rev-list` history size**: 546 commits reachable from HEAD is far
-  smaller than "140 releases" might suggest — this repo's history was
-  squashed/rewritten around `v6.0.4` (251 commits land under that one tag
-  in `labels_summary.json`'s per-tag table); Tier B's ancestry walk handles
-  this correctly (it's a pure git-ancestry fact, not an assumption), but a
-  reader expecting one-commit-per-logical-change across the full 140-tag
-  span should know the early tags are historical waypoints on a
-  reconstructed/condensed history, not evidence the repo was that thin.
-- **`--tags-count 13` is a request, not a guarantee** when the in-range tag
-  count is close to it: `evenly_sample` returns `min(13, n)` distinct tags
-  by rounding linspace indices, so a tighter or wider release cadence
-  between the two endpoints you pick will change the exact count slightly
-  (it was exactly 13 for the 17 in-range tags used here).
-- Both scripts assume `git` on `PATH` and a `csr-engine` release binary
-  already built; Tier A additionally assumes `--repo` resolves cleanly for
-  every sampled tag (a resolve failure for one of *our own* release tags
-  is treated as a hard error, not a skip — unlike `stamp-spans --at`'s own
-  skip-per-repo behavior for arbitrary revs).
+Output artifacts in this directory: `results.json` (Tier A + H1 arms, full
+per-tag detail, survival curve, provenance), `labels.json` (Tier B per-commit
+labels + summary counts).

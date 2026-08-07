@@ -13,7 +13,6 @@ use sha2::{Digest, Sha256};
 const FIRST_TAG: &str = "v8.0.0";
 const LAST_TAG: &str = "v9.5.0";
 const RECENCY_DAYS: [i64; 3] = [30, 90, 180];
-const SOURCE_COMMIT: &str = "9738838";
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 
@@ -718,7 +717,7 @@ fn run_bench(options: BenchOptions) -> AppResult<()> {
         .collect();
     let results = json!({
         "provenance": {
-            "source_commit": SOURCE_COMMIT,
+            "repo_head_at_run": resolve_commit(&repo, "HEAD")?,
             "binary_sha256": sha256_file(&binary)?,
             "per_tag_stamping_stats": run_stats,
         },
