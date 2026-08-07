@@ -6,6 +6,12 @@ const DEFAULT_DECAY_WEIGHT: f64 = 0.3;
 /// Default half-life in days (score halves after this many days).
 const DEFAULT_SCALE_DAYS: f64 = 90.0;
 
+/// Each shipped release behind increases effective age by 25%.
+pub const ANCESTRY_RELEASE_STEP: f64 = 0.25;
+
+/// Release ancestry never lowers a surface's effective half-life below 25%.
+pub const ANCESTRY_MIN_HALF_LIFE_RATIO: f64 = 0.25;
+
 /// Apply time-based decay to a search score.
 ///
 /// Formula (identical to Python `decay_manager.py`):
@@ -21,6 +27,25 @@ pub fn apply_decay(
     scale_days: Option<f64>,
 ) -> f32 {
     apply_decay_with_age_multiplier(score, timestamp, now, decay_weight, scale_days, 1.0)
+}
+
+/// Apply wall-clock decay plus deterministic release ancestry. The neutral
+/// cases call [`apply_decay`] directly to preserve pre-change floating-point
+/// behavior exactly.
+pub fn apply_decay_with_release_ancestry(
+    score: f32,
+    timestamp: &DateTime<Utc>,
+    now: &DateTime<Utc>,
+    decay_weight: Option<f64>,
+    scale_days: Option<f64>,
+    releases_behind: Option<u32>,
+) -> f32 {
+    let multiplier = ancestry_age_multiplier(releases_behind);
+    if multiplier == 1.0 {
+        apply_decay(score, timestamp, now, decay_weight, scale_days)
+    } else {
+        apply_decay_with_age_multiplier(score, timestamp, now, decay_weight, scale_days, multiplier)
+    }
 }
 
 /// Apply time-based decay after multiplying the memory's effective age.
@@ -115,6 +140,35 @@ pub fn apply_tad(
     config: &DecayConfig,
 ) -> f32 {
     apply_tad_with_age_multiplier(score, timestamp, now, retrieval_events, config, 1.0)
+}
+
+/// Apply TAD plus deterministic release-ancestry decay. Missing labels,
+/// unreleased work (represented by `None`), and the newest release preserve
+/// the pre-change TAD path bit-for-bit.
+pub fn apply_tad_with_release_ancestry(
+    score: f32,
+    timestamp: &DateTime<Utc>,
+    now: &DateTime<Utc>,
+    retrieval_events: &[RetrievalEvent],
+    config: &DecayConfig,
+    releases_behind: Option<u32>,
+) -> f32 {
+    let multiplier = ancestry_age_multiplier(releases_behind);
+    if multiplier == 1.0 {
+        apply_tad(score, timestamp, now, retrieval_events, config)
+    } else {
+        apply_tad_with_age_multiplier(score, timestamp, now, retrieval_events, config, multiplier)
+    }
+}
+
+/// Equivalent to `1 / half_life_ratio`, capped so the effective half-life
+/// never drops below [`ANCESTRY_MIN_HALF_LIFE_RATIO`] of the surface default.
+pub fn ancestry_age_multiplier(releases_behind: Option<u32>) -> f64 {
+    let Some(releases_behind) = releases_behind.filter(|n| *n > 0) else {
+        return 1.0;
+    };
+    (1.0 + ANCESTRY_RELEASE_STEP * f64::from(releases_behind))
+        .min(1.0 / ANCESTRY_MIN_HALF_LIFE_RATIO)
 }
 
 /// Apply TAD after multiplying the memory's effective age. Reinforcement

@@ -387,6 +387,26 @@ pub fn run(conn: &Connection) -> Result<()> {
             ON code_node_attribution(node_id);",
     )?;
 
+    // TAD v2 release-ancestry cache. Only conversations backed by the exact
+    // transcript -> node -> git attribution join are stored here. The daemon
+    // replaces the cache atomically after walking release ancestry; retrieval
+    // performs only an indexed conversation-id lookup and never invokes git.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conversation_ancestry_cache (
+            conversation_id TEXT PRIMARY KEY,
+            state           TEXT NOT NULL CHECK(state IN ('shipped','unreleased')),
+            release_tag     TEXT,
+            releases_behind INTEGER NOT NULL CHECK(releases_behind >= 0),
+            repository      TEXT NOT NULL,
+            refreshed_at    TEXT NOT NULL,
+            CHECK(
+                (state = 'shipped' AND release_tag IS NOT NULL)
+                OR
+                (state = 'unreleased' AND release_tag IS NULL AND releases_behind = 0)
+            )
+        );",
+    )?;
+
     // Migration: ast_status column on code_graph_file_state (WP2 Stage 3, H8
     // innovation — receipt R4 in
     // `.plans/2026-07-31-codegraph-shipping-plan.md`). File-level provenance

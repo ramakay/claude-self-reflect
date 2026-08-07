@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -335,7 +335,7 @@ async fn reflect_gather_pass(
     // saw. The final sink/annotate step (mirroring
     // `apply_resolutions_before_limit`) reuses this same map.
     let queried_convs = distinct_conversation_ids_of_chunks(&chunks);
-    let mut validity = resolve_validity_with(storage, &queried_convs, partition_enabled);
+    let mut signals = CandidateSignals::load(storage, &queried_convs, partition_enabled);
     let queried_convs: HashSet<String> = queried_convs.into_iter().collect();
 
     let now = chrono::Utc::now();
@@ -352,46 +352,43 @@ async fn reflect_gather_pass(
     // candidates into the result set even though active forgetting is only
     // allowed to reorder the already-demoted section.
     let mut semantic_top_score = 0.0f32;
+    let mut ancestry_applied_ids = HashSet::new();
     let mut enriched: Vec<EnrichedResult> = chunk_results
         .iter()
         .filter_map(|r| {
             chunks.iter().find(|c| c.id == r.id).map(|c| {
-                let decayed_score =
-                    if let Ok(ts) = c.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
-                        let events = tad_events.get(&c.id).map(|v| v.as_slice()).unwrap_or(&[]);
-                        apply_chunk_decay(
-                            r.score,
-                            &ts,
-                            &now,
-                            events,
-                            &tad_config,
-                            &validity,
-                            &c.conversation_id,
-                            active_forgetting,
-                        )
-                    } else {
-                        r.score
-                    };
-                // Cross-project multiplicative penalty
-                let final_score = if let Some(p) = effective_project {
-                    if c.project_name != p {
-                        decayed_score * 0.3
-                    } else {
-                        decayed_score
-                    }
-                } else {
-                    decayed_score
-                };
-                let fallback_score =
-                    if active_forgetting && is_demote_channel(&validity, &c.conversation_id) {
-                        if effective_project.is_some_and(|p| c.project_name != p) {
-                            r.score * 0.3
-                        } else {
-                            r.score
-                        }
-                    } else {
-                        final_score
-                    };
+                let events = tad_events.get(&c.id).map(|v| v.as_slice()).unwrap_or(&[]);
+                let (final_score, ancestry_applied) = score_chunk_candidate(
+                    r.score,
+                    c,
+                    &now,
+                    events,
+                    &tad_config,
+                    &signals.validity,
+                    signals.ancestry.get(&c.conversation_id),
+                    active_forgetting,
+                    effective_project,
+                );
+                if ancestry_applied {
+                    ancestry_applied_ids.insert(c.id.clone());
+                }
+                // FTS membership is decided from the pre-opt-in score:
+                // ordinary wall-clock TAD for valid/annotated chunks and
+                // the historical raw score for Demote chunks. Neither
+                // release ancestry nor active forgetting may expand the
+                // candidate set merely by crossing the fallback threshold.
+                let fallback_score = score_chunk_candidate(
+                    r.score,
+                    c,
+                    &now,
+                    events,
+                    &tad_config,
+                    &signals.validity,
+                    None,
+                    false,
+                    effective_project,
+                )
+                .0;
                 semantic_top_score = semantic_top_score.max(fallback_score);
                 EnrichedResult {
                     score: final_score,
@@ -402,6 +399,7 @@ async fn reflect_gather_pass(
             })
         })
         .collect();
+    let semantic_count = enriched.len();
 
     // Batch-fetch TAD events for reflection results
     let reflection_ids_for_tad: Vec<&str> =
@@ -489,40 +487,49 @@ async fn reflect_gather_pass(
                 .into_iter()
                 .filter(|c| !queried_convs.contains(c))
                 .collect();
-            validity.extend(resolve_validity_with(
-                storage,
-                &extra_convs,
-                partition_enabled,
-            ));
+            let ancestry_revoked = signals.extend(storage, &extra_convs, partition_enabled);
+            if ancestry_revoked {
+                // Semantic scores were computed before the FTS-only validity
+                // batch existed. Replay exactly those candidates without
+                // ancestry so a failed later batch disables the signal for
+                // the entire search pass, not just the appended candidates.
+                ancestry_applied_ids.clear();
+                for result in enriched.iter_mut().take(semantic_count) {
+                    let Some(raw) = chunk_results.iter().find(|raw| raw.id == result.chunk.id)
+                    else {
+                        continue;
+                    };
+                    let events = tad_events
+                        .get(&result.chunk.id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    result.score = score_chunk_candidate(
+                        raw.score,
+                        &result.chunk,
+                        &now,
+                        events,
+                        &tad_config,
+                        &signals.validity,
+                        None,
+                        active_forgetting,
+                        effective_project,
+                    )
+                    .0;
+                }
+            }
             for chunk in appended {
                 // FTS5 results get a synthetic score slightly below semantic threshold
                 // so they rank after good semantic matches but above nothing
-                let demoted = is_demote_channel(&validity, &chunk.conversation_id);
-                let fts_score = if demoted && !active_forgetting {
-                    // Default-off byte fidelity: preserve the v10 no-stacking
-                    // path exactly unless active forgetting is opted in.
-                    0.45
-                } else if let Ok(ts) = chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
-                    let age_multiplier = if demoted {
-                        ACTIVE_FORGETTING_DECAY_FACTOR
-                    } else {
-                        1.0
-                    };
-                    decay::apply_decay_with_age_multiplier(
-                        0.45,
-                        &ts,
-                        &now,
-                        None,
-                        None,
-                        age_multiplier,
-                    )
-                } else {
-                    if demoted {
-                        0.45
-                    } else {
-                        0.40
-                    }
-                };
+                let (fts_score, ancestry_applied) = score_fts_candidate(
+                    &chunk,
+                    &now,
+                    &signals.validity,
+                    signals.ancestry.get(&chunk.conversation_id),
+                    active_forgetting,
+                );
+                if ancestry_applied {
+                    ancestry_applied_ids.insert(chunk.id.clone());
+                }
                 let final_fts_score = if let Some(p) = effective_project {
                     if chunk.project_name != p {
                         fts_score * 0.3
@@ -563,7 +570,7 @@ async fn reflect_gather_pass(
     // is still the authoritative, independently-testable guarantee.
     let candidates: Vec<crate::search::rerank::RankCandidate> = enriched
         .iter()
-        .filter(|e| !is_demote_channel(&validity, &e.chunk.conversation_id))
+        .filter(|e| !is_demote_channel(&signals.validity, &e.chunk.conversation_id))
         .map(|e| crate::search::rerank::RankCandidate {
             id: e.chunk.id.clone(),
             cosine: e.score,
@@ -599,9 +606,18 @@ async fn reflect_gather_pass(
         .collect();
     format::dedupe_plan_origins(&mut enriched, &origin_of);
 
+    let ancestry_candidates_used = enriched
+        .iter()
+        .filter(|result| ancestry_applied_ids.contains(&result.chunk.id))
+        .count();
+    tracing::debug!(
+        ancestry_candidates_used,
+        "release ancestry applied to search candidates"
+    );
+
     Ok(GatherPass {
         enriched,
-        validity,
+        validity: signals.validity,
         window_full,
         search_ms,
     })
@@ -1389,6 +1405,7 @@ fn enrich_results_with_active_forgetting(
                         &tad_config,
                         &validity,
                         &e.chunk.conversation_id,
+                        None,
                         true,
                     );
                 }
@@ -1451,9 +1468,74 @@ fn fetch_enrich_partition_adaptive(
 /// not per-chunk, so this cannot be narrower); else Annotate if any hit is
 /// Annotate-only. `note` is the exact search-facing annotation string.
 #[derive(Debug, Clone)]
-struct ConvValidity {
-    demote: bool,
-    note: String,
+pub(crate) struct ConvValidity {
+    pub(crate) demote: bool,
+    pub(crate) note: String,
+}
+
+/// Signals that may influence one search pass. Release ancestry is trusted
+/// only when the validity batch covering the same candidates completed: if
+/// that read fails, the existing validity partition still fails open, while
+/// ancestry fails neutral so an unknown Demote channel cannot be stacked.
+#[derive(Default)]
+struct CandidateSignals {
+    validity: HashMap<String, ConvValidity>,
+    ancestry: HashMap<String, crate::storage::ancestry::AncestryLabel>,
+    ancestry_allowed: bool,
+}
+
+impl CandidateSignals {
+    fn load(storage: &Arc<Storage>, conversation_ids: &[String], enabled: bool) -> Self {
+        if !enabled {
+            return Self::default();
+        }
+        let Ok(validity) = resolve_validity_checked(storage, conversation_ids, enabled) else {
+            return Self::default();
+        };
+        Self {
+            validity,
+            ancestry: storage
+                .ancestry_labels_for_conversations(conversation_ids)
+                .unwrap_or_default(),
+            ancestry_allowed: true,
+        }
+    }
+
+    /// Extend the same search pass for FTS-only conversations. Once any
+    /// validity batch is unreliable, clear all ancestry already loaded for
+    /// the pass and keep it disabled; semantic candidates must not retain a
+    /// demotion signal that FTS candidates were denied for the same failure.
+    fn extend(
+        &mut self,
+        storage: &Arc<Storage>,
+        conversation_ids: &[String],
+        enabled: bool,
+    ) -> bool {
+        let ancestry_was_allowed = self.ancestry_allowed;
+        if !enabled {
+            self.validity.clear();
+            self.ancestry.clear();
+            self.ancestry_allowed = false;
+            return ancestry_was_allowed;
+        }
+        match resolve_validity_checked(storage, conversation_ids, enabled) {
+            Ok(validity) => {
+                self.validity.extend(validity);
+                if self.ancestry_allowed {
+                    self.ancestry.extend(
+                        storage
+                            .ancestry_labels_for_conversations(conversation_ids)
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            Err(_) => {
+                self.ancestry.clear();
+                self.ancestry_allowed = false;
+            }
+        }
+        ancestry_was_allowed && !self.ancestry_allowed
+    }
 }
 
 /// Distinct `conversation_id`s across `enriched`, first-seen order (order is
@@ -1521,12 +1603,41 @@ fn resolve_validity_with(
     conversation_ids: &[String],
     enabled: bool,
 ) -> HashMap<String, ConvValidity> {
+    resolve_validity_checked(storage, conversation_ids, enabled).unwrap_or_default()
+}
+
+/// Reliability-preserving core for consumers that combine validity with a
+/// second rank-affecting signal. The ordinary partition wrapper above keeps
+/// its historical fail-open map, while ancestry-aware paths can distinguish
+/// a trustworthy empty verdict batch from a failed read.
+fn resolve_validity_checked(
+    storage: &Arc<Storage>,
+    conversation_ids: &[String],
+    enabled: bool,
+) -> Result<HashMap<String, ConvValidity>> {
     if !enabled || conversation_ids.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
-    let hits = storage
-        .witness_verdicts_for_conversations(conversation_ids)
-        .unwrap_or_default();
+    let hits = storage.witness_verdicts_for_conversations(conversation_ids)?;
+    Ok(reduce_validity_hits(hits))
+}
+
+/// Prompt-submit needs the same Demote predicate before applying release
+/// ancestry. Unlike the normal validity path, preserve storage failure so
+/// prompt scoring can fail open to no ancestry rather than risk stacking.
+pub(crate) fn resolve_validity_for_ancestry(
+    storage: &Arc<Storage>,
+    conversation_ids: &[String],
+) -> Option<HashMap<String, ConvValidity>> {
+    if !validity_partition_enabled() {
+        return None;
+    }
+    resolve_validity_checked(storage, conversation_ids, true).ok()
+}
+
+fn reduce_validity_hits(
+    hits: BTreeMap<String, Vec<ChunkWitnessVerdict>>,
+) -> HashMap<String, ConvValidity> {
     hits.into_iter()
         .filter_map(|(conv, list)| {
             let chosen = list
@@ -1576,8 +1687,100 @@ fn short_oid(oid: &str) -> &str {
 /// "is this chunk about to be structurally demoted", rather than three
 /// independently-maintained copies of the same `.get(...).is_some_and(...)`
 /// check).
-fn is_demote_channel(validity: &HashMap<String, ConvValidity>, conv_id: &str) -> bool {
+pub(crate) fn is_demote_channel(validity: &HashMap<String, ConvValidity>, conv_id: &str) -> bool {
     validity.get(conv_id).is_some_and(|v| v.demote)
+}
+
+/// Score one semantic chunk from its raw similarity. Keeping this operation
+/// in one helper lets an FTS validity failure replay semantic scoring with no
+/// ancestry rather than leaving already-applied release decay behind.
+#[allow(clippy::too_many_arguments)]
+fn score_chunk_candidate(
+    score: f32,
+    chunk: &crate::import::ConversationChunk,
+    now: &chrono::DateTime<chrono::Utc>,
+    events: &[decay::RetrievalEvent],
+    config: &decay::DecayConfig,
+    validity: &HashMap<String, ConvValidity>,
+    ancestry: Option<&crate::storage::ancestry::AncestryLabel>,
+    active_forgetting: bool,
+    effective_project: Option<&str>,
+) -> (f32, bool) {
+    let mut ancestry_applied = false;
+    let ancestry = (!crate::search::rerank::is_scaffold_text(&chunk.content))
+        .then_some(ancestry)
+        .flatten();
+    let decayed_score =
+        if let Ok(timestamp) = chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
+            ancestry_applied = !is_demote_channel(validity, &chunk.conversation_id)
+                && timestamp < *now
+                && ancestry
+                    .and_then(|label| label.releases_behind_for_decay())
+                    .is_some_and(|releases| releases > 0);
+            apply_chunk_decay(
+                score,
+                &timestamp,
+                now,
+                events,
+                config,
+                validity,
+                &chunk.conversation_id,
+                ancestry,
+                active_forgetting,
+            )
+        } else {
+            score
+        };
+    let final_score = if effective_project.is_some_and(|p| chunk.project_name != p) {
+        decayed_score * 0.3
+    } else {
+        decayed_score
+    };
+    (final_score, ancestry_applied)
+}
+
+fn score_fts_candidate(
+    chunk: &crate::import::ConversationChunk,
+    now: &chrono::DateTime<chrono::Utc>,
+    validity: &HashMap<String, ConvValidity>,
+    ancestry: Option<&crate::storage::ancestry::AncestryLabel>,
+    active_forgetting: bool,
+) -> (f32, bool) {
+    let demoted = is_demote_channel(validity, &chunk.conversation_id);
+    if demoted && !active_forgetting {
+        return (0.45, false);
+    }
+    let Ok(timestamp) = chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() else {
+        return (if demoted { 0.45 } else { 0.40 }, false);
+    };
+    if demoted {
+        return (
+            decay::apply_decay_with_age_multiplier(
+                0.45,
+                &timestamp,
+                now,
+                None,
+                None,
+                ACTIVE_FORGETTING_DECAY_FACTOR,
+            ),
+            false,
+        );
+    }
+    let releases_behind = (!crate::search::rerank::is_scaffold_text(&chunk.content))
+        .then(|| ancestry.and_then(|label| label.releases_behind_for_decay()))
+        .flatten();
+    let ancestry_applied = timestamp < *now && releases_behind.is_some_and(|releases| releases > 0);
+    (
+        decay::apply_decay_with_release_ancestry(
+            0.45,
+            &timestamp,
+            now,
+            None,
+            None,
+            releases_behind,
+        ),
+        ancestry_applied,
+    )
 }
 
 /// Apply the existing search TAD policy, with one opt-in exception: a
@@ -1593,6 +1796,7 @@ fn apply_chunk_decay(
     config: &decay::DecayConfig,
     validity: &HashMap<String, ConvValidity>,
     conv_id: &str,
+    ancestry: Option<&crate::storage::ancestry::AncestryLabel>,
     active_forgetting: bool,
 ) -> f32 {
     if is_demote_channel(validity, conv_id) {
@@ -1608,7 +1812,14 @@ fn apply_chunk_decay(
             ACTIVE_FORGETTING_DECAY_FACTOR,
         );
     }
-    decay::apply_tad(score, timestamp, now, events, config)
+    decay::apply_tad_with_release_ancestry(
+        score,
+        timestamp,
+        now,
+        events,
+        config,
+        ancestry.and_then(|label| label.releases_behind_for_decay()),
+    )
 }
 
 /// Apply the resolved [`ConvValidity`] decision over already-scored/reranked
@@ -1850,6 +2061,7 @@ mod tests {
             &decay::DecayConfig::for_search(),
             &validity,
             "conv-demoted",
+            None,
             false,
         );
 
@@ -1889,6 +2101,7 @@ mod tests {
             &config,
             &validity,
             "conv-demoted",
+            None,
             true,
         );
         let clean = apply_chunk_decay(
@@ -1899,10 +2112,254 @@ mod tests {
             &config,
             &validity,
             "conv-clean",
+            None,
             true,
         );
 
         assert!(demoted < clean, "demoted={demoted}, clean={clean}");
+    }
+
+    #[test]
+    fn verdict_partitioned_chunk_does_not_stack_ancestry_decay() {
+        use crate::storage::ancestry::{AncestryLabel, AncestryState};
+
+        let now = chrono::Utc::now();
+        let past = now - chrono::Duration::days(30);
+        let config = decay::DecayConfig::for_search();
+        let validity: HashMap<String, ConvValidity> =
+            [("conv-demoted".to_string(), demote_validity("stale"))]
+                .into_iter()
+                .collect();
+        let label = AncestryLabel {
+            conversation_id: "conv-demoted".into(),
+            state: AncestryState::Shipped,
+            release_tag: Some("v1.0.0".into()),
+            releases_behind: 5,
+            repository: "/repo".into(),
+            refreshed_at: "2026-08-06T12:00:00Z".into(),
+        };
+
+        let expected = decay::apply_tad_with_age_multiplier(
+            0.9,
+            &past,
+            &now,
+            &[],
+            &config,
+            ACTIVE_FORGETTING_DECAY_FACTOR,
+        );
+        let actual = apply_chunk_decay(
+            0.9,
+            &past,
+            &now,
+            &[],
+            &config,
+            &validity,
+            "conv-demoted",
+            Some(&label),
+            true,
+        );
+
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn semantic_scaffold_suppresses_ancestry_and_neutral_paths_are_bit_identical() {
+        use crate::storage::ancestry::{AncestryLabel, AncestryState};
+
+        let now = chrono::Utc::now();
+        let mut chunk = enriched_result_conv("scaffold", "conv-scaffold", 0.9, 0).chunk;
+        chunk.timestamp = (now - chrono::Duration::days(30)).to_rfc3339();
+        chunk.content = "<command-message>quoted workflow</command-message>".into();
+        let config = decay::DecayConfig::for_search();
+        let label = |releases_behind| AncestryLabel {
+            conversation_id: "conv-scaffold".into(),
+            state: AncestryState::Shipped,
+            release_tag: Some("v1.0.0".into()),
+            releases_behind,
+            repository: "/repo".into(),
+            refreshed_at: now.to_rfc3339(),
+        };
+        let timestamp = chunk.timestamp.parse().unwrap();
+        let pre_change = decay::apply_tad(0.9, &timestamp, &now, &[], &config);
+        let missing = score_chunk_candidate(
+            0.9,
+            &chunk,
+            &now,
+            &[],
+            &config,
+            &HashMap::new(),
+            None,
+            false,
+            None,
+        );
+        let current_release = label(0);
+        let current = score_chunk_candidate(
+            0.9,
+            &chunk,
+            &now,
+            &[],
+            &config,
+            &HashMap::new(),
+            Some(&current_release),
+            false,
+            None,
+        );
+        let shipped_release = label(5);
+        let shipped = score_chunk_candidate(
+            0.9,
+            &chunk,
+            &now,
+            &[],
+            &config,
+            &HashMap::new(),
+            Some(&shipped_release),
+            false,
+            None,
+        );
+
+        assert_eq!(missing.0.to_bits(), pre_change.to_bits());
+        assert_eq!(current.0.to_bits(), pre_change.to_bits());
+        assert_eq!(shipped.0.to_bits(), pre_change.to_bits());
+        assert!(!missing.1 && !current.1 && !shipped.1);
+
+        chunk.content = "organic conversation".into();
+        let organic_pre_change = decay::apply_tad(0.9, &timestamp, &now, &[], &config);
+        let organic_missing = score_chunk_candidate(
+            0.9,
+            &chunk,
+            &now,
+            &[],
+            &config,
+            &HashMap::new(),
+            None,
+            false,
+            None,
+        );
+        let organic_current = score_chunk_candidate(
+            0.9,
+            &chunk,
+            &now,
+            &[],
+            &config,
+            &HashMap::new(),
+            Some(&current_release),
+            false,
+            None,
+        );
+        assert_eq!(organic_missing.0.to_bits(), organic_pre_change.to_bits());
+        assert_eq!(organic_current.0.to_bits(), organic_pre_change.to_bits());
+    }
+
+    #[test]
+    fn fts_scoring_none_and_current_release_match_pre_ancestry_bits() {
+        use crate::storage::ancestry::{AncestryLabel, AncestryState};
+
+        let now = chrono::Utc::now();
+        let mut chunk = enriched_result_conv("fts", "conv-fts", 0.45, 0).chunk;
+        chunk.timestamp = (now - chrono::Duration::days(30)).to_rfc3339();
+        chunk.content = "zebraquark organic conversation".into();
+        let timestamp = chunk.timestamp.parse().unwrap();
+        let current_release = AncestryLabel {
+            conversation_id: "conv-fts".into(),
+            state: AncestryState::Shipped,
+            release_tag: Some("v-current".into()),
+            releases_behind: 0,
+            repository: "/repo".into(),
+            refreshed_at: now.to_rfc3339(),
+        };
+
+        let pre_change = decay::apply_decay(0.45, &timestamp, &now, None, None);
+        let missing = score_fts_candidate(&chunk, &now, &HashMap::new(), None, false);
+        let current =
+            score_fts_candidate(&chunk, &now, &HashMap::new(), Some(&current_release), false);
+
+        assert_eq!(missing.0.to_bits(), pre_change.to_bits());
+        assert_eq!(current.0.to_bits(), pre_change.to_bits());
+        assert!(!missing.1 && !current.1);
+    }
+
+    #[test]
+    fn validity_read_failure_disables_ancestry_score_effect() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let refreshed_at = chrono::Utc::now().to_rfc3339();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO conversation_ancestry_cache
+                     (conversation_id, state, release_tag, releases_behind, repository, refreshed_at)
+                     VALUES
+                       ('conv-demoted', 'shipped', 'v1.0.0', 5, '/repo', ?1),
+                       ('conv-fts', 'shipped', 'v1.0.0', 5, '/repo', ?1)",
+                    [&refreshed_at],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let conversation_ids = vec!["conv-demoted".to_string()];
+        let mut signals = CandidateSignals::load(&storage, &conversation_ids, true);
+        assert!(signals.ancestry.contains_key("conv-demoted"));
+        let now = "2026-08-06T12:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let mut chunk = enriched_result_conv("candidate", "conv-demoted", 0.9, 0).chunk;
+        chunk.timestamp = (now - chrono::Duration::days(30)).to_rfc3339();
+        let config = decay::DecayConfig::for_search();
+        let (ancestry_score, ancestry_applied) = score_chunk_candidate(
+            0.9,
+            &chunk,
+            &now,
+            &[],
+            &config,
+            &signals.validity,
+            signals.ancestry.get("conv-demoted"),
+            false,
+            None,
+        );
+        assert!(ancestry_applied);
+
+        storage
+            .with_connection(|conn| {
+                // The validity resolver starts from code_nodes. Removing it
+                // gives us a real SQLite read failure while leaving the
+                // independently cached ancestry label readable.
+                conn.execute_batch("DROP TABLE code_nodes")?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(storage
+            .witness_verdicts_for_conversations(&conversation_ids)
+            .is_err());
+
+        let ancestry_revoked = signals.extend(&storage, &["conv-fts".to_string()], true);
+        assert!(ancestry_revoked);
+        assert!(
+            signals.ancestry.is_empty(),
+            "an FTS validity failure must clear semantic ancestry for the whole pass"
+        );
+
+        let (actual, ancestry_applied) = score_chunk_candidate(
+            0.9,
+            &chunk,
+            &now,
+            &[],
+            &config,
+            &signals.validity,
+            signals.ancestry.get("conv-demoted"),
+            false,
+            None,
+        );
+        let timestamp = chunk
+            .timestamp
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let expected = decay::apply_tad(0.9, &timestamp, &now, &[], &config);
+        assert!(!ancestry_applied);
+        assert!(ancestry_score < actual);
+        assert_eq!(actual.to_bits(), expected.to_bits());
+
+        let failed_initial = CandidateSignals::load(&storage, &conversation_ids, true);
+        assert!(failed_initial.validity.is_empty());
+        assert!(failed_initial.ancestry.is_empty());
     }
 
     #[test]
@@ -1923,6 +2380,7 @@ mod tests {
             &config,
             &validity,
             "conv-annotated",
+            None,
             true,
         );
         let clean = apply_chunk_decay(
@@ -1933,6 +2391,7 @@ mod tests {
             &config,
             &validity,
             "conv-clean",
+            None,
             true,
         );
 
@@ -2065,8 +2524,27 @@ mod tests {
         // parameter, not by mutating the real env var — see
         // `resolve_validity_with`'s doc on why (parallel test races).
         let storage = Arc::new(Storage::open_memory().unwrap());
+        let refreshed_at = chrono::Utc::now().to_rfc3339();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO conversation_ancestry_cache
+                     (conversation_id, state, release_tag, releases_behind, repository, refreshed_at)
+                     VALUES ('conv-1', 'shipped', 'v1.0.0', 5, '/repo', ?1)",
+                    [&refreshed_at],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         let out = resolve_validity_with(&storage, &["conv-1".to_string()], false);
         assert!(out.is_empty());
+        let signals = CandidateSignals::load(&storage, &["conv-1".to_string()], false);
+        assert!(signals.validity.is_empty());
+        assert!(
+            signals.ancestry.is_empty(),
+            "without a validity batch, the kill switch must also disable ancestry"
+        );
+        assert!(!signals.ancestry_allowed);
     }
 
     #[test]
@@ -2544,6 +3022,164 @@ mod tests {
             engine.insert_chunk(chunk.id.clone(), vector.clone());
         }
         (storage, Arc::new(RwLock::new(engine)))
+    }
+
+    #[tokio::test]
+    async fn e2e_ancestry_cannot_activate_fts_when_fts_validity_batch_fails() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let now = chrono::Utc::now();
+        let semantic = crate::import::ConversationChunk {
+            id: "chunk-semantic".into(),
+            conversation_id: "conv-semantic".into(),
+            project_name: "testproj".into(),
+            timestamp: (now - chrono::Duration::days(300)).to_rfc3339(),
+            content: "semantic candidate above the fallback threshold".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let keyword = crate::import::ConversationChunk {
+            id: "chunk-fts-failure".into(),
+            conversation_id: "conv-fts-failure".into(),
+            project_name: "testproj".into(),
+            timestamp: now.to_rfc3339(),
+            content: "zebraquark fallback candidate".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 1,
+            is_sidechain: false,
+        };
+        let semantic_vec = vec![0.7, 0.714_142_86, 0.0, 0.0];
+        let keyword_vec = vec![0.0, 0.0, 1.0, 0.0];
+        storage.insert_chunk(&semantic, &semantic_vec).unwrap();
+        storage.insert_chunk(&keyword, &keyword_vec).unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO conversation_ancestry_cache
+                     (conversation_id, state, release_tag, releases_behind, repository, refreshed_at)
+                     VALUES ('conv-semantic', 'shipped', 'v1.0.0', 100, '/repo', ?1)",
+                    [now.to_rfc3339()],
+                )?;
+                // Only the FTS conversation selects this row. SQLite accepts
+                // the malformed integer dynamically; NodeRow decoding then
+                // supplies a real read error for the second validity batch.
+                conn.execute(
+                    "INSERT INTO code_nodes
+                     (id, file, kind, name, span_start, span_end,
+                      first_conv_id, last_conv_id)
+                     VALUES ('bad-fts-node', '/repo/src/bad.rs', 'function',
+                             'bad', 'not-an-integer', 1,
+                             'conv-fts-failure', 'conv-fts-failure')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut engine = SearchEngine::new(16);
+        engine.insert_chunk(semantic.id.clone(), semantic_vec);
+        engine.insert_chunk(keyword.id.clone(), keyword_vec);
+        let search = Arc::new(RwLock::new(engine));
+
+        let out = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "zebraquark",
+            3,
+            0.1,
+            Some("all"),
+            0,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("<id>chunk-semantic</id>"), "{out}");
+        assert!(
+            !out.contains("chunk-fts-failure"),
+            "ancestry must not activate FTS when that pass cannot verify validity:\n{out}"
+        );
+    }
+
+    async fn render_fts_candidate(content: &str, ancestry_releases: Option<u32>) -> String {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let now = chrono::Utc::now();
+        let chunk = crate::import::ConversationChunk {
+            id: "chunk-fts-scaffold".into(),
+            conversation_id: "conv-fts-scaffold".into(),
+            project_name: "testproj".into(),
+            timestamp: (now - chrono::Duration::days(30)).to_rfc3339(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let vector = vec![0.0, 1.0];
+        storage.insert_chunk(&chunk, &vector).unwrap();
+        if let Some(releases) = ancestry_releases {
+            storage
+                .with_connection(|conn| {
+                    conn.execute(
+                        "INSERT INTO conversation_ancestry_cache
+                         (conversation_id, state, release_tag, releases_behind,
+                          repository, refreshed_at)
+                         VALUES ('conv-fts-scaffold', 'shipped', 'v1.0.0', ?1,
+                                 '/repo', ?2)",
+                        rusqlite::params![releases, now.to_rfc3339()],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let mut engine = SearchEngine::new(8);
+        engine.insert_chunk(chunk.id.clone(), vector);
+
+        reflect_on_past_with_vec(
+            &storage,
+            &Arc::new(RwLock::new(engine)),
+            &[1.0, 0.0],
+            "zebraquark",
+            1,
+            0.1,
+            Some("all"),
+            0,
+            true,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fts_scaffold_suppresses_ancestry_and_neutral_paths_are_bit_identical() {
+        let scaffold = "<command-message>zebraquark quoted workflow</command-message>";
+        let pre_change = render_fts_candidate(scaffold, None).await;
+        let current_release = render_fts_candidate(scaffold, Some(0)).await;
+        let shipped = render_fts_candidate(scaffold, Some(5)).await;
+
+        assert_eq!(
+            rendered_result(&current_release, "chunk-fts-scaffold"),
+            rendered_result(&pre_change, "chunk-fts-scaffold")
+        );
+        assert_eq!(
+            rendered_result(&shipped, "chunk-fts-scaffold"),
+            rendered_result(&pre_change, "chunk-fts-scaffold")
+        );
+
+        let organic = "zebraquark organic conversation";
+        let organic_pre_change = render_fts_candidate(organic, None).await;
+        let organic_current = render_fts_candidate(organic, Some(0)).await;
+        assert_eq!(
+            rendered_result(&organic_current, "chunk-fts-scaffold"),
+            rendered_result(&organic_pre_change, "chunk-fts-scaffold")
+        );
     }
 
     fn rendered_result<'a>(output: &'a str, id: &str) -> &'a str {

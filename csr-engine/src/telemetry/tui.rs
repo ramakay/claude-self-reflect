@@ -395,6 +395,7 @@ mod tests {
             },
             demoted_symbols: 3,
             witnesses_ledgered: 17,
+            ancestry_cached_conversations: 9,
             last_daemon_run: Some("2026-08-06T10:00:00Z".into()),
             next_due: Some("2026-08-06T18:00:00Z".into()),
         };

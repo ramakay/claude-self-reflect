@@ -29,6 +29,8 @@ pub enum Signal {
     ErrorPatternMatch(f32),
     /// Session continuity boost — result is from the immediately prior session.
     ContinuityBoost(f32),
+    /// Release-tier ancestry tightened the chunk's recency half-life.
+    AncestryDecay(u32),
 }
 
 /// Raw result from HNSW search, before scoring.
@@ -74,6 +76,27 @@ pub fn rank_results_with_continuity(
     phase: Option<super::weights::HookPhase>,
     continued_session_id: Option<&str>,
 ) -> Vec<ScoredResult> {
+    rank_results_with_continuity_and_ancestry(
+        results,
+        current_files,
+        current_errors,
+        phase,
+        continued_session_id,
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// Prompt-submit ranking with precomputed release ancestry. The map is keyed
+/// by conversation id and is populated only for chunk results; reflections
+/// retain their existing recency behavior.
+pub fn rank_results_with_continuity_and_ancestry(
+    results: Vec<RawResult>,
+    current_files: &[String],
+    current_errors: &[String],
+    phase: Option<super::weights::HookPhase>,
+    continued_session_id: Option<&str>,
+    ancestry_releases: &std::collections::HashMap<String, u32>,
+) -> Vec<ScoredResult> {
     let weights = phase
         .map(super::weights::WeightProfile::for_phase)
         .unwrap_or(super::weights::WeightProfile::for_phase(
@@ -86,7 +109,22 @@ pub fn rank_results_with_continuity(
         .map(|r| {
             let is_continued = continued_session_id.is_some()
                 && r.conversation_id.as_deref() == continued_session_id;
-            let mut result = score_result(r, current_files, current_errors, &weights, phase);
+            let releases_behind = if crate::search::rerank::is_scaffold_text(&r.content) {
+                None
+            } else {
+                r.conversation_id
+                    .as_ref()
+                    .and_then(|id| ancestry_releases.get(id))
+                    .copied()
+            };
+            let mut result = score_result(
+                r,
+                current_files,
+                current_errors,
+                &weights,
+                phase,
+                releases_behind,
+            );
             if is_continued {
                 result
                     .signals
@@ -115,6 +153,7 @@ fn score_result(
     current_errors: &[String],
     weights: &super::weights::WeightProfile,
     phase: super::weights::HookPhase,
+    ancestry_releases_behind: Option<u32>,
 ) -> ScoredResult {
     let mut signals = Vec::new();
 
@@ -123,8 +162,13 @@ fn score_result(
     signals.push(Signal::SemanticMatch(semantic));
 
     // 2. Recency boost (0.0-1.0 based on age)
-    let recency = compute_recency_boost(result.timestamp.as_deref());
+    let (recency, ancestry_applied) =
+        compute_recency_boost_with_ancestry(result.timestamp.as_deref(), ancestry_releases_behind);
     signals.push(Signal::RecencyBoost(recency));
+    if ancestry_applied {
+        let releases = ancestry_releases_behind.expect("applied ancestry has a release distance");
+        signals.push(Signal::AncestryDecay(releases));
+    }
 
     // 3. File overlap (fraction of current files mentioned in result)
     let file_overlap = compute_file_overlap(&result.files, current_files);
@@ -171,22 +215,46 @@ pub fn apply_outcome_multiplier(base_score: f32, successes: i64, failures: i64) 
 /// Uses formula: 2^(-age_days / 14) — halves every 14 days (steeper decay).
 /// Previous: 30-day half-life let 3-month-old results dominate on semantic alone.
 /// Now: 14d=0.5, 30d=0.23, 60d=0.05 — stale content gets crushed.
-fn compute_recency_boost(timestamp: Option<&str>) -> f32 {
+fn compute_recency_boost_with_ancestry(
+    timestamp: Option<&str>,
+    releases_behind: Option<u32>,
+) -> (f32, bool) {
+    compute_recency_outcome_at(timestamp, &chrono::Utc::now(), releases_behind)
+}
+
+#[cfg(test)]
+fn compute_recency_boost_at(
+    timestamp: Option<&str>,
+    now: &chrono::DateTime<chrono::Utc>,
+    releases_behind: Option<u32>,
+) -> f32 {
+    compute_recency_outcome_at(timestamp, now, releases_behind).0
+}
+
+fn compute_recency_outcome_at(
+    timestamp: Option<&str>,
+    now: &chrono::DateTime<chrono::Utc>,
+    releases_behind: Option<u32>,
+) -> (f32, bool) {
     let ts = match timestamp {
         Some(ts) => ts,
-        None => return 0.5, // No timestamp → neutral boost
+        None => return (0.5, false), // No timestamp → neutral boost
     };
 
     let parsed = match crate::temporal::parse_timestamp(ts) {
         Some(dt) => dt,
-        None => return 0.5,
+        None => return (0.5, false),
     };
 
-    let now = chrono::Utc::now();
-    let age_days = (now - parsed).num_days().max(0) as f64;
+    let age_days = (*now - parsed).num_days().max(0) as f64;
+    let age_multiplier = crate::search::decay::ancestry_age_multiplier(releases_behind);
+    let ancestry_applied = age_days > 0.0 && age_multiplier > 1.0;
 
     // 2^(-age/14): 1.0 today, 0.5 at 14 days, 0.23 at 30 days, 0.05 at 60 days
-    (2.0_f64.powf(-age_days / 14.0)) as f32
+    (
+        (2.0_f64.powf(-(age_days * age_multiplier) / 14.0)) as f32,
+        ancestry_applied,
+    )
 }
 
 /// Compute file overlap: fraction of current session files that appear in result.
@@ -266,6 +334,7 @@ fn split_error_words(s: &str) -> HashSet<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn test_semantic_only_scoring() {
@@ -298,6 +367,158 @@ mod tests {
         assert_eq!(scored.len(), 2);
         assert!(scored[0].final_score > scored[1].final_score);
         assert_eq!(scored[0].content, "high match");
+    }
+
+    #[test]
+    fn released_chunk_uses_stronger_recency_while_neutral_paths_are_bit_identical() {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0).unwrap();
+        let timestamp = (now - chrono::Duration::days(14)).to_rfc3339();
+        let pre_change = compute_recency_boost_at(Some(&timestamp), &now, None);
+        let released = compute_recency_boost_at(Some(&timestamp), &now, Some(5));
+        let missing = compute_recency_boost_at(Some(&timestamp), &now, None);
+        let current_release = compute_recency_boost_at(Some(&timestamp), &now, Some(0));
+
+        assert!(released < pre_change);
+        assert_eq!(missing.to_bits(), pre_change.to_bits());
+        assert_eq!(current_release.to_bits(), pre_change.to_bits());
+
+        let live_timestamp = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
+        let raw = |content: &str, conversation_id: &str| RawResult {
+            content: content.into(),
+            score: 0.8,
+            source: "chunk".into(),
+            timestamp: Some(live_timestamp.clone()),
+            files: vec![],
+            error_patterns: vec![],
+            tags: vec![],
+            conversation_id: Some(conversation_id.into()),
+            memory_id: None,
+        };
+        let ranked = rank_results_with_continuity_and_ancestry(
+            vec![raw("released", "conv-released"), raw("fresh", "conv-fresh")],
+            &[],
+            &[],
+            None,
+            None,
+            &[("conv-released".into(), 5)].into_iter().collect(),
+        );
+        let released = ranked.iter().find(|r| r.content == "released").unwrap();
+        let fresh = ranked.iter().find(|r| r.content == "fresh").unwrap();
+        assert!(released.final_score < fresh.final_score);
+        assert!(released
+            .signals
+            .iter()
+            .any(|signal| matches!(signal, Signal::AncestryDecay(5))));
+        assert!(!fresh
+            .signals
+            .iter()
+            .any(|signal| matches!(signal, Signal::AncestryDecay(_))));
+    }
+
+    #[test]
+    fn scaffold_prompt_candidate_suppresses_release_ancestry() {
+        let timestamp = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
+        let raw = || RawResult {
+            content: "<command-message>quoted workflow</command-message>".into(),
+            score: 0.8,
+            source: "chunk".into(),
+            timestamp: Some(timestamp.clone()),
+            files: vec![],
+            error_patterns: vec![],
+            tags: vec![],
+            conversation_id: Some("conv-scaffold".into()),
+            memory_id: None,
+        };
+        let pre_change = rank_results(vec![raw()], &[], &[], None);
+        let missing = rank_results_with_continuity_and_ancestry(
+            vec![raw()],
+            &[],
+            &[],
+            None,
+            None,
+            &std::collections::HashMap::new(),
+        );
+        let current_release = rank_results_with_continuity_and_ancestry(
+            vec![raw()],
+            &[],
+            &[],
+            None,
+            None,
+            &[("conv-scaffold".into(), 0)].into_iter().collect(),
+        );
+        let shipped = rank_results_with_continuity_and_ancestry(
+            vec![raw()],
+            &[],
+            &[],
+            None,
+            None,
+            &[("conv-scaffold".into(), 5)].into_iter().collect(),
+        );
+
+        for actual in [&missing, &current_release, &shipped] {
+            assert_eq!(
+                actual[0].final_score.to_bits(),
+                pre_change[0].final_score.to_bits()
+            );
+            assert!(!actual[0]
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, Signal::AncestryDecay(_))));
+        }
+    }
+
+    #[test]
+    fn prompt_scoring_none_and_current_release_match_pre_ancestry_bits() {
+        let timestamp = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
+        let raw = || RawResult {
+            content: "organic conversation".into(),
+            score: 0.8,
+            source: "chunk".into(),
+            timestamp: Some(timestamp.clone()),
+            files: vec![],
+            error_patterns: vec![],
+            tags: vec![],
+            conversation_id: Some("conv-neutral".into()),
+            memory_id: None,
+        };
+        let weights = super::super::weights::WeightProfile::for_phase(
+            super::super::weights::HookPhase::PromptSubmit,
+        );
+        let parsed = crate::temporal::parse_timestamp(&timestamp).unwrap();
+        let age_days = (chrono::Utc::now() - parsed).num_days().max(0) as f64;
+        let recency = (2.0_f64.powf(-age_days / 14.0)) as f32;
+        let phase_boost = super::super::weights::compute_phase_boost(
+            "chunk",
+            &[],
+            super::super::weights::HookPhase::PromptSubmit,
+        );
+        let pre_change = 0.8 * weights.semantic
+            + recency * weights.recency
+            + 0.0 * weights.file_overlap
+            + 0.0 * weights.error_match
+            + phase_boost * weights.phase_boost;
+        let missing = rank_results_with_continuity_and_ancestry(
+            vec![raw()],
+            &[],
+            &[],
+            None,
+            None,
+            &std::collections::HashMap::new(),
+        );
+        let current_release = rank_results_with_continuity_and_ancestry(
+            vec![raw()],
+            &[],
+            &[],
+            None,
+            None,
+            &[("conv-neutral".into(), 0)].into_iter().collect(),
+        );
+
+        assert_eq!(missing[0].final_score.to_bits(), pre_change.to_bits());
+        assert_eq!(
+            current_release[0].final_score.to_bits(),
+            pre_change.to_bits()
+        );
     }
 
     #[test]

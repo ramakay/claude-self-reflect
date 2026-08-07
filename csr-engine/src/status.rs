@@ -69,6 +69,8 @@ pub struct DreamStatus {
     pub demoted_symbols: i64,
     /// Total durable witnesses available for a first dream cycle.
     pub witnesses_ledgered: i64,
+    /// Evidence-backed conversations carrying a release-ancestry cache row.
+    pub ancestry_cached_conversations: i64,
     /// RFC3339 timestamp of the daemon's last COMPLETED dream cycle. `None`
     /// if the daemon dream loop has never completed one (never started,
     /// disabled via `CSR_NO_DREAMING`, or still waiting on its first
@@ -91,6 +93,7 @@ impl Default for DreamStatus {
             by_verdict: DreamVerdictTotals::default(),
             demoted_symbols: 0,
             witnesses_ledgered: 0,
+            ancestry_cached_conversations: 0,
             last_daemon_run: None,
             next_due: None,
         }
@@ -344,6 +347,7 @@ fn gather_dream(storage: &Storage) -> DreamStatus {
         },
         demoted_symbols,
         witnesses_ledgered,
+        ancestry_cached_conversations: storage.ancestry_cache_count().unwrap_or(0),
         last_daemon_run,
         next_due,
     }
@@ -781,6 +785,7 @@ mod tests {
             },
             demoted_symbols: 3,
             witnesses_ledgered: 0,
+            ancestry_cached_conversations: 0,
             last_daemon_run: None,
             next_due: None,
         };
@@ -852,6 +857,33 @@ mod tests {
         assert_eq!(report.dream, DreamStatus::default());
         assert_eq!(report.dream.demoted_symbols, 0);
         assert!(report.dream.last_run.is_none());
+    }
+
+    #[test]
+    fn status_dream_block_surfaces_ancestry_cache_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO conversation_ancestry_cache
+                     (conversation_id, state, release_tag, releases_behind, repository, refreshed_at)
+                     VALUES ('session-1', 'shipped', 'v1.0.0', 2, '/repo', '2026-08-06T12:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert_eq!(report.dream.ancestry_cached_conversations, 1);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["dream"]["ancestry_cached_conversations"], 1);
     }
 
     #[test]

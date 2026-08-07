@@ -1,12 +1,13 @@
 //! Daemon module — background processing for progressive enrichment.
 //!
-//! Runs five background tasks:
+//! Runs six background tasks:
 //! 1. File watcher (existing) — auto-import new JSONL files
 //! 2. Extraction loop (Layer 2) — V3 extraction on imported conversations
 //! 3. Narrator loop (Layer 3) — AI batch narrative generation (if API key set)
 //! 4. Consolidation loop (Layer 4) — Dreamer v1 typed fact extraction from narratives
 //! 5. Dream loop (v10) — periodic `dream_cadence::dream_loop` cycle over the
 //!    witness ledger (see that module for cadence/persistence/cost-discipline)
+//! 6. Release-ancestry loop — precomputes deterministic TAD v2 episode labels
 
 pub mod consolidation;
 pub mod dream_cadence;
@@ -357,6 +358,18 @@ impl Daemon {
         };
         tracing::info!("dream loop started (v10 \"dreaming\")");
 
+        // TAD v2 release ancestry: git traversal is daemon-only and shares
+        // the single heavy-work permit with watcher/plans/dream cycles.
+        let ancestry_handle = {
+            let storage = self.storage.clone();
+            let heavy_work = heavy_work.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                ancestry_refresh_loop(storage, heavy_work, shutdown).await;
+            })
+        };
+        tracing::info!("release-ancestry refresh loop started (TAD v2)");
+
         // Wait for Ctrl+C
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down daemon gracefully");
@@ -387,6 +400,12 @@ impl Daemon {
         // exit mid-cycle loses at most that cycle's remaining events, never
         // corrupts state.
         let _ = tokio::time::timeout(timeout, dream_handle).await;
+        // An ancestry refresh owns the same heavy-work permit and awaits its
+        // blocking git/cache publication. Timing out would detach that task,
+        // allowing a cache mutation after `run` returned. The loop abstains
+        // immediately when shutdown arrives while it waits for the permit;
+        // if publication already began, await that bounded cycle fully.
+        let _ = ancestry_handle.await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
 
         // Flush HNSW index to disk before exit
@@ -403,6 +422,117 @@ impl Daemon {
 
         tracing::info!("daemon stopped");
         Ok(())
+    }
+}
+
+/// Acquire the daemon's serialized heavy-work slot, then recheck shutdown at
+/// the handoff boundary. A loop may begin waiting before shutdown and acquire
+/// only afterward; returning `None` drops that permit without starting work.
+async fn acquire_heavy_work_unless_shutdown(
+    heavy_work: Arc<Semaphore>,
+    shutdown: &AtomicBool,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permit = heavy_work.acquire_owned().await.ok()?;
+    if shutdown.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(permit)
+}
+
+fn finish_ancestry_refresh<T>(
+    storage: &Storage,
+    result: std::result::Result<anyhow::Result<T>, tokio::task::JoinError>,
+) -> anyhow::Result<T> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => {
+            crate::storage::ancestry::invalidate_ancestry_cache(storage)?;
+            Err(error)
+        }
+        Err(error) => {
+            crate::storage::ancestry::invalidate_ancestry_cache(storage)?;
+            Err(error.into())
+        }
+    }
+}
+
+async fn ancestry_refresh_once(
+    storage: Arc<Storage>,
+    heavy_work: Arc<Semaphore>,
+    shutdown: &AtomicBool,
+) -> anyhow::Result<Option<usize>> {
+    if shutdown.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+
+    let refresh_storage = storage.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        crate::storage::ancestry::prepare_ancestry_refresh(
+            &refresh_storage,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+    })
+    .await;
+    let mut refresh = finish_ancestry_refresh(&storage, prepared)?;
+
+    for repository in refresh.repositories() {
+        if shutdown.load(Ordering::SeqCst) {
+            crate::storage::ancestry::invalidate_ancestry_cache(&storage)?;
+            return Ok(None);
+        }
+        let Some(permit) = acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown).await
+        else {
+            crate::storage::ancestry::invalidate_ancestry_cache(&storage)?;
+            return Ok(None);
+        };
+        let walked = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            Ok(refresh.walk_repository(&repository))
+        })
+        .await;
+        refresh = finish_ancestry_refresh(&storage, walked)?;
+    }
+
+    if shutdown.load(Ordering::SeqCst) {
+        crate::storage::ancestry::invalidate_ancestry_cache(&storage)?;
+        return Ok(None);
+    }
+    let publish_storage = storage.clone();
+    let published = tokio::task::spawn_blocking(move || refresh.publish(&publish_storage)).await;
+    finish_ancestry_refresh(&storage, published).map(Some)
+}
+
+/// Refresh immediately, then once per hour. A fixed post-cycle delay makes
+/// cadence deterministic and avoids overlapping refreshes. Git/repository
+/// errors are handled per repository by the refresh implementation and leave
+/// those conversations neutral (no cache row).
+async fn ancestry_refresh_loop(
+    storage: Arc<Storage>,
+    heavy_work: Arc<Semaphore>,
+    shutdown: Arc<AtomicBool>,
+) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        match ancestry_refresh_once(storage.clone(), heavy_work.clone(), &shutdown).await {
+            Ok(Some(count)) => {
+                tracing::debug!(count, "release-ancestry cache refreshed")
+            }
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, "release-ancestry refresh failed open")
+            }
+        }
+
+        // Shutdown-aware one-hour delay, matching the daemon's existing
+        // ten-second polling convention.
+        for _ in 0..360 {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        }
     }
 }
 
@@ -1072,6 +1202,55 @@ mod tests {
         assert_eq!(config.batch_size_trigger, 10);
         assert_eq!(config.batch_time_trigger_secs, 1800);
         assert_eq!(config.batch_poll_interval_secs, 60);
+    }
+
+    #[tokio::test]
+    async fn ancestry_refresh_abstains_when_shutdown_arrives_while_waiting_for_permit() {
+        let heavy_work = Arc::new(Semaphore::new(1));
+        let held_permit = heavy_work.clone().acquire_owned().await.unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let heavy_work = heavy_work.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                acquire_heavy_work_unless_shutdown(heavy_work, &shutdown)
+                    .await
+                    .is_some()
+            })
+        };
+
+        tokio::task::yield_now().await;
+        shutdown.store(true, Ordering::SeqCst);
+        drop(held_permit);
+
+        assert!(
+            !waiter.await.unwrap(),
+            "a refresh unblocked after shutdown must release the permit without mutating the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn ancestry_refresh_join_error_invalidates_cache() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO conversation_ancestry_cache
+                     (conversation_id, state, release_tag, releases_behind,
+                      repository, refreshed_at)
+                     VALUES ('stale', 'shipped', 'v1.0.0', 5, '/repo', ?1)",
+                    [chrono::Utc::now().to_rfc3339()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let panicked = tokio::task::spawn_blocking(|| -> anyhow::Result<usize> {
+            panic!("simulated ancestry worker panic")
+        })
+        .await;
+
+        assert!(finish_ancestry_refresh(&storage, panicked).is_err());
+        assert_eq!(storage.ancestry_cache_count().unwrap(), 0);
     }
 
     #[test]
