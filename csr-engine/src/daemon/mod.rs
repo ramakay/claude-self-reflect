@@ -495,7 +495,7 @@ async fn process_v3_extraction(
     conv_id: &str,
     file_path: &Path,
 ) -> Result<()> {
-    let messages = import::parse_jsonl_messages(file_path)?;
+    let messages = import::parse_jsonl_messages_for_search(file_path)?;
     if messages.is_empty() {
         return Ok(());
     }
@@ -670,42 +670,12 @@ async fn narrator_loop_inner(
                 }
             }
 
-            let messages = import::parse_jsonl_messages(path)?;
+            let messages = import::parse_jsonl_messages_for_search(path)?;
             if messages.is_empty() {
                 continue;
             }
 
-            // Build a conversation summary for the AI with size cap (D-16)
-            // Sample first 50 + last 50 messages to capture both context and resolution
-            let mut summary = String::new();
-            let max_prompt_chars: usize = 100_000; // ~25K tokens budget
-            let total = messages.len();
-            let head = 50.min(total);
-            let tail_start = if total > 100 { total - 50 } else { head };
-            let sampled: Vec<_> = messages[..head]
-                .iter()
-                .chain(messages[tail_start..].iter())
-                .collect();
-            for m in &sampled {
-                let line = serde_json::to_string(m).unwrap_or_default();
-                if summary.len() + line.len() > max_prompt_chars {
-                    break;
-                }
-                if !summary.is_empty() {
-                    summary.push('\n');
-                }
-                summary.push_str(&line);
-            }
-
-            // XML boundary tags separate system prompt from user data (D-4)
-            // Escape XML boundary tags in transcript to prevent prompt injection (Codex H-1)
-            let sanitized_summary = summary
-                .replace("</conversation_data>", "&lt;/conversation_data&gt;")
-                .replace("<conversation_data>", "&lt;conversation_data&gt;");
-            let prompt = format!(
-                "{}\n\n---\n<conversation_data>\n{}\n</conversation_data>",
-                skill_prompt, sanitized_summary
-            );
+            let prompt = build_narrative_prompt(&skill_prompt, &messages);
             requests.push(BatchRequest {
                 custom_id: conv_id.clone(),
                 prompt,
@@ -759,6 +729,34 @@ async fn narrator_loop_inner(
     }
 
     Ok(())
+}
+
+fn build_narrative_prompt(skill_prompt: &str, messages: &[serde_json::Value]) -> String {
+    // Sample first 50 + last 50 messages to capture both context and resolution.
+    let mut summary = String::new();
+    let max_prompt_chars: usize = 100_000;
+    let total = messages.len();
+    let head = 50.min(total);
+    let tail_start = if total > 100 { total - 50 } else { head };
+    for message in messages[..head].iter().chain(messages[tail_start..].iter()) {
+        let line = serde_json::to_string(message).unwrap_or_default();
+        if summary.len() + line.len() > max_prompt_chars {
+            break;
+        }
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        summary.push_str(&line);
+    }
+
+    // XML boundary tags separate system prompt from user data (D-4).
+    let sanitized_summary = summary
+        .replace("</conversation_data>", "&lt;/conversation_data&gt;")
+        .replace("<conversation_data>", "&lt;conversation_data&gt;");
+    format!(
+        "{}\n\n---\n<conversation_data>\n{}\n</conversation_data>",
+        skill_prompt, sanitized_summary
+    )
 }
 
 /// Poll a submitted batch until completion, then store results. Runs as a separate task (D-7).
@@ -1106,5 +1104,69 @@ mod tests {
         assert_eq!(*sampled[49], 49);
         assert_eq!(*sampled[50], 150); // first of the tail
         assert_eq!(*sampled[99], 199);
+    }
+
+    #[test]
+    fn narrative_prompt_excludes_csr_material_without_losing_neighbors() {
+        let messages = vec![
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [
+                    {
+                        "type": "tool_use",
+                        "id": "csr-call",
+                        "name": "csr_reflect_on_past",
+                        "input": {"query": "CSR QUERY MUST DISAPPEAR"}
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "read-call",
+                        "name": "Read",
+                        "input": {"file_path": "/repo/src/kept.rs"}
+                    }
+                ]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [
+                    {
+                        "type": "text",
+                        "text": "USER PROSE BEFORE <system-reminder>CSR ENDLESS MEMORY ACTIVE — CSR WRAPPER MUST DISAPPEAR</system-reminder> USER PROSE AFTER"
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "csr-call",
+                        "content": "CSR RESULT MUST DISAPPEAR"
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "read-call",
+                        "content": "SIBLING RESULT MUST STAY"
+                    }
+                ]}
+            }),
+        ];
+
+        let (sanitized, _) = import::sanitize_messages_for_search(&messages);
+        let prompt = build_narrative_prompt("NARRATIVE SKILL", &sanitized);
+
+        for forbidden in [
+            "CSR QUERY MUST DISAPPEAR",
+            "CSR RESULT MUST DISAPPEAR",
+            "CSR WRAPPER MUST DISAPPEAR",
+        ] {
+            assert!(!prompt.contains(forbidden));
+        }
+        for retained in [
+            "USER PROSE BEFORE",
+            "USER PROSE AFTER",
+            "kept.rs",
+            "SIBLING RESULT MUST STAY",
+        ] {
+            assert!(
+                prompt.contains(retained),
+                "narrative prompt lost {retained}"
+            );
+        }
     }
 }

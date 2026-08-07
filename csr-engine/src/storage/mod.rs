@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::import::ConversationChunk;
+use crate::import::{ConversationChunk, CsrSuppressionStats};
 
 /// SQLite storage with FTS5 for full-text search.
 /// Thread-safe via Mutex around the Connection.
@@ -505,6 +505,28 @@ impl Storage {
         Ok(out)
     }
 
+    pub fn get_csr_tool_blocks_suppressed(&self) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let split_value = queries::get_meta(&conn, "csr_tool_blocks_suppressed")?;
+        let value = match split_value {
+            Some(value) => Some(value),
+            None => queries::get_meta(&conn, "csr_self_suppressed")?,
+        };
+        Ok(value.and_then(|value| value.parse().ok()).unwrap_or(0))
+    }
+
+    pub fn get_csr_hook_wrappers_scrubbed(&self) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(queries::get_meta(&conn, "csr_hook_wrappers_scrubbed")?
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Backward-compatible aggregate surfaced by status: tool blocks + wrappers.
+    pub fn get_csr_self_suppressed(&self) -> Result<i64> {
+        Ok(self.get_csr_tool_blocks_suppressed()? + self.get_csr_hook_wrappers_scrubbed()?)
+    }
+
     pub fn insert_chunk_with_source(
         &self,
         chunk: &ConversationChunk,
@@ -668,6 +690,16 @@ impl Storage {
     pub fn mark_file_imported(&self, path: &Path, chunks: usize) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::mark_file_imported(&conn, path, chunks)
+    }
+
+    pub(crate) fn mark_file_imported_with_suppression(
+        &self,
+        path: &Path,
+        chunks: usize,
+        suppression: CsrSuppressionStats,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_file_imported_with_suppression(&mut conn, path, chunks, suppression)
     }
 
     /// Read an import_state mtime keyed by a synthetic (non-filesystem) `file_path`,
@@ -1770,5 +1802,190 @@ mod tests {
             .unwrap();
 
         assert_eq!(storage.coverage_stats().unwrap(), (3, 1, 2));
+    }
+
+    #[test]
+    fn per_file_csr_suppression_counters_only_apply_new_deltas() {
+        let storage = Storage::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counter.jsonl");
+        let initial = [
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "tool_use", "id": "csr-1", "name": "csr_reflect_on_past", "input": {"query": "old"}},
+                    {"type": "text", "text": "ordinary assistant prose"}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [
+                    {"type": "text", "text": "before <system-reminder>CSR PICKUP — injected</system-reminder> after"},
+                    {"type": "tool_result", "tool_use_id": "csr-1", "content": "old result"}
+                ]}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            initial
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = crate::import::parse_jsonl_file_with_stats(&path, "test").unwrap();
+        storage
+            .mark_file_imported_with_suppression(&path, parsed.chunks.len(), parsed.suppression)
+            .unwrap();
+        assert_eq!(storage.get_csr_tool_blocks_suppressed().unwrap(), 2);
+        assert_eq!(storage.get_csr_hook_wrappers_scrubbed().unwrap(), 1);
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 3);
+
+        // Same full-file totals must not recount history.
+        storage
+            .mark_file_imported_with_suppression(&path, parsed.chunks.len(), parsed.suppression)
+            .unwrap();
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 3);
+
+        // Appending only ordinary content leaves both suppression totals unchanged.
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(&format!(
+            "\n{}",
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [{"type": "text", "text": "ordinary append"}]}
+            })
+        ));
+        std::fs::write(&path, &content).unwrap();
+        let parsed = crate::import::parse_jsonl_file_with_stats(&path, "test").unwrap();
+        storage
+            .mark_file_imported_with_suppression(&path, parsed.chunks.len(), parsed.suppression)
+            .unwrap();
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 3);
+
+        // A newly appended correlated CSR pair contributes exactly two tool blocks.
+        content.push_str(
+            &format!(
+                "\n{}\n{}",
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "id": "csr-2", "name": "csr_quick_check", "input": {"query": "new"}}]}
+                }),
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"content": [{"type": "tool_result", "tool_use_id": "csr-2", "content": "new result"}]}
+                })
+            ),
+        );
+        std::fs::write(&path, content).unwrap();
+        let parsed = crate::import::parse_jsonl_file_with_stats(&path, "test").unwrap();
+        storage
+            .mark_file_imported_with_suppression(&path, parsed.chunks.len(), parsed.suppression)
+            .unwrap();
+
+        assert_eq!(storage.get_csr_tool_blocks_suppressed().unwrap(), 4);
+        assert_eq!(storage.get_csr_hook_wrappers_scrubbed().unwrap(), 1);
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 5);
+    }
+
+    #[test]
+    fn migrated_import_row_baselines_history_before_applying_new_suppression() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        let transcript_path = dir.path().join("existing.jsonl");
+        let pair = |id: &str| {
+            [
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"content": [{
+                        "type": "tool_use", "id": id, "name": "csr_reflect_on_past",
+                        "input": {"query": "history"}
+                    }]}
+                }),
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"content": [{
+                        "type": "tool_result", "tool_use_id": id, "content": "historical result"
+                    }]}
+                }),
+            ]
+        };
+        let mut messages = pair("csr-1").to_vec();
+        std::fs::write(
+            &transcript_path,
+            messages
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE import_state (
+                    file_path TEXT PRIMARY KEY,
+                    conversation_id TEXT,
+                    chunks_imported INTEGER,
+                    imported_at TEXT DEFAULT (datetime('now')),
+                    file_mtime TEXT
+                 );
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO import_state (file_path, conversation_id, chunks_imported, file_mtime) VALUES (?1, 'existing', 1, 'legacy')",
+                [transcript_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('csr_self_suppressed', '2')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let storage = Storage::open(&db_path).unwrap();
+        let parsed = crate::import::parse_jsonl_file_with_stats(&transcript_path, "test").unwrap();
+        storage
+            .mark_file_imported_with_suppression(
+                &transcript_path,
+                parsed.chunks.len(),
+                parsed.suppression,
+            )
+            .unwrap();
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 2);
+
+        messages.extend(pair("csr-2"));
+        std::fs::write(
+            &transcript_path,
+            messages
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let parsed = crate::import::parse_jsonl_file_with_stats(&transcript_path, "test").unwrap();
+        storage
+            .mark_file_imported_with_suppression(
+                &transcript_path,
+                parsed.chunks.len(),
+                parsed.suppression,
+            )
+            .unwrap();
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 4);
+
+        storage
+            .mark_file_imported_with_suppression(
+                &transcript_path,
+                parsed.chunks.len(),
+                parsed.suppression,
+            )
+            .unwrap();
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 4);
     }
 }

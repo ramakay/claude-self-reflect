@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::import::ConversationChunk;
+use crate::import::{ConversationChunk, CsrSuppressionStats};
 use crate::provenance::{ChunkProvenance, Speaker};
 
 /// Upsert provenance for a chunk (who authored it, source conv, supersession).
@@ -1047,9 +1047,98 @@ pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Resu
         .unwrap_or_default();
     let mtime = file_mtime_str(path);
     conn.execute(
-        "INSERT OR REPLACE INTO import_state (file_path, conversation_id, chunks_imported, file_mtime) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO import_state (
+             file_path, conversation_id, chunks_imported, file_mtime,
+             csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed
+         )
+         VALUES (?1, ?2, ?3, ?4, 0, 0)
+         ON CONFLICT(file_path) DO UPDATE SET
+             conversation_id = excluded.conversation_id,
+             chunks_imported = excluded.chunks_imported,
+             file_mtime = excluded.file_mtime",
         params![path_str, conv_id, chunks as i64, mtime],
     )?;
+    Ok(())
+}
+
+/// Atomically persist import state and apply only newly observed per-file CSR
+/// suppression totals. The import-state row is written before counter deltas;
+/// any failure rolls both back.
+pub(crate) fn mark_file_imported_with_suppression(
+    conn: &mut Connection,
+    path: &Path,
+    chunks: usize,
+    suppression: CsrSuppressionStats,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    let path_str = path.to_string_lossy().to_string();
+    let previous = tx
+        .query_row(
+            "SELECT csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed
+             FROM import_state WHERE file_path = ?1",
+            params![path_str],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?
+        .unwrap_or((Some(0), Some(0)));
+    let current_tool = suppression.csr_tool_blocks_suppressed as i64;
+    let current_wrappers = suppression.csr_hook_wrappers_scrubbed as i64;
+    let (persisted_tool, tool_delta) = previous.0.map_or((current_tool, 0), |previous| {
+        let persisted = previous.max(current_tool);
+        (persisted, persisted - previous)
+    });
+    let (persisted_wrappers, wrapper_delta) =
+        previous.1.map_or((current_wrappers, 0), |previous| {
+            let persisted = previous.max(current_wrappers);
+            (persisted, persisted - previous)
+        });
+    let conv_id = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mtime = file_mtime_str(path);
+
+    tx.execute(
+        "INSERT OR REPLACE INTO import_state
+         (file_path, conversation_id, chunks_imported, file_mtime,
+          csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            path_str,
+            conv_id,
+            chunks as i64,
+            mtime,
+            persisted_tool,
+            persisted_wrappers
+        ],
+    )?;
+
+    if tool_delta > 0 {
+        let split_value = get_meta(&tx, "csr_tool_blocks_suppressed")?;
+        let current = match split_value {
+            Some(value) => Some(value),
+            None => get_meta(&tx, "csr_self_suppressed")?,
+        }
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+        set_meta(
+            &tx,
+            "csr_tool_blocks_suppressed",
+            &(current + tool_delta).to_string(),
+        )?;
+    }
+    if wrapper_delta > 0 {
+        let current = get_meta(&tx, "csr_hook_wrappers_scrubbed")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        set_meta(
+            &tx,
+            "csr_hook_wrappers_scrubbed",
+            &(current + wrapper_delta).to_string(),
+        )?;
+    }
+
+    tx.commit()?;
     Ok(())
 }
 

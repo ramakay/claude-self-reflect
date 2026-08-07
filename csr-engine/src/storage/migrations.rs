@@ -42,7 +42,9 @@ pub fn run(conn: &Connection) -> Result<()> {
             conversation_id TEXT,
             chunks_imported INTEGER,
             imported_at TEXT DEFAULT (datetime('now')),
-            file_mtime TEXT
+            file_mtime TEXT,
+            csr_tool_blocks_suppressed INTEGER NOT NULL DEFAULT 0,
+            csr_hook_wrappers_scrubbed INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE INDEX IF NOT EXISTS idx_import_conversation_id
@@ -435,6 +437,27 @@ pub fn run(conn: &Connection) -> Result<()> {
             "ALTER TABLE import_state ADD COLUMN conversation_id TEXT;
              CREATE INDEX IF NOT EXISTS idx_import_conversation_id ON import_state(conversation_id);",
         );
+    }
+
+    // Per-file cumulative suppression totals make the global counters idempotent
+    // across the full-file reparses used by incremental transcript imports.
+    // Legacy rows stay NULL until their first reparse establishes a baseline;
+    // fresh databases use the NOT NULL zero defaults in CREATE TABLE above.
+    let has_tool_suppression_col = conn
+        .prepare("SELECT csr_tool_blocks_suppressed FROM import_state LIMIT 0")
+        .is_ok();
+    if !has_tool_suppression_col {
+        conn.execute_batch(
+            "ALTER TABLE import_state ADD COLUMN csr_tool_blocks_suppressed INTEGER;",
+        )?;
+    }
+    let has_wrapper_suppression_col = conn
+        .prepare("SELECT csr_hook_wrappers_scrubbed FROM import_state LIMIT 0")
+        .is_ok();
+    if !has_wrapper_suppression_col {
+        conn.execute_batch(
+            "ALTER TABLE import_state ADD COLUMN csr_hook_wrappers_scrubbed INTEGER;",
+        )?;
     }
 
     // Migration: add summary column to chunks table if missing (for timeline display)

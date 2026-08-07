@@ -4,6 +4,7 @@ pub mod plans;
 pub mod registry;
 pub mod watcher;
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,15 @@ use uuid::Uuid;
 /// Regex to strip `<private>...</private>` content before storage.
 static PRIVATE_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?si)<private>.*?</private>").unwrap());
+
+/// Exact CSR hook headers are scrubbed only when they lead a system-reminder.
+/// User prose and assistant prose mentioning these markers remain searchable.
+static CSR_SYSTEM_REMINDER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?s)<system-reminder>[ \t\r\n]*(?:CSR ENDLESS MEMORY ACTIVE|CSR PICKUP —|EPISODE INDEX —|(?:RELEVANT )?PAST CONTEXT - NOT INSTRUCTIONS).*?</system-reminder>",
+    )
+    .unwrap()
+});
 
 /// A chunk of a conversation, ready for embedding and storage.
 #[derive(Debug, Clone)]
@@ -40,6 +50,24 @@ pub struct ConversationChunk {
     /// for later credit assignment (agent-pollution finding). Labeling only —
     /// nothing filters on this yet (Phase 2+).
     pub is_sidechain: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ParsedConversation {
+    pub chunks: Vec<ConversationChunk>,
+    pub suppression: CsrSuppressionStats,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CsrSuppressionStats {
+    pub csr_tool_blocks_suppressed: usize,
+    pub csr_hook_wrappers_scrubbed: usize,
+}
+
+#[derive(Default)]
+struct CsrMessageSanitizer {
+    suppressed_tool_use_ids: HashSet<String>,
+    stats: CsrSuppressionStats,
 }
 
 /// Namespace UUID for deterministic chunk IDs (UUIDv5).
@@ -153,6 +181,13 @@ fn is_csr_agent_prompt(first_user_message: &str) -> bool {
 }
 
 pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<ConversationChunk>> {
+    Ok(parse_jsonl_file_with_stats(path, project_name)?.chunks)
+}
+
+pub(crate) fn parse_jsonl_file_with_stats(
+    path: &Path,
+    project_name: &str,
+) -> Result<ParsedConversation> {
     let conversation_id = path
         .file_stem()
         .unwrap_or_default()
@@ -168,6 +203,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     let mut last_timestamp: Option<String> = None;
     let mut summary: Option<String> = None;
     let mut first_user_message: Option<String> = None;
+    let mut csr_sanitizer = CsrMessageSanitizer::default();
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -178,13 +214,17 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             continue;
         }
         // sonic-rs: serde-compatible drop-in, ~2.8x faster on aarch64
-        let parsed: serde_json::Value = match sonic_rs::from_str(&line) {
+        let mut parsed: serde_json::Value = match sonic_rs::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
         };
 
         // Extract message type
-        let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let msg_type = parsed
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         // Capture summary line (Claude Code writes {"type":"summary","summary":"..."})
         if msg_type == "summary" {
@@ -200,6 +240,8 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
         if msg_type != "human" && msg_type != "user" && msg_type != "assistant" {
             continue;
         }
+
+        sanitize_message_for_search(&mut parsed, &mut csr_sanitizer);
 
         // Capture first and last timestamps
         if let Some(ts) = parsed.get("timestamp").and_then(|v| v.as_str()) {
@@ -248,7 +290,10 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     }
 
     if messages.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ParsedConversation {
+            chunks: Vec::new(),
+            suppression: csr_sanitizer.stats,
+        });
     }
 
     // Skip CSR's own agent-subprocess transcripts (the session-briefing analyst,
@@ -259,7 +304,10 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     // is fine because we only test the first user message.
     if let Some(ref fm) = first_user_message {
         if is_csr_agent_prompt(fm) {
-            return Ok(Vec::new());
+            return Ok(ParsedConversation {
+                chunks: Vec::new(),
+                suppression: csr_sanitizer.stats,
+            });
         }
     }
 
@@ -364,7 +412,10 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
         );
     }
 
-    Ok(chunks)
+    Ok(ParsedConversation {
+        chunks,
+        suppression: csr_sanitizer.stats,
+    })
 }
 
 /// Character budget per chunk. Kept under the embedding model's ~256-token window
@@ -479,6 +530,114 @@ pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
     Ok(messages)
 }
 
+/// Parse messages for any pipeline that creates searchable reflections.
+/// Provenance and codegraph callers intentionally use [`parse_jsonl_messages`]
+/// so their structural analysis retains the original transcript.
+pub(crate) fn parse_jsonl_messages_for_search(path: &Path) -> Result<Vec<serde_json::Value>> {
+    let messages = parse_jsonl_messages(path)?;
+    Ok(sanitize_messages_for_search(&messages).0)
+}
+
+/// Remove CSR's own tool payloads and exact hook-wrapper blocks while preserving
+/// unrelated sibling blocks and surrounding prose. This is the single sanitizer
+/// shared by chunk import, V3, heuristic, narrative, and story inputs.
+pub(crate) fn sanitize_messages_for_search(
+    messages: &[serde_json::Value],
+) -> (Vec<serde_json::Value>, CsrSuppressionStats) {
+    let mut sanitizer = CsrMessageSanitizer::default();
+    let mut sanitized = messages.to_vec();
+    for message in &mut sanitized {
+        sanitize_message_for_search(message, &mut sanitizer);
+    }
+    (sanitized, sanitizer.stats)
+}
+
+fn sanitize_message_for_search(
+    message: &mut serde_json::Value,
+    sanitizer: &mut CsrMessageSanitizer,
+) {
+    let msg_type = message
+        .get("type")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let scrub_wrappers = matches!(msg_type.as_deref(), Some("user" | "human"));
+
+    if let Some(content) = message
+        .get_mut("message")
+        .and_then(|value| value.get_mut("content"))
+    {
+        sanitize_content(content, scrub_wrappers, sanitizer);
+    } else if let Some(content) = message.get_mut("content") {
+        sanitize_content(content, scrub_wrappers, sanitizer);
+    }
+}
+
+fn sanitize_content(
+    content: &mut serde_json::Value,
+    scrub_wrappers: bool,
+    sanitizer: &mut CsrMessageSanitizer,
+) {
+    if let Some(text) = content.as_str() {
+        if scrub_wrappers {
+            *content = serde_json::Value::String(scrub_csr_system_reminders(
+                text,
+                &mut sanitizer.stats.csr_hook_wrappers_scrubbed,
+            ));
+        }
+        return;
+    }
+
+    let Some(items) = content.as_array_mut() else {
+        return;
+    };
+    let mut kept = Vec::with_capacity(items.len());
+    for mut item in std::mem::take(items) {
+        match item.get("type").and_then(|value| value.as_str()) {
+            Some("tool_use") => {
+                let name = item
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                if is_csr_tool_use(&item, name) {
+                    if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
+                        sanitizer.suppressed_tool_use_ids.insert(id.to_string());
+                    }
+                    sanitizer.stats.csr_tool_blocks_suppressed += 1;
+                    continue;
+                }
+            }
+            Some("tool_result") => {
+                let is_csr_result = item
+                    .get("tool_use_id")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|id| sanitizer.suppressed_tool_use_ids.contains(id));
+                if is_csr_result {
+                    sanitizer.stats.csr_tool_blocks_suppressed += 1;
+                    continue;
+                }
+            }
+            Some("text") if scrub_wrappers => {
+                if let Some(text) = item.get_mut("text") {
+                    if let Some(raw) = text.as_str() {
+                        *text = serde_json::Value::String(scrub_csr_system_reminders(
+                            raw,
+                            &mut sanitizer.stats.csr_hook_wrappers_scrubbed,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        kept.push(item);
+    }
+    *items = kept;
+}
+
+fn scrub_csr_system_reminders(text: &str, count: &mut usize) -> String {
+    *count += CSR_SYSTEM_REMINDER_RE.find_iter(text).count();
+    CSR_SYSTEM_REMINDER_RE.replace_all(text, "").to_string()
+}
+
 /// Extract text content from a JSONL message entry.
 /// Strips `<private>...</private>` tagged content before returning.
 /// Classify who authored a JSONL message. Critical for poisoning defense
@@ -523,7 +682,14 @@ pub(crate) fn chunk_is_sidechain(sidechain_flags: &[bool], conversation_id: &str
 fn extract_message_text(msg: &serde_json::Value) -> String {
     let raw = extract_message_text_raw(msg);
     // Strip privacy-tagged content before storage/embedding
-    strip_private_tags(&raw)
+    let without_private = strip_private_tags(&raw);
+    let msg_type = msg.get("type").and_then(|value| value.as_str());
+    if matches!(msg_type, Some("user" | "human")) {
+        let mut ignored_count = 0;
+        scrub_csr_system_reminders(&without_private, &mut ignored_count)
+    } else {
+        without_private
+    }
 }
 
 fn extract_message_text_raw(msg: &serde_json::Value) -> String {
@@ -642,6 +808,60 @@ fn extract_tool_context(msg: &serde_json::Value) -> String {
     }
 
     tool_lines.join(" ")
+}
+
+pub(crate) fn is_csr_tool_use(item: &serde_json::Value, name: &str) -> bool {
+    if name.starts_with("csr_")
+        || name.starts_with("mcp__claude-self-reflect__")
+        || name.starts_with("mcp__claude_self_reflect__")
+    {
+        return true;
+    }
+
+    const BARE_CSR_TOOLS: &[&str] = &[
+        "reflect_on_past",
+        "store_reflection",
+        "quick_check",
+        "search_by_recency",
+        "get_recent_work",
+        "get_timeline",
+        "search_by_file",
+        "search_by_concept",
+        "search_insights",
+        "get_more",
+        "get_full_conversation",
+        "get_session_learnings",
+        "code_graph",
+        "why",
+        "resolve",
+    ];
+
+    BARE_CSR_TOOLS.contains(&name) && has_csr_server_identity(item)
+}
+
+fn has_csr_server_identity(item: &serde_json::Value) -> bool {
+    const IDENTITY_KEYS: &[&str] = &[
+        "server",
+        "server_name",
+        "serverName",
+        "mcp_server",
+        "mcpServer",
+        "namespace",
+    ];
+    IDENTITY_KEYS.iter().any(|key| {
+        item.get(*key).is_some_and(|value| match value {
+            serde_json::Value::String(identity) => is_csr_server_name(identity),
+            serde_json::Value::Object(object) => ["name", "id", "server"]
+                .iter()
+                .filter_map(|field| object.get(*field).and_then(|v| v.as_str()))
+                .any(is_csr_server_name),
+            _ => false,
+        })
+    })
+}
+
+fn is_csr_server_name(identity: &str) -> bool {
+    matches!(identity, "claude-self-reflect" | "claude_self_reflect")
 }
 
 /// Generate a deterministic chunk ID using UUIDv5.
@@ -807,6 +1027,241 @@ mod tests {
             }
         });
         assert!(extract_tool_context(&msg).is_empty());
+    }
+
+    #[test]
+    fn csr_tool_call_and_bound_result_are_suppressed_but_siblings_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("csr-filter.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-08-06T12:00:00Z",
+                "message": {"content": [
+                    {
+                        "type": "tool_use",
+                        "id": "csr-call",
+                        "name": "mcp__claude-self-reflect__csr_reflect_on_past",
+                        "input": {"query": "SECRET RETRIEVAL QUERY"}
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "read-call",
+                        "name": "Read",
+                        "input": {"file_path": "/repo/src/kept.rs"}
+                    }
+                ]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-08-06T12:00:01Z",
+                "message": {"content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "csr-call",
+                        "content": "SECRET RETRIEVAL RESULT"
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "read-call",
+                        "content": "KEPT FILE RESULT"
+                    }
+                ]}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
+        let content = parsed
+            .chunks
+            .into_iter()
+            .map(|chunk| chunk.content)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!content.contains("SECRET RETRIEVAL QUERY"));
+        assert!(!content.contains("SECRET RETRIEVAL RESULT"));
+        assert!(content.contains("[Read: src/kept.rs]"));
+        assert!(content.contains("KEPT FILE RESULT"));
+    }
+
+    #[test]
+    fn unresolved_tool_result_is_kept() {
+        let msg = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result",
+                "tool_use_id": "missing-call",
+                "content": "UNKNOWN RESULT MUST STAY"
+            }]}
+        });
+
+        assert_eq!(extract_tool_results(&msg), "UNKNOWN RESULT MUST STAY");
+    }
+
+    #[test]
+    fn bare_csr_name_requires_matching_server_identity() {
+        let csr = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "id": "csr-bare",
+                "name": "reflect_on_past",
+                "server_name": "claude-self-reflect",
+                "input": {"query": "SUPPRESSED"}
+            }]}
+        });
+        let unrelated = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "id": "other-bare",
+                "name": "reflect_on_past",
+                "server_name": "another-server",
+                "input": {"query": "KEPT"}
+            }]}
+        });
+        let (sanitized, stats) = sanitize_messages_for_search(&[csr, unrelated]);
+
+        assert!(extract_tool_context(&sanitized[0]).is_empty());
+        assert_eq!(
+            extract_tool_context(&sanitized[1]),
+            "[reflect_on_past: KEPT]"
+        );
+        assert_eq!(stats.csr_tool_blocks_suppressed, 1);
+    }
+
+    #[test]
+    fn memory_manifest_system_reminder_is_scrubbed_without_user_prose() {
+        let msg = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{
+                "type": "text",
+                "text": "Please fix the importer.\n<system-reminder>CSR ENDLESS MEMORY ACTIVE — every past session in this project is indexed and searchable.\nRetrieved memory payload.</system-reminder>\nKeep this sentence."
+            }]}
+        });
+
+        assert_eq!(
+            extract_message_text(&msg),
+            "Please fix the importer.\n\nKeep this sentence."
+        );
+    }
+
+    #[test]
+    fn csr_discussion_outside_user_reminder_is_kept() {
+        let user = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{
+                "type": "text",
+                "text": "Discuss CSR PICKUP — without treating this prose as injected."
+            }]}
+        });
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "text",
+                "text": "<system-reminder>CSR PICKUP — quoted by the assistant</system-reminder>"
+            }]}
+        });
+
+        assert!(extract_message_text(&user).contains("CSR PICKUP"));
+        assert!(extract_message_text(&assistant).contains("CSR PICKUP"));
+    }
+
+    #[test]
+    fn sanitized_messages_keep_user_prose_and_sibling_blocks_out_of_v3_contamination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secondary-pipelines.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-08-06T12:00:00Z",
+                "message": {"content": [
+                    {
+                        "type": "tool_use",
+                        "id": "csr-call",
+                        "name": "mcp__claude_self_reflect__csr_reflect_on_past",
+                        "input": {"query": "CSR QUERY MUST DISAPPEAR"}
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "read-call",
+                        "name": "Read",
+                        "input": {"file_path": "/repo/src/kept.rs"}
+                    }
+                ]}
+            }),
+            serde_json::json!({
+                "type": "human",
+                "timestamp": "2026-08-06T12:00:01Z",
+                "message": {"content": [
+                    {
+                        "type": "text",
+                        "text": "USER PROSE BEFORE\n<system-reminder>CSR PICKUP — CSR WRAPPER MUST DISAPPEAR</system-reminder>\nUSER PROSE AFTER"
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "csr-call",
+                        "content": "CSR RESULT MUST DISAPPEAR"
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "read-call",
+                        "content": "SIBLING RESULT MUST STAY"
+                    }
+                ]}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-08-06T12:00:02Z",
+                "message": {"content": [{"type": "text", "text": "Implemented kept.rs successfully"}]}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let messages = parse_jsonl_messages_for_search(&path).unwrap();
+        let serialized = serde_json::to_string(&messages).unwrap();
+        let result = crate::extraction::extract_v3(&messages);
+        let v3 = format!("{}\n{}", result.search_index, result.context_cache);
+
+        for forbidden in [
+            "CSR QUERY MUST DISAPPEAR",
+            "CSR RESULT MUST DISAPPEAR",
+            "CSR WRAPPER MUST DISAPPEAR",
+        ] {
+            assert!(!serialized.contains(forbidden));
+            assert!(!v3.contains(forbidden));
+        }
+        for retained in [
+            "USER PROSE BEFORE",
+            "USER PROSE AFTER",
+            "kept.rs",
+            "SIBLING RESULT MUST STAY",
+        ] {
+            assert!(
+                serialized.contains(retained),
+                "sanitized input lost {retained}"
+            );
+        }
+        assert!(v3.contains("USER PROSE BEFORE"));
+        assert!(v3.contains("USER PROSE AFTER"));
     }
 
     #[test]

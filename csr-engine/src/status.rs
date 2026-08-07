@@ -21,6 +21,10 @@ pub struct StatusReport {
     pub imported_files: usize,
     pub total_jsonl_files: usize,
     pub import_percent: f64,
+    /// Backward-compatible sum of the two split suppression counters below.
+    pub csr_self_suppressed: i64,
+    pub csr_tool_blocks_suppressed: i64,
+    pub csr_hook_wrappers_scrubbed: i64,
     pub enrichment: EnrichmentBreakdown,
     pub narratives: NarrativeStatus,
     pub ratification: RatificationStatus,
@@ -203,6 +207,9 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             imported_files: 0,
             total_jsonl_files: total_jsonl,
             import_percent: 0.0,
+            csr_self_suppressed: 0,
+            csr_tool_blocks_suppressed: 0,
+            csr_hook_wrappers_scrubbed: 0,
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus {
                 disabled: crate::narrative::narratives_disabled(),
@@ -227,6 +234,9 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let chunks = storage.count_chunk_embeddings().unwrap_or(0);
     let reflections = storage.count_reflection_embeddings().unwrap_or(0);
     let imported_files = storage.count_imported_files().unwrap_or(0);
+    let csr_self_suppressed = storage.get_csr_self_suppressed().unwrap_or(0);
+    let csr_tool_blocks_suppressed = storage.get_csr_tool_blocks_suppressed().unwrap_or(0);
+    let csr_hook_wrappers_scrubbed = storage.get_csr_hook_wrappers_scrubbed().unwrap_or(0);
     let newest_chunk = storage.get_newest_chunk_timestamp().unwrap_or(None);
     let db_size_bytes = storage.get_db_size().unwrap_or(0);
     // Cached verdict (24h TTL, refreshed by the daemon or --deep). A full
@@ -273,6 +283,9 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         imported_files,
         total_jsonl_files: total_jsonl,
         import_percent,
+        csr_self_suppressed,
+        csr_tool_blocks_suppressed,
+        csr_hook_wrappers_scrubbed,
         enrichment,
         narratives,
         ratification,
@@ -722,6 +735,9 @@ mod tests {
             imported_files: 909,
             total_jsonl_files: 1000,
             import_percent: 90.9,
+            csr_self_suppressed: 0,
+            csr_tool_blocks_suppressed: 0,
+            csr_hook_wrappers_scrubbed: 0,
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus::default(),
             ratification: RatificationStatus::default(),
@@ -805,6 +821,23 @@ mod tests {
         assert_eq!(report.aux.coverage, CoverageStats::default());
         assert_eq!(report.aux.file_history_sessions, 0);
         assert_eq!(report.aux.transcripts_unindexed, 0);
+    }
+
+    #[test]
+    fn status_surfaces_split_csr_suppression_counters_and_sum() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage.set_meta("csr_tool_blocks_suppressed", "4").unwrap();
+        storage.set_meta("csr_hook_wrappers_scrubbed", "2").unwrap();
+
+        let value =
+            serde_json::to_value(gather_status(&db_path, &projects_dir, false).unwrap()).unwrap();
+        assert_eq!(value["csr_tool_blocks_suppressed"], 4);
+        assert_eq!(value["csr_hook_wrappers_scrubbed"], 2);
+        assert_eq!(value["csr_self_suppressed"], 6);
     }
 
     #[test]

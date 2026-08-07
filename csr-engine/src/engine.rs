@@ -254,12 +254,15 @@ impl Engine {
             return Ok(0);
         }
 
-        let chunks = import::parse_jsonl_file(file_path, project_name)?;
+        let parsed = import::parse_jsonl_file_with_stats(file_path, project_name)?;
+        let suppression = parsed.suppression;
+        let chunks = parsed.chunks;
         if chunks.is_empty() {
             // Record the skip (agent transcripts, empty conversations) so the
             // watcher doesn't re-parse the file every pass and import_percent
             // counts it as processed instead of silently under-reporting.
-            self.storage.mark_file_imported(file_path, 0)?;
+            self.storage
+                .mark_file_imported_with_suppression(file_path, 0, suppression)?;
             return Ok(0);
         }
 
@@ -267,7 +270,11 @@ impl Engine {
         let prev_count = self.storage.get_imported_chunk_count(file_path)?;
         if chunks.len() <= prev_count {
             // File parsed to same/fewer chunks — just update mtime
-            self.storage.mark_file_imported(file_path, chunks.len())?;
+            self.storage.mark_file_imported_with_suppression(
+                file_path,
+                chunks.len(),
+                suppression,
+            )?;
             return Ok(0);
         }
 
@@ -303,7 +310,8 @@ impl Engine {
             }
         }
 
-        self.storage.mark_file_imported(file_path, chunks.len())?;
+        self.storage
+            .mark_file_imported_with_suppression(file_path, chunks.len(), suppression)?;
 
         // Layer 1: Heuristic enrichment only on first import (not incremental updates)
         if prev_count == 0 {

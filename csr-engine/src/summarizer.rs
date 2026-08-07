@@ -299,7 +299,7 @@ pub async fn generate_story_cli(
         return Ok(());
     }
 
-    let messages = crate::import::parse_jsonl_messages(transcript)?;
+    let messages = crate::import::parse_jsonl_messages_for_search(transcript)?;
     if messages.len() < 5 {
         log_story_event(
             &project,

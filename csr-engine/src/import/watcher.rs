@@ -190,11 +190,14 @@ impl FileWatcher {
             .map(|n| import::normalize_project_name(&n.to_string_lossy()))
             .unwrap_or_else(|| "unknown".to_string());
 
-        let chunks = import::parse_jsonl_file(file_path, &project_name)?;
+        let parsed = import::parse_jsonl_file_with_stats(file_path, &project_name)?;
+        let suppression = parsed.suppression;
+        let chunks = parsed.chunks;
         if chunks.is_empty() {
             // Record the skip so this file isn't re-parsed every watcher pass
             // and import_percent counts it as processed.
-            self.storage.mark_file_imported(file_path, 0)?;
+            self.storage
+                .mark_file_imported_with_suppression(file_path, 0, suppression)?;
             return Ok(());
         }
 
@@ -217,7 +220,8 @@ impl FileWatcher {
             }
         }
 
-        self.storage.mark_file_imported(file_path, chunk_count)?;
+        self.storage
+            .mark_file_imported_with_suppression(file_path, chunk_count, suppression)?;
 
         // Layer 1: Heuristic enrichment (inline, instant, free)
         let conv_id = file_path
