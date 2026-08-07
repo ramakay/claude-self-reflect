@@ -254,6 +254,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn display_writes_the_complete_diff_id() {
+        let id = DiffId("b3d:0123456789abcdef".to_owned());
+
+        assert_eq!(id.to_string(), "b3d:0123456789abcdef");
+    }
+
+    #[test]
     fn identical_content_has_no_changed_lines() {
         let id = normalized_diff_id(b"a\nb\nc\n", b"a\nb\nc\n");
         // Still a valid, deterministic id (of the empty canonical diff).
@@ -321,6 +328,41 @@ mod tests {
     const OVERSIZED_LINES: usize = 2_500;
     // Compile-time proof the fixture actually exceeds the product cap.
     const _: () = assert!(OVERSIZED_LINES * OVERSIZED_LINES > MAX_LCS_CELLS);
+
+    #[test]
+    fn line_count_at_each_per_side_cap_stays_on_the_normal_path() {
+        let at_cap = b"x\n".repeat(MAX_LINES_PER_SIDE);
+
+        let old_at_cap = normalized_diff_id(&at_cap, b"");
+        let new_at_cap = normalized_diff_id(b"", &at_cap);
+
+        assert!(old_at_cap.as_str().starts_with(&format!("{PREFIX}:")));
+        assert!(new_at_cap.as_str().starts_with(&format!("{PREFIX}:")));
+    }
+
+    #[test]
+    fn new_side_above_line_cap_uses_fallback() {
+        let above_cap = b"x\n".repeat(MAX_LINES_PER_SIDE + 1);
+
+        let id = normalized_diff_id(b"", &above_cap);
+
+        assert!(
+            id.as_str().starts_with(&format!("{FALLBACK_PREFIX}:")),
+            "new side above the line cap must use the fallback prefix, got {id}"
+        );
+    }
+
+    #[test]
+    fn lcs_product_at_cell_cap_stays_on_the_normal_path() {
+        const SIDE: usize = 2_000;
+        const _: () = assert!(SIDE * SIDE == MAX_LCS_CELLS);
+        let old = b"old\n".repeat(SIDE);
+        let new = b"new\n".repeat(SIDE);
+
+        let id = normalized_diff_id(&old, &new);
+
+        assert!(id.as_str().starts_with(&format!("{PREFIX}:")));
+    }
 
     #[test]
     fn oversized_inputs_fall_back_to_deterministic_whole_buffer_hashing() {
@@ -398,5 +440,79 @@ mod tests {
         );
 
         assert_eq!(id_lf, id_crlf);
+    }
+
+    #[test]
+    fn whole_buffer_normalization_only_removes_carriage_returns_before_newlines() {
+        let normalized = normalize_line_endings(b"a\r\nb\rc\nd\r\n");
+
+        assert_eq!(normalized.as_ref(), b"a\nb\rc\nd\n");
+    }
+
+    #[test]
+    fn lcs_recurrence_uses_diagonal_and_adjacent_cells() {
+        assert_eq!(
+            diff_lines(&[b"a", b"a"], &[b"b", b"a", b"a"]),
+            vec![Op::Insert(0), Op::Equal(0, 1), Op::Equal(1, 2)]
+        );
+        assert_eq!(
+            diff_lines(&[b"a", b"a"], &[b"b", b"a"]),
+            vec![Op::Delete(0), Op::Insert(0), Op::Equal(1, 1)]
+        );
+        assert_eq!(
+            diff_lines(&[b"a", b"b", b"a"], &[b"c", b"a"]),
+            vec![Op::Delete(0), Op::Delete(1), Op::Insert(0), Op::Equal(2, 1),]
+        );
+        assert_eq!(
+            diff_lines(&[b"a"], &[b"b", b"b", b"a"]),
+            vec![Op::Insert(0), Op::Insert(1), Op::Equal(0, 2)]
+        );
+    }
+
+    #[test]
+    fn diff_lines_stops_when_either_side_is_exhausted() {
+        assert_eq!(
+            diff_lines(&[b"same", b"old-tail"], &[b"same"]),
+            vec![Op::Equal(0, 0), Op::Delete(1)]
+        );
+        assert_eq!(
+            diff_lines(&[b"same"], &[b"same", b"new-tail"]),
+            vec![Op::Equal(0, 0), Op::Insert(1)]
+        );
+    }
+
+    #[test]
+    fn deletion_tail_advances_to_completion() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sender
+                .send(diff_lines(&[b"same", b"old-tail"], &[b"same"]))
+                .expect("test receiver must remain connected");
+        });
+
+        let ops = receiver
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("deletion tail must make forward progress");
+        assert_eq!(ops, vec![Op::Equal(0, 0), Op::Delete(1)]);
+    }
+
+    #[test]
+    fn disjoint_lines_prefer_deletion_on_an_lcs_tie() {
+        assert_eq!(
+            diff_lines(&[b"old"], &[b"new", b"tail"]),
+            vec![Op::Delete(0), Op::Insert(0), Op::Insert(1)]
+        );
+    }
+
+    #[test]
+    fn canonical_render_keeps_unchanged_context_around_an_edit() {
+        let old: &[&[u8]] = &[b"before", b"old", b"after"];
+        let new: &[&[u8]] = &[b"before", b"new", b"after"];
+        let ops = diff_lines(old, new);
+
+        assert_eq!(
+            render_canonical(&ops, old, new),
+            b" before\n-old\n+new\n after\n"
+        );
     }
 }

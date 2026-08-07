@@ -100,3 +100,44 @@ impl SupersededReceipt {
         self.receipt
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object_id() -> gix::ObjectId {
+        gix::ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap()
+    }
+
+    #[test]
+    fn verdict_predicates_identify_only_their_matching_variant() {
+        let verdicts = [
+            Verdict::Intact,
+            Verdict::Drifted,
+            Verdict::Superseded(SupersededReceipt::new(
+                Anchor::new("replacement.rs"),
+                object_id(),
+            )),
+            Verdict::Vanished {
+                last_seen: object_id(),
+            },
+        ];
+
+        assert_eq!(
+            verdicts.each_ref().map(|verdict| verdict.is_intact()),
+            [true, false, false, false]
+        );
+        assert_eq!(
+            verdicts.each_ref().map(|verdict| verdict.is_drifted()),
+            [false, true, false, false]
+        );
+        assert_eq!(
+            verdicts.each_ref().map(|verdict| verdict.is_superseded()),
+            [false, false, true, false]
+        );
+        assert_eq!(
+            verdicts.each_ref().map(|verdict| verdict.is_vanished()),
+            [false, false, false, true]
+        );
+    }
+}

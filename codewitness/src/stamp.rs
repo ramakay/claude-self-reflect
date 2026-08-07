@@ -194,4 +194,27 @@ mod tests {
         let norm = stamp_normalized(b"x");
         assert!(norm.as_str().starts_with("b3n:"));
     }
+
+    #[test]
+    fn stamp_kind_requires_the_complete_normalized_prefix() {
+        let incomplete_prefix = Stamp("b3n-not-a-normalized-stamp".to_owned());
+
+        assert_eq!(incomplete_prefix.kind(), StampKind::Raw);
+    }
+
+    #[test]
+    fn display_and_as_ref_expose_the_canonical_stamp() {
+        let stamp = Stamp::from_bytes(b"display contract");
+
+        assert_eq!(stamp.to_string(), stamp.as_str());
+        assert_eq!(AsRef::<str>::as_ref(&stamp), stamp.as_str());
+    }
+
+    #[test]
+    fn normalized_stamp_preserves_every_noninitial_line_boundary() {
+        assert_eq!(
+            normalize_whitespace_bytes(b"alpha\nbeta\ngamma"),
+            b"alpha\nbeta\ngamma"
+        );
+    }
 }
