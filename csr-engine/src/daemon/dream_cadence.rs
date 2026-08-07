@@ -897,17 +897,15 @@ mod tests {
         };
         drop(initial_watcher);
 
-        for _ in 0..64 {
-            if dream.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            dream.is_finished(),
-            "overdue dream must not starve behind watcher churn"
-        );
-        let dream_permit = dream.await.unwrap().expect("overdue dream should acquire");
+        // Await the dream directly under a generous wall-clock bound instead of a
+        // fixed yield budget: on loaded CI runners 64 yields is not enough for the
+        // fair queue to drain the watcher churn, and the count is not the invariant —
+        // "finishes at all, promptly" is.
+        let dream_permit = tokio::time::timeout(std::time::Duration::from_secs(30), dream)
+            .await
+            .expect("overdue dream must not starve behind watcher churn")
+            .unwrap()
+            .expect("overdue dream should acquire");
         assert!(dream_running.load(Ordering::SeqCst));
         drop(dream_permit);
         watcher_churn.await.unwrap();

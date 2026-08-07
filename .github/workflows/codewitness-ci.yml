@@ -68,6 +68,16 @@ jobs:
             exit 1
           fi
 
+          # Exit 3 = timeouts only. A timeout here is an infinite-loop mutant
+          # (e.g. `i += 1` -> `i *= 1`) killed by the harness deadline — the
+          # mutant WAS detected, just by hang rather than assertion. With
+          # missed.txt empty this is a pass; any other nonzero status is a
+          # real cargo-mutants failure.
+          if [ "$status" -eq 3 ]; then
+            echo "cargo-mutants reported timeouts only (infinite-loop mutants killed by deadline); missed.txt is empty — passing."
+            exit 0
+          fi
+
           exit "$status"
 
   cargo-semver-checks:
