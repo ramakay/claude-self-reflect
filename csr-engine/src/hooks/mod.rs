@@ -190,6 +190,15 @@ fn resolve_hook_cwd(input_cwd: Option<&str>) -> PathBuf {
             }
             return resolved;
         }
+        // A cwd arrived but does not name a directory. Falling back is the right
+        // behaviour, but doing it silently is exactly how the Windows breakage
+        // above survived unnoticed for so long — leave a line so the next one is
+        // diagnosable from the log alone.
+        // Quoted, not `Display`: an empty cwd is a real case and prints as nothing,
+        // which reads as a corrupt log line rather than the anomaly it is.
+        crate::telemetry::append_timing_line(&format!(
+            "CSR cwd: input cwd {dir:?} is not a directory — falling back to current_dir()"
+        ));
     }
 
     std::env::current_dir().unwrap_or_else(|e| {
