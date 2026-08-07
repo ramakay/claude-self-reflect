@@ -1,4 +1,4 @@
-# Claude Self-Reflect v8.0 — Action Guide
+# Claude Self-Reflect v10.0 — Action Guide
 
 ## Architecture
 
@@ -15,17 +15,23 @@ csr-engine (44MB)
   └── 3-layer enrichment pipeline
 ```
 
-## Corpus Sources (v9.4+)
+## Corpus Sources (v10.0)
 
 | Source | Stage | Notes |
 |---|---|---|
 | `~/.claude/projects/*.jsonl` | import (watcher) | primary corpus, `source='conversation'` |
+| `~/.claude/projects/<proj>/<session>/subagents/agent-*.jsonl` | import (watcher, recursive) | `source='sidechain'`, real project from first path component (canonicalized), parent session via `chunk_provenance.source_conv_id`; parent beats child in search dedupe; legacy mis-scoped rows repaired import-side |
 | `~/.claude/tasks/<session>/` | Stop hook | authoritative task state → episode todos/outcome; completed tasks matching still-open verdicts → `resolution_proposals` (human promotes via `csr_resolve`) |
 | `~/.claude/plans/*.md` | daemon (30min) | `source='plan'`, `conversation_id=plan:<slug>`; margin-verified correlation, ambiguous → `_unscoped`; origin conversation always beats plan in search dedupe; decays via mtime timestamp |
+| `~/.codex/sessions/**/rollout-*.jsonl` | daemon (30min) + setup | optional vendor adapter, auto-detected; `source='codex_rollout'`; streaming batched ingest; capture-on-appearance (files deleted often); CSR tool payloads filtered via shared predicate |
 | `~/.claude/history.jsonl` | daemon (10min) | `session_registry` spine — never embedded/injected; coverage in `status` |
 | memories / paste-cache | NOT indexed | circularity / privacy — deliberate non-goals |
 
-`aux_schema_miss:*` counters in `csr-engine status` flag adapter parse failures — check them when Claude Code renames internal formats (TodoWrite→TaskCreate precedent).
+`aux_schema_miss:*` counters in `csr-engine status` flag adapter parse failures — check them when Claude Code renames internal formats (TodoWrite→TaskCreate precedent). All reflection-producing pipelines share one sanitizer that suppresses CSR's own tool payloads and hook-injected blocks (`csr_tool_blocks_suppressed` + `csr_hook_wrappers_scrubbed` in status) — the self-contamination loop closed in v10.
+
+## Dreaming (v10)
+
+Evidence-grounded forgetting: append-only `witness_ledger` (span-level BLAKE3 stamps at commit OIDs) + `witness_generations` publication manifests; deterministic abstention-first verdicts (no LLM); demote+annotate consumption (`[stale anchor]`/`[evolved]` with commit receipts in search). Daemon dream cadence 6h (`CSR_DREAM_INTERVAL_SECS` override), kill switch `CSR_NO_DREAMING=1`; TAD v2 decays by release ancestry (`conversation_ancestry_cache`, hourly refresh, fail-open to neutral). Benchmark: `codewitness labels` + `codewitness bench` (eval-kit/t4) — deterministic, provenance-stamped.
 
 ## Key Commands
 
