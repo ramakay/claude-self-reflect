@@ -66,6 +66,18 @@ impl Auditor {
         self.stamp_at_with_kind(anchor, commit, StampKind::Raw)
     }
 
+    /// Compute the raw stamp for `anchor` from an already-fetched full-file
+    /// blob. Callers that stamp many spans in one file can fetch the commit
+    /// blob once and avoid repeating tree/blob lookup for every anchor.
+    pub fn stamp_file_content(anchor: &Anchor, file_bytes: &[u8]) -> Result<crate::Stamp, Error> {
+        match anchor.span {
+            Some(span) => {
+                Ok(StampKind::Raw.compute(&apply_span_ref(file_bytes, span, &anchor.path)?))
+            }
+            None => Ok(StampKind::Raw.compute(file_bytes)),
+        }
+    }
+
     /// Like [`Self::stamp_at`], but whitespace-insensitive.
     pub fn stamp_normalized_at(
         &self,
@@ -471,6 +483,10 @@ fn apply_span(bytes: Vec<u8>, span: Option<(u32, u32)>, path: &Path) -> Result<V
     let Some((start, end)) = span else {
         return Ok(bytes);
     };
+    apply_span_ref(&bytes, (start, end), path)
+}
+
+fn apply_span_ref(bytes: &[u8], (start, end): (u32, u32), path: &Path) -> Result<Vec<u8>, Error> {
     if start == 0 || start > end {
         return Err(Error::InvalidSpan { start, end });
     }

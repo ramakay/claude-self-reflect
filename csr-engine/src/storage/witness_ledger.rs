@@ -31,6 +31,29 @@
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 
+/// Current extractor protocol version. Bump whenever re-derived anchor
+/// identity or span semantics change. Persisted in `witness_generations` by
+/// the publisher (`import::backfill`) and required by the binder
+/// (`storage::chunk_binding`) when selecting the preferred generation — a
+/// single definition so publisher and binder can never drift apart.
+pub(crate) const WITNESS_EXTRACTOR_VERSION: &str = "codegraph-v3";
+
+/// One re-derivation run's publication manifest. This bookkeeping table may
+/// be appended independently of the evidence ledger: COMPLETE is inserted in
+/// the same transaction as every ledger row; INCOMPLETE records a failed run
+/// with no corresponding v2 evidence rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessGeneration {
+    pub id: i64,
+    pub generation_id: String,
+    pub project: String,
+    pub file: String,
+    pub repo_root: Option<String>,
+    pub head_oid: String,
+    pub extractor_version: String,
+    pub status: String,
+}
+
 /// One row of the witness ledger — a `codewitness` stamp anchored to a file
 /// (optionally a symbol/span) at a specific tier/commit.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -90,6 +113,80 @@ pub fn insert_witness(conn: &Connection, row: &WitnessLedgerRow) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// Record a generation manifest. Callers publish COMPLETE inside the same
+/// transaction as its ledger rows; an INCOMPLETE manifest carries no rows.
+pub fn insert_generation(conn: &Connection, generation: &WitnessGeneration) -> Result<()> {
+    conn.execute(
+        "INSERT INTO witness_generations
+         (generation_id, project, file, repo_root, head_oid, extractor_version, status,
+          completed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                 CASE WHEN ?7 = 'complete' THEN datetime('now') END)",
+        params![
+            generation.generation_id,
+            generation.project,
+            generation.file,
+            generation.repo_root,
+            generation.head_oid,
+            generation.extractor_version,
+            generation.status,
+        ],
+    )?;
+    Ok(())
+}
+
+/// True when cadence can skip all extraction/stamping work for this exact
+/// file, HEAD, and extractor protocol.
+pub fn complete_generation_exists(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    head_oid: &str,
+    extractor_version: &str,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM witness_generations
+             WHERE project = ?1 AND file = ?2 AND head_oid = ?3
+               AND extractor_version = ?4 AND status = 'complete'
+         )",
+        params![project, file, head_oid, extractor_version],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// Complete generations for a file, newest publication first. Binding still
+/// applies git ancestry before choosing one; insertion order only breaks ties
+/// between distinct successful runs at the same causal HEAD.
+pub fn complete_generations_for_file(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+) -> Result<Vec<WitnessGeneration>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, generation_id, project, file, repo_root, head_oid,
+                extractor_version, status
+         FROM witness_generations
+         WHERE project = ?1 AND file = ?2 AND status = 'complete'
+         ORDER BY id DESC",
+    )?;
+    let rows = stmt.query_map(params![project, file], |row| {
+        Ok(WitnessGeneration {
+            id: row.get(0)?,
+            generation_id: row.get(1)?,
+            project: row.get(2)?,
+            file: row.get(3)?,
+            repo_root: row.get(4)?,
+            head_oid: row.get(5)?,
+            extractor_version: row.get(6)?,
+            status: row.get(7)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<WitnessLedgerRow> {

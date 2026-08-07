@@ -727,6 +727,31 @@ pub fn run(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_witness_ledger_lookup ON witness_ledger(project, file, symbol);",
     )?;
 
+    // Mutable publication bookkeeping for append-only witness evidence.
+    // `witness_ledger` itself remains immutable: a re-derivation run first
+    // computes every row in memory, then one transaction inserts the rows
+    // and a COMPLETE manifest. Failed runs may record an INCOMPLETE manifest
+    // but publish no ledger rows. Binding therefore has an explicit atomic
+    // publication boundary instead of inferring completeness from row order.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS witness_generations (
+            id INTEGER PRIMARY KEY,
+            generation_id TEXT NOT NULL UNIQUE,
+            project TEXT NOT NULL,
+            file TEXT NOT NULL,
+            repo_root TEXT,
+            head_oid TEXT NOT NULL,
+            extractor_version TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('complete','incomplete')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_witness_generations_lookup
+            ON witness_generations(project, file, status, id);
+        CREATE INDEX IF NOT EXISTS idx_witness_generations_skip
+            ON witness_generations(project, file, head_oid, extractor_version, status);",
+    )?;
+
     // witness_verdicts (v10 "dreaming" — see `dream` module +
     // `storage::witness_verdicts`'s module doc): append-only EVENTS describing
     // how a `witness_ledger` row's claim relates to git history, minted by the

@@ -602,6 +602,112 @@ pub fn symbol_verdict_states_for_files(
     Ok(out)
 }
 
+/// Binding-only bulk state lookup. Each anchor carries the exact selected
+/// re-derivation generation (`Some(source_id)`) or the legacy lineage
+/// (`None`). Both negative-event selection and the intact-at-HEAD check are
+/// constrained to that lineage, preventing an old collapsed spelling from
+/// poisoning a corrected complete generation.
+pub(crate) fn symbol_verdict_states_for_lineages(
+    conn: &Connection,
+    anchors: &[(String, String, String, Option<String>)],
+) -> Result<std::collections::BTreeMap<(String, String, String), SymbolVerdictState>> {
+    let mut out = std::collections::BTreeMap::new();
+    const BATCH: usize = 200;
+    for batch in anchors.chunks(BATCH) {
+        let filters: Vec<String> = (0..batch.len())
+            .map(|i| {
+                let base = 4 * i + 1;
+                format!(
+                    "(wl.project = ?{base} AND wl.file = ?{} AND wl.symbol = ?{}
+                      AND ((?{} IS NULL AND wl.source_kind <> 'backfill_rederived_v2')
+                           OR (wl.source_kind = 'backfill_rederived_v2'
+                               AND wl.source_id = ?{})))",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 3
+                )
+            })
+            .collect();
+        let sql = format!(
+            "SELECT wl.project, wl.file, wl.symbol,
+                    v.witness_id, v.verdict, v.successor_witness_id,
+                    v.receipt_oid, v.observed_head_oid,
+                    EXISTS(SELECT 1 FROM witness_ledger wl2
+                           WHERE wl2.project = wl.project AND wl2.file = wl.file
+                             AND wl2.symbol IS wl.symbol
+                             AND wl2.at_oid = v.observed_head_oid
+                             AND ((wl.source_kind = 'backfill_rederived_v2'
+                                   AND wl2.source_kind = 'backfill_rederived_v2'
+                                   AND wl2.source_id IS wl.source_id)
+                                  OR (wl.source_kind <> 'backfill_rederived_v2'
+                                      AND wl2.source_kind <> 'backfill_rederived_v2')))
+             FROM witness_verdicts v
+             JOIN witness_ledger wl ON wl.id = v.witness_id
+             WHERE ({})
+               AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
+                           WHERE v2.witness_id = v.witness_id)
+             ORDER BY v.id DESC",
+            filters.join(" OR ")
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = batch
+            .iter()
+            .flat_map(|(project, file, symbol, source_id)| {
+                [
+                    project as &dyn rusqlite::types::ToSql,
+                    file as &dyn rusqlite::types::ToSql,
+                    symbol as &dyn rusqlite::types::ToSql,
+                    source_id as &dyn rusqlite::types::ToSql,
+                ]
+            })
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<((String, String, String), WitnessVerdictRow, bool)> = stmt
+            .query_map(params.as_slice(), |row| {
+                let verdict_str: String = row.get(4)?;
+                Ok((
+                    (row.get(0)?, row.get(1)?, row.get(2)?),
+                    WitnessVerdictRow {
+                        witness_id: row.get(3)?,
+                        verdict: VerdictKind::parse(&verdict_str)
+                            .unwrap_or(VerdictKind::AnchorObsolete),
+                        successor_witness_id: row.get(5)?,
+                        receipt_oid: row.get(6)?,
+                        observed_head_oid: row.get(7)?,
+                    },
+                    row.get(8)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut grouped: std::collections::BTreeMap<
+            (String, String, String),
+            Vec<(WitnessVerdictRow, bool)>,
+        > = std::collections::BTreeMap::new();
+        for (key, event, intact) in rows {
+            grouped.entry(key).or_default().push((event, intact));
+        }
+        for (key, events) in grouped {
+            let Some((representative, _)) = events.iter().find(|(e, _)| e.verdict.is_negative())
+            else {
+                continue;
+            };
+            out.insert(
+                key,
+                SymbolVerdictState {
+                    channel: if events[0].1 {
+                        VerdictChannel::Annotate
+                    } else {
+                        VerdictChannel::Demote
+                    },
+                    representative: representative.clone(),
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

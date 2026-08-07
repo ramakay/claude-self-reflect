@@ -37,6 +37,7 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use anyhow::Result;
+use uuid::Uuid;
 
 use crate::engine::Engine;
 use crate::extraction::ast_analysis::lang_from_path_str;
@@ -48,7 +49,7 @@ use crate::import::{
     parse_jsonl_messages,
 };
 use crate::storage::codegraph::{EdgeRow, NodeRow};
-use crate::storage::witness_ledger::WitnessLedgerRow;
+use crate::storage::witness_ledger::{self, WitnessLedgerRow, WITNESS_EXTRACTOR_VERSION};
 use crate::storage::Storage;
 
 /// Log progress every N conversations.
@@ -841,7 +842,9 @@ pub struct StampSpansStats {
     /// Of those, how many were actually stamped (file on disk, repo
     /// discoverable, HEAD resolvable, path relative to its own repo_root).
     pub files_processed: usize,
-    /// Function/type/const-level witnesses minted (symbol-level, span-scoped).
+    /// Function/type/const-level span stamps successfully computed. A failed
+    /// sibling prevents the entire re-derived file generation from publishing,
+    /// so this can exceed the number of ledger rows inserted by a partial run.
     pub spans_stamped: usize,
     /// Whole-file witnesses minted (`symbol` NULL) — only for files where
     /// span extraction found no function/type/const-level node.
@@ -891,6 +894,9 @@ pub struct StampSpansStats {
     /// same-name collisions (e.g. `is_empty` in two different `impl`
     /// blocks) on its own.
     pub disambiguated_symbols: usize,
+    /// Files skipped before blob loading/parsing/stamping because a complete
+    /// generation already exists for the same HEAD and extractor version.
+    pub skipped_complete_generation: usize,
 }
 
 impl StampSpansStats {
@@ -905,7 +911,8 @@ impl StampSpansStats {
              spans stamped        : {}\n\
              whole-file witnesses : {}\n\
              skipped: no_repo_root={}  file_missing={}  non_git={}  outside_repo_root={}  stamp_error={}  span_out_of_range={}  rev_unresolved={}  non_utf8={}\n\
-             disambiguated symbols : {}\n",
+             disambiguated symbols : {}\n\
+             skipped complete generation : {}\n",
             self.files_checked,
             self.files_processed,
             self.spans_stamped,
@@ -919,6 +926,7 @@ impl StampSpansStats {
             self.skipped_rev_unresolved,
             self.skipped_non_utf8,
             self.disambiguated_symbols,
+            self.skipped_complete_generation,
         );
         // Single repo (the common case, especially with `--repo`): the
         // exact `at_commit: <oid>` form. Multiple repos (the `--at`
@@ -974,6 +982,13 @@ impl StampSpansStats {
 ///    rows from the same `(file, at_oid)` batch ever mint an identical
 ///    `symbol` to `witness_ledger`, closing the collision even when static
 ///    qualification cannot.
+///
+/// Identity migration safety: this function is used only while minting new
+/// append-only witness rows. Qualification changes intentionally fork anchor
+/// lineages: existing rows keep dreaming under their old symbol, that old
+/// lineage eventually goes quiet, and newly minted rows accumulate under the
+/// new qualified symbol. Existing `witness_ledger` rows are never rewritten or
+/// migrated to make the lineages appear continuous.
 fn qualify_witness_symbols(
     defs: &[(String, String, i64, i64)],
     containers: &[ContainerSpan],
@@ -1015,7 +1030,11 @@ fn qualify_witness_symbols(
 fn qualify_one_symbol(containers: &[ContainerSpan], start: i64, end: i64, name: &str) -> String {
     let mut best: Option<&ContainerSpan> = None;
     for c in containers {
-        if c.start <= start && end <= c.end {
+        // A named function/method is itself a container for nested defs, but
+        // must not qualify its own symbol as `name.name`. Line spans are the
+        // only persisted coordinates, so require proper (not equal) span
+        // containment here.
+        if c.start <= start && end <= c.end && (c.start < start || end < c.end) {
             let better = match best {
                 None => true,
                 Some(b) => (c.end - c.start) < (b.end - b.start),
@@ -1081,7 +1100,7 @@ pub fn backfill_stamp_spans(engine: &Engine, dry_run: bool) -> Result<StampSpans
 }
 
 /// Cancellation-aware daemon variant. Checks between files and periodically
-/// within files; completed append-only stamps remain valid partial progress.
+/// within files; only fully published per-file generations remain visible.
 pub(crate) fn backfill_stamp_spans_cancellable(
     engine: &Engine,
     dry_run: bool,
@@ -1100,6 +1119,19 @@ fn stamp_spans_into_cancellable(
     storage: &Storage,
     dry_run: bool,
     should_cancel: Option<&dyn Fn() -> bool>,
+) -> Result<StampSpansStats> {
+    stamp_spans_into_cancellable_with(storage, dry_run, should_cancel, &|anchor, bytes| {
+        Ok(codewitness::Auditor::stamp_file_content(anchor, bytes)?
+            .as_str()
+            .to_string())
+    })
+}
+
+fn stamp_spans_into_cancellable_with(
+    storage: &Storage,
+    dry_run: bool,
+    should_cancel: Option<&dyn Fn() -> bool>,
+    stamp_cached: &dyn Fn(&codewitness::Anchor, &[u8]) -> Result<String>,
 ) -> Result<StampSpansStats> {
     let mut stats = StampSpansStats::default();
 
@@ -1156,7 +1188,6 @@ fn stamp_spans_into_cancellable(
             continue;
         };
 
-        stats.files_processed += 1;
         let project = file_nodes
             .iter()
             .find(|n| !n.project.is_empty())
@@ -1164,28 +1195,100 @@ fn stamp_spans_into_cancellable(
             .unwrap_or_default();
         let at_oid_str = head_oid.to_string();
 
-        // Type-qualified symbol identity for witness-ledger minting (see
-        // `qualify_witness_symbols`'s doc comment): re-walk the file's
-        // CURRENT on-disk AST for impl/class container spans — `code_nodes`
-        // deliberately carries no such container rows (SCOPE DECISION), and
-        // `stamp_spans_into` already requires the file to exist on disk
-        // (checked above), so this is the one extra, acceptable-cost parse
-        // per file. A read/lang-detection failure degrades to "no
-        // containers" (every symbol stays bare) rather than aborting the
-        // file — same fail-soft posture as the rest of this module.
-        let containers = lang_from_path_str(&file)
-            .zip(std::fs::read_to_string(&file).ok())
-            .map(|(lang, src)| container_spans(&src, lang))
-            .unwrap_or_default();
-        let defs: Vec<(String, String, i64, i64)> = file_nodes
+        if !dry_run
+            && storage.with_connection(|conn| {
+                witness_ledger::complete_generation_exists(
+                    conn,
+                    &project,
+                    &file,
+                    &at_oid_str,
+                    WITNESS_EXTRACTOR_VERSION,
+                )
+            })?
+        {
+            stats.skipped_complete_generation += 1;
+            continue;
+        }
+        stats.files_processed += 1;
+
+        // Re-derive CURRENT anchor occurrences from the production extractor
+        // instead of trusting persisted `code_nodes`, whose coarse ids may
+        // already have collapsed coexisting same-named definitions. Limit
+        // the fresh fragment to `(kind,name)` anchors the graph actually
+        // knows, so this repairs identity without inventing unrelated graph
+        // coverage. A clean parse is required: on malformed/unreadable input
+        // retain the legacy rows and do not mint a preferred lineage.
+        // Read the exact committed blob `stamp_at(..., head_oid)` will hash.
+        // Parsing the worktree while stamping HEAD would mix two evidence
+        // versions under one source_id whenever the file has local edits.
+        let source_bytes = match auditor.file_content_at(Path::new(&relpath), head_oid) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                stats.skipped_stamp_error += 1;
+                eprintln!("CSR stamp-spans: blob read error for {file} ({e})");
+                continue;
+            }
+        };
+        let source = std::str::from_utf8(&source_bytes).ok();
+        let lang = lang_from_path_str(&file);
+        let anchor_keys: BTreeSet<(String, String)> = file_nodes
+            .iter()
+            .filter(|node| node.kind != "module")
+            .map(|node| (node.kind.clone(), node.name.clone()))
+            .collect();
+        let rederived = source.zip(lang).and_then(|(src, _)| {
+            let fragment = extract_graph_fragment_for_file(
+                src,
+                &file,
+                &repo_root,
+                &project,
+                &at_oid_str,
+                &at_oid_str,
+            );
+            fragment.parse_clean.then(|| {
+                let nodes = fragment
+                    .nodes
+                    .into_iter()
+                    .filter(|node| {
+                        node.kind != "module"
+                            && anchor_keys.contains(&(node.kind.clone(), node.name.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                (nodes, fragment.containers)
+            })
+        });
+        let (stamp_nodes, containers, source_kind, is_rederived): (
+            Vec<NodeRow>,
+            Vec<ContainerSpan>,
+            &str,
+            bool,
+        ) = match rederived {
+            Some((nodes, containers)) => (nodes, containers, "backfill_rederived_v2", true),
+            None => (file_nodes, Vec::new(), "backfill", false),
+        };
+        let defs: Vec<(String, String, i64, i64)> = stamp_nodes
             .iter()
             .map(|n| (n.kind.clone(), n.name.clone(), n.span_start, n.span_end))
             .collect();
         let (qualified_symbols, disambiguated) = qualify_witness_symbols(&defs, &containers);
         stats.disambiguated_symbols += disambiguated;
 
+        let generation_id = Uuid::new_v4().to_string();
+        let generation = |status: &str| witness_ledger::WitnessGeneration {
+            id: 0,
+            generation_id: generation_id.clone(),
+            project: project.clone(),
+            file: file.clone(),
+            repo_root: Some(repo_root.clone()),
+            head_oid: at_oid_str.clone(),
+            extractor_version: WITNESS_EXTRACTOR_VERSION.to_string(),
+            status: status.to_string(),
+        };
+
         let mut any_span = false;
-        for (idx, node) in file_nodes.iter().enumerate() {
+        let mut generation_failed = false;
+        let mut pending_rows = Vec::new();
+        for (idx, node) in stamp_nodes.iter().enumerate() {
             if idx % 64 == 0 && should_cancel.is_some_and(|cancel| cancel()) {
                 return Ok(stats);
             }
@@ -1195,7 +1298,9 @@ fn stamp_spans_into_cancellable(
             if node.kind == "module" {
                 continue;
             }
+            any_span = true;
             if node.span_start < 0 || node.span_end < node.span_start {
+                generation_failed |= is_rederived;
                 continue;
             }
 
@@ -1207,47 +1312,45 @@ fn stamp_spans_into_cancellable(
                 (checked_line(node.span_start), checked_line(node.span_end))
             else {
                 stats.skipped_span_out_of_range += 1;
+                generation_failed |= is_rederived;
                 eprintln!(
                     "CSR stamp-spans: span {}..{} for {file}::{} does not fit a 1-based u32 line (skip)",
                     node.span_start, node.span_end, node.name
                 );
                 continue;
             };
-            any_span = true;
-
             let symbol = &qualified_symbols[idx];
             let anchor = codewitness::Anchor::new(relpath.clone())
                 .with_symbol(symbol.clone())
                 .with_span(start_line, end_line);
 
-            match auditor.stamp_at(&anchor, head_oid) {
-                Ok(witness) => {
+            match stamp_cached(&anchor, &source_bytes) {
+                Ok(stamp) => {
                     stats.spans_stamped += 1;
                     if dry_run {
                         continue;
                     }
-                    let row = WitnessLedgerRow {
+                    pending_rows.push(WitnessLedgerRow {
                         id: 0,
                         project: project.clone(),
                         file: file.clone(),
                         symbol: Some(symbol.clone()),
                         span_start: Some(node.span_start),
                         span_end: Some(node.span_end),
-                        stamp: witness.stamp().as_str().to_string(),
+                        stamp,
                         tier: "committed".to_string(),
                         at_oid: Some(at_oid_str.clone()),
-                        source_kind: "backfill".to_string(),
-                        source_id: Some(at_oid_str.clone()),
-                    };
-                    if let Err(e) = storage.insert_witness(&row) {
-                        eprintln!(
-                            "CSR stamp-spans: ledger insert error for {file}::{} ({e})",
-                            node.name
-                        );
-                    }
+                        source_kind: source_kind.to_string(),
+                        source_id: Some(if is_rederived {
+                            generation_id.clone()
+                        } else {
+                            at_oid_str.clone()
+                        }),
+                    });
                 }
                 Err(e) => {
                     stats.skipped_stamp_error += 1;
+                    generation_failed |= is_rederived;
                     eprintln!(
                         "CSR stamp-spans: stamp error for {file}::{} ({e})",
                         node.name
@@ -1257,32 +1360,66 @@ fn stamp_spans_into_cancellable(
         }
 
         if any_span {
+            // A lineage generation is a FILE batch. Publish it atomically so
+            // the binding read path can never observe a half-minted newest
+            // generation and mistake one suffix candidate for a unique bind.
+            if !dry_run && is_rederived && generation_failed {
+                storage.with_connection(|conn| {
+                    witness_ledger::insert_generation(conn, &generation("incomplete"))
+                })?;
+            } else if !dry_run && !pending_rows.is_empty() {
+                if let Err(e) = storage.with_connection(|conn| {
+                    let tx = conn.unchecked_transaction()?;
+                    for row in &pending_rows {
+                        witness_ledger::insert_witness(&tx, row)?;
+                    }
+                    if is_rederived {
+                        witness_ledger::insert_generation(&tx, &generation("complete"))?;
+                    }
+                    tx.commit()?;
+                    Ok(())
+                }) {
+                    eprintln!("CSR stamp-spans: atomic ledger batch error for {file} ({e})");
+                }
+            }
             continue;
         }
 
         // No function/type/const span in this file — whole-file fallback
         // witness (symbol = NULL).
         let anchor = codewitness::Anchor::new(relpath.clone());
-        match auditor.stamp_at(&anchor, head_oid) {
-            Ok(witness) => {
+        match stamp_cached(&anchor, &source_bytes) {
+            Ok(stamp) => {
                 stats.whole_files_stamped += 1;
                 if dry_run {
                     continue;
                 }
                 let row = WitnessLedgerRow {
                     id: 0,
-                    project,
+                    project: project.clone(),
                     file: file.clone(),
                     symbol: None,
                     span_start: None,
                     span_end: None,
-                    stamp: witness.stamp().as_str().to_string(),
+                    stamp,
                     tier: "committed".to_string(),
                     at_oid: Some(at_oid_str.clone()),
-                    source_kind: "backfill".to_string(),
-                    source_id: Some(at_oid_str),
+                    source_kind: source_kind.to_string(),
+                    source_id: Some(if is_rederived {
+                        generation_id.clone()
+                    } else {
+                        at_oid_str.clone()
+                    }),
                 };
-                if let Err(e) = storage.insert_witness(&row) {
+                if let Err(e) = storage.with_connection(|conn| {
+                    let tx = conn.unchecked_transaction()?;
+                    witness_ledger::insert_witness(&tx, &row)?;
+                    if is_rederived {
+                        witness_ledger::insert_generation(&tx, &generation("complete"))?;
+                    }
+                    tx.commit()?;
+                    Ok(())
+                }) {
                     eprintln!("CSR stamp-spans: ledger insert error for {file} (whole-file) ({e})");
                 }
             }
@@ -2022,6 +2159,208 @@ mod tests {
     }
 
     #[test]
+    fn collision_rate_probe_fixture_corpus() {
+        use ast_grep_language::SupportLang;
+
+        struct Case {
+            category: &'static str,
+            lang: SupportLang,
+            source: &'static str,
+            file: &'static str,
+            expected_disambiguated: usize,
+        }
+
+        let cases = vec![
+            Case {
+                category: "ts_nested_functions",
+                lang: SupportLang::TypeScript,
+                source: "function alpha() {\n  function shared() {}\n}\nfunction beta() {\n  function shared() {}\n}\n",
+                file: "/repo/nested.ts",
+                expected_disambiguated: 0,
+            },
+            Case {
+                category: "ts_object_literal_methods",
+                lang: SupportLang::TypeScript,
+                source: "const handlers = {\n  left: {\n    run() {}\n  },\n  right: {\n    run() {}\n  }\n};\n",
+                file: "/repo/objects.ts",
+                expected_disambiguated: 0,
+            },
+            Case {
+                category: "ts_arrow_const_scopes",
+                lang: SupportLang::TypeScript,
+                source: "const left = () => {\n  function shared() {}\n};\nconst right = () => {\n  function shared() {}\n};\n",
+                file: "/repo/arrows.ts",
+                expected_disambiguated: 0,
+            },
+            Case {
+                category: "ts_module_overloads",
+                lang: SupportLang::TypeScript,
+                source: "function parse(value: string) { return value; }\nfunction parse(value: number) { return value; }\nfunction parse(value: string | number) { return value; }\n",
+                file: "/repo/overloads.ts",
+                expected_disambiguated: 2,
+            },
+            Case {
+                category: "python_nested_defs",
+                lang: SupportLang::Python,
+                source: "def outer_a():\n    def shared():\n        pass\n\ndef outer_b():\n    def shared():\n        pass\n",
+                file: "/repo/nested.py",
+                expected_disambiguated: 0,
+            },
+            Case {
+                category: "python_property_pairs",
+                lang: SupportLang::Python,
+                source: "class Box:\n    @property\n    def value(self):\n        return self._value\n    @value.setter\n    def value(self, value):\n        self._value = value\n",
+                file: "/repo/properties.py",
+                expected_disambiguated: 1,
+            },
+        ];
+
+        let mut total_defs = 0usize;
+        let mut total_legacy_disambiguated = 0usize;
+        let mut total_disambiguated = 0usize;
+        for case in cases {
+            let fragment = extract_graph_fragment(
+                case.source,
+                case.lang,
+                case.file,
+                "repo",
+                "proj",
+                "conv",
+                "session",
+            );
+            let defs: Vec<_> = fragment
+                .nodes
+                .iter()
+                .filter(|node| node.kind == "function")
+                .map(|node| {
+                    (
+                        node.kind.clone(),
+                        node.name.clone(),
+                        node.span_start,
+                        node.span_end,
+                    )
+                })
+                .collect();
+            let containers = container_spans(case.source, case.lang);
+            let legacy_containers: Vec<_> = containers
+                .iter()
+                .filter(|container| !container.name.contains(container.separator))
+                .filter(|container| {
+                    case.source
+                        .lines()
+                        .nth(container.start as usize)
+                        .is_some_and(|line| line.trim_start().starts_with("class "))
+                })
+                .cloned()
+                .collect();
+            let (_, legacy_disambiguated) = qualify_witness_symbols(&defs, &legacy_containers);
+            let (symbols, disambiguated) = qualify_witness_symbols(&defs, &containers);
+            eprintln!(
+                "collision-probe {}: defs={} before_#N={} after_#N={} symbols={symbols:?}",
+                case.category,
+                defs.len(),
+                legacy_disambiguated,
+                disambiguated
+            );
+            assert_eq!(
+                disambiguated, case.expected_disambiguated,
+                "category {} symbols={symbols:?} containers={containers:?}",
+                case.category
+            );
+            total_defs += defs.len();
+            total_legacy_disambiguated += legacy_disambiguated;
+            total_disambiguated += disambiguated;
+        }
+        eprintln!(
+            "collision-probe total: defs={total_defs} before_#N={total_legacy_disambiguated} after_#N={total_disambiguated} rate={:.1}%",
+            100.0 * total_disambiguated as f64 / total_defs as f64
+        );
+        assert_eq!((total_defs, total_legacy_disambiguated), (17, 7));
+        assert_eq!((total_defs, total_disambiguated), (17, 3));
+    }
+
+    fn qualified_fixture_symbols(
+        source: &str,
+        lang: ast_grep_language::SupportLang,
+        defs: &[(&str, i64, i64)],
+    ) -> (Vec<String>, usize) {
+        let defs: Vec<_> = defs
+            .iter()
+            .map(|(name, start, end)| ("function".to_string(), (*name).to_string(), *start, *end))
+            .collect();
+        qualify_witness_symbols(&defs, &container_spans(source, lang))
+    }
+
+    #[test]
+    fn qualifies_typescript_nested_functions_by_function_parent() {
+        use ast_grep_language::SupportLang;
+
+        let source = "function alpha() {\n  function shared() {}\n}\nfunction beta() {\n  function shared() {}\n}\n";
+        let (symbols, disambiguated) = qualified_fixture_symbols(
+            source,
+            SupportLang::TypeScript,
+            &[
+                ("alpha", 0, 2),
+                ("shared", 1, 1),
+                ("beta", 3, 5),
+                ("shared", 4, 4),
+            ],
+        );
+        assert_eq!(symbols, ["alpha", "alpha.shared", "beta", "beta.shared"]);
+        assert_eq!(disambiguated, 0);
+    }
+
+    #[test]
+    fn qualifies_typescript_object_methods_by_property_key_path() {
+        use ast_grep_language::SupportLang;
+
+        let source = "const handlers = {\n  left: {\n    run() {}\n  },\n  right: {\n    run() {}\n  }\n};\n";
+        let (symbols, disambiguated) = qualified_fixture_symbols(
+            source,
+            SupportLang::TypeScript,
+            &[("run", 2, 2), ("run", 5, 5)],
+        );
+        assert_eq!(symbols, ["handlers.left.run", "handlers.right.run"]);
+        assert_eq!(disambiguated, 0);
+    }
+
+    #[test]
+    fn qualifies_typescript_nested_functions_by_arrow_const_parent() {
+        use ast_grep_language::SupportLang;
+
+        let source = "const left = () => {\n  function shared() {}\n};\nconst right = () => {\n  function shared() {}\n};\n";
+        let (symbols, disambiguated) = qualified_fixture_symbols(
+            source,
+            SupportLang::TypeScript,
+            &[("shared", 1, 1), ("shared", 4, 4)],
+        );
+        assert_eq!(symbols, ["left.shared", "right.shared"]);
+        assert_eq!(disambiguated, 0);
+    }
+
+    #[test]
+    fn qualifies_python_nested_defs_by_function_parent() {
+        use ast_grep_language::SupportLang;
+
+        let source = "def outer_a():\n    def shared():\n        pass\n\ndef outer_b():\n    def shared():\n        pass\n";
+        let (symbols, disambiguated) = qualified_fixture_symbols(
+            source,
+            SupportLang::Python,
+            &[
+                ("outer_a", 0, 2),
+                ("shared", 1, 2),
+                ("outer_b", 4, 6),
+                ("shared", 5, 6),
+            ],
+        );
+        assert_eq!(
+            symbols,
+            ["outer_a", "outer_a.shared", "outer_b", "outer_b.shared"]
+        );
+        assert_eq!(disambiguated, 0);
+    }
+
+    #[test]
     fn qualify_witness_symbols_disambiguates_residual_collisions_by_span_order() {
         // Two defs that land on the identical bare symbol (empty
         // `containers` — qualification cannot resolve them, e.g. two free
@@ -2085,12 +2424,10 @@ mod tests {
         let storage = Storage::open_memory().unwrap();
         storage
             .with_connection(|conn| {
-                let mut ctx_is_empty = attr_node("n-ctx", &file_path, "is_empty");
-                ctx_is_empty.repo_root = Some(repo_root.clone());
-                ctx_is_empty.span_start = 3;
-                ctx_is_empty.span_end = 5;
-                codegraph_upsert_node(conn, &ctx_is_empty).unwrap();
-
+                // Simulate an existing corpus already damaged by the old
+                // `(repo,file,kind,name)` collapse: only ONE bare method row
+                // survived. The HEAD pass must re-extract the file and mint
+                // both physical definitions into a fresh append-only fork.
                 let mut diff_is_empty = attr_node("n-diff", &file_path, "is_empty");
                 diff_is_empty.repo_root = Some(repo_root.clone());
                 diff_is_empty.span_start = 11;
@@ -2122,11 +2459,90 @@ mod tests {
     }
 
     #[test]
-    fn stamp_spans_into_disambiguates_residual_bare_name_collision() {
-        // A collision qualification alone can't resolve (no impl/class
-        // container at all — e.g. two free-function `code_nodes` rows that
-        // happen to share a name) must fall back to the `#2` safety net
-        // rather than silently colliding into one `witness_ledger` symbol.
+    fn stamp_failure_publishes_no_partial_rederived_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        if !init_git_repo(repo) {
+            return;
+        }
+
+        let file = repo.join("dup.rs");
+        std::fs::write(&file, dup_impl_fixture_src()).unwrap();
+        git_in(repo).args(["add", "dup.rs"]).status().unwrap();
+        git_in(repo)
+            .args(["commit", "-q", "-m", "init"])
+            .status()
+            .unwrap();
+
+        let file_path = file.to_string_lossy().to_string();
+        let repo_root = repo.to_string_lossy().to_string();
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                let mut collapsed = attr_node("n-shared", &file_path, "is_empty");
+                collapsed.repo_root = Some(repo_root.clone());
+                collapsed.first_conv_id = "conv-partial".into();
+                collapsed.last_conv_id = "conv-partial".into();
+                codegraph_upsert_node(conn, &collapsed)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = stamp_spans_into_cancellable_with(&storage, false, None, &|anchor, bytes| {
+            if anchor.symbol.as_deref() == Some("AstDiff::is_empty") {
+                anyhow::bail!("forced sibling stamp failure");
+            }
+            Ok(codewitness::Auditor::stamp_file_content(anchor, bytes)?
+                .as_str()
+                .to_string())
+        })
+        .unwrap();
+        assert_eq!(stats.spans_stamped, 1, "one sibling hashes successfully");
+        assert_eq!(
+            stats.skipped_stamp_error, 1,
+            "one sibling is forced to fail"
+        );
+
+        storage
+            .with_connection(|conn| {
+                let published: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM witness_ledger
+                     WHERE project = 'proj' AND file = ?1
+                       AND source_kind = 'backfill_rederived_v2'",
+                    rusqlite::params![file_path],
+                    |row| row.get(0),
+                )?;
+                let incomplete: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM witness_generations
+                     WHERE project = 'proj' AND file = ?1 AND status = 'incomplete'",
+                    rusqlite::params![file_path],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(
+                    published, 0,
+                    "successful sibling must not be published alone"
+                );
+                assert_eq!(incomplete, 1, "failed run remains observable as incomplete");
+
+                let bound = crate::storage::chunk_binding::witness_verdict_for_chunks(
+                    conn,
+                    &["conv-partial".to_string()],
+                )?;
+                assert!(
+                    bound.is_empty(),
+                    "binding must abstain instead of seeing the successful sibling"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn stamp_spans_into_rederivation_drops_stale_same_name_span() {
+        // Persisted graph rows are candidates, not authority. The second
+        // row below claims `orphan` at a span whose source actually defines
+        // `orphan_two`; production re-extraction must not infer that it is a
+        // second `orphan` merely because an old code_nodes row says so.
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         if !init_git_repo(repo) {
@@ -2157,9 +2573,7 @@ mod tests {
                 a.span_end = 2;
                 codegraph_upsert_node(conn, &a).unwrap();
 
-                // Same name, different span — qualification has no
-                // container to disambiguate by (this file has none), so
-                // the safety net alone must keep them apart.
+                // Stale/corrupt same-name row at `orphan_two`'s span.
                 let mut b = attr_node("n-b", &file_path, "orphan");
                 b.repo_root = Some(repo_root.clone());
                 b.span_start = 4;
@@ -2170,18 +2584,12 @@ mod tests {
             .unwrap();
 
         let stats = stamp_spans_into(&storage, false).unwrap();
-        assert_eq!(stats.spans_stamped, 2);
-        assert_eq!(
-            stats.disambiguated_symbols, 1,
-            "second occurrence gets the #2 safety-net suffix"
-        );
+        assert_eq!(stats.spans_stamped, 1);
+        assert_eq!(stats.disambiguated_symbols, 0);
 
         let rows = storage.witnesses_for_file("proj", &file_path).unwrap();
         let symbols: BTreeSet<_> = rows.iter().map(|r| r.symbol.clone()).collect();
-        assert_eq!(
-            symbols,
-            BTreeSet::from([Some("orphan".to_string()), Some("orphan#2".to_string())]),
-        );
+        assert_eq!(symbols, BTreeSet::from([Some("orphan".to_string())]),);
     }
 
     #[test]
@@ -2235,7 +2643,7 @@ mod tests {
         for r in &rows {
             assert_eq!(r.tier, "committed");
             assert_eq!(r.at_oid.as_deref(), Some(head.as_str()));
-            assert_eq!(r.source_kind, "backfill");
+            assert_eq!(r.source_kind, "backfill_rederived_v2");
         }
 
         // Stamps must match codewitness's own `stamp_at` output exactly.
@@ -2253,9 +2661,12 @@ mod tests {
         assert_eq!(foo_row.span_start, Some(0));
         assert_eq!(foo_row.span_end, Some(2));
 
-        // Idempotency: rerunning must add zero new rows.
+        // Idempotency plus cadence short-circuit: rerunning at the same HEAD
+        // and extractor version must do no blob parsing or span stamping.
         let stats2 = stamp_spans_into(&storage, false).unwrap();
-        assert_eq!(stats2.spans_stamped, 2, "same 2 spans re-attempted");
+        assert_eq!(stats2.files_processed, 0);
+        assert_eq!(stats2.spans_stamped, 0);
+        assert_eq!(stats2.skipped_complete_generation, 1);
         let rows_after = storage.witnesses_for_file("proj", &file_path).unwrap();
         assert_eq!(rows_after.len(), 2, "rerun must not add new rows");
     }
@@ -2308,7 +2719,11 @@ mod tests {
         // dedupes them at the DB level — see `storage::witness_ledger`'s
         // module doc.
         let stats2 = stamp_spans_into(&storage, false).unwrap();
-        assert_eq!(stats2.whole_files_stamped, 1, "re-attempted, not net-new");
+        assert_eq!(
+            stats2.whole_files_stamped, 0,
+            "unchanged generation skipped"
+        );
+        assert_eq!(stats2.skipped_complete_generation, 1);
         let rows_after = storage.witnesses_for_file("proj", &file_path).unwrap();
         assert_eq!(
             rows_after.len(),
@@ -2319,10 +2734,10 @@ mod tests {
 
     #[test]
     fn stamp_spans_skips_span_that_overflows_u32_line_range() {
-        // A corrupt span near i64::MAX (or merely > u32::MAX) must be
-        // counted in `skipped_span_out_of_range` — never panic (debug
-        // overflow) or silently truncate (release `as u32`). With no other
-        // valid span in the file, the whole-file fallback still fires.
+        // A corrupt persisted span near i64::MAX is not reproduced by the
+        // production extractor, so re-derivation drops it without attempting
+        // a lossy conversion. With no matching current anchor, the whole-file
+        // fallback still fires.
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         if !init_git_repo(repo) {
@@ -2355,7 +2770,7 @@ mod tests {
             .unwrap();
 
         let stats = stamp_spans_into(&storage, false).expect("must never panic or fail");
-        assert_eq!(stats.skipped_span_out_of_range, 1);
+        assert_eq!(stats.skipped_span_out_of_range, 0);
         assert_eq!(stats.spans_stamped, 0);
         assert_eq!(
             stats.whole_files_stamped, 1,
@@ -2453,21 +2868,8 @@ mod tests {
 
     #[test]
     fn stamp_spans_at_qualifies_symbol_identity_by_impl_container() {
-        // A single `impl` block's method alongside an unrelated free
-        // function — through the `--at <rev>` (fresh re-extraction from the
-        // commit's own blob) path — proves the SAME qualification the
-        // HEAD-mode test exercises also applies when the source is a
-        // historical blob, not a persisted `code_nodes` row (a
-        // precondition for `(file, symbol)` joins across HEAD-mode and
-        // historical-mode rows). Deliberately only ONE `impl`-block method
-        // per commit here (not two same-named ones, as in the HEAD-mode
-        // fixture): `extract_inner`'s own per-parse node collection keys
-        // solely on `(repo, file, kind, name)` (`node_id`, unaffected by
-        // this fix — see its doc comment / the SCOPE DECISION) and already
-        // collapses two same-named `function_item`s in ONE file to a
-        // single survivor before witness minting ever sees them; that
-        // pre-existing, out-of-scope collision is exercised across
-        // COMMITS instead, below.
+        // Real v9.5 shape: coexisting same-named methods in two impl blocks
+        // must both survive the production extractor and reach the ledger.
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         if !init_git_repo(repo) {
@@ -2475,7 +2877,7 @@ mod tests {
         }
 
         let file = repo.join("dup.rs");
-        let src = "struct CodeContext;\n\nimpl CodeContext {\n    fn is_empty(&self) -> bool {\n        true\n    }\n}\n\nfn helper() -> i32 {\n    42\n}\n";
+        let src = dup_impl_fixture_src();
         std::fs::write(&file, src).unwrap();
         git_in(repo).args(["add", "dup.rs"]).status().unwrap();
         git_in(repo)
@@ -2490,12 +2892,12 @@ mod tests {
 
         let stats =
             stamp_spans_historical_into(&storage, &commit, Some(&repo_root), false).unwrap();
-        // Struct decl (type) + is_empty (method) + helper (free fn).
-        assert_eq!(stats.spans_stamped, 3);
+        // Two struct declarations + two same-named methods.
+        assert_eq!(stats.spans_stamped, 4);
         assert_eq!(stats.disambiguated_symbols, 0);
 
         let rows = storage.witnesses_for_file("", &file_abs).unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         let symbols: BTreeSet<_> = rows.iter().map(|r| r.symbol.clone()).collect();
         assert_eq!(
             symbols,
@@ -2504,10 +2906,10 @@ mod tests {
                 // only ever applies to `kind == "function"` (methods).
                 Some("CodeContext".to_string()),
                 Some("CodeContext::is_empty".to_string()),
-                Some("helper".to_string()),
+                Some("AstDiff".to_string()),
+                Some("AstDiff::is_empty".to_string()),
             ]),
-            "the impl-block method is container-qualified; the free function \
-             and the struct decl itself stay bare"
+            "both impl-block methods survive extraction and receive distinct qualified names"
         );
     }
 

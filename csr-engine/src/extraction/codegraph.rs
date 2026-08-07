@@ -28,6 +28,10 @@ use crate::storage::codegraph::{EdgeRow, NodeRow};
 pub struct GraphFragment {
     pub nodes: Vec<NodeRow>,
     pub edges: Vec<EdgeRow>,
+    /// Lexical containers derived from the same AST root as `nodes`. Span
+    /// stamping consumes this field to avoid parsing each committed file a
+    /// second time solely for witness symbol qualification.
+    pub containers: Vec<ContainerSpan>,
     /// TASK 2 (WCR truth pass X4 tier); scope-qualified as of the X4
     /// adversarial-review truth pass (Finding 1), and CHAIN-qualified as of
     /// Finding 4: `(scope, name)` pairs for every local-binding name
@@ -1410,7 +1414,7 @@ fn tree_has_error<D: ast_grep_core::Doc>(root: &ast_grep_core::Node<'_, D>) -> b
     root.dfs().any(|n| n.is_error() || n.is_missing())
 }
 
-/// One impl/class-like container span, computed SOLELY to qualify method
+/// One lexical container span, computed SOLELY to qualify function/method
 /// symbol identity in the `witness_ledger` minting path (see
 /// `import::backfill::stamp_spans_into`/`stamp_spans_historical_into`) —
 /// deliberately NEVER written to `NodeRow`/`code_nodes`. Extraction identity
@@ -1421,10 +1425,11 @@ fn tree_has_error<D: ast_grep_core::Doc>(root: &ast_grep_core::Node<'_, D>) -> b
 /// witness join (e.g. `CodeContext::is_empty` and `AstDiff::is_empty`, both
 /// bare `is_empty` under the old rule).
 ///
-/// Rust `impl Type { .. }` / `impl Trait for Type { .. }` containers use the
-/// `Type` name (never the trait) with a `::` separator — matching Rust's own
-/// `Type::method` call syntax. TS/JS/TSX class bodies and Python class
-/// bodies use the class name with a `.` separator.
+/// Rust `impl Type { .. }` / `impl Trait for Type { .. }` containers use
+/// `::`; TS/JS/TSX classes, named functions, object-literal
+/// property paths, and const-bound arrows use `.`; Python classes and named
+/// functions use `.`. Container names are themselves ancestor-qualified, so
+/// deeper definitions retain their complete lexical path.
 #[derive(Debug, Clone)]
 pub struct ContainerSpan {
     pub name: String,
@@ -1433,12 +1438,11 @@ pub struct ContainerSpan {
     pub end: i64,
 }
 
-/// Impl/class-like container spans in `source`, for method qualification
+/// Lexical container spans in `source`, for function/method qualification
 /// only (see `ContainerSpan`'s doc comment). Empty for languages with no
-/// cheaply-available parent-type context (Go method receivers are a
-/// materially different shape from Rust `impl` blocks / TS-JS-Python
-/// classes — deliberately out of scope here, free functions AND Go methods
-/// stay unqualified) or when the source is too small to parse meaningfully.
+/// supported deterministic container walk (Go method receivers are a
+/// materially different shape and remain deliberately out of scope) or when
+/// the source is too small to parse meaningfully.
 /// Wrapped in `catch_unwind` for the same reason `extract_graph_fragment`
 /// is: malformed input can panic inside tree-sitter/ast-grep.
 pub fn container_spans(source: &str, lang: SupportLang) -> Vec<ContainerSpan> {
@@ -1449,38 +1453,177 @@ pub fn container_spans(source: &str, lang: SupportLang) -> Vec<ContainerSpan> {
 }
 
 fn container_spans_inner(source: &str, lang: SupportLang) -> Vec<ContainerSpan> {
-    let (kind, separator): (&str, &'static str) = match lang {
-        SupportLang::Rust => ("impl_item", "::"),
-        SupportLang::Python => ("class_definition", "."),
-        SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => {
-            ("class_declaration", ".")
-        }
-        _ => return Vec::new(),
-    };
     let grep = lang.ast_grep(source);
     let root = grep.root();
-    let matcher = KindMatcher::new(kind, lang);
+    container_spans_from_root(&root, lang)
+}
+
+fn container_spans_from_root<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    lang: SupportLang,
+) -> Vec<ContainerSpan> {
+    let separator = match lang {
+        SupportLang::Rust => "::",
+        SupportLang::Python
+        | SupportLang::TypeScript
+        | SupportLang::Tsx
+        | SupportLang::JavaScript => ".",
+        _ => return Vec::new(),
+    };
     let mut out = Vec::new();
-    for n in root.find_all(&matcher) {
-        let Some(name) = container_name(&n, lang) else {
-            continue;
-        };
-        // Same min-length guard `extract_inner`'s def loop applies: never
-        // useful provenance, only orphan cruft from a misparsed fragment.
-        if name.len() < 2 {
-            continue;
+
+    let named_kinds: &[&str] = match lang {
+        SupportLang::Rust => &["impl_item"],
+        SupportLang::Python => &["class_definition", "function_definition"],
+        SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => &[
+            "class_declaration",
+            "function_declaration",
+            "method_definition",
+        ],
+        _ => unreachable!("unsupported languages returned above"),
+    };
+    for kind in named_kinds {
+        let matcher = KindMatcher::new(kind, lang);
+        for n in root.find_all(&matcher) {
+            if let Some(name) = container_name(&n, lang) {
+                push_container(&mut out, &n, name, separator);
+            }
         }
-        let text = n.text().to_string();
-        let start = n.start_pos().line() as i64;
-        let end = start + text.lines().count().saturating_sub(1) as i64;
-        out.push(ContainerSpan {
-            name,
-            separator,
-            start,
-            end,
-        });
     }
-    out
+
+    if matches!(
+        lang,
+        SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript
+    ) {
+        let object_matcher = KindMatcher::new("object", lang);
+        for n in root.find_all(&object_matcher) {
+            if let Some(name) = direct_binding_or_property_name(&n) {
+                push_container(&mut out, &n, name, separator);
+            }
+        }
+
+        let arrow_matcher = KindMatcher::new("arrow_function", lang);
+        for n in root.find_all(&arrow_matcher) {
+            if let Some(name) = ancestor_binding_or_property_name(&n) {
+                push_container(&mut out, &n, name, separator);
+            }
+        }
+    }
+
+    qualify_container_paths(out)
+}
+
+fn push_container<D: ast_grep_core::Doc>(
+    out: &mut Vec<ContainerSpan>,
+    node: &ast_grep_core::NodeMatch<'_, D>,
+    name: String,
+    separator: &'static str,
+) {
+    // Same min-length guard `extract_inner`'s def loop applies: never useful
+    // provenance, only orphan cruft from a misparsed fragment.
+    if name.len() < 2 {
+        return;
+    }
+    let text = node.text().to_string();
+    let start = node.start_pos().line() as i64;
+    let end = start + text.lines().count().saturating_sub(1) as i64;
+    out.push(ContainerSpan {
+        name,
+        separator,
+        start,
+        end,
+    });
+}
+
+fn direct_binding_or_property_name<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::NodeMatch<'_, D>,
+) -> Option<String> {
+    let parent = node.parent()?;
+    binding_or_property_name(&parent)
+}
+
+fn ancestor_binding_or_property_name<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::NodeMatch<'_, D>,
+) -> Option<String> {
+    for ancestor in node.ancestors() {
+        if let Some(name) = binding_or_property_name(&ancestor) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn binding_or_property_name<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> Option<String> {
+    let field = match node.kind().as_ref() {
+        "variable_declarator" => node.field("name"),
+        "pair" => node.field("key"),
+        "assignment_expression" => node.field("left"),
+        _ => None,
+    }?;
+    match field.kind().as_ref() {
+        "identifier" | "property_identifier" | "shorthand_property_identifier" => {
+            Some(field.text().to_string())
+        }
+        "string" | "string_fragment" => {
+            let text = field.text();
+            let trimmed = text.trim_matches(['\'', '"']);
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn qualify_container_paths(mut containers: Vec<ContainerSpan>) -> Vec<ContainerSpan> {
+    containers
+        .sort_by(|a, b| (a.start, a.end, a.name.as_str()).cmp(&(b.start, b.end, b.name.as_str())));
+    containers.dedup_by(|a, b| {
+        a.start == b.start && a.end == b.end && a.name == b.name && a.separator == b.separator
+    });
+
+    let raw_names: Vec<String> = containers.iter().map(|c| c.name.clone()).collect();
+    let mut qualified: Vec<Option<String>> = vec![None; containers.len()];
+    for index in 0..containers.len() {
+        let name = qualified_container_name(index, &containers, &raw_names, &mut qualified);
+        containers[index].name = name;
+    }
+    containers
+}
+
+fn qualified_container_name(
+    index: usize,
+    containers: &[ContainerSpan],
+    raw_names: &[String],
+    qualified: &mut [Option<String>],
+) -> String {
+    if let Some(name) = &qualified[index] {
+        return name.clone();
+    }
+    let current = &containers[index];
+    let parent = containers
+        .iter()
+        .enumerate()
+        .filter(|(candidate_index, candidate)| {
+            *candidate_index != index
+                && candidate.start <= current.start
+                && current.end <= candidate.end
+                && (candidate.start < current.start || current.end < candidate.end)
+        })
+        .min_by_key(|(_, candidate)| candidate.end - candidate.start)
+        .map(|(candidate_index, _)| candidate_index);
+
+    let name = match parent {
+        Some(parent_index) => format!(
+            "{}{}{}",
+            qualified_container_name(parent_index, containers, raw_names, qualified),
+            containers[parent_index].separator,
+            raw_names[index]
+        ),
+        None => raw_names[index].clone(),
+    };
+    qualified[index] = Some(name.clone());
+    name
 }
 
 /// A container node's own name. Rust `impl_item` needs dedicated handling
@@ -1573,7 +1716,17 @@ fn extract_inner(
     session_id: &str,
 ) -> GraphFragment {
     let lang_name = lang_name(lang);
-    let mut nodes: BTreeMap<String, NodeRow> = BTreeMap::new();
+    // Per-parse occurrence identity MUST retain span. `NodeRow::id` is the
+    // intentionally coarse persisted graph identity `(repo,file,kind,name)`;
+    // using it as this collection key used to overwrite coexisting methods
+    // such as `CodeContext::is_empty` and `AstDiff::is_empty` before witness
+    // qualification could see either container. The persisted ids remain
+    // unchanged; this key only preserves every physical definition through
+    // the extraction boundary, in deterministic `(id,start,end,AST-order)`
+    // order. The ordinal is necessary because distinct one-line definitions
+    // can share the same persisted line span.
+    let mut nodes: BTreeMap<(String, i64, i64, usize), NodeRow> = BTreeMap::new();
+    let mut node_occurrence = 0usize;
     let mut edges: BTreeMap<(String, String, String), EdgeRow> = BTreeMap::new();
     // X4 adversarial review, Finding 4; ALL-distinct-chains as of the Codex
     // round 4 adversarial review, Finding 1: keyed identically to `edges`
@@ -1605,7 +1758,7 @@ fn extract_inner(
     // Synthetic module node anchoring the file.
     let module_id = node_id(repo, file, "module", file);
     nodes.insert(
-        module_id.clone(),
+        (module_id.clone(), 0, 0, node_occurrence),
         NodeRow {
             id: module_id.clone(),
             repo: repo.into(),
@@ -1715,7 +1868,8 @@ fn extract_inner(
                     let end = start + text.lines().count().saturating_sub(1) as i64;
                     let node = mk_node(canon, &name, &text, start, end);
                     let nid = node.id.clone();
-                    nodes.insert(nid.clone(), node);
+                    node_occurrence += 1;
+                    nodes.insert((nid.clone(), start, end, node_occurrence), node);
                     add_edge(module_id.clone(), nid, "defines", 1, "", "");
                 }
             }
@@ -1742,7 +1896,8 @@ fn extract_inner(
                 let end = start + text.lines().count().saturating_sub(1) as i64;
                 let node = mk_node("const", &name, &text, start, end);
                 let nid = node.id.clone();
-                nodes.insert(nid.clone(), node);
+                node_occurrence += 1;
+                nodes.insert((nid.clone(), start, end, node_occurrence), node);
                 add_edge(module_id.clone(), nid, "defines", 1, "", "");
             }
         }
@@ -1885,6 +2040,7 @@ fn extract_inner(
     // parsed `root` above and the SAME `func_index` the calls loop just
     // used — never a second parse, never a second index pass.
     let local_bindings = collect_local_bindings_from_root(&root, lang, &func_index);
+    let containers = container_spans_from_root(&root, lang);
     // Finding 3 (X4 adversarial review): computed from the SAME parsed
     // `root` — see `tree_has_error`'s doc comment.
     let parse_clean = !tree_has_error(&root);
@@ -1892,6 +2048,7 @@ fn extract_inner(
     GraphFragment {
         nodes: nodes.into_values().collect(),
         edges: edges.into_values().collect(),
+        containers,
         local_bindings,
         call_scope_chains,
         call_attribution_pairs,
@@ -1914,6 +2071,49 @@ fn lang_name(lang: SupportLang) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_extractor_preserves_same_named_methods_in_distinct_impls() {
+        // Regression for the v9.5 T4 corruption: changing the per-parse node
+        // key back to `(repo,file,kind,name)` makes one of these real
+        // definitions overwrite the other before witness qualification.
+        let src = "struct CodeContext;\nimpl CodeContext {\n    fn is_empty(&self) -> bool { true }\n}\nstruct AstDiff;\nimpl AstDiff {\n    fn is_empty(&self) -> bool { false }\n}\n";
+        let fragment = extract_graph_fragment(
+            src,
+            SupportLang::Rust,
+            "/repo/src/ast_analysis.rs",
+            "repo",
+            "proj",
+            "conv",
+            "session",
+        );
+        let methods: Vec<_> = fragment
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "function" && node.name == "is_empty")
+            .map(|node| (node.span_start, node.span_end))
+            .collect();
+        assert_eq!(methods, [(2, 2), (6, 6)]);
+    }
+
+    #[test]
+    fn production_extractor_preserves_same_name_and_same_line_occurrences() {
+        let fragment = extract_graph_fragment(
+            "fn duplicate() {} fn duplicate() {}",
+            SupportLang::Rust,
+            "/repo/src/lib.rs",
+            "repo",
+            "proj",
+            "conv",
+            "session",
+        );
+        let count = fragment
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "function" && node.name == "duplicate")
+            .count();
+        assert_eq!(count, 2, "line spans alone must not collapse occurrences");
+    }
 
     #[test]
     fn container_spans_rust_distinguishes_two_impl_blocks_same_method_name() {
@@ -1957,10 +2157,12 @@ mod tests {
     fn container_spans_typescript_class_methods() {
         let src = "class Foo {\n  isEmpty() { return true; }\n}\nclass Bar {\n  isEmpty() { return false; }\n}\n";
         let containers = container_spans(src, SupportLang::TypeScript);
-        assert_eq!(containers.len(), 2, "containers: {containers:?}");
+        assert_eq!(containers.len(), 4, "containers: {containers:?}");
         let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"Foo"));
         assert!(names.contains(&"Bar"));
+        assert!(names.contains(&"Foo.isEmpty"));
+        assert!(names.contains(&"Bar.isEmpty"));
         for c in &containers {
             assert_eq!(c.separator, ".");
         }
@@ -1970,10 +2172,12 @@ mod tests {
     fn container_spans_python_class_methods() {
         let src = "class Foo:\n    def is_empty(self):\n        return True\n\nclass Bar:\n    def is_empty(self):\n        return False\n";
         let containers = container_spans(src, SupportLang::Python);
-        assert_eq!(containers.len(), 2, "containers: {containers:?}");
+        assert_eq!(containers.len(), 4, "containers: {containers:?}");
         let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"Foo"));
         assert!(names.contains(&"Bar"));
+        assert!(names.contains(&"Foo.is_empty"));
+        assert!(names.contains(&"Bar.is_empty"));
     }
 
     #[test]
