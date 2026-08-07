@@ -479,12 +479,20 @@ impl Storage {
     /// Silence was the failure mode that let the TodoWrite→TaskCreate rename rot episode
     /// extraction for weeks — every aux adapter counts what it fails to parse.
     pub fn bump_aux_counter(&self, source: &str) -> Result<()> {
+        self.bump_aux_counter_by(source, 1)
+    }
+
+    /// Increment an aux schema-miss counter by the number of quarantined raw lines.
+    pub fn bump_aux_counter_by(&self, source: &str, count: usize) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let key = format!("aux_schema_miss:{source}");
         let current: i64 = queries::get_meta(&conn, &key)?
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        queries::set_meta(&conn, &key, &(current + 1).to_string())
+        queries::set_meta(&conn, &key, &(current + count as i64).to_string())
     }
 
     /// All aux schema-miss counters as (source, count), for status surfacing.
@@ -594,6 +602,21 @@ impl Storage {
     pub fn get_chunk_source(&self, id: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_chunk_source(&conn, id)
+    }
+
+    pub fn rescope_sidechain_conversation(
+        &self,
+        conversation_id: &str,
+        project_name: &str,
+        parent_conversation_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::rescope_sidechain_conversation(
+            &mut conn,
+            conversation_id,
+            project_name,
+            parent_conversation_id,
+        )
     }
 
     /// Wipe a conversation's chunks + embeddings + FTS rows + provenance edges, so an
@@ -1498,6 +1521,65 @@ mod tests {
             counters,
             vec![("history".to_string(), 1), ("tasks".to_string(), 2)]
         );
+    }
+
+    #[test]
+    fn aux_counter_can_quarantine_multiple_raw_lines() {
+        let storage = Storage::open_memory().unwrap();
+        storage.bump_aux_counter_by("codex_rollout", 3).unwrap();
+        assert_eq!(
+            storage.get_aux_counters().unwrap(),
+            vec![("codex_rollout".to_string(), 3)]
+        );
+    }
+
+    #[test]
+    fn sidechain_rescope_repairs_project_source_and_parent_link_idempotently() {
+        use crate::provenance::Speaker;
+        let storage = Storage::open_memory().unwrap();
+        let chunk = ConversationChunk {
+            id: "sidechunk-1".into(),
+            conversation_id: "agent-child".into(),
+            project_name: "subagents".into(),
+            timestamp: "2026-08-06T12:00:00Z".into(),
+            content: "sidechain evidence".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::Assistant,
+            seq: 0,
+            is_sidechain: true,
+        };
+        storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
+
+        storage
+            .rescope_sidechain_conversation("agent-child", "real-project", "parent-session")
+            .unwrap();
+        let changes_after_first = storage.conn.lock().unwrap().total_changes();
+        storage
+            .rescope_sidechain_conversation("agent-child", "real-project", "parent-session")
+            .unwrap();
+        let changes_after_second = storage.conn.lock().unwrap().total_changes();
+        assert_eq!(
+            changes_after_second, changes_after_first,
+            "an already-correct discovery scan must perform zero writes"
+        );
+
+        let conn = storage.conn.lock().unwrap();
+        let row: (String, String) = conn
+            .query_row(
+                "SELECT project_name, source FROM chunks WHERE id = 'sidechunk-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(row, ("real-project".to_string(), "sidechain".to_string()));
+        let provenance = storage
+            .get_chunk_provenance("sidechunk-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(provenance.author, Speaker::Assistant);
+        assert_eq!(provenance.source_conv_id, "parent-session");
     }
 
     #[test]

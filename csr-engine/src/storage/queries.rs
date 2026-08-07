@@ -210,6 +210,50 @@ pub fn get_chunk_source(conn: &Connection, id: &str) -> Result<Option<String>> {
     .map_err(Into::into)
 }
 
+/// Repair sidechain rows imported by the recursive watcher before it understood
+/// the nested path layout. Additive-safe and idempotent; called only by explicit
+/// sidechain discovery/reimport, never by the normal storage startup path.
+pub fn rescope_sidechain_conversation(
+    conn: &mut Connection,
+    conversation_id: &str,
+    project_name: &str,
+    parent_conversation_id: &str,
+) -> Result<()> {
+    let needs_repair = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM chunks c
+             LEFT JOIN chunk_provenance p ON p.chunk_id = c.id
+             WHERE c.conversation_id = ?1
+               AND (c.project_name IS NOT ?2
+                    OR c.source IS NOT 'sidechain'
+                    OR c.is_sidechain != 1
+                    OR p.source_conv_id IS NOT ?3)
+         )",
+        params![conversation_id, project_name, parent_conversation_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !needs_repair {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE chunks SET project_name = ?2, source = 'sidechain', is_sidechain = 1
+         WHERE conversation_id = ?1",
+        params![conversation_id, project_name],
+    )?;
+    tx.execute(
+        "INSERT INTO chunk_provenance (chunk_id, author, source_conv_id, supersedes)
+         SELECT c.id, COALESCE(p.author, 'assistant'), ?2, p.supersedes
+         FROM chunks c LEFT JOIN chunk_provenance p ON p.chunk_id = c.id
+         WHERE c.conversation_id = ?1
+         ON CONFLICT(chunk_id) DO UPDATE SET source_conv_id = excluded.source_conv_id",
+        params![conversation_id, parent_conversation_id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Delete a whole conversation's chunks + their embeddings, FTS rows, and provenance
 /// edges. Aux-source adapters (plans, tasks, ...) reimport a whole document on content
 /// change, and the document can shrink — overwriting by deterministic chunk id alone
@@ -265,7 +309,7 @@ pub fn get_chunks_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<Conver
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(
-        "SELECT id, conversation_id, project_name, timestamp, content, message_count, summary
+        "SELECT id, conversation_id, project_name, timestamp, content, message_count, summary, is_sidechain
          FROM chunks WHERE id = ?1",
     )?;
     let mut chunks = Vec::new();
@@ -296,7 +340,7 @@ pub fn get_chunks_by_ids_with_provenance(
     }
     let mut stmt = conn.prepare(
         "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content,
-                c.message_count, c.summary, cp.author
+                c.message_count, c.summary, c.is_sidechain, cp.author
          FROM chunks c LEFT JOIN chunk_provenance cp ON cp.chunk_id = c.id
          WHERE c.id = ?1",
     )?;
@@ -405,7 +449,7 @@ pub fn get_chunks_by_project(
     limit: usize,
 ) -> Result<Vec<ConversationChunk>> {
     let mut stmt = conn.prepare(
-        "SELECT id, conversation_id, project_name, timestamp, content, message_count, summary
+        "SELECT id, conversation_id, project_name, timestamp, content, message_count, summary, is_sidechain
          FROM chunks WHERE project_name = ?1 ORDER BY timestamp DESC LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![project, limit as i64], row_to_chunk)?;
@@ -431,7 +475,7 @@ pub fn get_recent_chunks(
     let mut stmt;
     let rows = if let Some(p) = project.filter(|p| *p != "all") {
         stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain
              FROM chunks c
              WHERE c.project_name = ?1
                AND c.rowid = (SELECT MIN(c2.rowid) FROM chunks c2 WHERE c2.conversation_id = c.conversation_id)
@@ -440,7 +484,7 @@ pub fn get_recent_chunks(
         stmt.query_map(params![p, limit as i64], row_to_chunk)?
     } else {
         stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain
              FROM chunks c
              WHERE c.rowid = (SELECT MIN(c2.rowid) FROM chunks c2 WHERE c2.conversation_id = c.conversation_id)
              ORDER BY c.timestamp DESC LIMIT ?1",
@@ -461,7 +505,7 @@ pub fn get_chunks_in_timerange(
 ) -> Result<Vec<ConversationChunk>> {
     let chunks = if let Some(p) = project.filter(|p| *p != "all") {
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, project_name, timestamp, content, message_count, summary
+            "SELECT id, conversation_id, project_name, timestamp, content, message_count, summary, is_sidechain
              FROM chunks WHERE timestamp BETWEEN ?1 AND ?2 AND project_name = ?3
              ORDER BY timestamp DESC",
         )?;
@@ -469,7 +513,7 @@ pub fn get_chunks_in_timerange(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, project_name, timestamp, content, message_count, summary
+            "SELECT id, conversation_id, project_name, timestamp, content, message_count, summary, is_sidechain
              FROM chunks WHERE timestamp BETWEEN ?1 AND ?2
              ORDER BY timestamp DESC",
         )?;
@@ -532,7 +576,7 @@ pub fn fts5_search(
 
     let chunks = if let Some(p) = project.filter(|p| *p != "all") {
         let mut stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain
              FROM chunks c
              JOIN chunks_fts fts ON fts.rowid = c.rowid
              WHERE chunks_fts MATCH ?1 AND c.project_name = ?2
@@ -543,7 +587,7 @@ pub fn fts5_search(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         let mut stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain
              FROM chunks c
              JOIN chunks_fts fts ON fts.rowid = c.rowid
              WHERE chunks_fts MATCH ?1
@@ -633,7 +677,8 @@ pub fn get_reflections_by_two_tags(
 }
 
 /// Helper: map a row to ConversationChunk.
-/// Expects columns: id, conversation_id, project_name, timestamp, content, message_count, summary
+/// Expects columns: id, conversation_id, project_name, timestamp, content,
+/// message_count, summary, is_sidechain.
 fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
     Ok(ConversationChunk {
         id: row.get(0)?,
@@ -648,11 +693,10 @@ fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
         // provenance explicitly via get_chunk_provenance, or use
         // get_chunks_by_ids_with_provenance / row_to_chunk_with_author below.
         author: crate::provenance::Speaker::ToolResult,
-        // seq/is_sidechain are not selected here (7-col SELECT, unchanged) — reads via this
-        // path don't need them for WS1; real values live in the chunks table and are read
-        // directly by the saga queries below when needed.
+        // Sequence is not needed on these read paths; sidechain identity is live
+        // search metadata and must survive hydration for parent-origin dedupe.
         seq: 0,
-        is_sidechain: false,
+        is_sidechain: row.get::<_, i64>(7)? != 0,
     })
 }
 
@@ -660,7 +704,7 @@ fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
 /// that `LEFT JOIN chunk_provenance` (8th column: nullable `author` TEXT).
 /// See `get_chunks_by_ids_with_provenance`.
 fn row_to_chunk_with_author(row: &rusqlite::Row) -> rusqlite::Result<ConversationChunk> {
-    let author_str: Option<String> = row.get(7)?;
+    let author_str: Option<String> = row.get(8)?;
     let author = author_str
         .and_then(|s| s.parse::<Speaker>().ok())
         .unwrap_or(Speaker::ToolResult);
@@ -673,9 +717,9 @@ fn row_to_chunk_with_author(row: &rusqlite::Row) -> rusqlite::Result<Conversatio
         message_count: row.get::<_, i64>(5)? as usize,
         summary: row.get(6)?,
         author,
-        // Not selected here — same rationale as row_to_chunk above.
+        // Sequence is not needed on these read paths.
         seq: 0,
-        is_sidechain: false,
+        is_sidechain: row.get::<_, i64>(7)? != 0,
     })
 }
 

@@ -54,6 +54,21 @@ pub async fn handle(
     let imported = eng.import_conversations(None).await?;
     eprintln!("  Imported {} chunks", imported);
 
+    // Optional vendor corpus: absence is intentionally silent/inert.
+    if let Some(codex_root) = dirs::home_dir().map(|home| home.join(".codex/sessions")) {
+        if codex_root.exists() {
+            let adapter_engine = eng.clone();
+            let stats = tokio::task::spawn_blocking(move || {
+                crate::import::codex_rollout::import_changed_rollouts(&adapter_engine, &codex_root)
+            })
+            .await??;
+            eprintln!(
+                "  Imported {} Codex rollout chunks from {} changed files",
+                stats.chunks_imported, stats.files_imported
+            );
+        }
+    }
+
     // Step 5: Run enrichment
     eprintln!("[5/6] Running heuristic enrichment...");
     let (backfilled, enriched) = eng.backfill_and_enrich().await?;
@@ -205,7 +220,7 @@ fn count_total_files(projects_dir: &Path) -> usize {
     };
     let mut count = 0;
     for (dir, _) in &projects {
-        if let Ok(files) = import::list_jsonl_files(dir) {
+        if let Ok(files) = import::list_conversation_jsonl_files(dir) {
             count += files.len();
         }
     }

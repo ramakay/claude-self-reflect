@@ -329,6 +329,63 @@ impl Daemon {
         };
         tracing::info!("plans loop started (~/.claude/plans → source='plan' chunks)");
 
+        // Optional Codex rollout loop. It runs once immediately and then every
+        // 30 minutes. Missing ~/.codex/sessions is deliberately silent, and the
+        // directory is re-checked each cycle so a later installation is detected.
+        let codex_rollout_handle = {
+            let engine = Arc::new(crate::engine::Engine::from_parts(
+                self.storage.clone(),
+                self.embeddings.clone(),
+                self.search.clone(),
+                self.projects_dir.clone(),
+            ));
+            let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
+            tokio::spawn(async move {
+                loop {
+                    if shutdown.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let codex_root = dirs::home_dir().map(|home| home.join(".codex/sessions"));
+                    if let Some(root) = codex_root.filter(|root| root.exists()) {
+                        let permit = match heavy_work.clone().acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(_) => return,
+                        };
+                        let adapter_engine = engine.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            match crate::import::codex_rollout::import_changed_rollouts(
+                                &adapter_engine,
+                                &root,
+                            ) {
+                                Ok(stats) => tracing::debug!(
+                                    discovered = stats.files_discovered,
+                                    files = stats.files_imported,
+                                    chunks = stats.chunks_imported,
+                                    vanished = stats.vanished,
+                                    schema_misses = stats.schema_misses,
+                                    csr_tool_blocks_suppressed = stats.csr_tool_blocks_suppressed,
+                                    csr_hook_wrappers_scrubbed = stats.csr_hook_wrappers_scrubbed,
+                                    "Codex rollouts imported"
+                                ),
+                                Err(error) => {
+                                    tracing::warn!(%error, "Codex rollout import failed")
+                                }
+                            }
+                        })
+                        .await;
+                    }
+                    for _ in 0..180 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                }
+            })
+        };
+
         // Ratification loop — dialog-act scoring (interval via CSR_RATIFICATION_INTERVAL_SECS)
         let ratification_handle = {
             let storage = self.storage.clone();
@@ -392,6 +449,8 @@ impl Daemon {
         // between plans on shutdown, so at most one bounded import is in
         // flight: await it fully.
         let _ = plans_handle.await;
+        // Same index-mutation contract as plans: never detach an in-flight import.
+        let _ = codex_rollout_handle.await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
         // The dream loop's tick awaits its `spawn_blocking` cycle directly
         // (see `dream_cadence::tick`) and checks the shutdown flag between

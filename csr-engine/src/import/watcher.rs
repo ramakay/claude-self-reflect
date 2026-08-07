@@ -178,19 +178,27 @@ impl FileWatcher {
             return Ok(());
         }
 
+        let attribution =
+            import::derive_conversation_attribution_canonical(&canonical_base, &canonical);
+        let conv_id = file_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if let Some(parent) = attribution.parent_conversation_id.as_deref() {
+            self.storage.rescope_sidechain_conversation(
+                &conv_id,
+                &attribution.project_name,
+                parent,
+            )?;
+        }
+
         // Skip if already imported
         if self.storage.is_file_imported(file_path)? {
             return Ok(());
         }
 
-        // Infer project name from parent directory
-        let project_name = file_path
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| import::normalize_project_name(&n.to_string_lossy()))
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let parsed = import::parse_jsonl_file_with_stats(file_path, &project_name)?;
+        let parsed = import::parse_jsonl_file_with_stats(file_path, &attribution.project_name)?;
         let suppression = parsed.suppression;
         let chunks = parsed.chunks;
         if chunks.is_empty() {
@@ -215,7 +223,21 @@ impl FileWatcher {
 
             let mut idx = self.search.write().await;
             for (chunk, embedding) in batch.iter().zip(embeddings) {
-                self.storage.insert_chunk(chunk, &embedding)?;
+                self.storage
+                    .insert_chunk_with_source(chunk, &embedding, attribution.source)?;
+                if let Err(error) = self.storage.insert_chunk_provenance(
+                    &chunk.id,
+                    &crate::provenance::ChunkProvenance {
+                        author: chunk.author,
+                        source_conv_id: attribution
+                            .parent_conversation_id
+                            .clone()
+                            .unwrap_or_else(|| chunk.conversation_id.clone()),
+                        supersedes: None,
+                    },
+                ) {
+                    tracing::warn!(error = %error, chunk = %chunk.id, "chunk provenance persist failed");
+                }
                 idx.insert_chunk(chunk.id.clone(), embedding);
             }
         }
@@ -224,11 +246,6 @@ impl FileWatcher {
             .mark_file_imported_with_suppression(file_path, chunk_count, suppression)?;
 
         // Layer 1: Heuristic enrichment (inline, instant, free)
-        let conv_id = file_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
         if !self
             .storage
             .is_conversation_enriched(&conv_id, "heuristic")
@@ -237,7 +254,7 @@ impl FileWatcher {
             if let Err(e) = crate::extraction::heuristic::enrich_conversation(
                 file_path,
                 &conv_id,
-                &project_name,
+                &attribution.project_name,
                 &self.storage,
                 &self.embeddings,
                 &self.search,
@@ -255,7 +272,8 @@ impl FileWatcher {
         tracing::info!(
             file = %file_path.display(),
             chunks = chunk_count,
-            project = %project_name,
+            project = %attribution.project_name,
+            source = attribution.source,
             "auto-imported conversation"
         );
 

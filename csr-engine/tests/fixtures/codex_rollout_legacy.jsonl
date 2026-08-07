@@ -1,0 +1,3 @@
+{"id":"legacy-fixture","timestamp":"2025-08-21T19:18:55Z","git":{"branch":"synthetic"},"instructions":"synthetic fixture"}
+{"type":"message","id":"legacy-user","role":"user","content":[{"type":"input_text","text":"LEGACY USER REQUEST"}]}
+{"type":"message","id":"legacy-assistant","role":"assistant","content":[{"type":"output_text","text":"LEGACY ASSISTANT RESPONSE"}]}

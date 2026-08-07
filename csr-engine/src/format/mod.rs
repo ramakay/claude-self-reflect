@@ -140,6 +140,30 @@ pub fn dedupe_plan_origins(
     });
 }
 
+/// Drop sidechain chunks when their parent conversation is present. The parent
+/// is the authoritative origin; a sidechain remains independently searchable
+/// when the parent did not match.
+pub fn dedupe_sidechain_origins(
+    results: &mut Vec<EnrichedResult>,
+    parent_of: &std::collections::HashMap<String, String>,
+) {
+    use std::collections::HashSet;
+    let present_convs: HashSet<String> = results
+        .iter()
+        .filter(|result| !result.chunk.is_sidechain)
+        .map(|result| result.chunk.conversation_id.clone())
+        .collect();
+    results.retain(|result| {
+        if !result.chunk.is_sidechain {
+            return true;
+        }
+        match parent_of.get(&result.chunk.id) {
+            Some(parent) => !present_convs.contains(parent),
+            None => true,
+        }
+    });
+}
+
 /// Format search results as rich XML matching the Python server output.
 pub fn format_search_results(
     results: &[EnrichedResult],
@@ -1001,6 +1025,35 @@ mod tests {
         let mut results = vec![mk("p2", "plan:crispy"), mk("c1", "conv-a")];
         dedupe_plan_origins(&mut results, &HashMap::new());
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn dedupe_sidechain_origins_prefers_parent_conversation() {
+        use std::collections::HashMap;
+        let mk = |id: &str, conv: &str, sidechain: bool| {
+            let mut chunk = make_chunk(id, conv, "shared evidence text");
+            chunk.is_sidechain = sidechain;
+            EnrichedResult {
+                score: 0.9,
+                chunk,
+                resolution: None,
+                validity_demoted: false,
+            }
+        };
+        let parent_of: HashMap<String, String> =
+            [("side-1".to_string(), "parent-1".to_string())].into();
+
+        let mut tied = vec![
+            mk("side-1", "agent-child", true),
+            mk("origin-1", "parent-1", false),
+        ];
+        dedupe_sidechain_origins(&mut tied, &parent_of);
+        assert_eq!(tied.len(), 1);
+        assert_eq!(tied[0].chunk.id, "origin-1");
+
+        let mut parent_absent = vec![mk("side-1", "agent-child", true)];
+        dedupe_sidechain_origins(&mut parent_absent, &parent_of);
+        assert_eq!(parent_absent.len(), 1);
     }
 
     #[test]

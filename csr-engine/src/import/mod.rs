@@ -1,4 +1,5 @@
 pub mod backfill;
+pub mod codex_rollout;
 pub mod coedit_backfill;
 pub mod plans;
 pub mod registry;
@@ -13,6 +14,13 @@ use std::sync::LazyLock;
 use anyhow::{Context, Result};
 use regex::Regex;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConversationAttribution {
+    pub project_name: String,
+    pub source: &'static str,
+    pub parent_conversation_id: Option<String>,
+}
 
 /// Regex to strip `<private>...</private>` content before storage.
 static PRIVATE_TAG_RE: LazyLock<Regex> =
@@ -153,6 +161,86 @@ pub fn list_jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+/// List main transcripts and nested sidechain transcripts in stable path order.
+pub fn list_conversation_jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    fn visit(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+        let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                visit(&path, files)?;
+            } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    visit(dir, &mut files)?;
+    Ok(files)
+}
+
+/// Derive storage attribution from a transcript's position beneath the Claude
+/// projects root. Sidechains are `<project>/<session>/subagents/agent-*.jsonl`;
+/// their immediate parent is never the project.
+pub(crate) fn derive_conversation_attribution(
+    projects_dir: &Path,
+    file_path: &Path,
+) -> ConversationAttribution {
+    let canonical_base = projects_dir
+        .canonicalize()
+        .unwrap_or_else(|_| projects_dir.to_path_buf());
+    let canonical_file = file_path
+        .canonicalize()
+        .unwrap_or_else(|_| file_path.to_path_buf());
+    derive_conversation_attribution_canonical(&canonical_base, &canonical_file)
+}
+
+pub(crate) fn derive_conversation_attribution_canonical(
+    canonical_projects_dir: &Path,
+    canonical_file_path: &Path,
+) -> ConversationAttribution {
+    let components: Vec<String> = canonical_file_path
+        .strip_prefix(canonical_projects_dir)
+        .ok()
+        .and_then(|relative| {
+            relative
+                .components()
+                .map(|component| match component {
+                    std::path::Component::Normal(value) => value.to_str().map(str::to_string),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    let project_name = components
+        .first()
+        .map(|name| normalize_project_name(name))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let is_sidechain = components.len() >= 4
+        && components
+            .get(2)
+            .is_some_and(|component| component == "subagents")
+        && canonical_file_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("agent-") && name.ends_with(".jsonl"));
+
+    ConversationAttribution {
+        project_name,
+        source: if is_sidechain {
+            "sidechain"
+        } else {
+            "conversation"
+        },
+        parent_conversation_id: is_sidechain.then(|| components[1].clone()),
+    }
 }
 
 /// Parse a JSONL conversation file into chunks of ~50 messages each.
@@ -873,6 +961,116 @@ fn generate_chunk_id(conversation_id: &str, chunk_index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidechain_attribution_uses_project_ancestor_and_parent_session() {
+        let projects = Path::new("/Users/test/.claude/projects");
+        let path = projects
+            .join("-Users-test-projects-real-project")
+            .join("parent-session")
+            .join("subagents")
+            .join("agent-child.jsonl");
+
+        let attribution = derive_conversation_attribution(projects, &path);
+        assert_eq!(attribution.project_name, "real-project");
+        assert_eq!(attribution.source, "sidechain");
+        assert_eq!(
+            attribution.parent_conversation_id.as_deref(),
+            Some("parent-session")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_projects_root_attributes_canonical_sidechain_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_projects = temp.path().join("real-projects");
+        let sidechain = real_projects
+            .join("-Users-test-projects-real-project")
+            .join("parent-session")
+            .join("subagents");
+        std::fs::create_dir_all(&sidechain).unwrap();
+        let file = sidechain.join("agent-child.jsonl");
+        std::fs::write(&file, "{}\n").unwrap();
+        let linked_projects = temp.path().join("linked-projects");
+        symlink(&real_projects, &linked_projects).unwrap();
+
+        let attribution =
+            derive_conversation_attribution(&linked_projects, &file.canonicalize().unwrap());
+        assert_eq!(attribution.project_name, "real-project");
+        assert_eq!(attribution.source, "sidechain");
+        assert_eq!(
+            attribution.parent_conversation_id.as_deref(),
+            Some("parent-session")
+        );
+    }
+
+    #[test]
+    fn recursive_conversation_discovery_includes_sidechains_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let sidechains = root.join("session-a/subagents");
+        std::fs::create_dir_all(&sidechains).unwrap();
+        std::fs::write(root.join("main.jsonl"), "{}\n").unwrap();
+        std::fs::write(sidechains.join("agent-z.jsonl"), "{}\n").unwrap();
+        std::fs::write(sidechains.join("ignore.txt"), "ignored").unwrap();
+
+        let files = list_conversation_jsonl_files(&root).unwrap();
+        assert_eq!(
+            files,
+            vec![root.join("main.jsonl"), sidechains.join("agent-z.jsonl")]
+        );
+    }
+
+    #[test]
+    fn sidechain_transcript_suppresses_csr_tool_blocks_through_shared_sanitizer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-child.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "assistant",
+                "isSidechain": true,
+                "timestamp": "2026-08-06T12:00:00Z",
+                "message": {"content": [
+                    {"type":"tool_use","id":"csr-1","name":"csr_reflect_on_past","input":{"query":"SIDECHAIN CSR SECRET"}},
+                    {"type":"text","text":"SIDECHAIN ASSISTANT TEXT KEPT"}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "isSidechain": true,
+                "timestamp": "2026-08-06T12:00:01Z",
+                "message": {"content": [
+                    {"type":"tool_result","tool_use_id":"csr-1","content":"SIDECHAIN CSR RESULT SECRET"},
+                    {"type":"text","text":"SIDECHAIN USER TEXT KEPT"}
+                ]}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_jsonl_file_with_stats(&path, "real-project").unwrap();
+        let content = parsed
+            .chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(content.contains("SIDECHAIN ASSISTANT TEXT KEPT"));
+        assert!(content.contains("SIDECHAIN USER TEXT KEPT"));
+        assert!(!content.contains("SIDECHAIN CSR SECRET"));
+        assert!(!content.contains("SIDECHAIN CSR RESULT SECRET"));
+        assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
+    }
     use crate::provenance::Speaker;
 
     #[test]

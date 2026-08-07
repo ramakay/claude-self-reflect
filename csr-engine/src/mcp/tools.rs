@@ -319,7 +319,7 @@ async fn reflect_gather_pass(
         (chunks, reflections)
     };
     let search_ms = search_start.elapsed().as_millis() as u64;
-    let window_full = chunk_results.len() == fetch || reflection_results.len() == fetch;
+    let mut window_full = chunk_results.len() == fetch || reflection_results.len() == fetch;
 
     // Enrich chunk results with metadata
     let chunk_ids: Vec<String> = chunk_results.iter().map(|r| r.id.clone()).collect();
@@ -472,6 +472,7 @@ async fn reflect_gather_pass(
     // or empty, supplement with keyword search results
     if semantic_top_score < 0.5 {
         if let Ok(fts_chunks) = storage.fts5_search(query, fetch, effective_project) {
+            window_full |= fts_chunks.len() == fetch;
             let existing_ids: HashSet<String> =
                 enriched.iter().map(|e| e.chunk.id.clone()).collect();
             let appended: Vec<crate::import::ConversationChunk> = fts_chunks
@@ -605,6 +606,20 @@ async fn reflect_gather_pass(
         })
         .collect();
     format::dedupe_plan_origins(&mut enriched, &origin_of);
+    // Sidechain transcripts remain independent conversations, but when both a
+    // child and its parent session match, the parent is the authoritative origin.
+    let parent_of: std::collections::HashMap<String, String> = enriched
+        .iter()
+        .filter(|result| result.chunk.is_sidechain)
+        .filter_map(|result| {
+            storage
+                .get_chunk_provenance(&result.chunk.id)
+                .ok()
+                .flatten()
+                .map(|provenance| (result.chunk.id.clone(), provenance.source_conv_id))
+        })
+        .collect();
+    format::dedupe_sidechain_origins(&mut enriched, &parent_of);
 
     let ancestry_candidates_used = enriched
         .iter()
@@ -2012,6 +2027,163 @@ mod tests {
             resolution: None,
             validity_demoted: false,
         }
+    }
+
+    #[tokio::test]
+    async fn storage_backed_search_prefers_parent_but_keeps_unmatched_sidechain() {
+        fn fixture(include_parent: bool) -> (Arc<Storage>, Arc<RwLock<SearchEngine>>) {
+            let storage = Arc::new(Storage::open_memory().unwrap());
+            let mut search = SearchEngine::new(8);
+            let make_chunk = |id: &str, conversation_id: &str, is_sidechain: bool| {
+                crate::import::ConversationChunk {
+                    id: id.into(),
+                    conversation_id: conversation_id.into(),
+                    project_name: "test".into(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    content: format!("shared parent child recall {id}"),
+                    message_count: 1,
+                    summary: None,
+                    author: crate::provenance::Speaker::Assistant,
+                    seq: 0,
+                    is_sidechain,
+                }
+            };
+
+            if include_parent {
+                let parent = make_chunk("parent-chunk", "parent-conversation", false);
+                storage
+                    .insert_chunk(&parent, &[1.0, 0.0, 0.0, 0.0])
+                    .unwrap();
+                search.insert_chunk(parent.id, vec![1.0, 0.0, 0.0, 0.0]);
+            }
+            let child = make_chunk("child-chunk", "agent-child", true);
+            storage
+                .insert_chunk(&child, &[0.99, 0.01, 0.0, 0.0])
+                .unwrap();
+            storage
+                .insert_chunk_provenance(
+                    &child.id,
+                    &crate::provenance::ChunkProvenance {
+                        author: crate::provenance::Speaker::Assistant,
+                        source_conv_id: "parent-conversation".into(),
+                        supersedes: None,
+                    },
+                )
+                .unwrap();
+            search.insert_chunk(child.id, vec![0.99, 0.01, 0.0, 0.0]);
+            (storage, Arc::new(RwLock::new(search)))
+        }
+
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let (storage, search) = fixture(true);
+        let with_parent = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &query,
+            "recall",
+            2,
+            0.1,
+            Some("all"),
+            0,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(with_parent.contains("<id>parent-chunk</id>"));
+        assert!(!with_parent.contains("<id>child-chunk</id>"));
+
+        let (storage, search) = fixture(false);
+        let without_parent = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &query,
+            "recall",
+            2,
+            0.1,
+            Some("all"),
+            0,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(without_parent.contains("<id>child-chunk</id>"));
+    }
+
+    #[tokio::test]
+    async fn full_fts_window_refills_slots_opened_by_sidechain_dedupe() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let make_chunk = |id: &str, conversation_id: &str, is_sidechain: bool, content: &str| {
+            crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation_id.into(),
+                project_name: "test".into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::Assistant,
+                seq: 0,
+                is_sidechain,
+            }
+        };
+        let parent = make_chunk(
+            "fts-parent",
+            "fts-parent-conversation",
+            false,
+            "refilltoken refilltoken refilltoken",
+        );
+        storage.insert_chunk(&parent, &[0.0; 4]).unwrap();
+        for index in 0..5 {
+            let child = make_chunk(
+                &format!("fts-child-{index}"),
+                &format!("agent-fts-child-{index}"),
+                true,
+                "refilltoken refilltoken refilltoken",
+            );
+            storage.insert_chunk(&child, &[0.0; 4]).unwrap();
+            storage
+                .insert_chunk_provenance(
+                    &child.id,
+                    &crate::provenance::ChunkProvenance {
+                        author: crate::provenance::Speaker::Assistant,
+                        source_conv_id: "fts-parent-conversation".into(),
+                        supersedes: None,
+                    },
+                )
+                .unwrap();
+        }
+        for index in 0..2 {
+            let extra = make_chunk(
+                &format!("fts-extra-{index}"),
+                &format!("fts-extra-conversation-{index}"),
+                false,
+                "refilltoken with lower density filler words for an additional result",
+            );
+            storage.insert_chunk(&extra, &[0.0; 4]).unwrap();
+        }
+
+        let search = Arc::new(RwLock::new(SearchEngine::new(8)));
+        let output = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "refilltoken",
+            2,
+            0.1,
+            Some("all"),
+            0,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("<count>2</count>"), "{output}");
+        assert!(output.contains("<id>fts-parent</id>"), "{output}");
+        assert!(output.contains("<id>fts-extra-"), "{output}");
+        assert!(!output.contains("<id>fts-child-"), "{output}");
     }
 
     fn demote_validity(note: &str) -> ConvValidity {
