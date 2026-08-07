@@ -159,4 +159,36 @@ mod tests {
         let result = resolve_project_from_cwd("/tmp/something/mydir");
         assert_eq!(result, Some("mydir".to_string()));
     }
+
+    /// Pins the stored project-name contract for Windows drive paths.
+    ///
+    /// Deliberately NOT `#[cfg(windows)]`-gated: the code path under test is pure
+    /// string handling with no platform-conditional code, so gating it would only
+    /// hide the regression from the CI that actually runs — which has no Windows
+    /// job. A hook can deliver `cwd` raw, `\\?\`-canonicalized, with a trailing
+    /// separator, or any combination of those, and every shape has to land on the
+    /// same stored name or project-scoped search silently returns nothing.
+    #[test]
+    fn test_resolve_from_cwd_windows_drive_paths() {
+        for cwd in [
+            r"D:\Claude",
+            r"\\?\D:\Claude",
+            "D:\\Claude\\",
+            "\\\\?\\D:\\Claude\\",
+        ] {
+            assert_eq!(
+                resolve_project_from_cwd(cwd),
+                Some("D--Claude".to_string()),
+                "cwd {cwd:?} must encode to the stored project name"
+            );
+        }
+
+        // The encoding covers the whole path, not just the last component — that
+        // was the original bug: "D:\Claude" resolved to "Claude", which matches no
+        // stored project.
+        assert_eq!(
+            resolve_project_from_cwd(r"D:\Proyectos\claude-self-reflect"),
+            Some("D--Proyectos-claude-self-reflect".to_string())
+        );
+    }
 }
