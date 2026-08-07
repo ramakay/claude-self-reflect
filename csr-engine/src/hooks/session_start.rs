@@ -145,7 +145,13 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             .take(MAX_TIER0_VERIFY)
             .map(|a| (a.name.clone(), verify_anchor(a, cwd)))
             .collect();
-        output.push_str(&format_tier0_block(ep, &verdicts, age));
+        output.push_str(&format_session_start_tier0(
+            engine.storage(),
+            project_name,
+            ep,
+            &verdicts,
+            age,
+        ));
         output.push_str(&format_episode_index(&episodes[1..]));
         output.push_str(DEEPER_CONTEXT_FOOTER);
     } else {
@@ -574,6 +580,7 @@ fn is_session_framing_line(line: &str) -> bool {
             .any(|l| !l.trim().is_empty() && l.trim() == trimmed)
         || trimmed.starts_with("SESSION CONTINUITY DETECTED")
         || trimmed.starts_with("EPISODE INDEX")
+        || trimmed.starts_with("recap [")
 }
 
 fn focus_text_from_output_line(line: &str) -> &str {
@@ -741,6 +748,61 @@ pub fn format_tier0_block(
     anchor_verdicts: &[(String, AnchorVerdict)],
     age: &str,
 ) -> String {
+    format_tier0_block_with_recap(ep, anchor_verdicts, age, None)
+}
+
+fn recap_disabled() -> bool {
+    std::env::var("CSR_NO_RECAP")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn format_session_start_tier0(
+    storage: &crate::storage::Storage,
+    project: &str,
+    ep: &Episode,
+    anchor_verdicts: &[(String, AnchorVerdict)],
+    age: &str,
+) -> String {
+    let recap = if recap_disabled() {
+        None
+    } else {
+        let (settled, still_open) = storage
+            .recap_ledger_feeds(project, &ep.session_id)
+            .unwrap_or_else(|error| {
+                tracing::debug!(%error, "session-start recap ledger feed unavailable");
+                (Vec::new(), Vec::new())
+            });
+        let retired_while_away = storage
+            .recap_retired_since(project, &ep.timestamp)
+            .unwrap_or_else(|error| {
+                tracing::debug!(%error, "session-start recap retired feed unavailable");
+                Vec::new()
+            });
+        let open_proposals = storage
+            .recap_open_proposals(project)
+            .unwrap_or_else(|error| {
+                tracing::debug!(%error, "session-start recap proposal feed unavailable");
+                0
+            });
+        let feeds = crate::hooks::recap::RecapFeeds {
+            settled,
+            still_open,
+            retired_while_away,
+            open_proposals,
+        };
+        crate::hooks::recap::compose_recap(ep, &feeds, age)
+    };
+
+    format_tier0_block_with_recap(ep, anchor_verdicts, age, recap.as_deref())
+}
+
+fn format_tier0_block_with_recap(
+    ep: &Episode,
+    anchor_verdicts: &[(String, AnchorVerdict)],
+    age: &str,
+    recap: Option<&str>,
+) -> String {
     let open_todos = ep.todos.iter().filter(|t| t.status != "completed").count();
     let intact = anchor_verdicts
         .iter()
@@ -776,19 +838,24 @@ pub fn format_tier0_block(
 
     let outcome = display_outcome(ep, &last);
 
-    let mut out = format!(
-        "CSR CONTINUUM [{}]: {}\nLAST: {} (outcome={})\n",
-        age, request, last, outcome
-    );
-    // Only emit the NEXT/TODOS line when it carries signal — a real next step or
-    // open todos. "NEXT: none recorded | TODOS: 0 open" is pure filler.
-    if next.is_some() || open_todos > 0 {
-        out.push_str(&format!(
-            "NEXT: {} | TODOS: {} open\n",
-            next.as_deref().unwrap_or("none recorded"),
-            open_todos
-        ));
-    }
+    let mut out = if let Some(recap) = recap {
+        format!("{recap}\n")
+    } else {
+        let mut fragments = format!(
+            "CSR CONTINUUM [{}]: {}\nLAST: {} (outcome={})\n",
+            age, request, last, outcome
+        );
+        // Only emit the NEXT/TODOS line when it carries signal — a real next step or
+        // open todos. "NEXT: none recorded | TODOS: 0 open" is pure filler.
+        if next.is_some() || open_todos > 0 {
+            fragments.push_str(&format!(
+                "NEXT: {} | TODOS: {} open\n",
+                next.as_deref().unwrap_or("none recorded"),
+                open_todos
+            ));
+        }
+        fragments
+    };
     if !anchor_verdicts.is_empty() {
         out.push_str(&format!(
             "ANCHORS: {} intact, {} modified since checkpoint{}\n",
@@ -1817,6 +1884,28 @@ mod tests {
     }
 
     #[test]
+    fn prior_injected_recap_is_session_framing() {
+        assert!(is_session_framing_line(
+            "recap [2h ago]: Fixed the auth middleware regression."
+        ));
+    }
+
+    #[test]
+    fn prior_injected_recap_is_suppressed_by_extraction_provenance() {
+        // The framing guard above only shields the SwiftBar focus selector;
+        // re-indexing protection lives in provenance::extractable, which must
+        // treat an echoed recap block as a CSR emission, not user text.
+        let echoed = "recap [2h ago]: Fixed the auth middleware regression.\n\
+                      Settled: pinned action to v1 (abc1234).\n\
+                      Next: wire session start.";
+        assert!(crate::extraction::provenance::extractable(echoed).is_none());
+        // Genuine user prose that merely starts with "recap [" must survive:
+        // suppression matches the emitted `recap [<age>]: ` grammar only.
+        let genuine = "recap [the auth changes], then prioritize them for the release";
+        assert!(crate::extraction::provenance::extractable(genuine).is_some());
+    }
+
+    #[test]
     fn test_focus_text_skips_memory_manifest_and_footer_lines() {
         // Every manifest line is framing — the SwiftBar focus file must never
         // display the capability header as the "current focus".
@@ -1869,6 +1958,107 @@ mod tests {
             prev_episode_id: None,
             anchors: vec![],
         }
+    }
+
+    fn seed_recap_feeds(storage: &crate::storage::Storage, ep: &Episode) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO chunks
+                        (id, conversation_id, project_name, timestamp, content, message_count)
+                     VALUES ('recap-chunk', ?1, ?2, ?3, 'fixture', 1)",
+                    rusqlite::params![ep.session_id, ep.project, ep.timestamp],
+                )?;
+                conn.execute(
+                    "INSERT INTO chunks
+                        (id, conversation_id, project_name, timestamp, content, message_count)
+                     VALUES ('proposal-chunk', ?1, ?2, ?3, 'fixture', 1)",
+                    rusqlite::params![ep.session_id, ep.project, ep.timestamp],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .insert_resolutions(
+                &["recap-chunk".to_string()],
+                "resolved",
+                "verified at abcdef123456",
+                Some("seeded fact"),
+                "agent",
+            )
+            .unwrap();
+        storage
+            .insert_resolution_proposal(
+                "proposal-chunk",
+                Some("open proposal"),
+                "proposal evidence",
+                "proposal-session",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn session_start_tier0_renders_recap_from_seeded_feeds() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let ep = minimal_episode(
+            "Fix the auth middleware regression",
+            "Fixed token validation",
+            Some("Deploy to staging"),
+        );
+        seed_recap_feeds(&storage, &ep);
+        let verdicts = vec![("validate_token".to_string(), AnchorVerdict::Intact)];
+
+        let block = format_session_start_tier0(&storage, &ep.project, &ep, &verdicts, "2h ago");
+
+        assert!(block.starts_with(
+            "recap [2h ago]: Fix the auth middleware regression: Fixed token validation."
+        ));
+        assert!(block.contains("Settled: seeded fact (abcdef1)."));
+        assert!(block.contains("1 proposals awaiting csr_resolve"));
+        assert!(!block.contains("CSR CONTINUUM"));
+        assert!(!block.contains("LAST:"));
+        assert!(block.contains("ANCHORS: 1 intact, 0 modified since checkpoint"));
+        assert!(block.contains(r#"Full state: csr_reflect_on_past("conv_s")"#));
+    }
+
+    #[test]
+    fn session_start_tier0_none_is_byte_identical_to_fragment_snapshot() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let ep = minimal_episode("", "", Some("continue work"));
+
+        let block = format_session_start_tier0(&storage, &ep.project, &ep, &[], "2h ago");
+
+        assert_eq!(
+            block,
+            "CSR CONTINUUM [2h ago]: (command-only session)\n\
+LAST: (filtered: CSR meta) (outcome=success)\n\
+NEXT: continue work | TODOS: 0 open\n\
+Full state: csr_reflect_on_past(\"conv_s\")\n"
+        );
+    }
+
+    #[test]
+    fn no_recap_kill_switch_forces_fragment_snapshot() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::set_var("CSR_NO_RECAP", "1");
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let ep = minimal_episode(
+            "Fix the auth middleware regression",
+            "Fixed token validation",
+            Some("Deploy to staging"),
+        );
+        seed_recap_feeds(&storage, &ep);
+
+        let block = format_session_start_tier0(&storage, &ep.project, &ep, &[], "2h ago");
+        std::env::remove_var("CSR_NO_RECAP");
+
+        assert!(block.starts_with("CSR CONTINUUM [2h ago]: Fix the auth middleware regression\n"));
+        assert!(block.contains("LAST: Fixed token validation (outcome=success)"));
+        assert!(!block.contains("recap ["));
     }
 
     #[test]

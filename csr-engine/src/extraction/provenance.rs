@@ -164,6 +164,15 @@ pub fn is_csr_emission(text: &str) -> bool {
     if EMISSION_HEADERS.iter().any(|h| head.contains(h)) {
         return true;
     }
+    // Injected recaps open with `recap [<age>]: ` (hooks::recap). Match that
+    // exact grammar — short bracket then "]: " — instead of a bare "recap ["
+    // substring, so genuine prose like "recap [the auth changes], then
+    // prioritize them" stays extractable (a contains-header would eat it).
+    if let Some(rest) = head.trim_start().strip_prefix("recap [") {
+        if rest.find("]: ").is_some_and(|i| i <= 24) {
+            return true;
+        }
+    }
     EMISSION_FIELD_TOKENS
         .iter()
         .filter(|t| text.contains(**t))

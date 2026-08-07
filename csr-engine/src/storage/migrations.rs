@@ -841,6 +841,40 @@ pub fn run(conn: &Connection) -> Result<()> {
         DROP INDEX IF EXISTS idx_witness_verdicts_identity;",
     )?;
 
+    // Recap normalizes SQLite and RFC3339 timestamps through julianday(). This
+    // partial covering index matches that expression and the feed's newest-
+    // first ordering, so LIMIT can stop after three project matches.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_witness_verdicts_recap_created
+            ON witness_verdicts(
+                julianday(created_at) DESC,
+                id DESC,
+                witness_id,
+                verdict,
+                receipt_oid,
+                created_at
+            )
+            WHERE verdict IN ('superseded_by', 'anchor_obsolete');",
+    )?;
+
+    // Recap's still-open bucket starts at newest unresolved ledger events and
+    // joins chunks by primary key. This compact partial index preserves the
+    // requested id order without duplicating unbounded claim/evidence text.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_resolution_open_recent
+            ON resolution_ledger(id DESC, chunk_id, status)
+            WHERE status IN ('still_open', 'regressed');",
+    )?;
+
+    // Recap's settled bucket also credits facts authored inside this session's
+    // sidechains (`Storage::recap_ledger_feeds` provenance UNION arm): those
+    // chunks carry their own conversation_id but point back to the parent via
+    // chunk_provenance.source_conv_id, which had no index before this.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_chunk_provenance_source_conv
+            ON chunk_provenance(source_conv_id);",
+    )?;
+
     // code_nodes conversation-attribution indexes (v10 "dreaming" chunk
     // binding — `storage::chunk_binding::witness_verdict_for_chunks`):
     // `first_conv_id`/`last_conv_id` had no index before this, so every

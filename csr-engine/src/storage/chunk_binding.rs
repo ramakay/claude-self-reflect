@@ -707,6 +707,14 @@ mod tests {
         std::process::Command::new("git")
             .args(args)
             .current_dir(repo)
+            // Scrub repo-pinning vars git exports to hook subprocesses —
+            // under `git commit` (pre-commit runs this suite) GIT_DIR points
+            // at the OUTER repo and would hijack these temp-repo commands.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_COMMON_DIR")
             .env("GIT_AUTHOR_NAME", "CSR Test")
             .env("GIT_AUTHOR_EMAIL", "csr@example.invalid")
             .env("GIT_COMMITTER_NAME", "CSR Test")
@@ -1250,6 +1258,11 @@ mod tests {
             .args(["clone", "-q"])
             .arg(source.path())
             .arg(&clone)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_COMMON_DIR")
             .output()
             .unwrap();
         assert!(clone_output.status.success());
@@ -1402,6 +1415,11 @@ mod tests {
             Command::new("git")
                 .args(args)
                 .current_dir(repo)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_COMMON_DIR")
                 .env("GIT_AUTHOR_NAME", "CSR Test")
                 .env("GIT_AUTHOR_EMAIL", "csr@example.invalid")
                 .env("GIT_COMMITTER_NAME", "CSR Test")

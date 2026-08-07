@@ -11,6 +11,7 @@ pub mod intent;
 pub mod post_tool_use;
 pub mod precompact;
 pub mod prompt_submit;
+pub mod recap;
 pub mod session_briefing;
 pub mod session_end;
 pub mod session_start;
