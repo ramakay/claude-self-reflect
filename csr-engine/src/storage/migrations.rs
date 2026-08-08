@@ -885,6 +885,31 @@ pub fn run(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_code_nodes_last_conv ON code_nodes(last_conv_id);",
     )?;
 
+    // Drop graph rows keyed on a Claude Code managed-worktree path. Until
+    // `extraction::repo_path` gained its disk-free fallback, canonicalization
+    // needed the worktree's `.git` file to still exist; graph ingest runs from
+    // conversation history, typically after the worktree was removed or
+    // pruned, so those rows kept a path that no longer resolves and
+    // `csr_code_graph` answered with files that do not exist. Measured on a
+    // real 148k-chunk database: 384 `code_nodes`, 132 `code_evolution`, 1,539
+    // `code_edges`.
+    //
+    // Deleting rather than rewriting: `code_nodes.id` is
+    // `sha1(repo|file|kind|name)`, so a rewritten path would either contradict
+    // its own id or collide with the canonical row that usually already
+    // exists. These three tables are derived caches — `codegraph backfill`
+    // re-derives them from conversation history, now with correct paths — so
+    // deletion loses no evidence, matching the WCR re-derivation precedent.
+    //
+    // `witness_ledger` is deliberately excluded: it is append-only evidence,
+    // and a stamp taken inside a worktree really was taken there. Dreaming
+    // audits those anchors as `Vanished` on its own.
+    conn.execute_batch(
+        "DELETE FROM code_nodes WHERE file LIKE '%/.claude/worktrees/%';
+         DELETE FROM code_evolution WHERE file_path LIKE '%/.claude/worktrees/%';
+         DELETE FROM code_edges WHERE src_file LIKE '%/.claude/worktrees/%';",
+    )?;
+
     Ok(())
 }
 
@@ -1292,6 +1317,49 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 2, "raw inserts are never DB-deduped");
+    }
+
+    #[test]
+    fn managed_worktree_graph_rows_are_dropped_but_canonical_rows_survive() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        let worktree = "/repo/.claude/worktrees/lane/src/a.rs";
+        let canonical = "/repo/src/a.rs";
+        for (id, file) in [("wt", worktree), ("canon", canonical)] {
+            conn.execute(
+                "INSERT INTO code_nodes (id, file, kind, name) VALUES (?1, ?2, 'function', 'a')",
+                rusqlite::params![id, file],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO code_edges \
+             (src_id, dst_id, kind, resolved, weight, conv_id, session_id, src_file) \
+             VALUES ('wt', 'canon', 'call', 1, 1, 'c1', 's1', ?1)",
+            rusqlite::params![worktree],
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+
+        let files: Vec<String> = conn
+            .prepare("SELECT file FROM code_nodes ORDER BY file")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            files,
+            vec![canonical.to_string()],
+            "only the worktree-path node may be dropped"
+        );
+
+        let edges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(edges, 0, "worktree-path edges must be dropped too");
     }
 
     #[test]

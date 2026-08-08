@@ -84,11 +84,60 @@ pub fn canonical_repo_path(path: &Path) -> PathBuf {
         }
     }
 
+    // No `.git` found. Before giving up, try the disk-free rewrite: a
+    // Claude Code worktree is created at `<repo>/.claude/worktrees/<name>/`,
+    // so its layout alone identifies the main checkout even after the
+    // worktree (and its `.git` file) is gone. This is the common case, not a
+    // corner: the graph is written from conversation history, so ingest
+    // routinely runs after a worktree was removed or `git worktree prune`d,
+    // and the ancestor walk above then finds nothing. Without this fallback
+    // those nodes keep a dead worktree path forever and `csr_code_graph`
+    // answers with files that no longer exist.
+    if let Some(rewritten) = rewrite_managed_worktree_path(path) {
+        // Deliberately not cached: the key is the parent directory, and a
+        // resurrected worktree must go back through the `.git` path above.
+        return rewritten;
+    }
+
     // No `.git` found — cache as plain so we don't re-walk, return input as-is.
     if let Ok(mut guard) = cache().lock() {
         guard.insert(parent_key, None);
     }
     path.to_path_buf()
+}
+
+/// Path segments marking a Claude Code managed worktree: everything from
+/// `.claude/worktrees/<name>/` onward is worktree-local, and the prefix
+/// before it is the main repo root.
+const MANAGED_WORKTREE_MARKER: [&str; 2] = [".claude", "worktrees"];
+
+/// Rewrite `<repo>/.claude/worktrees/<name>/<rest>` to `<repo>/<rest>` using
+/// path structure only — no filesystem access, so it still works once the
+/// worktree is deleted.
+///
+/// Returns `None` when the path is not inside a managed worktree, or when
+/// nothing follows the worktree name (the worktree root itself has no
+/// main-repo counterpart worth naming).
+fn rewrite_managed_worktree_path(path: &Path) -> Option<PathBuf> {
+    let components: Vec<_> = path.components().collect();
+    let marker = components.windows(2).position(|pair| {
+        pair[0].as_os_str() == MANAGED_WORKTREE_MARKER[0]
+            && pair[1].as_os_str() == MANAGED_WORKTREE_MARKER[1]
+    })?;
+
+    // marker, marker+1 are `.claude`, `worktrees`; marker+2 is the worktree
+    // name; the remainder is the repo-relative path.
+    let rest = components.get(marker + 3..)?;
+    if rest.is_empty() {
+        return None;
+    }
+
+    let mut out: PathBuf = components.get(..marker)?.iter().collect();
+    if out.as_os_str().is_empty() {
+        return None;
+    }
+    out.extend(rest);
+    Some(out)
 }
 
 /// Canonicalize with a stable fallback for missing files (CodeRabbit PR
@@ -252,5 +301,71 @@ mod tests {
 
         let got = canonical_repo_path(&file);
         assert!(canon_eq(&got, &file), "expected {:?}, got {:?}", file, got);
+    }
+
+    // ---- disk-free managed-worktree rewrite ----------------------------
+    //
+    // Found in the live database: 384 of 9,759 `code_nodes` rows carried
+    // `.../.claude/worktrees/<name>/...` paths, all written after the
+    // canonicalizer shipped. The ancestor walk needs the worktree's `.git`
+    // file, and ingest runs from conversation history — typically after the
+    // worktree was removed or pruned — so it fell through and stored the
+    // dead path.
+
+    #[test]
+    fn deleted_managed_worktree_path_still_maps_onto_the_main_repo() {
+        let path = Path::new(
+            "/Users/dev/projects/thing/.claude/worktrees/recap-lane/csr-engine/src/hooks/recap.rs",
+        );
+        assert_eq!(
+            rewrite_managed_worktree_path(path),
+            Some(PathBuf::from(
+                "/Users/dev/projects/thing/csr-engine/src/hooks/recap.rs"
+            ))
+        );
+    }
+
+    #[test]
+    fn managed_worktree_rewrite_ignores_unrelated_paths() {
+        for path in [
+            "/Users/dev/projects/thing/csr-engine/src/hooks/recap.rs",
+            "/Users/dev/.claude/projects/thing/session.jsonl",
+            "/Users/dev/projects/thing/.claude/settings.json",
+        ] {
+            assert_eq!(
+                rewrite_managed_worktree_path(Path::new(path)),
+                None,
+                "should not rewrite {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_worktree_root_itself_is_not_rewritten() {
+        // Nothing follows the worktree name, so there is no main-repo file to
+        // name — and an empty prefix must never produce a bare relative path.
+        assert_eq!(
+            rewrite_managed_worktree_path(Path::new("/repo/.claude/worktrees/lane")),
+            None
+        );
+        assert_eq!(
+            rewrite_managed_worktree_path(Path::new(".claude/worktrees/lane/src/a.rs")),
+            None
+        );
+    }
+
+    #[test]
+    fn canonical_repo_path_uses_the_fallback_once_the_worktree_is_gone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let worktree = repo.join(".claude").join("worktrees").join("lane");
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        let file = worktree.join("src").join("c.rs");
+        fs::write(&file, b"fn c() {}").unwrap();
+        // No `.git` anywhere: the worktree's admin file is already pruned,
+        // which is exactly the state ingest observes.
+
+        let got = canonical_repo_path(&file);
+        assert_eq!(got, repo.join("src").join("c.rs"));
     }
 }
