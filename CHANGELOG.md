@@ -91,13 +91,21 @@ context on resume; this fills the model-facing half.
 
 - **TAD v2**: temporal decay driven by release ancestry rather than wall-clock
   age, with an hourly ancestry cache that fails open to neutral.
-- **Self-contamination: no new escapes, not a closed loop.** The importer
-  suppresses CSR's own tool output and hook-injected blocks going forward,
-  including a machine-owned sentinel for newly emitted recaps. This does
-  not retroactively clean what is already embedded — 747 historical
-  conversations remain self-contaminated (see "Known unproven in this
-  release" below). Counters for suppressed blocks and scrubbed hook
-  wrappers appear in `status`.
+- **Self-contamination: a sentinel-based rejection, not a closed loop.**
+  `is_csr_emission` checks a machine-owned sentinel (`RECAP_SENTINEL`)
+  embedded in every composed recap, scanned across the full text before
+  any grammar-dependent header/field-token logic runs. This is a
+  detection improvement, not proof of closure: the header match is
+  defeated by any non-whitespace prefix on `recap [`, the field-token
+  fallback is case-sensitive and a real recap paragraph matches zero of
+  the eight tokens, and four call sites (`search/rerank.rs`,
+  `hooks/session_briefing.rs`, `hooks/prompt_submit.rs`,
+  `hooks/session_start.rs`) call it directly and never run
+  `strip_quoted` first. It also does not retroactively clean what is
+  already embedded — 747 historical conversations remain
+  self-contaminated (see "Known unproven in this release" below).
+  Counters for suppressed blocks and scrubbed hook wrappers appear in
+  `status`.
 - **Corpus expansion**: sidechain attribution (real project and parent session
   recovered from provenance) and an optional Codex rollout adapter.
 - `reflect_on_past` sinks resolved chunks before the limit cut, so stale chunks
@@ -145,8 +153,10 @@ context on resume; this fills the model-facing half.
 - **Multi-repo witness attribution is unrecorded.** The witness ledger does
   not currently record which repository a witness belongs to.
 - **747 historical conversations remain self-contaminated.** The recap
-  sentinel prevents new escapes for newly emitted recaps; it does not
-  retroactively clean transcripts that already carry CSR's own tool output.
+  sentinel narrows — but does not close — detection of newly emitted
+  recaps (documented header-prefix and field-token bypasses remain; see
+  the self-contamination bullet above); it does not retroactively clean
+  transcripts that already carry CSR's own tool output.
 
 ## [9.5.0] - 2026-08-03
 
