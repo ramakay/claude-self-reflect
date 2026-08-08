@@ -6,6 +6,11 @@ use regex::Regex;
 
 static XML_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]{1,50}>").unwrap());
 static MD_HEADING_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#{1,4}\s+").unwrap());
+/// Bullet markers at the head of a flattened line. Lines are joined with
+/// spaces before the recap is composed, so a markdown list would otherwise
+/// read as `a: - one - two` in the middle of a sentence.
+static MD_BULLET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\s*(?:[-*+]|\d{1,3}[.)])\s+").unwrap());
 
 /// Maximum open facts accepted by the composer and requested by storage callers.
 pub const STILL_OPEN_LIMIT: usize = 3;
@@ -57,9 +62,13 @@ pub fn compose_recap(
     }
 
     let mut recap = match (intent.as_deref(), completed.as_deref()) {
-        (Some(intent), Some(completed)) => format!("recap [{age}]: {intent}: {completed}."),
-        (Some(intent), None) => format!("recap [{age}]: {intent}."),
-        (None, Some(completed)) => format!("recap [{age}]: {completed}."),
+        (Some(intent), Some(completed)) => format!(
+            "recap [{age}]: {}: {}",
+            intent.trim_end().trim_end_matches(TRAILING_JUNK),
+            terminate_clause(completed)
+        ),
+        (Some(intent), None) => format!("recap [{age}]: {}", terminate_clause(intent)),
+        (None, Some(completed)) => format!("recap [{age}]: {}", terminate_clause(completed)),
         (None, None) => unreachable!("empty episodes abstain above"),
     };
 
@@ -287,11 +296,7 @@ fn compact_preview(content: &str, max_chars: usize) -> String {
     if clean.chars().count() <= max_chars {
         return clean;
     }
-    let end = clean
-        .char_indices()
-        .nth(max_chars)
-        .map_or(clean.len(), |(index, _)| index);
-    format!("{}...", &clean[..end])
+    truncate_at_word_boundary(&clean, max_chars)
 }
 
 fn conclusion_preview(content: &str, max_chars: usize) -> String {
@@ -426,13 +431,38 @@ fn truncate_at_word_boundary(text: &str, max_chars: usize) -> String {
         .map_or(text.len(), |(index, _)| index);
     let window = &text[..byte_limit];
     let cut = window.rfind(char::is_whitespace).unwrap_or(byte_limit);
-    format!("{}{ELLIPSIS}", window[..cut].trim_end())
+    // Trailing punctuation before an ellipsis reads as a typo once the
+    // clause terminator is appended (`witness ledger,....`), so drop it.
+    let kept = window[..cut].trim_end().trim_end_matches(TRAILING_JUNK);
+    format!("{kept}{ELLIPSIS}")
+}
+
+/// Punctuation that must not survive immediately before an appended
+/// ellipsis or clause terminator.
+const TRAILING_JUNK: [char; 7] = [',', ';', ':', '-', '—', '–', '.'];
+
+/// Terminate a recap clause with a single `.`, unless it already ends in
+/// terminal punctuation or an ellipsis. Without this, a truncated clause
+/// renders as `… witness ledger....`.
+fn terminate_clause(clause: &str) -> String {
+    let trimmed = clause.trim_end();
+    if trimmed.ends_with("...")
+        || trimmed.ends_with('…')
+        || trimmed.ends_with('.')
+        || trimmed.ends_with('!')
+        || trimmed.ends_with('?')
+    {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
+    }
 }
 
 fn sanitize_preview(text: &str) -> String {
     let no_literal_newline = text.replace("\\n", " ");
     let no_xml = XML_TAG_RE.replace_all(&no_literal_newline, "");
-    let no_markdown = MD_HEADING_RE.replace_all(&no_xml, "");
+    let no_headings = MD_HEADING_RE.replace_all(&no_xml, "");
+    let no_markdown = MD_BULLET_RE.replace_all(&no_headings, "");
     let mut result = no_markdown
         .lines()
         .map(str::trim)
@@ -911,5 +941,78 @@ mod tests {
                 open_proposals: 0,
             }
         }
+    }
+
+    // ---- readability regressions from the 10.1.0 live smoke ------------
+    //
+    // The first real recap read `...never thought about it v10 of CSR b...:
+    // Current state: Merged to main: - #281 ... witness ledger,....` — a
+    // mid-word cut, flattened bullets, and a comma stacked against the
+    // ellipsis and clause terminator.
+
+    #[test]
+    fn compact_preview_never_cuts_mid_word() {
+        let got = compact_preview(
+            "dreaming research on v10 of CSR before anything shipped",
+            30,
+        );
+        assert!(got.ends_with("..."), "expected an ellipsis, got {got:?}");
+        let body = got.trim_end_matches('.');
+        assert!(
+            body.split_whitespace().last().is_some_and(|word| {
+                "dreaming research on v10 of CSR before anything shipped"
+                    .split_whitespace()
+                    .any(|whole| whole == word)
+            }),
+            "last word was cut mid-token: {got:?}"
+        );
+    }
+
+    #[test]
+    fn truncation_drops_trailing_punctuation_before_the_ellipsis() {
+        let got = truncate_at_word_boundary("codewitness, witness ledger, deterministic", 26);
+        assert!(!got.contains(",..."), "comma survived the cut: {got:?}");
+        assert!(got.ends_with("..."), "expected an ellipsis, got {got:?}");
+    }
+
+    #[test]
+    fn clause_terminator_is_never_doubled() {
+        assert_eq!(terminate_clause("witness ledger..."), "witness ledger...");
+        assert_eq!(terminate_clause("done already."), "done already.");
+        assert_eq!(terminate_clause("shipped it"), "shipped it.");
+        assert_eq!(terminate_clause("why not?"), "why not?");
+    }
+
+    #[test]
+    fn markdown_bullets_do_not_leak_into_the_paragraph() {
+        let cleaned =
+            sanitize_preview("Merged to main:\n- #281 landed\n- #282 landed\n2. then tag");
+        assert!(!cleaned.contains("- #281"), "bullet survived: {cleaned:?}");
+        assert!(
+            !cleaned.contains("2. then"),
+            "ordered marker survived: {cleaned:?}"
+        );
+        assert!(cleaned.contains("#281 landed"));
+    }
+
+    #[test]
+    fn live_shaped_episode_reads_as_prose() {
+        let mut ep = episode();
+        ep.request =
+            "Dreaming, we researched it chatted around it never thought about it v10 of CSR being \
+             the release that makes it real"
+                .into();
+        ep.completed = "Current state:\n- Merged to main: #281 v10 dreaming (codewitness, witness \
+                        ledger, deterministic supersession)\n- #282 recap layer"
+            .into();
+        ep.next_steps = None;
+        ep.blockers = None;
+        ep.todos = vec![];
+
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "2m ago").unwrap();
+        assert!(!got.contains("...."), "stacked punctuation: {got:?}");
+        assert!(!got.contains(",..."), "comma against ellipsis: {got:?}");
+        assert!(!got.contains(": - "), "flattened bullet: {got:?}");
+        assert!(!got.contains("Next:"), "next was fabricated: {got:?}");
     }
 }

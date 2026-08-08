@@ -1,4 +1,4 @@
-# Claude Self-Reflect v10.0 — Action Guide
+# Claude Self-Reflect v10.1 — Action Guide
 
 ## Architecture
 
@@ -15,7 +15,7 @@ csr-engine (44MB)
   └── 3-layer enrichment pipeline
 ```
 
-## Corpus Sources (v10.0)
+## Corpus Sources (v10.1)
 
 | Source | Stage | Notes |
 |---|---|---|
@@ -31,7 +31,11 @@ csr-engine (44MB)
 
 ## Dreaming (v10)
 
-Evidence-grounded forgetting: append-only `witness_ledger` (span-level BLAKE3 stamps at commit OIDs) + `witness_generations` publication manifests; deterministic abstention-first verdicts (no LLM); demote+annotate consumption (`[stale anchor]`/`[evolved]` with commit receipts in search). Daemon dream cadence 6h (`CSR_DREAM_INTERVAL_SECS` override), kill switch `CSR_NO_DREAMING=1`; TAD v2 decays by release ancestry (`conversation_ancestry_cache`, hourly refresh, fail-open to neutral). Benchmark: `codewitness labels` + `codewitness bench` (eval-kit/t4) — deterministic, provenance-stamped.
+Evidence-grounded forgetting: append-only `witness_ledger` (span-level BLAKE3 stamps at commit OIDs) + `witness_generations` publication manifests; deterministic abstention-first verdicts (no LLM); demote+annotate consumption (`[stale anchor]`/`[evolved]` with commit receipts in search). Daemon dream cadence 6h (`CSR_DREAM_INTERVAL_SECS` override), kill switch `CSR_NO_DREAMING=1`; TAD v2 decays by release ancestry (`conversation_ancestry_cache`, hourly refresh, fail-open to neutral). Benchmark: `codewitness labels` + `codewitness bench` (eval-kit/t4) — deterministic, provenance-stamped. Supersession receipts carry their basis (`GraphOrdered` vs `ContentOnly`) — a squash/rebase successor is never read as graph-proven.
+
+## Recap (v10.1)
+
+SessionStart injects one causal paragraph instead of the fragment pile: `recap [<age>]: <intent>: <completed>. Settled: <claim> (<receipt>). Now: <blockers|still-open|proposals|todos>. Learnt-then-retired while away: <label> (superseded <date>, <oid>). Next: <evidenced next step>.` Composer `src/hooks/recap.rs` + feeds `src/storage/recap_feeds.rs`, zero LLM. Every clause drops independently without evidence; `Next:` is never fabricated; receipts mandatory. Feeds fail open to the byte-identical fragment fallback. Suppressed from re-import by exact emitted grammar in `provenance::is_csr_emission` (the self-contamination guard). Kill switch `CSR_NO_RECAP=1`.
 
 ## Key Commands
 
@@ -125,7 +129,7 @@ cargo bench --bench spike_bench
 
 | Hook | When | What |
 |------|------|------|
-| SessionStart | Session begins | Injects past context (framed as history, not instructions) |
+| SessionStart | Session begins | Injects the recap paragraph (framed as history, not instructions); falls back to fragments when feeds are empty |
 | UserPromptSubmit | Every prompt | Predictive context injection |
 | PostToolUse | After Edit/Write | Tracks file changes |
 | Stop | Every response | Stores iteration learnings |

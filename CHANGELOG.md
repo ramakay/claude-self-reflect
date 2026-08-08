@@ -5,6 +5,102 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [10.1.0] - 2026-08-08
+
+### Dreaming and recap: memory that forgets on evidence and hands back one paragraph
+
+v10 folds into a single release. Two halves: the engine now retires its own
+claims when the code they described moves, and the session opens with one
+causal paragraph instead of a pile of fragments. 10.0.0 was never published —
+everything below ships together as 10.1.0.
+
+#### Recap at SessionStart (headline)
+
+Session start used to inject CONTINUUM, LAST, NEXT and ANCHORS as separate
+fragments and leave the model to guess how they related. It now composes one
+paragraph from evidence already in the database:
+
+```
+recap [<age>]: <intent>: <completed>. Settled: <claim> (<receipt>).
+Now: <blockers | still-open | proposals | todos>.
+Learnt-then-retired while away: <label> (superseded <date>, <oid>).
+Next: <evidenced next step>.
+```
+
+- No LLM on this path — pure composition over SQL feeds.
+- Abstention-first: every clause drops independently when its evidence is
+  missing. `Next:` is never invented. Punctuation-only sentinels never become
+  claims.
+- Receipts mandatory: a settled claim without a commit receipt is not emitted.
+- No self-contamination: emitted recaps re-enter the corpus through the
+  transcript, so the extraction sanitizer recognises the exact emitted grammar.
+- Feed errors fail open to the previous fragment output, byte for byte.
+- Kill switch: `CSR_NO_RECAP=1`.
+
+Claude Code's own `recap:` is human-facing and is not injected into model
+context on resume; this fills the model-facing half.
+
+#### Dreaming: evidence-grounded forgetting
+
+- **`codewitness` crate.** A deterministic evidence kernel: span-level BLAKE3
+  stamps pinned to commit OIDs, audited as intact, drifted, vanished, or
+  explicitly superseded. Causal ordering via git ancestry, no LLM and no
+  timestamps on the verdict path. Operational failures stay errors and never
+  collapse into verdicts. Every supersession receipt now records whether its
+  basis was graph ordering (`GraphOrdered`) or content re-derivation alone
+  (`ContentOnly`), so a squash/rebase successor is never mistaken for a
+  graph-proven one.
+- **Witness ledger.** Append-only `witness_ledger` plus `witness_generations`
+  publication manifests; `codegraph stamp-spans --at <rev>` mints witnesses at
+  historical revisions.
+- **Deterministic supersession verdicts.** Successor join, event ledger, and
+  two-channel consumption — demote and annotate rather than delete, with
+  `[stale anchor]` / `[evolved]` markers carrying commit receipts into search
+  results.
+- **Validity partition in rerank**, consuming dream verdicts; active forgetting
+  applies accelerated decay to demoted symbols.
+- **Daemon dream cadence** (6h, `CSR_DREAM_INTERVAL_SECS`, kill switch
+  `CSR_NO_DREAMING=1`), dream summary in the telemetry dashboard, and
+  `--report` HTML journal.
+- **T4 benchmark**, ported into `codewitness labels` / `codewitness bench` —
+  deterministic and provenance-stamped. H1 rematch on the corrected extractor:
+  1.000 / 1.000 over 13,626 beliefs.
+
+#### Search and corpus
+
+- **TAD v2**: temporal decay driven by release ancestry rather than wall-clock
+  age, with an hourly ancestry cache that fails open to neutral.
+- **Self-contamination closed**: the importer no longer indexes CSR's own tool
+  output. Counters for suppressed blocks and scrubbed hook wrappers appear in
+  `status`.
+- **Corpus expansion**: sidechain attribution (real project and parent session
+  recovered from provenance) and an optional Codex rollout adapter.
+- `reflect_on_past` sinks resolved chunks before the limit cut, so stale chunks
+  no longer occupy top-k slots ahead of live ones.
+
+#### Codegraph correctness
+
+- Type-qualified symbol identity for witness joins.
+- `#N`-collision abstention: occurrence keys, a complete-generation protocol,
+  and fail-closed lineage selection.
+
+#### Protocol
+
+- **rmcp 1.6 → 3.1** (MCP spec 2026-07-28): elicitation types renamed, tasks on
+  the SEP-2663 TaskManager with prior poll/TTL behaviour preserved, hand-written
+  `call_tool`/`list_tools`. All 15 tools, schemas and annotation hints unchanged.
+
+#### CI and tests
+
+- `codewitness` has its own scoped workflow with a mutation gate and a
+  determinism harness; all 31 missed mutants killed. `cargo-semver-checks` now
+  probes the crates.io index for a baseline, so it turns enforcing by itself at
+  first publish instead of relying on a flag someone must remember to remove.
+- `chunk_binding` tests clear `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE` before
+  spawning git — git exports those to hook subprocesses, which hijacked the
+  tests' temp repositories and made seven of them fail only when run from inside
+  `git commit`.
+
 ## [9.5.0] - 2026-08-03
 
 ### Codegraph truth pass: evidence-tiered resolution, two-channel attribution, honest abstention
