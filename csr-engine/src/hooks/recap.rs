@@ -49,7 +49,7 @@ pub fn compose_recap(
 ) -> Option<String> {
     const MAX_CHARS: usize = 700;
 
-    use crate::extraction::provenance::extractable;
+    use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
 
     let intent = extractable(&ep.request)
         .map(|text| compact_preview(&text, 80))
@@ -71,6 +71,11 @@ pub fn compose_recap(
         (None, Some(completed)) => format!("recap [{age}]: {}", terminate_clause(completed)),
         (None, None) => unreachable!("empty episodes abstain above"),
     };
+    // Machine-owned sentinel, accounted for INSIDE the MAX_CHARS budget below
+    // (not appended after trimming) — every downstream clause-drop decision
+    // already sees its true cost via `recap.chars().count()`.
+    recap.push(' ');
+    recap.push_str(RECAP_SENTINEL);
 
     let settled_entries: Vec<String> = feeds
         .settled
@@ -476,6 +481,7 @@ fn sanitize_preview(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
     use crate::hooks::stop::{Episode, TodoItem};
 
     fn episode() -> Episode {
@@ -544,7 +550,7 @@ mod tests {
         let got = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
         assert_eq!(
             got,
-            "recap [28m ago]: Fix the recap composer: Implemented deterministic recap output.\n\
+            "recap [28m ago]: Fix the recap composer: Implemented deterministic recap output. [[CSR:RECAP]]\n\
              Settled: schema is stable (810283b); queries are indexed (T2 2026-07-27).\n\
              Now: waiting for storage migration | Windows path behavior (91abcde) | 2 proposals awaiting csr_resolve | 1 todos open.\n\
              Learnt-then-retired while away: old schema assumption (superseded 2026-08-06, 77fedca).\n\
@@ -848,7 +854,10 @@ mod tests {
         ep.todos.clear();
         ep.blockers = None;
         let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
-        assert_eq!(got, "recap [now]: Implemented deterministic recap output.");
+        assert_eq!(
+            got,
+            "recap [now]: Implemented deterministic recap output. [[CSR:RECAP]]"
+        );
     }
 
     #[test]
@@ -1014,5 +1023,130 @@ mod tests {
         assert!(!got.contains(",..."), "comma against ellipsis: {got:?}");
         assert!(!got.contains(": - "), "flattened bullet: {got:?}");
         assert!(!got.contains("Next:"), "next was fabricated: {got:?}");
+    }
+
+    // ---- T3: machine-owned recap sentinel — metamorphic wrapper tests ----
+    //
+    // These compose a REAL recap via the canonical producer (not a
+    // hand-built string) so coverage tracks what actually ships, then apply
+    // each adversarial wrapper transformation and assert the full
+    // extractable() pipeline still rejects the result. Non-tautological:
+    // this exercises extractable()'s prose-extraction grammar end to end,
+    // not is_csr_emission alone on the composer's raw output.
+
+    fn wrap_bullet(text: &str) -> String {
+        text.lines()
+            .map(|l| format!("- {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn wrap_blockquote(text: &str) -> String {
+        text.lines()
+            .map(|l| format!("> {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn wrap_emphasis(text: &str) -> String {
+        format!("**{text}**")
+    }
+
+    fn wrap_html(text: &str) -> String {
+        format!("<div class=\"recap\"><p>{text}</p></div>")
+    }
+
+    fn wrap_zero_width(text: &str) -> String {
+        text.chars().flat_map(|c| [c, '\u{200B}']).collect()
+    }
+
+    fn wrap_confusable_brackets(text: &str) -> String {
+        text.replace('[', "\u{FF3B}").replace(']', "\u{FF3D}")
+    }
+
+    fn wrap_long_preamble(text: &str) -> String {
+        format!(
+            "{}\n{text}",
+            "filler text that reads like real prose ".repeat(40)
+        )
+    }
+
+    #[test]
+    fn composed_recap_survives_bullet_wrapping() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(extractable(&wrap_bullet(&recap)).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_blockquote_wrapping() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(extractable(&wrap_blockquote(&recap)).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_emphasis_wrapping() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(extractable(&wrap_emphasis(&recap)).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_html_wrapping() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(extractable(&wrap_html(&recap)).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_zero_width_noise() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(extractable(&wrap_zero_width(&recap)).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_confusable_bracket_substitution() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(extractable(&wrap_confusable_brackets(&recap)).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_preamble_past_header_window() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        let wrapped = wrap_long_preamble(&recap);
+        assert!(wrapped.len() > 400, "preamble must exceed HEADER_WINDOW");
+        assert!(extractable(&wrapped).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_stacked_wrapping() {
+        // Bullet + blockquote + zero-width noise + a long preamble, combined
+        // — the sentinel must survive all of it at once, not just one
+        // transformation at a time.
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        let stacked = wrap_long_preamble(&wrap_zero_width(&wrap_blockquote(&wrap_bullet(&recap))));
+        assert!(extractable(&stacked).is_none());
+    }
+
+    #[test]
+    fn composed_recap_always_carries_the_sentinel_within_budget() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(recap.contains(RECAP_SENTINEL));
+        assert!(recap.chars().count() <= 700);
+    }
+
+    // ---- negative corpus: genuine prose about recaps must stay extractable ----
+
+    #[test]
+    fn genuine_prose_mentioning_recaps_is_not_rejected() {
+        let samples = [
+            "Let's recap what we discussed: the login bug is fixed and deployed.",
+            "The recap feature works great, though it's verbose in the Now: clause sometimes.",
+            "I want to recap [the auth changes], then prioritize them.",
+            "Can you write a quick recap of yesterday's session for the standup?",
+        ];
+        for sample in samples {
+            assert!(
+                extractable(sample).is_some(),
+                "genuine prose wrongly rejected: {sample:?}"
+            );
+        }
     }
 }
