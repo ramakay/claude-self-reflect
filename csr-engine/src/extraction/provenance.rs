@@ -258,11 +258,14 @@ pub fn is_substantive(text: &str) -> bool {
 /// Returns the cleaned text safe to carry forward as session content.
 pub fn extractable(text: &str) -> Option<String> {
     let unplumbed = strip_plumbing(text);
-    // Sentinel check runs before strip_quoted: a blockquote-wrapped recap
-    // ("> recap [...]: ... [[CSR:RECAP]]") would otherwise have every
-    // quoted line erased before the sentinel is ever seen, letting an
-    // unquoted preamble alongside it survive as if it were genuine content.
-    if is_csr_emission(&unplumbed) {
+    // Recap sentinel only (not full is_csr_emission) runs before strip_quoted:
+    // a blockquote-wrapped recap ("> recap [...]: ... [[CSR:RECAP]]") would
+    // otherwise have every quoted line erased before the sentinel is ever
+    // seen, letting an unquoted preamble alongside it survive as if it were
+    // genuine content. Historical header/field-token branches still apply
+    // after strip_quoted on cleaned prose — quoted echoes alone must not
+    // reject genuine unquoted content co-occurring with them.
+    if contains_recap_sentinel(&unplumbed) {
         return None;
     }
     let prose = strip_quoted(&unplumbed);
@@ -489,5 +492,19 @@ mod tests {
             "some unrelated preamble text that reads like genuine session content\n{quoted_recap}"
         );
         assert!(extractable(&text).is_none());
+    }
+
+    #[test]
+    fn extractable_keeps_unquoted_prose_alongside_quoted_historical_header() {
+        // Regression: full is_csr_emission before strip_quoted over-rejected
+        // genuine unquoted content that merely co-occurred with a quoted
+        // historical EMISSION_HEADERS echo (no sentinel present).
+        let text = "> SESSION CONTINUITY DETECTED: old injected context\n\
+                    I actually fixed the login bug today, deployed and verified.";
+        let got = extractable(text).expect("unquoted genuine prose must survive");
+        assert_eq!(
+            got.trim(),
+            "I actually fixed the login bug today, deployed and verified."
+        );
     }
 }
