@@ -2,7 +2,9 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::anchor::to_git_path;
 use crate::verdict::SupersededReceipt;
-use crate::{causal, Anchor, CausalOrder, Error, StampKind, Tier, Verdict, Witness};
+use crate::{
+    causal, Anchor, CausalOrder, Error, StampKind, SupersessionBasis, Tier, Verdict, Witness,
+};
 
 /// Wraps a [`gix::Repository`] to produce and audit [`Witness`]es.
 ///
@@ -188,7 +190,9 @@ impl Auditor {
     ///      see `tests/adversarial.rs`) is accepted *only* because check #3
     ///      already proved the successor's content by direct re-derivation
     ///      from the object database; the commit graph gives no help in
-    ///      that case, and content re-derivation is why none is needed.
+    ///      that case, and content re-derivation is why none is needed. The
+    ///      emitted receipt records whether its basis was graph ordering or
+    ///      content-only evidence, so consumers can distinguish these cases.
     pub fn audit_against_successor(
         &self,
         witness: &Witness,
@@ -199,10 +203,11 @@ impl Auditor {
             return Ok(fallback);
         }
 
-        if self.successor_is_valid(witness, successor)? {
+        if let Some(basis) = self.successor_is_valid(witness, successor)? {
             Ok(Verdict::Superseded(SupersededReceipt::new(
                 successor.anchor().clone(),
                 successor.at(),
+                basis,
             )))
         } else {
             Ok(fallback)
@@ -210,16 +215,20 @@ impl Auditor {
     }
 
     /// All of [`Self::audit_against_successor`]'s supersession checks.
-    /// `Ok(false)` means the successor was fully checked and *rejected*
+    /// `Ok(None)` means the successor was fully checked and *rejected*
     /// (wrong tier, stamp mismatch, causally backwards); `Err` means a
     /// repository-access failure prevented checking at all (missing or
     /// undecodable commit, unreadable tree, merge-base error) — the two
     /// must stay distinguishable, because only the former is a
     /// deterministic fact about the evidence.
-    fn successor_is_valid(&self, witness: &Witness, successor: &Witness) -> Result<bool, Error> {
+    fn successor_is_valid(
+        &self,
+        witness: &Witness,
+        successor: &Witness,
+    ) -> Result<Option<SupersessionBasis>, Error> {
         // (1) Tier gate.
         if successor.tier() != Tier::Committed {
-            return Ok(false);
+            return Ok(None);
         }
 
         // (2) + (3): re-derive the successor's stamp from the commit it
@@ -230,19 +239,21 @@ impl Auditor {
         let bytes = self.read_committed_bytes(successor.anchor(), successor.at())?;
         let recomputed = successor.stamp().kind().compute(&bytes);
         if recomputed != *successor.stamp() {
-            return Ok(false);
+            return Ok(None);
         }
 
         // (4) Causal precedence, only meaningful when the original witness
         // is itself pinned to a real commit.
         if witness.tier() == Tier::Committed {
             let order = causal::compare(&self.repo, successor.at(), witness.at())?;
-            if matches!(order, CausalOrder::AncestorOf | CausalOrder::Equal) {
-                return Ok(false);
-            }
+            return match order {
+                CausalOrder::DescendantOf => Ok(Some(SupersessionBasis::GraphOrdered)),
+                CausalOrder::Incomparable => Ok(Some(SupersessionBasis::ContentOnly)),
+                CausalOrder::AncestorOf | CausalOrder::Equal => Ok(None),
+            };
         }
 
-        Ok(true)
+        Ok(Some(SupersessionBasis::ContentOnly))
     }
 
     // ---- content access -------------------------------------------------
