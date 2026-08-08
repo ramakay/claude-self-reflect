@@ -35,7 +35,7 @@ pub use causal::CausalOrder;
 pub use diff_id::{normalized_diff_id, DiffId};
 pub use error::{Error, Result};
 pub use stamp::{stamp_normalized, Stamp, StampKind};
-pub use verdict::{SupersededReceipt, Verdict};
+pub use verdict::{SupersededReceipt, SupersessionBasis, Verdict};
 pub use witness::{Tier, Witness};
 
 /// Re-exported so downstream crates can construct [`Witness::at`] /

@@ -51,10 +51,29 @@ impl Verdict {
     }
 }
 
+/// The evidence that backed a [`Verdict::Superseded`] receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SupersessionBasis {
+    /// The successor commit is a proven (transitive) descendant of the
+    /// witnessed commit: the commit graph itself orders the replacement.
+    GraphOrdered,
+    /// The commit graph did not order the two commits, so the mint rests
+    /// entirely on the successor's stamp being re-derived from the object
+    /// database plus the caller's assertion that this anchor replaces the
+    /// witnessed one. Reached when the two commits are
+    /// [`crate::CausalOrder::Incomparable`] (squash, rebase, cherry-pick, or an
+    /// unrelated branch), or when the witness is [`crate::Tier::Worktree`] and
+    /// therefore carries no reproducible commit to order against.
+    ContentOnly,
+}
+
 /// The evidence backing a [`Verdict::Superseded`] verdict: which anchor
 /// replaced the witnessed one, and the commit (`receipt`) at which that
-/// successor witness was taken — always [`crate::Tier::Committed`]
-/// evidence.
+/// successor witness was taken — always [`crate::Tier::Committed`] evidence —
+/// plus the [`SupersessionBasis`] that states which evidence backed the mint.
+/// In particular, [`SupersessionBasis::ContentOnly`] must not be read as
+/// graph-proven succession.
 ///
 /// The enum variant `Verdict::Superseded` stays public so callers can
 /// match on it freely, but this payload's fields are private and there is
@@ -83,11 +102,12 @@ impl Verdict {
 pub struct SupersededReceipt {
     by: Anchor,
     receipt: gix::ObjectId,
+    basis: SupersessionBasis,
 }
 
 impl SupersededReceipt {
-    pub(crate) fn new(by: Anchor, receipt: gix::ObjectId) -> Self {
-        Self { by, receipt }
+    pub(crate) fn new(by: Anchor, receipt: gix::ObjectId, basis: SupersessionBasis) -> Self {
+        Self { by, receipt, basis }
     }
 
     /// The anchor that replaced the witnessed one.
@@ -98,6 +118,11 @@ impl SupersededReceipt {
     /// The commit at which the successor witness was taken.
     pub fn receipt(&self) -> gix::ObjectId {
         self.receipt
+    }
+
+    /// The evidence that backed this supersession receipt.
+    pub fn basis(&self) -> SupersessionBasis {
+        self.basis
     }
 }
 
@@ -117,6 +142,7 @@ mod tests {
             Verdict::Superseded(SupersededReceipt::new(
                 Anchor::new("replacement.rs"),
                 object_id(),
+                SupersessionBasis::GraphOrdered,
             )),
             Verdict::Vanished {
                 last_seen: object_id(),
@@ -139,5 +165,20 @@ mod tests {
             verdicts.each_ref().map(|verdict| verdict.is_vanished()),
             [false, false, false, true]
         );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn superseded_receipt_serde_round_trip_preserves_basis() {
+        let receipt = SupersededReceipt::new(
+            Anchor::new("replacement.rs"),
+            object_id(),
+            SupersessionBasis::ContentOnly,
+        );
+
+        let encoded = serde_json::to_string(&receipt).unwrap();
+        let decoded: SupersededReceipt = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.basis(), SupersessionBasis::ContentOnly);
     }
 }

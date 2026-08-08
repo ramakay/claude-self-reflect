@@ -7,7 +7,9 @@
 
 mod common;
 
-use codewitness::{causal, normalized_diff_id, Anchor, CausalOrder, Tier, Verdict};
+use codewitness::{
+    causal, normalized_diff_id, Anchor, CausalOrder, SupersessionBasis, Tier, Verdict,
+};
 use common::TempRepo;
 
 const FILE: &str = "witness.txt";
@@ -245,7 +247,37 @@ fn near_identical_edit_is_drifted_not_superseded_without_a_successor() {
         .audit_against_successor(&witness_a, &committed_successor)
         .unwrap()
     {
-        Verdict::Superseded(receipt) => assert_eq!(receipt.receipt(), commit_a_prime),
+        Verdict::Superseded(receipt) => {
+            assert_eq!(receipt.receipt(), commit_a_prime);
+            assert_eq!(receipt.basis(), SupersessionBasis::GraphOrdered);
+        }
+        other => panic!("expected Superseded, got {other:?}"),
+    }
+}
+
+#[test]
+fn worktree_witness_supersession_records_content_only_basis() {
+    let repo = TempRepo::new();
+    repo.write(FILE, "original\n");
+    repo.commit_all("original");
+
+    let auditor = repo.auditor();
+    let anchor = Anchor::new(FILE);
+    let worktree_witness = auditor.stamp(&anchor).unwrap();
+    assert_eq!(worktree_witness.tier(), Tier::Worktree);
+
+    repo.write(FILE, "replacement\n");
+    let successor_commit = repo.commit_all("replacement");
+    let successor = auditor.stamp_at(&anchor, successor_commit).unwrap();
+
+    match auditor
+        .audit_against_successor(&worktree_witness, &successor)
+        .unwrap()
+    {
+        Verdict::Superseded(receipt) => {
+            assert_eq!(receipt.basis(), SupersessionBasis::ContentOnly);
+            assert_eq!(receipt.receipt(), successor_commit);
+        }
         other => panic!("expected Superseded, got {other:?}"),
     }
 }
@@ -291,6 +323,23 @@ fn cherry_pick_duplicate_shares_diff_id_but_not_topology() {
     let id_feature = normalized_diff_id(&feature_parent_content, &feature_content);
     let id_main = normalized_diff_id(&main_commit_parent_content, &main_commit_content);
     assert_eq!(id_feature, id_main);
+
+    let witnessed_feature = auditor
+        .stamp_at(&Anchor::new(FILE), feature_commit)
+        .unwrap();
+    let successor_cherry_pick = auditor
+        .stamp_at(&Anchor::new(FILE), cherry_pick_commit)
+        .unwrap();
+    match auditor
+        .audit_against_successor(&witnessed_feature, &successor_cherry_pick)
+        .unwrap()
+    {
+        Verdict::Superseded(receipt) => {
+            assert_eq!(receipt.basis(), SupersessionBasis::ContentOnly);
+            assert_eq!(receipt.receipt(), cherry_pick_commit);
+        }
+        other => panic!("expected Superseded, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -443,6 +492,29 @@ fn successor_causally_preceding_the_witness_is_not_superseded() {
         .unwrap();
     assert!(!verdict.is_superseded());
     assert_eq!(verdict, Verdict::Drifted);
+}
+
+#[test]
+fn successor_equal_to_the_witness_is_not_superseded() {
+    let repo = TempRepo::new();
+    repo.write(FILE, "v1\n");
+    repo.commit_all("v1");
+    repo.write(FILE, "v2\n");
+    let commit_2 = repo.commit_all("v2");
+    repo.write(FILE, "v3\n");
+    repo.commit_all("v3: current worktree state");
+
+    let auditor = repo.auditor();
+    let anchor = Anchor::new(FILE);
+    let witness = auditor.stamp_at(&anchor, commit_2).unwrap();
+    let equal_successor = auditor.stamp_at(&anchor, commit_2).unwrap();
+
+    assert_eq!(
+        auditor
+            .audit_against_successor(&witness, &equal_successor)
+            .unwrap(),
+        Verdict::Drifted
+    );
 }
 
 /// Forgery-based negative tests: these need to construct a `Witness` that
