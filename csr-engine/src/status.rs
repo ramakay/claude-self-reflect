@@ -309,11 +309,28 @@ fn gather_dream(storage: &Storage) -> DreamStatus {
         .last_dream_run()
         .unwrap_or(None)
         .map(|(_head_oid, created_at)| created_at);
-    let (obsolete, superseded, reinstated) = storage.dream_event_totals().unwrap_or((0, 0, 0));
-    let demoted_symbols = storage
-        .all_demoted_symbols()
-        .map(|v| v.len() as i64)
-        .unwrap_or(0);
+    // v10.1: CSR_DREAM_CONSUMPTION default OFF ships the witness ledger as
+    // experimental derived data — no dream verdict may reach the user as
+    // text (status/CLI surfaces included) unless explicitly opted in. The
+    // daemon's own operational bookkeeping below (whether it's enabled, when
+    // it last ran, when it's next due) is NOT verdict content and stays
+    // visible either way; only the verdict-derived counts are gated, and
+    // gating skips the underlying queries entirely rather than computing
+    // real totals and hiding them.
+    let consumption_enabled = crate::storage::recap_feeds::dream_consumption_enabled();
+    let (obsolete, superseded, reinstated) = if consumption_enabled {
+        storage.dream_event_totals().unwrap_or((0, 0, 0))
+    } else {
+        (0, 0, 0)
+    };
+    let demoted_symbols = if consumption_enabled {
+        storage
+            .all_demoted_symbols()
+            .map(|v| v.len() as i64)
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let last_daemon_run_dt = crate::daemon::dream_cadence::read_last_run(storage);
     let last_daemon_run = last_daemon_run_dt.map(|t| t.to_rfc3339());
     let daemon_enabled = !crate::daemon::dream_cadence::dreaming_disabled();
@@ -896,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn status_dream_block_reflects_recorded_events_and_demotions() {
+    fn status_dream_block_suppresses_verdict_counts_by_default_but_keeps_ledger_activity_visible() {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
         use crate::storage::witness_ledger::WitnessLedgerRow;
         use crate::storage::witness_verdicts::{VerdictKind, WitnessVerdictRow};
@@ -939,12 +956,28 @@ mod tests {
             .unwrap();
         drop(storage);
 
+        // CSR_DREAM_CONSUMPTION is unset in this test process — the real
+        // default — even though a real Demote-channel verdict exists in the
+        // DB. `gather_status` is the actual `csr-engine status` production
+        // path with no test-only parameter seam, so this drives it exactly
+        // as a real user would see it today.
         let report = gather_status(&db_path, &projects_dir, false).unwrap();
-        assert_eq!(report.dream.events_total, 1);
-        assert_eq!(report.dream.by_verdict.obsolete, 1);
+        assert_eq!(
+            report.dream.events_total, 0,
+            "verdict totals must be suppressed by default"
+        );
+        assert_eq!(report.dream.by_verdict.obsolete, 0);
         assert_eq!(report.dream.by_verdict.superseded, 0);
-        assert_eq!(report.dream.demoted_symbols, 1);
-        assert_eq!(report.dream.witnesses_ledgered, 1);
+        assert_eq!(
+            report.dream.demoted_symbols, 0,
+            "forgotten-symbol count must be suppressed by default"
+        );
+        // NOT verdict content — daemon/ledger bookkeeping stays visible
+        // either way (see `gather_dream`'s doc on what is/isn't gated).
+        assert_eq!(
+            report.dream.witnesses_ledgered, 1,
+            "raw ledger stamp count is not verdict content and must stay visible"
+        );
         assert!(report.dream.last_run.is_some());
     }
 
@@ -1021,5 +1054,20 @@ mod tests {
         assert!(!dream.daemon_enabled);
         assert!(dream.next_due.is_none());
         assert!(dream.last_daemon_run.is_some());
+    }
+
+    #[test]
+    fn gather_dream_hides_verdict_counts_when_consumption_is_off() {
+        // This test does NOT set CSR_DREAM_CONSUMPTION (matching the real
+        // default), so `gather_dream`'s verdict-derived fields must all read
+        // zero. This is a light smoke test; the "never queries witness_verdicts"
+        // proof lives in mcp::tools and storage::recap_feeds.
+        let storage = Storage::open_memory().unwrap();
+        let dream = gather_dream(&storage);
+        assert_eq!(dream.events_total, 0);
+        assert_eq!(dream.by_verdict.obsolete, 0);
+        assert_eq!(dream.by_verdict.superseded, 0);
+        assert_eq!(dream.by_verdict.reinstated, 0);
+        assert_eq!(dream.demoted_symbols, 0);
     }
 }

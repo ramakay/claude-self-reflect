@@ -199,8 +199,52 @@ fn group_by_day(storage: &Storage, events: &[DreamEventRow]) -> Vec<DayGroup> {
 }
 
 /// Gather every piece of data the template needs. Read-only: three existing
-/// `witness_ledger`/`witness_verdicts` query paths, no writes.
+/// `witness_ledger`/`witness_verdicts` query paths, no writes. Thin
+/// wrapper over `gather_report_data_with` for real callers — reads
+/// `CSR_DREAM_CONSUMPTION` from the real process env exactly once here.
 fn gather_report_data(storage: &Storage) -> Result<DreamReportData> {
+    gather_report_data_with(
+        storage,
+        crate::storage::recap_feeds::dream_consumption_enabled(),
+    )
+}
+
+/// Core of [`gather_report_data`] with the v10.1 dream-consumption opt-in
+/// passed in as a parameter — mirrors `resolve_validity_with`/
+/// `recap_retired_since_with`'s pattern so tests can drive the ON path
+/// directly instead of mutating the real process env (parallel-test
+/// race — same discipline as everywhere else this switch appears).
+/// `consumption_enabled = false` renders the same neutral "no dreams
+/// yet" state the template already supports (`is_empty: true`), WITHOUT
+/// touching witness_ledger/witness_verdicts at all, rather than
+/// computing real totals and hiding them — mirrors
+/// `recap_retired_since_with`'s early return. `csr-engine dream
+/// --report` still writes a valid, openable HTML file either way; only
+/// its verdict content is gated.
+fn gather_report_data_with(
+    storage: &Storage,
+    consumption_enabled: bool,
+) -> Result<DreamReportData> {
+    if !consumption_enabled {
+        return Ok(DreamReportData {
+            generated_at: chrono::Utc::now()
+                .format("%Y-%m-%d %H:%M:%S UTC")
+                .to_string(),
+            has_run: false,
+            last_run_head_short: None,
+            last_run_at: None,
+            totals: VerdictTotals {
+                obsolete: 0,
+                superseded: 0,
+                reinstated: 0,
+                total: 0,
+            },
+            days: Vec::new(),
+            forgotten: Vec::new(),
+            is_empty: true,
+        });
+    }
+
     let events = storage.all_dream_events()?;
     let (obsolete, superseded, reinstated) = storage.dream_event_totals()?;
     let last_run = storage.last_dream_run()?;
@@ -345,6 +389,28 @@ mod tests {
     }
 
     #[test]
+    fn consumption_off_renders_no_dreams_yet_even_with_real_verdicts() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch("DROP TABLE witness_verdicts")?;
+                Ok(())
+            })
+            .unwrap();
+        // consumption_enabled reads real env (unset in this test process by
+        // default) — dropping witness_verdicts on top proves the guard
+        // clause returns before any query would have needed that table.
+        let data = gather_report_data(&storage).unwrap();
+        assert!(data.is_empty);
+        assert!(!data.has_run);
+        assert!(data.days.is_empty());
+        assert!(data.forgotten.is_empty());
+
+        let html = render_html(&data).unwrap();
+        assert!(html.contains("No dreams yet"));
+    }
+
+    #[test]
     fn synthetic_events_render_key_strings() {
         let storage = Storage::open_memory().unwrap();
         storage
@@ -387,7 +453,7 @@ mod tests {
             })
             .unwrap();
 
-        let data = gather_report_data(&storage).unwrap();
+        let data = gather_report_data_with(&storage, true).unwrap();
         assert!(!data.is_empty);
         assert!(data.has_run);
         assert_eq!(data.totals.superseded, 1);
@@ -436,7 +502,7 @@ mod tests {
             })
             .unwrap();
 
-        let data = gather_report_data(&storage).unwrap();
+        let data = gather_report_data_with(&storage, true).unwrap();
         let html = render_html(&data).unwrap();
         assert!(!html.contains(payload), "raw script tag leaked into HTML");
         // minijinja HTML-escapes `/` as well: </script> -> &lt;&#x2f;script&gt;
@@ -471,7 +537,7 @@ mod tests {
             })
             .unwrap();
 
-        let data = gather_report_data(&storage).unwrap();
+        let data = gather_report_data_with(&storage, true).unwrap();
         assert_eq!(data.forgotten.len(), 1);
         assert_eq!(data.forgotten[0].symbol, "vanished");
 

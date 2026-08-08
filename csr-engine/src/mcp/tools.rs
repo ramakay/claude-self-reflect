@@ -12,6 +12,7 @@ use crate::search::cross_project;
 use crate::search::decay;
 use crate::search::SearchEngine;
 use crate::storage::chunk_binding::ChunkWitnessVerdict;
+use crate::storage::recap_feeds::dream_consumption_enabled;
 use crate::storage::witness_verdicts::VerdictChannel;
 use crate::storage::Storage;
 use crate::temporal;
@@ -58,11 +59,13 @@ fn is_uuid(s: &str) -> bool {
 /// Returns None when the tag matches nothing so the caller can fall through
 /// to semantic search.
 ///
-/// The v10 validity partition applies HERE TOO (`partition_enabled` is the
-/// caller's `validity_partition_enabled()` outcome): an exact handle to a
-/// conversation whose bound code symbol is stale must carry the same
-/// `[stale anchor]`/`[evolved]` annotation a semantic hit would — the fast
-/// path previously bypassed validity entirely. All rows share one
+/// The v10 validity partition applies HERE TOO (`consumption_enabled` is
+/// the caller's `validity_partition_enabled() && dream_consumption_enabled()`
+/// outcome — this fast path renders verdict text directly, so it must
+/// respect the v10.1 opt-in the same as every other consumer): an exact
+/// handle to a conversation whose bound code symbol is stale must carry the
+/// same `[stale anchor]`/`[evolved]` annotation a semantic hit would — the
+/// fast path previously bypassed validity entirely. All rows share one
 /// conversation id, so the partition never reorders here; it only annotates
 /// and flags.
 fn lookup_by_conv_tag(
@@ -70,7 +73,7 @@ fn lookup_by_conv_tag(
     conv_id: &str,
     query: &str,
     limit: usize,
-    partition_enabled: bool,
+    consumption_enabled: bool,
     active_forgetting: bool,
 ) -> Result<Option<String>> {
     let start = Instant::now();
@@ -117,7 +120,7 @@ fn lookup_by_conv_tag(
     // Resolve + apply validity on the fast path too (issue: the exact-handle
     // path returned without ever consulting dream verdicts). One batched
     // query for the single conversation id.
-    let validity = resolve_validity_with(storage, &[conv_id.to_string()], partition_enabled);
+    let validity = resolve_validity_with(storage, &[conv_id.to_string()], consumption_enabled);
     apply_validity_partition(&mut enriched, &validity, active_forgetting);
     let search_ms = start.elapsed().as_millis() as u64;
     Ok(Some(format::format_search_results(
@@ -139,7 +142,15 @@ pub async fn reflect_on_past(
     min_score: f32,
     project: Option<&str>,
 ) -> Result<String> {
+    // `partition_enabled` (the pre-existing `CSR_NO_VALIDITY_PARTITION` kill
+    // switch) gates ancestry availability too, so it must NOT be folded with
+    // `CSR_DREAM_CONSUMPTION` — that fold is exactly the regression the
+    // rejected first T2 attempt shipped (it killed release-ancestry ranking
+    // whenever dream consumption defaulted off). `consumption_enabled` gates
+    // ONLY whether the resolved verdict map is populated; ancestry loads
+    // independently of it — see `CandidateSignals`'s doc.
     let partition_enabled = validity_partition_enabled();
+    let consumption_enabled = partition_enabled && dream_consumption_enabled();
     let active_forgetting = active_forgetting_enabled();
     // Retrieval-handle fast path: `conv_<uuid>` (or a bare UUID) resolves by
     // exact tag. Falls through to semantic search only when the tag matches
@@ -150,7 +161,7 @@ pub async fn reflect_on_past(
             conv_id,
             query,
             limit.max(5),
-            partition_enabled,
+            consumption_enabled,
             active_forgetting,
         )? {
             return Ok(result);
@@ -171,6 +182,7 @@ pub async fn reflect_on_past(
         project,
         embed_ms,
         partition_enabled,
+        consumption_enabled,
         active_forgetting,
     )
     .await
@@ -178,9 +190,13 @@ pub async fn reflect_on_past(
 
 /// Everything in `reflect_on_past` after query embedding — the seam the
 /// end-to-end partition test drives with a synthetic query vector (no
-/// FastEmbed model in tests) and an explicit kill-switch outcome (never by
+/// FastEmbed model in tests) and explicit kill-switch outcomes (never by
 /// mutating the process env — see `resolve_validity_with`'s doc).
-/// `partition_enabled` is `validity_partition_enabled()` for real callers.
+/// `partition_enabled` is `validity_partition_enabled()` and
+/// `consumption_enabled` is `partition_enabled && dream_consumption_enabled()`
+/// for real callers — kept as two separate parameters all the way down to
+/// `CandidateSignals` so dream-verdict consumption can never fold into (and
+/// thereby disable) release-ancestry availability.
 #[allow(clippy::too_many_arguments)]
 async fn reflect_on_past_with_vec(
     storage: &Arc<Storage>,
@@ -192,6 +208,7 @@ async fn reflect_on_past_with_vec(
     project: Option<&str>,
     embed_ms: u64,
     partition_enabled: bool,
+    consumption_enabled: bool,
     active_forgetting: bool,
 ) -> Result<String> {
     let (effective_project, scope_label) = cross_project::normalize_project_scope(project);
@@ -211,6 +228,7 @@ async fn reflect_on_past_with_vec(
         min_score,
         effective_project.as_deref(),
         partition_enabled,
+        consumption_enabled,
         active_forgetting,
     )
     .await?;
@@ -239,6 +257,7 @@ async fn reflect_on_past_with_vec(
                 min_score,
                 effective_project.as_deref(),
                 partition_enabled,
+                consumption_enabled,
                 active_forgetting,
             )
             .await?;
@@ -302,6 +321,7 @@ async fn reflect_gather_pass(
     min_score: f32,
     effective_project: Option<&str>,
     partition_enabled: bool,
+    consumption_enabled: bool,
     active_forgetting: bool,
 ) -> Result<GatherPass> {
     let search_start = Instant::now();
@@ -335,7 +355,12 @@ async fn reflect_gather_pass(
     // saw. The final sink/annotate step (mirroring
     // `apply_resolutions_before_limit`) reuses this same map.
     let queried_convs = distinct_conversation_ids_of_chunks(&chunks);
-    let mut signals = CandidateSignals::load(storage, &queried_convs, partition_enabled);
+    let mut signals = CandidateSignals::load(
+        storage,
+        &queried_convs,
+        partition_enabled,
+        consumption_enabled,
+    );
     let queried_convs: HashSet<String> = queried_convs.into_iter().collect();
 
     let now = chrono::Utc::now();
@@ -488,7 +513,12 @@ async fn reflect_gather_pass(
                 .into_iter()
                 .filter(|c| !queried_convs.contains(c))
                 .collect();
-            let ancestry_revoked = signals.extend(storage, &extra_convs, partition_enabled);
+            let ancestry_revoked = signals.extend(
+                storage,
+                &extra_convs,
+                partition_enabled,
+                consumption_enabled,
+            );
             if ancestry_revoked {
                 // Semantic scores were computed before the FTS-only validity
                 // batch existed. Replay exactly those candidates without
@@ -826,7 +856,7 @@ pub async fn search_by_recency(
             storage,
             |n| idx.search_chunks_filtered(&query_vec, n, min_score, &time_ids),
             limit,
-            validity_partition_enabled(),
+            validity_partition_enabled() && dream_consumption_enabled(),
         )?
     };
     Ok(format::format_recency_results(&enriched, query, &time_desc))
@@ -1091,7 +1121,7 @@ pub async fn search_by_concept(
             storage,
             |n| idx.search_chunks_filtered(&query_vec, n, 0.3, &ids),
             limit,
-            validity_partition_enabled(),
+            validity_partition_enabled() && dream_consumption_enabled(),
         )?
     } else {
         let idx = search.read().await;
@@ -1099,7 +1129,7 @@ pub async fn search_by_concept(
             storage,
             |n| idx.search_chunks(&query_vec, n, 0.3),
             limit,
-            validity_partition_enabled(),
+            validity_partition_enabled() && dream_consumption_enabled(),
         )?
     };
     Ok(format::format_search_results(
@@ -1123,7 +1153,7 @@ pub async fn get_more_results(
     min_score: f32,
     project: Option<&str>,
 ) -> Result<String> {
-    let partition_enabled = validity_partition_enabled();
+    let partition_enabled = validity_partition_enabled() && dream_consumption_enabled();
     let active_forgetting = active_forgetting_enabled();
     let query_vec = embed_query(embeddings, query).await?;
     if active_forgetting {
@@ -1357,7 +1387,11 @@ fn enrich_results(
     storage: &Arc<Storage>,
     results: &[crate::search::SearchResult],
 ) -> Result<Vec<EnrichedResult>> {
-    enrich_results_with(storage, results, validity_partition_enabled())
+    enrich_results_with(
+        storage,
+        results,
+        validity_partition_enabled() && dream_consumption_enabled(),
+    )
 }
 
 /// Core of [`enrich_results`] with the validity kill-switch outcome passed
@@ -1492,6 +1526,17 @@ pub(crate) struct ConvValidity {
 /// only when the validity batch covering the same candidates completed: if
 /// that read fails, the existing validity partition still fails open, while
 /// ancestry fails neutral so an unknown Demote channel cannot be stacked.
+///
+/// `ancestry_enabled` (the pre-existing `CSR_NO_VALIDITY_PARTITION` kill
+/// switch outcome) and `consumption_enabled` (v10.1's new
+/// `CSR_DREAM_CONSUMPTION`, default OFF) are DELIBERATELY separate
+/// parameters below, never folded into one: `ancestry_enabled` gates whether
+/// this pass loads ANY signals at all (ancestry included), while
+/// `consumption_enabled` gates ONLY whether the resolved verdict map is
+/// populated. Folding them (the rejected first T2 attempt's bug) meant
+/// `CSR_DREAM_CONSUMPTION`'s default-OFF state silently killed release-
+/// ancestry ranking too — an unrelated feature dream-verdict consumption
+/// must never touch.
 #[derive(Default)]
 struct CandidateSignals {
     validity: HashMap<String, ConvValidity>,
@@ -1500,11 +1545,17 @@ struct CandidateSignals {
 }
 
 impl CandidateSignals {
-    fn load(storage: &Arc<Storage>, conversation_ids: &[String], enabled: bool) -> Self {
-        if !enabled {
+    fn load(
+        storage: &Arc<Storage>,
+        conversation_ids: &[String],
+        ancestry_enabled: bool,
+        consumption_enabled: bool,
+    ) -> Self {
+        if !ancestry_enabled {
             return Self::default();
         }
-        let Ok(validity) = resolve_validity_checked(storage, conversation_ids, enabled) else {
+        let Ok(validity) = resolve_validity_checked(storage, conversation_ids, consumption_enabled)
+        else {
             return Self::default();
         };
         Self {
@@ -1524,16 +1575,17 @@ impl CandidateSignals {
         &mut self,
         storage: &Arc<Storage>,
         conversation_ids: &[String],
-        enabled: bool,
+        ancestry_enabled: bool,
+        consumption_enabled: bool,
     ) -> bool {
         let ancestry_was_allowed = self.ancestry_allowed;
-        if !enabled {
+        if !ancestry_enabled {
             self.validity.clear();
             self.ancestry.clear();
             self.ancestry_allowed = false;
             return ancestry_was_allowed;
         }
-        match resolve_validity_checked(storage, conversation_ids, enabled) {
+        match resolve_validity_checked(storage, conversation_ids, consumption_enabled) {
             Ok(validity) => {
                 self.validity.extend(validity);
                 if self.ancestry_allowed {
@@ -1640,6 +1692,14 @@ fn resolve_validity_checked(
 /// Prompt-submit needs the same Demote predicate before applying release
 /// ancestry. Unlike the normal validity path, preserve storage failure so
 /// prompt scoring can fail open to no ancestry rather than risk stacking.
+/// `None` means ancestry itself is unavailable (the pre-existing
+/// `CSR_NO_VALIDITY_PARTITION` kill switch, or a genuine storage read
+/// failure) — prompt-submit falls back to no ancestry either way.
+/// `Some(map)` — possibly EMPTY when `CSR_DREAM_CONSUMPTION` is off — means
+/// ancestry itself is fine to use; an empty map just means no verdict is
+/// available to check for stacking, not that ancestry must be suppressed
+/// (dream-verdict consumption and release-ancestry availability are
+/// independent signals — see `CandidateSignals`'s doc).
 pub(crate) fn resolve_validity_for_ancestry(
     storage: &Arc<Storage>,
     conversation_ids: &[String],
@@ -1647,7 +1707,7 @@ pub(crate) fn resolve_validity_for_ancestry(
     if !validity_partition_enabled() {
         return None;
     }
-    resolve_validity_checked(storage, conversation_ids, true).ok()
+    resolve_validity_checked(storage, conversation_ids, dream_consumption_enabled()).ok()
 }
 
 fn reduce_validity_hits(
@@ -1962,6 +2022,9 @@ fn apply_resolutions_before_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Pure parsing seam — tests drive it by parameter instead of mutating
+    // the process env, so the non-test build has no use for it.
+    use crate::storage::recap_feeds::dream_consumption_enabled_from;
 
     fn enriched_result(id: &str, score: f32, seq: usize) -> EnrichedResult {
         EnrichedResult {
@@ -2087,6 +2150,7 @@ mod tests {
             0,
             false,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -2103,6 +2167,7 @@ mod tests {
             0.1,
             Some("all"),
             0,
+            false,
             false,
             false,
         )
@@ -2174,6 +2239,7 @@ mod tests {
             0.1,
             Some("all"),
             0,
+            false,
             false,
             false,
         )
@@ -2468,7 +2534,7 @@ mod tests {
             })
             .unwrap();
         let conversation_ids = vec!["conv-demoted".to_string()];
-        let mut signals = CandidateSignals::load(&storage, &conversation_ids, true);
+        let mut signals = CandidateSignals::load(&storage, &conversation_ids, true, true);
         assert!(signals.ancestry.contains_key("conv-demoted"));
         let now = "2026-08-06T12:00:00Z"
             .parse::<chrono::DateTime<chrono::Utc>>()
@@ -2502,7 +2568,7 @@ mod tests {
             .witness_verdicts_for_conversations(&conversation_ids)
             .is_err());
 
-        let ancestry_revoked = signals.extend(&storage, &["conv-fts".to_string()], true);
+        let ancestry_revoked = signals.extend(&storage, &["conv-fts".to_string()], true, true);
         assert!(ancestry_revoked);
         assert!(
             signals.ancestry.is_empty(),
@@ -2529,7 +2595,7 @@ mod tests {
         assert!(ancestry_score < actual);
         assert_eq!(actual.to_bits(), expected.to_bits());
 
-        let failed_initial = CandidateSignals::load(&storage, &conversation_ids, true);
+        let failed_initial = CandidateSignals::load(&storage, &conversation_ids, true, true);
         assert!(failed_initial.validity.is_empty());
         assert!(failed_initial.ancestry.is_empty());
     }
@@ -2710,7 +2776,7 @@ mod tests {
             .unwrap();
         let out = resolve_validity_with(&storage, &["conv-1".to_string()], false);
         assert!(out.is_empty());
-        let signals = CandidateSignals::load(&storage, &["conv-1".to_string()], false);
+        let signals = CandidateSignals::load(&storage, &["conv-1".to_string()], false, false);
         assert!(signals.validity.is_empty());
         assert!(
             signals.ancestry.is_empty(),
@@ -2875,6 +2941,299 @@ mod tests {
             "kill switch: original order preserved, nothing demoted/annotated"
         );
         assert!(enriched_off.iter().all(|e| e.resolution.is_none()));
+    }
+
+    /// Shared synthetic-DB builder for the dream-consumption tests below: ONE
+    /// Demote-channel conversation (`conv-demoted`, `AnchorObsolete` — no ledger
+    /// row at the observed HEAD oid, so the symbol is "truly gone"; same shape
+    /// as `synthetic_db_demoted_symbol_partitions_end_to_end`'s fixture above,
+    /// inlined here so this fixture is self-contained), ONE Annotate-channel
+    /// conversation (`conv-annotated`, `SupersededBy` A->B evolution — same
+    /// shape as `chunk_binding::a_b_evolution_yields_annotate_not_demote`, so
+    /// the symbol IS intact at HEAD), and a release-ancestry cache row for a
+    /// THIRD, otherwise-untouched conversation (`conv-ancestry`) proving
+    /// ancestry loads independently of whichever verdict channel is present.
+    /// `synthetic_db_demoted_symbol_partitions_end_to_end` above is left
+    /// untouched on purpose (predates `CSR_DREAM_CONSUMPTION`, drives
+    /// `resolve_validity_with` directly by parameter, bypasses the new gate
+    /// entirely — zero edits needed, must keep passing byte-for-byte).
+    fn dream_consumption_fixture() -> (Arc<Storage>, Vec<EnrichedResult>) {
+        use crate::storage::codegraph::{upsert_node, NodeRow};
+        use crate::storage::witness_ledger::{self, WitnessLedgerRow};
+        use crate::storage::witness_verdicts::{self, VerdictKind, WitnessVerdictRow};
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        storage
+            .with_connection(|conn| {
+                // conv-demoted / old_fn: single ledger row, no HEAD-oid row —
+                // Demote channel.
+                upsert_node(
+                    conn,
+                    &NodeRow {
+                        id: crate::extraction::codegraph::node_id(
+                            "proj",
+                            "/repo/src/lib.rs",
+                            "function",
+                            "old_fn",
+                        ),
+                        repo: "proj".into(),
+                        project: "proj".into(),
+                        file: "/repo/src/lib.rs".into(),
+                        lang: "rust".into(),
+                        kind: "function".into(),
+                        name: "old_fn".into(),
+                        fqname: String::new(),
+                        body_hash: String::new(),
+                        span_start: 1,
+                        span_end: 3,
+                        first_conv_id: "conv-demoted".into(),
+                        last_conv_id: "conv-demoted".into(),
+                        last_session_id: "sess".into(),
+                        repo_root: None,
+                        name_only: false,
+                        attribution: String::new(),
+                    },
+                )?;
+                witness_ledger::insert_witness(
+                    conn,
+                    &WitnessLedgerRow {
+                        id: 0,
+                        project: "proj".into(),
+                        file: "/repo/src/lib.rs".into(),
+                        symbol: Some("old_fn".into()),
+                        span_start: Some(1),
+                        span_end: Some(3),
+                        stamp: "b3:1".into(),
+                        tier: "committed".into(),
+                        at_oid: Some("aaa".into()),
+                        source_kind: "backfill".into(),
+                        source_id: Some("aaa".into()),
+                    },
+                )?;
+                let old_wid = witness_ledger::latest_witness_for_symbol(
+                    conn,
+                    "proj",
+                    "/repo/src/lib.rs",
+                    Some("old_fn"),
+                )?
+                .unwrap()
+                .id;
+                witness_verdicts::insert_verdict_if_changed(
+                    conn,
+                    &WitnessVerdictRow {
+                        witness_id: old_wid,
+                        verdict: VerdictKind::AnchorObsolete,
+                        successor_witness_id: None,
+                        receipt_oid: Some("deadbeef00".into()),
+                        observed_head_oid: "deadbeef00".into(),
+                    },
+                )?;
+
+                // conv-annotated / evolved_fn: two ledger rows (aaa2 -> bbb),
+                // the second AT the observed HEAD oid — Annotate channel.
+                upsert_node(
+                    conn,
+                    &NodeRow {
+                        id: crate::extraction::codegraph::node_id(
+                            "proj",
+                            "/repo/src/evolved.rs",
+                            "function",
+                            "evolved_fn",
+                        ),
+                        repo: "proj".into(),
+                        project: "proj".into(),
+                        file: "/repo/src/evolved.rs".into(),
+                        lang: "rust".into(),
+                        kind: "function".into(),
+                        name: "evolved_fn".into(),
+                        fqname: String::new(),
+                        body_hash: String::new(),
+                        span_start: 1,
+                        span_end: 3,
+                        first_conv_id: "conv-annotated".into(),
+                        last_conv_id: "conv-annotated".into(),
+                        last_session_id: "sess".into(),
+                        repo_root: None,
+                        name_only: false,
+                        attribution: String::new(),
+                    },
+                )?;
+                witness_ledger::insert_witness(
+                    conn,
+                    &WitnessLedgerRow {
+                        id: 0,
+                        project: "proj".into(),
+                        file: "/repo/src/evolved.rs".into(),
+                        symbol: Some("evolved_fn".into()),
+                        span_start: Some(1),
+                        span_end: Some(3),
+                        stamp: "b3:A".into(),
+                        tier: "committed".into(),
+                        at_oid: Some("aaa2".into()),
+                        source_kind: "backfill".into(),
+                        source_id: Some("aaa2".into()),
+                    },
+                )?;
+                witness_ledger::insert_witness(
+                    conn,
+                    &WitnessLedgerRow {
+                        id: 0,
+                        project: "proj".into(),
+                        file: "/repo/src/evolved.rs".into(),
+                        symbol: Some("evolved_fn".into()),
+                        span_start: Some(1),
+                        span_end: Some(3),
+                        stamp: "b3:B".into(),
+                        tier: "committed".into(),
+                        at_oid: Some("bbb".into()),
+                        source_kind: "backfill".into(),
+                        source_id: Some("bbb".into()),
+                    },
+                )?;
+                let a_wid: i64 = conn.query_row(
+                    "SELECT id FROM witness_ledger WHERE at_oid = 'aaa2'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let b_wid: i64 = conn.query_row(
+                    "SELECT id FROM witness_ledger WHERE at_oid = 'bbb'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                witness_verdicts::insert_verdict_if_changed(
+                    conn,
+                    &WitnessVerdictRow {
+                        witness_id: a_wid,
+                        verdict: VerdictKind::SupersededBy,
+                        successor_witness_id: Some(b_wid),
+                        receipt_oid: Some("bbb".into()),
+                        observed_head_oid: "bbb".into(),
+                    },
+                )?;
+
+                // conv-ancestry: an independent release-ancestry cache row
+                // with NO witness verdict at all — proves ancestry loads
+                // regardless of dream-consumption state.
+                let refreshed_at = chrono::Utc::now().to_rfc3339();
+                conn.execute(
+                    "INSERT INTO conversation_ancestry_cache
+                     (conversation_id, state, release_tag, releases_behind, repository, refreshed_at)
+                     VALUES ('conv-ancestry', 'shipped', 'v1.0.0', 3, '/repo', ?1)",
+                    [&refreshed_at],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let enriched = vec![
+            enriched_result_conv("stale", "conv-demoted", 0.95, 0),
+            enriched_result_conv("evolved", "conv-annotated", 0.92, 1),
+            enriched_result_conv("valid-1", "conv-clean-1", 0.90, 2),
+            enriched_result_conv("valid-2", "conv-clean-2", 0.80, 3),
+        ];
+        (storage, enriched)
+    }
+
+    #[test]
+    fn dream_consumption_off_never_queries_witness_verdicts_but_preserves_ancestry() {
+        // The regression this proves: `CandidateSignals::load`'s ancestry gate
+        // (`ancestry_enabled`, the pre-existing `CSR_NO_VALIDITY_PARTITION` kill
+        // switch) must stay independent from the NEW dream-consumption gate
+        // (`consumption_enabled`) — exactly the bug the rejected first T2
+        // attempt shipped by folding both into one boolean. Proven two ways:
+        // (1) dropping `witness_verdicts` entirely and confirming `load` still
+        // succeeds (never touches the table when consumption is off — not just
+        // "happens to return an empty result the same way an error would");
+        // (2) the release-ancestry cache row for `conv-ancestry` still loads.
+        let (storage, _enriched) = dream_consumption_fixture();
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch("DROP TABLE witness_verdicts")?;
+                Ok(())
+            })
+            .unwrap();
+
+        let ids = vec![
+            "conv-demoted".to_string(),
+            "conv-annotated".to_string(),
+            "conv-ancestry".to_string(),
+        ];
+        let consumption_enabled = dream_consumption_enabled_from(None);
+        assert!(!consumption_enabled, "default must be OFF");
+
+        let signals = CandidateSignals::load(&storage, &ids, true, consumption_enabled);
+        assert!(
+            signals.validity.is_empty(),
+            "no witness_verdicts query means no verdict can have been read"
+        );
+        assert!(
+            signals.ancestry.contains_key("conv-ancestry"),
+            "ancestry must load even though witness_verdicts is gone and consumption \
+             is off — the two signals are independent"
+        );
+        assert!(signals.ancestry_allowed);
+    }
+
+    #[test]
+    fn dream_consumption_off_by_default_suppresses_all_verdict_text_end_to_end() {
+        let (storage, mut enriched) = dream_consumption_fixture();
+        let conv_ids = distinct_conversation_ids(&enriched);
+
+        let consumption_enabled = dream_consumption_enabled_from(None);
+        assert!(!consumption_enabled, "default must be OFF");
+
+        let signals = CandidateSignals::load(&storage, &conv_ids, true, consumption_enabled);
+        assert!(signals.validity.is_empty());
+
+        apply_validity_partition(&mut enriched, &signals.validity, false);
+        let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["stale", "evolved", "valid-1", "valid-2"],
+            "dream consumption OFF: original score order preserved, nothing demoted \
+             or annotated"
+        );
+        assert!(
+            enriched.iter().all(|e| e.resolution.is_none()),
+            "no [stale anchor]/[evolved] text may render when consumption is off"
+        );
+    }
+
+    #[test]
+    fn dream_consumption_on_reproduces_demote_and_annotate_channels_byte_for_byte() {
+        let (storage, mut enriched) = dream_consumption_fixture();
+        let conv_ids = distinct_conversation_ids(&enriched);
+
+        let consumption_enabled = dream_consumption_enabled_from(Some("1"));
+        assert!(consumption_enabled);
+
+        let signals = CandidateSignals::load(&storage, &conv_ids, true, consumption_enabled);
+        assert!(is_demote_channel(&signals.validity, "conv-demoted"));
+        assert!(!is_demote_channel(&signals.validity, "conv-annotated"));
+        assert!(
+            signals.validity.contains_key("conv-annotated"),
+            "the Annotate channel must still be present in the map, just not demoted"
+        );
+        assert!(!is_demote_channel(&signals.validity, "conv-clean-1"));
+        assert!(!is_demote_channel(&signals.validity, "conv-clean-2"));
+
+        apply_validity_partition(&mut enriched, &signals.validity, false);
+        let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["evolved", "valid-1", "valid-2", "stale"],
+            "Demote sinks below everything; Annotate stays in place"
+        );
+        assert_eq!(
+            enriched[0].resolution.as_deref(),
+            Some("[evolved] evolved_fn changed since this conversation (as of bbb)")
+        );
+        assert!(enriched[1].resolution.is_none());
+        assert!(enriched[2].resolution.is_none());
+        assert_eq!(
+            enriched[3].resolution.as_deref(),
+            Some("[stale anchor] old_fn no longer in current code (receipt deadbee)")
+        );
     }
 
     #[test]
@@ -3266,6 +3625,7 @@ mod tests {
             Some("all"),
             0,
             true,
+            true,
             false,
         )
         .await
@@ -3322,6 +3682,7 @@ mod tests {
             0.1,
             Some("all"),
             0,
+            true,
             true,
             false,
         )
@@ -3383,6 +3744,7 @@ mod tests {
             Some("all"),
             0,
             true,
+            true,
             false,
         )
         .await
@@ -3413,6 +3775,7 @@ mod tests {
             0.1,
             Some("all"),
             0,
+            true,
             true,
             true,
         )
@@ -3457,6 +3820,7 @@ mod tests {
             0.1,
             Some("all"),
             0,
+            true,
             true,
             true,
         )
@@ -3570,6 +3934,7 @@ mod tests {
             Some("all"),
             0,
             true,
+            true,
             false,
         )
         .await
@@ -3603,6 +3968,7 @@ mod tests {
             Some("all"),
             0,
             true,
+            true,
             false,
         )
         .await
@@ -3627,6 +3993,7 @@ mod tests {
             0.3,
             Some("all"),
             0,
+            false,
             false,
             false,
         )
@@ -3718,6 +4085,7 @@ mod tests {
             Some("all"),
             0,
             true,
+            true,
             false,
         )
         .await
@@ -3801,6 +4169,7 @@ mod tests {
             0.3,
             Some("all"),
             0,
+            true,
             true,
             false,
         )

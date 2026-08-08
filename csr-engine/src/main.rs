@@ -532,7 +532,22 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         let stats = csr_engine::dream::run_dream(&eng, repo.as_deref(), dry_run)?;
-        print!("{}", stats.format_text(dry_run));
+        // v10.1: CSR_DREAM_CONSUMPTION default OFF. The cycle still runs and
+        // the witness ledger still updates for real either way — this
+        // switch is about consumption/exposure, not about whether dreaming
+        // happens — but the verdict-derived summary text (obsolete/
+        // superseded/reinstated counts, events written) must not print
+        // unless explicitly opted in, same shared switch as
+        // mcp::tools/status/dream::report.
+        if csr_engine::storage::recap_feeds::dream_consumption_enabled() {
+            print!("{}", stats.format_text(dry_run));
+        } else {
+            let mode = if dry_run { " (dry-run)" } else { "" };
+            println!(
+                "CSR dream{mode}: cycle complete — verdict summary suppressed (opt in \
+                 with CSR_DREAM_CONSUMPTION=1); witness ledger updated regardless."
+            );
+        }
         return Ok(());
     }
 

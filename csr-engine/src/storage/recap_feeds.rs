@@ -12,6 +12,27 @@ use crate::hooks::recap::{RetiredLine, SettledFact};
 const LEDGER_FEED_LIMIT: i64 = 5;
 const RETIRED_FEED_LIMIT: i64 = 3;
 
+/// `CSR_DREAM_CONSUMPTION=1` opts a user IN to v10 witness-ledger dream
+/// verdicts reaching them at all. Default OFF ships the witness ledger as
+/// experimental derived data: unless explicitly opted in, no dream verdict
+/// may demote/annotate search results (see `mcp::tools`'s validity
+/// partition) or populate the recap "Learnt-then-retired while away:"
+/// clause below. Pure parsing seam (mirrors `active_forgetting_enabled_from`
+/// in `mcp::tools`) — the ONE place this parser is defined; `mcp::tools`
+/// imports it from here so the two consumers can never diverge on ON/OFF
+/// semantics. Only the exact value `1` enables it.
+pub fn dream_consumption_enabled_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Reads `CSR_DREAM_CONSUMPTION` from the real process env. Real callers
+/// use this; tests drive `dream_consumption_enabled_from` or the `_with`
+/// seams below directly by parameter instead, to avoid mutating shared
+/// process state under cargo's parallel test runner.
+pub fn dream_consumption_enabled() -> bool {
+    dream_consumption_enabled_from(std::env::var("CSR_DREAM_CONSUMPTION").ok().as_deref())
+}
+
 static RECEIPT_OID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)(?:\b(?:receipt(?:_oid)?|commit|oid|sha(?:-?1)?|verified\s+at)(?:\s*[:=#]\s*|\s+)([0-9a-f]{7,40})\b|\b([0-9a-f]{7,40})\b\s+--|\b([0-9a-f]{40})\b|^([0-9a-f]{7,40})$)",
@@ -117,7 +138,32 @@ impl Storage {
 
     /// Negative dream verdicts recorded strictly after `since_ts`, scoped by
     /// the project carried directly on their witness ledger rows.
+    /// `CSR_DREAM_CONSUMPTION` (default OFF — see `dream_consumption_enabled`)
+    /// gates this feed: ships the witness ledger as experimental derived
+    /// data, so the "Learnt-then-retired while away:" recap clause never
+    /// reaches a user who hasn't explicitly opted in.
     pub fn recap_retired_since(&self, project: &str, since_ts: &str) -> Result<Vec<RetiredLine>> {
+        self.recap_retired_since_with(project, since_ts, dream_consumption_enabled())
+    }
+
+    /// Core of [`recap_retired_since`] with the dream-consumption opt-in
+    /// passed in as a parameter — mirrors `active_forgetting_enabled_from`'s
+    /// pattern in `mcp::tools` (tests drive this directly instead of
+    /// mutating the process env). `consumption_enabled = false` returns an
+    /// empty vector WITHOUT ever touching `witness_verdicts` (the early
+    /// return below is before the connection lock and the query) — the
+    /// recap composer already drops the "Learnt-then-retired while away:"
+    /// clause when its feed is empty, so no composer/grammar change is
+    /// needed anywhere.
+    pub fn recap_retired_since_with(
+        &self,
+        project: &str,
+        since_ts: &str,
+        consumption_enabled: bool,
+    ) -> Result<Vec<RetiredLine>> {
+        if !consumption_enabled {
+            return Ok(Vec::new());
+        }
         let conn = self
             .conn
             .lock()
@@ -444,7 +490,7 @@ mod tests {
         }
 
         let retired = storage
-            .recap_retired_since("alpha", "2026-08-01T00:00:00Z")
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", true)
             .unwrap();
 
         assert_eq!(retired.len(), 3);
@@ -471,7 +517,7 @@ mod tests {
         );
 
         let retired = storage
-            .recap_retired_since("alpha", "2026-08-02T00:00:00Z")
+            .recap_retired_since_with("alpha", "2026-08-02T00:00:00Z", true)
             .unwrap();
 
         assert_eq!(retired.len(), 1);
@@ -492,7 +538,7 @@ mod tests {
         );
 
         let retired = storage
-            .recap_retired_since("alpha", "2026-08-02T00:00:00.100Z")
+            .recap_retired_since_with("alpha", "2026-08-02T00:00:00.100Z", true)
             .unwrap();
 
         assert_eq!(retired.len(), 1);
@@ -522,10 +568,123 @@ mod tests {
         );
 
         let retired = storage
-            .recap_retired_since("alpha", "2026-08-01T00:00:00Z")
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", true)
             .unwrap();
 
         assert_eq!(retired[0].label, "newer_by_time");
+    }
+
+    #[test]
+    fn dream_consumption_parsing_is_opt_in_only() {
+        assert!(dream_consumption_enabled_from(Some("1")));
+        for value in [None, Some("0"), Some("true"), Some("yes"), Some("")] {
+            assert!(
+                !dream_consumption_enabled_from(value),
+                "value {value:?} must leave dream consumption off"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_feed_off_returns_empty_without_touching_witness_verdicts() {
+        let storage = Storage::open_memory().unwrap();
+        seed_witness_verdict(
+            &storage,
+            "alpha",
+            "/repo/src/file.rs",
+            Some("retired_symbol"),
+            "anchor_obsolete",
+            "abcdef1",
+            "2026-08-05T00:00:00Z",
+        );
+
+        let retired = storage
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", false)
+            .unwrap();
+
+        assert!(
+            retired.is_empty(),
+            "CSR_DREAM_CONSUMPTION default OFF must suppress the feed even \
+             with a populated witness_verdicts table"
+        );
+    }
+
+    #[test]
+    fn retired_feed_off_never_queries_witness_verdicts_table_at_all() {
+        // Stronger than the sibling test above: proves the query itself never
+        // fires, not just that its result happens to be empty. If
+        // `recap_retired_since_with(..., false)` executed the real query
+        // against a DB missing `witness_verdicts` entirely, it would return
+        // `Err`, not `Ok(vec![])` — the early return in the function must
+        // land before the connection lock / query, exactly as documented.
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch("DROP TABLE witness_verdicts")?;
+                Ok(())
+            })
+            .unwrap();
+
+        let retired = storage
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", false)
+            .unwrap();
+        assert!(retired.is_empty());
+    }
+
+    #[test]
+    fn retired_feed_off_empties_the_composer_clause_with_no_grammar_change() {
+        use crate::hooks::recap::{compose_recap, RecapFeeds};
+        use crate::hooks::stop::Episode;
+
+        let storage = Storage::open_memory().unwrap();
+        seed_witness_verdict(
+            &storage,
+            "alpha",
+            "/repo/src/file.rs",
+            Some("retired_symbol"),
+            "anchor_obsolete",
+            "abcdef1",
+            "2026-08-05T00:00:00Z",
+        );
+        let retired_while_away = storage
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", false)
+            .unwrap();
+        assert!(retired_while_away.is_empty());
+
+        let ep = Episode {
+            schema: "session_episode/v2".into(),
+            session_id: "session-1".into(),
+            project: "alpha".into(),
+            timestamp: "2026-08-07T10:00:00Z".into(),
+            request: "Fix the recap composer".into(),
+            investigated: vec![],
+            completed: "Implemented deterministic recap output".into(),
+            next_steps: None,
+            blockers: None,
+            outcome: "partial".into(),
+            error_signatures: vec![],
+            tools_used: vec![],
+            files_modified: vec![],
+            message_count: 4,
+            duration_minutes: 12,
+            todos: vec![],
+            approved_plan: None,
+            prev_episode_id: None,
+            anchors: vec![],
+        };
+        let feeds = RecapFeeds {
+            settled: vec![],
+            still_open: vec![],
+            retired_while_away,
+            open_proposals: 0,
+        };
+
+        let got = compose_recap(&ep, &feeds, "1h ago").unwrap();
+        assert!(
+            !got.contains("Learnt-then-retired while away:"),
+            "clause must drop when its feed is empty (composer grammar \
+             untouched): {got}"
+        );
     }
 
     #[test]
