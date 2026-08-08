@@ -27,15 +27,15 @@ csr-engine (44MB)
 | `~/.claude/history.jsonl` | daemon (10min) | `session_registry` spine — never embedded/injected; coverage in `status` |
 | memories / paste-cache | NOT indexed | circularity / privacy — deliberate non-goals |
 
-`aux_schema_miss:*` counters in `csr-engine status` flag adapter parse failures — check them when Claude Code renames internal formats (TodoWrite→TaskCreate precedent). All reflection-producing pipelines share one sanitizer that suppresses CSR's own tool payloads and hook-injected blocks (`csr_tool_blocks_suppressed` + `csr_hook_wrappers_scrubbed` in status) — the self-contamination loop closed in v10.
+`aux_schema_miss:*` counters in `csr-engine status` flag adapter parse failures — check them when Claude Code renames internal formats (TodoWrite→TaskCreate precedent). All reflection-producing pipelines share one sanitizer that suppresses CSR's own tool payloads and hook-injected blocks (`csr_tool_blocks_suppressed` + `csr_hook_wrappers_scrubbed` in status) — v10 stops new self-contamination escapes going forward; it does not retroactively clean the corpus. 747 historical conversations remain self-contaminated (known open debt, see CHANGELOG.md's "Known unproven in this release").
 
 ## Dreaming (v10)
 
-Evidence-grounded forgetting: append-only `witness_ledger` (span-level BLAKE3 stamps at commit OIDs) + `witness_generations` publication manifests; deterministic abstention-first verdicts (no LLM); demote+annotate consumption (`[stale anchor]`/`[evolved]` with commit receipts in search). Daemon dream cadence 6h (`CSR_DREAM_INTERVAL_SECS` override), kill switch `CSR_NO_DREAMING=1`; TAD v2 decays by release ancestry (`conversation_ancestry_cache`, hourly refresh, fail-open to neutral). Benchmark: `codewitness labels` + `codewitness bench` (eval-kit/t4) — deterministic, provenance-stamped. Supersession receipts carry their basis (`GraphOrdered` vs `ContentOnly`) — a squash/rebase successor is never read as graph-proven.
+Evidence-grounded forgetting: append-preferring event log (`witness_ledger` — no SQL trigger enforces immutability; span-level BLAKE3 stamps at commit OIDs) + `witness_generations` publication manifests; deterministic abstention-first verdicts (no LLM); demote+annotate consumption gated behind `CSR_DREAM_CONSUMPTION=1` (opt-in, off by default — this one flag gates all verdict consumption, not just demote; no demote-only switch exists), `[stale anchor]`/`[evolved]` with commit receipts in search when enabled. Daemon dream cadence 6h (`CSR_DREAM_INTERVAL_SECS` override), kill switch `CSR_NO_DREAMING=1`; TAD v2 decays by release ancestry (`conversation_ancestry_cache`, hourly refresh, fail-open to neutral). Benchmark: `codewitness labels` + `codewitness bench` (eval-kit/t4) — deterministic and provenance-stamped, but it does not execute the production dream algorithm (`dream::find_successor`); it predicts from sampled tag maps only. Supersession receipts carry their basis (`GraphOrdered` vs `ContentOnly`) — a squash/rebase successor's receipt is labeled `ContentOnly`, not presented as graph-proven. Dogfood corpus: 482 anchors observed at 2 HEAD commits — existence evidence, not accuracy.
 
 ## Recap (v10.1)
 
-SessionStart injects one causal paragraph instead of the fragment pile: `recap [<age>]: <intent>: <completed>. Settled: <claim> (<receipt>). Now: <blockers|still-open|proposals|todos>. Learnt-then-retired while away: <label> (superseded <date>, <oid>). Next: <evidenced next step>.` Composer `src/hooks/recap.rs` + feeds `src/storage/recap_feeds.rs`, zero LLM. Every clause drops independently without evidence; `Next:` is never fabricated; receipts mandatory. Feeds fail open to the byte-identical fragment fallback. Suppressed from re-import by exact emitted grammar in `provenance::is_csr_emission` (the self-contamination guard). Kill switch `CSR_NO_RECAP=1`.
+SessionStart injects one causal paragraph instead of the fragment pile: `recap [<age>]: <intent>: <completed>. Settled: <claim> (<receipt>). Now: <blockers|still-open|proposals|todos>. Learnt-then-retired while away: <label> (superseded <date>, <oid>). Next: <evidenced next step>.` Composer `src/hooks/recap.rs` + feeds `src/storage/recap_feeds.rs`, zero LLM. Every clause drops independently without evidence; `Next:` is never fabricated; receipts mandatory. Feeds fail open to the byte-identical fragment fallback. Suppressed from re-import via a machine-owned sentinel (`RECAP_SENTINEL`) checked in `provenance::is_csr_emission` before quote-stripping — this stops new recap output from re-entering the corpus; it does not clean transcripts already embedded (747 conversations, known open debt). Kill switch `CSR_NO_RECAP=1`.
 
 ## Key Commands
 
@@ -85,7 +85,7 @@ csr_resolve           — Record verified verdicts (resolved/still_open/regresse
 # Build
 cd csr-engine && cargo build --release
 
-# Test (615 unit + 45 hooks integration + 61 integration)
+# Test suite — 1150+ lib tests (verified at commit ff4ad3f), plus separate hooks and integration suites
 cargo test
 cargo test --test hooks_integration
 cargo test --test integration

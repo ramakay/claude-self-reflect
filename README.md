@@ -15,7 +15,7 @@ Single 44MB binary. No databases. No containers. No API keys required.
 > **v9.4 — Multi-Source Memory**
 > CSR now remembers more than transcripts: task outcomes, plan documents, and a cross-project session registry — each absorbed at the lifecycle stage it belongs to.
 > Episodes carry real task state again (Claude Code's TodoWrite→TaskCreate rename had silently emptied them — found, fixed, and guarded with schema-miss telemetry).
-> Sub-millisecond search, ~150ms cached startup, 720+ tests, zero external dependencies.
+> Sub-millisecond search, ~150ms cached startup, 1150+ tests (lib, verified at commit ff4ad3f), zero external dependencies.
 > [Release notes](https://github.com/ramakay/claude-self-reflect/releases/tag/v9.4.0)
 
 <img src="docs-site/public/images/csr-demo.gif" alt="CSR Demo — Setup, Search, and Hooks" width="800" />
@@ -46,7 +46,7 @@ Single 44MB binary. No databases. No containers. No API keys required.
 
 Claude starts fresh every session. Solutions you found, architectures you designed, bugs you debugged — all gone.
 
-Context retention drops below **20% after 10 sessions**. CSR fixes this with a single binary that gives Claude perfect memory.
+Context retention drops below **20% after 10 sessions**. CSR fixes this with a single binary that gives Claude durable, searchable memory of past sessions — not perfect recall, but structured retrieval with evidence-gated forgetting instead of a hard reset every session.
 
 No special syntax. No commands. Install once, and past context appears automatically when you need it.
 

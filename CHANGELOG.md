@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Dreaming and recap: memory that forgets on evidence and hands back one paragraph
 
-v10 folds into a single release. Two halves: the engine now retires its own
-claims when the code they described moves, and the session opens with one
-causal paragraph instead of a pile of fragments. 10.0.0 was never published —
-everything below ships together as 10.1.0.
+v10 folds into a single release. Two halves: the engine now generates
+deterministic supersession verdicts when the code an anchor described moves —
+consumption ships disabled by default and verdict accuracy is unproven (482
+anchors observed at 2 HEAD commits — existence evidence, not accuracy) — and
+the session opens with one causal paragraph instead of a pile of fragments.
+10.0.0 was never published — everything below ships together as 10.1.0.
 
 #### Recap at SessionStart (headline)
 
@@ -32,8 +34,12 @@ Next: <evidenced next step>.
   missing. `Next:` is never invented. Punctuation-only sentinels never become
   claims.
 - Receipts mandatory: a settled claim without a commit receipt is not emitted.
-- No self-contamination: emitted recaps re-enter the corpus through the
-  transcript, so the extraction sanitizer recognises the exact emitted grammar.
+- Self-contamination mitigation, not closure: emitted recaps carry a
+  machine-owned sentinel (`RECAP_SENTINEL`) that the extraction sanitizer
+  checks before quote-stripping, closing known bypass classes (bullet
+  prefix, blockquote, HTML wrapping, zero-width injection) for newly
+  emitted recaps specifically. This does not retroactively clean transcripts
+  already in the corpus — see "Known unproven in this release" below.
 - Feed errors fail open to the previous fragment output, byte for byte.
 - Kill switch: `CSR_NO_RECAP=1`.
 
@@ -46,33 +52,52 @@ context on resume; this fills the model-facing half.
   stamps pinned to commit OIDs, audited as intact, drifted, vanished, or
   explicitly superseded. Causal ordering via git ancestry, no LLM and no
   timestamps on the verdict path. Operational failures stay errors and never
-  collapse into verdicts. Every supersession receipt now records whether its
+  collapse into verdicts. Every supersession receipt records whether its
   basis was graph ordering (`GraphOrdered`) or content re-derivation alone
-  (`ContentOnly`), so a squash/rebase successor is never mistaken for a
-  graph-proven one.
-- **Witness ledger.** Append-only `witness_ledger` plus `witness_generations`
-  publication manifests; `codegraph stamp-spans --at <rev>` mints witnesses at
-  historical revisions.
+  (`ContentOnly`) — the field records the provenance of the match, not a
+  correctness guarantee; a squash/rebase successor's receipt is labeled
+  `ContentOnly`, not presented as graph-proven.
+- **Witness ledger.** Append-preferring event log (`witness_ledger` — no SQL
+  trigger enforces immutability) plus `witness_generations` publication
+  manifests; `codegraph stamp-spans --at <rev>` mints witnesses at historical
+  revisions.
 - **Deterministic supersession verdicts.** Successor join, event ledger, and
   two-channel consumption — demote and annotate rather than delete, with
   `[stale anchor]` / `[evolved]` markers carrying commit receipts into search
-  results.
-- **Validity partition in rerank**, consuming dream verdicts; active forgetting
-  applies accelerated decay to demoted symbols.
+  results, when consumption is enabled.
+- **Consumption is opt-in and ships disabled by default.** Set
+  `CSR_DREAM_CONSUMPTION=1` to let verdicts reach rerank, search-result
+  annotations, and the recap "Learnt-then-retired" clause. This one flag
+  gates all verdict consumption — there is no separate demote-only switch —
+  and the demote channel specifically is unmeasured (see "Known unproven in
+  this release" below).
+- **Validity partition in rerank** consumes dream verdicts once
+  `CSR_DREAM_CONSUMPTION=1` is set; active forgetting applies accelerated
+  decay to demoted symbols under the same gate.
 - **Daemon dream cadence** (6h, `CSR_DREAM_INTERVAL_SECS`, kill switch
   `CSR_NO_DREAMING=1`), dream summary in the telemetry dashboard, and
   `--report` HTML journal.
 - **T4 benchmark**, ported into `codewitness labels` / `codewitness bench` —
-  deterministic and provenance-stamped. H1 rematch on the corrected extractor:
-  1.000 / 1.000 over 13,626 beliefs.
+  deterministic and provenance-stamped, but it does not execute the
+  production dream algorithm (`dream::find_successor`); it predicts
+  staleness from sampled tag maps and scores against ground truth derived
+  from the final tag. H1 rematch on the corrected extractor: 1.000 / 1.000
+  over 13,626 beliefs — recall is 1.0 by construction for this rule, not a
+  measured result; the corpus contains zero revert commits, so precision
+  1.000 is unfalsified, not proven. Full derivation and caveats:
+  `csr-engine/eval-kit/t4/README.md`.
 
 #### Search and corpus
 
 - **TAD v2**: temporal decay driven by release ancestry rather than wall-clock
   age, with an hourly ancestry cache that fails open to neutral.
-- **Self-contamination closed**: the importer no longer indexes CSR's own tool
-  output. Counters for suppressed blocks and scrubbed hook wrappers appear in
-  `status`.
+- **Self-contamination: no new escapes, not a closed loop.** The importer
+  suppresses CSR's own tool output and hook-injected blocks going forward,
+  including a machine-owned sentinel for newly emitted recaps. This does
+  not retroactively clean what is already embedded — 747 historical
+  conversations remain self-contaminated (see "Known unproven in this
+  release" below). Counters for suppressed blocks and scrubbed hook
+  wrappers appear in `status`.
 - **Corpus expansion**: sidechain attribution (real project and parent session
   recovered from provenance) and an optional Codex rollout adapter.
 - `reflect_on_past` sinks resolved chunks before the limit cut, so stale chunks
@@ -100,6 +125,28 @@ context on resume; this fills the model-facing half.
   spawning git — git exports those to hook subprocesses, which hijacked the
   tests' temp repositories and made seven of them fail only when run from inside
   `git commit`.
+
+#### Known unproven in this release
+
+- **Verdict quality is existence data, not accuracy data.** The dogfood
+  corpus shows 482 anchors observed at 2 HEAD commits — existence evidence,
+  not accuracy. No independent ground truth scores these verdicts as
+  correct or incorrect.
+- **Revert precision is unfalsified, not proven.** The T4 benchmark corpus
+  behind the recall/precision figures above contains zero revert commits,
+  so the confusion-matrix cell that would catch a false supersession has
+  never been exercised.
+- **The demote channel is unmeasured, and consumption ships disabled by
+  default.** `CSR_DREAM_CONSUMPTION` is opt-in and off by default; with it
+  unset, no verdict reaches rerank, search annotations, or the recap
+  clause. There is no separate demote-only switch.
+- **CRLF / Windows stamp divergence is untested.** Span stamping has not
+  been verified across line-ending or `.gitattributes` filter differences.
+- **Multi-repo witness attribution is unrecorded.** The witness ledger does
+  not currently record which repository a witness belongs to.
+- **747 historical conversations remain self-contaminated.** The recap
+  sentinel prevents new escapes for newly emitted recaps; it does not
+  retroactively clean transcripts that already carry CSR's own tool output.
 
 ## [9.5.0] - 2026-08-03
 
