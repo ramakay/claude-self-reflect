@@ -8,7 +8,7 @@
 //! `code_graph_file_state`, `code_node_rank`). This module owns the queries.
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// A graph node row (a symbol seen in code). Used for both writes and reads.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -717,6 +717,25 @@ pub fn code_node_files_missing_repo_root(conn: &Connection) -> Result<Vec<String
         .map_err(Into::into)
 }
 
+/// The `repo_root` already stored on ANY `code_nodes` row for `file` —
+/// mirrors `import::backfill::stamp_spans_into`'s own resolution preference
+/// (prefer a value already on the node) so `dream`'s successor join
+/// resolves the identical repo for a file without duplicating the stamping
+/// pass's own per-node lookup. `None` when no row for `file` has a
+/// `repo_root` yet (caller falls back to
+/// `extraction::repo_root::repo_root_for_file`, exactly like
+/// `stamp_spans_into` does).
+pub fn stored_repo_root_for_file(conn: &Connection, file: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT repo_root FROM code_nodes WHERE file = ?1 AND repo_root IS NOT NULL
+         ORDER BY id LIMIT 1",
+        params![file],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Set `repo_root` on every `code_nodes` row matching `file` that is
 /// currently NULL. Never overwrites an already-resolved value (idempotent,
 /// re-runnable). Returns the number of rows changed.
@@ -738,6 +757,50 @@ pub fn all_nodes(conn: &Connection) -> Result<Vec<NodeRow>> {
     let rows = stmt.query_map([], row_to_node)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// Every non-module `code_nodes` row attributed (via `first_conv_id` OR
+/// `last_conv_id` — the direct conversation<->symbol link the code graph
+/// carries; see `storage::chunk_binding`'s module doc) to one of
+/// `conversation_ids`. Feeds v10 "dreaming" chunk binding: a search result's
+/// conversation ids resolve to the `(project, file, name)` symbols that
+/// conversation introduced or last touched, which chunk binding then tries
+/// to join against `witness_ledger`.
+///
+/// Batched ≤400 ids per statement (two `IN` lists per batch, so this stays
+/// well under `SQLITE_MAX_VARIABLE_NUMBER` — same reasoning as
+/// `queries::known_session_ids`). Uses `idx_code_nodes_first_conv` /
+/// `idx_code_nodes_last_conv` (see `migrations::run`) — a full scan of
+/// `code_nodes` would otherwise be paid on every search.
+pub fn nodes_for_conversations(
+    conn: &Connection,
+    conversation_ids: &[String],
+) -> Result<Vec<NodeRow>> {
+    if conversation_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    const BATCH: usize = 400;
+    let mut out = Vec::new();
+    for batch in conversation_ids.chunks(BATCH) {
+        let placeholders: Vec<String> = (1..=batch.len()).map(|i| format!("?{i}")).collect();
+        let in_list = placeholders.join(", ");
+        let sql = format!(
+            "SELECT {NODE_COLS} FROM code_nodes
+             WHERE kind != 'module'
+               AND (first_conv_id IN ({in_list}) OR last_conv_id IN ({in_list}))
+             ORDER BY id"
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = batch
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), row_to_node)?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    Ok(out)
 }
 
 // ─── Two-channel symbol attribution (WP2 Stage 2) ───

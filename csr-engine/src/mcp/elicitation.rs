@@ -11,9 +11,7 @@
 //! Graceful fallback: if the client doesn't support elicitation, proceeds
 //! without confirmation (the tool still works, just no guard rail).
 
-use rmcp::model::{
-    CreateElicitationRequestParams, CreateElicitationResult, ElicitationAction, ElicitationSchema,
-};
+use rmcp::model::{ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationSchema};
 use rmcp::service::RequestContext;
 use rmcp::RoleServer;
 
@@ -48,13 +46,13 @@ pub async fn request_confirmation(content: &str, context: &RequestContext<RoleSe
         Err(_) => return true, // Schema build failed, proceed without confirmation
     };
 
-    let params = CreateElicitationRequestParams::FormElicitationParams {
+    let params = ElicitRequestParams::FormElicitationParams {
         meta: None,
         message,
         requested_schema: schema,
     };
 
-    let result: Result<CreateElicitationResult, _> = context.peer.create_elicitation(params).await;
+    let result: Result<ElicitResult, _> = context.peer.create_elicitation(params).await;
 
     match result {
         Ok(response) => matches!(response.action, ElicitationAction::Accept),

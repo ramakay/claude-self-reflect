@@ -178,3 +178,6 @@ pytest.ini
 
 # Local release runbook (not for OSS)
 RELEASE.local.md
+csr-engine/eval-kit/ag/bootstrap_results.json
+csr-engine/eval-kit/ag/results.json
+csr-engine/eval-kit/t3/mech_input.json

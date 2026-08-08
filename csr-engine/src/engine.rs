@@ -225,12 +225,14 @@ impl Engine {
         let mut total = 0usize;
 
         for (dir, project_name) in &projects {
-            let files = import::list_jsonl_files(dir)?;
+            let files = import::list_conversation_jsonl_files(dir)?;
             for file_path in &files {
-                if self.storage.is_file_imported(file_path)? {
-                    continue;
-                }
-                total += self.import_file(file_path, project_name).await?;
+                let attribution =
+                    import::derive_conversation_attribution(&self.projects_dir, file_path);
+                debug_assert_eq!(&attribution.project_name, project_name);
+                total += self
+                    .import_file_with_attribution(file_path, &attribution)
+                    .await?;
 
                 if let Some(lim) = limit {
                     if total >= lim {
@@ -249,17 +251,46 @@ impl Engine {
     /// only new chunks are embedded (chunks beyond prev_count are new).
     /// Returns the number of NEW chunks imported (0 if nothing new).
     pub async fn import_file(&self, file_path: &Path, project_name: &str) -> Result<usize> {
+        let attribution = import::ConversationAttribution {
+            project_name: project_name.to_string(),
+            source: "conversation",
+            parent_conversation_id: None,
+        };
+        self.import_file_with_attribution(file_path, &attribution)
+            .await
+    }
+
+    async fn import_file_with_attribution(
+        &self,
+        file_path: &Path,
+        attribution: &import::ConversationAttribution,
+    ) -> Result<usize> {
+        let conversation_id = file_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if let Some(parent) = attribution.parent_conversation_id.as_deref() {
+            self.storage.rescope_sidechain_conversation(
+                &conversation_id,
+                &attribution.project_name,
+                parent,
+            )?;
+        }
         // Check if file is unchanged (mtime match = fully imported, nothing new)
         if self.storage.is_file_imported(file_path)? {
             return Ok(0);
         }
 
-        let chunks = import::parse_jsonl_file(file_path, project_name)?;
+        let parsed = import::parse_jsonl_file_with_stats(file_path, &attribution.project_name)?;
+        let suppression = parsed.suppression;
+        let chunks = parsed.chunks;
         if chunks.is_empty() {
             // Record the skip (agent transcripts, empty conversations) so the
             // watcher doesn't re-parse the file every pass and import_percent
             // counts it as processed instead of silently under-reporting.
-            self.storage.mark_file_imported(file_path, 0)?;
+            self.storage
+                .mark_file_imported_with_suppression(file_path, 0, suppression)?;
             return Ok(0);
         }
 
@@ -267,7 +298,11 @@ impl Engine {
         let prev_count = self.storage.get_imported_chunk_count(file_path)?;
         if chunks.len() <= prev_count {
             // File parsed to same/fewer chunks — just update mtime
-            self.storage.mark_file_imported(file_path, chunks.len())?;
+            self.storage.mark_file_imported_with_suppression(
+                file_path,
+                chunks.len(),
+                suppression,
+            )?;
             return Ok(0);
         }
 
@@ -285,7 +320,8 @@ impl Engine {
 
             let mut idx = self.search.write().await;
             for (chunk, embedding) in batch.iter().zip(embeddings) {
-                self.storage.insert_chunk(chunk, &embedding)?;
+                self.storage
+                    .insert_chunk_with_source(chunk, &embedding, attribution.source)?;
                 // Persist provenance: who authored this chunk + its source conv.
                 // Supersession detection is deferred (None) — recall still gains
                 // from author-authority weighting. Non-fatal on error.
@@ -293,7 +329,10 @@ impl Engine {
                     &chunk.id,
                     &crate::provenance::ChunkProvenance {
                         author: chunk.author,
-                        source_conv_id: chunk.conversation_id.clone(),
+                        source_conv_id: attribution
+                            .parent_conversation_id
+                            .clone()
+                            .unwrap_or_else(|| chunk.conversation_id.clone()),
                         supersedes: None,
                     },
                 ) {
@@ -303,7 +342,8 @@ impl Engine {
             }
         }
 
-        self.storage.mark_file_imported(file_path, chunks.len())?;
+        self.storage
+            .mark_file_imported_with_suppression(file_path, chunks.len(), suppression)?;
 
         // Layer 1: Heuristic enrichment only on first import (not incremental updates)
         if prev_count == 0 {
@@ -320,7 +360,7 @@ impl Engine {
                 if let Err(e) = crate::extraction::heuristic::enrich_conversation(
                     file_path,
                     &conv_id,
-                    project_name,
+                    &attribution.project_name,
                     &self.storage,
                     &self.embeddings,
                     &self.search,
@@ -348,7 +388,7 @@ impl Engine {
             std::collections::HashMap::new();
 
         for (dir, project_name) in &projects {
-            if let Ok(files) = import::list_jsonl_files(dir) {
+            if let Ok(files) = import::list_conversation_jsonl_files(dir) {
                 for file_path in files {
                     let conv_id = file_path
                         .file_stem()

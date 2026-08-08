@@ -28,6 +28,10 @@ use crate::storage::codegraph::{EdgeRow, NodeRow};
 pub struct GraphFragment {
     pub nodes: Vec<NodeRow>,
     pub edges: Vec<EdgeRow>,
+    /// Lexical containers derived from the same AST root as `nodes`. Span
+    /// stamping consumes this field to avoid parsing each committed file a
+    /// second time solely for witness symbol qualification.
+    pub containers: Vec<ContainerSpan>,
     /// TASK 2 (WCR truth pass X4 tier); scope-qualified as of the X4
     /// adversarial-review truth pass (Finding 1), and CHAIN-qualified as of
     /// Finding 4: `(scope, name)` pairs for every local-binding name
@@ -1410,6 +1414,259 @@ fn tree_has_error<D: ast_grep_core::Doc>(root: &ast_grep_core::Node<'_, D>) -> b
     root.dfs().any(|n| n.is_error() || n.is_missing())
 }
 
+/// One lexical container span, computed SOLELY to qualify function/method
+/// symbol identity in the `witness_ledger` minting path (see
+/// `import::backfill::stamp_spans_into`/`stamp_spans_historical_into`) —
+/// deliberately NEVER written to `NodeRow`/`code_nodes`. Extraction identity
+/// there stays exactly `(file, kind, name)` (see `node_id`'s doc comment);
+/// this is a witness-ledger-only disambiguation layer added after an
+/// adversarial-gate audit found that identity collides two unrelated
+/// same-named methods in different `impl`/class bodies into one cross-commit
+/// witness join (e.g. `CodeContext::is_empty` and `AstDiff::is_empty`, both
+/// bare `is_empty` under the old rule).
+///
+/// Rust `impl Type { .. }` / `impl Trait for Type { .. }` containers use
+/// `::`; TS/JS/TSX classes, named functions, object-literal
+/// property paths, and const-bound arrows use `.`; Python classes and named
+/// functions use `.`. Container names are themselves ancestor-qualified, so
+/// deeper definitions retain their complete lexical path.
+#[derive(Debug, Clone)]
+pub struct ContainerSpan {
+    pub name: String,
+    pub separator: &'static str,
+    pub start: i64,
+    pub end: i64,
+}
+
+/// Lexical container spans in `source`, for function/method qualification
+/// only (see `ContainerSpan`'s doc comment). Empty for languages with no
+/// supported deterministic container walk (Go method receivers are a
+/// materially different shape and remain deliberately out of scope) or when
+/// the source is too small to parse meaningfully.
+/// Wrapped in `catch_unwind` for the same reason `extract_graph_fragment`
+/// is: malformed input can panic inside tree-sitter/ast-grep.
+pub fn container_spans(source: &str, lang: SupportLang) -> Vec<ContainerSpan> {
+    if source.len() < 4 {
+        return Vec::new();
+    }
+    catch_unwind(AssertUnwindSafe(|| container_spans_inner(source, lang))).unwrap_or_default()
+}
+
+fn container_spans_inner(source: &str, lang: SupportLang) -> Vec<ContainerSpan> {
+    let grep = lang.ast_grep(source);
+    let root = grep.root();
+    container_spans_from_root(&root, lang)
+}
+
+fn container_spans_from_root<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    lang: SupportLang,
+) -> Vec<ContainerSpan> {
+    let separator = match lang {
+        SupportLang::Rust => "::",
+        SupportLang::Python
+        | SupportLang::TypeScript
+        | SupportLang::Tsx
+        | SupportLang::JavaScript => ".",
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+
+    let named_kinds: &[&str] = match lang {
+        SupportLang::Rust => &["impl_item"],
+        SupportLang::Python => &["class_definition", "function_definition"],
+        SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript => &[
+            "class_declaration",
+            "function_declaration",
+            "method_definition",
+        ],
+        _ => unreachable!("unsupported languages returned above"),
+    };
+    for kind in named_kinds {
+        let matcher = KindMatcher::new(kind, lang);
+        for n in root.find_all(&matcher) {
+            if let Some(name) = container_name(&n, lang) {
+                push_container(&mut out, &n, name, separator);
+            }
+        }
+    }
+
+    if matches!(
+        lang,
+        SupportLang::TypeScript | SupportLang::Tsx | SupportLang::JavaScript
+    ) {
+        let object_matcher = KindMatcher::new("object", lang);
+        for n in root.find_all(&object_matcher) {
+            if let Some(name) = direct_binding_or_property_name(&n) {
+                push_container(&mut out, &n, name, separator);
+            }
+        }
+
+        let arrow_matcher = KindMatcher::new("arrow_function", lang);
+        for n in root.find_all(&arrow_matcher) {
+            if let Some(name) = ancestor_binding_or_property_name(&n) {
+                push_container(&mut out, &n, name, separator);
+            }
+        }
+    }
+
+    qualify_container_paths(out)
+}
+
+fn push_container<D: ast_grep_core::Doc>(
+    out: &mut Vec<ContainerSpan>,
+    node: &ast_grep_core::NodeMatch<'_, D>,
+    name: String,
+    separator: &'static str,
+) {
+    // Same min-length guard `extract_inner`'s def loop applies: never useful
+    // provenance, only orphan cruft from a misparsed fragment.
+    if name.len() < 2 {
+        return;
+    }
+    let text = node.text().to_string();
+    let start = node.start_pos().line() as i64;
+    let end = start + text.lines().count().saturating_sub(1) as i64;
+    out.push(ContainerSpan {
+        name,
+        separator,
+        start,
+        end,
+    });
+}
+
+fn direct_binding_or_property_name<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::NodeMatch<'_, D>,
+) -> Option<String> {
+    let parent = node.parent()?;
+    binding_or_property_name(&parent)
+}
+
+fn ancestor_binding_or_property_name<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::NodeMatch<'_, D>,
+) -> Option<String> {
+    for ancestor in node.ancestors() {
+        if let Some(name) = binding_or_property_name(&ancestor) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn binding_or_property_name<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> Option<String> {
+    let field = match node.kind().as_ref() {
+        "variable_declarator" => node.field("name"),
+        "pair" => node.field("key"),
+        "assignment_expression" => node.field("left"),
+        _ => None,
+    }?;
+    match field.kind().as_ref() {
+        "identifier" | "property_identifier" | "shorthand_property_identifier" => {
+            Some(field.text().to_string())
+        }
+        "string" | "string_fragment" => {
+            let text = field.text();
+            let trimmed = text.trim_matches(['\'', '"']);
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn qualify_container_paths(mut containers: Vec<ContainerSpan>) -> Vec<ContainerSpan> {
+    containers
+        .sort_by(|a, b| (a.start, a.end, a.name.as_str()).cmp(&(b.start, b.end, b.name.as_str())));
+    containers.dedup_by(|a, b| {
+        a.start == b.start && a.end == b.end && a.name == b.name && a.separator == b.separator
+    });
+
+    let raw_names: Vec<String> = containers.iter().map(|c| c.name.clone()).collect();
+    let mut qualified: Vec<Option<String>> = vec![None; containers.len()];
+    for index in 0..containers.len() {
+        let name = qualified_container_name(index, &containers, &raw_names, &mut qualified);
+        containers[index].name = name;
+    }
+    containers
+}
+
+fn qualified_container_name(
+    index: usize,
+    containers: &[ContainerSpan],
+    raw_names: &[String],
+    qualified: &mut [Option<String>],
+) -> String {
+    if let Some(name) = &qualified[index] {
+        return name.clone();
+    }
+    let current = &containers[index];
+    let parent = containers
+        .iter()
+        .enumerate()
+        .filter(|(candidate_index, candidate)| {
+            *candidate_index != index
+                && candidate.start <= current.start
+                && current.end <= candidate.end
+                && (candidate.start < current.start || current.end < candidate.end)
+        })
+        .min_by_key(|(_, candidate)| candidate.end - candidate.start)
+        .map(|(candidate_index, _)| candidate_index);
+
+    let name = match parent {
+        Some(parent_index) => format!(
+            "{}{}{}",
+            qualified_container_name(parent_index, containers, raw_names, qualified),
+            containers[parent_index].separator,
+            raw_names[index]
+        ),
+        None => raw_names[index].clone(),
+    };
+    qualified[index] = Some(name.clone());
+    name
+}
+
+/// A container node's own name. Rust `impl_item` needs dedicated handling
+/// (never `extract_name_from_def`'s generic first-identifier-child scan):
+/// for `impl Trait for Type { .. }`, that scan's first identifier-like
+/// child is `Trait` (the `trait` field, which appears before `for` in the
+/// grammar), not `Type` — precisely the receiver/trait confusion this
+/// module exists to avoid. The `type` field (present on every `impl_item`,
+/// trait impl or not) is always the type actually being implemented, so it
+/// alone gives the right name; TS/JS/Python container names are ordinary
+/// class-name identifiers, handled by the same shared helper every other
+/// def node in this module uses.
+fn container_name<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::NodeMatch<'_, D>,
+    lang: SupportLang,
+) -> Option<String> {
+    if lang == SupportLang::Rust {
+        let field = node.field("type")?;
+        return first_type_identifier(&field);
+    }
+    extract_name_from_def(node, lang)
+}
+
+/// Base type identifier under a Rust `impl` block's `type` field,
+/// recursing past generic/reference wrappers: `impl<T> Foo<T>` and
+/// `impl<'a> &'a Foo` both resolve to `Foo`, matching how the type is
+/// referred to at call sites (`Foo::method(..)`), never `Foo<T>::method` or
+/// `&Foo::method`. First DFS-order `type_identifier` wins — a bounded walk
+/// over one type expression's subtree, not the whole file.
+fn first_type_identifier<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> Option<String> {
+    if node.kind().as_ref() == "type_identifier" {
+        return Some(node.text().to_string());
+    }
+    for child in node.children() {
+        if let Some(name) = first_type_identifier(&child) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Path-driven convenience wrapper: derive the language from `file`'s extension.
 /// Returns an empty fragment for unsupported file types.
 pub fn extract_graph_fragment_for_file(
@@ -1459,7 +1716,17 @@ fn extract_inner(
     session_id: &str,
 ) -> GraphFragment {
     let lang_name = lang_name(lang);
-    let mut nodes: BTreeMap<String, NodeRow> = BTreeMap::new();
+    // Per-parse occurrence identity MUST retain span. `NodeRow::id` is the
+    // intentionally coarse persisted graph identity `(repo,file,kind,name)`;
+    // using it as this collection key used to overwrite coexisting methods
+    // such as `CodeContext::is_empty` and `AstDiff::is_empty` before witness
+    // qualification could see either container. The persisted ids remain
+    // unchanged; this key only preserves every physical definition through
+    // the extraction boundary, in deterministic `(id,start,end,AST-order)`
+    // order. The ordinal is necessary because distinct one-line definitions
+    // can share the same persisted line span.
+    let mut nodes: BTreeMap<(String, i64, i64, usize), NodeRow> = BTreeMap::new();
+    let mut node_occurrence = 0usize;
     let mut edges: BTreeMap<(String, String, String), EdgeRow> = BTreeMap::new();
     // X4 adversarial review, Finding 4; ALL-distinct-chains as of the Codex
     // round 4 adversarial review, Finding 1: keyed identically to `edges`
@@ -1491,7 +1758,7 @@ fn extract_inner(
     // Synthetic module node anchoring the file.
     let module_id = node_id(repo, file, "module", file);
     nodes.insert(
-        module_id.clone(),
+        (module_id.clone(), 0, 0, node_occurrence),
         NodeRow {
             id: module_id.clone(),
             repo: repo.into(),
@@ -1601,7 +1868,8 @@ fn extract_inner(
                     let end = start + text.lines().count().saturating_sub(1) as i64;
                     let node = mk_node(canon, &name, &text, start, end);
                     let nid = node.id.clone();
-                    nodes.insert(nid.clone(), node);
+                    node_occurrence += 1;
+                    nodes.insert((nid.clone(), start, end, node_occurrence), node);
                     add_edge(module_id.clone(), nid, "defines", 1, "", "");
                 }
             }
@@ -1628,7 +1896,8 @@ fn extract_inner(
                 let end = start + text.lines().count().saturating_sub(1) as i64;
                 let node = mk_node("const", &name, &text, start, end);
                 let nid = node.id.clone();
-                nodes.insert(nid.clone(), node);
+                node_occurrence += 1;
+                nodes.insert((nid.clone(), start, end, node_occurrence), node);
                 add_edge(module_id.clone(), nid, "defines", 1, "", "");
             }
         }
@@ -1771,6 +2040,7 @@ fn extract_inner(
     // parsed `root` above and the SAME `func_index` the calls loop just
     // used — never a second parse, never a second index pass.
     let local_bindings = collect_local_bindings_from_root(&root, lang, &func_index);
+    let containers = container_spans_from_root(&root, lang);
     // Finding 3 (X4 adversarial review): computed from the SAME parsed
     // `root` — see `tree_has_error`'s doc comment.
     let parse_clean = !tree_has_error(&root);
@@ -1778,6 +2048,7 @@ fn extract_inner(
     GraphFragment {
         nodes: nodes.into_values().collect(),
         edges: edges.into_values().collect(),
+        containers,
         local_bindings,
         call_scope_chains,
         call_attribution_pairs,
@@ -1800,6 +2071,130 @@ fn lang_name(lang: SupportLang) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_extractor_preserves_same_named_methods_in_distinct_impls() {
+        // Regression for the v9.5 T4 corruption: changing the per-parse node
+        // key back to `(repo,file,kind,name)` makes one of these real
+        // definitions overwrite the other before witness qualification.
+        let src = "struct CodeContext;\nimpl CodeContext {\n    fn is_empty(&self) -> bool { true }\n}\nstruct AstDiff;\nimpl AstDiff {\n    fn is_empty(&self) -> bool { false }\n}\n";
+        let fragment = extract_graph_fragment(
+            src,
+            SupportLang::Rust,
+            "/repo/src/ast_analysis.rs",
+            "repo",
+            "proj",
+            "conv",
+            "session",
+        );
+        let methods: Vec<_> = fragment
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "function" && node.name == "is_empty")
+            .map(|node| (node.span_start, node.span_end))
+            .collect();
+        assert_eq!(methods, [(2, 2), (6, 6)]);
+    }
+
+    #[test]
+    fn production_extractor_preserves_same_name_and_same_line_occurrences() {
+        let fragment = extract_graph_fragment(
+            "fn duplicate() {} fn duplicate() {}",
+            SupportLang::Rust,
+            "/repo/src/lib.rs",
+            "repo",
+            "proj",
+            "conv",
+            "session",
+        );
+        let count = fragment
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "function" && node.name == "duplicate")
+            .count();
+        assert_eq!(count, 2, "line spans alone must not collapse occurrences");
+    }
+
+    #[test]
+    fn container_spans_rust_distinguishes_two_impl_blocks_same_method_name() {
+        // Reproduces the adversarial-gate audit's proven false positive:
+        // two unrelated `is_empty` methods in different `impl` blocks in
+        // the same file. Without container qualification these collide on
+        // bare `is_empty`; with it, they must resolve to distinct
+        // container-qualified names.
+        let src = "struct CodeContext;\nimpl CodeContext {\n    fn is_empty(&self) -> bool { true }\n}\nstruct AstDiff;\nimpl AstDiff {\n    fn is_empty(&self) -> bool { false }\n}\n";
+        let containers = container_spans(src, SupportLang::Rust);
+        assert_eq!(containers.len(), 2, "containers: {containers:?}");
+        let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"CodeContext"), "names: {names:?}");
+        assert!(names.contains(&"AstDiff"), "names: {names:?}");
+        for c in &containers {
+            assert_eq!(c.separator, "::");
+        }
+    }
+
+    #[test]
+    fn container_spans_rust_trait_impl_uses_type_not_trait() {
+        // `impl Trait for Type` must qualify by `Type`, never `Trait` — the
+        // generic first-identifier-child scan (`extract_name_from_def`)
+        // would wrongly pick `Trait` here since it appears first in the
+        // grammar.
+        let src = "struct Foo;\ntrait Greet { fn hello(&self); }\nimpl Greet for Foo {\n    fn hello(&self) {}\n}\n";
+        let containers = container_spans(src, SupportLang::Rust);
+        assert_eq!(containers.len(), 1, "containers: {containers:?}");
+        assert_eq!(containers[0].name, "Foo");
+    }
+
+    #[test]
+    fn container_spans_rust_strips_generics_and_references() {
+        let src = "struct Foo<T> { _t: T }\nimpl<T> Foo<T> {\n    fn is_empty(&self) -> bool { true }\n}\n";
+        let containers = container_spans(src, SupportLang::Rust);
+        assert_eq!(containers.len(), 1, "containers: {containers:?}");
+        assert_eq!(containers[0].name, "Foo");
+    }
+
+    #[test]
+    fn container_spans_typescript_class_methods() {
+        let src = "class Foo {\n  isEmpty() { return true; }\n}\nclass Bar {\n  isEmpty() { return false; }\n}\n";
+        let containers = container_spans(src, SupportLang::TypeScript);
+        assert_eq!(containers.len(), 4, "containers: {containers:?}");
+        let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"Foo"));
+        assert!(names.contains(&"Bar"));
+        assert!(names.contains(&"Foo.isEmpty"));
+        assert!(names.contains(&"Bar.isEmpty"));
+        for c in &containers {
+            assert_eq!(c.separator, ".");
+        }
+    }
+
+    #[test]
+    fn container_spans_python_class_methods() {
+        let src = "class Foo:\n    def is_empty(self):\n        return True\n\nclass Bar:\n    def is_empty(self):\n        return False\n";
+        let containers = container_spans(src, SupportLang::Python);
+        assert_eq!(containers.len(), 4, "containers: {containers:?}");
+        let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"Foo"));
+        assert!(names.contains(&"Bar"));
+        assert!(names.contains(&"Foo.is_empty"));
+        assert!(names.contains(&"Bar.is_empty"));
+    }
+
+    #[test]
+    fn container_spans_free_function_has_no_container() {
+        let src = "fn free_fn() -> bool { true }\n";
+        let containers = container_spans(src, SupportLang::Rust);
+        assert!(containers.is_empty(), "containers: {containers:?}");
+    }
+
+    #[test]
+    fn container_spans_go_is_out_of_scope() {
+        // Go is deliberately not covered (method receivers are a different
+        // shape from impl/class bodies) — must return empty, never panic.
+        let src = "package main\nfunc (r *Receiver) Method() {}\n";
+        let containers = container_spans(src, SupportLang::Go);
+        assert!(containers.is_empty(), "containers: {containers:?}");
+    }
 
     #[test]
     fn extracts_nodes_and_call_edge_from_rust() {

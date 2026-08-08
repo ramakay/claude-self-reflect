@@ -98,7 +98,7 @@ fn render(f: &mut Frame, t: &Telemetry) {
         .constraints([
             Constraint::Length(3), // header
             Constraint::Min(10),   // body
-            Constraint::Length(7), // footer (startup + log)
+            Constraint::Length(8), // footer (startup + dreaming + log)
         ])
         .split(f.area());
 
@@ -300,6 +300,10 @@ fn draw_footer(f: &mut Frame, area: Rect, t: &Telemetry) {
         ]));
     }
     lines.push(Line::from(""));
+    lines.push(Line::from(format_dream_summary(
+        &t.status.dream,
+        chrono::Utc::now(),
+    )));
     lines.push(Line::from(format!(
         "Source: {}  ({} scanned, {} in window)   [q quit | r refresh]",
         t.log_path, t.log_lines_scanned, t.log_lines_in_window
@@ -329,5 +333,99 @@ fn fmt_ms(ms: u64) -> String {
         format!("{:.2}s", ms as f64 / 1000.0)
     } else {
         format!("{}ms", ms)
+    }
+}
+
+fn format_dream_summary(
+    dream: &crate::status::DreamStatus,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    if !dream.daemon_enabled {
+        return "☾ dreaming: disabled".to_string();
+    }
+
+    let Some(last_run) = dream.last_daemon_run.as_deref() else {
+        return format!(
+            "☾ dreaming: never run ({} witnesses ledgered)",
+            dream.witnesses_ledgered
+        );
+    };
+
+    let relative = |timestamp: &str| {
+        crate::temporal::parse_timestamp(timestamp)
+            .map(|ts| crate::temporal::format_relative_time_at(&ts, &now))
+            .unwrap_or_else(|| timestamp.to_string())
+    };
+    let next = dream
+        .next_due
+        .as_deref()
+        .map(relative)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    format!(
+        "☾ dreaming: {} verdicts ({} demoted) · last {} · next {}",
+        dream.events_total,
+        dream.demoted_symbols,
+        relative(last_run),
+        next
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+    use crate::status::{DreamStatus, DreamVerdictTotals};
+
+    fn now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn dream_summary_reports_verdicts_and_daemon_cadence() {
+        let dream = DreamStatus {
+            daemon_enabled: true,
+            last_run: Some("2026-08-06T10:00:00Z".into()),
+            events_total: 12,
+            by_verdict: DreamVerdictTotals {
+                obsolete: 4,
+                superseded: 5,
+                reinstated: 3,
+            },
+            demoted_symbols: 3,
+            witnesses_ledgered: 17,
+            ancestry_cached_conversations: 9,
+            last_daemon_run: Some("2026-08-06T10:00:00Z".into()),
+            next_due: Some("2026-08-06T18:00:00Z".into()),
+        };
+
+        assert_eq!(
+            format_dream_summary(&dream, now()),
+            "☾ dreaming: 12 verdicts (3 demoted) · last 2h ago · next in 6h"
+        );
+    }
+
+    #[test]
+    fn dream_summary_reports_disabled_state() {
+        let dream = DreamStatus {
+            daemon_enabled: false,
+            ..DreamStatus::default()
+        };
+
+        assert_eq!(format_dream_summary(&dream, now()), "☾ dreaming: disabled");
+    }
+
+    #[test]
+    fn dream_summary_reports_never_run_with_witness_count() {
+        let dream = DreamStatus {
+            witnesses_ledgered: 17,
+            ..DreamStatus::default()
+        };
+
+        assert_eq!(
+            format_dream_summary(&dream, now()),
+            "☾ dreaming: never run (17 witnesses ledgered)"
+        );
     }
 }

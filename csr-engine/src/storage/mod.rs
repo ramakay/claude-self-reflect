@@ -1,6 +1,10 @@
+pub mod ancestry;
+pub mod chunk_binding;
 pub mod codegraph;
 pub mod migrations;
 pub mod queries;
+pub mod witness_ledger;
+pub mod witness_verdicts;
 
 pub use queries::{
     NarrativeUsageRow, NarrativeUsageSummary, RatificationScoreRow, ResolutionEntry,
@@ -12,7 +16,7 @@ use std::sync::Mutex;
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::import::ConversationChunk;
+use crate::import::{ConversationChunk, CsrSuppressionStats};
 
 /// SQLite storage with FTS5 for full-text search.
 /// Thread-safe via Mutex around the Connection.
@@ -475,12 +479,20 @@ impl Storage {
     /// Silence was the failure mode that let the TodoWrite→TaskCreate rename rot episode
     /// extraction for weeks — every aux adapter counts what it fails to parse.
     pub fn bump_aux_counter(&self, source: &str) -> Result<()> {
+        self.bump_aux_counter_by(source, 1)
+    }
+
+    /// Increment an aux schema-miss counter by the number of quarantined raw lines.
+    pub fn bump_aux_counter_by(&self, source: &str, count: usize) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let key = format!("aux_schema_miss:{source}");
         let current: i64 = queries::get_meta(&conn, &key)?
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        queries::set_meta(&conn, &key, &(current + 1).to_string())
+        queries::set_meta(&conn, &key, &(current + count as i64).to_string())
     }
 
     /// All aux schema-miss counters as (source, count), for status surfacing.
@@ -500,6 +512,28 @@ impl Storage {
             out.push((source, value.parse().unwrap_or(0)));
         }
         Ok(out)
+    }
+
+    pub fn get_csr_tool_blocks_suppressed(&self) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let split_value = queries::get_meta(&conn, "csr_tool_blocks_suppressed")?;
+        let value = match split_value {
+            Some(value) => Some(value),
+            None => queries::get_meta(&conn, "csr_self_suppressed")?,
+        };
+        Ok(value.and_then(|value| value.parse().ok()).unwrap_or(0))
+    }
+
+    pub fn get_csr_hook_wrappers_scrubbed(&self) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(queries::get_meta(&conn, "csr_hook_wrappers_scrubbed")?
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Backward-compatible aggregate surfaced by status: tool blocks + wrappers.
+    pub fn get_csr_self_suppressed(&self) -> Result<i64> {
+        Ok(self.get_csr_tool_blocks_suppressed()? + self.get_csr_hook_wrappers_scrubbed()?)
     }
 
     pub fn insert_chunk_with_source(
@@ -568,6 +602,21 @@ impl Storage {
     pub fn get_chunk_source(&self, id: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_chunk_source(&conn, id)
+    }
+
+    pub fn rescope_sidechain_conversation(
+        &self,
+        conversation_id: &str,
+        project_name: &str,
+        parent_conversation_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::rescope_sidechain_conversation(
+            &mut conn,
+            conversation_id,
+            project_name,
+            parent_conversation_id,
+        )
     }
 
     /// Wipe a conversation's chunks + embeddings + FTS rows + provenance edges, so an
@@ -665,6 +714,16 @@ impl Storage {
     pub fn mark_file_imported(&self, path: &Path, chunks: usize) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::mark_file_imported(&conn, path, chunks)
+    }
+
+    pub(crate) fn mark_file_imported_with_suppression(
+        &self,
+        path: &Path,
+        chunks: usize,
+        suppression: CsrSuppressionStats,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_file_imported_with_suppression(&mut conn, path, chunks, suppression)
     }
 
     /// Read an import_state mtime keyed by a synthetic (non-filesystem) `file_path`,
@@ -964,6 +1023,15 @@ impl Storage {
         codegraph::set_repo_root_for_file(&conn, file, repo_root)
     }
 
+    /// The `code_nodes`-stored `repo_root` for `file`, if any resolved node
+    /// exists for it. `None` does not mean unresolvable — callers typically
+    /// fall back to `extraction::repo_root::repo_root_for_file` (a live git
+    /// walk) when this returns `None`, same as `dream`'s own join.
+    pub fn stored_repo_root_for_file(&self, file: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::stored_repo_root_for_file(&conn, file)
+    }
+
     /// Distinct `code_evolution.file_path` values still missing `repo_root` (WP2 Stage 1 backfill).
     pub fn code_evolution_files_missing_repo_root(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
@@ -1166,6 +1234,23 @@ impl Storage {
         queries::get_resolutions_batch(&conn, chunk_ids)
     }
 
+    // ─── Dream verdicts (v10) ───
+
+    /// Batch-resolve dream-verdict hits for a set of conversation ids — see
+    /// `chunk_binding::witness_verdict_for_chunks`'s two-channel contract.
+    /// Consumed by the search validity partition (`mcp::tools`) to
+    /// demote/annotate chunks whose underlying code claim the `dream` cycle
+    /// has determined is stale (`Demote`) or has evolved (`Annotate`). One
+    /// batched query per call — zero git access, purely a read over
+    /// precomputed `witness_verdicts` events.
+    pub fn witness_verdicts_for_conversations(
+        &self,
+        conversation_ids: &[String],
+    ) -> Result<std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        chunk_binding::witness_verdict_for_chunks(&conn, conversation_ids)
+    }
+
     // ─── Session registry / aux coverage ───
 
     /// Runs `f` with the raw connection inside a single SQLite transaction.
@@ -1198,6 +1283,130 @@ impl Storage {
     ) -> anyhow::Result<std::collections::HashSet<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::known_session_ids(&conn, candidates)
+    }
+
+    // ─── Witness ledger (v10 "dreaming" substrate) ───
+    //
+    // APPEND-ONLY: insert + query only, no update/delete — see
+    // `witness_ledger`'s module doc for the full invariant.
+
+    /// Append one witness row. Duplicates (symbol-level AND whole-file
+    /// NULL-key rows alike) are a silent no-op: `INSERT OR IGNORE` against
+    /// the COALESCE-based `idx_witness_ledger_identity` UNIQUE index.
+    pub fn insert_witness(&self, row: &witness_ledger::WitnessLedgerRow) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_ledger::insert_witness(&conn, row)
+    }
+
+    /// Full append-only history of witnesses for `(project, file)`, oldest-first.
+    pub fn witnesses_for_file(
+        &self,
+        project: &str,
+        file: &str,
+    ) -> Result<Vec<witness_ledger::WitnessLedgerRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_ledger::witnesses_for_file(&conn, project, file)
+    }
+
+    /// Most recently inserted witness for `(project, file, symbol)`;
+    /// `symbol = None` selects the whole-file witness.
+    pub fn latest_witness_for_symbol(
+        &self,
+        project: &str,
+        file: &str,
+        symbol: Option<&str>,
+    ) -> Result<Option<witness_ledger::WitnessLedgerRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_ledger::latest_witness_for_symbol(&conn, project, file, symbol)
+    }
+
+    /// Count of ledger rows for `(project, file)` (idempotency checks).
+    pub fn count_witnesses_for_file(&self, project: &str, file: &str) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_ledger::count_witnesses_for_file(&conn, project, file)
+    }
+
+    /// Every `tier = 'committed'` witness row, grouped by `(project, file,
+    /// symbol)`. Feeds `dream`'s successor join.
+    pub fn all_committed_witnesses(&self) -> Result<Vec<witness_ledger::WitnessLedgerRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_ledger::all_committed_witnesses(&conn)
+    }
+
+    /// A single witness row by its primary key.
+    pub fn witness_by_id(&self, id: i64) -> Result<Option<witness_ledger::WitnessLedgerRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_ledger::witness_by_id(&conn, id)
+    }
+
+    // ─── Witness verdicts (v10 "dreaming" — see `crate::dream`) ───
+    //
+    // APPEND-ONLY: insert + query only, no update/delete — see
+    // `witness_verdicts`'s module doc for the full invariant.
+
+    /// The latest recorded verdict event for a specific `witness_ledger.id`.
+    pub fn latest_witness_verdict(
+        &self,
+        witness_id: i64,
+    ) -> Result<Option<witness_verdicts::WitnessVerdictRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::latest_event(&conn, witness_id)
+    }
+
+    /// Insert a verdict event unless it is identical to the latest recorded
+    /// event for that witness (see `witness_verdicts::is_new_event`).
+    /// Returns whether a new row was actually written.
+    pub fn insert_witness_verdict(
+        &self,
+        row: &witness_verdicts::WitnessVerdictRow,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::insert_verdict_if_changed(&conn, row)
+    }
+
+    /// Order-independent symbol-level current state: the resolved
+    /// `Demote`/`Annotate` channel plus representative negative event iff
+    /// the `(project, file, symbol)` anchor carries an uncancelled negative
+    /// verdict — see `witness_verdicts`'s "Symbol-level current state"
+    /// module doc for the two-channel rule chunk binding relies on.
+    pub fn symbol_verdict_state(
+        &self,
+        project: &str,
+        file: &str,
+        symbol: Option<&str>,
+    ) -> Result<Option<witness_verdicts::SymbolVerdictState>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::symbol_verdict_state(&conn, project, file, symbol)
+    }
+
+    /// Every `witness_verdicts` event ever recorded, newest-first, joined to
+    /// its witness's anchor identity — the dream report's timeline. See
+    /// `witness_verdicts::all_events_with_anchor`.
+    pub fn all_dream_events(&self) -> Result<Vec<witness_verdicts::DreamEventRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::all_events_with_anchor(&conn)
+    }
+
+    /// The most recent dream cycle observed anywhere in the ledger:
+    /// `(observed_head_oid, created_at)` of the globally newest event.
+    /// `None` if `dream` has never written an event.
+    pub fn last_dream_run(&self) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::last_dream_run(&conn)
+    }
+
+    /// Totals `(obsolete, superseded, reinstated)` across every event ever
+    /// recorded — feeds `status`'s `dream.by_verdict` and the report header.
+    pub fn dream_event_totals(&self) -> Result<(i64, i64, i64)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::event_totals_by_verdict(&conn)
+    }
+
+    /// Every `(project, file, symbol)` anchor currently on the `Demote`
+    /// channel — "what CSR forgot". See `witness_verdicts::all_demoted_symbols`.
+    pub fn all_demoted_symbols(&self) -> Result<Vec<witness_verdicts::DemotedSymbol>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        witness_verdicts::all_demoted_symbols(&conn)
     }
 }
 
@@ -1312,6 +1521,65 @@ mod tests {
             counters,
             vec![("history".to_string(), 1), ("tasks".to_string(), 2)]
         );
+    }
+
+    #[test]
+    fn aux_counter_can_quarantine_multiple_raw_lines() {
+        let storage = Storage::open_memory().unwrap();
+        storage.bump_aux_counter_by("codex_rollout", 3).unwrap();
+        assert_eq!(
+            storage.get_aux_counters().unwrap(),
+            vec![("codex_rollout".to_string(), 3)]
+        );
+    }
+
+    #[test]
+    fn sidechain_rescope_repairs_project_source_and_parent_link_idempotently() {
+        use crate::provenance::Speaker;
+        let storage = Storage::open_memory().unwrap();
+        let chunk = ConversationChunk {
+            id: "sidechunk-1".into(),
+            conversation_id: "agent-child".into(),
+            project_name: "subagents".into(),
+            timestamp: "2026-08-06T12:00:00Z".into(),
+            content: "sidechain evidence".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::Assistant,
+            seq: 0,
+            is_sidechain: true,
+        };
+        storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
+
+        storage
+            .rescope_sidechain_conversation("agent-child", "real-project", "parent-session")
+            .unwrap();
+        let changes_after_first = storage.conn.lock().unwrap().total_changes();
+        storage
+            .rescope_sidechain_conversation("agent-child", "real-project", "parent-session")
+            .unwrap();
+        let changes_after_second = storage.conn.lock().unwrap().total_changes();
+        assert_eq!(
+            changes_after_second, changes_after_first,
+            "an already-correct discovery scan must perform zero writes"
+        );
+
+        let conn = storage.conn.lock().unwrap();
+        let row: (String, String) = conn
+            .query_row(
+                "SELECT project_name, source FROM chunks WHERE id = 'sidechunk-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(row, ("real-project".to_string(), "sidechain".to_string()));
+        let provenance = storage
+            .get_chunk_provenance("sidechunk-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(provenance.author, Speaker::Assistant);
+        assert_eq!(provenance.source_conv_id, "parent-session");
     }
 
     #[test]
@@ -1617,5 +1885,190 @@ mod tests {
             .unwrap();
 
         assert_eq!(storage.coverage_stats().unwrap(), (3, 1, 2));
+    }
+
+    #[test]
+    fn per_file_csr_suppression_counters_only_apply_new_deltas() {
+        let storage = Storage::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counter.jsonl");
+        let initial = [
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "tool_use", "id": "csr-1", "name": "csr_reflect_on_past", "input": {"query": "old"}},
+                    {"type": "text", "text": "ordinary assistant prose"}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [
+                    {"type": "text", "text": "before <system-reminder>CSR PICKUP — injected</system-reminder> after"},
+                    {"type": "tool_result", "tool_use_id": "csr-1", "content": "old result"}
+                ]}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            initial
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = crate::import::parse_jsonl_file_with_stats(&path, "test").unwrap();
+        storage
+            .mark_file_imported_with_suppression(&path, parsed.chunks.len(), parsed.suppression)
+            .unwrap();
+        assert_eq!(storage.get_csr_tool_blocks_suppressed().unwrap(), 2);
+        assert_eq!(storage.get_csr_hook_wrappers_scrubbed().unwrap(), 1);
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 3);
+
+        // Same full-file totals must not recount history.
+        storage
+            .mark_file_imported_with_suppression(&path, parsed.chunks.len(), parsed.suppression)
+            .unwrap();
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 3);
+
+        // Appending only ordinary content leaves both suppression totals unchanged.
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(&format!(
+            "\n{}",
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [{"type": "text", "text": "ordinary append"}]}
+            })
+        ));
+        std::fs::write(&path, &content).unwrap();
+        let parsed = crate::import::parse_jsonl_file_with_stats(&path, "test").unwrap();
+        storage
+            .mark_file_imported_with_suppression(&path, parsed.chunks.len(), parsed.suppression)
+            .unwrap();
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 3);
+
+        // A newly appended correlated CSR pair contributes exactly two tool blocks.
+        content.push_str(
+            &format!(
+                "\n{}\n{}",
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "id": "csr-2", "name": "csr_quick_check", "input": {"query": "new"}}]}
+                }),
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"content": [{"type": "tool_result", "tool_use_id": "csr-2", "content": "new result"}]}
+                })
+            ),
+        );
+        std::fs::write(&path, content).unwrap();
+        let parsed = crate::import::parse_jsonl_file_with_stats(&path, "test").unwrap();
+        storage
+            .mark_file_imported_with_suppression(&path, parsed.chunks.len(), parsed.suppression)
+            .unwrap();
+
+        assert_eq!(storage.get_csr_tool_blocks_suppressed().unwrap(), 4);
+        assert_eq!(storage.get_csr_hook_wrappers_scrubbed().unwrap(), 1);
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 5);
+    }
+
+    #[test]
+    fn migrated_import_row_baselines_history_before_applying_new_suppression() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        let transcript_path = dir.path().join("existing.jsonl");
+        let pair = |id: &str| {
+            [
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"content": [{
+                        "type": "tool_use", "id": id, "name": "csr_reflect_on_past",
+                        "input": {"query": "history"}
+                    }]}
+                }),
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"content": [{
+                        "type": "tool_result", "tool_use_id": id, "content": "historical result"
+                    }]}
+                }),
+            ]
+        };
+        let mut messages = pair("csr-1").to_vec();
+        std::fs::write(
+            &transcript_path,
+            messages
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE import_state (
+                    file_path TEXT PRIMARY KEY,
+                    conversation_id TEXT,
+                    chunks_imported INTEGER,
+                    imported_at TEXT DEFAULT (datetime('now')),
+                    file_mtime TEXT
+                 );
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO import_state (file_path, conversation_id, chunks_imported, file_mtime) VALUES (?1, 'existing', 1, 'legacy')",
+                [transcript_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('csr_self_suppressed', '2')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let storage = Storage::open(&db_path).unwrap();
+        let parsed = crate::import::parse_jsonl_file_with_stats(&transcript_path, "test").unwrap();
+        storage
+            .mark_file_imported_with_suppression(
+                &transcript_path,
+                parsed.chunks.len(),
+                parsed.suppression,
+            )
+            .unwrap();
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 2);
+
+        messages.extend(pair("csr-2"));
+        std::fs::write(
+            &transcript_path,
+            messages
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let parsed = crate::import::parse_jsonl_file_with_stats(&transcript_path, "test").unwrap();
+        storage
+            .mark_file_imported_with_suppression(
+                &transcript_path,
+                parsed.chunks.len(),
+                parsed.suppression,
+            )
+            .unwrap();
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 4);
+
+        storage
+            .mark_file_imported_with_suppression(
+                &transcript_path,
+                parsed.chunks.len(),
+                parsed.suppression,
+            )
+            .unwrap();
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 4);
     }
 }

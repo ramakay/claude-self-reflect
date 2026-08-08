@@ -221,7 +221,7 @@ async fn run_v3_extraction(engine: &Engine, transcript_path: &Path, cwd: &Path) 
         return Ok(());
     }
 
-    let messages = crate::import::parse_jsonl_messages(transcript_path)?;
+    let messages = crate::import::parse_jsonl_messages_for_search(transcript_path)?;
     if messages.len() < 3 {
         return Ok(()); // skip trivial sessions
     }

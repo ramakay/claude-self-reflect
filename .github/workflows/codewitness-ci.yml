@@ -1,0 +1,125 @@
+name: CodeWitness CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'codewitness/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'codewitness/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codewitness -> target
+      - name: Format check
+        run: cargo fmt --manifest-path codewitness/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path codewitness/Cargo.toml -- -D warnings
+      - name: Test
+        run: cargo test --manifest-path codewitness/Cargo.toml
+      - name: Determinism (real labels and bench binary)
+        run: >-
+          cargo test --manifest-path codewitness/Cargo.toml
+          --test cli_smoke determinism_hashes_match_for_real_labels_and_bench_runs
+          -- --ignored --nocapture
+
+  cargo-mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codewitness -> target
+      - name: Install cargo-mutants
+        run: cargo install --locked cargo-mutants
+      - name: Mutation gate for core modules
+        working-directory: codewitness
+        run: |
+          set +e
+          cargo mutants --jobs 4 --minimum-test-timeout 20 \
+            --file src/anchor.rs \
+            --file src/stamp.rs \
+            --file src/verdict.rs \
+            --file src/witness.rs \
+            --file src/diff_id.rs
+          status=$?
+          set -e
+
+          if [ -s mutants.out/missed.txt ]; then
+            echo "MISSED mutants in core modules:"
+            cat mutants.out/missed.txt
+            exit 1
+          fi
+
+          # Exit 3 = timeouts only. A timeout here is an infinite-loop mutant
+          # (e.g. `i += 1` -> `i *= 1`) killed by the harness deadline — the
+          # mutant WAS detected, just by hang rather than assertion. With
+          # missed.txt empty this is a pass; any other nonzero status is a
+          # real cargo-mutants failure.
+          if [ "$status" -eq 3 ]; then
+            echo "cargo-mutants reported timeouts only (infinite-loop mutants killed by deadline); missed.txt is empty — passing."
+            exit 0
+          fi
+
+          exit "$status"
+
+  cargo-semver-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # cargo-semver-checks needs a published baseline to diff against, and
+      # codewitness has none until its first crates.io release. Probing the
+      # index (rather than pinning `continue-on-error`) means the check turns
+      # enforcing by itself the moment we publish — nobody has to remember to
+      # flip a flag. A probe that neither succeeds nor 404s is an operational
+      # failure, not a verdict: fail loudly instead of skipping silently.
+      - name: Probe crates.io for a published baseline
+        id: baseline
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 \
+            --retry-connrefused https://index.crates.io/co/de/codewitness) || code=000
+          case "$code" in
+            200)
+              echo 'published=true' >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo 'published=false' >> "$GITHUB_OUTPUT"
+              echo "::notice::codewitness is not on crates.io yet — semver check skipped until first publish."
+              ;;
+            *)
+              echo "::error::crates.io index probe returned HTTP $code; cannot tell whether a baseline exists."
+              exit 1
+              ;;
+          esac
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.baseline.outputs.published == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.baseline.outputs.published == 'true'
+        with:
+          workspaces: codewitness -> target
+      - name: Check semver
+        if: steps.baseline.outputs.published == 'true'
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          manifest-path: codewitness/Cargo.toml
+          rust-toolchain: manual

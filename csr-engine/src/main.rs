@@ -155,6 +155,42 @@ enum Commands {
         #[arg(long)]
         tui: bool,
     },
+    /// Run one v10 "dreaming" cycle: HEAD stamp-spans, then the
+    /// deterministic successor join over the witness ledger, emitting
+    /// `witness_verdicts` events (anchor_obsolete / superseded_by /
+    /// anchor_reinstated). Idempotent: re-running at an unchanged HEAD with
+    /// unchanged conclusions writes nothing new.
+    Dream {
+        /// Compute and print the summary without writing verdict events.
+        /// The prerequisite HEAD stamp-spans pass still runs FOR REAL
+        /// (append-only witness_ledger evidence, harmless and idempotent) —
+        /// only witness_verdicts insertion is suppressed, so a dry run and
+        /// a subsequent real run compute identical verdicts.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Restrict the join to anchors whose file resolves to this one
+        /// repo root instead of every repo root the code graph knows about.
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Render a self-contained static HTML dream journal from the
+        /// witness ledger instead of running a dream cycle. Read-only —
+        /// narrates whatever verdicts are already on record; run `dream`
+        /// (without `--report`) first to produce new ones.
+        #[arg(long)]
+        report: bool,
+
+        /// Output path for `--report`. Default:
+        /// `~/.claude-self-reflect/reports/dream-<YYYY-MM-DD>.html`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// With `--report`, don't launch the system viewer (`open`, macOS
+        /// only) after writing the file.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Generate a Haiku-curated session story (fire-and-forget from SessionEnd)
     GenerateStory {
         /// Path to the session transcript JSONL
@@ -188,6 +224,35 @@ enum CodegraphAction {
         /// Count what would be attributed, but make no changes.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Mint `codewitness` committed-tier witnesses for every function/type/
+    /// const span (and whole-file fallback) known to the code graph — the
+    /// append-only evidence substrate for v10 "dreaming" (evidence-grounded
+    /// forgetting). Idempotent: safe to re-run.
+    ///
+    /// With `--at <rev>`, stamps spans AS THEY EXISTED at that historical
+    /// commit instead of at each repo's live HEAD — the substrate for the
+    /// S3 time-travel precision gate. Extraction runs directly against the
+    /// commit's own tree (not the code graph's node list), so it can see
+    /// files the graph never observed.
+    StampSpans {
+        /// Count what would be stamped, but make no changes.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Stamp spans as they existed at this historical revision (commit
+        /// SHA, tag, branch, `HEAD~N`, ...) instead of each repo's live
+        /// HEAD. Resolved independently per repo; a repo where `rev` doesn't
+        /// resolve is skipped, never guessed. One rev per invocation.
+        #[arg(long)]
+        at: Option<String>,
+
+        /// Restrict to this one repo root instead of every repo root the
+        /// code graph already knows about. Requires `--at` — HEAD-mode
+        /// stamping (`backfill_stamp_spans`) has no repo filter, and
+        /// silently ignoring the flag would stamp every known repo.
+        #[arg(long, requires = "at")]
+        repo: Option<String>,
     },
 }
 
@@ -424,6 +489,49 @@ async fn main() -> Result<()> {
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
         let stats = csr_engine::import::backfill::backfill_attribution(&eng, dry_run)?;
+        print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
+    if let Some(Commands::Codegraph {
+        action: CodegraphAction::StampSpans { dry_run, at, repo },
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats = match at {
+            Some(rev) => csr_engine::import::backfill::backfill_stamp_spans_at(
+                &eng,
+                &rev,
+                repo.as_deref(),
+                dry_run,
+            )?,
+            None => csr_engine::import::backfill::backfill_stamp_spans(&eng, dry_run)?,
+        };
+        print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
+    if let Some(Commands::Dream {
+        dry_run,
+        ref repo,
+        report,
+        ref out,
+        no_open,
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        if report {
+            let path = csr_engine::dream::report::run_report(eng.storage(), out.clone(), no_open)?;
+            println!("CSR dream journal written to {}", path.display());
+            return Ok(());
+        }
+        let stats = csr_engine::dream::run_dream(&eng, repo.as_deref(), dry_run)?;
         print!("{}", stats.format_text(dry_run));
         return Ok(());
     }

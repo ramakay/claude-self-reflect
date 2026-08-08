@@ -1,0 +1,15 @@
+# cargo-mutants configuration for the CI mutation gate.
+#
+# Exclusions here must carry a written equivalence proof — an excluded
+# mutant is a claim that no behavioral test CAN kill it, not that we did
+# not bother. Review any addition like production code.
+#
+# diff_id.rs:199 `dp[i][j + 1]` -> `dp[i][j * 1]` (i.e. dp[i][j]):
+# in the mismatch branch the recurrence has already assigned
+#   dp[i][j] = max(dp[i + 1][j], dp[i][j + 1])
+# so comparing against dp[i][j] is true exactly when comparing against
+# dp[i][j + 1] — the mutant is behaviorally equivalent. Verified by
+# applying the mutation directly: all diff_id tests pass under it.
+exclude_re = [
+    "diff_id\\.rs:199:.*replace \\+ with \\* in diff_lines",
+]

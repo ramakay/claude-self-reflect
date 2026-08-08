@@ -14,7 +14,7 @@
 //!
 //! Always returns Ok(()) — never blocks Claude Code (catch-all wrapper).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
@@ -282,12 +282,33 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     raw_results.extend(chunk_results);
     raw_results.extend(reflection_results);
 
-    let mut scored = predictor::rank_results_with_continuity(
+    let mut ancestry_conversations: Vec<String> = raw_results
+        .iter()
+        .filter(|result| result.source == "chunk")
+        .filter_map(|result| result.conversation_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    ancestry_conversations.sort();
+    let ancestry_releases =
+        crate::mcp::tools::resolve_validity_for_ancestry(storage, &ancestry_conversations)
+            .map(|validity| {
+                ancestry_releases_for_prompt(
+                    storage
+                        .ancestry_labels_for_conversations(&ancestry_conversations)
+                        .unwrap_or_default(),
+                    &validity,
+                )
+            })
+            .unwrap_or_default();
+
+    let mut scored = predictor::rank_results_with_continuity_and_ancestry(
         raw_results,
         &current_files,
         &current_errors,
         Some(crate::injection::weights::HookPhase::PromptSubmit),
         continued_session_id.as_deref(),
+        &ancestry_releases,
     );
 
     // 4b. Apply outcome-scored multiplier (v9: learning from past injection effectiveness)
@@ -440,6 +461,23 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     );
 
     Ok(())
+}
+
+fn ancestry_releases_for_prompt(
+    labels: HashMap<String, crate::storage::ancestry::AncestryLabel>,
+    validity: &HashMap<String, crate::mcp::tools::ConvValidity>,
+) -> HashMap<String, u32> {
+    labels
+        .into_iter()
+        .filter(|(conversation_id, _)| {
+            !crate::mcp::tools::is_demote_channel(validity, conversation_id)
+        })
+        .filter_map(|(conversation_id, label)| {
+            label
+                .releases_behind_for_decay()
+                .map(|releases| (conversation_id, releases))
+        })
+        .collect()
 }
 
 /// Detect the most recent session's conversation_id if it ended recently.
@@ -1138,12 +1176,22 @@ fn log_injection_detail(
         .take(3)
         .map(|s| format!("{:.3}/{}", s.final_score, s.source))
         .collect();
+    let ancestry_candidates = scored
+        .iter()
+        .filter(|result| {
+            result
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, predictor::Signal::AncestryDecay(_)))
+        })
+        .count();
     crate::telemetry::append_timing_line(&format!(
-        "CSR {} inject: query=\"{}\" items={} anti={} stdout={}B top=[{}]",
+        "CSR {} inject: query=\"{}\" items={} anti={} ancestry={} stdout={}B top=[{}]",
         hook,
         query_preview,
         total_items,
         anti_count,
+        ancestry_candidates,
         stdout_bytes,
         top_scores.join(", "),
     ));
@@ -1196,6 +1244,40 @@ pub fn symbol_overlap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_ancestry_excludes_demote_channel_with_shared_guard() {
+        use crate::storage::ancestry::{AncestryLabel, AncestryState};
+
+        let label = |conversation_id: &str| AncestryLabel {
+            conversation_id: conversation_id.into(),
+            state: AncestryState::Shipped,
+            release_tag: Some("v1.0.0".into()),
+            releases_behind: 5,
+            repository: "/repo".into(),
+            refreshed_at: "2026-08-06T12:00:00Z".into(),
+        };
+        let labels = [
+            ("demoted".into(), label("demoted")),
+            ("clean".into(), label("clean")),
+        ]
+        .into_iter()
+        .collect();
+        let validity = [(
+            "demoted".into(),
+            crate::mcp::tools::ConvValidity {
+                demote: true,
+                note: "stale".into(),
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        let releases = ancestry_releases_for_prompt(labels, &validity);
+
+        assert!(!releases.contains_key("demoted"));
+        assert_eq!(releases.get("clean"), Some(&5));
+    }
 
     // --- episode recency ranking (Route B stale-anchor fix) ---
 

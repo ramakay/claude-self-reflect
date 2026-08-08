@@ -1,5 +1,6 @@
 pub mod api;
 pub mod daemon;
+pub mod dream;
 pub mod embeddings;
 pub mod engine;
 pub mod eval;

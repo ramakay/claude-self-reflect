@@ -67,6 +67,19 @@ pub struct Episode {
 /// Pure function — no I/O, no engine access. Parses each line as JSON and
 /// extracts fields from the Claude Code transcript format.
 pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episode {
+    let messages: Vec<serde_json::Value> = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str(line.trim()).ok())
+        .collect();
+    let (messages, _) = crate::import::sanitize_messages_for_search(&messages);
+    extract_episode_from_messages(&messages, session_id, project)
+}
+
+fn extract_episode_from_messages(
+    messages: &[serde_json::Value],
+    session_id: &str,
+    project: &str,
+) -> Episode {
     let mut request = String::new();
     let mut investigated = HashSet::new();
     let mut files_modified = HashSet::new();
@@ -92,15 +105,7 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
     // Error signature patterns
     let error_patterns: &[&str] = &["error[", "Error:", "panic", "FAIL", "FAILED", "Exception"];
 
-    for line in lines {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-
+    for val in messages {
         let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
         message_count += 1;
 
@@ -125,6 +130,9 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
 
                         if block_type == "tool_use" {
                             if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
+                                if crate::import::is_csr_tool_use(block, name) {
+                                    continue;
+                                }
                                 tools_used.insert(name.to_string());
 
                                 if name == "TodoWrite" {
@@ -1057,6 +1065,40 @@ mod tests {
             .error_signatures
             .iter()
             .any(|s| s.contains("error[E0308]")));
+    }
+
+    #[test]
+    fn episode_excludes_correlated_csr_pair_but_keeps_sibling_tool_and_user_error() {
+        let lines_owned = [
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "tool_use", "id": "csr-1", "name": "csr_reflect_on_past", "input": {"query": "history"}},
+                    {"type": "tool_use", "id": "read-1", "name": "Read", "input": {"file_path": "/src/lib.rs"}}
+                ]}
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [
+                    {"type": "text", "text": "Error: genuine compiler failure"},
+                    {"type": "tool_result", "tool_use_id": "csr-1", "content": "Error: not found in CSR memory"},
+                    {"type": "tool_result", "tool_use_id": "read-1", "content": "ordinary sibling result"}
+                ]}
+            })
+            .to_string(),
+            assistant_text_line("Investigation complete."),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(String::as_str).collect();
+
+        let serialized =
+            serde_json::to_string(&extract_episode(&lines, "sess-sanitized", "my-project"))
+                .unwrap();
+
+        assert!(!serialized.contains("csr_reflect_on_past"));
+        assert!(!serialized.contains("Error: not found in CSR memory"));
+        assert!(serialized.contains("Read"));
+        assert!(serialized.contains("Error: genuine compiler failure"));
     }
 
     #[test]

@@ -42,7 +42,9 @@ pub fn run(conn: &Connection) -> Result<()> {
             conversation_id TEXT,
             chunks_imported INTEGER,
             imported_at TEXT DEFAULT (datetime('now')),
-            file_mtime TEXT
+            file_mtime TEXT,
+            csr_tool_blocks_suppressed INTEGER NOT NULL DEFAULT 0,
+            csr_hook_wrappers_scrubbed INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE INDEX IF NOT EXISTS idx_import_conversation_id
@@ -385,6 +387,26 @@ pub fn run(conn: &Connection) -> Result<()> {
             ON code_node_attribution(node_id);",
     )?;
 
+    // TAD v2 release-ancestry cache. Only conversations backed by the exact
+    // transcript -> node -> git attribution join are stored here. The daemon
+    // replaces the cache atomically after walking release ancestry; retrieval
+    // performs only an indexed conversation-id lookup and never invokes git.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conversation_ancestry_cache (
+            conversation_id TEXT PRIMARY KEY,
+            state           TEXT NOT NULL CHECK(state IN ('shipped','unreleased')),
+            release_tag     TEXT,
+            releases_behind INTEGER NOT NULL CHECK(releases_behind >= 0),
+            repository      TEXT NOT NULL,
+            refreshed_at    TEXT NOT NULL,
+            CHECK(
+                (state = 'shipped' AND release_tag IS NOT NULL)
+                OR
+                (state = 'unreleased' AND release_tag IS NULL AND releases_behind = 0)
+            )
+        );",
+    )?;
+
     // Migration: ast_status column on code_graph_file_state (WP2 Stage 3, H8
     // innovation — receipt R4 in
     // `.plans/2026-07-31-codegraph-shipping-plan.md`). File-level provenance
@@ -435,6 +457,27 @@ pub fn run(conn: &Connection) -> Result<()> {
             "ALTER TABLE import_state ADD COLUMN conversation_id TEXT;
              CREATE INDEX IF NOT EXISTS idx_import_conversation_id ON import_state(conversation_id);",
         );
+    }
+
+    // Per-file cumulative suppression totals make the global counters idempotent
+    // across the full-file reparses used by incremental transcript imports.
+    // Legacy rows stay NULL until their first reparse establishes a baseline;
+    // fresh databases use the NOT NULL zero defaults in CREATE TABLE above.
+    let has_tool_suppression_col = conn
+        .prepare("SELECT csr_tool_blocks_suppressed FROM import_state LIMIT 0")
+        .is_ok();
+    if !has_tool_suppression_col {
+        conn.execute_batch(
+            "ALTER TABLE import_state ADD COLUMN csr_tool_blocks_suppressed INTEGER;",
+        )?;
+    }
+    let has_wrapper_suppression_col = conn
+        .prepare("SELECT csr_hook_wrappers_scrubbed FROM import_state LIMIT 0")
+        .is_ok();
+    if !has_wrapper_suppression_col {
+        conn.execute_batch(
+            "ALTER TABLE import_state ADD COLUMN csr_hook_wrappers_scrubbed INTEGER;",
+        )?;
     }
 
     // Migration: add summary column to chunks table if missing (for timeline display)
@@ -683,6 +726,131 @@ pub fn run(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_edge_scope_chains_file ON edge_scope_chains(project, file);",
     )?;
 
+    // witness_ledger (v10 "dreaming" substrate): append-only ledger of
+    // `codewitness` content-hash stamps anchored to a file/symbol/span at a
+    // specific git commit (or worktree). This is the evidence substrate for
+    // future evidence-grounded forgetting — a claim gets a witness once, and
+    // later audits (`codewitness::Auditor::try_audit`) check whether that
+    // witness still holds, rather than re-deriving the claim from scratch or
+    // trusting a wall-clock staleness heuristic.
+    //
+    // APPEND-ONLY INVARIANT: `storage::witness_ledger` exposes INSERT and
+    // QUERY functions ONLY — there is no UPDATE or DELETE for this table. A
+    // witness that no longer holds is superseded by inserting a NEW row (a
+    // fresh stamp at a later commit), never by mutating or removing the old
+    // one; see `storage::witness_ledger`'s module doc for the full rationale.
+    //
+    // Identity dedupe: `idx_witness_ledger_identity` (a UNIQUE expression
+    // index, below) makes a repeat insert of an identical claim (e.g. an
+    // idempotent `codegraph stamp-spans` re-run) conflict, and
+    // `storage::witness_ledger::insert_witness` uses `INSERT OR IGNORE` so
+    // the duplicate is a silent no-op. SQLite (like standard SQL) treats
+    // every NULL in a plain UNIQUE constraint as distinct from every other
+    // NULL, which is why this is an expression index over
+    // `COALESCE(...)`-normalized key columns rather than an inline
+    // `UNIQUE(...)` on the table: whole-file witnesses (`symbol`/
+    // `span_start`/`span_end` all NULL) dedupe atomically at the DB level
+    // too — see the
+    // `witness_ledger_identity_index_dedupes_null_symbol_rows` test below.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS witness_ledger (
+            id INTEGER PRIMARY KEY,
+            project TEXT NOT NULL,
+            file TEXT NOT NULL,
+            symbol TEXT,
+            span_start INTEGER, span_end INTEGER,
+            stamp TEXT NOT NULL,
+            tier TEXT NOT NULL CHECK (tier IN ('worktree','committed')),
+            at_oid TEXT,
+            source_kind TEXT NOT NULL,
+            source_id TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_witness_ledger_identity ON witness_ledger (project, file, COALESCE(symbol,''), COALESCE(span_start,-1), COALESCE(span_end,-1), stamp, tier, COALESCE(at_oid,''), source_kind, COALESCE(source_id,''));
+        CREATE INDEX IF NOT EXISTS idx_witness_ledger_lookup ON witness_ledger(project, file, symbol);",
+    )?;
+
+    // Mutable publication bookkeeping for append-only witness evidence.
+    // `witness_ledger` itself remains immutable: a re-derivation run first
+    // computes every row in memory, then one transaction inserts the rows
+    // and a COMPLETE manifest. Failed runs may record an INCOMPLETE manifest
+    // but publish no ledger rows. Binding therefore has an explicit atomic
+    // publication boundary instead of inferring completeness from row order.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS witness_generations (
+            id INTEGER PRIMARY KEY,
+            generation_id TEXT NOT NULL UNIQUE,
+            project TEXT NOT NULL,
+            file TEXT NOT NULL,
+            repo_root TEXT,
+            head_oid TEXT NOT NULL,
+            extractor_version TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('complete','incomplete')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_witness_generations_lookup
+            ON witness_generations(project, file, status, id);
+        CREATE INDEX IF NOT EXISTS idx_witness_generations_skip
+            ON witness_generations(project, file, head_oid, extractor_version, status);",
+    )?;
+
+    // witness_verdicts (v10 "dreaming" — see `dream` module +
+    // `storage::witness_verdicts`'s module doc): append-only EVENTS describing
+    // how a `witness_ledger` row's claim relates to git history, minted by the
+    // deterministic successor join (`dream::run_dream`), never by hand. Same
+    // append-only discipline as `witness_ledger` itself — INSERT + QUERY only,
+    // no UPDATE/DELETE. Events are per-witness history: the LATEST event
+    // (highest `id`) for a given `witness_id` is that witness's current state;
+    // a reinstatement (the A -> B -> A revert case) is a NEW `anchor_reinstated`
+    // event layered on top, never an update of the prior negative verdict.
+    //
+    // `verdict` CHECK constraint keeps the table from ever silently accepting a
+    // fourth pseudo-verdict — mirrors `code_node_attribution.channel`'s CHECK
+    // (both close the same class of "accidental new state, never validated"
+    // bug at the DB layer, not just by convention). `successor_witness_id` is
+    // set only for `superseded_by` (the OLDER witness's replacement); NULL for
+    // `anchor_obsolete`/`anchor_reinstated`. `receipt_oid` is the commit proving
+    // the verdict (the successor's `at_oid` for `superseded_by`, else the HEAD
+    // oid observed when the dream cycle ran). `observed_head_oid` is NOT NULL —
+    // every event is anchored to the HEAD commit the dream cycle that minted it
+    // saw (per-repo HEAD when a run visits multiple repos), never wall-clock
+    // time.
+    //
+    // Idempotency is APP-SIDE ONLY (`witness_verdicts::insert_verdict_if_changed`):
+    // before inserting, the writer reads the LATEST event for that witness and
+    // skips iff the candidate is identical in (verdict, successor_witness_id,
+    // receipt_oid, observed_head_oid). There is deliberately NO UNIQUE identity
+    // index on this table: event history legitimately re-visits earlier states
+    // (B -> A -> B: superseded, reinstated, superseded again with the exact
+    // same fields as the first event) and a UNIQUE index would silently swallow
+    // the third event via `INSERT OR IGNORE`, freezing the witness's state at
+    // "reinstated" forever. Only the LATEST event per witness matters, so
+    // "skip iff identical to latest" is the whole idempotency contract.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS witness_verdicts (
+            id INTEGER PRIMARY KEY,
+            witness_id INTEGER NOT NULL,
+            verdict TEXT NOT NULL CHECK (verdict IN ('anchor_obsolete','anchor_reinstated','superseded_by')),
+            successor_witness_id INTEGER,
+            receipt_oid TEXT,
+            observed_head_oid TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_witness_verdicts_witness ON witness_verdicts(witness_id);
+        DROP INDEX IF EXISTS idx_witness_verdicts_identity;",
+    )?;
+
+    // code_nodes conversation-attribution indexes (v10 "dreaming" chunk
+    // binding — `storage::chunk_binding::witness_verdict_for_chunks`):
+    // `first_conv_id`/`last_conv_id` had no index before this, so every
+    // search-time chunk-binding lookup would otherwise full-scan `code_nodes`.
+    // Purely additive, cheap to (re)create on existing DBs.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_code_nodes_first_conv ON code_nodes(first_conv_id);
+         CREATE INDEX IF NOT EXISTS idx_code_nodes_last_conv ON code_nodes(last_conv_id);",
+    )?;
+
     Ok(())
 }
 
@@ -915,5 +1083,198 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM edge_scope_chains", [], |r| r.get(0))
             .unwrap();
         assert_eq!((lb, esc), (1, 1), "witness rows must survive re-open");
+    }
+
+    #[test]
+    fn witness_ledger_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        // Insert BEFORE the rerun: idempotency means existing ledger rows
+        // survive a second migration pass (guards against the PR #279-class
+        // table-wipe regression, where a rerun recreated the table).
+        conn.execute(
+            "INSERT INTO witness_ledger (project, file, stamp, tier, source_kind) \
+             VALUES ('p', 'f.rs', 'b3:abc', 'committed', 'backfill')",
+            [],
+        )
+        .unwrap();
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare(
+                "SELECT id, project, file, symbol, span_start, span_end, stamp, tier, at_oid, \
+                 source_kind, source_id, created_at FROM witness_ledger LIMIT 0"
+            )
+            .is_ok(),
+            "witness_ledger table must exist after migration"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "ledger rows must survive a migration rerun");
+    }
+
+    #[test]
+    fn witness_ledger_tier_check_constraint_rejects_invalid_tier() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let ok = conn.execute(
+            "INSERT INTO witness_ledger (project, file, stamp, tier, source_kind) \
+             VALUES ('p', 'f', 'b3:abc', 'committed', 'backfill')",
+            [],
+        );
+        assert!(ok.is_ok(), "valid tier must be accepted: {ok:?}");
+        let bad = conn.execute(
+            "INSERT INTO witness_ledger (project, file, stamp, tier, source_kind) \
+             VALUES ('p', 'f', 'b3:abc', 'guess', 'backfill')",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "tier CHECK constraint must reject a non-worktree/committed value"
+        );
+    }
+
+    #[test]
+    fn witness_ledger_identity_index_dedupes_duplicate_symbol_row() {
+        // Symbol-level rows conflict on `idx_witness_ledger_identity`, so
+        // `INSERT OR IGNORE` (what `storage::witness_ledger::insert_witness`
+        // issues) must dedupe them (see the append-only invariant doc above `run`).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let insert = "INSERT OR IGNORE INTO witness_ledger
+            (project, file, symbol, span_start, span_end, stamp, tier, at_oid, source_kind, source_id)
+            VALUES ('p', 'f.rs', 'foo', 1, 3, 'b3:abc', 'committed', 'deadbeef', 'backfill', 'deadbeef')";
+        conn.execute(insert, []).unwrap();
+        conn.execute(insert, []).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "duplicate symbol-level witness must be ignored, not duplicated"
+        );
+    }
+
+    #[test]
+    fn witness_ledger_identity_index_dedupes_null_symbol_rows() {
+        // The reason `idx_witness_ledger_identity` is a COALESCE expression
+        // index rather than an inline UNIQUE(...) constraint: SQLite treats
+        // every NULL as distinct in a plain UNIQUE index, but COALESCE
+        // normalizes the NULL key columns, so two whole-file witnesses
+        // (`symbol`/`span_start`/`span_end` all NULL) with identical
+        // non-NULL columns dedupe atomically at the DB level — one row, no
+        // application-level guard needed.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let insert = "INSERT OR IGNORE INTO witness_ledger
+            (project, file, stamp, tier, at_oid, source_kind, source_id)
+            VALUES ('p', 'f.rs', 'b3:abc', 'committed', 'deadbeef', 'backfill', 'deadbeef')";
+        conn.execute(insert, []).unwrap();
+        conn.execute(insert, []).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "identical whole-file (NULL-key) witnesses must dedupe to one row via the identity index"
+        );
+    }
+
+    #[test]
+    fn witness_verdicts_migration_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        // Insert BEFORE the rerun — idempotency means existing verdict events
+        // survive a second migration pass (same PR #279-class table-wipe
+        // regression guard as `witness_ledger_migration_idempotent`).
+        conn.execute(
+            "INSERT INTO witness_verdicts (witness_id, verdict, observed_head_oid) \
+             VALUES (1, 'anchor_obsolete', 'deadbeef')",
+            [],
+        )
+        .unwrap();
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare(
+                "SELECT id, witness_id, verdict, successor_witness_id, receipt_oid, \
+                 observed_head_oid, created_at FROM witness_verdicts LIMIT 0"
+            )
+            .is_ok(),
+            "witness_verdicts table must exist after migration"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "verdict events must survive a migration rerun");
+    }
+
+    #[test]
+    fn witness_verdicts_verdict_check_constraint_rejects_invalid_verdict() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let ok = conn.execute(
+            "INSERT INTO witness_verdicts (witness_id, verdict, observed_head_oid) \
+             VALUES (1, 'superseded_by', 'deadbeef')",
+            [],
+        );
+        assert!(ok.is_ok(), "valid verdict must be accepted: {ok:?}");
+        let bad = conn.execute(
+            "INSERT INTO witness_verdicts (witness_id, verdict, observed_head_oid) \
+             VALUES (1, 'guess', 'deadbeef')",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "verdict CHECK constraint must reject a non-enumerated value"
+        );
+    }
+
+    #[test]
+    fn witness_verdicts_has_no_unique_identity_index() {
+        // Idempotency for verdict events is APP-SIDE ONLY (compare against the
+        // LATEST event per witness — see `witness_verdicts::is_new_event`). A
+        // UNIQUE identity index would silently swallow legitimate state
+        // re-visits (B -> A -> B) via `INSERT OR IGNORE`, so the migration
+        // must not create one — and must drop it from pre-release dev DBs.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_witness_verdicts_identity'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "no UNIQUE identity index on witness_verdicts");
+        // The same row twice must therefore insert twice at the raw SQL layer
+        // (the app-side latest-event check is the only dedupe).
+        let insert = "INSERT INTO witness_verdicts \
+            (witness_id, verdict, successor_witness_id, receipt_oid, observed_head_oid) \
+            VALUES (1, 'superseded_by', 2, 'cafebabe', 'deadbeef')";
+        conn.execute(insert, []).unwrap();
+        conn.execute(insert, []).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "raw inserts are never DB-deduped");
+    }
+
+    #[test]
+    fn code_nodes_conv_indexes_exist() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name IN ('idx_code_nodes_first_conv','idx_code_nodes_last_conv')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            idx_count, 2,
+            "both code_nodes conversation-attribution indexes must exist"
+        );
     }
 }

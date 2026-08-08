@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::embeddings::EmbeddingEngine;
 use crate::import;
@@ -24,6 +24,12 @@ pub struct FileWatcher {
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
     index_dir: PathBuf,
+    /// Optional shared one-owner permit, held while importing a debounced
+    /// batch of files. `None` for callers
+    /// that don't need the signal (e.g. the MCP-embedded watcher started by
+    /// `Engine::start_watcher`) — opt-in via [`Self::with_heavy_work_permit`] so
+    /// this stays additive for every existing caller.
+    heavy_work: Option<Arc<Semaphore>>,
 }
 
 impl FileWatcher {
@@ -40,7 +46,15 @@ impl FileWatcher {
             embeddings,
             search,
             index_dir,
+            heavy_work: None,
         }
+    }
+
+    /// Share the daemon's exclusive heavy-work semaphore. The watcher waits
+    /// for and retains an owned RAII permit across import and index flush.
+    pub fn with_heavy_work_permit(mut self, permit: Arc<Semaphore>) -> Self {
+        self.heavy_work = Some(permit);
+        self
     }
 
     /// Spawn the watcher as a background tokio task. Returns a JoinHandle.
@@ -114,6 +128,10 @@ impl FileWatcher {
 
             // Process all pending files
             if !pending.is_empty() {
+                let _heavy_permit = match &self.heavy_work {
+                    Some(heavy_work) => Some(acquire_heavy_work_permit(heavy_work.clone()).await),
+                    None => None,
+                };
                 tracing::info!(count = pending.len(), "processing new/modified JSONL files");
                 for file_path in &pending {
                     if let Err(e) = self.import_file(file_path).await {
@@ -134,6 +152,7 @@ impl FileWatcher {
                         tracing::warn!(error = %e, "failed to flush HNSW index after watcher batch");
                     }
                 }
+                drop(idx);
             }
         }
 
@@ -159,23 +178,34 @@ impl FileWatcher {
             return Ok(());
         }
 
+        let attribution =
+            import::derive_conversation_attribution_canonical(&canonical_base, &canonical);
+        let conv_id = file_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if let Some(parent) = attribution.parent_conversation_id.as_deref() {
+            self.storage.rescope_sidechain_conversation(
+                &conv_id,
+                &attribution.project_name,
+                parent,
+            )?;
+        }
+
         // Skip if already imported
         if self.storage.is_file_imported(file_path)? {
             return Ok(());
         }
 
-        // Infer project name from parent directory
-        let project_name = file_path
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| import::normalize_project_name(&n.to_string_lossy()))
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let chunks = import::parse_jsonl_file(file_path, &project_name)?;
+        let parsed = import::parse_jsonl_file_with_stats(file_path, &attribution.project_name)?;
+        let suppression = parsed.suppression;
+        let chunks = parsed.chunks;
         if chunks.is_empty() {
             // Record the skip so this file isn't re-parsed every watcher pass
             // and import_percent counts it as processed.
-            self.storage.mark_file_imported(file_path, 0)?;
+            self.storage
+                .mark_file_imported_with_suppression(file_path, 0, suppression)?;
             return Ok(());
         }
 
@@ -193,19 +223,29 @@ impl FileWatcher {
 
             let mut idx = self.search.write().await;
             for (chunk, embedding) in batch.iter().zip(embeddings) {
-                self.storage.insert_chunk(chunk, &embedding)?;
+                self.storage
+                    .insert_chunk_with_source(chunk, &embedding, attribution.source)?;
+                if let Err(error) = self.storage.insert_chunk_provenance(
+                    &chunk.id,
+                    &crate::provenance::ChunkProvenance {
+                        author: chunk.author,
+                        source_conv_id: attribution
+                            .parent_conversation_id
+                            .clone()
+                            .unwrap_or_else(|| chunk.conversation_id.clone()),
+                        supersedes: None,
+                    },
+                ) {
+                    tracing::warn!(error = %error, chunk = %chunk.id, "chunk provenance persist failed");
+                }
                 idx.insert_chunk(chunk.id.clone(), embedding);
             }
         }
 
-        self.storage.mark_file_imported(file_path, chunk_count)?;
+        self.storage
+            .mark_file_imported_with_suppression(file_path, chunk_count, suppression)?;
 
         // Layer 1: Heuristic enrichment (inline, instant, free)
-        let conv_id = file_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
         if !self
             .storage
             .is_conversation_enriched(&conv_id, "heuristic")
@@ -214,7 +254,7 @@ impl FileWatcher {
             if let Err(e) = crate::extraction::heuristic::enrich_conversation(
                 file_path,
                 &conv_id,
-                &project_name,
+                &attribution.project_name,
                 &self.storage,
                 &self.embeddings,
                 &self.search,
@@ -232,10 +272,20 @@ impl FileWatcher {
         tracing::info!(
             file = %file_path.display(),
             chunks = chunk_count,
-            project = %project_name,
+            project = %attribution.project_name,
+            source = attribution.source,
             "auto-imported conversation"
         );
 
         Ok(())
     }
+}
+
+/// Wait for exclusive ownership of daemon heavy work. The owned RAII
+/// permit is held by the caller for the complete watcher batch.
+pub(crate) async fn acquire_heavy_work_permit(heavy_work: Arc<Semaphore>) -> OwnedSemaphorePermit {
+    heavy_work
+        .acquire_owned()
+        .await
+        .expect("daemon heavy-work semaphore must never be closed")
 }

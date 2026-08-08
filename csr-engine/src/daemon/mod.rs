@@ -1,12 +1,16 @@
 //! Daemon module — background processing for progressive enrichment.
 //!
-//! Runs four background tasks:
+//! Runs six background tasks:
 //! 1. File watcher (existing) — auto-import new JSONL files
 //! 2. Extraction loop (Layer 2) — V3 extraction on imported conversations
 //! 3. Narrator loop (Layer 3) — AI batch narrative generation (if API key set)
 //! 4. Consolidation loop (Layer 4) — Dreamer v1 typed fact extraction from narratives
+//! 5. Dream loop (v10) — periodic `dream_cadence::dream_loop` cycle over the
+//!    witness ledger (see that module for cadence/persistence/cost-discipline)
+//! 6. Release-ancestry loop — precomputes deterministic TAD v2 episode labels
 
 pub mod consolidation;
+pub mod dream_cadence;
 pub mod ratification;
 
 use std::path::{Path, PathBuf};
@@ -15,7 +19,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::api::types::BatchRequest;
 use crate::api::{AnthropicClient, BatchClient};
@@ -122,6 +126,10 @@ impl Daemon {
         // Shared shutdown flag for graceful termination (D-8)
         let shutdown = Arc::new(AtomicBool::new(false));
 
+        // Shared one-owner permit for watcher batches, plan imports, and
+        // dream cycles. Owned permits provide RAII release on every exit.
+        let heavy_work = Arc::new(Semaphore::new(1));
+
         // Start file watcher
         let watcher = crate::import::watcher::FileWatcher::new(
             self.projects_dir.clone(),
@@ -129,7 +137,8 @@ impl Daemon {
             self.embeddings.clone(),
             self.search.clone(),
             self.index_dir.clone(),
-        );
+        )
+        .with_heavy_work_permit(heavy_work.clone());
         let watcher_handle = watcher.spawn();
         tracing::info!("file watcher started");
 
@@ -269,6 +278,7 @@ impl Daemon {
                 self.projects_dir.clone(),
             ));
             let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
             tokio::spawn(async move {
                 loop {
                     for _ in 0..180 {
@@ -279,7 +289,12 @@ impl Daemon {
                     }
                     let eng = engine.clone();
                     let shutdown_inner = shutdown.clone();
+                    let permit = match heavy_work.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
                     let _ = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
                         let Some(home) = dirs::home_dir() else { return };
                         let plans_dir = home.join(".claude/plans");
                         let plans =
@@ -314,6 +329,63 @@ impl Daemon {
         };
         tracing::info!("plans loop started (~/.claude/plans → source='plan' chunks)");
 
+        // Optional Codex rollout loop. It runs once immediately and then every
+        // 30 minutes. Missing ~/.codex/sessions is deliberately silent, and the
+        // directory is re-checked each cycle so a later installation is detected.
+        let codex_rollout_handle = {
+            let engine = Arc::new(crate::engine::Engine::from_parts(
+                self.storage.clone(),
+                self.embeddings.clone(),
+                self.search.clone(),
+                self.projects_dir.clone(),
+            ));
+            let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
+            tokio::spawn(async move {
+                loop {
+                    if shutdown.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let codex_root = dirs::home_dir().map(|home| home.join(".codex/sessions"));
+                    if let Some(root) = codex_root.filter(|root| root.exists()) {
+                        let permit = match heavy_work.clone().acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(_) => return,
+                        };
+                        let adapter_engine = engine.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            match crate::import::codex_rollout::import_changed_rollouts(
+                                &adapter_engine,
+                                &root,
+                            ) {
+                                Ok(stats) => tracing::debug!(
+                                    discovered = stats.files_discovered,
+                                    files = stats.files_imported,
+                                    chunks = stats.chunks_imported,
+                                    vanished = stats.vanished,
+                                    schema_misses = stats.schema_misses,
+                                    csr_tool_blocks_suppressed = stats.csr_tool_blocks_suppressed,
+                                    csr_hook_wrappers_scrubbed = stats.csr_hook_wrappers_scrubbed,
+                                    "Codex rollouts imported"
+                                ),
+                                Err(error) => {
+                                    tracing::warn!(%error, "Codex rollout import failed")
+                                }
+                            }
+                        })
+                        .await;
+                    }
+                    for _ in 0..180 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                }
+            })
+        };
+
         // Ratification loop — dialog-act scoring (interval via CSR_RATIFICATION_INTERVAL_SECS)
         let ratification_handle = {
             let storage = self.storage.clone();
@@ -323,6 +395,37 @@ impl Daemon {
             })
         };
         tracing::info!("ratification loop started");
+
+        // Dream loop (v10) — periodic cadence-gated `dream_cadence::dream_loop`
+        // cycle over the witness ledger. See that module's doc for cadence,
+        // persistence, cancellation, monotonic scheduling, and the heavy
+        // work permit it shares with the watcher and plans loop above.
+        let dream_handle = {
+            let engine = Arc::new(crate::engine::Engine::from_parts(
+                self.storage.clone(),
+                self.embeddings.clone(),
+                self.search.clone(),
+                self.projects_dir.clone(),
+            ));
+            let heavy_work = heavy_work.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                dream_cadence::dream_loop(engine, heavy_work, shutdown).await;
+            })
+        };
+        tracing::info!("dream loop started (v10 \"dreaming\")");
+
+        // TAD v2 release ancestry: git traversal is daemon-only and shares
+        // the single heavy-work permit with watcher/plans/dream cycles.
+        let ancestry_handle = {
+            let storage = self.storage.clone();
+            let heavy_work = heavy_work.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                ancestry_refresh_loop(storage, heavy_work, shutdown).await;
+            })
+        };
+        tracing::info!("release-ancestry refresh loop started (TAD v2)");
 
         // Wait for Ctrl+C
         tokio::signal::ctrl_c().await?;
@@ -346,7 +449,22 @@ impl Daemon {
         // between plans on shutdown, so at most one bounded import is in
         // flight: await it fully.
         let _ = plans_handle.await;
+        // Same index-mutation contract as plans: never detach an in-flight import.
+        let _ = codex_rollout_handle.await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
+        // The dream loop's tick awaits its `spawn_blocking` cycle directly
+        // (see `dream_cadence::tick`) and checks the shutdown flag between
+        // repos/anchors, so the timeout below bounds a cycle that ignores
+        // cancellation. Dream writes are single-statement inserts — an abrupt
+        // exit mid-cycle loses at most that cycle's remaining events, never
+        // corrupts state.
+        let _ = tokio::time::timeout(timeout, dream_handle).await;
+        // An ancestry refresh owns the same heavy-work permit and awaits its
+        // blocking git/cache publication. Timing out would detach that task,
+        // allowing a cache mutation after `run` returned. The loop abstains
+        // immediately when shutdown arrives while it waits for the permit;
+        // if publication already began, await that bounded cycle fully.
+        let _ = ancestry_handle.await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
 
         // Flush HNSW index to disk before exit
@@ -363,6 +481,117 @@ impl Daemon {
 
         tracing::info!("daemon stopped");
         Ok(())
+    }
+}
+
+/// Acquire the daemon's serialized heavy-work slot, then recheck shutdown at
+/// the handoff boundary. A loop may begin waiting before shutdown and acquire
+/// only afterward; returning `None` drops that permit without starting work.
+async fn acquire_heavy_work_unless_shutdown(
+    heavy_work: Arc<Semaphore>,
+    shutdown: &AtomicBool,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permit = heavy_work.acquire_owned().await.ok()?;
+    if shutdown.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(permit)
+}
+
+fn finish_ancestry_refresh<T>(
+    storage: &Storage,
+    result: std::result::Result<anyhow::Result<T>, tokio::task::JoinError>,
+) -> anyhow::Result<T> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => {
+            crate::storage::ancestry::invalidate_ancestry_cache(storage)?;
+            Err(error)
+        }
+        Err(error) => {
+            crate::storage::ancestry::invalidate_ancestry_cache(storage)?;
+            Err(error.into())
+        }
+    }
+}
+
+async fn ancestry_refresh_once(
+    storage: Arc<Storage>,
+    heavy_work: Arc<Semaphore>,
+    shutdown: &AtomicBool,
+) -> anyhow::Result<Option<usize>> {
+    if shutdown.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+
+    let refresh_storage = storage.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        crate::storage::ancestry::prepare_ancestry_refresh(
+            &refresh_storage,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+    })
+    .await;
+    let mut refresh = finish_ancestry_refresh(&storage, prepared)?;
+
+    for repository in refresh.repositories() {
+        if shutdown.load(Ordering::SeqCst) {
+            crate::storage::ancestry::invalidate_ancestry_cache(&storage)?;
+            return Ok(None);
+        }
+        let Some(permit) = acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown).await
+        else {
+            crate::storage::ancestry::invalidate_ancestry_cache(&storage)?;
+            return Ok(None);
+        };
+        let walked = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            Ok(refresh.walk_repository(&repository))
+        })
+        .await;
+        refresh = finish_ancestry_refresh(&storage, walked)?;
+    }
+
+    if shutdown.load(Ordering::SeqCst) {
+        crate::storage::ancestry::invalidate_ancestry_cache(&storage)?;
+        return Ok(None);
+    }
+    let publish_storage = storage.clone();
+    let published = tokio::task::spawn_blocking(move || refresh.publish(&publish_storage)).await;
+    finish_ancestry_refresh(&storage, published).map(Some)
+}
+
+/// Refresh immediately, then once per hour. A fixed post-cycle delay makes
+/// cadence deterministic and avoids overlapping refreshes. Git/repository
+/// errors are handled per repository by the refresh implementation and leave
+/// those conversations neutral (no cache row).
+async fn ancestry_refresh_loop(
+    storage: Arc<Storage>,
+    heavy_work: Arc<Semaphore>,
+    shutdown: Arc<AtomicBool>,
+) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        match ancestry_refresh_once(storage.clone(), heavy_work.clone(), &shutdown).await {
+            Ok(Some(count)) => {
+                tracing::debug!(count, "release-ancestry cache refreshed")
+            }
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, "release-ancestry refresh failed open")
+            }
+        }
+
+        // Shutdown-aware one-hour delay, matching the daemon's existing
+        // ten-second polling convention.
+        for _ in 0..360 {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        }
     }
 }
 
@@ -455,7 +684,7 @@ async fn process_v3_extraction(
     conv_id: &str,
     file_path: &Path,
 ) -> Result<()> {
-    let messages = import::parse_jsonl_messages(file_path)?;
+    let messages = import::parse_jsonl_messages_for_search(file_path)?;
     if messages.is_empty() {
         return Ok(());
     }
@@ -630,42 +859,12 @@ async fn narrator_loop_inner(
                 }
             }
 
-            let messages = import::parse_jsonl_messages(path)?;
+            let messages = import::parse_jsonl_messages_for_search(path)?;
             if messages.is_empty() {
                 continue;
             }
 
-            // Build a conversation summary for the AI with size cap (D-16)
-            // Sample first 50 + last 50 messages to capture both context and resolution
-            let mut summary = String::new();
-            let max_prompt_chars: usize = 100_000; // ~25K tokens budget
-            let total = messages.len();
-            let head = 50.min(total);
-            let tail_start = if total > 100 { total - 50 } else { head };
-            let sampled: Vec<_> = messages[..head]
-                .iter()
-                .chain(messages[tail_start..].iter())
-                .collect();
-            for m in &sampled {
-                let line = serde_json::to_string(m).unwrap_or_default();
-                if summary.len() + line.len() > max_prompt_chars {
-                    break;
-                }
-                if !summary.is_empty() {
-                    summary.push('\n');
-                }
-                summary.push_str(&line);
-            }
-
-            // XML boundary tags separate system prompt from user data (D-4)
-            // Escape XML boundary tags in transcript to prevent prompt injection (Codex H-1)
-            let sanitized_summary = summary
-                .replace("</conversation_data>", "&lt;/conversation_data&gt;")
-                .replace("<conversation_data>", "&lt;conversation_data&gt;");
-            let prompt = format!(
-                "{}\n\n---\n<conversation_data>\n{}\n</conversation_data>",
-                skill_prompt, sanitized_summary
-            );
+            let prompt = build_narrative_prompt(&skill_prompt, &messages);
             requests.push(BatchRequest {
                 custom_id: conv_id.clone(),
                 prompt,
@@ -719,6 +918,34 @@ async fn narrator_loop_inner(
     }
 
     Ok(())
+}
+
+fn build_narrative_prompt(skill_prompt: &str, messages: &[serde_json::Value]) -> String {
+    // Sample first 50 + last 50 messages to capture both context and resolution.
+    let mut summary = String::new();
+    let max_prompt_chars: usize = 100_000;
+    let total = messages.len();
+    let head = 50.min(total);
+    let tail_start = if total > 100 { total - 50 } else { head };
+    for message in messages[..head].iter().chain(messages[tail_start..].iter()) {
+        let line = serde_json::to_string(message).unwrap_or_default();
+        if summary.len() + line.len() > max_prompt_chars {
+            break;
+        }
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        summary.push_str(&line);
+    }
+
+    // XML boundary tags separate system prompt from user data (D-4).
+    let sanitized_summary = summary
+        .replace("</conversation_data>", "&lt;/conversation_data&gt;")
+        .replace("<conversation_data>", "&lt;conversation_data&gt;");
+    format!(
+        "{}\n\n---\n<conversation_data>\n{}\n</conversation_data>",
+        skill_prompt, sanitized_summary
+    )
 }
 
 /// Poll a submitted batch until completion, then store results. Runs as a separate task (D-7).
@@ -1036,6 +1263,55 @@ mod tests {
         assert_eq!(config.batch_poll_interval_secs, 60);
     }
 
+    #[tokio::test]
+    async fn ancestry_refresh_abstains_when_shutdown_arrives_while_waiting_for_permit() {
+        let heavy_work = Arc::new(Semaphore::new(1));
+        let held_permit = heavy_work.clone().acquire_owned().await.unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let heavy_work = heavy_work.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                acquire_heavy_work_unless_shutdown(heavy_work, &shutdown)
+                    .await
+                    .is_some()
+            })
+        };
+
+        tokio::task::yield_now().await;
+        shutdown.store(true, Ordering::SeqCst);
+        drop(held_permit);
+
+        assert!(
+            !waiter.await.unwrap(),
+            "a refresh unblocked after shutdown must release the permit without mutating the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn ancestry_refresh_join_error_invalidates_cache() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO conversation_ancestry_cache
+                     (conversation_id, state, release_tag, releases_behind,
+                      repository, refreshed_at)
+                     VALUES ('stale', 'shipped', 'v1.0.0', 5, '/repo', ?1)",
+                    [chrono::Utc::now().to_rfc3339()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let panicked = tokio::task::spawn_blocking(|| -> anyhow::Result<usize> {
+            panic!("simulated ancestry worker panic")
+        })
+        .await;
+
+        assert!(finish_ancestry_refresh(&storage, panicked).is_err());
+        assert_eq!(storage.ancestry_cache_count().unwrap(), 0);
+    }
+
     #[test]
     fn test_conversation_sampling_short() {
         // For <= 100 messages, all should be included (no gap)
@@ -1066,5 +1342,69 @@ mod tests {
         assert_eq!(*sampled[49], 49);
         assert_eq!(*sampled[50], 150); // first of the tail
         assert_eq!(*sampled[99], 199);
+    }
+
+    #[test]
+    fn narrative_prompt_excludes_csr_material_without_losing_neighbors() {
+        let messages = vec![
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [
+                    {
+                        "type": "tool_use",
+                        "id": "csr-call",
+                        "name": "csr_reflect_on_past",
+                        "input": {"query": "CSR QUERY MUST DISAPPEAR"}
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "read-call",
+                        "name": "Read",
+                        "input": {"file_path": "/repo/src/kept.rs"}
+                    }
+                ]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [
+                    {
+                        "type": "text",
+                        "text": "USER PROSE BEFORE <system-reminder>CSR ENDLESS MEMORY ACTIVE — CSR WRAPPER MUST DISAPPEAR</system-reminder> USER PROSE AFTER"
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "csr-call",
+                        "content": "CSR RESULT MUST DISAPPEAR"
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "read-call",
+                        "content": "SIBLING RESULT MUST STAY"
+                    }
+                ]}
+            }),
+        ];
+
+        let (sanitized, _) = import::sanitize_messages_for_search(&messages);
+        let prompt = build_narrative_prompt("NARRATIVE SKILL", &sanitized);
+
+        for forbidden in [
+            "CSR QUERY MUST DISAPPEAR",
+            "CSR RESULT MUST DISAPPEAR",
+            "CSR WRAPPER MUST DISAPPEAR",
+        ] {
+            assert!(!prompt.contains(forbidden));
+        }
+        for retained in [
+            "USER PROSE BEFORE",
+            "USER PROSE AFTER",
+            "kept.rs",
+            "SIBLING RESULT MUST STAY",
+        ] {
+            assert!(
+                prompt.contains(retained),
+                "narrative prompt lost {retained}"
+            );
+        }
     }
 }

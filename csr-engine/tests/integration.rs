@@ -387,6 +387,7 @@ fn test_format_search_results_structure() {
             is_sidechain: false,
         },
         resolution: None,
+        validity_demoted: false,
     }];
 
     let xml = format::format_search_results(&results, "docker memory", "test-project", 5, 2);
@@ -420,6 +421,7 @@ fn test_format_recency_results_includes_age_stamp() {
             is_sidechain: false,
         },
         resolution: None,
+        validity_demoted: false,
     }];
 
     let xml = format::format_recency_results(&results, "recency query", "last 7 days");
@@ -449,6 +451,7 @@ fn test_dedupe_results_collapses_same_conversation_duplicate() {
                 is_sidechain: false,
             },
             resolution: None,
+            validity_demoted: false,
         },
         EnrichedResult {
             score: 0.70,
@@ -465,6 +468,7 @@ fn test_dedupe_results_collapses_same_conversation_duplicate() {
                 is_sidechain: false,
             },
             resolution: None,
+            validity_demoted: false,
         },
     ];
 
@@ -502,6 +506,7 @@ fn test_format_quick_check_structure() {
             is_sidechain: false,
         },
         resolution: None,
+        validity_demoted: false,
     }];
 
     let xml = format::format_quick_check(&results, "JWT auth");
@@ -538,6 +543,7 @@ fn test_xml_escaping_in_output() {
             is_sidechain: false,
         },
         resolution: None,
+        validity_demoted: false,
     }];
 
     let xml = format::format_search_results(&results, "test <query>", "test & <project>", 0, 0);
@@ -578,6 +584,7 @@ fn test_resolve_and_annotate() {
                 is_sidechain: false,
             },
             resolution: None,
+            validity_demoted: false,
         },
         EnrichedResult {
             score: 0.8,
@@ -594,6 +601,7 @@ fn test_resolve_and_annotate() {
                 is_sidechain: false,
             },
             resolution: None,
+            validity_demoted: false,
         },
     ];
 
@@ -838,6 +846,7 @@ fn test_full_pipeline_storage_search_format() {
                     score: r.score,
                     chunk: c.clone(),
                     resolution: None,
+                    validity_demoted: false,
                 })
         })
         .collect();

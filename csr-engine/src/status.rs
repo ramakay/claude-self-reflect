@@ -21,6 +21,10 @@ pub struct StatusReport {
     pub imported_files: usize,
     pub total_jsonl_files: usize,
     pub import_percent: f64,
+    /// Backward-compatible sum of the two split suppression counters below.
+    pub csr_self_suppressed: i64,
+    pub csr_tool_blocks_suppressed: i64,
+    pub csr_hook_wrappers_scrubbed: i64,
     pub enrichment: EnrichmentBreakdown,
     pub narratives: NarrativeStatus,
     pub ratification: RatificationStatus,
@@ -30,6 +34,70 @@ pub struct StatusReport {
     pub healthy: bool,
     /// Aux corpus coverage (session_registry vs chunks) — never injected into search.
     pub aux: AuxStatus,
+    /// v10 "dreaming" summary (`crate::dream`) — witness_verdicts totals and
+    /// current demoted-symbol count. See `gather_dream`.
+    pub dream: DreamStatus,
+}
+
+/// Totals by verdict kind across every `witness_verdicts` event ever
+/// recorded (not latest-per-witness — see
+/// `storage::witness_verdicts::event_totals_by_verdict`).
+#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+pub struct DreamVerdictTotals {
+    pub obsolete: i64,
+    pub superseded: i64,
+    pub reinstated: i64,
+}
+
+/// v10 "dreaming" summary block. `last_run` is the `created_at` timestamp of
+/// the globally newest `witness_verdicts` event (`None` if `dream` has never
+/// run). `demoted_symbols` is the count on the `Demote` channel right now —
+/// see `storage::witness_verdicts::all_demoted_symbols`.
+///
+/// `last_daemon_run`/`next_due` are the DAEMON's own cadence bookkeeping
+/// (`daemon::dream_cadence`) — deliberately separate from `last_run`: a
+/// daemon cycle that runs and writes zero new events (re-running at an
+/// unchanged HEAD) still counts as "the daemon acted" and moves cadence
+/// forward, but would leave `last_run` frozen since no event was written.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DreamStatus {
+    /// Whether daemon dreaming is enabled by configuration.
+    pub daemon_enabled: bool,
+    pub last_run: Option<String>,
+    pub events_total: i64,
+    pub by_verdict: DreamVerdictTotals,
+    pub demoted_symbols: i64,
+    /// Total durable witnesses available for a first dream cycle.
+    pub witnesses_ledgered: i64,
+    /// Evidence-backed conversations carrying a release-ancestry cache row.
+    pub ancestry_cached_conversations: i64,
+    /// RFC3339 timestamp of the daemon's last COMPLETED dream cycle. `None`
+    /// if the daemon dream loop has never completed one (never started,
+    /// disabled via `CSR_NO_DREAMING`, or still waiting on its first
+    /// cadence/catch-up window).
+    pub last_daemon_run: Option<String>,
+    /// RFC3339 timestamp of the next expected daemon cycle
+    /// (`last_daemon_run + interval`). `None` when `last_daemon_run` is
+    /// `None` or `daemon_enabled` is false — the exact first-cycle timing
+    /// depends on daemon process-start state a stateless status read doesn't
+    /// have (see `daemon::dream_cadence::first_cycle_due_at`).
+    pub next_due: Option<String>,
+}
+
+impl Default for DreamStatus {
+    fn default() -> Self {
+        Self {
+            daemon_enabled: true,
+            last_run: None,
+            events_total: 0,
+            by_verdict: DreamVerdictTotals::default(),
+            demoted_symbols: 0,
+            witnesses_ledgered: 0,
+            ancestry_cached_conversations: 0,
+            last_daemon_run: None,
+            next_due: None,
+        }
+    }
 }
 
 #[derive(Serialize, Default, Debug, PartialEq, Eq)]
@@ -142,6 +210,9 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             imported_files: 0,
             total_jsonl_files: total_jsonl,
             import_percent: 0.0,
+            csr_self_suppressed: 0,
+            csr_tool_blocks_suppressed: 0,
+            csr_hook_wrappers_scrubbed: 0,
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus {
                 disabled: crate::narrative::narratives_disabled(),
@@ -153,6 +224,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             db_path: db_path.to_string_lossy().to_string(),
             healthy: false,
             aux: AuxStatus::default(),
+            dream: DreamStatus::default(),
         });
     }
 
@@ -165,6 +237,9 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let chunks = storage.count_chunk_embeddings().unwrap_or(0);
     let reflections = storage.count_reflection_embeddings().unwrap_or(0);
     let imported_files = storage.count_imported_files().unwrap_or(0);
+    let csr_self_suppressed = storage.get_csr_self_suppressed().unwrap_or(0);
+    let csr_tool_blocks_suppressed = storage.get_csr_tool_blocks_suppressed().unwrap_or(0);
+    let csr_hook_wrappers_scrubbed = storage.get_csr_hook_wrappers_scrubbed().unwrap_or(0);
     let newest_chunk = storage.get_newest_chunk_timestamp().unwrap_or(None);
     let db_size_bytes = storage.get_db_size().unwrap_or(0);
     // Cached verdict (24h TTL, refreshed by the daemon or --deep). A full
@@ -201,6 +276,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     }
 
     let aux = gather_aux(&storage, projects_dir);
+    let dream = gather_dream(&storage);
 
     Ok(StatusReport {
         conversations,
@@ -210,6 +286,9 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         imported_files,
         total_jsonl_files: total_jsonl,
         import_percent,
+        csr_self_suppressed,
+        csr_tool_blocks_suppressed,
+        csr_hook_wrappers_scrubbed,
         enrichment,
         narratives,
         ratification,
@@ -218,7 +297,60 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         db_path: db_path.to_string_lossy().to_string(),
         healthy,
         aux,
+        dream,
     })
+}
+
+/// Assemble the v10 "dreaming" status block. Fail-soft to defaults —
+/// `status` opens SQLite directly and must never fail on a pre-migration
+/// schema gap (mirrors `gather_narratives`).
+fn gather_dream(storage: &Storage) -> DreamStatus {
+    let last_run = storage
+        .last_dream_run()
+        .unwrap_or(None)
+        .map(|(_head_oid, created_at)| created_at);
+    let (obsolete, superseded, reinstated) = storage.dream_event_totals().unwrap_or((0, 0, 0));
+    let demoted_symbols = storage
+        .all_demoted_symbols()
+        .map(|v| v.len() as i64)
+        .unwrap_or(0);
+    let last_daemon_run_dt = crate::daemon::dream_cadence::read_last_run(storage);
+    let last_daemon_run = last_daemon_run_dt.map(|t| t.to_rfc3339());
+    let daemon_enabled = !crate::daemon::dream_cadence::dreaming_disabled();
+    // The TUI only renders this count for the enabled/never-run state, so keep
+    // the extra COUNT query off the steady-state refresh path.
+    let witnesses_ledgered = if daemon_enabled && last_daemon_run_dt.is_none() {
+        storage
+            .with_connection(crate::storage::witness_ledger::count_all)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let next_due = daemon_enabled
+        .then(|| {
+            crate::daemon::dream_cadence::next_due(
+                last_daemon_run_dt,
+                crate::daemon::dream_cadence::interval_secs(),
+            )
+        })
+        .flatten()
+        .map(|t| t.to_rfc3339());
+
+    DreamStatus {
+        daemon_enabled,
+        last_run,
+        events_total: obsolete + superseded + reinstated,
+        by_verdict: DreamVerdictTotals {
+            obsolete,
+            superseded,
+            reinstated,
+        },
+        demoted_symbols,
+        witnesses_ledgered,
+        ancestry_cached_conversations: storage.ancestry_cache_count().unwrap_or(0),
+        last_daemon_run,
+        next_due,
+    }
 }
 
 /// Assemble aux coverage / file-history / transcript gap stats. Fail-soft to zeros.
@@ -525,6 +657,13 @@ fn format_age(timestamp: &str) -> String {
 
 /// Print compact one-line status for statusline integration.
 fn print_compact(report: &StatusReport) {
+    print!("{}", format_compact(report));
+}
+
+/// Pure formatter for the compact one-line statusline — separated from
+/// `print_compact` so tests can assert on the string directly (same split
+/// `format_narrative_segment` uses).
+fn format_compact(report: &StatusReport) -> String {
     // Format: [████████░░ 82%] [✓ 909c 54r] [3 projects]
     let bar_filled = (report.import_percent / 10.0).round() as usize;
     let bar_empty = 10_usize.saturating_sub(bar_filled);
@@ -532,7 +671,7 @@ fn print_compact(report: &StatusReport) {
 
     let health = if report.healthy { "ok" } else { "!!" };
 
-    print!(
+    let mut out = format!(
         "[{} {:.0}%] [{}] {}c {}r | {}p | {}",
         bar,
         report.import_percent,
@@ -542,6 +681,12 @@ fn print_compact(report: &StatusReport) {
         report.projects,
         format_narrative_segment(&report.narratives),
     );
+    // v10 "dreaming": only speak up when there's something to forget —
+    // terse by design, matching the rest of this line's style.
+    if report.dream.demoted_symbols > 0 {
+        out.push_str(&format!(" | ☾ {} forgotten", report.dream.demoted_symbols));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -574,6 +719,7 @@ mod tests {
 
     #[test]
     fn test_status_nonexistent_db() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let report = gather_status(
             Path::new("/tmp/nonexistent-csr-test.db"),
             Path::new("/tmp/nonexistent-projects"),
@@ -585,9 +731,8 @@ mod tests {
         assert_eq!(report.import_percent, 0.0);
     }
 
-    #[test]
-    fn test_compact_format() {
-        let report = StatusReport {
+    fn base_report() -> StatusReport {
+        StatusReport {
             conversations: 909,
             projects: 3,
             chunks: 5000,
@@ -595,6 +740,9 @@ mod tests {
             imported_files: 909,
             total_jsonl_files: 1000,
             import_percent: 90.9,
+            csr_self_suppressed: 0,
+            csr_tool_blocks_suppressed: 0,
+            csr_hook_wrappers_scrubbed: 0,
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus::default(),
             ratification: RatificationStatus::default(),
@@ -603,13 +751,55 @@ mod tests {
             db_path: "/tmp/test.db".to_string(),
             healthy: true,
             aux: AuxStatus::default(),
-        };
+            dream: DreamStatus::default(),
+        }
+    }
+
+    #[test]
+    fn test_compact_format() {
         // Just verify it doesn't panic
-        print_compact(&report);
+        print_compact(&base_report());
+    }
+
+    #[test]
+    fn test_compact_omits_dream_suffix_when_nothing_forgotten() {
+        let report = base_report();
+        assert_eq!(report.dream.demoted_symbols, 0);
+        let line = format_compact(&report);
+        assert!(
+            !line.contains('☾'),
+            "no demoted symbols means no dream suffix: {line:?}"
+        );
+    }
+
+    #[test]
+    fn test_compact_includes_dream_suffix_when_symbols_forgotten() {
+        let mut report = base_report();
+        report.dream = DreamStatus {
+            daemon_enabled: true,
+            last_run: Some("2026-08-05 10:00:00".into()),
+            events_total: 3,
+            by_verdict: DreamVerdictTotals {
+                obsolete: 2,
+                superseded: 1,
+                reinstated: 0,
+            },
+            demoted_symbols: 3,
+            witnesses_ledgered: 0,
+            ancestry_cached_conversations: 0,
+            last_daemon_run: None,
+            next_due: None,
+        };
+        let line = format_compact(&report);
+        assert!(
+            line.contains("☾ 3 forgotten"),
+            "must surface the demoted count: {line:?}"
+        );
     }
 
     #[test]
     fn test_status_with_empty_db() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let projects_dir = dir.path().join("projects");
@@ -627,6 +817,7 @@ mod tests {
 
     #[test]
     fn status_aux_block_assembles_with_missing_dirs() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let projects_dir = dir.path().join("projects");
@@ -638,5 +829,197 @@ mod tests {
         assert_eq!(report.aux.coverage, CoverageStats::default());
         assert_eq!(report.aux.file_history_sessions, 0);
         assert_eq!(report.aux.transcripts_unindexed, 0);
+    }
+
+    #[test]
+    fn status_surfaces_split_csr_suppression_counters_and_sum() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage.set_meta("csr_tool_blocks_suppressed", "4").unwrap();
+        storage.set_meta("csr_hook_wrappers_scrubbed", "2").unwrap();
+
+        let value =
+            serde_json::to_value(gather_status(&db_path, &projects_dir, false).unwrap()).unwrap();
+        assert_eq!(value["csr_tool_blocks_suppressed"], 4);
+        assert_eq!(value["csr_hook_wrappers_scrubbed"], 2);
+        assert_eq!(value["csr_self_suppressed"], 6);
+    }
+
+    #[test]
+    fn status_dream_block_defaults_to_empty_on_fresh_db() {
+        // gather_dream reads the process-global CSR_NO_DREAMING kill switch;
+        // hold the shared env lock so parallel kill-switch tests can't flip
+        // daemon_enabled mid-assertion.
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let _storage = Storage::open(&db_path).unwrap();
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert_eq!(report.dream, DreamStatus::default());
+        assert_eq!(report.dream.demoted_symbols, 0);
+        assert!(report.dream.last_run.is_none());
+    }
+
+    #[test]
+    fn status_dream_block_surfaces_ancestry_cache_count() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO conversation_ancestry_cache
+                     (conversation_id, state, release_tag, releases_behind, repository, refreshed_at)
+                     VALUES ('session-1', 'shipped', 'v1.0.0', 2, '/repo', '2026-08-06T12:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert_eq!(report.dream.ancestry_cached_conversations, 1);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["dream"]["ancestry_cached_conversations"], 1);
+    }
+
+    #[test]
+    fn status_dream_block_reflects_recorded_events_and_demotions() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        use crate::storage::witness_ledger::WitnessLedgerRow;
+        use crate::storage::witness_verdicts::{VerdictKind, WitnessVerdictRow};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .insert_witness(&WitnessLedgerRow {
+                id: 0,
+                project: "proj".into(),
+                file: "/repo/src/gone.rs".into(),
+                symbol: Some("vanished".into()),
+                span_start: Some(1),
+                span_end: Some(3),
+                stamp: "b3:1".into(),
+                tier: "committed".into(),
+                at_oid: Some("aaa".into()),
+                source_kind: "backfill".into(),
+                source_id: Some("aaa".into()),
+            })
+            .unwrap();
+        let w = storage
+            .witnesses_for_file("proj", "/repo/src/gone.rs")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        storage
+            .insert_witness_verdict(&WitnessVerdictRow {
+                witness_id: w.id,
+                verdict: VerdictKind::AnchorObsolete,
+                successor_witness_id: None,
+                receipt_oid: Some("headoid".into()),
+                observed_head_oid: "headoid".into(),
+            })
+            .unwrap();
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert_eq!(report.dream.events_total, 1);
+        assert_eq!(report.dream.by_verdict.obsolete, 1);
+        assert_eq!(report.dream.by_verdict.superseded, 0);
+        assert_eq!(report.dream.demoted_symbols, 1);
+        assert_eq!(report.dream.witnesses_ledgered, 1);
+        assert!(report.dream.last_run.is_some());
+    }
+
+    #[test]
+    fn status_dream_block_last_daemon_run_and_next_due_default_to_none() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let _storage = Storage::open(&db_path).unwrap();
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert!(
+            report.dream.last_daemon_run.is_none(),
+            "daemon dream loop has never completed a cycle on a fresh DB"
+        );
+        assert!(
+            report.dream.next_due.is_none(),
+            "next_due depends on last_daemon_run — must also be None"
+        );
+    }
+
+    #[test]
+    fn status_dream_block_surfaces_daemon_cadence_once_persisted() {
+        // `dream_cadence::env_test_guard` — shared with that module's own
+        // env-var tests — because `gather_dream` reads `interval_secs()`,
+        // which is process-global env state (see that guard's doc).
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::set_var("CSR_DREAM_INTERVAL_SECS", "3600");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let storage = Storage::open(&db_path).unwrap();
+        let last = chrono::Utc::now() - chrono::Duration::hours(1);
+        storage
+            .set_meta(
+                crate::daemon::dream_cadence::META_LAST_RUN_AT,
+                &last.to_rfc3339(),
+            )
+            .unwrap();
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        std::env::remove_var("CSR_DREAM_INTERVAL_SECS");
+
+        assert_eq!(
+            report.dream.last_daemon_run.as_deref(),
+            Some(last.to_rfc3339().as_str())
+        );
+        let expected_next_due = last + chrono::Duration::seconds(3600);
+        assert_eq!(
+            report.dream.next_due.as_deref(),
+            Some(expected_next_due.to_rfc3339().as_str())
+        );
+    }
+
+    #[test]
+    fn status_dream_block_hides_next_due_when_daemon_dreaming_is_disabled() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::set_var("CSR_NO_DREAMING", "1");
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .set_meta(
+                crate::daemon::dream_cadence::META_LAST_RUN_AT,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        let dream = gather_dream(&storage);
+        std::env::remove_var("CSR_NO_DREAMING");
+        assert!(!dream.daemon_enabled);
+        assert!(dream.next_due.is_none());
+        assert!(dream.last_daemon_run.is_some());
     }
 }
