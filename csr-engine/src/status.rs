@@ -310,25 +310,35 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
 /// `status` opens SQLite directly and must never fail on a pre-migration
 /// schema gap (mirrors `gather_narratives`).
 fn gather_dream(storage: &Storage) -> DreamStatus {
+    gather_dream_with(
+        storage,
+        crate::storage::recap_feeds::dream_consumption_mode(),
+    )
+}
+
+fn gather_dream_with(
+    storage: &Storage,
+    consumption_mode: crate::storage::recap_feeds::ConsumptionMode,
+) -> DreamStatus {
     let last_run = storage
         .last_dream_run()
         .unwrap_or(None)
         .map(|(_head_oid, created_at)| created_at);
-    // v10.1: CSR_DREAM_CONSUMPTION default OFF ships the witness ledger as
-    // experimental derived data — no dream verdict may reach the user as
-    // text (status/CLI surfaces included) unless explicitly opted in. The
+    // I6: ConsumptionMode defaults to AnnotateOnly — verdict counts are
+    // user-facing by default; only an explicit Off suppresses them, and the
+    // Demote-channel forgotten count additionally requires Full. The
     // daemon's own operational bookkeeping below (whether it's enabled, when
     // it last ran, when it's next due) is NOT verdict content and stays
-    // visible either way; only the verdict-derived counts are gated, and
-    // gating skips the underlying queries entirely rather than computing
-    // real totals and hiding them.
-    let consumption_enabled = crate::storage::recap_feeds::dream_consumption_enabled();
-    let (obsolete, superseded, reinstated) = if consumption_enabled {
-        storage.dream_event_totals().unwrap_or((0, 0, 0))
-    } else {
-        (0, 0, 0)
-    };
-    let demoted_symbols = if consumption_enabled {
+    // visible in every mode; gating skips the underlying queries entirely
+    // rather than computing real totals and hiding them.
+    let (obsolete, superseded, reinstated) =
+        if consumption_mode != crate::storage::recap_feeds::ConsumptionMode::Off {
+            storage.dream_event_totals().unwrap_or((0, 0, 0))
+        } else {
+            (0, 0, 0)
+        };
+    let demoted_symbols = if consumption_mode == crate::storage::recap_feeds::ConsumptionMode::Full
+    {
         storage
             .all_demoted_symbols()
             .map(|v| v.len() as i64)
@@ -925,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn status_dream_block_suppresses_verdict_counts_by_default_but_keeps_ledger_activity_visible() {
+    fn status_dream_block_shows_verdict_counts_by_default_and_suppresses_when_off() {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
         use crate::storage::witness_ledger::WitnessLedgerRow;
         use crate::storage::witness_verdicts::{VerdictKind, WitnessVerdictRow};
@@ -969,28 +979,42 @@ mod tests {
         drop(storage);
 
         // CSR_DREAM_CONSUMPTION is unset in this test process — the real
-        // default — even though a real Demote-channel verdict exists in the
-        // DB. `gather_status` is the actual `csr-engine status` production
-        // path with no test-only parameter seam, so this drives it exactly
-        // as a real user would see it today.
+        // default, which since I6 is AnnotateOnly: verdict COUNTS are
+        // visible (dreams are user-facing by default) while the Demote
+        // channel stays dark. `gather_status` is the actual `csr-engine
+        // status` production path with no test-only parameter seam, so this
+        // drives it exactly as a real user would see it today.
         let report = gather_status(&db_path, &projects_dir, false).unwrap();
         assert_eq!(
-            report.dream.events_total, 0,
-            "verdict totals must be suppressed by default"
+            report.dream.events_total, 1,
+            "verdict totals must be visible under the AnnotateOnly default"
         );
-        assert_eq!(report.dream.by_verdict.obsolete, 0);
+        assert_eq!(report.dream.by_verdict.obsolete, 1);
         assert_eq!(report.dream.by_verdict.superseded, 0);
         assert_eq!(
             report.dream.demoted_symbols, 0,
-            "forgotten-symbol count must be suppressed by default"
+            "forgotten-symbol count is Full-channel only and must stay 0 under the default"
         );
-        // NOT verdict content — daemon/ledger bookkeeping stays visible
-        // either way (see `gather_dream`'s doc on what is/isn't gated).
+        // Daemon/ledger bookkeeping stays visible in every mode.
         assert_eq!(
             report.dream.witnesses_ledgered, 1,
             "raw ledger stamp count is not verdict content and must stay visible"
         );
         assert!(report.dream.last_run.is_some());
+
+        // Explicit opt-out suppresses the verdict-derived counts entirely.
+        std::env::set_var("CSR_DREAM_CONSUMPTION", "0");
+        let report_off = gather_status(&db_path, &projects_dir, false).unwrap();
+        std::env::remove_var("CSR_DREAM_CONSUMPTION");
+        assert_eq!(
+            report_off.dream.events_total, 0,
+            "verdict totals must be suppressed when consumption is Off"
+        );
+        assert_eq!(report_off.dream.by_verdict.obsolete, 0);
+        assert_eq!(
+            report_off.dream.witnesses_ledgered, 1,
+            "ledger bookkeeping stays visible even when Off"
+        );
     }
 
     #[test]

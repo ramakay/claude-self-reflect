@@ -12,7 +12,7 @@ use crate::search::cross_project;
 use crate::search::decay;
 use crate::search::SearchEngine;
 use crate::storage::chunk_binding::ChunkWitnessVerdict;
-use crate::storage::recap_feeds::dream_consumption_enabled;
+use crate::storage::recap_feeds::{dream_consumption_mode, ConsumptionMode};
 use crate::storage::witness_verdicts::VerdictChannel;
 use crate::storage::Storage;
 use crate::temporal;
@@ -159,7 +159,7 @@ fn lookup_by_conv_tag(
     conv_id: &str,
     query: &str,
     limit: usize,
-    consumption_enabled: bool,
+    consumption_mode: ConsumptionMode,
     active_forgetting: bool,
 ) -> Result<Option<String>> {
     let start = Instant::now();
@@ -208,7 +208,7 @@ fn lookup_by_conv_tag(
     // query for the single conversation id.
     let chunks: Vec<crate::import::ConversationChunk> =
         enriched.iter().map(|result| result.chunk.clone()).collect();
-    let validity = resolve_validity_with(storage, &chunks, consumption_enabled);
+    let validity = resolve_validity_with(storage, &chunks, consumption_mode);
     apply_validity_partition(&mut enriched, &validity, active_forgetting);
     let search_ms = start.elapsed().as_millis() as u64;
     Ok(Some(format::format_search_results(
@@ -238,7 +238,7 @@ pub async fn reflect_on_past(
     // ONLY whether the resolved verdict map is populated; ancestry loads
     // independently of it — see `CandidateSignals`'s doc.
     let partition_enabled = validity_partition_enabled();
-    let consumption_enabled = partition_enabled && dream_consumption_enabled();
+    let consumption_mode = consumption_mode_for_partition(partition_enabled);
     let active_forgetting = active_forgetting_enabled();
     // Retrieval-handle fast path: `conv_<uuid>` (or a bare UUID) resolves by
     // exact tag. Falls through to semantic search only when the tag matches
@@ -249,7 +249,7 @@ pub async fn reflect_on_past(
             conv_id,
             query,
             limit.max(5),
-            consumption_enabled,
+            consumption_mode,
             active_forgetting,
         )? {
             return Ok(result);
@@ -270,7 +270,7 @@ pub async fn reflect_on_past(
         project,
         embed_ms,
         partition_enabled,
-        consumption_enabled,
+        consumption_mode,
         active_forgetting,
     )
     .await
@@ -296,7 +296,7 @@ async fn reflect_on_past_with_vec(
     project: Option<&str>,
     embed_ms: u64,
     partition_enabled: bool,
-    consumption_enabled: bool,
+    consumption_mode: ConsumptionMode,
     active_forgetting: bool,
 ) -> Result<String> {
     let current_project = cross_project::resolve_current_project();
@@ -312,7 +312,7 @@ async fn reflect_on_past_with_vec(
         &scope,
         embed_ms,
         partition_enabled,
-        consumption_enabled,
+        consumption_mode,
         active_forgetting,
     )
     .await
@@ -329,7 +329,7 @@ async fn reflect_on_past_with_vec_in_scope(
     scope: &SearchProjectScope,
     embed_ms: u64,
     partition_enabled: bool,
-    consumption_enabled: bool,
+    consumption_mode: ConsumptionMode,
     active_forgetting: bool,
 ) -> Result<String> {
     // OVERFETCH (validity partition, issue 2): fetching exactly `limit`
@@ -347,7 +347,7 @@ async fn reflect_on_past_with_vec_in_scope(
         min_score,
         scope,
         partition_enabled,
-        consumption_enabled,
+        consumption_mode,
         active_forgetting,
     )
     .await?;
@@ -376,7 +376,7 @@ async fn reflect_on_past_with_vec_in_scope(
                 min_score,
                 scope,
                 partition_enabled,
-                consumption_enabled,
+                consumption_mode,
                 active_forgetting,
             )
             .await?;
@@ -501,7 +501,7 @@ async fn reflect_gather_pass(
     min_score: f32,
     scope: &SearchProjectScope,
     partition_enabled: bool,
-    consumption_enabled: bool,
+    consumption_mode: ConsumptionMode,
     active_forgetting: bool,
 ) -> Result<GatherPass> {
     let search_start = Instant::now();
@@ -537,8 +537,7 @@ async fn reflect_gather_pass(
     // below merges in verdicts for conversations the semantic pass never
     // saw. The final sink/annotate step (mirroring
     // `apply_resolutions_before_limit`) reuses this same map.
-    let mut signals =
-        CandidateSignals::load(storage, &chunks, partition_enabled, consumption_enabled);
+    let mut signals = CandidateSignals::load(storage, &chunks, partition_enabled, consumption_mode);
     let queried_chunk_ids: HashSet<String> = chunks.iter().map(|chunk| chunk.id.clone()).collect();
 
     let now = chrono::Utc::now();
@@ -700,12 +699,8 @@ async fn reflect_gather_pass(
                 .filter(|chunk| !queried_chunk_ids.contains(&chunk.id))
                 .cloned()
                 .collect();
-            let ancestry_revoked = signals.extend(
-                storage,
-                &extra_chunks,
-                partition_enabled,
-                consumption_enabled,
-            );
+            let ancestry_revoked =
+                signals.extend(storage, &extra_chunks, partition_enabled, consumption_mode);
             if ancestry_revoked {
                 // Semantic scores were computed before the FTS-only validity
                 // batch existed. Replay exactly those candidates without
@@ -1097,7 +1092,7 @@ pub async fn search_by_recency(
             storage,
             |n| idx.search_chunks_filtered(&query_vec, n, min_score, &time_ids),
             limit,
-            validity_partition_enabled() && dream_consumption_enabled(),
+            consumption_mode_for_partition(validity_partition_enabled()),
         )?
     };
     Ok(format::format_recency_results(&enriched, query, &time_desc))
@@ -1572,7 +1567,7 @@ pub async fn search_by_concept(
             storage,
             |n| idx.search_chunks_filtered(&query_vec, n, 0.3, &ids),
             limit,
-            validity_partition_enabled() && dream_consumption_enabled(),
+            consumption_mode_for_partition(validity_partition_enabled()),
         )?
     } else {
         let idx = search.read().await;
@@ -1580,7 +1575,7 @@ pub async fn search_by_concept(
             storage,
             |n| idx.search_chunks(&query_vec, n, 0.3),
             limit,
-            validity_partition_enabled() && dream_consumption_enabled(),
+            consumption_mode_for_partition(validity_partition_enabled()),
         )?
     };
     Ok(format::format_search_results(
@@ -1604,7 +1599,7 @@ pub async fn get_more_results(
     min_score: f32,
     project: Option<&str>,
 ) -> Result<String> {
-    let partition_enabled = validity_partition_enabled() && dream_consumption_enabled();
+    let consumption_mode = consumption_mode_for_partition(validity_partition_enabled());
     let active_forgetting = active_forgetting_enabled();
     let query_vec = embed_query(embeddings, query).await?;
     if active_forgetting {
@@ -1617,7 +1612,7 @@ pub async fn get_more_results(
             limit,
             min_score,
             project,
-            partition_enabled,
+            consumption_mode,
             true,
         )
         .await
@@ -1631,7 +1626,7 @@ pub async fn get_more_results(
             limit,
             min_score,
             project,
-            partition_enabled,
+            consumption_mode,
         )
         .await
     }
@@ -1667,7 +1662,7 @@ async fn get_more_results_with_vec(
     limit: usize,
     min_score: f32,
     project: Option<&str>,
-    partition_enabled: bool,
+    consumption_mode: ConsumptionMode,
 ) -> Result<String> {
     get_more_results_with_vec_active(
         storage,
@@ -1678,7 +1673,7 @@ async fn get_more_results_with_vec(
         limit,
         min_score,
         project,
-        partition_enabled,
+        consumption_mode,
         false,
     )
     .await
@@ -1694,7 +1689,7 @@ async fn get_more_results_with_vec_active(
     limit: usize,
     min_score: f32,
     project: Option<&str>,
-    partition_enabled: bool,
+    consumption_mode: ConsumptionMode,
     active_forgetting: bool,
 ) -> Result<String> {
     let (effective_project, _) = cross_project::normalize_project_scope(project);
@@ -1713,7 +1708,7 @@ async fn get_more_results_with_vec_active(
     let enriched = enrich_results_with_active_forgetting(
         storage,
         &all_results,
-        partition_enabled,
+        consumption_mode,
         active_forgetting,
     )?;
     let total = enriched.len();
@@ -1841,7 +1836,7 @@ fn enrich_results(
     enrich_results_with(
         storage,
         results,
-        validity_partition_enabled() && dream_consumption_enabled(),
+        consumption_mode_for_partition(validity_partition_enabled()),
     )
 }
 
@@ -1851,15 +1846,15 @@ fn enrich_results(
 fn enrich_results_with(
     storage: &Arc<Storage>,
     results: &[crate::search::SearchResult],
-    partition_enabled: bool,
+    consumption_mode: ConsumptionMode,
 ) -> Result<Vec<EnrichedResult>> {
-    enrich_results_with_active_forgetting(storage, results, partition_enabled, false)
+    enrich_results_with_active_forgetting(storage, results, consumption_mode, false)
 }
 
 fn enrich_results_with_active_forgetting(
     storage: &Arc<Storage>,
     results: &[crate::search::SearchResult],
-    partition_enabled: bool,
+    consumption_mode: ConsumptionMode,
     active_forgetting: bool,
 ) -> Result<Vec<EnrichedResult>> {
     let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
@@ -1883,7 +1878,7 @@ fn enrich_results_with_active_forgetting(
     apply_resolutions(&mut enriched_vec, storage);
     let validity_chunks: Vec<crate::import::ConversationChunk> =
         enriched_vec.iter().map(|e| e.chunk.clone()).collect();
-    let validity = resolve_validity_with(storage, &validity_chunks, partition_enabled);
+    let validity = resolve_validity_with(storage, &validity_chunks, consumption_mode);
     if active_forgetting {
         let chunk_ids: Vec<&str> = enriched_vec.iter().map(|e| e.chunk.id.as_str()).collect();
         let tad_events = storage
@@ -1931,18 +1926,18 @@ fn fetch_enrich_partition_adaptive(
     storage: &Arc<Storage>,
     fetch_fn: impl Fn(usize) -> Vec<crate::search::SearchResult>,
     limit: usize,
-    partition_enabled: bool,
+    consumption_mode: ConsumptionMode,
 ) -> Result<Vec<EnrichedResult>> {
     let first = overfetch(limit);
     let results = fetch_fn(first);
     let window_full = results.len() == first;
-    let mut enriched = enrich_results_with(storage, &results, partition_enabled)?;
+    let mut enriched = enrich_results_with(storage, &results, consumption_mode)?;
     let valid = enriched.iter().filter(|e| !e.validity_demoted).count();
     if valid < limit && window_full {
         let refetch = limit.saturating_mul(10);
         if refetch > first {
             let results = fetch_fn(refetch);
-            enriched = enrich_results_with(storage, &results, partition_enabled)?;
+            enriched = enrich_results_with(storage, &results, consumption_mode)?;
         }
     }
     enriched.truncate(limit);
@@ -1997,14 +1992,16 @@ impl CandidateSignals {
         storage: &Arc<Storage>,
         chunks: &[crate::import::ConversationChunk],
         ancestry_enabled: bool,
-        consumption_enabled: bool,
+        consumption_mode: ConsumptionMode,
     ) -> Self {
         if !ancestry_enabled {
             return Self::default();
         }
         let conversation_ids = distinct_conversation_ids_of_chunks(chunks);
-        let Ok(validity) = resolve_validity_checked(storage, chunks, consumption_enabled) else {
-            return Self::default();
+        let validity = match resolve_validity_checked(storage, chunks, consumption_mode) {
+            Ok(validity) => validity,
+            Err(_) if consumption_mode == ConsumptionMode::Full => return Self::default(),
+            Err(_) => HashMap::new(),
         };
         Self {
             validity,
@@ -2024,7 +2021,7 @@ impl CandidateSignals {
         storage: &Arc<Storage>,
         chunks: &[crate::import::ConversationChunk],
         ancestry_enabled: bool,
-        consumption_enabled: bool,
+        consumption_mode: ConsumptionMode,
     ) -> bool {
         let ancestry_was_allowed = self.ancestry_allowed;
         if !ancestry_enabled {
@@ -2034,7 +2031,7 @@ impl CandidateSignals {
             return ancestry_was_allowed;
         }
         let conversation_ids = distinct_conversation_ids_of_chunks(chunks);
-        match resolve_validity_checked(storage, chunks, consumption_enabled) {
+        match resolve_validity_checked(storage, chunks, consumption_mode) {
             Ok(validity) => {
                 self.validity.extend(validity);
                 if self.ancestry_allowed {
@@ -2045,10 +2042,11 @@ impl CandidateSignals {
                     );
                 }
             }
-            Err(_) => {
+            Err(_) if consumption_mode == ConsumptionMode::Full => {
                 self.ancestry.clear();
                 self.ancestry_allowed = false;
             }
+            Err(_) => {}
         }
         ancestry_was_allowed && !self.ancestry_allowed
     }
@@ -2082,6 +2080,14 @@ fn validity_partition_enabled() -> bool {
     std::env::var("CSR_NO_VALIDITY_PARTITION").ok().as_deref() != Some("1")
 }
 
+fn consumption_mode_for_partition(partition_enabled: bool) -> ConsumptionMode {
+    if partition_enabled {
+        dream_consumption_mode()
+    } else {
+        ConsumptionMode::Off
+    }
+}
+
 /// Opt-in active forgetting flag. Only the exact value `1` enables it;
 /// unset and every other value preserve the current ranking byte-for-byte.
 fn active_forgetting_enabled() -> bool {
@@ -2111,9 +2117,9 @@ fn active_forgetting_enabled_from(value: Option<&str>) -> bool {
 fn resolve_validity_with(
     storage: &Arc<Storage>,
     chunks: &[crate::import::ConversationChunk],
-    enabled: bool,
+    consumption_mode: ConsumptionMode,
 ) -> HashMap<String, ConvValidity> {
-    resolve_validity_checked(storage, chunks, enabled).unwrap_or_default()
+    resolve_validity_checked(storage, chunks, consumption_mode).unwrap_or_default()
 }
 
 /// Reliability-preserving core for consumers that combine validity with a
@@ -2123,9 +2129,9 @@ fn resolve_validity_with(
 fn resolve_validity_checked(
     storage: &Arc<Storage>,
     chunks: &[crate::import::ConversationChunk],
-    enabled: bool,
+    consumption_mode: ConsumptionMode,
 ) -> Result<HashMap<String, ConvValidity>> {
-    if !enabled || chunks.is_empty() {
+    if consumption_mode == ConsumptionMode::Off || chunks.is_empty() {
         return Ok(HashMap::new());
     }
     let identities: Vec<(String, String)> = chunks
@@ -2133,7 +2139,9 @@ fn resolve_validity_checked(
         .map(|chunk| (chunk.id.clone(), chunk.conversation_id.clone()))
         .collect();
     let hits = storage.witness_verdicts_for_chunks(&identities)?;
-    Ok(reduce_validity_hits(hits, chunks))
+    let mut validity = reduce_validity_hits(hits, chunks);
+    normalize_validity_for_mode(&mut validity, consumption_mode);
+    Ok(validity)
 }
 
 /// Prompt-submit needs the same Demote predicate before applying release
@@ -2154,11 +2162,25 @@ pub(crate) fn resolve_validity_for_ancestry(
     if !validity_partition_enabled() {
         return None;
     }
-    if !dream_consumption_enabled() || chunks.is_empty() {
+    let consumption_mode = dream_consumption_mode();
+    if consumption_mode == ConsumptionMode::Off || chunks.is_empty() {
         return Some(HashMap::new());
     }
     let hits = storage.witness_verdicts_for_chunks(chunks).ok()?;
-    Some(reduce_validity_hit_identities(hits, chunks))
+    let mut validity = reduce_validity_hit_identities(hits, chunks);
+    normalize_validity_for_mode(&mut validity, consumption_mode);
+    Some(validity)
+}
+
+fn normalize_validity_for_mode(
+    validity: &mut HashMap<String, ConvValidity>,
+    consumption_mode: ConsumptionMode,
+) {
+    if consumption_mode == ConsumptionMode::AnnotateOnly {
+        for verdict in validity.values_mut() {
+            verdict.demote = false;
+        }
+    }
 }
 
 fn reduce_validity_hits(
@@ -2514,7 +2536,7 @@ mod tests {
     use super::*;
     // Pure parsing seam — tests drive it by parameter instead of mutating
     // the process env, so the non-test build has no use for it.
-    use crate::storage::recap_feeds::dream_consumption_enabled_from;
+    use crate::storage::recap_feeds::{dream_consumption_mode_from, ConsumptionMode};
 
     fn unscoped_search_scope() -> SearchProjectScope {
         SearchProjectScope {
@@ -2707,7 +2729,7 @@ mod tests {
             &without_current,
             0,
             false,
-            false,
+            ConsumptionMode::Off,
             false,
         )
         .await
@@ -2722,7 +2744,7 @@ mod tests {
             &with_current,
             0,
             false,
-            false,
+            ConsumptionMode::Off,
             false,
         )
         .await
@@ -3017,7 +3039,7 @@ mod tests {
             Some("all"),
             0,
             false,
-            false,
+            ConsumptionMode::Off,
             false,
         )
         .await
@@ -3036,7 +3058,7 @@ mod tests {
             Some("all"),
             0,
             false,
-            false,
+            ConsumptionMode::Off,
             false,
         )
         .await
@@ -3108,7 +3130,7 @@ mod tests {
             Some("all"),
             0,
             false,
-            false,
+            ConsumptionMode::Off,
             false,
         )
         .await
@@ -3403,8 +3425,12 @@ mod tests {
             .unwrap();
         let chunk = enriched_result_conv("candidate", "conv-demoted", 0.9, 0).chunk;
         let conversation_ids = vec!["conv-demoted".to_string()];
-        let mut signals =
-            CandidateSignals::load(&storage, std::slice::from_ref(&chunk), true, true);
+        let mut signals = CandidateSignals::load(
+            &storage,
+            std::slice::from_ref(&chunk),
+            true,
+            ConsumptionMode::Full,
+        );
         assert!(signals.ancestry.contains_key("conv-demoted"));
         let now = "2026-08-06T12:00:00Z"
             .parse::<chrono::DateTime<chrono::Utc>>()
@@ -3439,7 +3465,7 @@ mod tests {
             .is_err());
 
         let fts_chunk = enriched_result_conv("fts", "conv-fts", 0.8, 0).chunk;
-        let ancestry_revoked = signals.extend(&storage, &[fts_chunk], true, true);
+        let ancestry_revoked = signals.extend(&storage, &[fts_chunk], true, ConsumptionMode::Full);
         assert!(ancestry_revoked);
         assert!(
             signals.ancestry.is_empty(),
@@ -3466,8 +3492,12 @@ mod tests {
         assert!(ancestry_score < actual);
         assert_eq!(actual.to_bits(), expected.to_bits());
 
-        let failed_initial =
-            CandidateSignals::load(&storage, std::slice::from_ref(&chunk), true, true);
+        let failed_initial = CandidateSignals::load(
+            &storage,
+            std::slice::from_ref(&chunk),
+            true,
+            ConsumptionMode::Full,
+        );
         assert!(failed_initial.validity.is_empty());
         assert!(failed_initial.ancestry.is_empty());
     }
@@ -3560,8 +3590,12 @@ mod tests {
             "conv-shared",
         );
         assert!(
-            resolve_validity_with(&storage, std::slice::from_ref(&enriched[1].chunk), true)
-                .is_empty(),
+            resolve_validity_with(
+                &storage,
+                std::slice::from_ref(&enriched[1].chunk),
+                ConsumptionMode::Full,
+            )
+            .is_empty(),
             "legacy conversation-only identity must abstain when storage contains siblings"
         );
         storage
@@ -3608,12 +3642,17 @@ mod tests {
             })
             .unwrap();
         let chunks: Vec<_> = enriched.iter().map(|result| result.chunk.clone()).collect();
-        let validity = resolve_validity_with(&storage, &chunks, true);
+        let validity = resolve_validity_with(&storage, &chunks, ConsumptionMode::Full);
 
         assert!(is_demote_channel(&validity, "chunk-stale"));
         assert!(!validity.contains_key("chunk-live"));
         assert!(
-            resolve_validity_with(&storage, std::slice::from_ref(&chunks[1]), true).is_empty(),
+            resolve_validity_with(
+                &storage,
+                std::slice::from_ref(&chunks[1]),
+                ConsumptionMode::Full,
+            )
+            .is_empty(),
             "a retrieval window containing only the clean sibling must not inherit the verdict"
         );
 
@@ -3789,9 +3828,10 @@ mod tests {
             })
             .unwrap();
         let chunk = enriched_result("chunk-1", 0.9, 0).chunk;
-        let out = resolve_validity_with(&storage, std::slice::from_ref(&chunk), false);
+        let out =
+            resolve_validity_with(&storage, std::slice::from_ref(&chunk), ConsumptionMode::Off);
         assert!(out.is_empty());
-        let signals = CandidateSignals::load(&storage, &[chunk], false, false);
+        let signals = CandidateSignals::load(&storage, &[chunk], false, ConsumptionMode::Off);
         assert!(signals.validity.is_empty());
         assert!(
             signals.ancestry.is_empty(),
@@ -3915,7 +3955,7 @@ mod tests {
             storage.insert_chunk(&result.chunk, &[1.0, 0.0]).unwrap();
         }
         let chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
-        let validity = resolve_validity_with(&storage, &chunks, true);
+        let validity = resolve_validity_with(&storage, &chunks, ConsumptionMode::Full);
 
         // NO STACKING: the shared skip predicate agrees with what the
         // partition below will do — this is the exact check
@@ -3945,7 +3985,7 @@ mod tests {
         // doc on why tests drive this by parameter, never by mutating the
         // real env var): resolution must come back empty and the partition
         // must be a total no-op.
-        let validity_off = resolve_validity_with(&storage, &chunks, false);
+        let validity_off = resolve_validity_with(&storage, &chunks, ConsumptionMode::Off);
         assert!(validity_off.is_empty());
 
         let mut enriched_off = vec![
@@ -4180,10 +4220,10 @@ mod tests {
             enriched_result_conv("evolved", "conv-annotated", 0.92, 1).chunk,
             enriched_result_conv("ancestry", "conv-ancestry", 0.90, 2).chunk,
         ];
-        let consumption_enabled = dream_consumption_enabled_from(None);
-        assert!(!consumption_enabled, "default must be OFF");
+        let consumption_mode = dream_consumption_mode_from(Some("off"));
+        assert_eq!(consumption_mode, ConsumptionMode::Off);
 
-        let signals = CandidateSignals::load(&storage, &chunks, true, consumption_enabled);
+        let signals = CandidateSignals::load(&storage, &chunks, true, consumption_mode);
         assert!(
             signals.validity.is_empty(),
             "no witness_verdicts query means no verdict can have been read"
@@ -4197,14 +4237,14 @@ mod tests {
     }
 
     #[test]
-    fn dream_consumption_off_by_default_suppresses_all_verdict_text_end_to_end() {
+    fn dream_consumption_off_suppresses_all_verdict_text_end_to_end() {
         let (storage, mut enriched) = dream_consumption_fixture();
         let chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
 
-        let consumption_enabled = dream_consumption_enabled_from(None);
-        assert!(!consumption_enabled, "default must be OFF");
+        let consumption_mode = dream_consumption_mode_from(Some("0"));
+        assert_eq!(consumption_mode, ConsumptionMode::Off);
 
-        let signals = CandidateSignals::load(&storage, &chunks, true, consumption_enabled);
+        let signals = CandidateSignals::load(&storage, &chunks, true, consumption_mode);
         assert!(signals.validity.is_empty());
 
         apply_validity_partition(&mut enriched, &signals.validity, false);
@@ -4222,16 +4262,42 @@ mod tests {
     }
 
     #[test]
-    fn dream_consumption_on_reproduces_demote_and_annotate_channels_byte_for_byte() {
+    fn dream_consumption_annotate_only_renders_notes_without_sinking() {
+        let (storage, mut enriched) = dream_consumption_fixture();
+        let chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
+
+        let consumption_mode = dream_consumption_mode_from(None);
+        assert_eq!(consumption_mode, ConsumptionMode::AnnotateOnly);
+
+        let signals = CandidateSignals::load(&storage, &chunks, true, consumption_mode);
+        assert!(!is_demote_channel(&signals.validity, "stale"));
+        assert!(!is_demote_channel(&signals.validity, "evolved"));
+
+        apply_validity_partition(&mut enriched, &signals.validity, false);
+        let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
+        assert_eq!(ids, ["stale", "evolved", "valid-1", "valid-2"]);
+        assert_eq!(
+            enriched[0].resolution.as_deref(),
+            Some("[stale anchor] old_fn no longer in current code (receipt deadbee)")
+        );
+        assert_eq!(
+            enriched[1].resolution.as_deref(),
+            Some("[evolved] evolved_fn changed since this conversation (as of bbb)")
+        );
+        assert!(enriched.iter().all(|result| !result.validity_demoted));
+    }
+
+    #[test]
+    fn dream_consumption_full_reproduces_demote_and_annotate_channels_byte_for_byte() {
         let (storage, mut enriched) = dream_consumption_fixture();
         enriched[0].chunk.content = "old_fn stale claim".into();
         enriched[1].chunk.content = "evolved_fn evolved claim".into();
         let chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
 
-        let consumption_enabled = dream_consumption_enabled_from(Some("1"));
-        assert!(consumption_enabled);
+        let consumption_mode = dream_consumption_mode_from(Some("full"));
+        assert_eq!(consumption_mode, ConsumptionMode::Full);
 
-        let signals = CandidateSignals::load(&storage, &chunks, true, consumption_enabled);
+        let signals = CandidateSignals::load(&storage, &chunks, true, consumption_mode);
         assert!(is_demote_channel(&signals.validity, "stale"));
         assert!(!is_demote_channel(&signals.validity, "evolved"));
         assert!(
@@ -4657,7 +4723,7 @@ mod tests {
             Some("all"),
             0,
             true,
-            true,
+            ConsumptionMode::Full,
             false,
         )
         .await
@@ -4715,7 +4781,7 @@ mod tests {
             Some("all"),
             0,
             true,
-            true,
+            ConsumptionMode::Full,
             false,
         )
         .await
@@ -4776,7 +4842,7 @@ mod tests {
             Some("all"),
             0,
             true,
-            true,
+            ConsumptionMode::Full,
             false,
         )
         .await
@@ -4808,7 +4874,7 @@ mod tests {
             Some("all"),
             0,
             true,
-            true,
+            ConsumptionMode::Full,
             true,
         )
         .await
@@ -4853,7 +4919,7 @@ mod tests {
             Some("all"),
             0,
             true,
-            true,
+            ConsumptionMode::Full,
             true,
         )
         .await
@@ -4867,7 +4933,7 @@ mod tests {
             1,
             0.1,
             Some("all"),
-            true,
+            ConsumptionMode::Full,
             true,
         )
         .await
@@ -4919,7 +4985,7 @@ mod tests {
             2,
             0.1,
             Some("all"),
-            true,
+            ConsumptionMode::Full,
             true,
         )
         .await
@@ -4938,7 +5004,7 @@ mod tests {
             2,
             0.1,
             Some("all"),
-            true,
+            ConsumptionMode::Full,
             true,
         )
         .await
@@ -4966,7 +5032,7 @@ mod tests {
             Some("all"),
             0,
             true,
-            true,
+            ConsumptionMode::Full,
             false,
         )
         .await
@@ -5000,7 +5066,7 @@ mod tests {
             Some("all"),
             0,
             true,
-            true,
+            ConsumptionMode::Full,
             false,
         )
         .await
@@ -5026,7 +5092,7 @@ mod tests {
             Some("all"),
             0,
             false,
-            false,
+            ConsumptionMode::Off,
             false,
         )
         .await
@@ -5049,20 +5115,38 @@ mod tests {
         // 4) get_more page 2 respects the partition: full-set partition
         //    yields [valid-1, valid-2, stale], so page 2 (offset 2) is the
         //    demoted chunk, annotated — and page 1 is demotion-free.
-        let page1 =
-            get_more_results_with_vec(&storage, &search, &q, "topic", 0, 2, 0.3, Some("all"), true)
-                .await
-                .unwrap();
+        let page1 = get_more_results_with_vec(
+            &storage,
+            &search,
+            &q,
+            "topic",
+            0,
+            2,
+            0.3,
+            Some("all"),
+            ConsumptionMode::Full,
+        )
+        .await
+        .unwrap();
         assert!(page1.contains("first current topic notes"), "got: {page1}");
         assert!(page1.contains("second current topic notes"), "got: {page1}");
         assert!(
             !page1.contains("old_fn design discussion"),
             "page 1 must not contain the demoted chunk:\n{page1}"
         );
-        let page2 =
-            get_more_results_with_vec(&storage, &search, &q, "topic", 2, 2, 0.3, Some("all"), true)
-                .await
-                .unwrap();
+        let page2 = get_more_results_with_vec(
+            &storage,
+            &search,
+            &q,
+            "topic",
+            2,
+            2,
+            0.3,
+            Some("all"),
+            ConsumptionMode::Full,
+        )
+        .await
+        .unwrap();
         assert!(
             page2.contains("old_fn design discussion"),
             "page 2 must carry the demoted chunk after the partition:\n{page2}"
@@ -5093,10 +5177,19 @@ mod tests {
                 "'{marker}' must appear on exactly one page (p1: {on_p1}, p2: {on_p2})"
             );
         }
-        let page2_again =
-            get_more_results_with_vec(&storage, &search, &q, "topic", 2, 2, 0.3, Some("all"), true)
-                .await
-                .unwrap();
+        let page2_again = get_more_results_with_vec(
+            &storage,
+            &search,
+            &q,
+            "topic",
+            2,
+            2,
+            0.3,
+            Some("all"),
+            ConsumptionMode::Full,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             page2, page2_again,
             "re-requested page 2 must be identical (offset-independent window)"
@@ -5117,7 +5210,7 @@ mod tests {
             Some("all"),
             0,
             true,
-            true,
+            ConsumptionMode::Full,
             false,
         )
         .await
@@ -5211,7 +5304,7 @@ mod tests {
             Some("all"),
             0,
             true,
-            true,
+            ConsumptionMode::Full,
             false,
         )
         .await

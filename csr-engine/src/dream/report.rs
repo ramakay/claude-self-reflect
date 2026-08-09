@@ -205,7 +205,7 @@ fn group_by_day(storage: &Storage, events: &[DreamEventRow]) -> Vec<DayGroup> {
 fn gather_report_data(storage: &Storage) -> Result<DreamReportData> {
     gather_report_data_with(
         storage,
-        crate::storage::recap_feeds::dream_consumption_enabled(),
+        crate::storage::recap_feeds::dream_consumption_mode(),
     )
 }
 
@@ -223,9 +223,9 @@ fn gather_report_data(storage: &Storage) -> Result<DreamReportData> {
 /// its verdict content is gated.
 fn gather_report_data_with(
     storage: &Storage,
-    consumption_enabled: bool,
+    consumption_mode: crate::storage::recap_feeds::ConsumptionMode,
 ) -> Result<DreamReportData> {
-    if !consumption_enabled {
+    if consumption_mode == crate::storage::recap_feeds::ConsumptionMode::Off {
         return Ok(DreamReportData {
             generated_at: chrono::Utc::now()
                 .format("%Y-%m-%d %H:%M:%S UTC")
@@ -248,7 +248,11 @@ fn gather_report_data_with(
     let events = storage.all_dream_events()?;
     let (obsolete, superseded, reinstated) = storage.dream_event_totals()?;
     let last_run = storage.last_dream_run()?;
-    let forgotten_raw = storage.all_demoted_symbols()?;
+    let forgotten_raw = if consumption_mode == crate::storage::recap_feeds::ConsumptionMode::Full {
+        storage.all_demoted_symbols()?
+    } else {
+        Vec::new()
+    };
 
     let generated_at = chrono::Utc::now()
         .format("%Y-%m-%d %H:%M:%S UTC")
@@ -372,7 +376,9 @@ mod tests {
     #[test]
     fn empty_db_renders_no_dreams_yet() {
         let storage = Storage::open_memory().unwrap();
-        let data = gather_report_data(&storage).unwrap();
+        let data =
+            gather_report_data_with(&storage, crate::storage::recap_feeds::ConsumptionMode::Off)
+                .unwrap();
         assert!(data.is_empty);
         assert!(!data.has_run);
         assert!(data.days.is_empty());
@@ -400,7 +406,9 @@ mod tests {
         // consumption_enabled reads real env (unset in this test process by
         // default) — dropping witness_verdicts on top proves the guard
         // clause returns before any query would have needed that table.
-        let data = gather_report_data(&storage).unwrap();
+        let data =
+            gather_report_data_with(&storage, crate::storage::recap_feeds::ConsumptionMode::Off)
+                .unwrap();
         assert!(data.is_empty);
         assert!(!data.has_run);
         assert!(data.days.is_empty());
@@ -453,7 +461,11 @@ mod tests {
             })
             .unwrap();
 
-        let data = gather_report_data_with(&storage, true).unwrap();
+        let data = gather_report_data_with(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        )
+        .unwrap();
         assert!(!data.is_empty);
         assert!(data.has_run);
         assert_eq!(data.totals.superseded, 1);
@@ -502,7 +514,11 @@ mod tests {
             })
             .unwrap();
 
-        let data = gather_report_data_with(&storage, true).unwrap();
+        let data = gather_report_data_with(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        )
+        .unwrap();
         let html = render_html(&data).unwrap();
         assert!(!html.contains(payload), "raw script tag leaked into HTML");
         // minijinja HTML-escapes `/` as well: </script> -> &lt;&#x2f;script&gt;
@@ -537,7 +553,9 @@ mod tests {
             })
             .unwrap();
 
-        let data = gather_report_data_with(&storage, true).unwrap();
+        let data =
+            gather_report_data_with(&storage, crate::storage::recap_feeds::ConsumptionMode::Full)
+                .unwrap();
         assert_eq!(data.forgotten.len(), 1);
         assert_eq!(data.forgotten[0].symbol, "vanished");
 

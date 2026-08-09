@@ -539,14 +539,18 @@ async fn main() -> Result<()> {
         // superseded/reinstated counts, events written) must not print
         // unless explicitly opted in, same shared switch as
         // mcp::tools/status/dream::report.
-        if csr_engine::storage::recap_feeds::dream_consumption_enabled() {
-            print!("{}", stats.format_text(dry_run));
-        } else {
-            let mode = if dry_run { " (dry-run)" } else { "" };
-            println!(
-                "CSR dream{mode}: cycle complete — verdict summary suppressed (opt in \
-                 with CSR_DREAM_CONSUMPTION=1); witness ledger updated regardless."
-            );
+        match csr_engine::storage::recap_feeds::dream_consumption_mode() {
+            csr_engine::storage::recap_feeds::ConsumptionMode::Off => {
+                let mode = if dry_run { " (dry-run)" } else { "" };
+                println!(
+                    "CSR dream{mode}: cycle complete — verdict summary suppressed; witness ledger \
+                     updated regardless."
+                );
+            }
+            csr_engine::storage::recap_feeds::ConsumptionMode::AnnotateOnly
+            | csr_engine::storage::recap_feeds::ConsumptionMode::Full => {
+                print!("{}", stats.format_text(dry_run));
+            }
         }
         return Ok(());
     }

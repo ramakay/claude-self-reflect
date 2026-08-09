@@ -12,25 +12,24 @@ use crate::hooks::recap::{RetiredLine, SettledFact};
 const LEDGER_FEED_LIMIT: i64 = 5;
 const RETIRED_FEED_LIMIT: i64 = 3;
 
-/// `CSR_DREAM_CONSUMPTION=1` opts a user IN to v10 witness-ledger dream
-/// verdicts reaching them at all. Default OFF ships the witness ledger as
-/// experimental derived data: unless explicitly opted in, no dream verdict
-/// may demote/annotate search results (see `mcp::tools`'s validity
-/// partition) or populate the recap "Learnt-then-retired while away:"
-/// clause below. Pure parsing seam (mirrors `active_forgetting_enabled_from`
-/// in `mcp::tools`) — the ONE place this parser is defined; `mcp::tools`
-/// imports it from here so the two consumers can never diverge on ON/OFF
-/// semantics. Only the exact value `1` enables it.
-pub fn dream_consumption_enabled_from(value: Option<&str>) -> bool {
-    value == Some("1")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumptionMode {
+    Off,
+    AnnotateOnly,
+    Full,
 }
 
-/// Reads `CSR_DREAM_CONSUMPTION` from the real process env. Real callers
-/// use this; tests drive `dream_consumption_enabled_from` or the `_with`
-/// seams below directly by parameter instead, to avoid mutating shared
-/// process state under cargo's parallel test runner.
-pub fn dream_consumption_enabled() -> bool {
-    dream_consumption_enabled_from(std::env::var("CSR_DREAM_CONSUMPTION").ok().as_deref())
+pub fn dream_consumption_mode_from(value: Option<&str>) -> ConsumptionMode {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("0" | "false" | "off") => ConsumptionMode::Off,
+        Some("1" | "true" | "full") => ConsumptionMode::Full,
+        Some("annotate") | None => ConsumptionMode::AnnotateOnly,
+        Some(_) => ConsumptionMode::AnnotateOnly,
+    }
+}
+
+pub fn dream_consumption_mode() -> ConsumptionMode {
+    dream_consumption_mode_from(std::env::var("CSR_DREAM_CONSUMPTION").ok().as_deref())
 }
 
 static RECEIPT_OID_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -143,7 +142,7 @@ impl Storage {
     /// data, so the "Learnt-then-retired while away:" recap clause never
     /// reaches a user who hasn't explicitly opted in.
     pub fn recap_retired_since(&self, project: &str, since_ts: &str) -> Result<Vec<RetiredLine>> {
-        self.recap_retired_since_with(project, since_ts, dream_consumption_enabled())
+        self.recap_retired_since_with(project, since_ts, dream_consumption_mode())
     }
 
     /// Core of [`recap_retired_since`] with the dream-consumption opt-in
@@ -159,9 +158,9 @@ impl Storage {
         &self,
         project: &str,
         since_ts: &str,
-        consumption_enabled: bool,
+        consumption_mode: ConsumptionMode,
     ) -> Result<Vec<RetiredLine>> {
-        if !consumption_enabled {
+        if consumption_mode != ConsumptionMode::Full {
             return Ok(Vec::new());
         }
         let conn = self
@@ -490,7 +489,7 @@ mod tests {
         }
 
         let retired = storage
-            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", true)
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", ConsumptionMode::Full)
             .unwrap();
 
         assert_eq!(retired.len(), 3);
@@ -517,7 +516,7 @@ mod tests {
         );
 
         let retired = storage
-            .recap_retired_since_with("alpha", "2026-08-02T00:00:00Z", true)
+            .recap_retired_since_with("alpha", "2026-08-02T00:00:00Z", ConsumptionMode::Full)
             .unwrap();
 
         assert_eq!(retired.len(), 1);
@@ -538,7 +537,7 @@ mod tests {
         );
 
         let retired = storage
-            .recap_retired_since_with("alpha", "2026-08-02T00:00:00.100Z", true)
+            .recap_retired_since_with("alpha", "2026-08-02T00:00:00.100Z", ConsumptionMode::Full)
             .unwrap();
 
         assert_eq!(retired.len(), 1);
@@ -568,19 +567,32 @@ mod tests {
         );
 
         let retired = storage
-            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", true)
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", ConsumptionMode::Full)
             .unwrap();
 
         assert_eq!(retired[0].label, "newer_by_time");
     }
 
     #[test]
-    fn dream_consumption_parsing_is_opt_in_only() {
-        assert!(dream_consumption_enabled_from(Some("1")));
-        for value in [None, Some("0"), Some("true"), Some("yes"), Some("")] {
-            assert!(
-                !dream_consumption_enabled_from(value),
-                "value {value:?} must leave dream consumption off"
+    fn dream_consumption_mode_parsing_matrix() {
+        for (value, expected) in [
+            (None, ConsumptionMode::AnnotateOnly),
+            (Some("0"), ConsumptionMode::Off),
+            (Some("false"), ConsumptionMode::Off),
+            (Some("FALSE"), ConsumptionMode::Off),
+            (Some("OFF"), ConsumptionMode::Off),
+            (Some("1"), ConsumptionMode::Full),
+            (Some("true"), ConsumptionMode::Full),
+            (Some("full"), ConsumptionMode::Full),
+            (Some("FULL"), ConsumptionMode::Full),
+            (Some("annotate"), ConsumptionMode::AnnotateOnly),
+            (Some("ANNOTATE"), ConsumptionMode::AnnotateOnly),
+            (Some("garbage"), ConsumptionMode::AnnotateOnly),
+        ] {
+            assert_eq!(
+                dream_consumption_mode_from(value),
+                expected,
+                "value {value:?}"
             );
         }
     }
@@ -599,7 +611,7 @@ mod tests {
         );
 
         let retired = storage
-            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", false)
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", ConsumptionMode::Off)
             .unwrap();
 
         assert!(
@@ -626,7 +638,7 @@ mod tests {
             .unwrap();
 
         let retired = storage
-            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", false)
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", ConsumptionMode::Off)
             .unwrap();
         assert!(retired.is_empty());
     }
@@ -647,7 +659,11 @@ mod tests {
             "2026-08-05T00:00:00Z",
         );
         let retired_while_away = storage
-            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", false)
+            .recap_retired_since_with(
+                "alpha",
+                "2026-08-01T00:00:00Z",
+                ConsumptionMode::AnnotateOnly,
+            )
             .unwrap();
         assert!(retired_while_away.is_empty());
 
