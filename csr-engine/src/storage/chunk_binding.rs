@@ -535,7 +535,33 @@ pub fn witness_verdict_for_chunks(
         resolved.push((*idx, convs, bound_symbol));
     }
 
-    let states = witness_verdicts::symbol_verdict_states_for_lineages(&tx, &state_anchors)?;
+    let mut states = witness_verdicts::symbol_verdict_states_for_lineages(&tx, &state_anchors)?;
+    // Legacy-lineage fallback (annotate channel only): when a file has a
+    // rederived-v2 generation, the anchor filter above restricts verdicts to
+    // that lineage — silently hiding every verdict recorded on the file's
+    // pre-rederivation witnesses (observed live: 545/545 verdicts invisible
+    // in search, 2026-08-09). A negative latest event on the SAME
+    // (project,file,symbol) in the legacy lineage is still true history for
+    // the conversations that produced that code, so it surfaces as an
+    // annotation with its receipt — but it is forced onto the Annotate
+    // channel: only strictly-current-lineage states may ever demote.
+    {
+        let missing: Vec<(String, String, String, Option<String>)> = state_anchors
+            .iter()
+            .filter(|(project, file, symbol, source_id)| {
+                source_id.is_some()
+                    && !states.contains_key(&(project.clone(), file.clone(), symbol.clone()))
+            })
+            .map(|(project, file, symbol, _)| (project.clone(), file.clone(), symbol.clone(), None))
+            .collect();
+        if !missing.is_empty() {
+            let legacy = witness_verdicts::symbol_verdict_states_for_lineages(&tx, &missing)?;
+            for (key, mut state) in legacy {
+                state.channel = witness_verdicts::VerdictChannel::Annotate;
+                states.entry(key).or_insert(state);
+            }
+        }
+    }
     let negative_witness_ids: Vec<i64> = states
         .values()
         .flat_map(|state| state.negative_witness_ids.iter().copied())
@@ -1501,6 +1527,98 @@ mod tests {
         assert!(
             out.is_empty(),
             "newer HEAD's two candidates must abstain; late older HEAD must not win by row id"
+        );
+    }
+
+    #[test]
+    fn legacy_lineage_verdict_surfaces_as_annotation_when_rederived_lineage_is_clean() {
+        // Live-corpus shape (2026-08-09): a file has a complete rederived-v2
+        // generation with NO verdicts, while the superseded_by verdict sits on
+        // an older legacy `backfill` witness. The lineage-restricted lookup
+        // alone hides all such verdicts (observed: 545/545 invisible in
+        // search). The legacy fallback must surface it — Annotate channel
+        // only, never demote.
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_COMMON_DIR")
+                .env("GIT_AUTHOR_NAME", "CSR Test")
+                .env("GIT_AUTHOR_EMAIL", "csr@example.invalid")
+                .env("GIT_COMMITTER_NAME", "CSR Test")
+                .env("GIT_COMMITTER_EMAIL", "csr@example.invalid")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        std::fs::write(repo.join("history.txt"), "one\n").unwrap();
+        assert!(git(&["add", "history.txt"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "one"]).status.success());
+        let old_head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        std::fs::write(repo.join("history.txt"), "two\n").unwrap();
+        assert!(git(&["add", "history.txt"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "two"]).status.success());
+        let new_head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let conn = open();
+        upsert_node(&conn, &node("shared", "conv-1", "conv-1")).unwrap();
+        let repo_root = repo.to_string_lossy();
+
+        // Selected lineage: complete rederived generation at HEAD, clean.
+        let mut current = ledger_row("Outer::shared", &new_head, "b3:new");
+        current.source_kind = "backfill_rederived_v2".into();
+        current.source_id = Some("run-new".into());
+        witness_ledger::insert_witness(&conn, &current).unwrap();
+        generation(&conn, "run-new", &new_head, "complete", Some(&repo_root));
+
+        // Legacy witness (plain backfill) carrying the only verdict.
+        let legacy = ledger_row("Outer::shared", &old_head, "b3:old");
+        witness_ledger::insert_witness(&conn, &legacy).unwrap();
+        let legacy_id = witness_ledger::latest_witness_for_symbol(
+            &conn,
+            "proj",
+            "/repo/src/lib.rs",
+            Some("Outer::shared"),
+        )
+        .unwrap()
+        .unwrap()
+        .id;
+        witness_verdicts::insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id: legacy_id,
+                verdict: VerdictKind::SupersededBy,
+                successor_witness_id: None,
+                receipt_oid: Some("receiptoid".into()),
+                observed_head_oid: new_head.clone(),
+            },
+        )
+        .unwrap();
+
+        let out = witness_verdict_for_chunks(&conn, &["conv-1".to_string()]).unwrap();
+        let hits = out
+            .get("conv-1")
+            .expect("legacy verdict must annotate the conversation");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].verdict, "superseded_by");
+        assert_eq!(hits[0].receipt_oid.as_deref(), Some("receiptoid"));
+        assert_eq!(
+            hits[0].channel,
+            witness_verdicts::VerdictChannel::Annotate,
+            "legacy-lineage fallback may only annotate, never demote"
         );
     }
 
