@@ -3845,7 +3845,9 @@ mod tests {
         // The one place this suite touches the real process env var for
         // this feature — every other test drives `resolve_validity_with`
         // directly by parameter to avoid racing with this test under
-        // cargo's parallel test runner.
+        // cargo's parallel test runner. The guard serializes us against the
+        // other env-sensitive tests (status, eval gate) that also hold it.
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let restore = std::env::var("CSR_NO_VALIDITY_PARTITION").ok();
         std::env::set_var("CSR_NO_VALIDITY_PARTITION", "1");
         assert!(!validity_partition_enabled());
