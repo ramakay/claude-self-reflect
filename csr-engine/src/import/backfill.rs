@@ -393,9 +393,20 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
                     eprintln!("CSR backfill: file state error for {file} ({e})");
                 }
             }
-            if let Some(ids) = latest_node_ids.get(&(project.clone(), file.clone())) {
-                if let Err(e) = storage.retire_missing_code_nodes(project, file, ids) {
-                    eprintln!("CSR backfill: node retire error for {file} ({e})");
+            // Retire ONLY from a complete on-disk observation. When the file is
+            // gone — routine for a pruned worktree — extraction above falls back
+            // to concatenated transcript edit snippets, which are fragments of a
+            // file, not a file. Their node ids are non-empty, so the empty-set
+            // guard in `retire_missing_nodes` does not help: every historical
+            // symbol the snippet happens not to contain would be hard-deleted
+            // along with its `code_node_attribution` provenance. Edge replacement
+            // and file state above are keyed to the same observation, but only
+            // retirement destroys history, so only it is gated here.
+            if from_disk_files.contains(&(project.clone(), file.clone())) {
+                if let Some(ids) = latest_node_ids.get(&(project.clone(), file.clone())) {
+                    if let Err(e) = storage.retire_missing_code_nodes(project, file, ids) {
+                        eprintln!("CSR backfill: node retire error for {file} ({e})");
+                    }
                 }
             }
         }

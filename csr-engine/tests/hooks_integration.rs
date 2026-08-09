@@ -533,6 +533,111 @@ fn code_evolution_stores_canonical_path_not_worktree_path() {
     );
 }
 
+/// A file observed mid-edit parses partially: `parse_clean == false` while some
+/// definitions still extract. Retiring against that truncated view would delete
+/// every symbol it failed to see, along with its attribution provenance. Drives
+/// the real hook so the gate in `update_code_graph` is what is under test.
+#[test]
+fn partial_parse_must_not_retire_previously_stored_nodes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let file = repo.join("src").join("partial.rs");
+    let file_str = file.to_string_lossy().to_string();
+
+    let transcript = tmp.path().join("session.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"user","message":{"content":[{"type":"text","text":"edit"}]},"timestamp":"2026-02-22T16:00:00Z"}
+"#,
+    )
+    .unwrap();
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage.clone(),
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
+    );
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let fire = |content: &str| {
+        std::fs::write(&file, content).unwrap();
+        let input = csr_engine::hooks::HookInput {
+            transcript_path: Some(transcript.to_string_lossy().to_string()),
+            session_id: Some("88888888-9999-aaaa-bbbb-cccccccccccc".into()),
+            cwd: Some(repo.to_string_lossy().to_string()),
+            tool_name: Some("Write".into()),
+            tool_input: Some(serde_json::json!({ "file_path": file_str, "content": content })),
+            ..Default::default()
+        };
+        rt.block_on(csr_engine::hooks::post_tool_use::handle(
+            &input,
+            &engine,
+            repo.as_path(),
+        ))
+        .unwrap();
+    };
+
+    // Clean parse: two functions land in the graph.
+    fire("fn alpha() {\n    let _ = 1;\n}\n\nfn beta() {\n    let _ = 2;\n}\n");
+    // Nodes are stored under the resolved spelling (macOS /var → /private/var),
+    // so look them up the same way rather than by the raw fixture path.
+    let stored_str = std::fs::canonicalize(&file)
+        .unwrap_or(file.clone())
+        .to_string_lossy()
+        .to_string();
+    let after_clean = storage.count_code_nodes_for_file(&stored_str).unwrap();
+    assert!(
+        after_clean >= 2,
+        "fixture must seed at least two nodes or the test is vacuous (got {after_clean})"
+    );
+
+    // Same file caught mid-edit: `alpha` survives, `beta` is truncated to an
+    // unclosed body, so the parse is dirty but still yields a definition.
+    let partial_src = "fn alpha() {\n    let _ = 1;\n}\n\nfn beta() {\n    let _ = 2;\n";
+
+    // Pin WHY this fixture exercises the parse_clean gate specifically. If the
+    // partial source extracted zero nodes, the empty-set guard in
+    // `retire_missing_nodes` would be what saves it and the gate under test
+    // would never run — the test would pass for the wrong reason.
+    {
+        let lang = csr_engine::extraction::ast_analysis::lang_from_path_str("partial.rs")
+            .expect("rust is a supported language");
+        let frag = csr_engine::extraction::codegraph::extract_graph_fragment(
+            partial_src,
+            lang,
+            &file_str,
+            "repo",
+            "proj",
+            "c1",
+            "s1",
+        );
+        assert!(
+            !frag.parse_clean,
+            "fixture must produce a DIRTY parse, else the parse_clean gate is not what is under test"
+        );
+        assert!(
+            !frag.nodes.is_empty(),
+            "fixture must still yield nodes, else the empty-set guard is what protects the data, not parse_clean"
+        );
+    }
+
+    fire(partial_src);
+    let after_partial = storage.count_code_nodes_for_file(&stored_str).unwrap();
+
+    assert_eq!(
+        after_partial, after_clean,
+        "a partial parse must retire nothing — {after_clean} nodes before, {after_partial} after"
+    );
+}
+
 // ─── Install Config with All Hooks ───
 
 #[test]

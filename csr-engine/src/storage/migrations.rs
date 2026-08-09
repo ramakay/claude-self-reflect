@@ -929,53 +929,26 @@ pub(crate) fn backfill_worktree_paths(conn: &Connection) -> Result<()> {
         }
     }
 
-    // code_nodes: `id = sha256(repo|file|kind|name)` is content-derived but is
-    // NEVER changed here (out of scope — code_edges/code_node_attribution
-    // reference it). Only `file` is rewritten, and only when no other row
-    // already owns the canonical (repo, file, kind, name) identity.
-    {
-        let mut stmt =
-            conn.prepare("SELECT id, repo, file, kind, name FROM code_nodes WHERE file LIKE ?1")?;
-        let rows: Vec<(String, String, String, String, String)> = stmt
-            .query_map([WORKTREE_MARKER], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-
-        for (id, repo, file, kind, name) in rows {
-            let canonical =
-                crate::extraction::repo_path::canonical_repo_path(std::path::Path::new(&file));
-            let canonical_str = canonical.to_string_lossy().to_string();
-            if canonical_str == file {
-                // Not actually rewritable right now (e.g. the worktree was
-                // already removed from disk, so canonicalization fails open
-                // and returns the input unchanged) — leave it, never guess.
-                continue;
-            }
-
-            let collision: bool = conn.query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM code_nodes
-                     WHERE repo = ?1 AND file = ?2 AND kind = ?3 AND name = ?4 AND id != ?5
-                 )",
-                rusqlite::params![repo, canonical_str, kind, name, id],
-                |r| r.get(0),
-            )?;
-            if collision {
-                // A canonical row for this exact symbol already exists under a
-                // different id — prefer it, leave this worktree row as a known
-                // duplicate for a later dedup pass. Do not delete it.
-                continue;
-            }
-
-            conn.execute(
-                "UPDATE code_nodes SET file = ?1 WHERE id = ?2",
-                rusqlite::params![canonical_str, id],
-            )?;
-        }
-    }
-
+    // code_nodes is deliberately NOT rewritten here.
+    //
+    // `id = sha256(repo|file|kind|name)` (extraction::codegraph::node_id), so
+    // rewriting `file` without recomputing `id` leaves a row whose stored path
+    // disagrees with its own identity. The next extraction of that file mints a
+    // second row under the correct canonical id, and `retire_missing_nodes` —
+    // which scopes by (project, file) — then sees the migrated legacy row as
+    // absent from the observed set and hard-deletes it together with its
+    // `code_node_attribution` provenance. The migration would manufacture
+    // exactly the data loss the rest of this branch is closing.
+    //
+    // Re-keying properly would mean rewriting `code_edges.src_id`/`dst_id`,
+    // `code_node_attribution.node_id` and `code_node_rank.node_id` in one
+    // transaction and merging into any pre-existing canonical row — a real
+    // migration, not a release-gate cleanup, and not worth the risk here.
+    //
+    // Leaving these rows untouched is a no-op against today's behaviour: they
+    // already sit under their worktree paths, and retirement never reaches them
+    // because it is scoped to the canonical (project, file). The forward fix in
+    // `hooks::post_tool_use::update_code_graph` stops new ones being written.
     Ok(())
 }
 
@@ -1465,13 +1438,19 @@ mod tests {
             evo_path, wt_file,
             "must not remain keyed under the worktree path"
         );
+        // code_nodes must be left ALONE. Rewriting `file` without recomputing
+        // the path-derived `id` would desynchronize a row from its own identity
+        // and hand it to `retire_missing_nodes` as a deletion target on the next
+        // extraction, destroying its attribution provenance. Asserting the
+        // non-rewrite is the safety property, not a relaxation of the old one.
         assert_eq!(
-            node_path, main_file_str,
-            "code_nodes.file must be rewritten to the canonical path"
+            node_path, wt_file,
+            "code_nodes.file must NOT be rewritten — id is derived from file, \
+             so rewriting the path alone makes the row a retirement target"
         );
         assert_ne!(
-            node_path, wt_file,
-            "must not remain keyed under the worktree path"
+            node_path, main_file_str,
+            "code_nodes must not be silently re-keyed to the canonical path"
         );
     }
 

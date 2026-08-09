@@ -126,8 +126,19 @@ fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
         storage.upsert_code_node(&node)?;
     }
     let seen_node_ids: Vec<String> = fragment.nodes.iter().map(|n| n.id.clone()).collect();
-    storage.retire_missing_code_nodes(&project, &stored_path_str, &seen_node_ids)?;
-    storage.replace_code_file_edges(&project, &stored_path_str, &fragment.edges)?;
+    // Only a CLEAN parse may drive the destructive half. A partial parse still
+    // returns some valid definitions — `extract_graph_fragment` sets
+    // `parse_clean = false` while `nodes` stays non-empty — and treating that
+    // truncated view as authoritative would retire every symbol it failed to
+    // see, taking each one's `code_node_attribution` provenance with it. Files
+    // are routinely observed mid-edit, so this is a common path, not a corner
+    // case. Upserts above are additive and safe unconditionally; only
+    // retirement and edge replacement are gated. This is the same signal
+    // `eval::codegraph` and `import::backfill` already gate on.
+    if fragment.parse_clean {
+        storage.retire_missing_code_nodes(&project, &stored_path_str, &seen_node_ids)?;
+        storage.replace_code_file_edges(&project, &stored_path_str, &fragment.edges)?;
+    }
 
     let content_hash = crate::extraction::anchors::hash_normalized(&source);
     storage.upsert_code_file_state(&project, &stored_path_str, &content_hash, false)?;

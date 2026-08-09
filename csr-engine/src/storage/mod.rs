@@ -1026,6 +1026,18 @@ impl Storage {
         codegraph::retire_missing_nodes(&conn, project, file, seen_ids)
     }
 
+    /// Count `code_nodes` rows for a file, across every project. Used by the
+    /// retirement-safety tests to assert that a destructive path did not fire.
+    pub fn count_code_nodes_for_file(&self, file: &str) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM code_nodes WHERE file = ?1",
+            rusqlite::params![file],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     /// Fetch a single `code_nodes` row by id (thin wrapper for tests / tools).
     pub fn get_code_node(&self, id: &str) -> Result<Option<codegraph::NodeRow>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
