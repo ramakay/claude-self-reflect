@@ -446,6 +446,93 @@ fn code_evolution_keys_by_transcript_stem_not_session_id() {
     );
 }
 
+/// D5: a file edited inside a linked git worktree must be recorded under the
+/// canonical main-repo path, not the throwaway worktree path — otherwise a
+/// search against the real repo path returns nothing.
+#[test]
+fn code_evolution_stores_canonical_path_not_worktree_path() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let main = tmp.path().join("main");
+    let wt = tmp.path().join("wt");
+
+    std::fs::create_dir_all(main.join("src")).unwrap();
+    std::fs::create_dir_all(main.join(".git").join("worktrees").join("wt")).unwrap();
+    std::fs::create_dir_all(wt.join("src")).unwrap();
+
+    // Main-repo file the worktree path must canonicalize onto.
+    let main_file = main.join("src").join("evolved.rs");
+    std::fs::write(&main_file, "fn old() {}\n").unwrap();
+
+    // Linked worktree marker: `.git` is a file pointing at the main repo's gitdir.
+    let gitdir_line = format!("gitdir: {}/.git/worktrees/wt\n", main.display());
+    std::fs::write(wt.join(".git"), gitdir_line).unwrap();
+
+    let wt_file = wt.join("src").join("evolved.rs");
+    let wt_file_str = wt_file.to_string_lossy().to_string();
+    // Same resolved spelling `canonical_repo_path` stores (macOS /var → /private/var).
+    let main_file_str = std::fs::canonicalize(&main_file)
+        .unwrap_or(main_file.clone())
+        .to_string_lossy()
+        .to_string();
+
+    let transcript = tmp.path().join("session.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"user","message":{"content":[{"type":"text","text":"Add a function"}]},"timestamp":"2026-02-22T16:00:00Z"}
+"#,
+    )
+    .unwrap();
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage.clone(),
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
+    );
+
+    let input = csr_engine::hooks::HookInput {
+        transcript_path: Some(transcript.to_string_lossy().to_string()),
+        session_id: Some("33333333-4444-5555-6666-777777777777".into()),
+        cwd: Some(wt.to_string_lossy().to_string()),
+        tool_name: Some("Write".into()),
+        tool_input: Some(serde_json::json!({
+            "file_path": wt_file_str,
+            "content": "fn new_function() { }"
+        })),
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(csr_engine::hooks::post_tool_use::handle(
+        &input,
+        &engine,
+        wt.as_path(),
+    ));
+    assert!(result.is_ok());
+
+    let rows_by_main = storage
+        .get_recent_code_evolution(&main_file_str, "", 10)
+        .unwrap();
+    assert!(
+        !rows_by_main.is_empty(),
+        "code_evolution must be keyed by the canonical main-repo path"
+    );
+
+    let rows_by_worktree = storage
+        .get_recent_code_evolution(&wt_file_str, "", 10)
+        .unwrap();
+    assert!(
+        rows_by_worktree.is_empty(),
+        "no row should remain keyed under the throwaway worktree path: {:?}",
+        rows_by_worktree
+    );
+}
+
 // ─── Install Config with All Hooks ───
 
 #[test]

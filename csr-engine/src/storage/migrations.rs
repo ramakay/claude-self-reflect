@@ -885,6 +885,97 @@ pub fn run(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_code_nodes_last_conv ON code_nodes(last_conv_id);",
     )?;
 
+    // D5 one-shot backfill: rewrite worktree-local paths already stored in
+    // code_evolution.file_path / code_nodes.file to canonical main-repo form.
+    // Gated by `meta` so it runs exactly once per database, never on every
+    // open (canonicalization does a filesystem walk per row).
+    if crate::storage::queries::get_meta(conn, "worktree_path_backfill_v1")?.is_none() {
+        backfill_worktree_paths(conn)?;
+        crate::storage::queries::set_meta(conn, "worktree_path_backfill_v1", "done")?;
+    }
+
+    Ok(())
+}
+
+/// One-shot backfill (D5): rewrite already-stored worktree-local paths in
+/// `code_evolution.file_path` / `code_nodes.file` to their canonical main-repo
+/// form. Companion to the `track_code_evolution` fix in `hooks::post_tool_use`
+/// (which now canonicalizes on every new write) — this corrects rows written
+/// before that fix landed. Never deletes anything. `pub(crate)` so tests can
+/// call it directly, independent of the one-shot `meta` gate in `run()`.
+pub(crate) fn backfill_worktree_paths(conn: &Connection) -> Result<()> {
+    const WORKTREE_MARKER: &str = "%/.claude/worktrees/%";
+
+    // code_evolution: `id` is never derived from `file_path` — plain rewrite,
+    // no collision possible, no logical-duplicate concern (append-only ledger).
+    {
+        let mut stmt =
+            conn.prepare("SELECT id, file_path FROM code_evolution WHERE file_path LIKE ?1")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([WORKTREE_MARKER], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        for (id, file_path) in rows {
+            let canonical =
+                crate::extraction::repo_path::canonical_repo_path(std::path::Path::new(&file_path));
+            let canonical_str = canonical.to_string_lossy().to_string();
+            if canonical_str != file_path {
+                conn.execute(
+                    "UPDATE code_evolution SET file_path = ?1 WHERE id = ?2",
+                    rusqlite::params![canonical_str, id],
+                )?;
+            }
+        }
+    }
+
+    // code_nodes: `id = sha256(repo|file|kind|name)` is content-derived but is
+    // NEVER changed here (out of scope — code_edges/code_node_attribution
+    // reference it). Only `file` is rewritten, and only when no other row
+    // already owns the canonical (repo, file, kind, name) identity.
+    {
+        let mut stmt =
+            conn.prepare("SELECT id, repo, file, kind, name FROM code_nodes WHERE file LIKE ?1")?;
+        let rows: Vec<(String, String, String, String, String)> = stmt
+            .query_map([WORKTREE_MARKER], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        for (id, repo, file, kind, name) in rows {
+            let canonical =
+                crate::extraction::repo_path::canonical_repo_path(std::path::Path::new(&file));
+            let canonical_str = canonical.to_string_lossy().to_string();
+            if canonical_str == file {
+                // Not actually rewritable right now (e.g. the worktree was
+                // already removed from disk, so canonicalization fails open
+                // and returns the input unchanged) — leave it, never guess.
+                continue;
+            }
+
+            let collision: bool = conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM code_nodes
+                     WHERE repo = ?1 AND file = ?2 AND kind = ?3 AND name = ?4 AND id != ?5
+                 )",
+                rusqlite::params![repo, canonical_str, kind, name, id],
+                |r| r.get(0),
+            )?;
+            if collision {
+                // A canonical row for this exact symbol already exists under a
+                // different id — prefer it, leave this worktree row as a known
+                // duplicate for a later dedup pass. Do not delete it.
+                continue;
+            }
+
+            conn.execute(
+                "UPDATE code_nodes SET file = ?1 WHERE id = ?2",
+                rusqlite::params![canonical_str, id],
+            )?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1309,6 +1400,173 @@ mod tests {
         assert_eq!(
             idx_count, 2,
             "both code_nodes conversation-attribution indexes must exist"
+        );
+    }
+
+    #[test]
+    fn worktree_backfill_rewrites_stored_paths_to_canonical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        // Path must contain `/.claude/worktrees/` so the migration LIKE filter matches.
+        let wt = tmp.path().join(".claude").join("worktrees").join("wt");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::create_dir_all(main.join(".git").join("worktrees").join("wt")).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+
+        let main_file = main.join("src").join("a.rs");
+        std::fs::write(&main_file, "fn a() {}").unwrap();
+        let gitdir_line = format!("gitdir: {}/.git/worktrees/wt\n", main.display());
+        std::fs::write(wt.join(".git"), gitdir_line).unwrap();
+
+        let wt_file = wt.join("src").join("a.rs").to_string_lossy().to_string();
+        // Compare against the same resolved spelling `canonical_repo_path` stores
+        // (macOS /var → /private/var via canonicalize).
+        let main_file_str = std::fs::canonicalize(&main_file)
+            .unwrap_or(main_file.clone())
+            .to_string_lossy()
+            .to_string();
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+
+        conn.execute(
+            "INSERT INTO code_evolution (id, session_id, project_name, file_path, language, tool_name) \
+             VALUES ('evo_1', 'sess', 'proj', ?1, 'rust', 'Write')",
+            rusqlite::params![wt_file],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_nodes (id, repo, project, file, kind, name) \
+             VALUES ('node_1', 'repo', 'proj', ?1, 'function', 'foo')",
+            rusqlite::params![wt_file],
+        )
+        .unwrap();
+
+        backfill_worktree_paths(&conn).unwrap();
+
+        let evo_path: String = conn
+            .query_row(
+                "SELECT file_path FROM code_evolution WHERE id = 'evo_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let node_path: String = conn
+            .query_row("SELECT file FROM code_nodes WHERE id = 'node_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        assert_eq!(
+            evo_path, main_file_str,
+            "code_evolution.file_path must be rewritten to the canonical path"
+        );
+        assert_ne!(
+            evo_path, wt_file,
+            "must not remain keyed under the worktree path"
+        );
+        assert_eq!(
+            node_path, main_file_str,
+            "code_nodes.file must be rewritten to the canonical path"
+        );
+        assert_ne!(
+            node_path, wt_file,
+            "must not remain keyed under the worktree path"
+        );
+    }
+
+    #[test]
+    fn worktree_backfill_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main2");
+        // Path must contain `/.claude/worktrees/` so the migration LIKE filter matches.
+        let wt = tmp.path().join(".claude").join("worktrees").join("wt2");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::create_dir_all(main.join(".git").join("worktrees").join("wt2")).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+
+        let main_file = main.join("src").join("b.rs");
+        std::fs::write(&main_file, "fn b() {}").unwrap();
+        let gitdir_line = format!("gitdir: {}/.git/worktrees/wt2\n", main.display());
+        std::fs::write(wt.join(".git"), gitdir_line).unwrap();
+
+        let wt_file = wt.join("src").join("b.rs").to_string_lossy().to_string();
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+
+        conn.execute(
+            "INSERT INTO code_evolution (id, session_id, project_name, file_path, language, tool_name) \
+             VALUES ('evo_2', 'sess', 'proj', ?1, 'rust', 'Write')",
+            rusqlite::params![wt_file],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_nodes (id, repo, project, file, kind, name) \
+             VALUES ('node_2', 'repo', 'proj', ?1, 'function', 'bar')",
+            rusqlite::params![wt_file],
+        )
+        .unwrap();
+
+        backfill_worktree_paths(&conn).unwrap();
+
+        let count_evo_1: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_evolution", [], |r| r.get(0))
+            .unwrap();
+        let count_nodes_1: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_nodes", [], |r| r.get(0))
+            .unwrap();
+        let evo_path_1: String = conn
+            .query_row(
+                "SELECT file_path FROM code_evolution WHERE id = 'evo_2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let node_path_1: String = conn
+            .query_row("SELECT file FROM code_nodes WHERE id = 'node_2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        // Second pass, direct call (bypassing the one-shot `meta` gate on purpose,
+        // to prove the underlying rewrite logic itself is idempotent).
+        backfill_worktree_paths(&conn).unwrap();
+
+        let count_evo_2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_evolution", [], |r| r.get(0))
+            .unwrap();
+        let count_nodes_2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_nodes", [], |r| r.get(0))
+            .unwrap();
+        let evo_path_2: String = conn
+            .query_row(
+                "SELECT file_path FROM code_evolution WHERE id = 'evo_2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let node_path_2: String = conn
+            .query_row("SELECT file FROM code_nodes WHERE id = 'node_2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        assert_eq!(
+            count_evo_1, count_evo_2,
+            "row count must be stable across repeated backfill passes"
+        );
+        assert_eq!(
+            count_nodes_1, count_nodes_2,
+            "row count must be stable across repeated backfill passes"
+        );
+        assert_eq!(
+            evo_path_1, evo_path_2,
+            "path must be stable across repeated backfill passes"
+        );
+        assert_eq!(
+            node_path_1, node_path_2,
+            "path must be stable across repeated backfill passes"
         );
     }
 }

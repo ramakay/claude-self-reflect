@@ -245,6 +245,13 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
     // Resolve project name for cross-project scoping
     let project_name = resolve_project_for_hook(Path::new(file_path).parent());
 
+    // Read from the original path (worktree-local); store under the canonical
+    // main-repo path so worktree edits do not create duplicate rows (D5 — mirrors
+    // `update_code_graph` and `import::coedit_backfill`, the two sibling write
+    // paths that already canonicalize before storing).
+    let stored_path = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path));
+    let stored_path_str = stored_path.to_string_lossy();
+
     // Serialize to JSON arrays
     let fa = serde_json::to_string(&diff.functions_added).unwrap_or_default();
     let fr = serde_json::to_string(&diff.functions_removed).unwrap_or_default();
@@ -254,13 +261,17 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
     let ir = serde_json::to_string(&diff.imports_removed).unwrap_or_default();
 
     // Repo identity (WP2 Stage 1, H8 finding): stable across cwd/session
-    // boundaries, unlike `project_name` — never overwrites it.
-    let repo_root = crate::extraction::repo_root::repo_root_for_file(file_path);
+    // boundaries, unlike `project_name` — never overwrites it. Resolved from the
+    // canonical path (same as `update_code_graph`): `git rev-parse --show-toplevel`
+    // run against a worktree-local path returns the worktree's own root, not the
+    // main repo's — resolving from the raw path would produce a wrong repo_root
+    // even after the file_path fix above.
+    let repo_root = crate::extraction::repo_root::repo_root_for_file(&stored_path_str);
 
     engine.storage().insert_code_evolution(
         &conv_id,
         &project_name,
-        file_path,
+        &stored_path_str,
         language,
         tool_name,
         &fa,
@@ -274,7 +285,7 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
 
     eprintln!(
         "CSR: tracked code evolution for {} (+{} fns, -{} fns)",
-        file_path,
+        stored_path_str,
         diff.functions_added.len(),
         diff.functions_removed.len()
     );
