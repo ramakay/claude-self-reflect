@@ -35,6 +35,11 @@ static CSR_SYSTEM_REMINDER_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Single tool-use marker token produced by `extract_tool_context`:
+/// `[Word]` or `[Word: detail]` (detail may contain spaces, never brackets).
+static TOOL_MARKER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[[A-Za-z0-9_]+(?::[^\[\]]*)?\]").unwrap());
+
 /// A chunk of a conversation, ready for embedding and storage.
 #[derive(Debug, Clone)]
 pub struct ConversationChunk {
@@ -370,7 +375,7 @@ pub(crate) fn parse_jsonl_file_with_stats(
             .get("isSidechain")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if !combined_text.is_empty() {
+        if !combined_text.is_empty() && !is_marker_only_text(&combined_text) {
             messages.push(combined_text);
             authors.push(classify_message_author(&parsed));
             sidechains.push(is_sidechain_msg);
@@ -898,6 +903,20 @@ fn extract_tool_context(msg: &serde_json::Value) -> String {
     tool_lines.join(" ")
 }
 
+/// A tool-use marker has the shape `[Word]` or `[Word: detail]` (produced by
+/// extract_tool_context). Returns true if `text`, after trimming, consists ONLY of
+/// one or more such markers separated by whitespace and nothing else — i.e. it carries
+/// no real prose or tool-result content and should not be embedded as a search chunk.
+fn is_marker_only_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Strip every marker token; pure tool-call noise leaves only whitespace.
+    let remainder = TOOL_MARKER_RE.replace_all(trimmed, "");
+    remainder.chars().all(|c| c.is_whitespace())
+}
+
 pub(crate) fn is_csr_tool_use(item: &serde_json::Value, name: &str) -> bool {
     if name.starts_with("csr_")
         || name.starts_with("mcp__claude-self-reflect__")
@@ -1288,8 +1307,85 @@ mod tests {
 
         assert!(!content.contains("SECRET RETRIEVAL QUERY"));
         assert!(!content.contains("SECRET RETRIEVAL RESULT"));
-        assert!(content.contains("[Read: src/kept.rs]"));
+        // Marker-only assistant messages are not embedded (D7); the substantive
+        // sibling tool_result still survives as a searchable chunk.
         assert!(content.contains("KEPT FILE RESULT"));
+    }
+
+    #[test]
+    fn marker_only_text_detection() {
+        assert!(is_marker_only_text("[Edit: foo.md]"));
+        assert!(!is_marker_only_text(
+            "[Edit: foo.md]\nFixed the parser bug."
+        ));
+        assert!(is_marker_only_text("[Read] [Bash]"));
+        assert!(is_marker_only_text(
+            "[Read: src/engine.rs] [Bash: cargo test --release]"
+        ));
+        assert!(!is_marker_only_text("Fixed the parser bug."));
+        assert!(!is_marker_only_text(""));
+    }
+
+    #[test]
+    fn marker_only_assistant_message_produces_no_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker-only.jsonl");
+        let marker_only = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-08-08T12:00:00Z",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "edit-1",
+                    "name": "Edit",
+                    "input": {"file_path": "/repo/tasks/2026-08-08-v10.1-release-gate.md"}
+                }
+            ]}
+        });
+        std::fs::write(&path, marker_only.to_string()).unwrap();
+
+        let parsed = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        assert!(
+            parsed.chunks.is_empty(),
+            "marker-only assistant message must not produce a searchable chunk, got: {:?}",
+            parsed
+                .chunks
+                .iter()
+                .map(|c| c.content.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // Same Edit tool_use plus real prose must still produce a chunk.
+        let with_prose = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-08-08T12:00:01Z",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "edit-2",
+                    "name": "Edit",
+                    "input": {"file_path": "/repo/tasks/2026-08-08-v10.1-release-gate.md"}
+                },
+                {
+                    "type": "text",
+                    "text": "Fixed the parser bug."
+                }
+            ]}
+        });
+        let path2 = dir.path().join("marker-plus-prose.jsonl");
+        std::fs::write(&path2, with_prose.to_string()).unwrap();
+        let parsed2 = parse_jsonl_file_with_stats(&path2, "test").unwrap();
+        assert!(!parsed2.chunks.is_empty());
+        let content = parsed2
+            .chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            content.contains("Fixed the parser bug."),
+            "prose next to a tool marker must survive embedding, got: {content}"
+        );
     }
 
     #[test]
