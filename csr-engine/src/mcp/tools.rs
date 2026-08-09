@@ -949,6 +949,7 @@ pub async fn quick_check(
     search: &Arc<RwLock<SearchEngine>>,
     query: &str,
     min_score: f32,
+    project: Option<&str>,
 ) -> Result<String> {
     let query_vec = {
         let q = query.to_string();
@@ -956,9 +957,32 @@ pub async fn quick_check(
         tokio::task::spawn_blocking(move || emb.embed_single(&q)).await??
     };
 
-    let results = {
+    quick_check_with_vec(storage, search, &query_vec, query, min_score, project).await
+}
+
+async fn quick_check_with_vec(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query_vec: &[f32],
+    query: &str,
+    min_score: f32,
+    project: Option<&str>,
+) -> Result<String> {
+    let (effective_project, _) = cross_project::normalize_project_scope(project);
+    let results = if let Some(ref project) = effective_project {
+        let family_projects = storage
+            .list_project_names("", i64::MAX as usize)?
+            .into_iter()
+            .filter(|candidate| cross_project::same_project_family(project, candidate));
+        let mut ids = HashSet::new();
+        for family_project in family_projects {
+            ids.extend(storage.get_chunk_ids_for_project(&family_project)?);
+        }
         let idx = search.read().await;
-        idx.search_chunks(&query_vec, 1, min_score)
+        idx.search_chunks_filtered(query_vec, 2, min_score, &ids)
+    } else {
+        let idx = search.read().await;
+        idx.search_chunks(query_vec, 2, min_score)
     };
 
     let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
@@ -2459,6 +2483,117 @@ mod tests {
             family_projects: HashSet::new(),
             projects_root_override: None,
         }
+    }
+
+    fn quick_check_fixture(
+        rows: &[(&str, &str, &str, [f32; 4])],
+    ) -> (Arc<Storage>, Arc<RwLock<SearchEngine>>) {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        for (sequence, (id, project, content, vector)) in rows.iter().enumerate() {
+            let chunk = crate::import::ConversationChunk {
+                id: (*id).into(),
+                conversation_id: format!("conv-{id}"),
+                project_name: (*project).into(),
+                timestamp: "2099-01-01T00:00:00Z".into(),
+                content: (*content).into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: sequence,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, vector).unwrap();
+            engine.insert_chunk(chunk.id, vector.to_vec());
+        }
+        (storage, Arc::new(RwLock::new(engine)))
+    }
+
+    #[tokio::test]
+    async fn quick_check_reports_margin_from_second_candidate_but_renders_only_top() {
+        let (storage, search) = quick_check_fixture(&[
+            ("top", "project-a", "top candidate", [1.0, 0.0, 0.0, 0.0]),
+            (
+                "runner-up",
+                "project-b",
+                "runner-up candidate",
+                [0.8, 0.6, 0.0, 0.0],
+            ),
+        ]);
+
+        let xml = quick_check_with_vec(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "probe",
+            0.3,
+            Some("all"),
+        )
+        .await
+        .unwrap();
+
+        assert!(xml.contains("<margin>0.200</margin>"), "got: {xml}");
+        assert!(xml.contains("<count>1</count>"), "got: {xml}");
+        assert!(xml.contains("top candidate"), "got: {xml}");
+        assert!(!xml.contains("runner-up candidate"), "got: {xml}");
+    }
+
+    #[tokio::test]
+    async fn quick_check_reports_na_margin_when_corpus_has_one_candidate() {
+        let (storage, search) =
+            quick_check_fixture(&[("only", "project-a", "only candidate", [1.0, 0.0, 0.0, 0.0])]);
+
+        let xml = quick_check_with_vec(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "probe",
+            0.3,
+            Some("all"),
+        )
+        .await
+        .unwrap();
+
+        assert!(xml.contains("<margin>n/a</margin>"), "got: {xml}");
+    }
+
+    #[tokio::test]
+    async fn quick_check_project_scope_excludes_out_of_family_candidate() {
+        let (storage, search) = quick_check_fixture(&[
+            (
+                "out-of-family",
+                "other-project",
+                "out-of-family candidate",
+                [1.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "local-top",
+                "scope-project",
+                "scoped top candidate",
+                [0.8, 0.6, 0.0, 0.0],
+            ),
+            (
+                "local-second",
+                "scope-project",
+                "scoped runner-up candidate",
+                [0.7, 0.714_142_86, 0.0, 0.0],
+            ),
+        ]);
+
+        let xml = quick_check_with_vec(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "probe",
+            0.3,
+            Some("scope-project"),
+        )
+        .await
+        .unwrap();
+
+        assert!(xml.contains("scoped top candidate"), "got: {xml}");
+        assert!(xml.contains("<margin>0.100</margin>"), "got: {xml}");
+        assert!(!xml.contains("out-of-family candidate"), "got: {xml}");
     }
 
     #[tokio::test]

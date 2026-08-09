@@ -417,7 +417,9 @@ pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
     let margin = results.get(1).map(|second| top.score - second.score);
 
     out.push_str("  <found>true</found>\n");
-    out.push_str(&format!("  <count>{}</count>\n", results.len()));
+    // The runner-up is fetched only to calculate the margin. Keep the public
+    // quick-check surface at one rendered match, as promised by the tool.
+    out.push_str("  <count>1</count>\n");
     out.push_str(&format!("  <relevance>{}</relevance>\n", relevance));
     out.push_str("  <collections_with_matches>1</collections_with_matches>\n");
 
@@ -1655,11 +1657,22 @@ mod tests {
             "got: {xml_decisive}"
         );
         assert!(xml_tie.contains("<margin>0.010</margin>"), "got: {xml_tie}");
+        assert!(
+            xml_decisive.contains("<count>1</count>"),
+            "the runner-up is margin evidence, not a rendered result: {xml_decisive}"
+        );
+        assert!(
+            !xml_decisive.contains("distant runner-up"),
+            "the runner-up preview must remain hidden: {xml_decisive}"
+        );
     }
 
     #[test]
     fn quick_check_margin_is_na_with_no_second_candidate() {
+        // This slice represents the complete candidate corpus: n/a is valid
+        // only because the corpus genuinely contains no runner-up.
         let results = vec![quick_result(0.80, "only candidate")];
+        assert_eq!(results.len(), 1);
         let xml = format_quick_check(&results, "probe");
         assert!(xml.contains("<margin>n/a</margin>"), "got: {xml}");
     }
