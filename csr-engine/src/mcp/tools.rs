@@ -206,7 +206,9 @@ fn lookup_by_conv_tag(
     // Resolve + apply validity on the fast path too (issue: the exact-handle
     // path returned without ever consulting dream verdicts). One batched
     // query for the single conversation id.
-    let validity = resolve_validity_with(storage, &[conv_id.to_string()], consumption_enabled);
+    let chunks: Vec<crate::import::ConversationChunk> =
+        enriched.iter().map(|result| result.chunk.clone()).collect();
+    let validity = resolve_validity_with(storage, &chunks, consumption_enabled);
     apply_validity_partition(&mut enriched, &validity, active_forgetting);
     let search_ms = start.elapsed().as_millis() as u64;
     Ok(Some(format::format_search_results(
@@ -360,7 +362,7 @@ async fn reflect_on_past_with_vec_in_scope(
     let valid = pass
         .enriched
         .iter()
-        .filter(|e| !is_demote_channel(&pass.validity, &e.chunk.conversation_id))
+        .filter(|e| !is_demote_channel(&pass.validity, &e.chunk.id))
         .count();
     if valid < limit && pass.window_full {
         let refetch = limit.saturating_mul(10);
@@ -535,14 +537,9 @@ async fn reflect_gather_pass(
     // below merges in verdicts for conversations the semantic pass never
     // saw. The final sink/annotate step (mirroring
     // `apply_resolutions_before_limit`) reuses this same map.
-    let queried_convs = distinct_conversation_ids_of_chunks(&chunks);
-    let mut signals = CandidateSignals::load(
-        storage,
-        &queried_convs,
-        partition_enabled,
-        consumption_enabled,
-    );
-    let queried_convs: HashSet<String> = queried_convs.into_iter().collect();
+    let mut signals =
+        CandidateSignals::load(storage, &chunks, partition_enabled, consumption_enabled);
+    let queried_chunk_ids: HashSet<String> = chunks.iter().map(|chunk| chunk.id.clone()).collect();
 
     let now = chrono::Utc::now();
 
@@ -695,15 +692,17 @@ async fn reflect_gather_pass(
             // Validity was resolved over the SEMANTIC candidate set only —
             // FTS-appended chunks can carry conversation ids that set never
             // saw, and those must not slip past the partition (or past the
-            // active-forgetting decay decision below). Re-resolve for just the new
-            // conversation ids and merge the maps.
-            let extra_convs: Vec<String> = distinct_conversation_ids_of_chunks(&appended)
-                .into_iter()
-                .filter(|c| !queried_convs.contains(c))
+            // active-forgetting decay decision below). Re-resolve for every new
+            // chunk id and merge the maps; a new chunk can share a conversation
+            // with the semantic pass and still needs its own verdict decision.
+            let extra_chunks: Vec<crate::import::ConversationChunk> = appended
+                .iter()
+                .filter(|chunk| !queried_chunk_ids.contains(&chunk.id))
+                .cloned()
                 .collect();
             let ancestry_revoked = signals.extend(
                 storage,
-                &extra_convs,
+                &extra_chunks,
                 partition_enabled,
                 consumption_enabled,
             );
@@ -782,7 +781,7 @@ async fn reflect_gather_pass(
     // is still the authoritative, independently-testable guarantee.
     let candidates: Vec<crate::search::rerank::RankCandidate> = enriched
         .iter()
-        .filter(|e| !is_demote_channel(&signals.validity, &e.chunk.conversation_id))
+        .filter(|e| !is_demote_channel(&signals.validity, &e.chunk.id))
         .map(|e| crate::search::rerank::RankCandidate {
             id: e.chunk.id.clone(),
             cosine: e.score,
@@ -1882,8 +1881,9 @@ fn enrich_results_with_active_forgetting(
         .collect();
     format::dedupe_results(&mut enriched_vec);
     apply_resolutions(&mut enriched_vec, storage);
-    let conv_ids = distinct_conversation_ids(&enriched_vec);
-    let validity = resolve_validity_with(storage, &conv_ids, partition_enabled);
+    let validity_chunks: Vec<crate::import::ConversationChunk> =
+        enriched_vec.iter().map(|e| e.chunk.clone()).collect();
+    let validity = resolve_validity_with(storage, &validity_chunks, partition_enabled);
     if active_forgetting {
         let chunk_ids: Vec<&str> = enriched_vec.iter().map(|e| e.chunk.id.as_str()).collect();
         let tad_events = storage
@@ -1892,7 +1892,7 @@ fn enrich_results_with_active_forgetting(
         let tad_config = decay::DecayConfig::for_search();
         let now = chrono::Utc::now();
         for e in &mut enriched_vec {
-            if is_demote_channel(&validity, &e.chunk.conversation_id) {
+            if is_demote_channel(&validity, &e.chunk.id) {
                 if let Ok(timestamp) = e.chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
                     let events = tad_events
                         .get(&e.chunk.id)
@@ -1905,7 +1905,7 @@ fn enrich_results_with_active_forgetting(
                         events,
                         &tad_config,
                         &validity,
-                        &e.chunk.conversation_id,
+                        &e.chunk.id,
                         None,
                         true,
                     );
@@ -1961,13 +1961,9 @@ fn fetch_enrich_partition_adaptive(
 // the limit cut, so a demoted chunk never occupies a page slot that should
 // go to the next best non-demoted candidate.
 
-/// Per-conversation dream-verdict decision, reduced from
-/// `witness_verdict_for_chunks`'s per-node hits to the single worst channel
-/// touching that conversation's chunks: `demote = true` if ANY hit for the
-/// conversation is Demote-channel (one stale symbol is enough to flag the
-/// whole conversation's code claim — chunk binding is conversation-grained,
-/// not per-chunk, so this cannot be narrower); else Annotate if any hit is
-/// Annotate-only. `note` is the exact search-facing annotation string.
+/// Per-chunk dream-verdict decision. Maps are keyed by chunk id; an absent
+/// chunk has no verdict even when a sibling from the same conversation does.
+/// `note` is the exact search-facing annotation string.
 #[derive(Debug, Clone)]
 pub(crate) struct ConvValidity {
     pub(crate) demote: bool,
@@ -1999,21 +1995,21 @@ struct CandidateSignals {
 impl CandidateSignals {
     fn load(
         storage: &Arc<Storage>,
-        conversation_ids: &[String],
+        chunks: &[crate::import::ConversationChunk],
         ancestry_enabled: bool,
         consumption_enabled: bool,
     ) -> Self {
         if !ancestry_enabled {
             return Self::default();
         }
-        let Ok(validity) = resolve_validity_checked(storage, conversation_ids, consumption_enabled)
-        else {
+        let conversation_ids = distinct_conversation_ids_of_chunks(chunks);
+        let Ok(validity) = resolve_validity_checked(storage, chunks, consumption_enabled) else {
             return Self::default();
         };
         Self {
             validity,
             ancestry: storage
-                .ancestry_labels_for_conversations(conversation_ids)
+                .ancestry_labels_for_conversations(&conversation_ids)
                 .unwrap_or_default(),
             ancestry_allowed: true,
         }
@@ -2026,7 +2022,7 @@ impl CandidateSignals {
     fn extend(
         &mut self,
         storage: &Arc<Storage>,
-        conversation_ids: &[String],
+        chunks: &[crate::import::ConversationChunk],
         ancestry_enabled: bool,
         consumption_enabled: bool,
     ) -> bool {
@@ -2037,13 +2033,14 @@ impl CandidateSignals {
             self.ancestry_allowed = false;
             return ancestry_was_allowed;
         }
-        match resolve_validity_checked(storage, conversation_ids, consumption_enabled) {
+        let conversation_ids = distinct_conversation_ids_of_chunks(chunks);
+        match resolve_validity_checked(storage, chunks, consumption_enabled) {
             Ok(validity) => {
                 self.validity.extend(validity);
                 if self.ancestry_allowed {
                     self.ancestry.extend(
                         storage
-                            .ancestry_labels_for_conversations(conversation_ids)
+                            .ancestry_labels_for_conversations(&conversation_ids)
                             .unwrap_or_default(),
                     );
                 }
@@ -2057,16 +2054,9 @@ impl CandidateSignals {
     }
 }
 
-/// Distinct `conversation_id`s across `enriched`, first-seen order (order is
-/// irrelevant to correctness — `witness_verdicts_for_conversations` batches
-/// regardless — but deterministic iteration keeps this easy to test).
-fn distinct_conversation_ids(enriched: &[EnrichedResult]) -> Vec<String> {
-    distinct_conversation_ids_of(enriched.iter().map(|e| e.chunk.conversation_id.as_str()))
-}
-
-/// Same as [`distinct_conversation_ids`] but over raw chunk metadata,
-/// fetched before any `EnrichedResult` exists yet — `reflect_on_past` needs
-/// the validity decision before it starts scoring, not after.
+/// Distinct conversation ids over raw chunk metadata, first-seen order.
+/// The storage lookup remains conversation-batched, while reduction below
+/// restores the candidate chunk ids before any rank-affecting consumer runs.
 fn distinct_conversation_ids_of_chunks(chunks: &[crate::import::ConversationChunk]) -> Vec<String> {
     distinct_conversation_ids_of(chunks.iter().map(|c| c.conversation_id.as_str()))
 }
@@ -2104,25 +2094,25 @@ fn active_forgetting_enabled_from(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-/// Resolve the v10 validity partition for a batch of conversation ids, with
+/// Resolve the v10 validity partition for a batch of chunks, with
 /// the kill switch's outcome passed in rather than read from the
 /// environment — every entry point evaluates
 /// [`validity_partition_enabled`] exactly once and threads the outcome
 /// here, so tests drive this by parameter instead of mutating the env var.
 /// ONE batched
 /// `witness_verdicts_for_conversations` query (never per-chunk; the perf
-/// requirement) when `enabled`, reduced per-conversation via
-/// [`ConvValidity`]. `enabled = false` returns an empty map — every
-/// consumer below treats an absent conversation id as "nothing to do", so
+/// requirement) when `enabled`, reduced per chunk via [`ConvValidity`].
+/// `enabled = false` returns an empty map — every consumer below treats an
+/// absent chunk id as "nothing to do", so
 /// an empty map disables the whole feature with no other branching needed.
 /// Non-fatal: a storage error here must never fail the calling search (same
 /// discipline as `apply_resolutions`).
 fn resolve_validity_with(
     storage: &Arc<Storage>,
-    conversation_ids: &[String],
+    chunks: &[crate::import::ConversationChunk],
     enabled: bool,
 ) -> HashMap<String, ConvValidity> {
-    resolve_validity_checked(storage, conversation_ids, enabled).unwrap_or_default()
+    resolve_validity_checked(storage, chunks, enabled).unwrap_or_default()
 }
 
 /// Reliability-preserving core for consumers that combine validity with a
@@ -2131,14 +2121,15 @@ fn resolve_validity_with(
 /// a trustworthy empty verdict batch from a failed read.
 fn resolve_validity_checked(
     storage: &Arc<Storage>,
-    conversation_ids: &[String],
+    chunks: &[crate::import::ConversationChunk],
     enabled: bool,
 ) -> Result<HashMap<String, ConvValidity>> {
-    if !enabled || conversation_ids.is_empty() {
+    if !enabled || chunks.is_empty() {
         return Ok(HashMap::new());
     }
-    let hits = storage.witness_verdicts_for_conversations(conversation_ids)?;
-    Ok(reduce_validity_hits(hits))
+    let conversation_ids = distinct_conversation_ids_of_chunks(chunks);
+    let hits = storage.witness_verdicts_for_conversations(&conversation_ids)?;
+    Ok(reduce_validity_hits(hits, chunks))
 }
 
 /// Prompt-submit needs the same Demote predicate before applying release
@@ -2159,20 +2150,66 @@ pub(crate) fn resolve_validity_for_ancestry(
     if !validity_partition_enabled() {
         return None;
     }
-    resolve_validity_checked(storage, conversation_ids, dream_consumption_enabled()).ok()
+    if !dream_consumption_enabled() || conversation_ids.is_empty() {
+        return Some(HashMap::new());
+    }
+    let hits = storage
+        .witness_verdicts_for_conversations(conversation_ids)
+        .ok()?;
+    Some(reduce_conversation_validity_hits(hits))
 }
 
 fn reduce_validity_hits(
     hits: BTreeMap<String, Vec<ChunkWitnessVerdict>>,
+    chunks: &[crate::import::ConversationChunk],
+) -> HashMap<String, ConvValidity> {
+    let mut validity = HashMap::new();
+    let mut chunk_counts = HashMap::new();
+    for chunk in chunks {
+        *chunk_counts
+            .entry(chunk.conversation_id.as_str())
+            .or_insert(0usize) += 1;
+    }
+    for chunk in chunks {
+        let Some(conversation_hits) = hits.get(&chunk.conversation_id) else {
+            continue;
+        };
+        let matching_hits: Vec<&ChunkWitnessVerdict> = conversation_hits
+            .iter()
+            .filter(|hit| validity_hit_matches_chunk(hit, chunk))
+            .collect();
+        let candidates: Vec<&ChunkWitnessVerdict> = if matching_hits.is_empty()
+            && chunk_counts.get(chunk.conversation_id.as_str()) == Some(&1)
+        {
+            conversation_hits.iter().collect()
+        } else {
+            matching_hits
+        };
+        let Some(chosen) = choose_validity_hit(candidates.into_iter()) else {
+            continue;
+        };
+        validity.insert(
+            chunk.id.clone(),
+            ConvValidity {
+                demote: chosen.channel == VerdictChannel::Demote,
+                note: validity_note(chosen),
+            },
+        );
+    }
+    validity
+}
+
+/// Compatibility path for prompt-submit, whose existing interface carries
+/// conversation ids rather than chunks. Search ranking never uses this map;
+/// every rank-affecting path above is chunk-keyed.
+fn reduce_conversation_validity_hits(
+    hits: BTreeMap<String, Vec<ChunkWitnessVerdict>>,
 ) -> HashMap<String, ConvValidity> {
     hits.into_iter()
-        .filter_map(|(conv, list)| {
-            let chosen = list
-                .iter()
-                .find(|h| h.channel == VerdictChannel::Demote)
-                .or_else(|| list.iter().find(|h| h.channel == VerdictChannel::Annotate))?;
+        .filter_map(|(conversation_id, list)| {
+            let chosen = choose_validity_hit(list.iter())?;
             Some((
-                conv,
+                conversation_id,
                 ConvValidity {
                     demote: chosen.channel == VerdictChannel::Demote,
                     note: validity_note(chosen),
@@ -2180,6 +2217,36 @@ fn reduce_validity_hits(
             ))
         })
         .collect()
+}
+
+fn choose_validity_hit<'a>(
+    hits: impl Iterator<Item = &'a ChunkWitnessVerdict>,
+) -> Option<&'a ChunkWitnessVerdict> {
+    let hits: Vec<&ChunkWitnessVerdict> = hits.collect();
+    hits.iter()
+        .copied()
+        .find(|hit| hit.channel == VerdictChannel::Demote)
+        .or_else(|| {
+            hits.iter()
+                .copied()
+                .find(|hit| hit.channel == VerdictChannel::Annotate)
+        })
+}
+
+fn validity_hit_matches_chunk(
+    hit: &ChunkWitnessVerdict,
+    chunk: &crate::import::ConversationChunk,
+) -> bool {
+    match hit.symbol.as_deref() {
+        Some(symbol) => chunk.content.contains(symbol),
+        None => {
+            chunk.content.contains(&hit.file)
+                || std::path::Path::new(&hit.file)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| chunk.content.contains(name))
+        }
+    }
 }
 
 /// Render one dream-verdict hit as the search-facing annotation string —
@@ -2206,7 +2273,7 @@ fn short_oid(oid: &str) -> &str {
     }
 }
 
-/// `true` iff `conv_id` is Demote-channel per `validity`. The ONE predicate
+/// `true` iff `chunk_id` is Demote-channel per `validity`. The ONE predicate
 /// every validity-sensitive point shares — `reflect_on_past`'s TAD/decay loop,
 /// its rerank-candidate filter, and `apply_validity_partition`'s own sink
 /// all call this SAME function, so the three skip points cannot silently
@@ -2214,8 +2281,10 @@ fn short_oid(oid: &str) -> &str {
 /// "is this chunk about to be structurally demoted", rather than three
 /// independently-maintained copies of the same `.get(...).is_some_and(...)`
 /// check).
-pub(crate) fn is_demote_channel(validity: &HashMap<String, ConvValidity>, conv_id: &str) -> bool {
-    validity.get(conv_id).is_some_and(|v| v.demote)
+pub(crate) fn is_demote_channel(validity: &HashMap<String, ConvValidity>, chunk_id: &str) -> bool {
+    validity
+        .get(chunk_id)
+        .is_some_and(|validity| validity.demote)
 }
 
 /// Score one semantic chunk from its raw similarity. Keeping this operation
@@ -2239,7 +2308,7 @@ fn score_chunk_candidate(
         .flatten();
     let decayed_score =
         if let Ok(timestamp) = chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
-            ancestry_applied = !is_demote_channel(validity, &chunk.conversation_id)
+            ancestry_applied = !is_demote_channel(validity, &chunk.id)
                 && timestamp < *now
                 && ancestry
                     .and_then(|label| label.releases_behind_for_decay())
@@ -2251,7 +2320,7 @@ fn score_chunk_candidate(
                 events,
                 config,
                 validity,
-                &chunk.conversation_id,
+                &chunk.id,
                 ancestry,
                 active_forgetting,
             )
@@ -2269,7 +2338,7 @@ fn score_fts_candidate(
     ancestry: Option<&crate::storage::ancestry::AncestryLabel>,
     active_forgetting: bool,
 ) -> (f32, bool) {
-    let demoted = is_demote_channel(validity, &chunk.conversation_id);
+    let demoted = is_demote_channel(validity, &chunk.id);
     if demoted && !active_forgetting {
         return (0.45, false);
     }
@@ -2318,11 +2387,11 @@ fn apply_chunk_decay(
     events: &[decay::RetrievalEvent],
     config: &decay::DecayConfig,
     validity: &HashMap<String, ConvValidity>,
-    conv_id: &str,
+    chunk_id: &str,
     ancestry: Option<&crate::storage::ancestry::AncestryLabel>,
     active_forgetting: bool,
 ) -> f32 {
-    if is_demote_channel(validity, conv_id) {
+    if is_demote_channel(validity, chunk_id) {
         if !active_forgetting {
             return score;
         }
@@ -2375,7 +2444,7 @@ fn apply_validity_partition(
         return;
     }
     for e in enriched.iter_mut() {
-        if let Some(v) = validity.get(&e.chunk.conversation_id) {
+        if let Some(v) = validity.get(&e.chunk.id) {
             e.resolution = Some(match e.resolution.take() {
                 Some(existing) => format!("{existing}; {}", v.note),
                 None => v.note.clone(),
@@ -2386,7 +2455,7 @@ fn apply_validity_partition(
     let mut kept = Vec::with_capacity(enriched.len());
     let mut demoted = Vec::new();
     for mut e in std::mem::take(enriched) {
-        if is_demote_channel(validity, &e.chunk.conversation_id) {
+        if is_demote_channel(validity, &e.chunk.id) {
             // The ONLY writer of this flag — `format_search_results`'s
             // dream-verdict footer counts it (never a substring of the
             // resolution note), so with the kill switch on (empty map, early
@@ -3112,7 +3181,7 @@ mod tests {
             .parse::<chrono::DateTime<chrono::Utc>>()
             .unwrap();
         let validity: HashMap<String, ConvValidity> =
-            [("conv-demoted".to_string(), demote_validity("stale"))]
+            [("stale".to_string(), demote_validity("stale"))]
                 .into_iter()
                 .collect();
         let score = 0.91_f32;
@@ -3124,7 +3193,7 @@ mod tests {
             &[],
             &decay::DecayConfig::for_search(),
             &validity,
-            "conv-demoted",
+            "stale",
             None,
             false,
         );
@@ -3152,7 +3221,7 @@ mod tests {
         let now = chrono::Utc::now();
         let timestamp = now - chrono::Duration::days(90);
         let validity: HashMap<String, ConvValidity> =
-            [("conv-demoted".to_string(), demote_validity("stale"))]
+            [("chunk-demoted".to_string(), demote_validity("stale"))]
                 .into_iter()
                 .collect();
         let config = decay::DecayConfig::for_search();
@@ -3164,7 +3233,7 @@ mod tests {
             &[],
             &config,
             &validity,
-            "conv-demoted",
+            "chunk-demoted",
             None,
             true,
         );
@@ -3191,7 +3260,7 @@ mod tests {
         let past = now - chrono::Duration::days(30);
         let config = decay::DecayConfig::for_search();
         let validity: HashMap<String, ConvValidity> =
-            [("conv-demoted".to_string(), demote_validity("stale"))]
+            [("chunk-demoted".to_string(), demote_validity("stale"))]
                 .into_iter()
                 .collect();
         let label = AncestryLabel {
@@ -3218,7 +3287,7 @@ mod tests {
             &[],
             &config,
             &validity,
-            "conv-demoted",
+            "chunk-demoted",
             Some(&label),
             true,
         );
@@ -3359,13 +3428,15 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        let chunk = enriched_result_conv("candidate", "conv-demoted", 0.9, 0).chunk;
         let conversation_ids = vec!["conv-demoted".to_string()];
-        let mut signals = CandidateSignals::load(&storage, &conversation_ids, true, true);
+        let mut signals =
+            CandidateSignals::load(&storage, std::slice::from_ref(&chunk), true, true);
         assert!(signals.ancestry.contains_key("conv-demoted"));
         let now = "2026-08-06T12:00:00Z"
             .parse::<chrono::DateTime<chrono::Utc>>()
             .unwrap();
-        let mut chunk = enriched_result_conv("candidate", "conv-demoted", 0.9, 0).chunk;
+        let mut chunk = chunk;
         chunk.timestamp = (now - chrono::Duration::days(30)).to_rfc3339();
         let config = decay::DecayConfig::for_search();
         let (ancestry_score, ancestry_applied) = score_chunk_candidate(
@@ -3394,7 +3465,8 @@ mod tests {
             .witness_verdicts_for_conversations(&conversation_ids)
             .is_err());
 
-        let ancestry_revoked = signals.extend(&storage, &["conv-fts".to_string()], true, true);
+        let fts_chunk = enriched_result_conv("fts", "conv-fts", 0.8, 0).chunk;
+        let ancestry_revoked = signals.extend(&storage, &[fts_chunk], true, true);
         assert!(ancestry_revoked);
         assert!(
             signals.ancestry.is_empty(),
@@ -3421,7 +3493,8 @@ mod tests {
         assert!(ancestry_score < actual);
         assert_eq!(actual.to_bits(), expected.to_bits());
 
-        let failed_initial = CandidateSignals::load(&storage, &conversation_ids, true, true);
+        let failed_initial =
+            CandidateSignals::load(&storage, std::slice::from_ref(&chunk), true, true);
         assert!(failed_initial.validity.is_empty());
         assert!(failed_initial.ancestry.is_empty());
     }
@@ -3431,7 +3504,7 @@ mod tests {
         let now = chrono::Utc::now();
         let timestamp = now - chrono::Duration::days(90);
         let validity: HashMap<String, ConvValidity> =
-            [("conv-annotated".to_string(), annotate_validity("evolved"))]
+            [("chunk-annotated".to_string(), annotate_validity("evolved"))]
                 .into_iter()
                 .collect();
         let config = decay::DecayConfig::for_search();
@@ -3443,7 +3516,7 @@ mod tests {
             &[],
             &config,
             &validity,
-            "conv-annotated",
+            "chunk-annotated",
             None,
             true,
         );
@@ -3470,10 +3543,16 @@ mod tests {
             enriched_result_conv("c", "conv-demoted", 0.85, 2),
             enriched_result_conv("d", "conv-clean-2", 0.80, 3),
         ];
-        let validity: HashMap<String, ConvValidity> = [(
-            "conv-demoted".to_string(),
-            demote_validity("[stale anchor] foo no longer in current code (receipt abc1234)"),
-        )]
+        let validity: HashMap<String, ConvValidity> = [
+            (
+                "a".to_string(),
+                demote_validity("[stale anchor] foo no longer in current code (receipt abc1234)"),
+            ),
+            (
+                "c".to_string(),
+                demote_validity("[stale anchor] foo no longer in current code (receipt abc1234)"),
+            ),
+        ]
         .into_iter()
         .collect();
 
@@ -3486,13 +3565,94 @@ mod tests {
     }
 
     #[test]
+    fn validity_demote_verdict_only_sinks_its_own_chunk_in_shared_conversation() {
+        let mut enriched = vec![
+            enriched_result_conv("chunk-stale", "conv-shared", 0.95, 0),
+            enriched_result_conv("chunk-live", "conv-shared", 0.90, 1),
+        ];
+        enriched[0].chunk.content = "old_fn is the stale claim".into();
+        enriched[1].chunk.content = "unrelated live design discussion".into();
+        let live_score = enriched[1].score;
+        let hits = BTreeMap::from([(
+            "conv-shared".to_string(),
+            vec![ChunkWitnessVerdict {
+                file: "/repo/src/lib.rs".into(),
+                symbol: Some("old_fn".into()),
+                channel: VerdictChannel::Demote,
+                verdict: "anchor_obsolete",
+                receipt_oid: Some("abc123456".into()),
+            }],
+        )]);
+        let chunks: Vec<_> = enriched.iter().map(|result| result.chunk.clone()).collect();
+        let validity = reduce_validity_hits(hits, &chunks);
+
+        assert!(is_demote_channel(&validity, "chunk-stale"));
+        assert!(!validity.contains_key("chunk-live"));
+
+        let rerank_ids: Vec<&str> = enriched
+            .iter()
+            .filter(|result| !is_demote_channel(&validity, &result.chunk.id))
+            .map(|result| result.chunk.id.as_str())
+            .collect();
+        assert_eq!(rerank_ids, ["chunk-live"]);
+
+        let now = chrono::Utc::now();
+        let label = crate::storage::ancestry::AncestryLabel {
+            conversation_id: "conv-shared".into(),
+            state: crate::storage::ancestry::AncestryState::Shipped,
+            release_tag: Some("v1.0.0".into()),
+            releases_behind: 5,
+            repository: "/repo".into(),
+            refreshed_at: now.to_rfc3339(),
+        };
+        let config = decay::DecayConfig::for_search();
+        let (_, stale_ancestry_applied) = score_chunk_candidate(
+            enriched[0].score,
+            &enriched[0].chunk,
+            &now,
+            &[],
+            &config,
+            &validity,
+            Some(&label),
+            false,
+            &unscoped_search_scope(),
+        );
+        let (_, live_ancestry_applied) = score_chunk_candidate(
+            enriched[1].score,
+            &enriched[1].chunk,
+            &now,
+            &[],
+            &config,
+            &validity,
+            Some(&label),
+            false,
+            &unscoped_search_scope(),
+        );
+        assert!(!stale_ancestry_applied);
+        assert!(live_ancestry_applied);
+
+        apply_validity_partition(&mut enriched, &validity, false);
+
+        assert_eq!(enriched[0].chunk.id, "chunk-live");
+        assert_eq!(enriched[0].score.to_bits(), live_score.to_bits());
+        assert_eq!(enriched[0].resolution, None);
+        assert!(!enriched[0].validity_demoted);
+        assert_eq!(enriched[1].chunk.id, "chunk-stale");
+        assert!(enriched[1].validity_demoted);
+        assert_eq!(
+            enriched[1].resolution.as_deref(),
+            Some("[stale anchor] old_fn no longer in current code (receipt abc1234)")
+        );
+    }
+
+    #[test]
     fn demoted_chunk_still_returned_if_it_fits_the_limit() {
         let mut enriched = vec![
             enriched_result_conv("a", "conv-demoted", 0.95, 0),
             enriched_result_conv("b", "conv-clean", 0.90, 1),
         ];
         let validity: HashMap<String, ConvValidity> = [(
-            "conv-demoted".to_string(),
+            "a".to_string(),
             demote_validity("[stale anchor] foo no longer in current code (receipt abc1234)"),
         )]
         .into_iter()
@@ -3509,7 +3669,7 @@ mod tests {
     fn demoted_chunk_annotation_string_exact() {
         let mut enriched = vec![enriched_result_conv("a", "conv-demoted", 0.95, 0)];
         let validity: HashMap<String, ConvValidity> = [(
-            "conv-demoted".to_string(),
+            "a".to_string(),
             demote_validity("[stale anchor] old_fn no longer in current code (receipt abc1234)"),
         )]
         .into_iter()
@@ -3530,7 +3690,7 @@ mod tests {
             enriched_result_conv("b", "conv-clean", 0.95, 1),
         ];
         let validity: HashMap<String, ConvValidity> = [(
-            "conv-evolved".to_string(),
+            "a".to_string(),
             annotate_validity("[evolved] foo changed since this conversation (as of abc1234)"),
         )]
         .into_iter()
@@ -3554,7 +3714,7 @@ mod tests {
         let mut enriched = vec![enriched_result_conv("a", "conv-evolved", 0.70, 0)];
         enriched[0].resolution = Some("still_open: earlier verdict".to_string());
         let validity: HashMap<String, ConvValidity> = [(
-            "conv-evolved".to_string(),
+            "a".to_string(),
             annotate_validity("[evolved] foo changed since this conversation (as of abc1234)"),
         )]
         .into_iter()
@@ -3600,9 +3760,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let out = resolve_validity_with(&storage, &["conv-1".to_string()], false);
+        let chunk = enriched_result("chunk-1", 0.9, 0).chunk;
+        let out = resolve_validity_with(&storage, std::slice::from_ref(&chunk), false);
         assert!(out.is_empty());
-        let signals = CandidateSignals::load(&storage, &["conv-1".to_string()], false, false);
+        let signals = CandidateSignals::load(&storage, &[chunk], false, false);
         assert!(signals.validity.is_empty());
         assert!(
             signals.ancestry.is_empty(),
@@ -3721,15 +3882,16 @@ mod tests {
             enriched_result_conv("valid-1", "conv-clean-1", 0.90, 1),
             enriched_result_conv("valid-2", "conv-clean-2", 0.80, 2),
         ];
-        let conv_ids = distinct_conversation_ids(&enriched);
-        let validity = resolve_validity_with(&storage, &conv_ids, true);
+        enriched[0].chunk.content = "old_fn stale claim".into();
+        let chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
+        let validity = resolve_validity_with(&storage, &chunks, true);
 
         // NO STACKING: the shared skip predicate agrees with what the
         // partition below will do — this is the exact check
         // `reflect_on_past`'s TAD loop and rerank filter make.
-        assert!(is_demote_channel(&validity, "conv-demoted"));
-        assert!(!is_demote_channel(&validity, "conv-clean-1"));
-        assert!(!is_demote_channel(&validity, "conv-clean-2"));
+        assert!(is_demote_channel(&validity, "stale"));
+        assert!(!is_demote_channel(&validity, "valid-1"));
+        assert!(!is_demote_channel(&validity, "valid-2"));
 
         apply_validity_partition(&mut enriched, &validity, false);
 
@@ -3752,7 +3914,7 @@ mod tests {
         // doc on why tests drive this by parameter, never by mutating the
         // real env var): resolution must come back empty and the partition
         // must be a total no-op.
-        let validity_off = resolve_validity_with(&storage, &conv_ids, false);
+        let validity_off = resolve_validity_with(&storage, &chunks, false);
         assert!(validity_off.is_empty());
 
         let mut enriched_off = vec![
@@ -3979,15 +4141,15 @@ mod tests {
             })
             .unwrap();
 
-        let ids = vec![
-            "conv-demoted".to_string(),
-            "conv-annotated".to_string(),
-            "conv-ancestry".to_string(),
+        let chunks = vec![
+            enriched_result_conv("stale", "conv-demoted", 0.95, 0).chunk,
+            enriched_result_conv("evolved", "conv-annotated", 0.92, 1).chunk,
+            enriched_result_conv("ancestry", "conv-ancestry", 0.90, 2).chunk,
         ];
         let consumption_enabled = dream_consumption_enabled_from(None);
         assert!(!consumption_enabled, "default must be OFF");
 
-        let signals = CandidateSignals::load(&storage, &ids, true, consumption_enabled);
+        let signals = CandidateSignals::load(&storage, &chunks, true, consumption_enabled);
         assert!(
             signals.validity.is_empty(),
             "no witness_verdicts query means no verdict can have been read"
@@ -4003,12 +4165,12 @@ mod tests {
     #[test]
     fn dream_consumption_off_by_default_suppresses_all_verdict_text_end_to_end() {
         let (storage, mut enriched) = dream_consumption_fixture();
-        let conv_ids = distinct_conversation_ids(&enriched);
+        let chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
 
         let consumption_enabled = dream_consumption_enabled_from(None);
         assert!(!consumption_enabled, "default must be OFF");
 
-        let signals = CandidateSignals::load(&storage, &conv_ids, true, consumption_enabled);
+        let signals = CandidateSignals::load(&storage, &chunks, true, consumption_enabled);
         assert!(signals.validity.is_empty());
 
         apply_validity_partition(&mut enriched, &signals.validity, false);
@@ -4028,20 +4190,22 @@ mod tests {
     #[test]
     fn dream_consumption_on_reproduces_demote_and_annotate_channels_byte_for_byte() {
         let (storage, mut enriched) = dream_consumption_fixture();
-        let conv_ids = distinct_conversation_ids(&enriched);
+        enriched[0].chunk.content = "old_fn stale claim".into();
+        enriched[1].chunk.content = "evolved_fn evolved claim".into();
+        let chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
 
         let consumption_enabled = dream_consumption_enabled_from(Some("1"));
         assert!(consumption_enabled);
 
-        let signals = CandidateSignals::load(&storage, &conv_ids, true, consumption_enabled);
-        assert!(is_demote_channel(&signals.validity, "conv-demoted"));
-        assert!(!is_demote_channel(&signals.validity, "conv-annotated"));
+        let signals = CandidateSignals::load(&storage, &chunks, true, consumption_enabled);
+        assert!(is_demote_channel(&signals.validity, "stale"));
+        assert!(!is_demote_channel(&signals.validity, "evolved"));
         assert!(
-            signals.validity.contains_key("conv-annotated"),
+            signals.validity.contains_key("evolved"),
             "the Annotate channel must still be present in the map, just not demoted"
         );
-        assert!(!is_demote_channel(&signals.validity, "conv-clean-1"));
-        assert!(!is_demote_channel(&signals.validity, "conv-clean-2"));
+        assert!(!is_demote_channel(&signals.validity, "valid-1"));
+        assert!(!is_demote_channel(&signals.validity, "valid-2"));
 
         apply_validity_partition(&mut enriched, &signals.validity, false);
         let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
@@ -4103,10 +4267,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_validity_prefers_demote_over_annotate_for_same_conversation() {
-        // A conversation touching two symbols — one demoted, one merely
-        // evolved — must be flagged Demote overall (module doc: one stale
-        // symbol is enough to flag the whole conversation's code claim).
+    fn validity_prefers_demote_over_annotate_for_same_chunk() {
+        // One chunk touching two symbols — one demoted, one merely evolved —
+        // takes its own strongest channel without affecting sibling chunks.
         let demote_hit = ChunkWitnessVerdict {
             file: "/repo/src/a.rs".into(),
             symbol: Some("gone_fn".into()),
@@ -4121,15 +4284,13 @@ mod tests {
             verdict: "superseded_by",
             receipt_oid: Some("head2".into()),
         };
-        // Exercise the reduction logic directly (same code path
-        // `resolve_validity` uses after the storage round-trip).
-        let list = [annotate_hit, demote_hit];
-        let chosen = list
-            .iter()
-            .find(|h| h.channel == VerdictChannel::Demote)
-            .or_else(|| list.iter().find(|h| h.channel == VerdictChannel::Annotate))
-            .unwrap();
-        assert_eq!(chosen.channel, VerdictChannel::Demote);
+        let mut chunk = enriched_result_conv("chunk-both", "conv-both", 0.9, 0).chunk;
+        chunk.content = "gone_fn and evolved_fn".into();
+        let validity = reduce_validity_hits(
+            BTreeMap::from([("conv-both".into(), vec![annotate_hit, demote_hit])]),
+            &[chunk],
+        );
+        assert!(is_demote_channel(&validity, "chunk-both"));
     }
 
     // --- end-to-end: real tool path through retrieval → FTS-append →
