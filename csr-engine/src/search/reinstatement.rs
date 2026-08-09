@@ -264,10 +264,17 @@ fn best_chunk_for_conv(
     Ok(best)
 }
 
-/// Walk the episode chain from `conv`'s session-episode reflection to the session
-/// id of the PREVIOUS episode, if one exists. `None` on any missing link (no
-/// episode reflection, malformed JSON, dangling prev_episode_id) — episode chains
-/// are sparse by design in this phase, this must never error the whole walk.
+/// Walk the episode chain from `conv`'s session-episode reflection to
+/// the conversation id of the PREVIOUS episode, if one exists.
+/// `prev_episode_id` in the stored episode JSON is already a
+/// conversation/session id — it is written by
+/// `hooks::stop::pick_prev_episode`, which returns the `session_id`
+/// half of a `(session_id, timestamp)` candidate tuple, never a
+/// `reflections.id` — so no further reflection lookup is needed or
+/// correct. `None` on any missing link (no episode reflection,
+/// malformed JSON, empty prev_episode_id) — episode chains are sparse
+/// by design in this phase (not every session gets an episode
+/// reflection), this must never error the whole walk.
 fn episode_prev_session(storage: &Storage, conv: &str) -> Result<Option<String>> {
     let tag_b = format!("conv_{conv}");
     let rows = storage.get_reflections_by_two_tags("session_episode", &tag_b, 1)?;
@@ -278,15 +285,10 @@ fn episode_prev_session(storage: &Storage, conv: &str) -> Result<Option<String>>
         Ok(v) => v,
         Err(_) => return Ok(None),
     };
-    let Some(prev_id) = v.get("prev_episode_id").and_then(|p| p.as_str()) else {
-        return Ok(None);
-    };
-    let Some((_content, tags, _timestamp)) = storage.get_reflection_by_id(prev_id)? else {
-        return Ok(None);
-    };
-    Ok(tags
-        .iter()
-        .find_map(|t| t.strip_prefix("conv_").map(str::to_string)))
+    Ok(v.get("prev_episode_id")
+        .and_then(|p| p.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string))
 }
 
 /// The proven reinstatement walk: seed (hop 1) -> blend + graph spread + episode
@@ -869,5 +871,43 @@ mod tests {
         // Ratification values themselves are simply readable, independent of order:
         assert_eq!(ratification_scores.get("conv_lo").copied(), Some(0.99));
         assert_eq!(ratification_scores.get("conv_hi").copied(), Some(0.01));
+    }
+
+    #[test]
+    fn episode_prev_session_returns_prev_id_directly_not_via_reflection_lookup() {
+        // `prev_episode_id` in a stored episode reflection is already a
+        // conversation id (written by hooks::stop::pick_prev_episode,
+        // which returns a session_id, never a reflections.id) —
+        // episode_prev_session must use it directly, not treat it as
+        // another reflection to look up. The pre-fix code, which called
+        // `storage.get_reflection_by_id(prev_id)`, would return None here
+        // because no reflection with id "prev-conv-id" exists — only a
+        // conversation by that id is implied.
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let content = serde_json::json!({
+            "prev_episode_id": "prev-conv-id"
+        })
+        .to_string();
+        storage
+            .insert_reflection(
+                "refl-current-episode",
+                &content,
+                &[
+                    "session_episode".to_string(),
+                    "conv_current-conv".to_string(),
+                ],
+                &[],
+            )
+            .unwrap();
+
+        let result = episode_prev_session(&storage, "current-conv").unwrap();
+        assert_eq!(result, Some("prev-conv-id".to_string()));
+    }
+
+    #[test]
+    fn episode_prev_session_none_when_no_episode_reflection() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let result = episode_prev_session(&storage, "no-such-conv").unwrap();
+        assert_eq!(result, None);
     }
 }

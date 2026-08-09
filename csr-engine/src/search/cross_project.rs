@@ -20,7 +20,20 @@ pub fn resolve_project_from_cwd(cwd: &str) -> Option<String> {
     let components: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
     for (i, comp) in components.iter().enumerate() {
         if *comp == "projects" && i + 1 < components.len() {
-            return Some(components[i + 1].to_string());
+            // The found component can itself be a Claude dash-encoded
+            // projects dir name (cwd nested under
+            // `~/.claude/projects/<encoded>/memory`, where the literal
+            // "projects" segment is `.claude`'s own child, not the encoded
+            // project's own parent) — normalize it the same way the
+            // primary branch above does. Without this, callers that write
+            // storage rows keyed by this project name
+            // (`hooks::post_tool_use::resolve_project_for_hook`,
+            // `import::coedit_backfill::resolve_project_for_backfill`)
+            // produce an unnormalized project_name that a normalized
+            // project-scope filter can never match — silently zeroing the
+            // reinstatement graph hop for any session whose most-touched
+            // file lives under a CSR memory dir.
+            return Some(import::normalize_project_name(components[i + 1]));
         }
     }
 
@@ -140,5 +153,22 @@ mod tests {
     fn test_resolve_from_cwd_no_projects_segment() {
         let result = resolve_project_from_cwd("/tmp/something/mydir");
         assert_eq!(result, Some("mydir".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_from_cwd_nested_under_claude_memory_dir() {
+        // A CSR memory-file's own path is
+        // ~/.claude/projects/<dash-encoded-project>/memory/<file>.md — its
+        // immediate parent dir name is "memory" (doesn't start with '-'),
+        // so this must resolve via the walk-up branch, not the primary
+        // dash-encoded-dirname branch. The walk-up branch must normalize
+        // the encoded component the same way, or code_evolution rows
+        // written for memory-file touches (live hook + coedit backfill)
+        // get a project_name that never matches a normalized project
+        // scope.
+        let result = resolve_project_from_cwd(
+            "/Users/name/.claude/projects/-Users-name-projects-claude-self-reflect/memory",
+        );
+        assert_eq!(result, Some("claude-self-reflect".to_string()));
     }
 }
