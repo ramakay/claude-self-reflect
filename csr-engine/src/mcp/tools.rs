@@ -1129,8 +1129,8 @@ pub async fn why(
     Ok(format_why(query, &items))
 }
 
-/// Format evidence items as: header, grouped-by-conversation body (chronological
-/// within group), footer summary.
+/// Format evidence items as: header, grouped-by-conversation body (in the
+/// ranked order `items` already carries), footer summary.
 fn format_why(query: &str, items: &[crate::search::reinstatement::EvidenceItem]) -> String {
     use crate::search::reinstatement::Via;
 
@@ -1157,8 +1157,13 @@ fn format_why(query: &str, items: &[crate::search::reinstatement::EvidenceItem])
     }
 
     for conv in &order {
-        let mut group = groups.remove(conv).unwrap_or_default();
-        group.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        // Render in the order `items` already carries: score-descending, with
+        // the D2 same-anchor recency tie-break applied. This group previously
+        // re-sorted by ASCENDING timestamp, which silently discarded both —
+        // and, being oldest-first, rendered a superseded claim above the very
+        // correction D2 exists to surface. Ranking decided upstream must not be
+        // undone at render time.
+        let group = groups.remove(conv).unwrap_or_default();
         out.push_str(&format!("conv_{conv}:\n"));
         for it in &group {
             out.push_str(&format!(
@@ -4384,6 +4389,37 @@ mod tests {
             orders.len(),
             1,
             "every permutation must yield one stable order, got {orders:?}"
+        );
+    }
+
+    /// The tie-break is worthless if the renderer re-sorts it away. It used to:
+    /// each conversation group was re-sorted by ASCENDING timestamp, so the
+    /// oldest — i.e. the superseded claim — rendered above its own correction,
+    /// and every unit test still passed because they only exercised the pure
+    /// ranking function. Assert on the rendered string instead.
+    #[test]
+    fn format_why_renders_in_ranked_order_not_chronological() {
+        let older_wrong = why_item("wrong", "conv-x", 0.840, "2026-01-01T00:00:00Z");
+        let newer_fixed = why_item("fixed", "conv-x", 0.810, "2026-01-02T00:00:00Z");
+        let mut anchors = HashMap::new();
+        for id in ["wrong", "fixed"] {
+            anchors.insert(
+                id.to_string(),
+                ("proj".to_string(), "CLAUDE.md".to_string()),
+            );
+        }
+        let ranked = apply_why_recency_tiebreak(vec![older_wrong, newer_fixed], &anchors);
+        assert_eq!(
+            ranked[0].chunk_id, "fixed",
+            "precondition: ranking puts the correction first"
+        );
+
+        let rendered = format_why("why", &ranked);
+        let newer_at = rendered.find("0.810").expect("newer item must render");
+        let older_at = rendered.find("0.840").expect("older item must render");
+        assert!(
+            newer_at < older_at,
+            "renderer must preserve ranked order; got:\n{rendered}"
         );
     }
 
