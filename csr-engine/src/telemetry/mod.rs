@@ -90,9 +90,45 @@ pub struct Telemetry {
     pub log_lines_in_window: usize,
 }
 
+/// Explicit override for the timing log location: an absolute path.
+pub const TIMING_LOG_ENV: &str = "CSR_TIMING_LOG";
+
 /// Resolve the canonical log path: `~/.claude-self-reflect/hook-timing.log`.
+///
+/// Checked in order: the `CSR_TIMING_LOG` override, a test-harness redirect, then
+/// the real installation path.
 pub fn default_log_path() -> Option<PathBuf> {
+    match std::env::var_os(TIMING_LOG_ENV) {
+        Some(p) if !p.is_empty() => return Some(PathBuf::from(p)),
+        _ => {}
+    }
+    if running_under_test_harness() {
+        return Some(std::env::temp_dir().join("csr-test-hook-timing.log"));
+    }
     dirs::home_dir().map(|h| h.join(".claude-self-reflect").join("hook-timing.log"))
+}
+
+/// True when this process is a `cargo test` / `cargo bench` binary.
+///
+/// Without this, `cargo test` appends to the developer's live hook-timing.log —
+/// the same log they debug hooks with, which is how a test run can invent
+/// evidence for the bug being investigated.
+///
+/// Two signals, both required: Cargo exports `CARGO_MANIFEST_DIR` into the
+/// processes it launches, and it runs test/bench harnesses out of
+/// `target/<profile>/deps/`. An installed `csr-engine` has neither; `cargo run`
+/// has the first but not the second, so a hook run by hand still writes where the
+/// developer expects.
+fn running_under_test_harness() -> bool {
+    if std::env::var_os("CARGO_MANIFEST_DIR").is_none() {
+        return false;
+    }
+    std::env::args_os().next().is_some_and(|arg0| {
+        Path::new(&arg0)
+            .parent()
+            .and_then(|d| d.file_name())
+            .is_some_and(|d| d == std::ffi::OsStr::new("deps"))
+    })
 }
 
 /// The previous log generation kept after rotation: `hook-timing.log.1`.
@@ -174,4 +210,46 @@ pub fn collect(db_path: &Path, projects_dir: &Path, window: Window) -> Result<Te
         log_lines_scanned: scanned,
         log_lines_in_window: entries.len(),
     })
+}
+
+#[cfg(test)]
+mod log_path_tests {
+    use super::*;
+
+    /// The bug this guards: `cargo test` used to append to
+    /// `~/.claude-self-reflect/hook-timing.log` — the developer's live log —
+    /// because the path resolved straight through `home_dir()`.
+    #[test]
+    fn test_runs_never_resolve_to_the_live_log() {
+        let path = default_log_path().expect("a log path is always resolvable under test");
+        let live = dirs::home_dir().map(|h| h.join(".claude-self-reflect").join("hook-timing.log"));
+        assert_ne!(
+            Some(path.clone()),
+            live,
+            "a test run must not write to the installed log"
+        );
+        assert!(
+            running_under_test_harness(),
+            "the harness signal is what redirects it; path was {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn explicit_override_wins() {
+        let want = std::env::temp_dir().join("csr-override-probe.log");
+        std::env::set_var(TIMING_LOG_ENV, &want);
+        let got = default_log_path();
+        std::env::remove_var(TIMING_LOG_ENV);
+        assert_eq!(got, Some(want));
+    }
+
+    /// An empty override is a mis-set variable, not a request to log to "".
+    #[test]
+    fn empty_override_falls_through() {
+        std::env::set_var(TIMING_LOG_ENV, "");
+        let got = default_log_path();
+        std::env::remove_var(TIMING_LOG_ENV);
+        assert_ne!(got, Some(PathBuf::new()));
+    }
 }
