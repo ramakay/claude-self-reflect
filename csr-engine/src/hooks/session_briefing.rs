@@ -424,7 +424,14 @@ fn is_meta_episode(content: &str) -> bool {
             return crate::extraction::provenance::extractable(req).is_none();
         }
     }
-    // Fallback for non-JSON content: scan only the leading window.
+    // Fallback for non-JSON content. The machine-owned sentinel is scanned
+    // across the FULL text first: a recap trails its sentinel after the header
+    // clause, so any recap longer than the window below would otherwise carry
+    // its sentinel outside it and read as genuine content. Only the grammar
+    // heuristics are window-limited.
+    if crate::extraction::provenance::contains_recap_sentinel(content) {
+        return true;
+    }
     let head_end = content.floor_char_boundary(400);
     crate::extraction::provenance::is_csr_emission(&content[..head_end])
 }
@@ -515,6 +522,30 @@ mod tests {
         assert!(is_meta_episode(analyst));
         assert!(is_meta_episode(summarizer));
         assert!(!is_meta_episode(real));
+    }
+
+    #[test]
+    fn test_is_meta_episode_catches_sentinel_past_the_grammar_window() {
+        // A recap trails its sentinel after the header clause. Anything longer
+        // than the 400-char grammar window pushes the sentinel out of it, so a
+        // window-limited check alone would read this as genuine user content.
+        // The `- ` prefix is the documented legacy bypass: it defeats the
+        // header grammar, so only the sentinel can catch this one. ASCII-only,
+        // so byte slicing is safe.
+        let filler = "shipped the resolver rewrite and the ledger backfill. ".repeat(12);
+        let recap = format!(
+            "- recap [2h ago]: {filler} {}",
+            crate::extraction::provenance::RECAP_SENTINEL
+        );
+        assert!(
+            recap.len() > 400,
+            "fixture must exceed the window to exercise the gap"
+        );
+        assert!(
+            !crate::extraction::provenance::is_csr_emission(&recap[..400]),
+            "window-limited check must miss it — otherwise this test proves nothing"
+        );
+        assert!(is_meta_episode(&recap));
     }
 
     #[test]

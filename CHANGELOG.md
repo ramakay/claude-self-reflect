@@ -52,11 +52,14 @@ context on resume; this fills the model-facing half.
   stamps pinned to commit OIDs, audited as intact, drifted, vanished, or
   explicitly superseded. Causal ordering via git ancestry, no LLM and no
   timestamps on the verdict path. Operational failures stay errors and never
-  collapse into verdicts. Every supersession receipt records whether its
-  basis was graph ordering (`GraphOrdered`) or content re-derivation alone
-  (`ContentOnly`) — the field records the provenance of the match, not a
-  correctness guarantee; a squash/rebase successor's receipt is labeled
-  `ContentOnly`, not presented as graph-proven.
+  collapse into verdicts. The crate's `Auditor::audit_against_successor`
+  records whether a supersession receipt's basis was graph ordering
+  (`GraphOrdered`) or content re-derivation alone (`ContentOnly`) — the field
+  records the provenance of the match, not a correctness guarantee; a
+  squash/rebase successor's receipt there is labeled `ContentOnly`, not
+  presented as graph-proven. This applies to the crate API only: the
+  production supersession path (`dream::find_successor`) has no basis field
+  and does not emit one.
 - **Witness ledger.** Append-preferring event log (`witness_ledger` — no SQL
   trigger enforces immutability) plus `witness_generations` publication
   manifests; `codegraph stamp-spans --at <rev>` mints witnesses at historical
