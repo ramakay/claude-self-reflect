@@ -1012,6 +1012,26 @@ impl Storage {
         codegraph::replace_file_edges(&conn, project, src_file, edges)
     }
 
+    /// Retire `code_nodes` rows for `(project, file)` absent from `seen_ids`
+    /// after a fresh extraction (D6 — per-file extraction has REPLACE
+    /// semantics, a symbol renamed/deleted/re-kinded must not survive as a
+    /// stale row with a stale span).
+    pub fn retire_missing_code_nodes(
+        &self,
+        project: &str,
+        file: &str,
+        seen_ids: &[String],
+    ) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::retire_missing_nodes(&conn, project, file, seen_ids)
+    }
+
+    /// Fetch a single `code_nodes` row by id (thin wrapper for tests / tools).
+    pub fn get_code_node(&self, id: &str) -> Result<Option<codegraph::NodeRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::get_node(&conn, id)
+    }
+
     /// Distinct `code_nodes.file` values still missing `repo_root` (WP2 Stage 1 backfill).
     pub fn code_node_files_missing_repo_root(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;

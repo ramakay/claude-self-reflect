@@ -289,6 +289,55 @@ pub fn upsert_repo_defs(
     Ok(())
 }
 
+/// Retire `code_nodes` rows for `(project, file)` whose id is not in
+/// `seen_ids` after a fresh extraction. Extraction has REPLACE
+/// semantics per file (D6): a node absent from the current fragment
+/// (renamed, deleted, or its `kind` changed) must not survive as a
+/// stale row with a stale span. No retired/tombstone column exists on
+/// `code_nodes` (checked `migrations.rs`), so this hard-deletes — but
+/// ONLY rows scoped to this exact (project, file), and ONLY ids absent
+/// from `seen_ids`. `code_node_rank` FK-references `code_nodes.id`
+/// with no cascade, so its row for each retired id is deleted first,
+/// in the same transaction; `code_node_attribution` has no FK but is
+/// cleaned up too so it never dangles.
+pub fn retire_missing_nodes(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    seen_ids: &[String],
+) -> Result<usize> {
+    let seen: std::collections::HashSet<&str> = seen_ids.iter().map(String::as_str).collect();
+
+    let mut stmt = conn.prepare("SELECT id FROM code_nodes WHERE project = ?1 AND file = ?2")?;
+    let existing: Vec<String> = stmt
+        .query_map(params![project, file], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let stale_ids: Vec<String> = existing
+        .into_iter()
+        .filter(|id| !seen.contains(id.as_str()))
+        .collect();
+
+    if stale_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    for id in &stale_ids {
+        tx.execute("DELETE FROM code_node_rank WHERE node_id = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM code_node_attribution WHERE node_id = ?1",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_nodes WHERE id = ?1 AND project = ?2 AND file = ?3",
+            params![id, project, file],
+        )?;
+    }
+    tx.commit()?;
+    Ok(stale_ids.len())
+}
+
 /// Definition sites for `name` within `project`: `(file, kind)`, deterministic order.
 pub fn lookup_repo_defs(
     conn: &Connection,
@@ -1359,5 +1408,122 @@ mod tests {
         let conn = mem();
         upsert_node(&conn, &node("n1", "a.rs", "function", "foo", "conv_A")).unwrap();
         assert_eq!(attribution_for_node(&conn, "n1").unwrap(), "unattributed");
+    }
+
+    /// D6 regression guard: moving a function within a file must refresh span
+    /// and leave exactly one `code_nodes` row (id is stable; upsert updates span).
+    #[test]
+    fn retire_missing_nodes_span_updates_on_move_no_duplicate() {
+        use crate::extraction::ast_analysis::lang_from_path_str;
+        use crate::extraction::codegraph::extract_graph_fragment;
+
+        let conn = mem();
+        let lang = lang_from_path_str("a.rs").expect("rust");
+        let source1 = "fn extractable() {\n    let x = 1;\n    let y = x + 1;\n    let _ = y;\n}\n";
+        let fragment1 = extract_graph_fragment(source1, lang, "a.rs", "repo", "proj", "c1", "s1");
+        for n in &fragment1.nodes {
+            upsert_node(&conn, n).unwrap();
+        }
+        let ids1: Vec<String> = fragment1.nodes.iter().map(|n| n.id.clone()).collect();
+        retire_missing_nodes(&conn, "proj", "a.rs", &ids1).unwrap();
+
+        // Same function, pushed down ~50 blank lines so span_start increases.
+        let pad = "\n".repeat(50);
+        let source2 = format!(
+            "{pad}fn extractable() {{\n    let x = 1;\n    let y = x + 1;\n    let _ = y;\n}}\n"
+        );
+        let fragment2 = extract_graph_fragment(&source2, lang, "a.rs", "repo", "proj", "c2", "s2");
+        for n in &fragment2.nodes {
+            upsert_node(&conn, n).unwrap();
+        }
+        let ids2: Vec<String> = fragment2.nodes.iter().map(|n| n.id.clone()).collect();
+        retire_missing_nodes(&conn, "proj", "a.rs", &ids2).unwrap();
+
+        let rows = nodes_by_name(&conn, "extractable", "proj", 10).unwrap();
+        let extractable: Vec<_> = rows
+            .into_iter()
+            .filter(|n| n.file == "a.rs" && n.kind == "function")
+            .collect();
+        assert_eq!(
+            extractable.len(),
+            1,
+            "exactly one extractable row after move: {:?}",
+            extractable
+                .iter()
+                .map(|n| (n.id.clone(), n.span_start, n.span_end))
+                .collect::<Vec<_>>()
+        );
+        let span_start = extractable[0].span_start;
+        assert!(
+            span_start > 40,
+            "span_start must reflect the padded source 2 position, got {span_start}"
+        );
+    }
+
+    /// D6: a deleted function must be retired (FK-safe: rank row deleted first).
+    /// Uses `Storage::open_memory()` so `PRAGMA foreign_keys=ON` is active.
+    #[test]
+    fn retire_missing_nodes_deletes_absent_function_fk_safe() {
+        use crate::extraction::ast_analysis::lang_from_path_str;
+        use crate::extraction::codegraph::{extract_graph_fragment, node_id};
+
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let lang = lang_from_path_str("a.rs").expect("rust");
+        let source1 = "fn alpha() {\n    let a = 1;\n}\n\nfn beta() {\n    let b = 2;\n}\n";
+        let fragment1 = extract_graph_fragment(source1, lang, "a.rs", "repo", "proj", "c1", "s1");
+        for n in &fragment1.nodes {
+            storage.upsert_code_node(n).unwrap();
+        }
+        let ids1: Vec<String> = fragment1.nodes.iter().map(|n| n.id.clone()).collect();
+        storage
+            .retire_missing_code_nodes("proj", "a.rs", &ids1)
+            .unwrap();
+
+        let beta_id = node_id("repo", "a.rs", "function", "beta");
+        let alpha_id = node_id("repo", "a.rs", "function", "alpha");
+        assert!(
+            storage.get_code_node(&beta_id).unwrap().is_some(),
+            "beta present after first extract"
+        );
+        assert!(
+            storage.get_code_node(&alpha_id).unwrap().is_some(),
+            "alpha present after first extract"
+        );
+
+        // Seed a rank row so FK ON would fail if we delete code_nodes first.
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO code_node_rank (node_id, rank, in_degree, out_degree)
+                 VALUES (?1, 1.0, 0, 0)",
+                rusqlite::params![beta_id],
+            )
+            .unwrap();
+        }
+
+        // Source 2: beta deleted.
+        let source2 = "fn alpha() {\n    let a = 1;\n}\n";
+        let fragment2 = extract_graph_fragment(source2, lang, "a.rs", "repo", "proj", "c2", "s2");
+        for n in &fragment2.nodes {
+            storage.upsert_code_node(n).unwrap();
+        }
+        let ids2: Vec<String> = fragment2.nodes.iter().map(|n| n.id.clone()).collect();
+        storage
+            .retire_missing_code_nodes("proj", "a.rs", &ids2)
+            .unwrap();
+
+        assert!(
+            storage.get_code_node(&beta_id).unwrap().is_none(),
+            "beta must be retired after deletion from source"
+        );
+        assert!(
+            storage.get_code_node(&alpha_id).unwrap().is_some(),
+            "alpha must survive retirement of beta"
+        );
+        // Rank row for beta must also be gone (hygiene + FK ordering).
+        assert!(
+            storage.code_get_node_rank(&beta_id).unwrap().is_none(),
+            "code_node_rank for beta must be deleted with the node"
+        );
     }
 }

@@ -178,7 +178,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS code_nodes (
-            id          TEXT PRIMARY KEY,          -- sha1(repo|file|kind|name)
+            id          TEXT PRIMARY KEY,          -- sha256(repo|file|kind|name), truncated to 40 hex chars
             repo        TEXT NOT NULL DEFAULT '',
             project     TEXT NOT NULL DEFAULT '',
             file        TEXT NOT NULL,

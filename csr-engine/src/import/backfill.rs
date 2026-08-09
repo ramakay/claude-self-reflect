@@ -248,9 +248,10 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
     files.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
     stats.files_scanned = files.len();
 
-    // Newest-wins per-file edge set + content hash (flushed once at the end).
+    // Newest-wins per-file edge set + content hash + node ids (flushed once at the end).
     let mut latest_edges: BTreeMap<(String, String), Vec<EdgeRow>> = BTreeMap::new();
     let mut latest_hash: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut latest_node_ids: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     let mut touched_projects: BTreeSet<String> = BTreeSet::new();
     // Cache of on-disk file contents (Some) / absence (None), keyed by path.
     let mut disk_cache: BTreeMap<String, Option<String>> = BTreeMap::new();
@@ -355,9 +356,13 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
                 stats.nodes_upserted += 1;
             }
 
-            // Edges: newest conversation wins — overwrite the per-file entry.
+            // Edges + node ids: newest conversation wins — overwrite the per-file entry.
             let key = (project_name.clone(), file_path.clone());
             latest_edges.insert(key.clone(), fragment.edges);
+            latest_node_ids.insert(
+                key.clone(),
+                fragment.nodes.iter().map(|n| n.id.clone()).collect(),
+            );
             latest_hash.insert(key, crate::extraction::anchors::hash_normalized(source));
             touched_projects.insert(project_name.clone());
         }
@@ -378,7 +383,7 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
     stats.files_from_disk = from_disk_files.len();
 
     if !dry_run {
-        // 3. Flush the newest edge set + file state per file.
+        // 3. Flush the newest edge set + file state + retire stale nodes per file.
         for ((project, file), edges) in &latest_edges {
             if let Err(e) = storage.replace_code_file_edges(project, file, edges) {
                 eprintln!("CSR backfill: edge replace error for {file} ({e})");
@@ -386,6 +391,11 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
             if let Some(hash) = latest_hash.get(&(project.clone(), file.clone())) {
                 if let Err(e) = storage.upsert_code_file_state(project, file, hash, false) {
                     eprintln!("CSR backfill: file state error for {file} ({e})");
+                }
+            }
+            if let Some(ids) = latest_node_ids.get(&(project.clone(), file.clone())) {
+                if let Err(e) = storage.retire_missing_code_nodes(project, file, ids) {
+                    eprintln!("CSR backfill: node retire error for {file} ({e})");
                 }
             }
         }

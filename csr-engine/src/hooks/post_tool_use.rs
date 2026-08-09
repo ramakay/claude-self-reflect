@@ -125,6 +125,8 @@ fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
         node.repo_root = repo_root.clone();
         storage.upsert_code_node(&node)?;
     }
+    let seen_node_ids: Vec<String> = fragment.nodes.iter().map(|n| n.id.clone()).collect();
+    storage.retire_missing_code_nodes(&project, &stored_path_str, &seen_node_ids)?;
     storage.replace_code_file_edges(&project, &stored_path_str, &fragment.edges)?;
 
     let content_hash = crate::extraction::anchors::hash_normalized(&source);
