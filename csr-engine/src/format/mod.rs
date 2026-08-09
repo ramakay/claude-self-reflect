@@ -78,6 +78,14 @@ pub struct EnrichedResult {
     pub validity_demoted: bool,
 }
 
+/// Effective rerank score for a result whose position differs from raw-score
+/// order. Kept separate from [`EnrichedResult`] so other search surfaces retain
+/// their existing result model.
+pub(crate) struct DisplayRankScore {
+    pub chunk_id: String,
+    pub adjusted_score: f32,
+}
+
 /// Drop multi-route and near-duplicate results, keeping first occurrence.
 ///
 /// Input is assumed sorted by score descending. A result is dropped if either:
@@ -176,6 +184,19 @@ pub fn format_search_results(
     search_ms: u64,
     embed_ms: u64,
 ) -> String {
+    format_search_results_with_rank_scores(results, query, project_scope, search_ms, embed_ms, &[])
+}
+
+/// Format search results with the effective rerank scores for candidates whose
+/// position differs from pure raw-score order.
+pub(crate) fn format_search_results_with_rank_scores(
+    results: &[EnrichedResult],
+    query: &str,
+    project_scope: &str,
+    search_ms: u64,
+    embed_ms: u64,
+    display_rank_scores: &[DisplayRankScore],
+) -> String {
     let mut out = String::new();
 
     // Upfront summary
@@ -185,7 +206,10 @@ pub fn format_search_results(
             query
         ));
     } else {
-        let top_score = results[0].score;
+        let top_score = results
+            .iter()
+            .map(|result| result.score)
+            .fold(f32::NEG_INFINITY, f32::max);
         let relevance = relevance_label(top_score);
         out.push_str(&format!(
             "🎯 RESULTS: {} matches ({} relevance, top score: {:.3})\n",
@@ -203,7 +227,10 @@ pub fn format_search_results(
 
     // Summary
     if !results.is_empty() {
-        let top_score = results[0].score;
+        let top_score = results
+            .iter()
+            .map(|result| result.score)
+            .fold(f32::NEG_INFINITY, f32::max);
         let relevance = relevance_label(top_score);
 
         let preview = &results[0].chunk.content;
@@ -235,10 +262,17 @@ pub fn format_search_results(
     ));
     out.push_str(&format!("    <count>{}</count>\n", results.len()));
     if !results.is_empty() {
-        let last_score = results.last().unwrap().score;
+        let min_score = results
+            .iter()
+            .map(|result| result.score)
+            .fold(f32::INFINITY, f32::min);
+        let max_score = results
+            .iter()
+            .map(|result| result.score)
+            .fold(f32::NEG_INFINITY, f32::max);
         out.push_str(&format!(
             "    <range>{:.3}-{:.3}</range>\n",
-            last_score, results[0].score,
+            min_score, max_score,
         ));
     }
     out.push_str("    <perf>\n");
@@ -253,7 +287,17 @@ pub fn format_search_results(
     out.push_str("  <results>\n");
     for (i, r) in results.iter().enumerate() {
         out.push_str(&format!("    <r rank=\"{}\">\n", i + 1));
-        out.push_str(&format!("      <s>{:.3}</s>\n", r.score));
+        if let Some(rank_score) = display_rank_scores
+            .iter()
+            .find(|rank_score| rank_score.chunk_id == r.chunk.id)
+        {
+            out.push_str(&format!(
+                "      <s adj=\"{:.3}\">{:.3}</s>\n",
+                rank_score.adjusted_score, r.score
+            ));
+        } else {
+            out.push_str(&format!("      <s>{:.3}</s>\n", r.score));
+        }
         out.push_str(&format!(
             "      <p>{}</p>\n",
             xml_escape(&r.chunk.project_name)
@@ -1255,6 +1299,72 @@ mod tests {
         let xml = format_search_results(&results, "q", "all", 1, 1);
         assert!(!xml.contains("<resolution>"), "got: {xml}");
         assert!(!xml.contains("<note>"), "got: {xml}");
+    }
+
+    #[test]
+    fn format_search_results_explains_reranked_order_with_raw_extrema() {
+        let results = vec![
+            EnrichedResult {
+                score: 0.474,
+                chunk: make_chunk("boosted", "conv-1", "boosted result"),
+                resolution: None,
+                validity_demoted: false,
+            },
+            EnrichedResult {
+                score: 0.765,
+                chunk: make_chunk("demoted", "conv-2", "demoted result"),
+                resolution: None,
+                validity_demoted: false,
+            },
+            EnrichedResult {
+                score: 0.200,
+                chunk: make_chunk("validity-tail", "conv-3", "validity-demoted tail"),
+                resolution: None,
+                validity_demoted: true,
+            },
+        ];
+
+        let display_rank_scores = vec![
+            DisplayRankScore {
+                chunk_id: "boosted".to_string(),
+                adjusted_score: 1.124,
+            },
+            DisplayRankScore {
+                chunk_id: "demoted".to_string(),
+                adjusted_score: 0.265,
+            },
+        ];
+        let xml = format_search_results_with_rank_scores(
+            &results,
+            "rerank",
+            "all",
+            5,
+            3,
+            &display_rank_scores,
+        );
+
+        assert!(
+            xml.contains("top score: 0.765"),
+            "upfront summary must use the maximum raw score: {xml}"
+        );
+        assert!(
+            xml.contains("top-score=\"0.765\""),
+            "XML summary must use the maximum raw score: {xml}"
+        );
+        assert!(
+            xml.contains("<range>0.200-0.765</range>"),
+            "range must use raw min..max even after partitioning: {xml}"
+        );
+        let boosted = xml.find("<id>boosted</id>").unwrap();
+        let demoted = xml.find("<id>demoted</id>").unwrap();
+        let validity_tail = xml.find("<id>validity-tail</id>").unwrap();
+        assert!(boosted < demoted && demoted < validity_tail, "{xml}");
+        assert!(xml.contains("<s adj=\"1.124\">0.474</s>"), "got: {xml}");
+        assert!(xml.contains("<s adj=\"0.265\">0.765</s>"), "got: {xml}");
+        assert!(
+            xml.contains("<s>0.200</s>"),
+            "validity-only tail movement must not gain an adjusted score: {xml}"
+        );
     }
 
     #[test]

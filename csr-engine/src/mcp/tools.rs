@@ -7,7 +7,7 @@ use anyhow::Result;
 use tokio::sync::RwLock;
 
 use crate::embeddings::EmbeddingEngine;
-use crate::format::{self, EnrichedResult};
+use crate::format::{self, DisplayRankScore, EnrichedResult};
 use crate::search::cross_project;
 use crate::search::decay;
 use crate::search::SearchEngine;
@@ -23,6 +23,92 @@ use crate::temporal;
 /// evidence gate limits the multiplier to symbols proven gone at HEAD;
 /// Annotate-channel evolution remains rank-neutral.
 const ACTIVE_FORGETTING_DECAY_FACTOR: f64 = 3.0;
+
+/// In all-project searches, gently favor the current repository family so
+/// local context wins close ties without hiding genuinely stronger memories.
+const CURRENT_PROJECT_ALL_SCOPE_BOOST: f32 = 1.15;
+
+struct SearchProjectScope {
+    effective_project: Option<String>,
+    scope_label: String,
+    current_project_for_all_scope: Option<String>,
+    family_anchor: Option<String>,
+    family_projects: HashSet<String>,
+    projects_root_override: Option<PathBuf>,
+}
+
+impl SearchProjectScope {
+    fn resolve_with(
+        storage: &Storage,
+        requested_project: Option<&str>,
+        current_project: Option<&str>,
+        projects_root_override: Option<&Path>,
+    ) -> Result<Self> {
+        let (effective_project, scope_label, current_project_for_all_scope) =
+            match requested_project {
+                Some(project) if project.eq_ignore_ascii_case("all") => {
+                    (None, "all".to_string(), current_project.map(str::to_string))
+                }
+                Some(project) if !project.is_empty() => {
+                    (Some(project.to_string()), project.to_string(), None)
+                }
+                _ => match current_project {
+                    Some(project) => (Some(project.to_string()), project.to_string(), None),
+                    None => (None, "all".to_string(), None),
+                },
+            };
+        let family_anchor = effective_project
+            .clone()
+            .or_else(|| current_project_for_all_scope.clone());
+        let mut family_projects = HashSet::new();
+        if let Some(anchor) = family_anchor.as_deref() {
+            family_projects.extend(
+                storage
+                    .list_project_names("", i64::MAX as usize)?
+                    .into_iter()
+                    .filter(|candidate| match projects_root_override {
+                        Some(root) => {
+                            cross_project::same_project_family_at_root(anchor, candidate, root)
+                        }
+                        None => cross_project::same_project_family(anchor, candidate),
+                    }),
+            );
+            family_projects.insert(anchor.to_string());
+        }
+        Ok(Self {
+            effective_project,
+            scope_label,
+            current_project_for_all_scope,
+            family_anchor,
+            family_projects,
+            projects_root_override: projects_root_override.map(Path::to_path_buf),
+        })
+    }
+
+    fn is_family(&self, candidate: &str) -> bool {
+        self.family_anchor.as_deref().is_some_and(|anchor| {
+            if let Some(root) = self.projects_root_override.as_deref() {
+                cross_project::same_project_family_at_root(anchor, candidate, root)
+            } else {
+                cross_project::same_project_family(anchor, candidate)
+            }
+        })
+    }
+}
+
+fn project_scope_multiplier(candidate: &str, scope: &SearchProjectScope) -> f32 {
+    if scope.effective_project.is_some() {
+        if scope.is_family(candidate) {
+            1.0
+        } else {
+            0.3
+        }
+    } else if scope.current_project_for_all_scope.is_some() && scope.is_family(candidate) {
+        CURRENT_PROJECT_ALL_SCOPE_BOOST
+    } else {
+        1.0
+    }
+}
 
 /// Extract a conversation UUID from a query that is (or contains) a
 /// `conv_<uuid>` retrieval handle, or that is a bare UUID. Injection blocks
@@ -211,8 +297,39 @@ async fn reflect_on_past_with_vec(
     consumption_enabled: bool,
     active_forgetting: bool,
 ) -> Result<String> {
-    let (effective_project, scope_label) = cross_project::normalize_project_scope(project);
+    let current_project = cross_project::resolve_current_project();
+    let scope =
+        SearchProjectScope::resolve_with(storage, project, current_project.as_deref(), None)?;
+    reflect_on_past_with_vec_in_scope(
+        storage,
+        search,
+        query_vec,
+        query,
+        limit,
+        min_score,
+        &scope,
+        embed_ms,
+        partition_enabled,
+        consumption_enabled,
+        active_forgetting,
+    )
+    .await
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn reflect_on_past_with_vec_in_scope(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query_vec: &[f32],
+    query: &str,
+    limit: usize,
+    min_score: f32,
+    scope: &SearchProjectScope,
+    embed_ms: u64,
+    partition_enabled: bool,
+    consumption_enabled: bool,
+    active_forgetting: bool,
+) -> Result<String> {
     // OVERFETCH (validity partition, issue 2): fetching exactly `limit`
     // candidates lets one demoted top-N hit permanently displace the valid
     // N+1 candidate — it was never fetched, so the sink has nothing to
@@ -226,7 +343,7 @@ async fn reflect_on_past_with_vec(
         query,
         first,
         min_score,
-        effective_project.as_deref(),
+        scope,
         partition_enabled,
         consumption_enabled,
         active_forgetting,
@@ -255,7 +372,7 @@ async fn reflect_on_past_with_vec(
                 query,
                 refetch,
                 min_score,
-                effective_project.as_deref(),
+                scope,
                 partition_enabled,
                 consumption_enabled,
                 active_forgetting,
@@ -266,6 +383,7 @@ async fn reflect_on_past_with_vec(
     }
 
     let mut enriched = pass.enriched;
+    let display_rank_scores = pass.display_rank_scores;
     // Sink resolved chunks AND dream-verdict-demoted chunks BEFORE the limit
     // cut so stale results do not occupy slots that should go to
     // unresolved/non-demoted chunks ranked below them.
@@ -284,12 +402,13 @@ async fn reflect_on_past_with_vec(
         let _ = storage.log_retrieval_event(&e.chunk.id, "chunk", "mcp_search", "mcp");
     }
 
-    Ok(format::format_search_results(
+    Ok(format::format_search_results_with_rank_scores(
         &enriched,
         query,
-        &scope_label,
+        &scope.scope_label,
         search_ms,
         embed_ms,
+        &display_rank_scores,
     ))
 }
 
@@ -300,11 +419,70 @@ async fn reflect_on_past_with_vec(
 /// single adaptive refetch before cutting.
 struct GatherPass {
     enriched: Vec<EnrichedResult>,
+    /// Effective rerank scores keyed only for candidates whose rank differs
+    /// from pure raw-score order. Later structural partitions do not alter it.
+    display_rank_scores: Vec<DisplayRankScore>,
     validity: HashMap<String, ConvValidity>,
     /// The HNSW window came back full — more candidates may exist beyond it,
     /// so a refetch could backfill demotion-vacated slots.
     window_full: bool,
     search_ms: u64,
+}
+
+/// Compute the exact score used by recall reranking, including its conversation
+/// primacy bonus. `search::rerank` intentionally returns candidates rather than
+/// a scored wrapper, so the display path reconstructs the same pure policy here
+/// while keeping the ranking implementation itself out of the response model.
+fn recall_display_rank_scores(
+    candidates: &[crate::search::rerank::RankCandidate],
+) -> HashMap<String, f32> {
+    // Keep these in lockstep with search::rerank's private recall constants.
+    const PRIMACY_BAND: f32 = 0.05;
+    const PRIMACY_BOOST: f32 = 0.15;
+
+    let eligible = |candidate: &&crate::search::rerank::RankCandidate| {
+        candidate.timestamp.is_some()
+            && candidate
+                .provenance
+                .as_ref()
+                .is_some_and(|provenance| provenance.author == crate::provenance::Speaker::User)
+            && !crate::search::rerank::is_scaffold_text(&candidate.content)
+    };
+    let top_eligible = candidates
+        .iter()
+        .filter(eligible)
+        .map(|candidate| candidate.cosine)
+        .fold(f32::MIN, f32::max);
+    let primacy_conversation = candidates
+        .iter()
+        .filter(eligible)
+        .filter(|candidate| candidate.cosine >= top_eligible - PRIMACY_BAND)
+        .filter_map(|candidate| {
+            Some((
+                candidate.timestamp.as_deref()?,
+                candidate.provenance.as_ref()?.source_conv_id.as_str(),
+            ))
+        })
+        .min_by(|left, right| left.0.cmp(right.0))
+        .map(|(_, conversation_id)| conversation_id);
+
+    candidates
+        .iter()
+        .map(|candidate| {
+            let primacy_bonus = if candidate.provenance.as_ref().is_some_and(|provenance| {
+                provenance.author == crate::provenance::Speaker::User
+                    && Some(provenance.source_conv_id.as_str()) == primacy_conversation
+            }) {
+                PRIMACY_BOOST
+            } else {
+                0.0
+            };
+            (
+                candidate.id.clone(),
+                crate::search::rerank::adjusted_score(candidate) + primacy_bonus,
+            )
+        })
+        .collect()
 }
 
 /// One retrieval + enrichment pass for `reflect_on_past_with_vec`: HNSW
@@ -319,7 +497,7 @@ async fn reflect_gather_pass(
     query: &str,
     fetch: usize,
     min_score: f32,
-    effective_project: Option<&str>,
+    scope: &SearchProjectScope,
     partition_enabled: bool,
     consumption_enabled: bool,
     active_forgetting: bool,
@@ -329,8 +507,11 @@ async fn reflect_gather_pass(
     // Search BOTH chunks and reflections, merge by score
     let (chunk_results, reflection_results) = {
         let idx = search.read().await;
-        let chunks = if let Some(p) = effective_project {
-            let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+        let chunks = if scope.effective_project.is_some() {
+            let mut ids = HashSet::new();
+            for project in &scope.family_projects {
+                ids.extend(storage.get_chunk_ids_for_project(project)?);
+            }
             idx.search_chunks_filtered(query_vec, fetch, min_score, &ids)
         } else {
             idx.search_chunks(query_vec, fetch, min_score)
@@ -392,7 +573,7 @@ async fn reflect_gather_pass(
                     &signals.validity,
                     signals.ancestry.get(&c.conversation_id),
                     active_forgetting,
-                    effective_project,
+                    scope,
                 );
                 if ancestry_applied {
                     ancestry_applied_ids.insert(c.id.clone());
@@ -411,7 +592,7 @@ async fn reflect_gather_pass(
                     &signals.validity,
                     None,
                     false,
-                    effective_project,
+                    scope,
                 )
                 .0;
                 semantic_top_score = semantic_top_score.max(fallback_score);
@@ -452,15 +633,7 @@ async fn reflect_gather_pass(
                 .map(|t| t.trim_start_matches("project_").to_string())
                 .unwrap_or_else(|| "unknown".to_string());
             // Cross-project multiplicative penalty
-            let final_score = if let Some(p) = effective_project {
-                if project_name != p {
-                    decayed_score * 0.3
-                } else {
-                    decayed_score
-                }
-            } else {
-                decayed_score
-            };
+            let final_score = decayed_score * project_scope_multiplier(&project_name, scope);
             semantic_top_score = semantic_top_score.max(final_score);
             let tag_prefix = if tags.iter().any(|t| t == "session_episode") {
                 "[episode] "
@@ -496,8 +669,23 @@ async fn reflect_gather_pass(
     // FTS5 hybrid fallback: if semantic results are weak (top score < 0.5)
     // or empty, supplement with keyword search results
     if semantic_top_score < 0.5 {
-        if let Ok(fts_chunks) = storage.fts5_search(query, fetch, effective_project) {
-            window_full |= fts_chunks.len() == fetch;
+        let fts_searches = if scope.effective_project.is_some() {
+            scope
+                .family_projects
+                .iter()
+                .map(|project| storage.fts5_search(query, fetch, Some(project)))
+                .collect::<Vec<_>>()
+        } else {
+            vec![storage.fts5_search(query, fetch, None)]
+        };
+        let mut fts_chunks = Vec::new();
+        let mut fts_window_full = false;
+        for chunks in fts_searches.into_iter().flatten() {
+            fts_window_full |= chunks.len() == fetch;
+            fts_chunks.extend(chunks);
+        }
+        if !fts_chunks.is_empty() {
+            window_full |= fts_window_full;
             let existing_ids: HashSet<String> =
                 enriched.iter().map(|e| e.chunk.id.clone()).collect();
             let appended: Vec<crate::import::ConversationChunk> = fts_chunks
@@ -543,7 +731,7 @@ async fn reflect_gather_pass(
                         &signals.validity,
                         None,
                         active_forgetting,
-                        effective_project,
+                        scope,
                     )
                     .0;
                 }
@@ -561,15 +749,8 @@ async fn reflect_gather_pass(
                 if ancestry_applied {
                     ancestry_applied_ids.insert(chunk.id.clone());
                 }
-                let final_fts_score = if let Some(p) = effective_project {
-                    if chunk.project_name != p {
-                        fts_score * 0.3
-                    } else {
-                        fts_score
-                    }
-                } else {
-                    fts_score
-                };
+                let final_fts_score =
+                    fts_score * project_scope_multiplier(&chunk.project_name, scope);
                 enriched.push(EnrichedResult {
                     score: final_fts_score,
                     chunk: crate::import::ConversationChunk {
@@ -610,9 +791,45 @@ async fn reflect_gather_pass(
             timestamp: Some(e.chunk.timestamp.clone()),
         })
         .collect();
+    let mut raw_order = candidates.clone();
+    raw_order.sort_by(|left, right| {
+        right
+            .cosine
+            .partial_cmp(&left.cosine)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let raw_rank: HashMap<String, usize> = raw_order
+        .into_iter()
+        .enumerate()
+        .map(|(rank, candidate)| (candidate.id, rank))
+        .collect();
+    let adjusted_scores = recall_display_rank_scores(&candidates);
     let order: Vec<String> = crate::search::rerank::rerank(candidates)
         .into_iter()
         .map(|c| c.id)
+        .collect();
+    let rerank_rank: HashMap<&str, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(rank, id)| (id.as_str(), rank))
+        .collect();
+    let display_rank_scores = enriched
+        .iter()
+        .filter_map(|result| {
+            let moved_by_rerank = raw_rank.get(&result.chunk.id).is_some_and(|raw| {
+                rerank_rank
+                    .get(result.chunk.id.as_str())
+                    .is_some_and(|reranked| raw != reranked)
+            });
+            moved_by_rerank.then(|| {
+                adjusted_scores
+                    .get(&result.chunk.id)
+                    .map(|score| DisplayRankScore {
+                        chunk_id: result.chunk.id.clone(),
+                        adjusted_score: *score,
+                    })
+            })?
+        })
         .collect();
     let rank_of = |id: &str| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
     enriched.sort_by_key(|e| rank_of(&e.chunk.id));
@@ -662,6 +879,7 @@ async fn reflect_gather_pass(
 
     Ok(GatherPass {
         enriched,
+        display_rank_scores,
         validity: signals.validity,
         window_full,
         search_ms,
@@ -936,6 +1154,38 @@ pub async fn code_graph(
     limit: usize,
 ) -> Result<String> {
     let project = cross_project::resolve_current_project().unwrap_or_default();
+    let mut family_projects: Vec<String> = storage
+        .with_connection(crate::storage::codegraph::project_names)?
+        .into_iter()
+        .filter(|candidate| {
+            project.is_empty() || cross_project::same_project_family(&project, candidate)
+        })
+        .collect();
+    family_projects.sort();
+    family_projects.dedup();
+    if !project.is_empty() && !family_projects.contains(&project) {
+        family_projects.push(project.clone());
+    }
+    code_graph_for_projects(
+        storage,
+        symbol,
+        file,
+        mode,
+        limit,
+        &project,
+        &family_projects,
+    )
+}
+
+fn code_graph_for_projects(
+    storage: &Arc<Storage>,
+    symbol: Option<&str>,
+    file: Option<&str>,
+    mode: &str,
+    limit: usize,
+    project: &str,
+    family_projects: &[String],
+) -> Result<String> {
     let target_label = symbol.or(file).unwrap_or("").to_string();
 
     match mode {
@@ -944,22 +1194,36 @@ pub async fn code_graph(
                 Some(s) if !s.is_empty() => s,
                 _ => return Ok(format::format_code_graph(mode, &target_label, &[], &[])),
             };
-            let mut nodes = storage.code_query_callers(name, &project, limit)?;
+            let mut nodes = storage.with_connection(|conn| {
+                crate::storage::codegraph::query_callers_in_projects(
+                    conn,
+                    name,
+                    family_projects,
+                    limit,
+                )
+            })?;
             attach_attribution(storage, &mut nodes);
             Ok(format::format_code_graph(mode, &target_label, &nodes, &[]))
         }
         "callees" => {
-            let node_id = match resolve_node_id(storage, symbol, file, &project)? {
+            let node_id = match resolve_node_id(storage, symbol, file, project, family_projects)? {
                 Some(id) => id,
                 None => return Ok(format::format_code_graph(mode, &target_label, &[], &[])),
             };
-            let mut nodes = storage.code_query_callees(&node_id, limit)?;
+            let mut nodes = storage.with_connection(|conn| {
+                crate::storage::codegraph::query_callees_in_projects(
+                    conn,
+                    &node_id,
+                    family_projects,
+                    limit,
+                )
+            })?;
             attach_attribution(storage, &mut nodes);
             Ok(format::format_code_graph(mode, &target_label, &nodes, &[]))
         }
         _ => {
             // Default: neighbors (1-hop, both directions).
-            let node_id = match resolve_node_id(storage, symbol, file, &project)? {
+            let node_id = match resolve_node_id(storage, symbol, file, project, family_projects)? {
                 Some(id) => id,
                 None => {
                     return Ok(format::format_code_graph(
@@ -970,7 +1234,15 @@ pub async fn code_graph(
                     ))
                 }
             };
-            let mut neighbors = storage.code_query_neighbors(&node_id, None, limit)?;
+            let mut neighbors = storage.with_connection(|conn| {
+                crate::storage::codegraph::query_neighbors_in_projects(
+                    conn,
+                    &node_id,
+                    family_projects,
+                    None,
+                    limit,
+                )
+            })?;
             for ne in neighbors.iter_mut() {
                 ne.node.attribution = if ne.node.id.is_empty() {
                     "unattributed".to_string()
@@ -995,6 +1267,12 @@ pub async fn code_graph(
 /// on purpose. A wide band would bury older-but-still-valid evidence just to fix a
 /// narrower failure (a stale fact outranking its own correction).
 const WHY_RECENCY_EPSILON: f32 = 0.05;
+const WHY_RECENCY_HOIST_MARKER: &str = " [recent↑]";
+
+struct WhyRanking {
+    items: Vec<crate::search::reinstatement::EvidenceItem>,
+    hoisted_chunk_ids: HashSet<String>,
+}
 
 /// Anchor for csr_why's recency tie-break: (project, most-touched file of the
 /// evidence item's source session). Resolved once per `why()` call via
@@ -1046,7 +1324,7 @@ fn resolve_why_anchors(
 fn apply_why_recency_tiebreak(
     mut items: Vec<crate::search::reinstatement::EvidenceItem>,
     anchors: &HashMap<String, (String, String)>,
-) -> Vec<crate::search::reinstatement::EvidenceItem> {
+) -> WhyRanking {
     // Two phases, because a pairwise "near-tie" predicate is NOT transitive and
     // must never be handed to sort_by: for same-anchor scores 0.90/0.86/0.82
     // with ascending timestamps, A beats B and B beats C but C beats A. Rust
@@ -1065,6 +1343,7 @@ fn apply_why_recency_tiebreak(
     // an anchor and sit within epsilon of the run's leader. Runs are disjoint, so
     // no cross-run comparison happens and no cycle is possible. Items with no
     // anchor, or whose neighbours differ, form runs of one and never move.
+    let mut hoisted_chunk_ids = HashSet::new();
     let mut start = 0;
     while start < items.len() {
         let anchor = anchors.get(&items[start].chunk_id);
@@ -1085,10 +1364,21 @@ fn apply_why_recency_tiebreak(
                     .cmp(&a.timestamp)
                     .then_with(|| a.chunk_id.cmp(&b.chunk_id))
             });
+            for index in start..end {
+                if items[index + 1..end]
+                    .iter()
+                    .any(|sibling| sibling.score > items[index].score)
+                {
+                    hoisted_chunk_ids.insert(items[index].chunk_id.clone());
+                }
+            }
         }
         start = end;
     }
-    items
+    WhyRanking {
+        items,
+        hoisted_chunk_ids,
+    }
 }
 
 /// Provenance recall: why does this code/decision exist. Reinstatement walk (seed ->
@@ -1117,21 +1407,29 @@ pub async fn why(
 
     // D2: local recency tie-break, csr_why only — see apply_why_recency_tiebreak.
     let anchors = resolve_why_anchors(storage, &items);
-    let items = apply_why_recency_tiebreak(items, &anchors);
+    let ranking = apply_why_recency_tiebreak(items, &anchors);
 
     // TAD: log each returned chunk as an MCP-search retrieval event. session_id="mcp" is
     // the sentinel (MCP has no session id) — same pattern as reflect_on_past. Non-fatal:
     // a logging failure must never fail the search.
-    for item in &items {
+    for item in &ranking.items {
         let _ = storage.log_retrieval_event(&item.chunk_id, "chunk", "mcp_search", "mcp");
     }
 
-    Ok(format_why(query, &items))
+    Ok(format_why(
+        query,
+        &ranking.items,
+        &ranking.hoisted_chunk_ids,
+    ))
 }
 
 /// Format evidence items as: header, grouped-by-conversation body (in the
 /// ranked order `items` already carries), footer summary.
-fn format_why(query: &str, items: &[crate::search::reinstatement::EvidenceItem]) -> String {
+fn format_why(
+    query: &str,
+    items: &[crate::search::reinstatement::EvidenceItem],
+    hoisted_chunk_ids: &HashSet<String>,
+) -> String {
     use crate::search::reinstatement::Via;
 
     let mut out = String::new();
@@ -1166,10 +1464,16 @@ fn format_why(query: &str, items: &[crate::search::reinstatement::EvidenceItem])
         let group = groups.remove(conv).unwrap_or_default();
         out.push_str(&format!("conv_{conv}:\n"));
         for it in &group {
+            let score_marker = if hoisted_chunk_ids.contains(&it.chunk_id) {
+                WHY_RECENCY_HOIST_MARKER
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "  via={} score={:.3} [{}] conv_{}: {}\n",
+                "  via={} score={:.3}{} [{}] conv_{}: {}\n",
                 it.via,
                 it.score,
+                score_marker,
                 format::age_stamp(&it.timestamp),
                 it.conversation_id,
                 it.excerpt
@@ -1198,14 +1502,28 @@ fn resolve_node_id(
     symbol: Option<&str>,
     file: Option<&str>,
     project: &str,
+    family_projects: &[String],
 ) -> Result<Option<String>> {
     if let Some(s) = symbol.filter(|s| !s.is_empty()) {
-        let nodes = storage.code_nodes_by_name(s, project, 1)?;
+        let mut nodes = storage.code_nodes_by_name(s, "", i64::MAX as usize)?;
+        if !family_projects.is_empty() {
+            nodes.retain(|node| family_projects.contains(&node.project));
+            // `code_nodes_by_name` is already rank-descending. Stable sorting
+            // only promotes an exact-project definition over equally valid
+            // aliases without disturbing rank order inside either group.
+            nodes.sort_by_key(|node| node.project != project);
+        }
         return Ok(nodes.into_iter().next().map(|n| n.id));
     }
     if let Some(f) = file.filter(|f| !f.is_empty()) {
-        let ledger = storage.code_file_ledger(project, f)?;
-        return Ok(ledger.symbols.into_iter().next().map(|n| n.id));
+        let mut nodes = storage.all_code_nodes()?;
+        nodes.retain(|node| {
+            node.kind != "module"
+                && (node.file == f || node.file.ends_with(f))
+                && (family_projects.is_empty() || family_projects.contains(&node.project))
+        });
+        nodes.sort_by_key(|node| node.project != project);
+        return Ok(nodes.into_iter().next().map(|n| n.id));
     }
     Ok(None)
 }
@@ -1889,7 +2207,7 @@ fn score_chunk_candidate(
     validity: &HashMap<String, ConvValidity>,
     ancestry: Option<&crate::storage::ancestry::AncestryLabel>,
     active_forgetting: bool,
-    effective_project: Option<&str>,
+    scope: &SearchProjectScope,
 ) -> (f32, bool) {
     let mut ancestry_applied = false;
     let ancestry = (!crate::search::rerank::is_scaffold_text(&chunk.content))
@@ -1916,11 +2234,7 @@ fn score_chunk_candidate(
         } else {
             score
         };
-    let final_score = if effective_project.is_some_and(|p| chunk.project_name != p) {
-        decayed_score * 0.3
-    } else {
-        decayed_score
-    };
+    let final_score = decayed_score * project_scope_multiplier(&chunk.project_name, scope);
     (final_score, ancestry_applied)
 }
 
@@ -2135,6 +2449,273 @@ mod tests {
     // Pure parsing seam — tests drive it by parameter instead of mutating
     // the process env, so the non-test build has no use for it.
     use crate::storage::recap_feeds::dream_consumption_enabled_from;
+
+    fn unscoped_search_scope() -> SearchProjectScope {
+        SearchProjectScope {
+            effective_project: None,
+            scope_label: "all".into(),
+            current_project_for_all_scope: None,
+            family_anchor: None,
+            family_projects: HashSet::new(),
+            projects_root_override: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn all_scope_cross_project_alias_boost_changes_ranking_after_rerank() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = temp.path().join("projects");
+        let current = "scope-family-root";
+        let alias = "scope-family-root-csr-engine";
+        let cwd = projects.join(current).join("csr-engine");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let resolved_current = cross_project::resolve_project_from_cwd(cwd.to_str().unwrap());
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let rows = [
+            ("alias-result", alias, vec![0.90, 0.435_889_9, 0.0, 0.0]),
+            (
+                "other-result",
+                "unrelated-project",
+                vec![0.95, 0.312_249_9, 0.0, 0.0],
+            ),
+        ];
+        for (sequence, (id, project, vector)) in rows.into_iter().enumerate() {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: format!("conv-{id}"),
+                project_name: project.into(),
+                timestamp: "2099-01-01T00:00:00Z".into(),
+                content: format!("organic scope ranking claim {id}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: sequence,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            engine.insert_chunk(chunk.id, vector);
+        }
+        let search = Arc::new(RwLock::new(engine));
+        let without_current =
+            SearchProjectScope::resolve_with(&storage, Some("all"), None, Some(&projects)).unwrap();
+        let with_current = SearchProjectScope::resolve_with(
+            &storage,
+            Some("all"),
+            resolved_current.as_deref(),
+            Some(&projects),
+        )
+        .unwrap();
+
+        assert_eq!(with_current.effective_project, None);
+        assert_eq!(
+            with_current.current_project_for_all_scope.as_deref(),
+            Some(current)
+        );
+        assert!(with_current.family_projects.contains(alias));
+        assert_eq!(
+            project_scope_multiplier(alias, &with_current),
+            CURRENT_PROJECT_ALL_SCOPE_BOOST
+        );
+
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let unboosted = reflect_on_past_with_vec_in_scope(
+            &storage,
+            &search,
+            &query,
+            "scope ranking",
+            2,
+            0.1,
+            &without_current,
+            0,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let boosted = reflect_on_past_with_vec_in_scope(
+            &storage,
+            &search,
+            &query,
+            "scope ranking",
+            2,
+            0.1,
+            &with_current,
+            0,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            unboosted.find("other-result").unwrap() < unboosted.find("alias-result").unwrap(),
+            "unboosted all-scope order:\n{unboosted}"
+        );
+        assert!(
+            boosted.find("alias-result").unwrap() < boosted.find("other-result").unwrap(),
+            "boosted all-scope order:\n{boosted}"
+        );
+    }
+
+    #[test]
+    fn resolve_node_id_preserves_suffix_matching_and_excludes_module_nodes() {
+        use crate::storage::codegraph::NodeRow;
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let project = "claude-self-reflect";
+        storage
+            .upsert_code_node(&NodeRow {
+                id: "module-node".into(),
+                project: project.into(),
+                file: "/repo/src/search/rerank.rs".into(),
+                kind: "module".into(),
+                name: "rerank".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+        storage
+            .upsert_code_node(&NodeRow {
+                id: "function-node".into(),
+                project: project.into(),
+                file: "/repo/src/search/rerank.rs".into(),
+                kind: "function".into(),
+                name: "is_scaffold_text".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+
+        let family = vec![project.to_string()];
+        let resolved = resolve_node_id(
+            &storage,
+            None,
+            Some("src/search/rerank.rs"),
+            project,
+            &family,
+        )
+        .unwrap();
+        assert_eq!(resolved.as_deref(), Some("function-node"));
+    }
+
+    #[test]
+    fn resolve_node_id_prefers_exact_project_over_higher_ranked_family_alias() {
+        use crate::storage::codegraph::NodeRow;
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let current = "fixture-root";
+        let alias = "fixture-root-csr-engine";
+        for (id, project) in [("exact-def", current), ("alias-def", alias)] {
+            storage
+                .upsert_code_node(&NodeRow {
+                    id: id.into(),
+                    project: project.into(),
+                    file: "src/provenance.rs".into(),
+                    kind: "function".into(),
+                    name: "is_csr_emission".into(),
+                    ..NodeRow::default()
+                })
+                .unwrap();
+        }
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO code_node_rank (node_id, rank, in_degree, out_degree)
+                     VALUES ('exact-def', 1.0, 0, 0), ('alias-def', 10.0, 0, 0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let family = vec![current.to_string(), alias.to_string()];
+        let resolved =
+            resolve_node_id(&storage, Some("is_csr_emission"), None, current, &family).unwrap();
+        assert_eq!(resolved.as_deref(), Some("exact-def"));
+    }
+
+    #[test]
+    fn codegraph_callers_cross_explicit_project_family_namespaces() {
+        use crate::storage::codegraph::{EdgeRow, NodeRow};
+
+        let current = "fixture-root";
+        let alias = "fixture-root-csr-engine";
+        let family = vec![current.to_string(), alias.to_string()];
+        let storage = Arc::new(Storage::open_memory().unwrap());
+
+        for (id, project, file) in [
+            ("target-current", current, "src/provenance.rs"),
+            ("target-alias", alias, "src/provenance.rs"),
+        ] {
+            storage
+                .upsert_code_node(&NodeRow {
+                    id: id.into(),
+                    project: project.into(),
+                    file: file.into(),
+                    kind: "function".into(),
+                    name: "is_csr_emission".into(),
+                    ..NodeRow::default()
+                })
+                .unwrap();
+        }
+        for (id, name, project, file, target) in [
+            (
+                "caller-current",
+                "base_caller",
+                current,
+                "src/hooks/stop.rs",
+                "target-current",
+            ),
+            (
+                "caller-alias",
+                "is_scaffold_text",
+                alias,
+                "src/search/rerank.rs",
+                "target-alias",
+            ),
+        ] {
+            storage
+                .upsert_code_node(&NodeRow {
+                    id: id.into(),
+                    project: project.into(),
+                    file: file.into(),
+                    kind: "function".into(),
+                    name: name.into(),
+                    ..NodeRow::default()
+                })
+                .unwrap();
+            storage
+                .replace_code_file_edges(
+                    project,
+                    file,
+                    &[EdgeRow {
+                        src_id: id.into(),
+                        dst_id: target.into(),
+                        kind: "calls".into(),
+                        src_file: file.into(),
+                        resolved: 1,
+                        weight: 1.0,
+                        ..EdgeRow::default()
+                    }],
+                )
+                .unwrap();
+        }
+
+        let rendered = code_graph_for_projects(
+            &storage,
+            Some("is_csr_emission"),
+            None,
+            "callers",
+            20,
+            current,
+            &family,
+        )
+        .unwrap();
+        assert!(rendered.contains("base_caller"), "{rendered}");
+        assert!(rendered.contains("is_scaffold_text"), "{rendered}");
+    }
 
     fn enriched_result(id: &str, score: f32, seq: usize) -> EnrichedResult {
         EnrichedResult {
@@ -2538,7 +3119,7 @@ mod tests {
             &HashMap::new(),
             None,
             false,
-            None,
+            &unscoped_search_scope(),
         );
         let current_release = label(0);
         let current = score_chunk_candidate(
@@ -2550,7 +3131,7 @@ mod tests {
             &HashMap::new(),
             Some(&current_release),
             false,
-            None,
+            &unscoped_search_scope(),
         );
         let shipped_release = label(5);
         let shipped = score_chunk_candidate(
@@ -2562,7 +3143,7 @@ mod tests {
             &HashMap::new(),
             Some(&shipped_release),
             false,
-            None,
+            &unscoped_search_scope(),
         );
 
         assert_eq!(missing.0.to_bits(), pre_change.to_bits());
@@ -2581,7 +3162,7 @@ mod tests {
             &HashMap::new(),
             None,
             false,
-            None,
+            &unscoped_search_scope(),
         );
         let organic_current = score_chunk_candidate(
             0.9,
@@ -2592,7 +3173,7 @@ mod tests {
             &HashMap::new(),
             Some(&current_release),
             false,
-            None,
+            &unscoped_search_scope(),
         );
         assert_eq!(organic_missing.0.to_bits(), organic_pre_change.to_bits());
         assert_eq!(organic_current.0.to_bits(), organic_pre_change.to_bits());
@@ -2661,7 +3242,7 @@ mod tests {
             &signals.validity,
             signals.ancestry.get("conv-demoted"),
             false,
-            None,
+            &unscoped_search_scope(),
         );
         assert!(ancestry_applied);
 
@@ -2694,7 +3275,7 @@ mod tests {
             &signals.validity,
             signals.ancestry.get("conv-demoted"),
             false,
-            None,
+            &unscoped_search_scope(),
         );
         let timestamp = chunk
             .timestamp
@@ -4378,6 +4959,7 @@ mod tests {
             .into_iter()
             .map(|p| {
                 apply_why_recency_tiebreak(p, &anchors)
+                    .items
                     .iter()
                     .map(|i| i.chunk_id.clone())
                     .collect::<Vec<_>>()
@@ -4408,13 +4990,13 @@ mod tests {
                 ("proj".to_string(), "CLAUDE.md".to_string()),
             );
         }
-        let ranked = apply_why_recency_tiebreak(vec![older_wrong, newer_fixed], &anchors);
+        let ranking = apply_why_recency_tiebreak(vec![older_wrong, newer_fixed], &anchors);
         assert_eq!(
-            ranked[0].chunk_id, "fixed",
+            ranking.items[0].chunk_id, "fixed",
             "precondition: ranking puts the correction first"
         );
 
-        let rendered = format_why("why", &ranked);
+        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
         let newer_at = rendered.find("0.810").expect("newer item must render");
         let older_at = rendered.find("0.840").expect("older item must render");
         assert!(
@@ -4425,8 +5007,8 @@ mod tests {
 
     #[test]
     fn why_recency_tiebreak_prefers_newer_within_epsilon_same_anchor() {
-        let older_wrong = why_item("wrong", "conv-old", 0.840, "2026-01-01T00:00:00Z");
-        let newer_fixed = why_item("fixed", "conv-new", 0.810, "2026-01-02T00:00:00Z"); // within 0.05
+        let older_wrong = why_item("wrong", "conv-x", 0.715, "2026-01-01T00:00:00Z");
+        let newer_fixed = why_item("fixed", "conv-x", 0.696, "2026-01-02T00:00:00Z"); // 0.019 gap
         let mut anchors = HashMap::new();
         anchors.insert(
             "wrong".to_string(),
@@ -4437,11 +5019,25 @@ mod tests {
             ("proj".to_string(), "CLAUDE.md".to_string()),
         );
 
-        let ranked = apply_why_recency_tiebreak(vec![older_wrong, newer_fixed], &anchors);
+        let ranking = apply_why_recency_tiebreak(vec![older_wrong, newer_fixed], &anchors);
 
         assert_eq!(
-            ranked[0].chunk_id, "fixed",
+            ranking.items[0].chunk_id, "fixed",
             "newer correction must rank first within epsilon on the same anchor"
+        );
+        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+        assert!(
+            rendered.contains("score=0.696 [recent↑]"),
+            "the lower-scored item hoisted by recency must carry a marker:\n{rendered}"
+        );
+        assert!(
+            rendered.find("score=0.696 [recent↑]").unwrap()
+                < rendered.find("score=0.715 [").unwrap(),
+            "the newer item must render before its higher-scored sibling:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("score=0.715 ["),
+            "the higher-scored sibling must not carry a marker:\n{rendered}"
         );
     }
 
@@ -4459,11 +5055,16 @@ mod tests {
             ("proj".to_string(), "CLAUDE.md".to_string()),
         );
 
-        let ranked = apply_why_recency_tiebreak(vec![higher_older, lower_newer], &anchors);
+        let ranking = apply_why_recency_tiebreak(vec![higher_older, lower_newer], &anchors);
 
         assert_eq!(
-            ranked[0].chunk_id, "higher",
+            ranking.items[0].chunk_id, "higher",
             "outside epsilon must not be reordered by recency"
+        );
+        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+        assert!(
+            !rendered.contains('↑'),
+            "strict score ordering outside epsilon must not carry a marker:\n{rendered}"
         );
     }
 
@@ -4481,11 +5082,107 @@ mod tests {
             ("proj".to_string(), "file_b.rs".to_string()),
         );
 
-        let ranked = apply_why_recency_tiebreak(vec![older_a, newer_b], &anchors);
+        let ranking = apply_why_recency_tiebreak(vec![older_a, newer_b], &anchors);
 
         assert_eq!(
-            ranked[0].chunk_id, "a-old",
+            ranking.items[0].chunk_id, "a-old",
             "different anchors must never be reordered by recency, even within epsilon"
         );
+        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+        assert!(
+            !rendered.contains('↑'),
+            "items on different anchors must not carry a marker:\n{rendered}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod why_marker_tests {
+    use super::*;
+
+    fn evidence(
+        chunk_id: &str,
+        score: f32,
+        timestamp: &str,
+    ) -> crate::search::reinstatement::EvidenceItem {
+        crate::search::reinstatement::EvidenceItem {
+            chunk_id: chunk_id.to_string(),
+            conversation_id: "conv-x".to_string(),
+            score,
+            via: crate::search::reinstatement::Via::Seed,
+            timestamp: timestamp.to_string(),
+            excerpt: chunk_id.to_string(),
+            ratification: None,
+        }
+    }
+
+    #[test]
+    fn same_anchor_within_epsilon() {
+        let higher = evidence("higher", 0.715, "2026-01-01T00:00:00Z");
+        let newer = evidence("newer", 0.696, "2026-01-02T00:00:00Z");
+        let anchors = HashMap::from([
+            (
+                "higher".to_string(),
+                ("project".to_string(), "file.rs".to_string()),
+            ),
+            (
+                "newer".to_string(),
+                ("project".to_string(), "file.rs".to_string()),
+            ),
+        ]);
+
+        let ranking = apply_why_recency_tiebreak(vec![higher, newer], &anchors);
+        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+
+        assert_eq!(ranking.items[0].chunk_id, "newer");
+        assert!(ranking.hoisted_chunk_ids.contains("newer"));
+        assert!(rendered.contains("score=0.696 [recent↑]"));
+        assert!(!ranking.hoisted_chunk_ids.contains("higher"));
+    }
+
+    #[test]
+    fn items_outside_epsilon() {
+        let higher = evidence("higher", 0.90, "2026-01-01T00:00:00Z");
+        let newer = evidence("newer", 0.50, "2026-01-02T00:00:00Z");
+        let anchors = HashMap::from([
+            (
+                "higher".to_string(),
+                ("project".to_string(), "file.rs".to_string()),
+            ),
+            (
+                "newer".to_string(),
+                ("project".to_string(), "file.rs".to_string()),
+            ),
+        ]);
+
+        let ranking = apply_why_recency_tiebreak(vec![newer, higher], &anchors);
+        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+
+        assert_eq!(ranking.items[0].chunk_id, "higher");
+        assert!(ranking.hoisted_chunk_ids.is_empty());
+        assert!(!rendered.contains(WHY_RECENCY_HOIST_MARKER));
+    }
+
+    #[test]
+    fn different_anchors() {
+        let higher = evidence("higher", 0.715, "2026-01-01T00:00:00Z");
+        let newer = evidence("newer", 0.696, "2026-01-02T00:00:00Z");
+        let anchors = HashMap::from([
+            (
+                "higher".to_string(),
+                ("project".to_string(), "file-a.rs".to_string()),
+            ),
+            (
+                "newer".to_string(),
+                ("project".to_string(), "file-b.rs".to_string()),
+            ),
+        ]);
+
+        let ranking = apply_why_recency_tiebreak(vec![newer, higher], &anchors);
+        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+
+        assert_eq!(ranking.items[0].chunk_id, "higher");
+        assert!(ranking.hoisted_chunk_ids.is_empty());
+        assert!(!rendered.contains(WHY_RECENCY_HOIST_MARKER));
     }
 }

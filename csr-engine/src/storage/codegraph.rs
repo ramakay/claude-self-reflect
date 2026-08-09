@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 
 /// A graph node row (a symbol seen in code). Used for both writes and reads.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -460,15 +461,60 @@ pub fn nodes_by_name(
         .map_err(Into::into)
 }
 
+/// Distinct stored code-graph project namespaces, ordered for determinism.
+pub fn project_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT project FROM code_nodes ORDER BY project")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// Resolve a `symbol or id` to candidate node ids: exact id match first, else by name.
-fn resolve_target_ids(conn: &Connection, name_or_id: &str, project: &str) -> Result<Vec<String>> {
+fn family_projects(conn: &Connection, project: &str) -> Result<Vec<String>> {
+    let mut projects = project_names(conn)?;
+    if !project.is_empty() {
+        projects.retain(|candidate| {
+            crate::search::cross_project::same_project_family(project, candidate)
+        });
+        if !projects.iter().any(|candidate| candidate == project) {
+            projects.push(project.to_string());
+        }
+    }
+    Ok(projects)
+}
+
+fn project_is_in(projects: &[String], candidate: &str) -> bool {
+    projects.is_empty() || projects.iter().any(|project| project == candidate)
+}
+
+fn nodes_by_name_in_projects(
+    conn: &Connection,
+    name: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<NodeRow>> {
+    let nodes = nodes_by_name(conn, name, "", i64::MAX as usize)?;
+    Ok(nodes
+        .into_iter()
+        .filter(|node| project_is_in(projects, &node.project))
+        .take(limit)
+        .collect())
+}
+
+fn resolve_target_ids_in_projects(
+    conn: &Connection,
+    name_or_id: &str,
+    projects: &[String],
+) -> Result<Vec<String>> {
     if get_node(conn, name_or_id)?.is_some() {
         return Ok(vec![name_or_id.to_string()]);
     }
-    Ok(nodes_by_name(conn, name_or_id, project, 50)?
-        .into_iter()
-        .map(|n| n.id)
-        .collect())
+    Ok(
+        nodes_by_name_in_projects(conn, name_or_id, projects, i64::MAX as usize)?
+            .into_iter()
+            .map(|n| n.id)
+            .collect(),
+    )
 }
 
 /// Who calls `name_or_id` — inbound `calls` edges (resolved id match OR the
@@ -484,7 +530,21 @@ pub fn query_callers(
     project: &str,
     limit: usize,
 ) -> Result<Vec<NodeRow>> {
-    let mut targets = resolve_target_ids(conn, name_or_id, project)?;
+    let projects = family_projects(conn, project)?;
+    query_callers_in_projects(conn, name_or_id, &projects, limit)
+}
+
+/// Family-scoped variant used by code-graph queries and regression fixtures.
+pub fn query_callers_in_projects(
+    conn: &Connection,
+    name_or_id: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<NodeRow>> {
+    if get_node(conn, name_or_id)?.is_some_and(|node| !project_is_in(projects, &node.project)) {
+        return Ok(Vec::new());
+    }
+    let mut targets = resolve_target_ids_in_projects(conn, name_or_id, projects)?;
     // Also match the unresolved placeholder form keyed on the bare name.
     let bare = name_or_id.rsplit("::").next().unwrap_or(name_or_id);
     let placeholder = format!("name:{bare}");
@@ -495,8 +555,7 @@ pub fn query_callers(
         targets.push(placeholder);
     }
 
-    let placeholders: Vec<String> = (0..targets.len()).map(|i| format!("?{}", i + 2)).collect();
-    let project_idx = targets.len() + 2;
+    let placeholders: Vec<String> = (0..targets.len()).map(|i| format!("?{}", i + 1)).collect();
     let cols = NODE_COLS
         .split(", ")
         .map(|c| format!("s.{c}"))
@@ -507,32 +566,54 @@ pub fn query_callers(
         "SELECT {cols}, MAX(e.resolved) AS any_resolved FROM code_edges e
          JOIN code_nodes s ON s.id = e.src_id
          WHERE e.kind = 'calls' AND e.dst_id IN ({})
-           AND (?{project_idx} = '' OR s.project = ?{project_idx})
          GROUP BY s.id
-         ORDER BY s.id LIMIT ?1",
+         ORDER BY s.id",
         placeholders.join(", ")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut p: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(targets.len() + 2);
-    let lim = limit as i64;
-    p.push(&lim);
-    for t in &targets {
-        p.push(t);
-    }
-    p.push(&project);
+    let p: Vec<&dyn rusqlite::types::ToSql> = targets
+        .iter()
+        .map(|target| target as &dyn rusqlite::types::ToSql)
+        .collect();
     let rows = stmt.query_map(p.as_slice(), |row| {
         let mut node = row_to_node(row)?;
         let any_resolved: i64 = row.get(node_col_count)?;
         node.name_only = any_resolved == 0;
         Ok(node)
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|node| project_is_in(projects, &node.project))
+        .take(limit)
+        .collect())
 }
 
 /// What `node_id` calls — outbound `calls` edges. Resolved edges return the real
 /// dst node; unresolved `name:<x>` placeholders return a synthetic node.
 pub fn query_callees(conn: &Connection, node_id: &str, limit: usize) -> Result<Vec<NodeRow>> {
+    let projects = match get_node(conn, node_id)? {
+        Some(node) => family_projects(conn, &node.project)?,
+        None => Vec::new(),
+    };
+    query_callees_in_projects(conn, node_id, &projects, limit)
+}
+
+/// Return callees of the selected definition, filtering resolved destinations
+/// to the supplied project family.
+pub fn query_callees_in_projects(
+    conn: &Connection,
+    node_id: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<NodeRow>> {
+    if get_node(conn, node_id)?.is_some_and(|node| !project_is_in(projects, &node.project)) {
+        return Ok(Vec::new());
+    }
+    let source_ids = [node_id.to_string()];
+    let placeholders: Vec<String> = (0..source_ids.len())
+        .map(|index| format!("?{}", index + 1))
+        .collect();
     let cols = NODE_COLS
         .split(", ")
         .map(|c| format!("d.{c}"))
@@ -541,11 +622,16 @@ pub fn query_callees(conn: &Connection, node_id: &str, limit: usize) -> Result<V
     let sql = format!(
         "SELECT e.dst_id, e.resolved, {cols} FROM code_edges e
          LEFT JOIN code_nodes d ON d.id = e.dst_id
-         WHERE e.kind = 'calls' AND e.src_id = ?1
-         ORDER BY e.dst_id LIMIT ?2"
+         WHERE e.kind = 'calls' AND e.src_id IN ({})
+         ORDER BY e.dst_id",
+        placeholders.join(", ")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![node_id, limit as i64], |row| {
+    let params: Vec<&dyn rusqlite::types::ToSql> = source_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
         let dst_id: String = row.get(0)?;
         let resolved: i64 = row.get(1)?;
         // Columns 2.. are the joined node (may be all NULL if unresolved).
@@ -585,8 +671,16 @@ pub fn query_callees(conn: &Connection, node_id: &str, limit: usize) -> Result<V
             })
         }
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut seen = HashSet::new();
+    Ok(rows
+        .into_iter()
+        .filter(|node| {
+            (node.kind == "unresolved" || project_is_in(projects, &node.project))
+                && seen.insert(node.id.clone())
+        })
+        .take(limit)
+        .collect())
 }
 
 /// 1-hop neighbours (both directions) of `node_id`, optional edge-kind filter.
@@ -596,8 +690,46 @@ pub fn query_neighbors(
     kind_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<NeighborEdge>> {
+    let projects = match get_node(conn, node_id)? {
+        Some(node) => family_projects(conn, &node.project)?,
+        None => Vec::new(),
+    };
+    query_neighbors_in_projects(conn, node_id, &projects, kind_filter, limit)
+}
+
+/// Return one-hop edges for a selected definition within a project family.
+/// Outbound edges stay anchored to that exact definition. Inbound edges also
+/// include same-named definitions from alias namespaces, but never other
+/// same-named definitions from the selected definition's own project.
+pub fn query_neighbors_in_projects(
+    conn: &Connection,
+    node_id: &str,
+    projects: &[String],
+    kind_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<NeighborEdge>> {
+    if get_node(conn, node_id)?.is_some_and(|node| !project_is_in(projects, &node.project)) {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     let kf = kind_filter.unwrap_or("");
+    let selected = get_node(conn, node_id)?;
+    let inbound_target_ids = match selected.as_ref() {
+        Some(node) => {
+            let mut ids = vec![node.id.clone()];
+            ids.extend(
+                nodes_by_name_in_projects(conn, &node.name, projects, i64::MAX as usize)?
+                    .into_iter()
+                    .filter(|candidate| candidate.project != node.project)
+                    .map(|candidate| candidate.id),
+            );
+            ids
+        }
+        None => vec![node_id.to_string()],
+    };
+    let inbound_placeholders: Vec<String> = (0..inbound_target_ids.len())
+        .map(|index| format!("?{}", index + 2))
+        .collect();
 
     // Outbound: node_id -> other (only resolved edges have a real other node).
     let out_cols = NODE_COLS
@@ -608,12 +740,12 @@ pub fn query_neighbors(
     let out_sql = format!(
         "SELECT e.kind, e.resolved, {out_cols} FROM code_edges e
          JOIN code_nodes d ON d.id = e.dst_id
-         WHERE e.src_id = ?1 AND (?2 = '' OR e.kind = ?2)
-         ORDER BY e.kind, d.id LIMIT ?3"
+         WHERE (?1 = '' OR e.kind = ?1) AND e.src_id = ?2
+         ORDER BY e.kind, d.id",
     );
     {
         let mut stmt = conn.prepare(&out_sql)?;
-        let rows = stmt.query_map(params![node_id, kf, limit as i64], |row| {
+        let rows = stmt.query_map(params![kf, node_id], |row| {
             let edge_kind: String = row.get(0)?;
             let resolved: i64 = row.get(1)?;
             let node = shift2_node(row)?;
@@ -625,7 +757,13 @@ pub fn query_neighbors(
             })
         })?;
         for r in rows {
-            out.push(r?);
+            let edge = r?;
+            if project_is_in(projects, &edge.node.project) {
+                out.push(edge);
+            }
+            if out.len() == limit {
+                break;
+            }
         }
     }
 
@@ -638,12 +776,21 @@ pub fn query_neighbors(
     let in_sql = format!(
         "SELECT e.kind, e.resolved, {in_cols} FROM code_edges e
          JOIN code_nodes s ON s.id = e.src_id
-         WHERE e.dst_id = ?1 AND (?2 = '' OR e.kind = ?2)
-         ORDER BY e.kind, s.id LIMIT ?3"
+         WHERE (?1 = '' OR e.kind = ?1) AND e.dst_id IN ({})
+         ORDER BY e.kind, s.id",
+        inbound_placeholders.join(", ")
     );
     {
         let mut stmt = conn.prepare(&in_sql)?;
-        let rows = stmt.query_map(params![node_id, kf, limit as i64], |row| {
+        let mut params: Vec<&dyn rusqlite::types::ToSql> =
+            Vec::with_capacity(inbound_target_ids.len() + 1);
+        params.push(&kf);
+        params.extend(
+            inbound_target_ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::types::ToSql),
+        );
+        let rows = stmt.query_map(params.as_slice(), |row| {
             let edge_kind: String = row.get(0)?;
             let resolved: i64 = row.get(1)?;
             let node = shift2_node(row)?;
@@ -654,11 +801,27 @@ pub fn query_neighbors(
                 node,
             })
         })?;
+        let mut inbound = 0;
         for r in rows {
-            out.push(r?);
+            let edge = r?;
+            if project_is_in(projects, &edge.node.project) {
+                out.push(edge);
+                inbound += 1;
+            }
+            if inbound == limit {
+                break;
+            }
         }
     }
 
+    let mut seen = HashSet::new();
+    out.retain(|edge| {
+        seen.insert((
+            edge.direction.clone(),
+            edge.edge_kind.clone(),
+            edge.node.id.clone(),
+        ))
+    });
     Ok(out)
 }
 
@@ -1212,6 +1375,268 @@ mod tests {
             callers.iter().all(|n| n.id != "caller_other"),
             "caller from another project must not leak: {:?}",
             callers.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn query_callers_includes_callers_of_every_family_definition() {
+        let conn = mem();
+        let base = "claude-self-reflect";
+        let alias = "claude-self-reflect-csr-engine";
+
+        let mut base_def = node(
+            "target_base",
+            "src/hooks/session_start.rs",
+            "function",
+            "is_csr_emission",
+            "conv_T1",
+        );
+        base_def.project = base.into();
+        upsert_node(&conn, &base_def).unwrap();
+
+        let mut alias_def = node(
+            "target_alias",
+            "src/hooks/mod.rs",
+            "function",
+            "is_csr_emission",
+            "conv_T2",
+        );
+        alias_def.project = alias.into();
+        upsert_node(&conn, &alias_def).unwrap();
+
+        let mut base_caller = node(
+            "caller_base",
+            "src/hooks/stop.rs",
+            "function",
+            "base_caller",
+            "conv_C1",
+        );
+        base_caller.project = base.into();
+        upsert_node(&conn, &base_caller).unwrap();
+        replace_file_edges(
+            &conn,
+            base,
+            &base_caller.file,
+            &[EdgeRow {
+                src_id: base_caller.id.clone(),
+                dst_id: base_def.id.clone(),
+                kind: "calls".into(),
+                src_file: base_caller.file.clone(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+
+        let mut alias_caller = node(
+            "caller_alias",
+            "src/search/rerank.rs",
+            "function",
+            "is_scaffold_text",
+            "conv_C2",
+        );
+        alias_caller.project = alias.into();
+        upsert_node(&conn, &alias_caller).unwrap();
+        replace_file_edges(
+            &conn,
+            alias,
+            &alias_caller.file,
+            &[EdgeRow {
+                src_id: alias_caller.id.clone(),
+                dst_id: alias_def.id.clone(),
+                kind: "calls".into(),
+                src_file: alias_caller.file.clone(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+
+        let family = vec![base.to_string(), alias.to_string()];
+        let callers = query_callers_in_projects(&conn, "is_csr_emission", &family, 20).unwrap();
+        let ids: Vec<&str> = callers.iter().map(|node| node.id.as_str()).collect();
+        assert_eq!(ids, vec!["caller_alias", "caller_base"]);
+
+        let neighbors =
+            query_neighbors_in_projects(&conn, "target_base", &family, Some("calls"), 20).unwrap();
+        let inbound_ids: Vec<&str> = neighbors
+            .iter()
+            .filter(|edge| edge.direction == "in")
+            .map(|edge| edge.node.id.as_str())
+            .collect();
+        assert_eq!(inbound_ids, vec!["caller_alias", "caller_base"]);
+    }
+
+    #[test]
+    fn selected_definition_does_not_merge_unrelated_same_name_callees_or_neighbors() {
+        let conn = mem();
+        let family = vec!["proj".to_string(), "proj-subdir".to_string()];
+
+        for mut definition in [
+            node(
+                "selected",
+                "src/selected.rs",
+                "function",
+                "duplicate",
+                "conv_S",
+            ),
+            node(
+                "unrelated",
+                "src/unrelated.rs",
+                "function",
+                "duplicate",
+                "conv_U",
+            ),
+        ] {
+            definition.project = "proj".into();
+            upsert_node(&conn, &definition).unwrap();
+        }
+        for callee in [
+            node("wanted", "src/wanted.rs", "function", "wanted", "conv_W"),
+            node("wrong", "src/wrong.rs", "function", "wrong", "conv_X"),
+        ] {
+            upsert_node(&conn, &callee).unwrap();
+        }
+        replace_file_edges(
+            &conn,
+            "proj",
+            "src/selected.rs",
+            &[EdgeRow {
+                src_id: "selected".into(),
+                dst_id: "wanted".into(),
+                kind: "calls".into(),
+                src_file: "src/selected.rs".into(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+        replace_file_edges(
+            &conn,
+            "proj",
+            "src/unrelated.rs",
+            &[EdgeRow {
+                src_id: "unrelated".into(),
+                dst_id: "wrong".into(),
+                kind: "calls".into(),
+                src_file: "src/unrelated.rs".into(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+
+        let callees = query_callees_in_projects(&conn, "selected", &family, 20).unwrap();
+        assert_eq!(
+            callees
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wanted"]
+        );
+
+        let neighbors =
+            query_neighbors_in_projects(&conn, "selected", &family, Some("calls"), 20).unwrap();
+        let outbound = neighbors
+            .iter()
+            .filter(|edge| edge.direction == "out")
+            .map(|edge| edge.node.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(outbound, vec!["wanted"]);
+    }
+
+    #[test]
+    fn explicit_family_queries_reject_out_of_family_exact_anchor_ids() {
+        let conn = mem();
+        let family = vec!["family-root".to_string()];
+
+        for mut row in [
+            node(
+                "outside-target",
+                "src/outside_target.rs",
+                "function",
+                "outside_target",
+                "conv-O1",
+            ),
+            node(
+                "outside-source",
+                "src/outside_source.rs",
+                "function",
+                "outside_source",
+                "conv-O2",
+            ),
+        ] {
+            row.project = "other-project".into();
+            upsert_node(&conn, &row).unwrap();
+        }
+        for mut row in [
+            node(
+                "family-caller",
+                "src/family_caller.rs",
+                "function",
+                "family_caller",
+                "conv-F1",
+            ),
+            node(
+                "family-callee",
+                "src/family_callee.rs",
+                "function",
+                "family_callee",
+                "conv-F2",
+            ),
+        ] {
+            row.project = "family-root".into();
+            upsert_node(&conn, &row).unwrap();
+        }
+        replace_file_edges(
+            &conn,
+            "family-root",
+            "src/family_caller.rs",
+            &[EdgeRow {
+                src_id: "family-caller".into(),
+                dst_id: "outside-target".into(),
+                kind: "calls".into(),
+                src_file: "src/family_caller.rs".into(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+        replace_file_edges(
+            &conn,
+            "other-project",
+            "src/outside_source.rs",
+            &[EdgeRow {
+                src_id: "outside-source".into(),
+                dst_id: "family-callee".into(),
+                kind: "calls".into(),
+                src_file: "src/outside_source.rs".into(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+
+        assert!(
+            query_callers_in_projects(&conn, "outside-target", &family, 20)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            query_callees_in_projects(&conn, "outside-source", &family, 20)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            query_neighbors_in_projects(&conn, "outside-source", &family, None, 20)
+                .unwrap()
+                .is_empty()
         );
     }
 

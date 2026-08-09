@@ -1,4 +1,65 @@
 use crate::import;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+static PROJECT_DIR_EXISTS: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+
+fn cached_is_dir(path: PathBuf) -> bool {
+    let cache = PROJECT_DIR_EXISTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cache.entry(path.clone()).or_insert_with(|| path.is_dir())
+}
+
+fn is_alias_at_root(
+    base: &str,
+    derived: &str,
+    projects_root: &Path,
+    is_dir: impl Fn(PathBuf) -> bool,
+) -> bool {
+    derived
+        .strip_prefix(base)
+        .is_some_and(|suffix| suffix.starts_with('-') && suffix.len() > 1)
+        && is_dir(projects_root.join(base))
+        && !is_dir(projects_root.join(derived))
+}
+
+fn same_project_family_at_root_with(
+    current: &str,
+    candidate: &str,
+    projects_root: &Path,
+    is_dir: impl Fn(PathBuf) -> bool + Copy,
+) -> bool {
+    current == candidate
+        || is_alias_at_root(current, candidate, projects_root, is_dir)
+        || is_alias_at_root(candidate, current, projects_root, is_dir)
+}
+
+/// Filesystem-root seam for hermetic callers and tests.
+pub(crate) fn same_project_family_at_root(
+    current: &str,
+    candidate: &str,
+    projects_root: &Path,
+) -> bool {
+    same_project_family_at_root_with(current, candidate, projects_root, |path| path.is_dir())
+}
+
+/// Whether two stored project namespaces identify the same on-disk project.
+///
+/// A hyphenated namespace is an alias only when the shorter project directory
+/// exists under `~/projects` and the longer name does not. This keeps genuine
+/// sibling repositories such as `anukriti-meta-campaigns` separate.
+pub fn same_project_family(current: &str, candidate: &str) -> bool {
+    if current == candidate {
+        return true;
+    }
+    let Some(projects_root) = dirs::home_dir().map(|home| home.join("projects")) else {
+        return false;
+    };
+    same_project_family_at_root_with(current, candidate, &projects_root, cached_is_dir)
+}
 
 /// Resolve project name from a CWD path string.
 /// Pure function — testable without environment variable manipulation.
@@ -79,6 +140,78 @@ pub fn normalize_project_scope(project: Option<&str>) -> (Option<String>, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_family_aliases_require_only_the_base_directory_to_exist() {
+        let projects = tempfile::tempdir().unwrap();
+
+        assert!(same_project_family_at_root_with(
+            "claude-self-reflect",
+            "claude-self-reflect",
+            projects.path(),
+            |path| path.is_dir()
+        ));
+        assert!(!same_project_family_at_root_with(
+            "claude-self-reflect",
+            "claude-self-reflect-csr-engine",
+            projects.path(),
+            |path| path.is_dir()
+        ));
+
+        std::fs::create_dir(projects.path().join("claude-self-reflect-csr-engine")).unwrap();
+        assert!(!same_project_family_at_root_with(
+            "claude-self-reflect",
+            "claude-self-reflect-csr-engine",
+            projects.path(),
+            |path| path.is_dir()
+        ));
+        std::fs::remove_dir(projects.path().join("claude-self-reflect-csr-engine")).unwrap();
+
+        std::fs::create_dir(projects.path().join("claude-self-reflect")).unwrap();
+        std::fs::create_dir(projects.path().join("claude-self-reflect-csr-engine")).unwrap();
+        assert!(!same_project_family_at_root_with(
+            "claude-self-reflect",
+            "claude-self-reflect-csr-engine",
+            projects.path(),
+            |path| path.is_dir()
+        ));
+
+        std::fs::remove_dir(projects.path().join("claude-self-reflect-csr-engine")).unwrap();
+        assert!(same_project_family_at_root_with(
+            "claude-self-reflect",
+            "claude-self-reflect-csr-engine",
+            projects.path(),
+            |path| path.is_dir()
+        ));
+        assert!(same_project_family_at_root_with(
+            "claude-self-reflect-csr-engine",
+            "claude-self-reflect",
+            projects.path(),
+            |path| path.is_dir()
+        ));
+    }
+
+    #[test]
+    fn real_hyphenated_project_is_not_swallowed_by_prefix_project() {
+        let projects = tempfile::tempdir().unwrap();
+        std::fs::create_dir(projects.path().join("anukriti-meta-campaigns")).unwrap();
+
+        assert!(!same_project_family_at_root_with(
+            "anukriti",
+            "anukriti-meta-campaigns",
+            projects.path(),
+            |path| path.is_dir()
+        ));
+
+        std::fs::remove_dir(projects.path().join("anukriti-meta-campaigns")).unwrap();
+        std::fs::create_dir(projects.path().join("anukriti")).unwrap();
+        assert!(same_project_family_at_root_with(
+            "anukriti",
+            "anukriti-meta-campaigns",
+            projects.path(),
+            |path| path.is_dir()
+        ));
+    }
 
     #[test]
     fn test_normalize_scope_all() {
