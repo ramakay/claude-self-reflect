@@ -32,6 +32,9 @@ pub struct StatusReport {
     pub db_size_bytes: u64,
     pub db_path: String,
     pub healthy: bool,
+    /// True when a live MCP server is running an older build than the binary now
+    /// on disk — the connection must be re-established for the upgrade to apply.
+    pub mcp_binary_stale: bool,
     /// Aux corpus coverage (session_registry vs chunks) — never injected into search.
     pub aux: AuxStatus,
     /// v10 "dreaming" summary (`crate::dream`) — witness_verdicts totals and
@@ -203,6 +206,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     // If DB doesn't exist yet, return empty report
     if !db_path.exists() {
         return Ok(StatusReport {
+            mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
             conversations: 0,
             projects: 0,
             chunks: 0,
@@ -279,6 +283,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let dream = gather_dream(&storage);
 
     Ok(StatusReport {
+        mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
         conversations,
         projects,
         chunks,
@@ -703,6 +708,12 @@ fn format_compact(report: &StatusReport) -> String {
     if report.dream.demoted_symbols > 0 {
         out.push_str(&format!(" | ☾ {} forgotten", report.dream.demoted_symbols));
     }
+    // A newer binary is installed but the live MCP server predates it. Say so
+    // on the statusline the user already watches, rather than leaving them to
+    // discover it from stale behaviour.
+    if report.mcp_binary_stale {
+        out.push_str(" | ⟳ reconnect mcp");
+    }
     out
 }
 
@@ -750,6 +761,7 @@ mod tests {
 
     fn base_report() -> StatusReport {
         StatusReport {
+            mcp_binary_stale: false,
             conversations: 909,
             projects: 3,
             chunks: 5000,

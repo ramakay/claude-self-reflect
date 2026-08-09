@@ -540,6 +540,9 @@ impl Engine {
             self.projects_dir,
             self.index_dir,
         );
+        // Record which build is serving, so `status` can tell the user when a
+        // newer binary was installed underneath this connection.
+        crate::binary_stamp::record_serving_binary();
         let service = server.serve(rmcp::transport::io::stdio()).await?;
         service.waiting().await?;
 

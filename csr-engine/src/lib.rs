@@ -1,4 +1,5 @@
 pub mod api;
+pub mod binary_stamp;
 pub mod daemon;
 pub mod dream;
 pub mod embeddings;
