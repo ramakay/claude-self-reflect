@@ -1,5 +1,27 @@
 use crate::import;
 
+/// Encode a path the way Claude Code names its `~/.claude/projects` folders.
+///
+/// Claude Code does `path.replace(/[^a-zA-Z0-9]/g, "-")` (verified in the shipped
+/// binary, 2.1.226). That regex carries no `u` flag, so it runs over UTF-16 code
+/// units, not scalar values: an accented BMP character costs one dash, but a
+/// non-BMP one (emoji, rarer CJK) is a surrogate pair and costs *two*. Mapping per
+/// `char` would emit one dash there and miss the stored folder — the same silent
+/// empty-result failure this whole branch exists to fix, just narrower.
+fn encode_project_folder(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else {
+            for _ in 0..c.len_utf16() {
+                out.push('-');
+            }
+        }
+    }
+    out
+}
+
 /// Resolve project name from a CWD path string.
 /// Pure function — testable without environment variable manipulation.
 pub fn resolve_project_from_cwd(cwd: &str) -> Option<String> {
@@ -17,12 +39,7 @@ pub fn resolve_project_from_cwd(cwd: &str) -> Option<String> {
     let stripped = cwd.strip_prefix(r"\\?\").unwrap_or(cwd);
     let trimmed = stripped.trim_end_matches(['\\', '/']);
     if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
-        return Some(
-            trimmed
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                .collect(),
-        );
+        return Some(encode_project_folder(trimmed));
     }
 
     let path = std::path::Path::new(cwd);
@@ -189,6 +206,31 @@ mod tests {
         assert_eq!(
             resolve_project_from_cwd(r"D:\Proyectos\claude-self-reflect"),
             Some("D--Proyectos-claude-self-reflect".to_string())
+        );
+    }
+
+    /// Claude Code's encoder is `replace(/[^a-zA-Z0-9]/g, "-")` with no `u` flag,
+    /// so it counts UTF-16 code units: one dash for a BMP character, two for a
+    /// surrogate pair. Non-ASCII project directories are ordinary outside English
+    /// locales, so getting this wrong reproduces the original miss on exactly the
+    /// paths least likely to be reported.
+    #[test]
+    fn test_resolve_from_cwd_non_ascii_drive_paths() {
+        // Every non-ASCII character here is BMP: one code unit, one dash.
+        assert_eq!(
+            resolve_project_from_cwd(r"D:\Proyectos\Español"),
+            Some("D--Proyectos-Espa-ol".to_string())
+        );
+        // ':' + '\' + 7 Cyrillic + '\' + 3 Cyrillic = 13 code units after "C".
+        assert_eq!(
+            resolve_project_from_cwd(r"C:\Проекты\бот"),
+            Some(format!("C{}", "-".repeat(13)))
+        );
+
+        // A non-BMP character is a surrogate pair: two code units, two dashes.
+        assert_eq!(
+            resolve_project_from_cwd("D:\\🚀x"),
+            Some("D----x".to_string())
         );
     }
 }
