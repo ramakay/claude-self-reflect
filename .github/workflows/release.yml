@@ -44,7 +44,7 @@ jobs:
       - name: Test
         run: cargo test --manifest-path csr-engine/Cargo.toml --locked
       - name: Clippy
-        run: cargo clippy --manifest-path csr-engine/Cargo.toml --locked -- -D warnings
+        run: cargo clippy --manifest-path csr-engine/Cargo.toml --locked --all-targets -- -D warnings
 
   build:
     needs: test
