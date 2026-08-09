@@ -990,6 +990,80 @@ pub async fn code_graph(
     }
 }
 
+/// Epsilon band for csr_why's recency tie-break (D2). Deliberately matches the
+/// existing primacy-boost band in src/search/rerank.rs (PRIMACY_BAND = 0.05) — tight
+/// on purpose. A wide band would bury older-but-still-valid evidence just to fix a
+/// narrower failure (a stale fact outranking its own correction).
+const WHY_RECENCY_EPSILON: f32 = 0.05;
+
+/// Anchor for csr_why's recency tie-break: (project, most-touched file of the
+/// evidence item's source session). Resolved once per `why()` call via
+/// `code_evolution` (`storage.files_for_session`) + chunk metadata
+/// (`storage.get_chunks_by_ids`). Items with no resolvable file (reflections, pure-
+/// chat sessions) are absent from the map and are therefore never tie-broken —
+/// absence, not a wildcard, is the safe default. I/O only; contains no ranking
+/// logic (that's in `apply_why_recency_tiebreak`, kept separate and pure so it's
+/// unit-testable without a database).
+fn resolve_why_anchors(
+    storage: &Arc<Storage>,
+    items: &[crate::search::reinstatement::EvidenceItem],
+) -> HashMap<String, (String, String)> {
+    let chunk_ids: Vec<String> = items.iter().map(|i| i.chunk_id.clone()).collect();
+    let mut project_by_chunk: HashMap<String, String> = HashMap::new();
+    if let Ok(chunks) = storage.get_chunks_by_ids(&chunk_ids) {
+        for c in chunks {
+            project_by_chunk.insert(c.id, c.project_name);
+        }
+    }
+
+    let mut file_by_conv: HashMap<String, Option<String>> = HashMap::new();
+    let mut anchors: HashMap<String, (String, String)> = HashMap::new();
+    for item in items {
+        let file = file_by_conv
+            .entry(item.conversation_id.clone())
+            .or_insert_with(|| {
+                storage
+                    .files_for_session(&item.conversation_id, 1)
+                    .ok()
+                    .and_then(|v| v.into_iter().next())
+            })
+            .clone();
+        if let (Some(project), Some(file)) = (project_by_chunk.get(&item.chunk_id), file) {
+            anchors.insert(item.chunk_id.clone(), (project.clone(), file));
+        }
+    }
+    anchors
+}
+
+/// Pure secondary sort for csr_why (D2 fix): among evidence items that resolve to
+/// the SAME anchor (same project + same file, see `resolve_why_anchors`) and whose
+/// primary scores sit within `WHY_RECENCY_EPSILON` of each other, prefer the item
+/// with the LATER timestamp. Every other pair keeps its primary score order
+/// unchanged. No label, no annotation, no demotion, no dependence on dreaming or
+/// supersession verdicts — this is a local, symmetric near-tie preference only.
+/// Pure and deterministic: takes a precomputed anchor map so it is unit-testable
+/// without touching storage.
+fn apply_why_recency_tiebreak(
+    mut items: Vec<crate::search::reinstatement::EvidenceItem>,
+    anchors: &HashMap<String, (String, String)>,
+) -> Vec<crate::search::reinstatement::EvidenceItem> {
+    items.sort_by(|a, b| {
+        let same_anchor = match (anchors.get(&a.chunk_id), anchors.get(&b.chunk_id)) {
+            (Some(pa), Some(pb)) => pa == pb,
+            _ => false,
+        };
+        if same_anchor && (a.score - b.score).abs() <= WHY_RECENCY_EPSILON {
+            // Later timestamp first (RFC3339 strings sort lexicographically by time).
+            b.timestamp.cmp(&a.timestamp)
+        } else {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    });
+    items
+}
+
 /// Provenance recall: why does this code/decision exist. Reinstatement walk (seed ->
 /// blend + code-graph spread + episode chain), formatted as a cited evidence chain
 /// grouped by conversation. Project scope is normalized via
@@ -1013,6 +1087,10 @@ pub async fn why(
         cfg,
     )
     .await?;
+
+    // D2: local recency tie-break, csr_why only — see apply_why_recency_tiebreak.
+    let anchors = resolve_why_anchors(storage, &items);
+    let items = apply_why_recency_tiebreak(items, &anchors);
 
     // TAD: log each returned chunk as an MCP-search retrieval event. session_id="mcp" is
     // the sentinel (MCP has no session id) — same pattern as reflect_on_past. Non-fatal:
@@ -4219,5 +4297,90 @@ mod tests {
         assert_eq!(extract_conv_id("that docker issue we fixed"), None);
         assert_eq!(extract_conv_id("convention for naming conversations"), None);
         assert_eq!(extract_conv_id("conv_not-a-real-uuid"), None);
+    }
+
+    // --- csr_why recency tie-break (D2) ---
+
+    fn why_item(
+        chunk_id: &str,
+        conv_id: &str,
+        score: f32,
+        timestamp: &str,
+    ) -> crate::search::reinstatement::EvidenceItem {
+        crate::search::reinstatement::EvidenceItem {
+            chunk_id: chunk_id.into(),
+            conversation_id: conv_id.into(),
+            score,
+            via: crate::search::reinstatement::Via::Seed,
+            timestamp: timestamp.into(),
+            excerpt: "excerpt".into(),
+            ratification: None,
+        }
+    }
+
+    #[test]
+    fn why_recency_tiebreak_prefers_newer_within_epsilon_same_anchor() {
+        let older_wrong = why_item("wrong", "conv-old", 0.840, "2026-01-01T00:00:00Z");
+        let newer_fixed = why_item("fixed", "conv-new", 0.810, "2026-01-02T00:00:00Z"); // within 0.05
+        let mut anchors = HashMap::new();
+        anchors.insert(
+            "wrong".to_string(),
+            ("proj".to_string(), "CLAUDE.md".to_string()),
+        );
+        anchors.insert(
+            "fixed".to_string(),
+            ("proj".to_string(), "CLAUDE.md".to_string()),
+        );
+
+        let ranked = apply_why_recency_tiebreak(vec![older_wrong, newer_fixed], &anchors);
+
+        assert_eq!(
+            ranked[0].chunk_id, "fixed",
+            "newer correction must rank first within epsilon on the same anchor"
+        );
+    }
+
+    #[test]
+    fn why_recency_tiebreak_leaves_order_when_scores_outside_epsilon() {
+        let higher_older = why_item("higher", "conv-old", 0.90, "2026-01-01T00:00:00Z");
+        let lower_newer = why_item("lower", "conv-new", 0.50, "2026-01-02T00:00:00Z"); // 0.40 gap, well outside 0.05
+        let mut anchors = HashMap::new();
+        anchors.insert(
+            "higher".to_string(),
+            ("proj".to_string(), "CLAUDE.md".to_string()),
+        );
+        anchors.insert(
+            "lower".to_string(),
+            ("proj".to_string(), "CLAUDE.md".to_string()),
+        );
+
+        let ranked = apply_why_recency_tiebreak(vec![higher_older, lower_newer], &anchors);
+
+        assert_eq!(
+            ranked[0].chunk_id, "higher",
+            "outside epsilon must not be reordered by recency"
+        );
+    }
+
+    #[test]
+    fn why_recency_tiebreak_leaves_order_across_different_anchors() {
+        let older_a = why_item("a-old", "conv-a-old", 0.840, "2026-01-01T00:00:00Z");
+        let newer_b = why_item("b-new", "conv-b-new", 0.820, "2026-01-02T00:00:00Z"); // within 0.05 but different file
+        let mut anchors = HashMap::new();
+        anchors.insert(
+            "a-old".to_string(),
+            ("proj".to_string(), "file_a.rs".to_string()),
+        );
+        anchors.insert(
+            "b-new".to_string(),
+            ("proj".to_string(), "file_b.rs".to_string()),
+        );
+
+        let ranked = apply_why_recency_tiebreak(vec![older_a, newer_b], &anchors);
+
+        assert_eq!(
+            ranked[0].chunk_id, "a-old",
+            "different anchors must never be reordered by recency, even within epsilon"
+        );
     }
 }
