@@ -39,7 +39,17 @@ pub fn resolve_project_from_cwd(cwd: &str) -> Option<String> {
     let stripped = cwd.strip_prefix(r"\\?\").unwrap_or(cwd);
     let trimmed = stripped.trim_end_matches(['\\', '/']);
     if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
-        return Some(encode_project_folder(trimmed));
+        // At a drive root the separator is the path, not trailing decoration:
+        // Claude Code stores `D:\` as `D--`, so trimming down to `D:` would
+        // resolve `D-` and miss. Below the root, a trailing separator is just a
+        // shape the hook may deliver and is dropped.
+        let at_drive_root = trimmed.len() == 2 && stripped.len() > 2;
+        let to_encode = if at_drive_root {
+            &stripped[..3]
+        } else {
+            trimmed
+        };
+        return Some(encode_project_folder(to_encode));
     }
 
     let path = std::path::Path::new(cwd);
@@ -207,6 +217,23 @@ mod tests {
             resolve_project_from_cwd(r"D:\Proyectos\claude-self-reflect"),
             Some("D--Proyectos-claude-self-reflect".to_string())
         );
+    }
+
+    /// A project sitting at the drive root. The separator there is part of the
+    /// path — `D:\` is stored as `D--`, not `D-` — so the trailing-separator trim
+    /// must stop at the root.
+    #[test]
+    fn test_resolve_from_cwd_drive_root() {
+        for cwd in [r"D:\", "D:/", r"\\?\D:\", r"D:\\\\"] {
+            assert_eq!(
+                resolve_project_from_cwd(cwd),
+                Some("D--".to_string()),
+                "cwd {cwd:?} is the drive root"
+            );
+        }
+
+        // A bare drive letter carries no separator to preserve.
+        assert_eq!(resolve_project_from_cwd("D:"), Some("D-".to_string()));
     }
 
     /// Claude Code's encoder is `replace(/[^a-zA-Z0-9]/g, "-")` with no `u` flag,

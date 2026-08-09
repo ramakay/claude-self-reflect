@@ -90,7 +90,10 @@ pub struct Telemetry {
     pub log_lines_in_window: usize,
 }
 
-/// Explicit override for the timing log location: an absolute path.
+/// Explicit override for the timing log location. Must be an absolute path — a
+/// relative one would resolve against whatever directory the hook happened to run
+/// in, scattering the log — so relative values are ignored and the normal path is
+/// used instead.
 pub const TIMING_LOG_ENV: &str = "CSR_TIMING_LOG";
 
 /// Resolve the canonical log path: `~/.claude-self-reflect/hook-timing.log`.
@@ -98,14 +101,39 @@ pub const TIMING_LOG_ENV: &str = "CSR_TIMING_LOG";
 /// Checked in order: the `CSR_TIMING_LOG` override, a test-harness redirect, then
 /// the real installation path.
 pub fn default_log_path() -> Option<PathBuf> {
-    match std::env::var_os(TIMING_LOG_ENV) {
-        Some(p) if !p.is_empty() => return Some(PathBuf::from(p)),
-        _ => {}
+    resolve_log_path(
+        std::env::var_os(TIMING_LOG_ENV),
+        running_under_test_harness(),
+        dirs::home_dir(),
+    )
+}
+
+/// The decision behind [`default_log_path`], with every input passed in.
+///
+/// Pure on purpose: the alternative is tests that mutate `CSR_TIMING_LOG` in a
+/// process-global environment while the rest of the suite reads it on other
+/// threads.
+fn resolve_log_path(
+    override_var: Option<std::ffi::OsString>,
+    under_test_harness: bool,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(raw) = override_var {
+        let p = PathBuf::from(raw);
+        if p.is_absolute() {
+            return Some(p);
+        }
+        // Empty or relative: a mis-set variable, not a request to log to "." —
+        // fall through rather than write somewhere unpredictable.
     }
-    if running_under_test_harness() {
-        return Some(std::env::temp_dir().join("csr-test-hook-timing.log"));
+    if under_test_harness {
+        // Per-process: `cargo test` runs the lib, hooks and integration harnesses
+        // concurrently, and a shared file would let them rotate each other's log.
+        return Some(
+            std::env::temp_dir().join(format!("csr-test-hook-timing-{}.log", std::process::id())),
+        );
     }
-    dirs::home_dir().map(|h| h.join(".claude-self-reflect").join("hook-timing.log"))
+    home.map(|h| h.join(".claude-self-reflect").join("hook-timing.log"))
 }
 
 /// True when this process is a `cargo test` / `cargo bench` binary.
@@ -235,21 +263,60 @@ mod log_path_tests {
         );
     }
 
-    #[test]
-    fn explicit_override_wins() {
-        let want = std::env::temp_dir().join("csr-override-probe.log");
-        std::env::set_var(TIMING_LOG_ENV, &want);
-        let got = default_log_path();
-        std::env::remove_var(TIMING_LOG_ENV);
-        assert_eq!(got, Some(want));
+    fn home() -> Option<PathBuf> {
+        Some(PathBuf::from("/home/dev"))
     }
 
-    /// An empty override is a mis-set variable, not a request to log to "".
+    fn live() -> Option<PathBuf> {
+        Some(PathBuf::from(
+            "/home/dev/.claude-self-reflect/hook-timing.log",
+        ))
+    }
+
+    /// Every input is an argument, so none of these mutate the process
+    /// environment — the suite runs in parallel and `set_var` is process-global.
     #[test]
-    fn empty_override_falls_through() {
-        std::env::set_var(TIMING_LOG_ENV, "");
-        let got = default_log_path();
-        std::env::remove_var(TIMING_LOG_ENV);
-        assert_ne!(got, Some(PathBuf::new()));
+    fn an_absolute_override_wins() {
+        let want = PathBuf::from("/var/log/csr/hook-timing.log");
+        assert_eq!(
+            resolve_log_path(Some(want.clone().into()), false, home()),
+            Some(want.clone())
+        );
+        // Even under the test harness, and even with no home directory at all.
+        assert_eq!(
+            resolve_log_path(Some(want.clone().into()), true, None),
+            Some(want)
+        );
+    }
+
+    /// Empty or relative is a mis-set variable, not a request to log to "." — it
+    /// would follow the hook's working directory and scatter the log.
+    #[test]
+    fn empty_and_relative_overrides_fall_through() {
+        for bad in ["", "hook-timing.log", "./logs/hook-timing.log", ".."] {
+            assert_eq!(
+                resolve_log_path(Some(bad.into()), false, home()),
+                live(),
+                "override {bad:?} must not be honoured"
+            );
+        }
+    }
+
+    #[test]
+    fn the_harness_redirect_is_per_process_and_not_the_live_log() {
+        let path = resolve_log_path(None, true, home()).expect("harness path");
+        assert_ne!(Some(path.clone()), live());
+        assert!(
+            path.to_string_lossy()
+                .ends_with(&format!("csr-test-hook-timing-{}.log", std::process::id())),
+            "concurrent test binaries must not share one file: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn without_an_override_or_harness_it_is_the_installed_path() {
+        assert_eq!(resolve_log_path(None, false, home()), live());
+        assert_eq!(resolve_log_path(None, false, None), None);
     }
 }
