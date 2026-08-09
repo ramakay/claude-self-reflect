@@ -35,12 +35,16 @@ pub fn truncate_chars(s: &str, max: usize) -> &str {
 /// ones (a floor at 0.605 would lose 4 of 12 genuine topics). 0.45 is therefore
 /// the highest floor that misses no verified-genuine probe; it suppresses only
 /// the clearly-hopeless tail. The overlap band above it is handled by the `weak`
-/// label plus an explicit spurious-match warning, not by silent confidence.
+/// label plus an honest calibration warning and a top1-top2 margin signal, not
+/// by silent confidence.
 pub const QUICK_CHECK_FLOOR: f32 = 0.45;
 
 /// Top of the measured fabrication-overlap band (highest fabricated probe: 0.605,
 /// rounded up). At or above this, a match is at least `partial`; below it a match
-/// is `weak` and scores indistinguishable from never-discussed topics.
+/// is `weak` — absolute cosine is weakly calibrated in this band on this corpus
+/// and does not reliably separate genuine matches from noise by score alone.
+/// `format_quick_check` surfaces a top1-top2 margin alongside the score as a
+/// cheap discriminating signal instead of pretending the score settles it.
 pub const WEAK_BAND_TOP: f32 = 0.62;
 
 /// Band a similarity score into the relevance vocabulary shared by every result
@@ -323,8 +327,12 @@ pub fn format_search_results(
 /// — including topics that were never discussed — into an apparent confirmation.
 /// Below [`QUICK_CHECK_FLOOR`] the answer is a negative existence claim with no
 /// preview (weak-match preview text is exactly how fabrication presents); in the
-/// measured overlap band it is labelled `weak` and carries an explicit
-/// may-be-spurious warning.
+/// measured overlap band it is labelled `weak` and carries an honest calibration
+/// warning — absolute cosine is weakly calibrated on this corpus, not that the
+/// topic was probably never discussed (genuine topics measure inside the same
+/// band). Every `found=true` response also carries a top1-top2 margin alongside
+/// the score: a cheap, already-computed signal for whether the top hit actually
+/// beat the field, since the score alone cannot be trusted to say so here.
 pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
     let mut out = String::new();
 
@@ -356,6 +364,14 @@ pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
 
     let relevance = relevance_label(top.score);
 
+    // Cheap discriminating signal: how far the top hit sits above the runner-up.
+    // A wide margin says "this beat the field"; a near-zero margin says "this is
+    // indistinguishable from the next candidate" — useful whether or not the top
+    // score itself lands in the weakly-calibrated band. `results` is assumed
+    // sorted descending by score (same assumption `dedupe_results` documents),
+    // so `results[1]` is the runner-up whenever it exists.
+    let margin = results.get(1).map(|second| top.score - second.score);
+
     out.push_str("  <found>true</found>\n");
     out.push_str(&format!("  <count>{}</count>\n", results.len()));
     out.push_str(&format!("  <relevance>{}</relevance>\n", relevance));
@@ -363,13 +379,17 @@ pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
 
     if relevance == "weak" {
         out.push_str(&format!(
-            "  <warning>weak match — may be spurious. Scores in {:.2}–{:.2} are not distinguishable from topics that were never discussed (fabricated probes measured 0.456–0.605). Read the preview before treating this as evidence the topic came up.</warning>\n",
+            "  <warning>weak match — may be spurious. Absolute cosine similarity is weakly calibrated in the {:.2}-{:.2} range on this corpus: genuine and fabricated-probe scores overlap here and the score alone cannot tell them apart. Check the margin below and read the preview before treating this as evidence the topic came up.</warning>\n",
             QUICK_CHECK_FLOOR, WEAK_BAND_TOP,
         ));
     }
 
     out.push_str("  <top_result>\n");
     out.push_str(&format!("    <score>{:.3}</score>\n", top.score));
+    match margin {
+        Some(m) => out.push_str(&format!("    <margin>{:.3}</margin>\n", m)),
+        None => out.push_str("    <margin>n/a</margin>\n"),
+    }
     out.push_str(&format!(
         "    <timestamp>{}</timestamp>\n",
         age_stamp(&top.chunk.timestamp)
@@ -1482,6 +1502,56 @@ mod tests {
             assert!(xml.contains("<found>true</found>"), "{score}: {xml}");
             assert!((QUICK_CHECK_FLOOR..WEAK_BAND_TOP).contains(&score));
         }
+    }
+
+    #[test]
+    fn quick_check_warning_no_longer_claims_indistinguishable_from_never_discussed() {
+        // D4: the old wording ("not distinguishable from topics that were never
+        // discussed") told users a weak score meant "probably never happened",
+        // but real matches land in this exact band too. The honest claim is that
+        // absolute cosine is weakly calibrated here — not a verdict on the topic.
+        let results = vec![quick_result(0.50, "borderline content")];
+        let xml = format_quick_check(&results, "borderline probe");
+        assert!(xml.contains("<warning>"), "got: {xml}");
+        assert!(
+            !xml.contains("never discussed"),
+            "warning must not claim indistinguishability from never-discussed topics: {xml}"
+        );
+        assert!(
+            xml.contains("weakly calibrated"),
+            "warning should honestly describe weak calibration instead: {xml}"
+        );
+    }
+
+    #[test]
+    fn quick_check_margin_signal_differs_with_top1_top2_gap() {
+        // D4 part 2: a cheap discriminating signal (top1-top2 margin) must render
+        // differently for a decisive win vs. a near-tie, even when both top scores
+        // land in the same relevance band.
+        let decisive = vec![
+            quick_result(0.70, "clear top match"),
+            quick_result(0.20, "distant runner-up"),
+        ];
+        let near_tie = vec![
+            quick_result(0.70, "clear top match"),
+            quick_result(0.69, "near-tied runner-up"),
+        ];
+
+        let xml_decisive = format_quick_check(&decisive, "probe");
+        let xml_tie = format_quick_check(&near_tie, "probe");
+
+        assert!(
+            xml_decisive.contains("<margin>0.500</margin>"),
+            "got: {xml_decisive}"
+        );
+        assert!(xml_tie.contains("<margin>0.010</margin>"), "got: {xml_tie}");
+    }
+
+    #[test]
+    fn quick_check_margin_is_na_with_no_second_candidate() {
+        let results = vec![quick_result(0.80, "only candidate")];
+        let xml = format_quick_check(&results, "probe");
+        assert!(xml.contains("<margin>n/a</margin>"), "got: {xml}");
     }
 
     #[test]
