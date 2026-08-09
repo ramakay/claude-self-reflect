@@ -175,11 +175,32 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
         .ok_or_else(|| anyhow::anyhow!("no file_path in tool_input"))?;
 
     let language = detect_language(file_path);
-    if language.is_empty() {
-        return Ok(()); // Unknown language — skip AST analysis
-    }
-
     let tool_name = input.tool_name.as_deref().unwrap_or("unknown");
+
+    // Mirrors the code-graph policy at update_code_graph (lines 68–88):
+    // record an honest file-level presence row instead of silently dropping.
+    if language.is_empty() {
+        let conv_id = conv_id_for(input);
+        let project_name = resolve_project_for_hook(Path::new(file_path).parent());
+        let stored_path = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path));
+        let stored_path_str = stored_path.to_string_lossy();
+        let repo_root = crate::extraction::repo_root::repo_root_for_file(&stored_path_str);
+        engine.storage().insert_code_evolution(
+            &conv_id,
+            &project_name,
+            &stored_path_str,
+            "text",
+            tool_name,
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+            "[]",
+            repo_root.as_deref(),
+        )?;
+        return Ok(());
+    }
 
     // Build before/after pairs depending on tool type (Codex M-2: handle MultiEdit edits array)
     let edit_pairs: Vec<(String, String)> = if tool_name == "Edit" {
@@ -351,5 +372,129 @@ mod tests {
         let project = resolve_project_for_hook_with(parent, None, None);
         assert_eq!(project, "my-repo");
         assert!(!project.is_empty());
+    }
+
+    fn test_engine() -> (
+        crate::engine::Engine,
+        std::sync::Arc<crate::storage::Storage>,
+    ) {
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let embeddings = std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap());
+        let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::search::SearchEngine::new(100),
+        ));
+        let engine = crate::engine::Engine::from_parts(
+            storage.clone(),
+            embeddings,
+            search,
+            std::path::PathBuf::from("/tmp"),
+        );
+        (engine, storage)
+    }
+
+    #[tokio::test]
+    async fn track_code_evolution_records_touch_row_for_unsupported_extension() {
+        let (engine, _storage) = test_engine();
+        let input = crate::hooks::HookInput {
+            transcript_path: Some("/tmp/nonexistent-test-transcript.jsonl".to_string()),
+            session_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
+            cwd: Some("/tmp".into()),
+            tool_name: Some("Edit".into()),
+            tool_input: Some(serde_json::json!({
+                "file_path": "/tmp/csr-test-workflow-file.yml",
+                "old_string": "name: old",
+                "new_string": "name: new"
+            })),
+            ..Default::default()
+        };
+
+        let result = track_code_evolution(&input, &engine).await;
+        assert!(result.is_ok());
+
+        // LIKE lookup: `canonical_repo_path` may spell `/tmp` vs `/private/tmp`
+        // depending on cache state; match the basename instead.
+        let (fa, fr): (String, String) = engine
+            .storage()
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT functions_added, functions_removed FROM code_evolution \
+                     WHERE file_path LIKE ?1",
+                    [format!("%{}", "csr-test-workflow-file.yml")],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(Into::into)
+            })
+            .expect("unsupported extension should insert a code_evolution touch row");
+        assert_eq!(fa, "[]");
+        assert_eq!(fr, "[]");
+    }
+
+    #[tokio::test]
+    async fn track_code_evolution_touch_row_language_is_placeholder_not_empty() {
+        let (engine, _storage) = test_engine();
+        let input = crate::hooks::HookInput {
+            transcript_path: Some("/tmp/nonexistent-test-transcript.jsonl".to_string()),
+            session_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
+            cwd: Some("/tmp".into()),
+            tool_name: Some("Edit".into()),
+            tool_input: Some(serde_json::json!({
+                "file_path": "/tmp/csr-test-workflow-file.yml",
+                "old_string": "name: old",
+                "new_string": "name: new"
+            })),
+            ..Default::default()
+        };
+
+        let result = track_code_evolution(&input, &engine).await;
+        assert!(result.is_ok());
+
+        let language: String = engine
+            .storage()
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT language FROM code_evolution WHERE file_path LIKE ?1",
+                    [format!("%{}", "csr-test-workflow-file.yml")],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(language, "text");
+        assert!(!language.is_empty());
+    }
+
+    #[tokio::test]
+    async fn track_code_evolution_still_populates_symbols_for_supported_language() {
+        let (engine, _storage) = test_engine();
+        let input = crate::hooks::HookInput {
+            transcript_path: Some("/tmp/nonexistent-test-transcript.jsonl".to_string()),
+            session_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
+            cwd: Some("/tmp".into()),
+            tool_name: Some("Write".into()),
+            tool_input: Some(serde_json::json!({
+                "file_path": "/tmp/csr-test-evolved-file.rs",
+                "content": "fn touched_marker_fn() {}\n"
+            })),
+            ..Default::default()
+        };
+
+        let result = track_code_evolution(&input, &engine).await;
+        assert!(result.is_ok());
+
+        let functions_added: String = engine
+            .storage()
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT functions_added FROM code_evolution WHERE file_path LIKE ?1",
+                    [format!("%{}", "csr-test-evolved-file.rs")],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .expect("supported language with structural change should insert a row");
+        assert_ne!(
+            functions_added, "[]",
+            "functions_added must contain real AST diff, not an empty touch array"
+        );
     }
 }
