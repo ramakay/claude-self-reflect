@@ -1,10 +1,55 @@
 use crate::import;
 
+/// Encode a path the way Claude Code names its `~/.claude/projects` folders.
+///
+/// Claude Code does `path.replace(/[^a-zA-Z0-9]/g, "-")` (verified in the shipped
+/// binary, 2.1.226). That regex carries no `u` flag, so it runs over UTF-16 code
+/// units, not scalar values: an accented BMP character costs one dash, but a
+/// non-BMP one (emoji, rarer CJK) is a surrogate pair and costs *two*. Mapping per
+/// `char` would emit one dash there and miss the stored folder — the same silent
+/// empty-result failure this whole branch exists to fix, just narrower.
+fn encode_project_folder(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else {
+            for _ in 0..c.len_utf16() {
+                out.push('-');
+            }
+        }
+    }
+    out
+}
+
 /// Resolve project name from a CWD path string.
 /// Pure function — testable without environment variable manipulation.
 pub fn resolve_project_from_cwd(cwd: &str) -> Option<String> {
     if cwd.is_empty() {
         return None;
+    }
+
+    // Windows drive path ("D:\Claude", or "\\?\D:\Claude" after canonicalize):
+    // stored project names are Claude Code's ~/.claude/projects folder names,
+    // which encode the FULL path with every non-alphanumeric char as '-'
+    // ("D:\Claude" → "D--Claude"). The last-component fallback below returned
+    // "Claude", which matches no stored project and silently emptied every
+    // project-scoped search. Hooks receive the project root as cwd, so no
+    // component-walking is needed here.
+    let stripped = cwd.strip_prefix(r"\\?\").unwrap_or(cwd);
+    let trimmed = stripped.trim_end_matches(['\\', '/']);
+    if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
+        // At a drive root the separator is the path, not trailing decoration:
+        // Claude Code stores `D:\` as `D--`, so trimming down to `D:` would
+        // resolve `D-` and miss. Below the root, a trailing separator is just a
+        // shape the hook may deliver and is dropped.
+        let at_drive_root = trimmed.len() == 2 && stripped.len() > 2;
+        let to_encode = if at_drive_root {
+            &stripped[..3]
+        } else {
+            trimmed
+        };
+        return Some(encode_project_folder(to_encode));
     }
 
     let path = std::path::Path::new(cwd);
@@ -140,5 +185,79 @@ mod tests {
     fn test_resolve_from_cwd_no_projects_segment() {
         let result = resolve_project_from_cwd("/tmp/something/mydir");
         assert_eq!(result, Some("mydir".to_string()));
+    }
+
+    /// Pins the stored project-name contract for Windows drive paths.
+    ///
+    /// Deliberately NOT `#[cfg(windows)]`-gated: the code path under test is pure
+    /// string handling with no platform-conditional code, so gating it would only
+    /// hide the regression from the CI that actually runs — which has no Windows
+    /// job. A hook can deliver `cwd` raw, `\\?\`-canonicalized, with a trailing
+    /// separator, or any combination of those, and every shape has to land on the
+    /// same stored name or project-scoped search silently returns nothing.
+    #[test]
+    fn test_resolve_from_cwd_windows_drive_paths() {
+        for cwd in [
+            r"D:\Claude",
+            r"\\?\D:\Claude",
+            "D:\\Claude\\",
+            "\\\\?\\D:\\Claude\\",
+        ] {
+            assert_eq!(
+                resolve_project_from_cwd(cwd),
+                Some("D--Claude".to_string()),
+                "cwd {cwd:?} must encode to the stored project name"
+            );
+        }
+
+        // The encoding covers the whole path, not just the last component — that
+        // was the original bug: "D:\Claude" resolved to "Claude", which matches no
+        // stored project.
+        assert_eq!(
+            resolve_project_from_cwd(r"D:\Proyectos\claude-self-reflect"),
+            Some("D--Proyectos-claude-self-reflect".to_string())
+        );
+    }
+
+    /// A project sitting at the drive root. The separator there is part of the
+    /// path — `D:\` is stored as `D--`, not `D-` — so the trailing-separator trim
+    /// must stop at the root.
+    #[test]
+    fn test_resolve_from_cwd_drive_root() {
+        for cwd in [r"D:\", "D:/", r"\\?\D:\", r"D:\\\\"] {
+            assert_eq!(
+                resolve_project_from_cwd(cwd),
+                Some("D--".to_string()),
+                "cwd {cwd:?} is the drive root"
+            );
+        }
+
+        // A bare drive letter carries no separator to preserve.
+        assert_eq!(resolve_project_from_cwd("D:"), Some("D-".to_string()));
+    }
+
+    /// Claude Code's encoder is `replace(/[^a-zA-Z0-9]/g, "-")` with no `u` flag,
+    /// so it counts UTF-16 code units: one dash for a BMP character, two for a
+    /// surrogate pair. Non-ASCII project directories are ordinary outside English
+    /// locales, so getting this wrong reproduces the original miss on exactly the
+    /// paths least likely to be reported.
+    #[test]
+    fn test_resolve_from_cwd_non_ascii_drive_paths() {
+        // Every non-ASCII character here is BMP: one code unit, one dash.
+        assert_eq!(
+            resolve_project_from_cwd(r"D:\Proyectos\Español"),
+            Some("D--Proyectos-Espa-ol".to_string())
+        );
+        // ':' + '\' + 7 Cyrillic + '\' + 3 Cyrillic = 13 code units after "C".
+        assert_eq!(
+            resolve_project_from_cwd(r"C:\Проекты\бот"),
+            Some(format!("C{}", "-".repeat(13)))
+        );
+
+        // A non-BMP character is a surrogate pair: two code units, two dashes.
+        assert_eq!(
+            resolve_project_from_cwd("D:\\🚀x"),
+            Some("D----x".to_string())
+        );
     }
 }

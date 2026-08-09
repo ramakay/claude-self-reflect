@@ -18,7 +18,7 @@ pub mod session_start;
 pub mod stop;
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -50,21 +50,167 @@ pub struct HookInput {
     pub source: Option<String>,
 }
 
-/// Read and parse JSON from stdin. Returns a default HookInput if stdin is empty or invalid.
-/// Guards against hanging when invoked from a terminal (S-4 fix).
+/// How long the hook waits for the piped JSON before giving up.
+///
+/// `read_to_string` returns at EOF, so a parent that opens the pipe, writes
+/// nothing and keeps its write handle open would block the hook — and with it the
+/// session — forever. A hook must never block Claude Code, so the read is bounded.
+const STDIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// What reading stdin produced. Separated from the read itself so the outcomes and
+/// their logging are testable without a real pipe.
+#[derive(Debug)]
+enum StdinRead {
+    Payload(String),
+    Empty,
+    TimedOut,
+    Failed(String),
+}
+
+/// Read and parse JSON from stdin. Returns a default HookInput if stdin is empty,
+/// unreadable, invalid or too slow: a hook never fails because of its input.
+/// Guards against hanging when invoked from a terminal (S-4 fix) and against a
+/// parent that never closes the pipe.
 pub fn read_stdin_json() -> HookInput {
     use std::io::IsTerminal;
 
     // If stdin is a TTY (not piped), don't block waiting for input
     if std::io::stdin().is_terminal() {
+        crate::telemetry::append_timing_line("CSR stdin: is a terminal, no piped input");
         return HookInput::default();
     }
 
-    let mut buf = String::new();
-    match std::io::stdin().read_to_string(&mut buf) {
-        Ok(_) if !buf.trim().is_empty() => serde_json::from_str(&buf).unwrap_or_default(),
-        _ => HookInput::default(),
+    hook_input_from(read_bounded(STDIN_READ_TIMEOUT, || {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf).map(|_| buf)
+    }))
+}
+
+/// Run `read` on its own thread and give up after `timeout`.
+///
+/// The reader thread is deliberately detached rather than joined: when the timeout
+/// fires it is still parked on a pipe nobody is going to close, and this process is
+/// about to exit anyway.
+fn read_bounded<F>(timeout: std::time::Duration, read: F) -> StdinRead
+where
+    F: FnOnce() -> std::io::Result<String> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = match read() {
+            Ok(buf) if buf.trim().is_empty() => StdinRead::Empty,
+            Ok(buf) => StdinRead::Payload(buf),
+            Err(e) => StdinRead::Failed(e.to_string()),
+        };
+        let _ = tx.send(outcome);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(outcome) => outcome,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => StdinRead::TimedOut,
+        // The reader vanished without reporting. Unreadable is not the same as empty.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            StdinRead::Failed("reader thread disconnected".to_string())
+        }
     }
+}
+
+/// Turn a stdin read into a HookInput, recording *why* an input was unusable —
+/// empty, unreadable, too slow and unparseable used to be one indistinguishable
+/// `hook=0ms` line.
+fn hook_input_from(read: StdinRead) -> HookInput {
+    match read {
+        StdinRead::Payload(buf) => match serde_json::from_str(&buf) {
+            Ok(input) => input,
+            Err(e) => {
+                // A parse failure here silently degrades to Default (no prompt,
+                // no transcript_path) — the hook then no-ops. Log it loudly.
+                crate::telemetry::append_timing_line(&format!(
+                    "CSR stdin: {}B received but JSON parse FAILED: {}",
+                    buf.len(),
+                    e
+                ));
+                HookInput::default()
+            }
+        },
+        StdinRead::Empty => {
+            crate::telemetry::append_timing_line("CSR stdin: empty (no JSON piped)");
+            HookInput::default()
+        }
+        StdinRead::TimedOut => {
+            crate::telemetry::append_timing_line(&format!(
+                "CSR stdin: no EOF within {}ms, giving up (parent still holds the pipe)",
+                STDIN_READ_TIMEOUT.as_millis()
+            ));
+            HookInput::default()
+        }
+        StdinRead::Failed(e) => {
+            crate::telemetry::append_timing_line(&format!("CSR stdin: read FAILED: {}", e));
+            HookInput::default()
+        }
+    }
+}
+
+/// Resolve the directory a hook operates on. Prefers the cwd Claude Code sent,
+/// falls back to the process cwd, and **never fails**.
+///
+/// Every step here used to abort the whole hook with `?`: `canonicalize` fails if
+/// the directory is renamed or removed between `is_dir()` and the call, and
+/// `current_dir` fails outright once the process's own working directory is gone.
+/// Aborting is the failure this module keeps having to fix — it silently disables
+/// both context injection and live transcript import — so each step now degrades to
+/// the next best path and says so, rather than taking the session down with it.
+///
+/// Also performs the S-3 home-directory check (Windows-fixed: `canonicalize()`
+/// returns a `\\?\`-prefixed path, so the raw `home_dir()` never prefix-matched and
+/// this bailed on EVERY hook that carried a cwd — compare canonical vs canonical).
+/// Outside-`$HOME` is a warning, not an error: projects legitimately live on other
+/// drives.
+fn resolve_hook_cwd(input_cwd: Option<&str>) -> PathBuf {
+    if let Some(dir) = input_cwd {
+        let p = PathBuf::from(dir);
+        if p.is_dir() {
+            let resolved = match p.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(e) => {
+                    crate::telemetry::append_timing_line(&format!(
+                        "CSR cwd: canonicalize({}) failed ({}) — using the path as given",
+                        p.display(),
+                        e
+                    ));
+                    p
+                }
+            };
+            let home_ok = dirs::home_dir()
+                .and_then(|h| h.canonicalize().ok())
+                .map(|h| resolved.starts_with(&h))
+                .unwrap_or(false);
+            if !home_ok {
+                eprintln!("CSR: cwd {} outside home (allowed)", resolved.display());
+            }
+            return resolved;
+        }
+        // A cwd arrived but does not name a directory. Falling back is the right
+        // behaviour, but doing it silently is exactly how the Windows breakage
+        // above survived unnoticed for so long — leave a line so the next one is
+        // diagnosable from the log alone.
+        // Quoted, not `Display`: an empty cwd is a real case and prints as nothing,
+        // which reads as a corrupt log line rather than the anomaly it is.
+        crate::telemetry::append_timing_line(&format!(
+            "CSR cwd: input cwd {dir:?} is not a directory — falling back to current_dir()"
+        ));
+    }
+
+    std::env::current_dir().unwrap_or_else(|e| {
+        // The process cwd itself is unreadable (deleted out from under us). A
+        // relative path keeps the hook alive; whatever it touches will fail on its
+        // own terms instead of killing the session here.
+        crate::telemetry::append_timing_line(&format!(
+            "CSR cwd: current_dir() failed ({}) — falling back to \".\"",
+            e
+        ));
+        PathBuf::from(".")
+    })
 }
 
 /// Shared helper: import the current transcript incrementally.
@@ -120,24 +266,18 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     let input = read_stdin_json();
     let t_stdin = t0.elapsed();
 
-    // Determine CWD: prefer input.cwd, fall back to process CWD
-    // Validate that cwd is a real directory under $HOME (S-3 fix)
-    let cwd = if let Some(ref dir) = input.cwd {
-        let p = std::path::PathBuf::from(dir);
-        if p.is_dir() {
-            let canonical = p.canonicalize()?;
-            if let Some(home) = dirs::home_dir() {
-                if !canonical.starts_with(&home) {
-                    anyhow::bail!("cwd {} is outside home directory", canonical.display());
-                }
-            }
-            canonical
-        } else {
-            std::env::current_dir()?
-        }
-    } else {
-        std::env::current_dir()?
-    };
+    // Field-presence diagnostic: hook=0ms exits are indistinguishable from a
+    // missing prompt without this (live debugging 2026-07-30).
+    crate::telemetry::append_timing_line(&format!(
+        "CSR hook {} input: prompt_len={} cwd={:?} transcript={} session={}",
+        hook_name,
+        input.prompt.as_deref().map(str::len).unwrap_or(0),
+        input.cwd,
+        input.transcript_path.is_some(),
+        input.session_id.is_some(),
+    ));
+
+    let cwd = resolve_hook_cwd(input.cwd.as_deref());
 
     let t_setup = t0.elapsed();
 
@@ -180,4 +320,86 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     crate::telemetry::append_timing_line(&timing_line);
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn read_bounded_gives_up_instead_of_hanging() {
+        // Stands in for a parent that opened the pipe and never closes it.
+        let started = Instant::now();
+        let outcome = read_bounded(Duration::from_millis(20), || {
+            std::thread::sleep(Duration::from_secs(30));
+            Ok(String::new())
+        });
+        assert!(
+            matches!(outcome, StdinRead::TimedOut),
+            "a read that never finishes must time out, got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the hook must not wait for the reader"
+        );
+    }
+
+    #[test]
+    fn read_bounded_reports_io_errors_separately_from_empty() {
+        let outcome = read_bounded(Duration::from_secs(5), || {
+            Err(std::io::Error::other("pipe exploded"))
+        });
+        match outcome {
+            StdinRead::Failed(e) => assert!(e.contains("pipe exploded")),
+            other => panic!("an I/O failure must not be reported as empty, got {other:?}"),
+        }
+
+        let outcome = read_bounded(Duration::from_secs(5), || Ok("  \n".to_string()));
+        assert!(
+            matches!(outcome, StdinRead::Empty),
+            "whitespace-only input is empty, not a payload"
+        );
+    }
+
+    #[test]
+    fn resolve_hook_cwd_never_fails() {
+        // A real directory is taken and canonicalized.
+        let real = std::env::temp_dir();
+        assert_eq!(
+            resolve_hook_cwd(Some(&real.to_string_lossy())),
+            real.canonicalize().unwrap()
+        );
+
+        // A cwd that is not a directory, and no cwd at all, both fall back to the
+        // process directory instead of aborting the hook.
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(
+            resolve_hook_cwd(Some("/definitely/not/a/directory/csr-test")),
+            here
+        );
+        assert_eq!(resolve_hook_cwd(None), here);
+        assert_eq!(resolve_hook_cwd(Some("")), here);
+    }
+
+    #[test]
+    fn hook_input_from_parses_a_payload_and_degrades_otherwise() {
+        let input = hook_input_from(StdinRead::Payload(
+            r#"{"prompt":"hola","cwd":"/tmp/proj"}"#.to_string(),
+        ));
+        assert_eq!(input.prompt.as_deref(), Some("hola"));
+        assert_eq!(input.cwd.as_deref(), Some("/tmp/proj"));
+
+        // Every unusable outcome degrades to a default input rather than failing:
+        // the hook still runs, it just has nothing to work with.
+        for unusable in [
+            StdinRead::Payload("not json".to_string()),
+            StdinRead::Empty,
+            StdinRead::TimedOut,
+            StdinRead::Failed("boom".to_string()),
+        ] {
+            let input = hook_input_from(unusable);
+            assert!(input.prompt.is_none() && input.transcript_path.is_none());
+        }
+    }
 }

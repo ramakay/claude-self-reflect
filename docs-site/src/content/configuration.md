@@ -20,6 +20,7 @@ Configured in `~/.claude/settings.json` via `csr-engine hook install --apply`.
 | CSR_NARRATIVE_MODEL | — | Override model for AI narratives (falls back to `haiku`, then CLI default) |
 | CSR_NO_AI_NARRATIVES | — | Set to `1` to disable AI narrative generation entirely |
 | CSR_DB_PATH | ~/.claude-self-reflect/csr-engine.db | Custom DB path |
+| CSR_TIMING_LOG | ~/.claude-self-reflect/hook-timing.log | Custom hook-timing log path (test runs redirect to a temp file automatically) |
 
 AI narratives run through the Claude Code CLI (`claude -p`) — no API key required.
 
