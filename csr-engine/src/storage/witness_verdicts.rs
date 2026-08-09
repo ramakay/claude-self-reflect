@@ -72,6 +72,7 @@
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 
 /// The three deterministic conclusions the `dream` successor join can draw
 /// about a witness. There is no "unknown" variant — every witness with more
@@ -233,12 +234,124 @@ pub enum VerdictChannel {
     Annotate,
 }
 
+/// One storage-resolved verdict bound to a stable search chunk identity.
+/// Consumers must key ranking and annotation decisions by `chunk_id`; the
+/// conversation grouping used by batched reads is transport only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkWitnessVerdict {
+    pub chunk_id: String,
+    pub file: String,
+    pub symbol: Option<String>,
+    pub channel: VerdictChannel,
+    pub verdict: &'static str,
+    pub receipt_oid: Option<String>,
+}
+
+/// Persist an exact witness-to-chunk attribution. This relation is separate
+/// from the append-only verdict event stream because one witness may support
+/// multiple historical chunks, while verdict state continues to evolve.
+pub fn bind_witness_to_chunk(conn: &Connection, witness_id: i64, chunk_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO witness_chunk_bindings (witness_id, chunk_id) VALUES (?1, ?2)",
+        params![witness_id, chunk_id],
+    )?;
+    Ok(())
+}
+
+/// Publish the exact chunk attribution captured by the live code-graph hook
+/// for a newly inserted (or deduplicated) witness row. Historical nodes that
+/// predate chunk attribution safely leave no binding.
+pub fn bind_witness_row_to_node_chunk(
+    conn: &Connection,
+    row: &super::witness_ledger::WitnessLedgerRow,
+    node_id: &str,
+) -> Result<()> {
+    let witness_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM witness_ledger
+             WHERE project = ?1 AND file = ?2
+               AND COALESCE(symbol, '') = COALESCE(?3, '')
+               AND COALESCE(span_start, -1) = COALESCE(?4, -1)
+               AND COALESCE(span_end, -1) = COALESCE(?5, -1)
+               AND stamp = ?6 AND tier = ?7
+               AND COALESCE(at_oid, '') = COALESCE(?8, '')
+               AND source_kind = ?9
+               AND COALESCE(source_id, '') = COALESCE(?10, '')",
+            params![
+                row.project,
+                row.file,
+                row.symbol,
+                row.span_start,
+                row.span_end,
+                row.stamp,
+                row.tier,
+                row.at_oid,
+                row.source_kind,
+                row.source_id,
+            ],
+            |result| result.get(0),
+        )
+        .optional()?;
+    let chunk_id: Option<String> = conn
+        .query_row(
+            "SELECT n.last_chunk_id
+             FROM code_nodes n JOIN chunks c ON c.id = n.last_chunk_id
+             WHERE n.id = ?1 AND n.last_chunk_id IS NOT NULL",
+            params![node_id],
+            |result| result.get(0),
+        )
+        .optional()?;
+    if let (Some(witness_id), Some(chunk_id)) = (witness_id, chunk_id) {
+        bind_witness_to_chunk(conn, witness_id, &chunk_id)?;
+    }
+    Ok(())
+}
+
+/// Exact persisted `(chunk_id, conversation_id)` bindings for the supplied
+/// witnesses. Orphaned chunk ids abstain through the inner join.
+pub fn chunk_bindings_for_witnesses(
+    conn: &Connection,
+    witness_ids: &[i64],
+) -> Result<HashMap<i64, Vec<(String, String)>>> {
+    let mut out: HashMap<i64, Vec<(String, String)>> = HashMap::new();
+    const BATCH: usize = 400;
+    for batch in witness_ids.chunks(BATCH) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders: Vec<String> = (1..=batch.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT b.witness_id, b.chunk_id, c.conversation_id
+             FROM witness_chunk_bindings b
+             JOIN chunks c ON c.id = b.chunk_id
+             WHERE b.witness_id IN ({})
+             ORDER BY b.witness_id, b.chunk_id",
+            placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        for row in rows {
+            let (witness_id, chunk_id, conversation_id) = row?;
+            out.entry(witness_id)
+                .or_default()
+                .push((chunk_id, conversation_id));
+        }
+    }
+    Ok(out)
+}
+
 /// Order-independent CURRENT state of a `(project, file, symbol)` anchor —
 /// the resolved [`VerdictChannel`] plus a deterministic representative
 /// negative event for surfacing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SymbolVerdictState {
     pub channel: VerdictChannel,
+    /// Every witness whose latest event is negative. Exact chunk attribution
+    /// may have been recorded on an older witness than the representative,
+    /// so binding must consult the complete current negative set.
+    pub negative_witness_ids: Vec<i64>,
     /// The newest (highest event `id`) negative latest-event among the
     /// symbol's witnesses — the source of `verdict` and `receipt_oid` for
     /// surfacing; never a claim that global insertion order is meaningful
@@ -321,6 +434,11 @@ pub fn symbol_verdict_state(
         } else {
             VerdictChannel::Demote
         },
+        negative_witness_ids: latest_per_witness
+            .iter()
+            .filter(|event| event.verdict.is_negative())
+            .map(|event| event.witness_id)
+            .collect(),
         representative: representative.clone(),
     }))
 }
@@ -594,6 +712,11 @@ pub fn symbol_verdict_states_for_files(
                     } else {
                         VerdictChannel::Demote
                     },
+                    negative_witness_ids: events
+                        .iter()
+                        .filter(|(event, _)| event.verdict.is_negative())
+                        .map(|(event, _)| event.witness_id)
+                        .collect(),
                     representative: representative.clone(),
                 },
             );
@@ -700,6 +823,11 @@ pub(crate) fn symbol_verdict_states_for_lineages(
                     } else {
                         VerdictChannel::Demote
                     },
+                    negative_witness_ids: events
+                        .iter()
+                        .filter(|(event, _)| event.verdict.is_negative())
+                        .map(|(event, _)| event.witness_id)
+                        .collect(),
                     representative: representative.clone(),
                 },
             );

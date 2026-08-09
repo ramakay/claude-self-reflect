@@ -2100,8 +2100,9 @@ fn active_forgetting_enabled_from(value: Option<&str>) -> bool {
 /// [`validity_partition_enabled`] exactly once and threads the outcome
 /// here, so tests drive this by parameter instead of mutating the env var.
 /// ONE batched
-/// `witness_verdicts_for_conversations` query (never per-chunk; the perf
-/// requirement) when `enabled`, reduced per chunk via [`ConvValidity`].
+/// `witness_verdicts_for_chunks` query (one conversation-batched storage
+/// read, never one query per chunk) when `enabled`, reduced per chunk via
+/// [`ConvValidity`].
 /// `enabled = false` returns an empty map — every consumer below treats an
 /// absent chunk id as "nothing to do", so
 /// an empty map disables the whole feature with no other branching needed.
@@ -2127,8 +2128,11 @@ fn resolve_validity_checked(
     if !enabled || chunks.is_empty() {
         return Ok(HashMap::new());
     }
-    let conversation_ids = distinct_conversation_ids_of_chunks(chunks);
-    let hits = storage.witness_verdicts_for_conversations(&conversation_ids)?;
+    let identities: Vec<(String, String)> = chunks
+        .iter()
+        .map(|chunk| (chunk.id.clone(), chunk.conversation_id.clone()))
+        .collect();
+    let hits = storage.witness_verdicts_for_chunks(&identities)?;
     Ok(reduce_validity_hits(hits, chunks))
 }
 
@@ -2145,71 +2149,56 @@ fn resolve_validity_checked(
 /// independent signals — see `CandidateSignals`'s doc).
 pub(crate) fn resolve_validity_for_ancestry(
     storage: &Arc<Storage>,
-    conversation_ids: &[String],
+    chunks: &[(String, String)],
 ) -> Option<HashMap<String, ConvValidity>> {
     if !validity_partition_enabled() {
         return None;
     }
-    if !dream_consumption_enabled() || conversation_ids.is_empty() {
+    if !dream_consumption_enabled() || chunks.is_empty() {
         return Some(HashMap::new());
     }
-    let hits = storage
-        .witness_verdicts_for_conversations(conversation_ids)
-        .ok()?;
-    Some(reduce_conversation_validity_hits(hits))
+    let hits = storage.witness_verdicts_for_chunks(chunks).ok()?;
+    Some(reduce_validity_hit_identities(hits, chunks))
 }
 
 fn reduce_validity_hits(
     hits: BTreeMap<String, Vec<ChunkWitnessVerdict>>,
     chunks: &[crate::import::ConversationChunk],
 ) -> HashMap<String, ConvValidity> {
-    let mut validity = HashMap::new();
-    let mut chunk_counts = HashMap::new();
-    for chunk in chunks {
-        *chunk_counts
-            .entry(chunk.conversation_id.as_str())
-            .or_insert(0usize) += 1;
-    }
-    for chunk in chunks {
-        let Some(conversation_hits) = hits.get(&chunk.conversation_id) else {
-            continue;
-        };
-        let matching_hits: Vec<&ChunkWitnessVerdict> = conversation_hits
-            .iter()
-            .filter(|hit| validity_hit_matches_chunk(hit, chunk))
-            .collect();
-        let candidates: Vec<&ChunkWitnessVerdict> = if matching_hits.is_empty()
-            && chunk_counts.get(chunk.conversation_id.as_str()) == Some(&1)
-        {
-            conversation_hits.iter().collect()
-        } else {
-            matching_hits
-        };
-        let Some(chosen) = choose_validity_hit(candidates.into_iter()) else {
-            continue;
-        };
-        validity.insert(
-            chunk.id.clone(),
-            ConvValidity {
-                demote: chosen.channel == VerdictChannel::Demote,
-                note: validity_note(chosen),
-            },
-        );
-    }
-    validity
+    let identities: Vec<(String, String)> = chunks
+        .iter()
+        .map(|chunk| (chunk.id.clone(), chunk.conversation_id.clone()))
+        .collect();
+    reduce_validity_hit_identities(hits, &identities)
 }
 
-/// Compatibility path for prompt-submit, whose existing interface carries
-/// conversation ids rather than chunks. Search ranking never uses this map;
-/// every rank-affecting path above is chunk-keyed.
-fn reduce_conversation_validity_hits(
+fn reduce_validity_hit_identities(
     hits: BTreeMap<String, Vec<ChunkWitnessVerdict>>,
+    chunks: &[(String, String)],
 ) -> HashMap<String, ConvValidity> {
-    hits.into_iter()
-        .filter_map(|(conversation_id, list)| {
+    let chunk_ids: HashSet<&str> = chunks.iter().map(|(id, _)| id.as_str()).collect();
+    let mut by_chunk: HashMap<String, Vec<ChunkWitnessVerdict>> = HashMap::new();
+    for (stored_chunk_id, chunk_hits) in hits {
+        if !chunk_ids.contains(stored_chunk_id.as_str()) {
+            continue;
+        }
+        for hit in chunk_hits {
+            if hit.chunk_id != stored_chunk_id {
+                continue;
+            }
+            by_chunk
+                .entry(stored_chunk_id.clone())
+                .or_default()
+                .push(hit);
+        }
+    }
+
+    by_chunk
+        .into_iter()
+        .filter_map(|(chunk_id, list)| {
             let chosen = choose_validity_hit(list.iter())?;
             Some((
-                conversation_id,
+                chunk_id,
                 ConvValidity {
                     demote: chosen.channel == VerdictChannel::Demote,
                     note: validity_note(chosen),
@@ -2231,22 +2220,6 @@ fn choose_validity_hit<'a>(
                 .copied()
                 .find(|hit| hit.channel == VerdictChannel::Annotate)
         })
-}
-
-fn validity_hit_matches_chunk(
-    hit: &ChunkWitnessVerdict,
-    chunk: &crate::import::ConversationChunk,
-) -> bool {
-    match hit.symbol.as_deref() {
-        Some(symbol) => chunk.content.contains(symbol),
-        None => {
-            chunk.content.contains(&hit.file)
-                || std::path::Path::new(&hit.file)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| chunk.content.contains(name))
-        }
-    }
 }
 
 /// Render one dream-verdict hit as the search-facing annotation string —
@@ -2523,7 +2496,7 @@ pub fn apply_resolutions(enriched: &mut Vec<EnrichedResult>, storage: &Arc<Stora
 /// cut, then truncate once. `validity` is the caller's already-resolved
 /// [`ConvValidity`] decision (see `resolve_validity`) — passed in rather
 /// than re-queried here so the whole search issues exactly one
-/// `witness_verdicts_for_conversations` query (perf requirement).
+/// `witness_verdicts_for_chunks` query (perf requirement).
 fn apply_resolutions_before_limit(
     enriched: &mut Vec<EnrichedResult>,
     storage: &Arc<Storage>,
@@ -3566,28 +3539,83 @@ mod tests {
 
     #[test]
     fn validity_demote_verdict_only_sinks_its_own_chunk_in_shared_conversation() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
         let mut enriched = vec![
             enriched_result_conv("chunk-stale", "conv-shared", 0.95, 0),
             enriched_result_conv("chunk-live", "conv-shared", 0.90, 1),
         ];
-        enriched[0].chunk.content = "old_fn is the stale claim".into();
+        // The stored verdict already owns its chunk identity. Neither chunk
+        // needs to repeat the symbol/filename text for binding to work.
+        enriched[0].chunk.content = "historical implementation discussion".into();
         enriched[1].chunk.content = "unrelated live design discussion".into();
         let live_score = enriched[1].score;
-        let hits = BTreeMap::from([(
-            "conv-shared".to_string(),
-            vec![ChunkWitnessVerdict {
-                file: "/repo/src/lib.rs".into(),
-                symbol: Some("old_fn".into()),
-                channel: VerdictChannel::Demote,
-                verdict: "anchor_obsolete",
-                receipt_oid: Some("abc123456".into()),
-            }],
-        )]);
+        for result in &enriched {
+            storage.insert_chunk(&result.chunk, &[1.0, 0.0]).unwrap();
+        }
+        let witness_id = install_demote_verdict_for(
+            &storage,
+            "/repo/src/lib.rs",
+            "old_fn",
+            "conv-shared",
+            "conv-shared",
+        );
+        assert!(
+            resolve_validity_with(&storage, std::slice::from_ref(&enriched[1].chunk), true)
+                .is_empty(),
+            "legacy conversation-only identity must abstain when storage contains siblings"
+        );
+        storage
+            .with_connection(|conn| {
+                crate::storage::witness_verdicts::bind_witness_to_chunk(
+                    conn,
+                    witness_id,
+                    "chunk-stale",
+                )?;
+                crate::storage::witness_ledger::insert_witness(
+                    conn,
+                    &crate::storage::witness_ledger::WitnessLedgerRow {
+                        id: 0,
+                        project: "proj".into(),
+                        file: "/repo/src/lib.rs".into(),
+                        symbol: Some("old_fn".into()),
+                        span_start: Some(1),
+                        span_end: Some(3),
+                        stamp: "b3:2".into(),
+                        tier: "committed".into(),
+                        at_oid: Some("bbb".into()),
+                        source_kind: "backfill".into(),
+                        source_id: Some("bbb:old_fn".into()),
+                    },
+                )?;
+                let newest_witness = crate::storage::witness_ledger::latest_witness_for_symbol(
+                    conn,
+                    "proj",
+                    "/repo/src/lib.rs",
+                    Some("old_fn"),
+                )?
+                .expect("second witness must exist");
+                crate::storage::witness_verdicts::insert_verdict_if_changed(
+                    conn,
+                    &crate::storage::witness_verdicts::WitnessVerdictRow {
+                        witness_id: newest_witness.id,
+                        verdict: crate::storage::witness_verdicts::VerdictKind::AnchorObsolete,
+                        successor_witness_id: None,
+                        receipt_oid: Some("cafebabe".into()),
+                        observed_head_oid: "cafebabe".into(),
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
         let chunks: Vec<_> = enriched.iter().map(|result| result.chunk.clone()).collect();
-        let validity = reduce_validity_hits(hits, &chunks);
+        let validity = resolve_validity_with(&storage, &chunks, true);
 
         assert!(is_demote_channel(&validity, "chunk-stale"));
         assert!(!validity.contains_key("chunk-live"));
+        assert!(
+            resolve_validity_with(&storage, std::slice::from_ref(&chunks[1]), true).is_empty(),
+            "a retrieval window containing only the clean sibling must not inherit the verdict"
+        );
 
         let rerank_ids: Vec<&str> = enriched
             .iter()
@@ -3641,7 +3669,7 @@ mod tests {
         assert!(enriched[1].validity_demoted);
         assert_eq!(
             enriched[1].resolution.as_deref(),
-            Some("[stale anchor] old_fn no longer in current code (receipt abc1234)")
+            Some("[stale anchor] old_fn no longer in current code (receipt cafebab)")
         );
     }
 
@@ -3883,6 +3911,9 @@ mod tests {
             enriched_result_conv("valid-2", "conv-clean-2", 0.80, 2),
         ];
         enriched[0].chunk.content = "old_fn stale claim".into();
+        for result in &enriched {
+            storage.insert_chunk(&result.chunk, &[1.0, 0.0]).unwrap();
+        }
         let chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
         let validity = resolve_validity_with(&storage, &chunks, true);
 
@@ -4119,6 +4150,9 @@ mod tests {
             enriched_result_conv("valid-1", "conv-clean-1", 0.90, 2),
             enriched_result_conv("valid-2", "conv-clean-2", 0.80, 3),
         ];
+        for result in &enriched {
+            storage.insert_chunk(&result.chunk, &[1.0, 0.0]).unwrap();
+        }
         (storage, enriched)
     }
 
@@ -4239,6 +4273,7 @@ mod tests {
     #[test]
     fn validity_note_exact_wording_demote() {
         let hit = ChunkWitnessVerdict {
+            chunk_id: "chunk-demote".into(),
             file: "/repo/src/lib.rs".into(),
             symbol: Some("old_fn".into()),
             channel: VerdictChannel::Demote,
@@ -4254,6 +4289,7 @@ mod tests {
     #[test]
     fn validity_note_exact_wording_annotate() {
         let hit = ChunkWitnessVerdict {
+            chunk_id: "chunk-annotate".into(),
             file: "/repo/src/lib.rs".into(),
             symbol: Some("foo".into()),
             channel: VerdictChannel::Annotate,
@@ -4271,6 +4307,7 @@ mod tests {
         // One chunk touching two symbols — one demoted, one merely evolved —
         // takes its own strongest channel without affecting sibling chunks.
         let demote_hit = ChunkWitnessVerdict {
+            chunk_id: "chunk-both".into(),
             file: "/repo/src/a.rs".into(),
             symbol: Some("gone_fn".into()),
             channel: VerdictChannel::Demote,
@@ -4278,6 +4315,7 @@ mod tests {
             receipt_oid: Some("head1".into()),
         };
         let annotate_hit = ChunkWitnessVerdict {
+            chunk_id: "chunk-both".into(),
             file: "/repo/src/b.rs".into(),
             symbol: Some("evolved_fn".into()),
             channel: VerdictChannel::Annotate,
@@ -4287,7 +4325,7 @@ mod tests {
         let mut chunk = enriched_result_conv("chunk-both", "conv-both", 0.9, 0).chunk;
         chunk.content = "gone_fn and evolved_fn".into();
         let validity = reduce_validity_hits(
-            BTreeMap::from([("conv-both".into(), vec![annotate_hit, demote_hit])]),
+            BTreeMap::from([("chunk-both".into(), vec![annotate_hit, demote_hit])]),
             &[chunk],
         );
         assert!(is_demote_channel(&validity, "chunk-both"));
@@ -4305,6 +4343,22 @@ mod tests {
     /// genuine Demote-channel verdict for `conv-demoted` (symbol `old_fn`,
     /// receipt `deadbeef00`) — shared by every DB-backed e2e fixture.
     fn install_demote_verdict(storage: &Arc<Storage>) {
+        install_demote_verdict_for(
+            storage,
+            "/repo/src/lib.rs",
+            "old_fn",
+            "conv-demoted",
+            "conv-demoted-new",
+        );
+    }
+
+    fn install_demote_verdict_for(
+        storage: &Arc<Storage>,
+        file: &str,
+        symbol: &str,
+        first_conv_id: &str,
+        last_conv_id: &str,
+    ) -> i64 {
         use crate::storage::codegraph::{upsert_node, NodeRow};
         use crate::storage::witness_ledger::{self, WitnessLedgerRow};
         use crate::storage::witness_verdicts::{self, VerdictKind, WitnessVerdictRow};
@@ -4314,24 +4368,19 @@ mod tests {
                 upsert_node(
                     conn,
                     &NodeRow {
-                        id: crate::extraction::codegraph::node_id(
-                            "proj",
-                            "/repo/src/lib.rs",
-                            "function",
-                            "old_fn",
-                        ),
+                        id: crate::extraction::codegraph::node_id("proj", file, "function", symbol),
                         repo: "proj".into(),
                         project: "proj".into(),
-                        file: "/repo/src/lib.rs".into(),
+                        file: file.into(),
                         lang: "rust".into(),
                         kind: "function".into(),
-                        name: "old_fn".into(),
+                        name: symbol.into(),
                         fqname: String::new(),
                         body_hash: String::new(),
                         span_start: 1,
                         span_end: 3,
-                        first_conv_id: "conv-demoted".into(),
-                        last_conv_id: "conv-demoted".into(),
+                        first_conv_id: first_conv_id.into(),
+                        last_conv_id: last_conv_id.into(),
                         last_session_id: "sess".into(),
                         repo_root: None,
                         name_only: false,
@@ -4343,25 +4392,21 @@ mod tests {
                     &WitnessLedgerRow {
                         id: 0,
                         project: "proj".into(),
-                        file: "/repo/src/lib.rs".into(),
-                        symbol: Some("old_fn".into()),
+                        file: file.into(),
+                        symbol: Some(symbol.into()),
                         span_start: Some(1),
                         span_end: Some(3),
                         stamp: "b3:1".into(),
                         tier: "committed".into(),
                         at_oid: Some("aaa".into()),
                         source_kind: "backfill".into(),
-                        source_id: Some("aaa".into()),
+                        source_id: Some(format!("aaa:{symbol}")),
                     },
                 )?;
-                let wid = witness_ledger::latest_witness_for_symbol(
-                    conn,
-                    "proj",
-                    "/repo/src/lib.rs",
-                    Some("old_fn"),
-                )?
-                .unwrap()
-                .id;
+                let wid =
+                    witness_ledger::latest_witness_for_symbol(conn, "proj", file, Some(symbol))?
+                        .unwrap()
+                        .id;
                 witness_verdicts::insert_verdict_if_changed(
                     conn,
                     &WitnessVerdictRow {
@@ -4372,9 +4417,9 @@ mod tests {
                         observed_head_oid: "deadbeef00".into(),
                     },
                 )?;
-                Ok(())
+                Ok(wid)
             })
-            .unwrap();
+            .unwrap()
     }
 
     fn e2e_fixture() -> (Arc<Storage>, Arc<RwLock<SearchEngine>>) {
@@ -4424,7 +4469,7 @@ mod tests {
             (
                 mk(
                     "chunk-fts",
-                    "conv-demoted",
+                    "conv-demoted-new",
                     "zebraquark keyword only claim",
                     3,
                 ),
@@ -4495,7 +4540,7 @@ mod tests {
             (
                 mk(
                     "chunk-demoted-new",
-                    "conv-demoted",
+                    "conv-demoted-new",
                     &new_ts,
                     "recent stale old_fn claim",
                     1,
@@ -5094,7 +5139,6 @@ mod tests {
         // candidates exist) — so the single adaptive refetch at 10*limit
         // must surface the valid pair from beyond the first window.
         let storage = Arc::new(Storage::open_memory().unwrap());
-        install_demote_verdict(&storage);
 
         let now = chrono::Utc::now().to_rfc3339();
         let mk =
@@ -5112,10 +5156,20 @@ mod tests {
             };
         let mut engine = SearchEngine::new(32);
         for i in 0..8 {
+            let symbol = format!("old_fn_{i}");
+            let conversation_id = format!("conv-demoted-{i}");
+            let file = format!("/repo/src/stale_{i}.rs");
+            install_demote_verdict_for(
+                &storage,
+                &file,
+                &symbol,
+                &conversation_id,
+                &conversation_id,
+            );
             let chunk = mk(
                 &format!("chunk-demoted-{i}"),
-                "conv-demoted",
-                &format!("stale claim number {i} about old_fn"),
+                &conversation_id,
+                &format!("stale claim number {i}"),
                 i,
             );
             // cos ≈ 1.0 against [1,0,0,0] — every demoted chunk outranks

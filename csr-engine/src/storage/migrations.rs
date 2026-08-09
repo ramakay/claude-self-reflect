@@ -338,6 +338,12 @@ pub fn run(conn: &Connection) -> Result<()> {
         if !has_repo_root_nodes {
             let _ = conn.execute_batch("ALTER TABLE code_nodes ADD COLUMN repo_root TEXT;");
         }
+        let has_last_chunk_id: bool = conn
+            .prepare("SELECT last_chunk_id FROM code_nodes LIMIT 0")
+            .is_ok();
+        if !has_last_chunk_id {
+            let _ = conn.execute_batch("ALTER TABLE code_nodes ADD COLUMN last_chunk_id TEXT;");
+        }
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_code_nodes_repo_root ON code_nodes(repo_root);",
         );
@@ -838,7 +844,15 @@ pub fn run(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_witness_verdicts_witness ON witness_verdicts(witness_id);
-        DROP INDEX IF EXISTS idx_witness_verdicts_identity;",
+        DROP INDEX IF EXISTS idx_witness_verdicts_identity;
+
+        CREATE TABLE IF NOT EXISTS witness_chunk_bindings (
+            witness_id INTEGER NOT NULL REFERENCES witness_ledger(id),
+            chunk_id TEXT NOT NULL,
+            PRIMARY KEY (witness_id, chunk_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_witness_chunk_bindings_chunk
+            ON witness_chunk_bindings(chunk_id);",
     )?;
 
     // Recap normalizes SQLite and RFC3339 timestamps through julianday(). This

@@ -120,10 +120,19 @@ fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
     let repo_root = crate::extraction::repo_root::repo_root_for_file(&stored_path_str);
 
     let storage = engine.storage();
+    let source_chunk_id = storage.latest_chunk_id_for_conversation(&conv_id)?;
     for node in &fragment.nodes {
         let mut node = node.clone();
         node.repo_root = repo_root.clone();
+        let changed = storage
+            .get_code_node(&node.id)?
+            .is_none_or(|stored| stored.body_hash != node.body_hash);
         storage.upsert_code_node(&node)?;
+        if changed {
+            if let Some(chunk_id) = source_chunk_id.as_deref() {
+                storage.set_code_node_last_chunk(&node.id, chunk_id)?;
+            }
+        }
     }
     let seen_node_ids: Vec<String> = fragment.nodes.iter().map(|n| n.id.clone()).collect();
     // Only a CLEAN parse may drive the destructive half. A partial parse still
@@ -606,6 +615,68 @@ mod tests {
         assert_ne!(
             functions_added, "[]",
             "functions_added must contain real AST diff, not an empty touch array"
+        );
+    }
+
+    #[test]
+    fn code_graph_records_latest_chunk_only_for_changed_nodes() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("lib.rs");
+        std::fs::write(&file, "fn changed() { 1; }\nfn sibling() { 2; }\n").unwrap();
+        let canonical_file = file.canonicalize().unwrap();
+        let input = crate::hooks::HookInput {
+            transcript_path: Some(tmp.path().join("conv.jsonl").to_string_lossy().to_string()),
+            session_id: Some("session".into()),
+            tool_name: Some("Edit".into()),
+            tool_input: Some(serde_json::json!({
+                "file_path": canonical_file.to_string_lossy().to_string()
+            })),
+            ..Default::default()
+        };
+        let chunk = |id: &str, seq: usize| crate::import::ConversationChunk {
+            id: id.into(),
+            conversation_id: "conv".into(),
+            project_name: "proj".into(),
+            timestamp: "2026-08-09T00:00:00Z".into(),
+            content: "tool edit".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq,
+            is_sidechain: false,
+        };
+
+        storage
+            .insert_chunk(&chunk("chunk-1", 0), &[0.0; 4])
+            .unwrap();
+        update_code_graph(&input, &engine).unwrap();
+
+        storage
+            .insert_chunk(&chunk("chunk-2", 1), &[0.0; 4])
+            .unwrap();
+        std::fs::write(
+            &canonical_file,
+            "fn changed() { 3; }\nfn sibling() { 2; }\n",
+        )
+        .unwrap();
+        update_code_graph(&input, &engine).unwrap();
+
+        let attributions: std::collections::HashMap<String, Option<String>> = storage
+            .with_connection(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT name, last_chunk_id FROM code_nodes
+                     WHERE name IN ('changed', 'sibling')",
+                )?;
+                let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(attributions.get("changed"), Some(&Some("chunk-2".into())));
+        assert_eq!(
+            attributions.get("sibling"),
+            Some(&Some("chunk-1".into())),
+            "an unchanged sibling must not inherit the later edit chunk"
         );
     }
 }

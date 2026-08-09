@@ -282,21 +282,26 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     raw_results.extend(chunk_results);
     raw_results.extend(reflection_results);
 
-    let mut ancestry_conversations: Vec<String> = raw_results
+    let ancestry_chunks: Vec<(String, String)> = raw_results
         .iter()
         .filter(|result| result.source == "chunk")
-        .filter_map(|result| result.conversation_id.clone())
+        .filter_map(|result| Some((result.memory_id.clone()?, result.conversation_id.clone()?)))
+        .collect();
+    let mut ancestry_conversations: Vec<String> = ancestry_chunks
+        .iter()
+        .map(|(_, conversation_id)| conversation_id.clone())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
     ancestry_conversations.sort();
     let ancestry_releases =
-        crate::mcp::tools::resolve_validity_for_ancestry(storage, &ancestry_conversations)
+        crate::mcp::tools::resolve_validity_for_ancestry(storage, &ancestry_chunks)
             .map(|validity| {
                 ancestry_releases_for_prompt(
                     storage
                         .ancestry_labels_for_conversations(&ancestry_conversations)
                         .unwrap_or_default(),
+                    &ancestry_chunks,
                     &validity,
                 )
             })
@@ -465,17 +470,17 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
 
 fn ancestry_releases_for_prompt(
     labels: HashMap<String, crate::storage::ancestry::AncestryLabel>,
+    chunks: &[(String, String)],
     validity: &HashMap<String, crate::mcp::tools::ConvValidity>,
 ) -> HashMap<String, u32> {
-    labels
-        .into_iter()
-        .filter(|(conversation_id, _)| {
-            !crate::mcp::tools::is_demote_channel(validity, conversation_id)
-        })
-        .filter_map(|(conversation_id, label)| {
-            label
-                .releases_behind_for_decay()
-                .map(|releases| (conversation_id, releases))
+    chunks
+        .iter()
+        .filter(|(chunk_id, _)| !crate::mcp::tools::is_demote_channel(validity, chunk_id))
+        .filter_map(|(chunk_id, conversation_id)| {
+            labels
+                .get(conversation_id)
+                .and_then(|label| label.releases_behind_for_decay())
+                .map(|releases| (chunk_id.clone(), releases))
         })
         .collect()
 }
@@ -1246,7 +1251,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_ancestry_excludes_demote_channel_with_shared_guard() {
+    fn prompt_ancestry_excludes_only_demoted_chunk_in_shared_conversation() {
         use crate::storage::ancestry::{AncestryLabel, AncestryState};
 
         let label = |conversation_id: &str| AncestryLabel {
@@ -1257,14 +1262,13 @@ mod tests {
             repository: "/repo".into(),
             refreshed_at: "2026-08-06T12:00:00Z".into(),
         };
-        let labels = [
-            ("demoted".into(), label("demoted")),
-            ("clean".into(), label("clean")),
-        ]
-        .into_iter()
-        .collect();
+        let labels = [("shared".into(), label("shared"))].into_iter().collect();
+        let chunks = vec![
+            ("chunk-demoted".to_string(), "shared".to_string()),
+            ("chunk-clean".to_string(), "shared".to_string()),
+        ];
         let validity = [(
-            "demoted".into(),
+            "chunk-demoted".into(),
             crate::mcp::tools::ConvValidity {
                 demote: true,
                 note: "stale".into(),
@@ -1273,10 +1277,10 @@ mod tests {
         .into_iter()
         .collect();
 
-        let releases = ancestry_releases_for_prompt(labels, &validity);
+        let releases = ancestry_releases_for_prompt(labels, &chunks, &validity);
 
-        assert!(!releases.contains_key("demoted"));
-        assert_eq!(releases.get("clean"), Some(&5));
+        assert!(!releases.contains_key("chunk-demoted"));
+        assert_eq!(releases.get("chunk-clean"), Some(&5));
     }
 
     // --- episode recency ranking (Route B stale-anchor fix) ---

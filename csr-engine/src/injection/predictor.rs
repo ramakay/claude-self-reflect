@@ -87,7 +87,7 @@ pub fn rank_results_with_continuity(
 }
 
 /// Prompt-submit ranking with precomputed release ancestry. The map is keyed
-/// by conversation id and is populated only for chunk results; reflections
+/// by chunk id and is populated only for chunk results; reflections
 /// retain their existing recency behavior.
 pub fn rank_results_with_continuity_and_ancestry(
     results: Vec<RawResult>,
@@ -112,7 +112,7 @@ pub fn rank_results_with_continuity_and_ancestry(
             let releases_behind = if crate::search::rerank::is_scaffold_text(&r.content) {
                 None
             } else {
-                r.conversation_id
+                r.memory_id
                     .as_ref()
                     .and_then(|id| ancestry_releases.get(id))
                     .copied()
@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(current_release.to_bits(), pre_change.to_bits());
 
         let live_timestamp = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
-        let raw = |content: &str, conversation_id: &str| RawResult {
+        let raw = |content: &str, conversation_id: &str, chunk_id: &str| RawResult {
             content: content.into(),
             score: 0.8,
             source: "chunk".into(),
@@ -392,15 +392,18 @@ mod tests {
             error_patterns: vec![],
             tags: vec![],
             conversation_id: Some(conversation_id.into()),
-            memory_id: None,
+            memory_id: Some(chunk_id.into()),
         };
         let ranked = rank_results_with_continuity_and_ancestry(
-            vec![raw("released", "conv-released"), raw("fresh", "conv-fresh")],
+            vec![
+                raw("released", "conv-released", "chunk-released"),
+                raw("fresh", "conv-fresh", "chunk-fresh"),
+            ],
             &[],
             &[],
             None,
             None,
-            &[("conv-released".into(), 5)].into_iter().collect(),
+            &[("chunk-released".into(), 5)].into_iter().collect(),
         );
         let released = ranked.iter().find(|r| r.content == "released").unwrap();
         let fresh = ranked.iter().find(|r| r.content == "fresh").unwrap();

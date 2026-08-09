@@ -205,6 +205,17 @@ pub fn upsert_node(conn: &Connection, n: &NodeRow) -> Result<()> {
     Ok(())
 }
 
+/// Record the exact transcript chunk containing the latest tool edit that
+/// produced this node. Kept outside [`NodeRow`] so historical/backfill graph
+/// writers cannot accidentally overwrite live transcript attribution.
+pub fn set_last_chunk_id(conn: &Connection, node_id: &str, chunk_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE code_nodes SET last_chunk_id = ?2 WHERE id = ?1",
+        params![node_id, chunk_id],
+    )?;
+    Ok(())
+}
+
 /// Per-file edge replace (Codex #3): delete every edge extracted from `src_file`,
 /// then bulk-insert the fresh set. Single transaction — no stale fan-out.
 ///

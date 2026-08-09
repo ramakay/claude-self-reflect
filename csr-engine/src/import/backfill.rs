@@ -1285,7 +1285,7 @@ fn stamp_spans_into_cancellable_with(
             bool,
         ) = match rederived {
             Some((nodes, containers)) => (nodes, containers, "backfill_rederived_v2", true),
-            None => (file_nodes, Vec::new(), "backfill", false),
+            None => (file_nodes.clone(), Vec::new(), "backfill", false),
         };
         let defs: Vec<(String, String, i64, i64)> = stamp_nodes
             .iter()
@@ -1293,6 +1293,31 @@ fn stamp_spans_into_cancellable_with(
             .collect();
         let (qualified_symbols, disambiguated) = qualify_witness_symbols(&defs, &containers);
         stats.disambiguated_symbols += disambiguated;
+        let attribution_node_ids: Vec<Option<String>> = stamp_nodes
+            .iter()
+            .map(|node| {
+                if !is_rederived {
+                    return Some(node.id.clone());
+                }
+                let exact: Vec<&NodeRow> = file_nodes
+                    .iter()
+                    .filter(|stored| {
+                        stored.kind == node.kind
+                            && stored.name == node.name
+                            && stored.span_start == node.span_start
+                            && stored.span_end == node.span_end
+                    })
+                    .collect();
+                if exact.len() == 1 {
+                    return Some(exact[0].id.clone());
+                }
+                let same_anchor: Vec<&NodeRow> = file_nodes
+                    .iter()
+                    .filter(|stored| stored.kind == node.kind && stored.name == node.name)
+                    .collect();
+                (same_anchor.len() == 1).then(|| same_anchor[0].id.clone())
+            })
+            .collect();
 
         let generation_id = Uuid::new_v4().to_string();
         let generation = |status: &str| witness_ledger::WitnessGeneration {
@@ -1351,23 +1376,26 @@ fn stamp_spans_into_cancellable_with(
                     if dry_run {
                         continue;
                     }
-                    pending_rows.push(WitnessLedgerRow {
-                        id: 0,
-                        project: project.clone(),
-                        file: file.clone(),
-                        symbol: Some(symbol.clone()),
-                        span_start: Some(node.span_start),
-                        span_end: Some(node.span_end),
-                        stamp,
-                        tier: "committed".to_string(),
-                        at_oid: Some(at_oid_str.clone()),
-                        source_kind: source_kind.to_string(),
-                        source_id: Some(if is_rederived {
-                            generation_id.clone()
-                        } else {
-                            at_oid_str.clone()
-                        }),
-                    });
+                    pending_rows.push((
+                        WitnessLedgerRow {
+                            id: 0,
+                            project: project.clone(),
+                            file: file.clone(),
+                            symbol: Some(symbol.clone()),
+                            span_start: Some(node.span_start),
+                            span_end: Some(node.span_end),
+                            stamp,
+                            tier: "committed".to_string(),
+                            at_oid: Some(at_oid_str.clone()),
+                            source_kind: source_kind.to_string(),
+                            source_id: Some(if is_rederived {
+                                generation_id.clone()
+                            } else {
+                                at_oid_str.clone()
+                            }),
+                        },
+                        attribution_node_ids[idx].clone(),
+                    ));
                 }
                 Err(e) => {
                     stats.skipped_stamp_error += 1;
@@ -1391,8 +1419,13 @@ fn stamp_spans_into_cancellable_with(
             } else if !dry_run && !pending_rows.is_empty() {
                 if let Err(e) = storage.with_connection(|conn| {
                     let tx = conn.unchecked_transaction()?;
-                    for row in &pending_rows {
+                    for (row, node_id) in &pending_rows {
                         witness_ledger::insert_witness(&tx, row)?;
+                        if let Some(node_id) = node_id {
+                            crate::storage::witness_verdicts::bind_witness_row_to_node_chunk(
+                                &tx, row, node_id,
+                            )?;
+                        }
                     }
                     if is_rederived {
                         witness_ledger::insert_generation(&tx, &generation("complete"))?;
@@ -2635,14 +2668,36 @@ mod tests {
 
         let storage = Storage::open_memory().unwrap();
         storage
+            .insert_chunk(
+                &crate::import::ConversationChunk {
+                    id: "chunk-foo-edit".into(),
+                    conversation_id: "conv".into(),
+                    project_name: "proj".into(),
+                    timestamp: "2026-08-09T00:00:00Z".into(),
+                    content: "edited foo".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: crate::provenance::Speaker::Assistant,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                &[0.0; 4],
+            )
+            .unwrap();
+        storage
             .with_connection(|conn| {
-                let mut foo = attr_node("n-foo", &file_path, "foo");
+                let foo_id =
+                    crate::extraction::codegraph::node_id("proj", &file_path, "function", "foo");
+                let mut foo = attr_node(&foo_id, &file_path, "foo");
                 foo.repo_root = Some(repo_root.clone());
                 foo.span_start = 0;
                 foo.span_end = 2;
                 codegraph_upsert_node(conn, &foo).unwrap();
+                crate::storage::codegraph::set_last_chunk_id(conn, &foo_id, "chunk-foo-edit")?;
 
-                let mut bar = attr_node("n-bar", &file_path, "bar");
+                let bar_id =
+                    crate::extraction::codegraph::node_id("proj", &file_path, "function", "bar");
+                let mut bar = attr_node(&bar_id, &file_path, "bar");
                 bar.repo_root = Some(repo_root.clone());
                 bar.span_start = 4;
                 bar.span_end = 6;
@@ -2681,6 +2736,25 @@ mod tests {
         assert_eq!(foo_row.stamp, expected_foo.stamp().as_str());
         assert_eq!(foo_row.span_start, Some(0));
         assert_eq!(foo_row.span_end, Some(2));
+        storage
+            .with_connection(|conn| {
+                let bound_chunk: String = conn.query_row(
+                    "SELECT chunk_id FROM witness_chunk_bindings WHERE witness_id = ?1",
+                    rusqlite::params![foo_row.id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(bound_chunk, "chunk-foo-edit");
+                let bar_bindings: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM witness_chunk_bindings b
+                     JOIN witness_ledger w ON w.id = b.witness_id
+                     WHERE w.symbol = 'bar'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(bar_bindings, 0, "unattributed sibling must stay unbound");
+                Ok(())
+            })
+            .unwrap();
 
         // Idempotency plus cadence short-circuit: rerunning at the same HEAD
         // and extractor version must do no blob parsing or span stamping.

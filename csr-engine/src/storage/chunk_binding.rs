@@ -20,15 +20,11 @@
 //!    where `receipt_oid` is the receipt of the most recent negative event
 //!    for the symbol.
 //!
-//! Rationale: symbol-level binding cannot attribute staleness to individual
-//! chunk COHORTS — chunks minted in the A era and chunks minted in the B
-//! era share the same `(conversation -> symbol)` binding, so demoting on
-//! evolution would punish current-truth chunks alongside stale ones. v10
-//! therefore never demotes on evolution — it annotates with the receipt and
-//! lets the reader decide. (Corollary: a fully-reverted A -> B -> A still
-//! surfaces as Annotate, because B's witness keeps an uncancelled negative
-//! event while the A witnesses are intact at HEAD — "the symbol carries
-//! history of a rejected change".)
+//! Exact `witness_chunk_bindings` carry the stable chunk id to consumers.
+//! Legacy witnesses without that relation surface a conversation-only hit;
+//! the storage facade may safely recover it only when the complete persisted
+//! conversation has one chunk. Ambiguous multi-chunk legacy evidence abstains
+//! instead of guessing from chunk text or demoting siblings.
 //!
 //! # The actual link: `code_nodes.first_conv_id` / `last_conv_id`
 //!
@@ -89,10 +85,12 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::codegraph::{self, NodeRow};
-use super::witness_verdicts::{self, VerdictChannel};
+use super::witness_verdicts;
+#[cfg(test)]
+use super::witness_verdicts::VerdictChannel;
 
 use super::witness_ledger::WITNESS_EXTRACTOR_VERSION as CURRENT_EXTRACTOR_VERSION;
 
@@ -333,25 +331,7 @@ fn selected_lineage(
     Ok(selection)
 }
 
-/// One verdict hit surfaced for a chunk's conversation — carries the
-/// two-channel contract's `channel` (see the module doc's "Two-channel
-/// consumption") alongside the raw verdict and receipt.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ChunkWitnessVerdict {
-    pub file: String,
-    /// `None` only if a future caller ever binds against a whole-file
-    /// witness; `nodes_for_conversations` only returns symbol-level nodes
-    /// today, so this is always `Some` in practice.
-    pub symbol: Option<String>,
-    /// `Demote` (rank-affecting: symbol gone/fully stale at HEAD) or
-    /// `Annotate` (no rank effect: "symbol evolved since earlier evidence;
-    /// current as of `receipt_oid`").
-    pub channel: VerdictChannel,
-    /// `"anchor_obsolete"` | `"superseded_by"` — always negative (reinstated
-    /// verdicts are filtered out before a row is ever constructed).
-    pub verdict: &'static str,
-    pub receipt_oid: Option<String>,
-}
+pub use super::witness_verdicts::ChunkWitnessVerdict;
 
 /// The two known container separators `import::backfill::container_spans`
 /// mints (`"::"` for Rust, `"."` for the rest) — see this module's doc
@@ -454,7 +434,8 @@ fn resolve_bound_symbol(witness_symbols: &[String], bare_name: &str) -> Option<S
 
 /// Given conversation/chunk identifiers appearing in search results, resolve
 /// their bound witnesses via the code graph and return, per conversation, a
-/// `Vec` of `{file, symbol, channel: Demote|Annotate, verdict, receipt_oid}`
+/// `Vec` of `{chunk_id, file, symbol, channel: Demote|Annotate, verdict,
+/// receipt_oid}`
 /// hits per `witness_verdicts::symbol_verdict_state`'s order-independent
 /// two-channel rule (see the module doc's "Two-channel consumption" and
 /// that module's "Symbol-level current state"). Conversation ids whose
@@ -555,6 +536,12 @@ pub fn witness_verdict_for_chunks(
     }
 
     let states = witness_verdicts::symbol_verdict_states_for_lineages(&tx, &state_anchors)?;
+    let negative_witness_ids: Vec<i64> = states
+        .values()
+        .flat_map(|state| state.negative_witness_ids.iter().copied())
+        .collect();
+    let chunk_bindings =
+        witness_verdicts::chunk_bindings_for_witnesses(&tx, &negative_witness_ids)?;
 
     for (idx, convs, bound_symbol) in resolved {
         let node = &nodes[idx];
@@ -572,6 +559,7 @@ pub fn witness_verdict_for_chunks(
         );
 
         let hit = ChunkWitnessVerdict {
+            chunk_id: String::new(),
             file: node.file.clone(),
             symbol: Some(bound_symbol.clone()),
             channel: state.channel,
@@ -579,7 +567,27 @@ pub fn witness_verdict_for_chunks(
             receipt_oid: state.representative.receipt_oid.clone(),
         };
         for conv in convs {
-            out.entry(conv.clone()).or_default().push(hit.clone());
+            let mut exact_chunk_ids = BTreeSet::new();
+            let mut has_exact_binding = false;
+            for witness_id in &state.negative_witness_ids {
+                if let Some(bindings) = chunk_bindings.get(witness_id) {
+                    has_exact_binding = true;
+                    for (chunk_id, conversation_id) in bindings {
+                        if conversation_id == conv {
+                            exact_chunk_ids.insert(chunk_id.clone());
+                        }
+                    }
+                }
+            }
+            if has_exact_binding {
+                for chunk_id in exact_chunk_ids {
+                    let mut bound_hit = hit.clone();
+                    bound_hit.chunk_id = chunk_id;
+                    out.entry(conv.clone()).or_default().push(bound_hit);
+                }
+            } else {
+                out.entry(conv.clone()).or_default().push(hit.clone());
+            }
         }
     }
 

@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::import::{ConversationChunk, CsrSuppressionStats};
 
@@ -1002,6 +1002,26 @@ impl Storage {
         codegraph::upsert_node(&conn, node)
     }
 
+    pub fn set_code_node_last_chunk(&self, node_id: &str, chunk_id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::set_last_chunk_id(&conn, node_id, chunk_id)
+    }
+
+    pub fn latest_chunk_id_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.query_row(
+            "SELECT id FROM chunks WHERE conversation_id = ?1
+             ORDER BY COALESCE(seq, -1) DESC, rowid DESC LIMIT 1",
+            rusqlite::params![conversation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn replace_code_file_edges(
         &self,
         project: &str,
@@ -1282,6 +1302,84 @@ impl Storage {
     ) -> Result<std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         chunk_binding::witness_verdict_for_chunks(&conn, conversation_ids)
+    }
+
+    /// Resolve verdict hits to stable chunk ids before returning them to a
+    /// ranking consumer. Exact chunk ids pass through unchanged. Legacy
+    /// conversation-keyed hits are rebound only when the supplied batch has
+    /// exactly one chunk for that conversation; ambiguous bindings abstain.
+    pub fn witness_verdicts_for_chunks(
+        &self,
+        chunks: &[(String, String)],
+    ) -> Result<std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>>> {
+        use std::collections::{BTreeMap, HashMap, HashSet};
+
+        let mut conversation_ids: Vec<String> = chunks
+            .iter()
+            .map(|(_, conversation_id)| conversation_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        conversation_ids.sort();
+        let grouped = self.witness_verdicts_for_conversations(&conversation_ids)?;
+        let candidate_owners: HashMap<&str, &str> = chunks
+            .iter()
+            .map(|(chunk_id, conversation_id)| (chunk_id.as_str(), conversation_id.as_str()))
+            .collect();
+        let mut persisted_by_conversation: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            const BATCH: usize = 400;
+            for batch in conversation_ids.chunks(BATCH) {
+                let placeholders: Vec<String> =
+                    (1..=batch.len()).map(|i| format!("?{i}")).collect();
+                let sql = format!(
+                    "SELECT id, conversation_id FROM chunks
+                     WHERE conversation_id IN ({}) ORDER BY conversation_id, id",
+                    placeholders.join(", ")
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (chunk_id, conversation_id) = row?;
+                    persisted_by_conversation
+                        .entry(conversation_id)
+                        .or_default()
+                        .push(chunk_id);
+                }
+            }
+        }
+
+        let mut by_chunk = BTreeMap::new();
+        for (conversation_id, hits) in grouped {
+            for mut hit in hits {
+                let bound_chunk_id = if candidate_owners.get(hit.chunk_id.as_str())
+                    == Some(&conversation_id.as_str())
+                {
+                    Some(hit.chunk_id.clone())
+                } else if hit.chunk_id.is_empty() {
+                    persisted_by_conversation
+                        .get(&conversation_id)
+                        .and_then(|ids| (ids.len() == 1).then(|| ids[0].clone()))
+                        .filter(|id| {
+                            candidate_owners.get(id.as_str()) == Some(&conversation_id.as_str())
+                        })
+                } else {
+                    None
+                };
+                let Some(bound_chunk_id) = bound_chunk_id else {
+                    continue;
+                };
+                hit.chunk_id = bound_chunk_id.clone();
+                by_chunk
+                    .entry(bound_chunk_id)
+                    .or_insert_with(Vec::new)
+                    .push(hit);
+            }
+        }
+        Ok(by_chunk)
     }
 
     // ─── Session registry / aux coverage ───
