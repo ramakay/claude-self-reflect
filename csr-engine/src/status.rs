@@ -713,8 +713,23 @@ fn format_compact(report: &StatusReport) -> String {
         report.projects,
         format_narrative_segment(&report.narratives),
     );
-    // v10 "dreaming": only speak up when there's something to forget —
-    // terse by design, matching the rest of this line's style.
+    // I7: dreams are user-facing under the AnnotateOnly default — show the
+    // verdict count whenever any exist; otherwise say when a cycle is
+    // overdue so "no dreams" is distinguishable from "daemon never ran".
+    if report.dream.events_total > 0 {
+        out.push_str(&format!(" | ☾ {} dreams", report.dream.events_total));
+    } else if report.dream.daemon_enabled
+        && report
+            .dream
+            .next_due
+            .as_deref()
+            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+            .is_some_and(|due| due < chrono::Utc::now())
+    {
+        out.push_str(" | ☾ due");
+    }
+    // v10 "dreaming" Full channel: only speak up when there's something to
+    // forget — terse by design, matching the rest of this line's style.
     if report.dream.demoted_symbols > 0 {
         out.push_str(&format!(" | ☾ {} forgotten", report.dream.demoted_symbols));
     }
@@ -833,6 +848,59 @@ mod tests {
         assert!(
             line.contains("☾ 3 forgotten"),
             "must surface the demoted count: {line:?}"
+        );
+        assert!(
+            line.contains("☾ 3 dreams"),
+            "verdict events must also surface as dreams: {line:?}"
+        );
+    }
+
+    #[test]
+    fn test_compact_shows_dreams_segment_without_demotion() {
+        let mut report = base_report();
+        report.dream.events_total = 545;
+        let line = format_compact(&report);
+        assert!(
+            line.contains("☾ 545 dreams"),
+            "annotate-only verdicts must be visible: {line:?}"
+        );
+        assert!(
+            !line.contains("forgotten"),
+            "no demotion, no forgotten segment: {line:?}"
+        );
+    }
+
+    #[test]
+    fn test_compact_shows_due_when_daemon_overdue_and_no_events() {
+        let mut report = base_report();
+        report.dream.daemon_enabled = true;
+        report.dream.next_due = Some("2020-01-01T00:00:00+00:00".into());
+        let line = format_compact(&report);
+        assert!(
+            line.contains("☾ due"),
+            "overdue daemon with zero events must say due: {line:?}"
+        );
+
+        // Future due date -> silent.
+        report.dream.next_due = Some("2099-01-01T00:00:00+00:00".into());
+        let line = format_compact(&report);
+        assert!(
+            !line.contains('☾'),
+            "not yet due must stay silent: {line:?}"
+        );
+    }
+
+    #[test]
+    fn test_compact_dream_segment_coexists_with_stale_marker() {
+        let mut report = base_report();
+        report.dream.events_total = 2;
+        report.mcp_binary_stale = true;
+        let line = format_compact(&report);
+        let dreams = line.find("☾ 2 dreams").expect("dreams segment present");
+        let stale = line.find("⟳ reconnect mcp").expect("stale marker present");
+        assert!(
+            dreams < stale,
+            "dreams renders before stale marker: {line:?}"
         );
     }
 
