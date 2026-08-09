@@ -375,9 +375,18 @@ pub(crate) fn parse_jsonl_file_with_stats(
             .get("isSidechain")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if !combined_text.is_empty() && !is_marker_only_text(&combined_text) {
+        // Marker-only suppression applies to ASSISTANT turns only. The grammar
+        // ("[Word: path]" / "[Word]") describes CSR's own rendering of a tool
+        // call, but a human can legitimately type exactly `[TODO]` or
+        // `[Note: review this]` as their whole message — dropping that is
+        // recall loss on genuine user content, which is strictly worse than
+        // keeping one content-free assistant marker.
+        let author = classify_message_author(&parsed);
+        let drop_as_marker = matches!(author, crate::provenance::Speaker::Assistant)
+            && is_marker_only_text(&combined_text);
+        if !combined_text.is_empty() && !drop_as_marker {
             messages.push(combined_text);
-            authors.push(classify_message_author(&parsed));
+            authors.push(author);
             sidechains.push(is_sidechain_msg);
         }
     }

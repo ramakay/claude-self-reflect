@@ -1047,20 +1047,47 @@ fn apply_why_recency_tiebreak(
     mut items: Vec<crate::search::reinstatement::EvidenceItem>,
     anchors: &HashMap<String, (String, String)>,
 ) -> Vec<crate::search::reinstatement::EvidenceItem> {
+    // Two phases, because a pairwise "near-tie" predicate is NOT transitive and
+    // must never be handed to sort_by: for same-anchor scores 0.90/0.86/0.82
+    // with ascending timestamps, A beats B and B beats C but C beats A. Rust
+    // requires a total order and may panic or order unpredictably otherwise.
+    //
+    // Phase 1: sort by score alone — a genuine total order.
     items.sort_by(|a, b| {
-        let same_anchor = match (anchors.get(&a.chunk_id), anchors.get(&b.chunk_id)) {
-            (Some(pa), Some(pb)) => pa == pb,
-            _ => false,
-        };
-        if same_anchor && (a.score - b.score).abs() <= WHY_RECENCY_EPSILON {
-            // Later timestamp first (RFC3339 strings sort lexicographically by time).
-            b.timestamp.cmp(&a.timestamp)
-        } else {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // Deterministic final key so equal scores never depend on input order.
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
+
+    // Phase 2: reorder only within each maximal run of ADJACENT items that share
+    // an anchor and sit within epsilon of the run's leader. Runs are disjoint, so
+    // no cross-run comparison happens and no cycle is possible. Items with no
+    // anchor, or whose neighbours differ, form runs of one and never move.
+    let mut start = 0;
+    while start < items.len() {
+        let anchor = anchors.get(&items[start].chunk_id);
+        let lead = items[start].score;
+        let mut end = start + 1;
+        if anchor.is_some() {
+            while end < items.len()
+                && anchors.get(&items[end].chunk_id) == anchor
+                && (lead - items[end].score).abs() <= WHY_RECENCY_EPSILON
+            {
+                end += 1;
+            }
+        }
+        if end - start > 1 {
+            // Later timestamp first (RFC3339 sorts lexicographically by time).
+            items[start..end].sort_by(|a, b| {
+                b.timestamp
+                    .cmp(&a.timestamp)
+                    .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+            });
+        }
+        start = end;
+    }
     items
 }
 
@@ -4316,6 +4343,48 @@ mod tests {
             excerpt: "excerpt".into(),
             ratification: None,
         }
+    }
+
+    /// The chain that a pairwise near-tie comparator gets wrong. Scores 0.90 /
+    /// 0.86 / 0.82 on one anchor: each adjacent pair is within epsilon but the
+    /// ends are 0.08 apart, so a pairwise predicate says A>B, B>C and C>A — a
+    /// cycle, which is not a valid total order and can make sort_by panic.
+    /// Every input permutation must produce the SAME output and must not panic.
+    #[test]
+    fn why_recency_tiebreak_is_a_total_order_on_an_epsilon_chain() {
+        let a = why_item("a", "conv-a", 0.90, "2026-01-01T00:00:00Z");
+        let b = why_item("b", "conv-b", 0.86, "2026-01-02T00:00:00Z");
+        let c = why_item("c", "conv-c", 0.82, "2026-01-03T00:00:00Z");
+        let mut anchors = HashMap::new();
+        for id in ["a", "b", "c"] {
+            anchors.insert(id.to_string(), ("proj".to_string(), "F.md".to_string()));
+        }
+
+        let perms = [
+            vec![a.clone(), b.clone(), c.clone()],
+            vec![a.clone(), c.clone(), b.clone()],
+            vec![b.clone(), a.clone(), c.clone()],
+            vec![b.clone(), c.clone(), a.clone()],
+            vec![c.clone(), a.clone(), b.clone()],
+            vec![c.clone(), b.clone(), a.clone()],
+        ];
+
+        let mut orders = perms
+            .into_iter()
+            .map(|p| {
+                apply_why_recency_tiebreak(p, &anchors)
+                    .iter()
+                    .map(|i| i.chunk_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        orders.dedup();
+
+        assert_eq!(
+            orders.len(),
+            1,
+            "every permutation must yield one stable order, got {orders:?}"
+        );
     }
 
     #[test]

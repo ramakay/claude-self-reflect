@@ -208,9 +208,17 @@ has none. No scalar confidence scores anywhere — ordinal evidence labels only.
   0.45–0.62 carry an explicit may-be-spurious warning quoting the measured
   fabricated-probe range. Floor re-derivable via `examples/quick_check_floor.rs`.
 - **NEW: repo-identity labels.** `code_nodes.repo_root` records the git
-  toplevel at write time, stable across cwd/session boundaries; linked
-  worktree paths canonicalize onto the main checkout so one logical file has
-  one key.
+  toplevel at write time, stable across cwd/session boundaries. Linked worktree
+  paths canonicalize onto the main checkout *going forward*, so newly recorded
+  edits converge on one key per logical file. Two limits, both deliberate:
+  canonicalization needs the worktree's `.git` marker still on disk, so rows
+  whose worktree was already pruned keep their original path rather than being
+  guessed at; and the one-shot backfill rewrites `code_evolution` only. It does
+  **not** rewrite `code_nodes.file`, because a node's id is derived from its
+  path — rewriting the path alone would desynchronize a row from its own
+  identity and make it a deletion target for node retirement. Pre-existing
+  worktree-keyed nodes therefore remain, and one logical file can still have
+  more than one key in historical data.
 - **NEW: `csr-engine backfill-coedit`** — rebuilds the session↔file co-edit
   ledger from the historical JSONL corpus (idempotent).
 - **FIX (review round): witness tables survived only until the next process

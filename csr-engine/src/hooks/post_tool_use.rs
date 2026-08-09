@@ -157,6 +157,34 @@ fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
     Ok(())
 }
 
+/// Paths a file-level presence row must never record: credentials, dependency
+/// trees and build output. High volume, no provenance value, and for the
+/// credential cases the stored path is itself a disclosure. Only consulted for
+/// the unsupported-extension "touch row" branch — the AST path is already
+/// bounded by the language allowlist.
+fn is_unrecordable_path(path: &str) -> bool {
+    const NOISE_DIRS: [&str; 9] = [
+        "/node_modules/",
+        "/target/",
+        "/.git/",
+        "/dist/",
+        "/build/",
+        "/vendor/",
+        "/.venv/",
+        "/__pycache__/",
+        "/.next/",
+    ];
+    if NOISE_DIRS.iter().any(|seg| path.contains(seg)) {
+        return true;
+    }
+    let name = path.rsplit('/').next().unwrap_or("");
+    name == ".env"
+        || name.starts_with(".env.")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.ends_with(".p12")
+}
+
 /// Detect programming language from file extension.
 ///
 /// Shared with `import::coedit_backfill` so historically replayed rows use
@@ -198,6 +226,14 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
         let stored_path = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path));
         let stored_path_str = stored_path.to_string_lossy();
         let repo_root = crate::extraction::repo_root::repo_root_for_file(&stored_path_str);
+        // Bound what a blanket presence row may record. This branch fires for
+        // EVERY unsupported extension, so without a boundary every scratch
+        // file, secret and vendored artifact a session touches becomes a
+        // permanent timeline entry — and for a secret the stored path is itself
+        // the disclosure. A file outside any repository is not project history.
+        if repo_root.is_none() || is_unrecordable_path(&stored_path_str) {
+            return Ok(());
+        }
         engine.storage().insert_code_evolution(
             &conv_id,
             &project_name,
@@ -408,13 +444,20 @@ mod tests {
     #[tokio::test]
     async fn track_code_evolution_records_touch_row_for_unsupported_extension() {
         let (engine, _storage) = test_engine();
+        // A presence row is now bounded to files inside a repository, so the
+        // fixture must be one — a bare /tmp path is correctly ignored.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let repo_file = tmp.path().join("csr-test-workflow-file.yml");
+        std::fs::write(&repo_file, "name: old\n").unwrap();
+        let repo_file_str = repo_file.to_string_lossy().to_string();
         let input = crate::hooks::HookInput {
             transcript_path: Some("/tmp/nonexistent-test-transcript.jsonl".to_string()),
             session_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
             cwd: Some("/tmp".into()),
             tool_name: Some("Edit".into()),
             tool_input: Some(serde_json::json!({
-                "file_path": "/tmp/csr-test-workflow-file.yml",
+                "file_path": repo_file_str,
                 "old_string": "name: old",
                 "new_string": "name: new"
             })),
@@ -442,16 +485,71 @@ mod tests {
         assert_eq!(fr, "[]");
     }
 
+    /// The touch-row branch fires for EVERY unsupported extension, so it must be
+    /// bounded. A file outside any repository, and a credential or vendored path
+    /// inside one, must never be recorded — the stored path is itself the leak.
+    #[tokio::test]
+    async fn track_code_evolution_touch_row_is_bounded_to_repo_and_skips_secrets() {
+        let (engine, _storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+
+        let secret = tmp.path().join(".env");
+        std::fs::write(&secret, "TOKEN=shhh\n").unwrap();
+        let vendored = tmp.path().join("node_modules").join("pkg").join("a.yml");
+        std::fs::create_dir_all(vendored.parent().unwrap()).unwrap();
+        std::fs::write(&vendored, "name: dep\n").unwrap();
+        // Outside any repository: no .git anywhere above it.
+        let outside_dir = tempfile::TempDir::new().unwrap();
+        let outside = outside_dir.path().join("loose.yml");
+        std::fs::write(&outside, "name: loose\n").unwrap();
+
+        for path in [&secret, &vendored, &outside] {
+            let input = crate::hooks::HookInput {
+                transcript_path: Some("/tmp/nonexistent-test-transcript.jsonl".to_string()),
+                session_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
+                cwd: Some(tmp.path().to_string_lossy().to_string()),
+                tool_name: Some("Edit".into()),
+                tool_input: Some(serde_json::json!({
+                    "file_path": path.to_string_lossy().to_string(),
+                    "old_string": "a",
+                    "new_string": "b"
+                })),
+                ..Default::default()
+            };
+            track_code_evolution(&input, &engine).await.unwrap();
+        }
+
+        let rows: i64 = engine
+            .storage()
+            .with_connection(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM code_evolution", [], |r| r.get(0))
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "secrets, vendored and non-repo paths must not be recorded"
+        );
+    }
+
     #[tokio::test]
     async fn track_code_evolution_touch_row_language_is_placeholder_not_empty() {
         let (engine, _storage) = test_engine();
+        // A presence row is now bounded to files inside a repository, so the
+        // fixture must be one — a bare /tmp path is correctly ignored.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let repo_file = tmp.path().join("csr-test-workflow-file.yml");
+        std::fs::write(&repo_file, "name: old\n").unwrap();
+        let repo_file_str = repo_file.to_string_lossy().to_string();
         let input = crate::hooks::HookInput {
             transcript_path: Some("/tmp/nonexistent-test-transcript.jsonl".to_string()),
             session_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
             cwd: Some("/tmp".into()),
             tool_name: Some("Edit".into()),
             tool_input: Some(serde_json::json!({
-                "file_path": "/tmp/csr-test-workflow-file.yml",
+                "file_path": repo_file_str,
                 "old_string": "name: old",
                 "new_string": "name: new"
             })),
