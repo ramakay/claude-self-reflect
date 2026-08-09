@@ -1,6 +1,9 @@
-# To require a review before a release can proceed (not yet applied — this
-# workflow deliberately does not call the GitHub API to change repository or
-# environment settings; run this by hand, once, as a repo admin):
+# The prod environment requires a human review before a release can proceed.
+# APPLIED 2026-08-08 — verified as
+# protection_rules:[required_reviewers], reviewers:[ramakay].
+# This workflow deliberately does not call the GitHub API to change repository
+# or environment settings; the one-time admin command is recorded here so the
+# setting is reproducible if the environment is ever recreated:
 #
 #   gh api --method PUT repos/ramakay/claude-self-reflect/environments/prod \
 #     --input - <<'JSON'
@@ -16,6 +19,10 @@
 # owner) is also the person who pushes release tags. With a single reviewer,
 # prevent_self_review:true would mean the actor can never approve their own
 # deployment and no release could ever pass the gate.
+#
+# Known limit: the environment keeps can_admins_bypass:true, so a repo admin can
+# skip the approval entirely. With one maintainer who is also the sole reviewer
+# that is not a real weakening — revisit if more maintainers are added.
 name: Release
 
 on:
