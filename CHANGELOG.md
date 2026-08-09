@@ -105,8 +105,8 @@ context on resume; this fills the model-facing half.
   `hooks/session_briefing.rs`, `hooks/prompt_submit.rs`,
   `hooks/session_start.rs`) call it directly and never run
   `strip_quoted` first. It also does not retroactively clean what is
-  already embedded — 747 historical conversations remain
-  self-contaminated (see "Known unproven in this release" below).
+  already embedded — 58 of 1,330 conversations (4.4%) in the maintainer's
+  corpus remain self-contaminated (see "Known unproven in this release").
   Counters for suppressed blocks and scrubbed hook wrappers appear in
   `status`.
 - **Corpus expansion**: sidechain attribution (real project and parent session
@@ -155,11 +155,27 @@ context on resume; this fills the model-facing half.
   been verified across line-ending or `.gitattributes` filter differences.
 - **Multi-repo witness attribution is unrecorded.** The witness ledger does
   not currently record which repository a witness belongs to.
-- **747 historical conversations remain self-contaminated.** The recap
-  sentinel narrows — but does not close — detection of newly emitted
-  recaps (documented header-prefix and field-token bypasses remain; see
-  the self-contamination bullet above); it does not retroactively clean
-  transcripts that already carry CSR's own tool output.
+- **Historical conversations remain self-contaminated, and the size of that
+  debt depends on where you measure.** On the maintainer's corpus:
+  **58 of 1,330 embedded conversations (4.4%)** carry a CSR-emitted block —
+  108 (8.1%) under a deliberately over-broad pattern set that also counts
+  ordinary prose mentioning `csr_reflect_on_past(`. In the *source*
+  transcripts the figure is far higher — 5,465 of 7,003 session JSONL files
+  contain an injected block — because the sanitizer strips those before
+  embedding, so source contamination is largely not corpus contamination.
+  Quote the embedded number, not the source number, when the claim is about
+  what search actually sees. The recap sentinel narrows — but does not close —
+  detection of newly emitted recaps (documented header-prefix and field-token
+  bypasses remain; see the self-contamination bullet above); it does not
+  retroactively clean transcripts that already carry CSR's own tool output.
+- **The sentinel rejects any text containing it, including text that merely
+  discusses it.** Sessions that quote `RECAP_SENTINEL`'s literal value — source
+  files, grep output, design discussion — are dropped from the corpus wholesale.
+  For ordinary users this is unreachable; for work *on CSR itself* it is a live
+  recall hole, and it is why this release's own engineering sessions are
+  partially unindexed. Separating a recap from a quotation of a recap is not
+  decidable at the string level, so the guard deliberately errs toward
+  rejecting. Measured, not modelled: 2 chunks in the maintainer's corpus.
 
 ## [9.5.0] - 2026-08-03
 
