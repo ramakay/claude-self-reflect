@@ -306,6 +306,18 @@ pub fn retire_missing_nodes(
     file: &str,
     seen_ids: &[String],
 ) -> Result<usize> {
+    // Fail-open on an empty observation. A re-extraction that yielded no nodes
+    // is far more likely a parse failure — a file caught mid-edit in a
+    // syntactically broken state, an unsupported construct, an ast-grep miss —
+    // than a file that genuinely lost every symbol it had. Retiring against an
+    // empty set would treat every existing node as stale and hard-delete the
+    // whole file's `code_node_attribution` provenance, which is the memory this
+    // system exists to keep. A stale span is a far cheaper failure than erased
+    // provenance, so an empty extraction retires nothing.
+    if seen_ids.is_empty() {
+        return Ok(0);
+    }
+
     let seen: std::collections::HashSet<&str> = seen_ids.iter().map(String::as_str).collect();
 
     let mut stmt = conn.prepare("SELECT id FROM code_nodes WHERE project = ?1 AND file = ?2")?;
@@ -1408,6 +1420,47 @@ mod tests {
         let conn = mem();
         upsert_node(&conn, &node("n1", "a.rs", "function", "foo", "conv_A")).unwrap();
         assert_eq!(attribution_for_node(&conn, "n1").unwrap(), "unattributed");
+    }
+
+    /// D6 safety guard: an extraction that yielded nothing must retire nothing.
+    /// A file saved mid-edit parses to zero nodes; retiring against that empty
+    /// set would hard-delete the file's whole attribution provenance.
+    #[test]
+    fn retire_missing_nodes_empty_extraction_retires_nothing() {
+        use crate::extraction::ast_analysis::lang_from_path_str;
+        use crate::extraction::codegraph::extract_graph_fragment;
+
+        let conn = mem();
+        let lang = lang_from_path_str("a.rs").expect("rust");
+        let source = "fn alpha() {\n    let x = 1;\n    let _ = x;\n}\n";
+        let fragment = extract_graph_fragment(source, lang, "a.rs", "repo", "proj", "c1", "s1");
+        for n in &fragment.nodes {
+            upsert_node(&conn, n).unwrap();
+        }
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_nodes WHERE project = 'proj' AND file = 'a.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(before > 0, "fixture must seed nodes or the test is vacuous");
+
+        // Simulate a parse failure: zero observed nodes.
+        let retired = retire_missing_nodes(&conn, "proj", "a.rs", &[]).unwrap();
+
+        assert_eq!(retired, 0, "an empty extraction must retire nothing");
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_nodes WHERE project = 'proj' AND file = 'a.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "no node may be deleted on an empty extraction"
+        );
     }
 
     /// D6 regression guard: moving a function within a file must refresh span
