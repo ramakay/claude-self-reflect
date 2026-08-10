@@ -496,10 +496,12 @@ pub fn all_events_with_anchor(conn: &Connection) -> Result<Vec<DreamEventRow>> {
 
 /// Conversation provenance for exact `(project, file, symbol)` anchors.
 ///
-/// Reads both endpoints recorded by `code_nodes`, preserves their database
-/// order (`first_conv_id` before `last_conv_id` per node), and removes blank
-/// and duplicate IDs. Missing anchors are absent from the returned map so
-/// callers can distinguish them honestly from linked anchors.
+/// Sourced EXCLUSIVELY from the trusted transcript channel of
+/// `code_node_attribution`. `code_nodes.first_conv_id`/`last_conv_id` are
+/// file-level projections measured at ~50.7% per-symbol accuracy and are
+/// forbidden on consumer surfaces (see the two-channel attribution work);
+/// an anchor with no transcript attribution is absent from the returned map
+/// so callers can distinguish it honestly from a linked anchor.
 pub(crate) fn conversation_ids_for_anchors(
     conn: &Connection,
     anchors: &[(String, String, String)],
@@ -528,10 +530,12 @@ pub(crate) fn conversation_ids_for_anchors(
             })
             .collect();
         let sql = format!(
-            "SELECT project, file, name, first_conv_id, last_conv_id
-             FROM code_nodes
+            "SELECT n.project, n.file, n.name, a.source_id
+             FROM code_nodes n
+             JOIN code_node_attribution a
+               ON a.node_id = n.id AND a.channel = 'transcript'
              WHERE {}
-             ORDER BY project, file, name, id",
+             ORDER BY n.project, n.file, n.name, n.id",
             filters.join(" OR ")
         );
         let params: Vec<&dyn rusqlite::types::ToSql> = batch
@@ -549,16 +553,13 @@ pub(crate) fn conversation_ids_for_anchors(
             Ok((
                 (row.get(0)?, row.get(1)?, row.get(2)?),
                 row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
             ))
         })?;
         for row in rows {
-            let (key, first, last) = row?;
+            let (key, source_id) = row?;
             let ids = out.entry(key).or_insert_with(Vec::new);
-            for id in [first, last] {
-                if !id.is_empty() && !ids.contains(&id) {
-                    ids.push(id);
-                }
+            if !source_id.is_empty() && !ids.contains(&source_id) {
+                ids.push(source_id);
             }
         }
     }
@@ -1349,29 +1350,54 @@ mod tests {
     }
 
     #[test]
-    fn conversation_ids_for_anchors_matches_identity_and_deduplicates_first_and_last() {
+    fn conversation_ids_for_anchors_uses_transcript_attribution_never_projections() {
         let conn = open();
+        // node-a: transcript attribution AND (different) projection endpoints.
+        // The projections must never leak into the linkage.
         conn.execute(
             "INSERT INTO code_nodes
                 (id, project, file, kind, name, first_conv_id, last_conv_id)
              VALUES ('node-a', 'proj', '/repo/src/lib.rs', 'function', 'foo',
-                     'conversation-first', 'conversation-shared')",
+                     'projection-first', 'projection-last')",
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO code_node_attribution (node_id, channel, source_id)
+             VALUES ('node-a', 'transcript', 'conversation-attributed')",
+            [],
+        )
+        .unwrap();
+        // node-b: same anchor name via a second kind, its own attribution —
+        // deduplicated into the same anchor's list. A git-channel row must
+        // not count as conversation linkage.
         conn.execute(
             "INSERT INTO code_nodes
                 (id, project, file, kind, name, first_conv_id, last_conv_id)
              VALUES ('node-b', 'proj', '/repo/src/lib.rs', 'method', 'foo',
-                     'conversation-shared', 'conversation-last')",
+                     'projection-first', 'projection-last')",
             [],
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO code_node_attribution (node_id, channel, source_id)
+             VALUES ('node-b', 'transcript', 'conversation-attributed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_node_attribution (node_id, channel, source_id)
+             VALUES ('node-b', 'git', 'abc123def')",
+            [],
+        )
+        .unwrap();
+        // projection-only node: endpoints recorded, NO transcript attribution
+        // -> must be absent from the map, not linked via projections.
+        conn.execute(
             "INSERT INTO code_nodes
                 (id, project, file, kind, name, first_conv_id, last_conv_id)
-             VALUES ('wrong-project', 'other', '/repo/src/lib.rs', 'function', 'foo',
-                     'wrong-project-conversation', 'wrong-project-conversation')",
+             VALUES ('node-c', 'proj', '/repo/src/lib.rs', 'function', 'bar',
+                     'projection-only-conv', 'projection-only-conv')",
             [],
         )
         .unwrap();
@@ -1385,20 +1411,20 @@ mod tests {
             (
                 "proj".to_string(),
                 "/repo/src/lib.rs".to_string(),
-                "missing".to_string(),
+                "bar".to_string(),
             ),
         ];
         let links = conversation_ids_for_anchors(&conn, &anchors).unwrap();
 
         assert_eq!(
             links.get(&anchors[0]).unwrap(),
-            &vec![
-                "conversation-first".to_string(),
-                "conversation-shared".to_string(),
-                "conversation-last".to_string(),
-            ]
+            &vec!["conversation-attributed".to_string()],
+            "transcript attribution only: no projections, no git channel, deduped"
         );
-        assert!(!links.contains_key(&anchors[1]));
+        assert!(
+            !links.contains_key(&anchors[1]),
+            "projection-only anchor must read as 'no linked conversations'"
+        );
     }
 
     #[test]
