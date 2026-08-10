@@ -1,25 +1,23 @@
 //! `csr-engine dream --report`: a self-contained static HTML dream journal.
 //!
-//! Renders `witness_verdicts` (joined to `witness_ledger`) into a single
-//! HTML file with everything inlined — CSS in a `<style>` block, no external
-//! fonts, no JS, zero network requests. The template
+//! Renders one story card per usable session from stored episodes, narratives,
+//! anchors, code attribution, and receipt-bearing verdicts. Everything is
+//! inlined in one HTML file — CSS in a `<style>` block, no external fonts, no
+//! JS, zero network requests. The template
 //! (`report_template.html.jinja`) is compiled into the binary via
 //! `include_str!`, so the rendered file is fully portable: open it anywhere,
 //! offline, forever.
 //!
-//! This module only READS `witness_ledger`/`witness_verdicts` (through
-//! `Storage`'s existing append-only query surface plus the small bulk
-//! additions in `storage::witness_verdicts`) — it never writes an event.
-//! Run `csr-engine dream` (no `--report`) first to actually produce new
-//! verdicts; this just narrates whatever is already on record.
+//! This module only reads through `Storage`; it never writes an event. Running
+//! `csr-engine dream` first adds fresh verdict receipts, but session stories
+//! remain useful even before the first dream cycle.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::storage::witness_verdicts::{DemotedSymbol, DreamEventRow, VerdictKind};
+use crate::storage::dream_report::{StoryArtifact, StorySession};
 use crate::storage::Storage;
 
 /// The compiled-in Jinja template — see the module doc. Named `.html` so
@@ -54,130 +52,151 @@ const LEGACY_TIMELINE_TEMPLATE: &str = r#"  <section>
   </section>"#;
 
 const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section>
-    <h2>Timeline</h2>
-    <p class="subtitle">Searches touching these anchors carry [evolved] annotations with these receipts</p>
-
-    {% for group in data.superseded_groups %}
-    <div class="day-group">
-      <p class="day-heading">{{ group.project }} · {{ group.file_relative }}</p>
-      {% for event in group.events %}
-      <div class="event">
-        <span class="badge superseded">Superseded</span>
-        <span class="symbol">{{ event.symbol }}</span>
-        <span class="file">{{ event.file_relative }}</span>
-        <span class="oids">receipt {{ event.receipt_short | default("—") }}</span>
-        <span class="successor-line">{{ event.conversation_line }}</span>
-      </div>
-      {% endfor %}
+    <h2>Session stories</h2>
+    <div class="story-list">
+    {% for card in data.cards %}
+      <details class="story-card {{ card.tier_slug }}" data-tier="{{ card.tier_slug }}">
+        <summary>
+          <span class="story-summary">{{ card.summary }}</span>
+          <span class="story-meta">{{ card.project }} · {{ card.date }} · {{ card.session_short }}</span>
+          {% if card.tier_label %}<span class="tier-badge">{{ card.tier_label }}</span>{% endif %}
+        </summary>
+        <div class="story-flow" aria-label="Session flow">
+        {% for stage in card.stages %}
+          <div class="story-stage {{ stage.slug }}" data-stage="{{ stage.slug }}" title="{{ stage.detail }}">
+            <span class="stage-label">{{ stage.label }}</span>
+            {% for badge in stage.badges %}
+            <span class="badge superseded">{{ badge.text }}</span>
+            {% endfor %}
+          </div>
+        {% endfor %}
+        </div>
+      </details>
+    {% endfor %}
     </div>
-    {% endfor %}
+    <p class="omission-summary">
+      {% if data.low_signal_omitted %}<span>{{ data.low_signal_omitted }} low-signal sessions omitted</span>{% endif %}
+      {% if data.older_omitted %}<span>{{ data.older_omitted }} older sessions omitted</span>{% endif %}
+    </p>
+  </section>"#;
 
-    {% for day in data.other_days %}
-    <div class="day-group">
-      <p class="day-heading">{{ day.date }}</p>
-      {% for event in day.events %}
-      <div class="event">
-        <span class="badge {{ event.verdict_slug }}">{{ event.verdict_label }}</span>
-        <span class="symbol">{{ event.symbol }}</span>
-        <span class="file">{{ event.file_relative }}</span>
-        <span class="oids">receipt {{ event.receipt_short | default("—") }} · HEAD {{ event.observed_head_short }} · {{ event.time }}</span>
+const LEGACY_FORGOTTEN_TEMPLATE: &str = r#"  <section>
+    <h2>What CSR forgot</h2>
+    {% if data.forgotten %}
+      {% for item in data.forgotten %}
+      <div class="forgotten-row">
+        <span class="badge obsolete">Demoted</span>
+        <span class="symbol">{{ item.symbol }}</span>
+        <span class="file">{{ item.file_relative }}</span>
+        <span class="oids">{{ item.verdict_label }} · receipt {{ item.receipt_short | default("—") }} · HEAD {{ item.observed_head_short }}</span>
       </div>
       {% endfor %}
-    </div>
-    {% endfor %}
-
-    {% for group in data.internal_groups %}
-    <details class="day-group">
-      <summary>{{ group.events | length }} internal/test symbols · {{ group.project }}</summary>
-      {% for event in group.events %}
-      <div class="event">
-        <span class="badge {{ event.verdict_slug }}">{{ event.verdict_label }}</span>
-        <span class="symbol">{{ event.symbol }}</span>
-        <span class="file">{{ event.file_relative }}</span>
-        {% if event.receipt_short %}<span class="oids">receipt {{ event.receipt_short }}</span>{% endif %}
-        {% if event.conversation_line %}<span class="successor-line">{{ event.conversation_line }}</span>{% endif %}
-      </div>
-      {% endfor %}
-    </details>
-    {% endfor %}
-
-    {% if data.reinstated %}
-    <details class="day-group">
-      <summary>{{ data.reinstated.count }} anchors re-observed at HEAD {{ data.reinstated.head_short }}</summary>
-      {% for event in data.reinstated.events %}
-      <div class="event">
-        <span class="badge reinstated">Reinstated</span>
-        <span class="symbol">{{ event.symbol }}</span>
-        <span class="file">{{ event.file_relative }}</span>
-        <span class="oids">HEAD {{ event.observed_head_short }} · {{ event.time }}</span>
-      </div>
-      {% endfor %}
-    </details>
+    {% else %}
+      <div class="empty-state">Nothing is currently demoted — every audited symbol is either intact or annotated, never fully stale.</div>
     {% endif %}
   </section>"#;
 
-/// One rendered timeline event — the shape the template walks per day group.
+const LEGACY_EMPTY_TEMPLATE: &str = r#"  <div class="empty-state">
+    <span class="glyph">☾</span>
+    No dreams yet. Run <code>csr-engine dream</code> to audit the witness ledger against current HEAD.
+  </div>"#;
+
+const STORY_EMPTY_TEMPLATE: &str = r#"  <div class="empty-state">
+    <span class="glyph">☾</span>
+    No session has enough story signal to render yet.
+  </div>
+  <p class="omission-summary">
+    {% if data.low_signal_omitted %}<span>{{ data.low_signal_omitted }} low-signal sessions omitted</span>{% endif %}
+    {% if data.older_omitted %}<span>{{ data.older_omitted }} older sessions omitted</span>{% endif %}
+  </p>"#;
+
+const LEGACY_HERO_META: &str = r#"    <p class="subtitle">Deterministic supersession verdicts drawn from content-hash stamps and git ancestry — zero LLM, zero guessing.</p>
+    <div class="meta-row">
+      {% if data.has_run %}
+        <span>Last dream: <code>{{ data.last_run_at }}</code> at HEAD <code>{{ data.last_run_head_short }}</code></span>
+      {% else %}
+        <span>No dream cycle has run yet.</span>
+      {% endif %}
+      <span>Generated {{ data.generated_at }}</span>
+    </div>"#;
+
+const STORY_HERO_META: &str = r#"    <p class="subtitle">What each session set out to do, considered, changed, and left behind.</p>
+    <div class="meta-row">
+      {% if data.has_run %}
+        <span>Last dream: <code>{{ data.last_run_at }}</code> at HEAD <code>{{ data.last_run_head_short }}</code></span>
+      {% else %}
+        <span>No dream cycle has run yet.</span>
+      {% endif %}
+    </div>"#;
+
+const STORY_CSS: &str = r#"
+  .story-list { display: grid; gap: 0.7rem; }
+  .story-card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 12px; overflow: visible;
+  }
+  .story-card > summary {
+    list-style: none; cursor: pointer; padding: 0.9rem 1rem;
+    display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: center; gap: 0.75rem;
+  }
+  .story-card > summary::-webkit-details-marker { display: none; }
+  .story-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .story-meta { color: var(--fg-muted); font-size: 0.74rem; white-space: nowrap; }
+  .tier-badge {
+    color: var(--fg-muted); border: 1px solid var(--border); border-radius: 999px;
+    font-size: 0.66rem; font-weight: 700; padding: 0.15rem 0.45rem;
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .story-flow {
+    border-top: 1px solid var(--border); padding: 1rem;
+    display: flex; align-items: stretch; gap: 1.6rem;
+  }
+  .story-stage {
+    position: relative; flex: 1 1 0; min-width: 0; min-height: 4.2rem;
+    border: 1px solid var(--border); border-radius: 9px; padding: 0.8rem;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; background: var(--bg); cursor: help;
+  }
+  .story-stage + .story-stage::before {
+    content: "→"; position: absolute; left: -1.18rem; top: 50%;
+    transform: translateY(-50%); color: var(--fg-muted); font-weight: 700;
+  }
+  .stage-label { font-size: 0.73rem; font-weight: 800; letter-spacing: 0.06em; }
+  .story-stage .badge { margin-top: 0.45rem; text-transform: none; }
+  .omission-summary { display: flex; justify-content: center; gap: 1rem; color: var(--fg-muted); font-size: 0.75rem; }
+  @media (max-width: 680px) {
+    .story-card > summary { grid-template-columns: minmax(0, 1fr) auto; }
+    .story-meta { grid-column: 1 / -1; grid-row: 2; }
+    .story-flow { flex-direction: column; gap: 1.4rem; }
+    .story-stage + .story-stage::before { content: "↓"; left: 50%; top: -1.15rem; transform: translateX(-50%); }
+  }
+"#;
+
+const MAX_STORY_CARDS: usize = 50;
+
 #[derive(Debug, Clone, Serialize)]
-struct EventView {
-    symbol: String,
-    file_relative: String,
-    verdict_slug: &'static str,
-    verdict_label: &'static str,
-    receipt_short: Option<String>,
-    observed_head_short: String,
-    /// Set only for `superseded_by` — the "successor link line" the task
-    /// asks for (the successor is identified by its receipt oid; there is
-    /// no richer successor identity to show than that, since `witness_id`
-    /// has no stable human-facing name).
-    successor_line: Option<String>,
-    conversation_line: Option<String>,
-    /// `HH:MM:SS` slice of `created_at`.
-    time: String,
+struct ReceiptBadgeView {
+    text: String,
 }
 
-/// Newest-first day group of events, mirroring `dream::group_by_anchor`'s
-/// contiguous-grouping style (the source rows are already newest-first, so
-/// grouping needs no re-sort — see `all_events_with_anchor`).
 #[derive(Debug, Clone, Serialize)]
-struct DayGroup {
-    /// `YYYY-MM-DD`.
+struct StoryStageView {
+    slug: &'static str,
+    label: &'static str,
+    detail: String,
+    badges: Vec<ReceiptBadgeView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StoryCardView {
+    summary: String,
+    project: String,
     date: String,
-    events: Vec<EventView>,
-}
-
-/// User-code supersessions are the journal's primary evidence, grouped by
-/// the exact source file whose anchor evolved.
-#[derive(Debug, Clone, Serialize)]
-struct SupersededFileGroup {
-    project: String,
-    file_relative: String,
-    events: Vec<EventView>,
-}
-
-/// Test and fixture anchors remain available without dominating the journal.
-#[derive(Debug, Clone, Serialize)]
-struct InternalProjectGroup {
-    project: String,
-    events: Vec<EventView>,
-}
-
-/// Reinstatement receipts equal the observed HEAD, so they are narrated once
-/// and their anchors are kept in a receipt-free disclosure list.
-#[derive(Debug, Clone, Serialize)]
-struct ReinstatedSummary {
-    count: usize,
-    head_short: String,
-    events: Vec<EventView>,
-}
-
-/// One "what CSR forgot" row — a symbol currently on the `Demote` channel.
-#[derive(Debug, Clone, Serialize)]
-struct ForgottenView {
-    symbol: String,
-    file_relative: String,
-    verdict_label: &'static str,
-    receipt_short: Option<String>,
-    observed_head_short: String,
+    session_short: String,
+    tier_slug: &'static str,
+    tier_label: Option<&'static str>,
+    stages: Vec<StoryStageView>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -191,262 +210,234 @@ struct VerdictTotals {
 /// Everything the template needs, gathered once from `Storage`.
 #[derive(Debug, Clone, Serialize)]
 struct DreamReportData {
-    generated_at: String,
     has_run: bool,
     last_run_head_short: Option<String>,
     last_run_at: Option<String>,
     totals: VerdictTotals,
-    days: Vec<DayGroup>,
-    superseded_groups: Vec<SupersededFileGroup>,
-    other_days: Vec<DayGroup>,
-    internal_groups: Vec<InternalProjectGroup>,
-    reinstated: Option<ReinstatedSummary>,
-    forgotten: Vec<ForgottenView>,
-    /// `true` iff zero events have ever been recorded — drives the "no
-    /// dreams yet" empty state (the timeline section is skipped entirely;
-    /// the forgotten section, which is independently emptiable, is not
-    /// gated by this and gets its own "nothing demoted" message).
+    cards: Vec<StoryCardView>,
+    low_signal_omitted: usize,
+    older_omitted: usize,
     is_empty: bool,
 }
 
-fn verdict_slug(v: VerdictKind) -> &'static str {
-    match v {
-        VerdictKind::AnchorObsolete => "obsolete",
-        VerdictKind::SupersededBy => "superseded",
-        VerdictKind::AnchorReinstated => "reinstated",
-    }
-}
-
-fn verdict_label(v: VerdictKind) -> &'static str {
-    match v {
-        VerdictKind::AnchorObsolete => "Obsolete",
-        VerdictKind::SupersededBy => "Superseded",
-        VerdictKind::AnchorReinstated => "Reinstated",
-    }
-}
-
-/// First 8 hex chars of a commit oid — long enough to disambiguate in any
-/// real repo, short enough to keep the timeline scannable. `None`/empty in
-/// is passed through as `None` so the template's `default("—")` filter can
-/// render a dash instead of an empty string.
+/// First 8 hex chars of a commit oid.
 fn short_oid(oid: &str) -> String {
     oid.chars().take(8).collect()
 }
 
-fn short_oid_opt(oid: Option<&str>) -> Option<String> {
-    oid.filter(|s| !s.is_empty()).map(short_oid)
+fn plain_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_start_matches(['#', '-', '*', ' '])
+        .chars()
+        .filter(|ch| !matches!(ch, '*' | '`'))
+        .collect()
 }
 
-/// A displayable symbol name — witness_ledger's `symbol` column is `None`
-/// for whole-file witnesses.
-fn symbol_display(symbol: Option<&str>) -> String {
-    symbol.unwrap_or("(whole file)").to_string()
-}
-
-/// Best-effort repo-relative path for display: prefer the `code_nodes`-
-/// stored `repo_root` (same resolution order `dream`'s own join uses), fall
-/// back to a live git walk, fall back to the raw absolute path if neither
-/// resolves — a report must never fail to render just because a file's repo
-/// root can't be found.
-fn repo_relative_file(storage: &Storage, file: &str) -> String {
-    let repo_root = storage
-        .stored_repo_root_for_file(file)
-        .unwrap_or(None)
-        .or_else(|| crate::extraction::repo_root::repo_root_for_file(file));
-    match repo_root {
-        Some(root) => {
-            let root_trimmed = root.trim_end_matches('/');
-            match file.strip_prefix(root_trimmed) {
-                Some(rel) => rel.trim_start_matches('/').to_string(),
-                None => file.to_string(),
-            }
-        }
-        None => file.to_string(),
+fn truncate_chars(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
     }
+    let mut truncated = value
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
-fn conversation_line(
-    e: &DreamEventRow,
-    links: &BTreeMap<(String, String, String), Vec<String>>,
-) -> Option<String> {
-    if e.verdict != VerdictKind::SupersededBy {
+fn first_sentence(value: &str) -> String {
+    let normalized = plain_text(value);
+    let end = normalized
+        .char_indices()
+        .find_map(|(index, ch)| matches!(ch, '.' | '!' | '?').then_some(index + ch.len_utf8()))
+        .unwrap_or(normalized.len());
+    truncate_chars(normalized[..end].trim(), 180)
+}
+
+fn basename(file: &str) -> String {
+    Path::new(file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(file)
+        .to_string()
+}
+
+fn artifacts_stage(artifacts: &[StoryArtifact]) -> Option<StoryStageView> {
+    if artifacts.is_empty() {
         return None;
     }
-    let ids = e
-        .symbol
-        .as_ref()
-        .and_then(|symbol| links.get(&(e.project.clone(), e.file.clone(), symbol.clone())));
-    Some(match ids {
-        Some(ids) if !ids.is_empty() => {
-            let previews = ids
-                .iter()
-                .take(3)
-                .map(|id| id.chars().take(8).collect::<String>())
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("appears in {} conversation(s): {previews}", ids.len())
-        }
-        _ => "no linked conversations".to_string(),
+    let items = artifacts
+        .iter()
+        .map(|artifact| match &artifact.symbol {
+            Some(symbol) => format!("{symbol} ({})", basename(&artifact.file)),
+            None => basename(&artifact.file),
+        })
+        .collect::<Vec<_>>();
+    let badges = artifacts
+        .iter()
+        .filter_map(|artifact| {
+            artifact
+                .superseded_receipt
+                .as_deref()
+                .map(|receipt| ReceiptBadgeView {
+                    text: format!("superseded at {}", short_oid(receipt)),
+                })
+        })
+        .collect::<Vec<_>>();
+    Some(StoryStageView {
+        slug: "artifacts",
+        label: "ARTIFACTS",
+        detail: format!("Artifacts: {}", items.join(", ")),
+        badges,
     })
 }
 
-fn event_view(
-    storage: &Storage,
-    e: &DreamEventRow,
-    links: &BTreeMap<(String, String, String), Vec<String>>,
-) -> EventView {
-    let successor_line = if e.verdict == VerdictKind::SupersededBy {
-        short_oid_opt(e.receipt_oid.as_deref())
-            .map(|r| format!("superseded by the witness recorded at receipt {r}"))
-    } else {
-        None
-    };
-    EventView {
-        symbol: symbol_display(e.symbol.as_deref()),
-        file_relative: repo_relative_file(storage, &e.file),
-        verdict_slug: verdict_slug(e.verdict),
-        verdict_label: verdict_label(e.verdict),
-        receipt_short: (e.verdict != VerdictKind::AnchorReinstated)
-            .then(|| short_oid_opt(e.receipt_oid.as_deref()))
-            .flatten(),
-        observed_head_short: short_oid(&e.observed_head_oid),
-        successor_line,
-        conversation_line: conversation_line(e, links),
-        time: e.created_at.get(11..19).unwrap_or("").to_string(),
-    }
-}
-
-fn forgotten_view(storage: &Storage, d: &DemotedSymbol) -> ForgottenView {
-    let rep = &d.state.representative;
-    ForgottenView {
-        symbol: symbol_display(d.symbol.as_deref()),
-        file_relative: repo_relative_file(storage, &d.file),
-        verdict_label: verdict_label(rep.verdict),
-        receipt_short: short_oid_opt(rep.receipt_oid.as_deref()),
-        observed_head_short: short_oid(&rep.observed_head_oid),
-    }
-}
-
-/// Group already newest-first events into contiguous newest-first day
-/// buckets (date = `created_at`'s first 10 chars, `YYYY-MM-DD`) — same
-/// "already sorted, just group contiguous runs" shape as
-/// `dream::group_by_anchor`.
-fn group_by_day(
-    storage: &Storage,
-    events: &[DreamEventRow],
-    links: &BTreeMap<(String, String, String), Vec<String>>,
-) -> Vec<DayGroup> {
-    let mut days: Vec<DayGroup> = Vec::new();
-    for e in events {
-        let date = e.created_at.get(..10).unwrap_or(&e.created_at).to_string();
-        let view = event_view(storage, e, links);
-        match days.last_mut() {
-            Some(d) if d.date == date => d.events.push(view),
-            _ => days.push(DayGroup {
-                date,
-                events: vec![view],
-            }),
-        }
-    }
-    days
-}
-
-fn is_testish(e: &DreamEventRow) -> bool {
-    let symbol_is_test = e
-        .symbol
+fn story_card(session: &StorySession) -> Option<StoryCardView> {
+    let request = session
+        .request
         .as_deref()
-        .is_some_and(|symbol| symbol.starts_with("test_") || symbol.starts_with("fixture_"));
-    let normalized = e.file.replace('\\', "/");
-    symbol_is_test || normalized.contains("/tests/") || normalized.starts_with("tests/")
-}
-
-fn journal_sections(
-    storage: &Storage,
-    events: &[DreamEventRow],
-    links: &BTreeMap<(String, String, String), Vec<String>>,
-) -> (
-    Vec<SupersededFileGroup>,
-    Vec<DayGroup>,
-    Vec<InternalProjectGroup>,
-    Option<ReinstatedSummary>,
-) {
-    let mut superseded: BTreeMap<(String, String), Vec<&DreamEventRow>> = BTreeMap::new();
-    let mut other = Vec::new();
-    let mut internal: BTreeMap<String, Vec<&DreamEventRow>> = BTreeMap::new();
-    let mut reinstated = Vec::new();
-
-    for event in events {
-        if event.verdict == VerdictKind::AnchorReinstated {
-            reinstated.push(event);
-        } else if is_testish(event) {
-            internal
-                .entry(event.project.clone())
-                .or_default()
-                .push(event);
-        } else if event.verdict == VerdictKind::SupersededBy {
-            superseded
-                .entry((event.project.clone(), event.file.clone()))
-                .or_default()
-                .push(event);
-        } else {
-            other.push(event.clone());
-        }
-    }
-
-    let superseded_groups = superseded
-        .into_iter()
-        .map(|((project, file), mut rows)| {
-            rows.sort_by_key(|event| std::cmp::Reverse(event.event_id));
-            SupersededFileGroup {
-                project,
-                file_relative: repo_relative_file(storage, &file),
-                events: rows
-                    .into_iter()
-                    .map(|event| event_view(storage, event, links))
-                    .collect(),
-            }
-        })
-        .collect();
-    let internal_groups = internal
-        .into_iter()
-        .map(|(project, mut rows)| {
-            rows.sort_by_key(|event| std::cmp::Reverse(event.event_id));
-            InternalProjectGroup {
-                project,
-                events: rows
-                    .into_iter()
-                    .map(|event| event_view(storage, event, links))
-                    .collect(),
-            }
-        })
-        .collect();
-    let reinstated_summary = if let Some(newest) = reinstated.first() {
-        let count = reinstated.len();
-        let head_short = short_oid(&newest.observed_head_oid);
-        Some(ReinstatedSummary {
-            count,
-            head_short,
-            events: reinstated
-                .into_iter()
-                .map(|event| event_view(storage, event, links))
-                .collect(),
-        })
+        .filter(|value| !value.trim().is_empty());
+    let outcome = session
+        .outcome
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let narrative = session
+        .narrative
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let has_artifacts = !session.artifacts.is_empty();
+    let (tier_slug, tier_label) = if request.is_some() && narrative.is_some() && has_artifacts {
+        ("full", None)
+    } else if request.is_some() && outcome.is_some() {
+        ("template", Some("template"))
+    } else if has_artifacts {
+        ("thin-evidence", Some("thin evidence"))
     } else {
-        None
+        return None;
     };
 
-    (
-        superseded_groups,
-        group_by_day(storage, &other, links),
-        internal_groups,
-        reinstated_summary,
-    )
+    let input = request
+        .or_else(|| {
+            session
+                .first_prompt
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .map(|value| StoryStageView {
+            slug: "input",
+            label: "INPUT",
+            detail: truncate_chars(&plain_text(value), 300),
+            badges: Vec::new(),
+        });
+
+    let investigated = session
+        .investigated
+        .iter()
+        .map(|file| basename(file))
+        .filter(|file| !file.is_empty())
+        .take(6)
+        .collect::<Vec<_>>();
+    let deliberation_detail = match (narrative, investigated.is_empty()) {
+        (Some(story), false) => Some(format!(
+            "{} Investigated: {}",
+            plain_text(story),
+            investigated.join(", ")
+        )),
+        (Some(story), true) => Some(plain_text(story)),
+        (None, false) => Some(format!("Investigated: {}", investigated.join(", "))),
+        (None, true) => None,
+    };
+    let deliberation = deliberation_detail.map(|detail| StoryStageView {
+        slug: "deliberation",
+        label: "DELIBERATION",
+        detail,
+        badges: Vec::new(),
+    });
+
+    let steer_detail = if outcome.is_none() && session.todos.is_empty() {
+        None
+    } else {
+        let mut parts = Vec::new();
+        if let Some(value) = outcome {
+            parts.push(format!("Outcome: {}", plain_text(value)));
+        }
+        if !session.todos.is_empty() {
+            let todos = session
+                .todos
+                .iter()
+                .map(|todo| {
+                    if todo.status.trim().is_empty() {
+                        plain_text(&todo.content)
+                    } else {
+                        format!(
+                            "{} [{}]",
+                            plain_text(&todo.content),
+                            plain_text(&todo.status)
+                        )
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("Todos: {todos}"));
+        }
+        Some(parts.join(". "))
+    };
+    let steer = steer_detail.map(|detail| StoryStageView {
+        slug: "steer",
+        label: "STEER",
+        detail,
+        badges: Vec::new(),
+    });
+
+    let mut stages = Vec::with_capacity(4);
+    stages.extend(input);
+    stages.extend(deliberation);
+    stages.extend(artifacts_stage(&session.artifacts));
+    stages.extend(steer);
+    debug_assert!(stages.iter().all(|stage| !stage.detail.trim().is_empty()));
+
+    let summary = narrative
+        .map(first_sentence)
+        .filter(|summary| !summary.is_empty())
+        .unwrap_or_else(|| match (request, outcome) {
+            (Some(request), Some(outcome)) => truncate_chars(
+                &format!(
+                    "{} — outcome: {}.",
+                    plain_text(request),
+                    plain_text(outcome)
+                ),
+                180,
+            ),
+            _ => format!(
+                "Evidence recorded for session {}.",
+                short_oid(&session.session_id)
+            ),
+        });
+
+    Some(StoryCardView {
+        summary,
+        project: if session.project.is_empty() {
+            "unknown".to_string()
+        } else {
+            session.project.clone()
+        },
+        date: session
+            .timestamp
+            .get(..10)
+            .unwrap_or(&session.timestamp)
+            .to_string(),
+        session_short: short_oid(&session.session_id),
+        tier_slug,
+        tier_label,
+        stages,
+    })
 }
 
-/// Gather every piece of data the template needs. Read-only: three existing
-/// `witness_ledger`/`witness_verdicts` query paths, no writes. Thin
-/// wrapper over `gather_report_data_with` for real callers — reads
-/// `CSR_DREAM_CONSUMPTION` from the real process env exactly once here.
+/// Gather every piece of data through read-only storage projections.
 fn gather_report_data(storage: &Storage) -> Result<DreamReportData> {
     gather_report_data_with(
         storage,
@@ -454,88 +445,31 @@ fn gather_report_data(storage: &Storage) -> Result<DreamReportData> {
     )
 }
 
-/// Core of [`gather_report_data`] with the v10.1 dream-consumption opt-in
-/// passed in as a parameter — mirrors `resolve_validity_with`/
-/// `recap_retired_since_with`'s pattern so tests can drive the ON path
-/// directly instead of mutating the real process env (parallel-test
-/// race — same discipline as everywhere else this switch appears).
-/// `consumption_enabled = false` renders the same neutral "no dreams
-/// yet" state the template already supports (`is_empty: true`), WITHOUT
-/// touching witness_ledger/witness_verdicts at all, rather than
-/// computing real totals and hiding them — mirrors
-/// `recap_retired_since_with`'s early return. `csr-engine dream
-/// --report` still writes a valid, openable HTML file either way; only
-/// its verdict content is gated.
 fn gather_report_data_with(
     storage: &Storage,
-    consumption_mode: crate::storage::recap_feeds::ConsumptionMode,
+    _consumption_mode: crate::storage::recap_feeds::ConsumptionMode,
 ) -> Result<DreamReportData> {
-    if consumption_mode == crate::storage::recap_feeds::ConsumptionMode::Off {
-        return Ok(DreamReportData {
-            generated_at: chrono::Utc::now()
-                .format("%Y-%m-%d %H:%M:%S UTC")
-                .to_string(),
-            has_run: false,
-            last_run_head_short: None,
-            last_run_at: None,
-            totals: VerdictTotals {
-                obsolete: 0,
-                superseded: 0,
-                reinstated: 0,
-                total: 0,
-            },
-            days: Vec::new(),
-            superseded_groups: Vec::new(),
-            other_days: Vec::new(),
-            internal_groups: Vec::new(),
-            reinstated: None,
-            forgotten: Vec::new(),
-            is_empty: true,
-        });
-    }
-
-    let events = storage.all_dream_events()?;
     let (obsolete, superseded, reinstated) = storage.dream_event_totals()?;
     let last_run = storage.last_dream_run()?;
-    let forgotten_raw = if consumption_mode == crate::storage::recap_feeds::ConsumptionMode::Full {
-        storage.all_demoted_symbols()?
-    } else {
-        Vec::new()
-    };
-
-    let generated_at = chrono::Utc::now()
-        .format("%Y-%m-%d %H:%M:%S UTC")
-        .to_string();
-
     let (last_run_head_short, last_run_at) = match &last_run {
         Some((oid, at)) => (Some(short_oid(oid)), Some(at.clone())),
         None => (None, None),
     };
 
-    let anchors = events
-        .iter()
-        .filter(|event| event.verdict == VerdictKind::SupersededBy)
-        .filter_map(|event| {
-            event
-                .symbol
-                .as_ref()
-                .map(|symbol| (event.project.clone(), event.file.clone(), symbol.clone()))
-        })
-        .collect::<Vec<_>>();
-    let links = storage.with_connection(|conn| {
-        crate::storage::witness_verdicts::conversation_ids_for_anchors(conn, &anchors)
-    })?;
-    let days = group_by_day(storage, &events, &links);
-    let (superseded_groups, other_days, internal_groups, reinstated_summary) =
-        journal_sections(storage, &events, &links);
-    let forgotten = forgotten_raw
-        .iter()
-        .map(|d| forgotten_view(storage, d))
-        .collect();
+    let sessions = storage.with_connection(crate::storage::dream_report::load_story_sessions)?;
+    let mut low_signal_omitted = 0;
+    let mut usable_cards = Vec::new();
+    for session in &sessions {
+        match story_card(session) {
+            Some(card) => usable_cards.push(card),
+            None => low_signal_omitted += 1,
+        }
+    }
+    let older_omitted = usable_cards.len().saturating_sub(MAX_STORY_CARDS);
+    usable_cards.truncate(MAX_STORY_CARDS);
 
     let total = obsolete + superseded + reinstated;
     Ok(DreamReportData {
-        generated_at,
         has_run: last_run.is_some(),
         last_run_head_short,
         last_run_at,
@@ -545,22 +479,27 @@ fn gather_report_data_with(
             reinstated,
             total,
         },
-        days,
-        superseded_groups,
-        other_days,
-        internal_groups,
-        reinstated: reinstated_summary,
-        forgotten,
-        is_empty: total == 0,
+        is_empty: usable_cards.is_empty(),
+        cards: usable_cards,
+        low_signal_omitted,
+        older_omitted,
     })
 }
 
 /// Render `data` through the embedded template into a complete, standalone
 /// HTML document.
 fn render_html(data: &DreamReportData) -> Result<String> {
-    let template = TEMPLATE.replacen(LEGACY_TIMELINE_TEMPLATE, JOURNAL_TIMELINE_TEMPLATE, 1);
-    if template == TEMPLATE {
-        anyhow::bail!("embedded dream report timeline fragment no longer matches renderer");
+    let template = TEMPLATE
+        .replacen(LEGACY_HERO_META, STORY_HERO_META, 1)
+        .replacen(LEGACY_EMPTY_TEMPLATE, STORY_EMPTY_TEMPLATE, 1)
+        .replacen(LEGACY_TIMELINE_TEMPLATE, JOURNAL_TIMELINE_TEMPLATE, 1)
+        .replacen(LEGACY_FORGOTTEN_TEMPLATE, "", 1)
+        .replacen("</style>", &format!("{STORY_CSS}</style>"), 1);
+    if template.contains("Generated {{ data.generated_at }}")
+        || template.contains("<h2>Timeline</h2>")
+        || template.contains("<h2>What CSR forgot</h2>")
+    {
+        anyhow::bail!("embedded dream report fragments no longer match story renderer");
     }
     let mut env = minijinja::Environment::new();
     env.add_template(TEMPLATE_NAME, &template)
@@ -623,6 +562,88 @@ mod tests {
     use crate::storage::witness_ledger::{self, WitnessLedgerRow};
     use crate::storage::witness_verdicts::{self, VerdictKind, WitnessVerdictRow};
 
+    fn seed_episode(
+        storage: &Storage,
+        session_id: &str,
+        timestamp: &str,
+        request: &str,
+        outcome: &str,
+        investigated: &[&str],
+        todos: &[(&str, &str)],
+    ) {
+        let content = serde_json::json!({
+            "schema": "v2",
+            "session_id": session_id,
+            "project": "proj",
+            "timestamp": timestamp,
+            "request": request,
+            "outcome": outcome,
+            "investigated": investigated,
+            "todos": todos.iter().map(|(content, status)| {
+                serde_json::json!({"content": content, "status": status})
+            }).collect::<Vec<_>>(),
+        });
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        format!("episode-{session_id}"),
+                        content.to_string(),
+                        format!(r#"["session_episode","schema_v2","conv_{session_id}"]"#),
+                        timestamp,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn seed_story(storage: &Storage, session_id: &str, timestamp: &str, story: &str) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        format!("story-{session_id}"),
+                        story,
+                        format!(r#"["session_story","project_proj","conv_{session_id}"]"#),
+                        timestamp,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn seed_registry(storage: &Storage, session_id: &str, timestamp: &str, prompt: &str) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO session_registry
+                        (session_id, project, first_prompt, first_ts, last_ts, prompt_count)
+                     VALUES (?1, 'proj', ?2, ?3, ?3, 1)",
+                    rusqlite::params![session_id, prompt, timestamp],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn seed_anchor(storage: &Storage, session_id: &str, timestamp: &str, symbol: &str) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO episode_anchors
+                        (session_id, project, file, node_kind, name, body_hash, created_at)
+                     VALUES (?1, 'proj', '/repo/src/lib.rs', 'function_item', ?2, 'hash', ?3)",
+                    rusqlite::params![session_id, symbol, timestamp],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
     fn ledger_row(
         project: &str,
         file: &str,
@@ -646,52 +667,49 @@ mod tests {
     }
 
     #[test]
-    fn empty_db_renders_no_dreams_yet() {
+    fn empty_db_renders_no_session_story_signal() {
         let storage = Storage::open_memory().unwrap();
         let data =
             gather_report_data_with(&storage, crate::storage::recap_feeds::ConsumptionMode::Off)
                 .unwrap();
         assert!(data.is_empty);
         assert!(!data.has_run);
-        assert!(data.days.is_empty());
-        assert!(data.forgotten.is_empty());
+        assert!(data.cards.is_empty());
 
         let html = render_html(&data).unwrap();
-        assert!(html.contains("No dreams yet"));
+        assert!(html.contains("No session has enough story signal"));
         assert!(html.contains("<!doctype html>"));
         assert!(html.contains("CSR Dream Journal"));
-        // Zero network requests: no external script/link/stylesheet tags.
         assert!(!html.to_lowercase().contains("<script"));
         assert!(!html.contains("http://"));
         assert!(!html.contains("https://"));
     }
 
     #[test]
-    fn consumption_off_renders_no_dreams_yet_even_with_real_verdicts() {
+    fn consumption_mode_does_not_hide_story_data() {
         let storage = Storage::open_memory().unwrap();
-        storage
-            .with_connection(|conn| {
-                conn.execute_batch("DROP TABLE witness_verdicts")?;
-                Ok(())
-            })
-            .unwrap();
-        // consumption_enabled reads real env (unset in this test process by
-        // default) — dropping witness_verdicts on top proves the guard
-        // clause returns before any query would have needed that table.
+        seed_episode(
+            &storage,
+            "visible-story",
+            "2026-01-01T01:00:00Z",
+            "Show the session story",
+            "done",
+            &[],
+            &[],
+        );
         let data =
             gather_report_data_with(&storage, crate::storage::recap_feeds::ConsumptionMode::Off)
                 .unwrap();
-        assert!(data.is_empty);
+        assert!(!data.is_empty);
         assert!(!data.has_run);
-        assert!(data.days.is_empty());
-        assert!(data.forgotten.is_empty());
+        assert_eq!(data.cards.len(), 1);
 
         let html = render_html(&data).unwrap();
-        assert!(html.contains("No dreams yet"));
+        assert!(html.contains("Show the session story"));
     }
 
     #[test]
-    fn synthetic_events_render_key_strings() {
+    fn synthetic_event_keeps_totals_and_renders_as_artifact_receipt() {
         let storage = Storage::open_memory().unwrap();
         storage
             .insert_witness(&ledger_row(
@@ -702,177 +720,36 @@ mod tests {
                 "b3:1",
             ))
             .unwrap();
-        storage
-            .insert_witness(&ledger_row(
-                "proj",
-                "/repo/src/lib.rs",
-                Some("foo"),
-                "bbb",
-                "b3:2",
-            ))
-            .unwrap();
-        let w1 = storage
+        let witness = storage
             .witnesses_for_file("proj", "/repo/src/lib.rs")
             .unwrap()
-            .into_iter()
-            .find(|r| r.at_oid.as_deref() == Some("aaa"))
-            .unwrap();
-        let w2 = storage
-            .witnesses_for_file("proj", "/repo/src/lib.rs")
-            .unwrap()
-            .into_iter()
-            .find(|r| r.at_oid.as_deref() == Some("bbb"))
+            .pop()
             .unwrap();
         storage
             .insert_witness_verdict(&WitnessVerdictRow {
-                witness_id: w1.id,
+                witness_id: witness.id,
                 verdict: VerdictKind::SupersededBy,
-                successor_witness_id: Some(w2.id),
+                successor_witness_id: None,
                 receipt_oid: Some("bbb".into()),
                 observed_head_oid: "bbb".into(),
             })
             .unwrap();
+        seed_anchor(&storage, "event-session", "2026-01-02T01:00:00Z", "foo");
 
         let data = gather_report_data_with(
             &storage,
             crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
         )
         .unwrap();
-        assert!(!data.is_empty);
         assert!(data.has_run);
         assert_eq!(data.totals.superseded, 1);
         assert_eq!(data.totals.total, 1);
-        assert_eq!(data.days.len(), 1);
-        assert_eq!(data.days[0].events.len(), 1);
-        assert_eq!(data.days[0].events[0].symbol, "foo");
-        assert_eq!(data.days[0].events[0].verdict_slug, "superseded");
-        assert!(data.days[0].events[0].successor_line.is_some());
+        assert_eq!(data.cards.len(), 1);
 
         let html = render_html(&data).unwrap();
         assert!(html.contains("foo"));
-        assert!(html.contains("Superseded"));
+        assert!(html.contains("superseded at bbb"));
         assert!(html.contains("lib.rs"));
-        assert!(!html.contains("No dreams yet"));
-    }
-
-    #[test]
-    fn journal_leads_with_user_supersessions_and_collapses_noise_with_links() {
-        let storage = Storage::open_memory().unwrap();
-        let seed_event =
-            |symbol: &str, file: &str, at_oid: &str, receipt: &str, verdict: VerdictKind| {
-                storage
-                    .insert_witness(&ledger_row("proj", file, Some(symbol), at_oid, at_oid))
-                    .unwrap();
-                let witness = storage
-                    .witnesses_for_file("proj", file)
-                    .unwrap()
-                    .into_iter()
-                    .find(|row| row.at_oid.as_deref() == Some(at_oid))
-                    .unwrap();
-                storage
-                    .insert_witness_verdict(&WitnessVerdictRow {
-                        witness_id: witness.id,
-                        verdict,
-                        successor_witness_id: (verdict == VerdictKind::SupersededBy)
-                            .then_some(witness.id),
-                        receipt_oid: Some(receipt.into()),
-                        observed_head_oid: receipt.into(),
-                    })
-                    .unwrap();
-            };
-
-        seed_event(
-            "business_old",
-            "/repo/src/lib.rs",
-            "anchor-old",
-            "11111111-old",
-            VerdictKind::SupersededBy,
-        );
-        seed_event(
-            "business_new",
-            "/repo/src/lib.rs",
-            "anchor-new",
-            "22222222-new",
-            VerdictKind::SupersededBy,
-        );
-        seed_event(
-            "test_helper",
-            "/repo/src/lib.rs",
-            "anchor-test",
-            "33333333-test",
-            VerdictKind::SupersededBy,
-        );
-        seed_event(
-            "fixture_builder",
-            "/repo/src/lib.rs",
-            "anchor-fixture",
-            "44444444-fixture",
-            VerdictKind::SupersededBy,
-        );
-        seed_event(
-            "integration_helper",
-            "/repo/tests/integration.rs",
-            "anchor-integration",
-            "55555555-integration",
-            VerdictKind::SupersededBy,
-        );
-        seed_event(
-            "restored_one",
-            "/repo/src/lib.rs",
-            "anchor-restored-one",
-            "headfeed-restored",
-            VerdictKind::AnchorReinstated,
-        );
-        seed_event(
-            "restored_two",
-            "/repo/src/other.rs",
-            "anchor-restored-two",
-            "headfeed-restored",
-            VerdictKind::AnchorReinstated,
-        );
-        storage
-            .with_connection(|conn| {
-                conn.execute(
-                    "INSERT INTO code_nodes
-                        (id, project, file, kind, name, first_conv_id, last_conv_id)
-                     VALUES ('business-node', 'proj', '/repo/src/lib.rs', 'function',
-                             'business_new', 'aaaaaaaa-alpha', 'bbbbbbbb-beta')",
-                    [],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-
-        let data = gather_report_data_with(
-            &storage,
-            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
-        )
-        .unwrap();
-        let html = render_html(&data).unwrap();
-
-        assert!(html.contains(
-            "Searches touching these anchors carry [evolved] annotations with these receipts"
-        ));
-        let new_pos = html.find("business_new").unwrap();
-        let old_pos = html.find("business_old").unwrap();
-        let tests_pos = html.find("internal/test symbols").unwrap();
-        assert!(
-            new_pos < old_pos,
-            "newest receipt must render first within its file"
-        );
-        assert!(
-            old_pos < tests_pos,
-            "user symbols must lead collapsed test symbols"
-        );
-        assert!(html.contains("3 internal/test symbols"));
-        assert!(html.contains("appears in 2 conversation(s): aaaaaaaa bbbbbbbb"));
-        assert!(html.contains("no linked conversations"));
-        assert!(html.contains("2 anchors re-observed at HEAD headfeed"));
-        assert!(html.contains("<details"));
-        assert!(
-            !html.contains("receipt headfeed"),
-            "reinstatement details must not expose a tautological receipt column"
-        );
     }
 
     /// Symbol names are user code identifiers interpolated into HTML; minijinja
@@ -905,6 +782,7 @@ mod tests {
                 observed_head_oid: "bbb".into(),
             })
             .unwrap();
+        seed_anchor(&storage, "hostile-session", "2026-01-03T01:00:00Z", payload);
 
         let data = gather_report_data_with(
             &storage,
@@ -918,46 +796,6 @@ mod tests {
     }
 
     #[test]
-    fn demoted_symbol_appears_in_forgotten_section() {
-        let storage = Storage::open_memory().unwrap();
-        storage
-            .insert_witness(&ledger_row(
-                "proj",
-                "/repo/src/gone.rs",
-                Some("vanished"),
-                "aaa",
-                "b3:1",
-            ))
-            .unwrap();
-        let w = storage
-            .witnesses_for_file("proj", "/repo/src/gone.rs")
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        storage
-            .insert_witness_verdict(&WitnessVerdictRow {
-                witness_id: w.id,
-                verdict: VerdictKind::AnchorObsolete,
-                successor_witness_id: None,
-                receipt_oid: Some("deadbeef".into()),
-                observed_head_oid: "deadbeef".into(),
-            })
-            .unwrap();
-
-        let data =
-            gather_report_data_with(&storage, crate::storage::recap_feeds::ConsumptionMode::Full)
-                .unwrap();
-        assert_eq!(data.forgotten.len(), 1);
-        assert_eq!(data.forgotten[0].symbol, "vanished");
-
-        let html = render_html(&data).unwrap();
-        assert!(html.contains("What CSR forgot"));
-        assert!(html.contains("vanished"));
-        assert!(html.contains("Demoted"));
-    }
-
-    #[test]
     fn report_no_open_writes_file_to_tempdir() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open_memory().unwrap();
@@ -967,7 +805,7 @@ mod tests {
         assert_eq!(written, out_path);
         let contents = std::fs::read_to_string(&written).unwrap();
         assert!(contents.contains("CSR Dream Journal"));
-        assert!(contents.contains("No dreams yet"));
+        assert!(contents.contains("No session has enough story signal"));
     }
 
     #[test]
@@ -994,5 +832,187 @@ mod tests {
         assert_eq!(conn_row.symbol, None);
         let _ = witness_ledger::insert_witness;
         let _ = witness_verdicts::VerdictChannel::Demote;
+    }
+
+    #[test]
+    fn story_cards_render_full_flow_newest_first_without_scripts() {
+        let storage = Storage::open_memory().unwrap();
+        for (session, timestamp, story, symbol) in [
+            (
+                "older-session",
+                "2026-02-01T01:00:00Z",
+                "Older session summary. Supporting detail.",
+                "older_symbol",
+            ),
+            (
+                "newer-session",
+                "2026-02-02T01:00:00Z",
+                "Newer session summary. Supporting detail.",
+                "newer_symbol",
+            ),
+        ] {
+            seed_episode(
+                &storage,
+                session,
+                timestamp,
+                "Build the story surface",
+                "done",
+                &["/repo/src/report.rs"],
+                &[("verify output", "completed")],
+            );
+            seed_story(&storage, session, timestamp, story);
+            seed_anchor(&storage, session, timestamp, symbol);
+        }
+
+        let data = gather_report_data_with(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        )
+        .unwrap();
+        let html = render_html(&data).unwrap();
+
+        let newer = html.find("Newer session summary.").unwrap();
+        let older = html.find("Older session summary.").unwrap();
+        assert!(newer < older, "cards must render newest first");
+        assert!(html.contains("data-tier=\"full\""));
+        for stage in ["input", "deliberation", "artifacts", "steer"] {
+            assert!(html.contains(&format!("data-stage=\"{stage}\"")));
+        }
+        assert!(!html.to_lowercase().contains("<script"));
+    }
+
+    #[test]
+    fn request_and_outcome_render_template_card_with_only_populated_stages() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode(
+            &storage,
+            "template-session",
+            "2026-02-03T01:00:00Z",
+            "Investigate the release gate",
+            "partial",
+            &[],
+            &[],
+        );
+
+        let data = gather_report_data_with(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        )
+        .unwrap();
+        let html = render_html(&data).unwrap();
+
+        assert!(html.contains("data-tier=\"template\""));
+        assert!(html.contains("data-stage=\"input\""));
+        assert!(html.contains("data-stage=\"steer\""));
+        assert!(!html.contains("data-stage=\"deliberation\""));
+        assert!(!html.contains("data-stage=\"artifacts\""));
+    }
+
+    #[test]
+    fn artifact_only_card_is_thin_evidence_and_shows_superseded_receipt() {
+        let storage = Storage::open_memory().unwrap();
+        seed_anchor(
+            &storage,
+            "thin-session",
+            "2026-02-04T01:00:00Z",
+            "retired_symbol",
+        );
+        storage
+            .insert_witness(&ledger_row(
+                "proj",
+                "/repo/src/lib.rs",
+                Some("retired_symbol"),
+                "old-oid",
+                "b3:old",
+            ))
+            .unwrap();
+        let witness = storage
+            .witnesses_for_file("proj", "/repo/src/lib.rs")
+            .unwrap()
+            .pop()
+            .unwrap();
+        storage
+            .insert_witness_verdict(&WitnessVerdictRow {
+                witness_id: witness.id,
+                verdict: VerdictKind::SupersededBy,
+                successor_witness_id: None,
+                receipt_oid: Some("abcdef1234567890".into()),
+                observed_head_oid: "head".into(),
+            })
+            .unwrap();
+
+        let data = gather_report_data_with(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        )
+        .unwrap();
+        let html = render_html(&data).unwrap();
+
+        assert!(html.contains("data-tier=\"thin-evidence\""));
+        assert!(html.contains("thin evidence"));
+        assert!(html.contains("retired_symbol"));
+        assert!(html.contains("superseded at abcdef12"));
+        assert!(html.contains("data-stage=\"artifacts\""));
+        assert!(!html.contains("data-stage=\"input\""));
+        assert!(!html.contains("data-stage=\"steer\""));
+    }
+
+    #[test]
+    fn low_signal_sessions_are_omitted_and_counted() {
+        let storage = Storage::open_memory().unwrap();
+        seed_registry(
+            &storage,
+            "low-signal",
+            "2026-02-05T01:00:00Z",
+            "A prompt alone is not enough",
+        );
+
+        let data = gather_report_data_with(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        )
+        .unwrap();
+        let html = render_html(&data).unwrap();
+
+        assert!(!html.contains("class=\"story-card"));
+        assert!(html.contains("1 low-signal sessions omitted"));
+        assert!(!html.contains("data-stage="));
+    }
+
+    #[test]
+    fn report_caps_cards_at_fifty_and_counts_older_and_low_signal_omissions() {
+        let storage = Storage::open_memory().unwrap();
+        for index in 0..52 {
+            let session = format!("session-{index:02}");
+            let timestamp = format!("2026-03-{:02}T01:00:00Z", index + 1);
+            seed_episode(
+                &storage,
+                &session,
+                &timestamp,
+                &format!("request {index}"),
+                "done",
+                &[],
+                &[],
+            );
+        }
+        for index in 0..2 {
+            seed_registry(
+                &storage,
+                &format!("low-{index}"),
+                &format!("2026-01-0{}T01:00:00Z", index + 1),
+                "prompt only",
+            );
+        }
+
+        let data = gather_report_data_with(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        )
+        .unwrap();
+        let html = render_html(&data).unwrap();
+
+        assert_eq!(html.matches("class=\"story-card").count(), 50);
+        assert!(html.contains("2 older sessions omitted"));
+        assert!(html.contains("2 low-signal sessions omitted"));
     }
 }
