@@ -24,9 +24,10 @@
   :root {
     /* Journal v2 Phase 4 (glassmorphic brand pass) — one light register,
        matched to docs-site's Editorial Glassmorphic Bento
-       (docs-site/DESIGN_SYSTEM.md). The dark-SaaS theme this replaced is a
-       banned anti-pattern per that spec; there is deliberately no
-       prefers-color-scheme: dark branch here. */
+       (docs-site/DESIGN_SYSTEM.md). Journal v2 Phase 6 adds a dark variant
+       of this SAME glass brand below (deep indigo night, not the banned
+       flat-black/SaaS-grey anti-pattern) — token swap only, see the two
+       dark blocks right after this one. */
     --sky-top: #e8e4f0;
     --sky-bottom: #c8cae0;
     --ink: #1a1a2e;
@@ -38,6 +39,11 @@
     --amber-cream: #d4a574;
     --glass: rgba(255, 255, 255, 0.55);
     --glass-border: rgba(255, 255, 255, 0.3);
+    /* Brand-polish overlay for hover/selected states (index-row.selected
+       background, stage-card/artifact-tile hover border) — same value as
+       --glass today, kept as its own token so the dark variant can dim it
+       instead of literally whiting out a dark panel. */
+    --highlight: rgba(255, 255, 255, 0.55);
     --glass-blur: blur(16px);
     --radius-pane: 1.25rem;
     --radius-tile: 0.75rem;
@@ -69,6 +75,69 @@
     --green: #3f5238;
     --green-bg: rgba(124, 148, 115, 0.2);
   }
+
+  /* Journal v2 Phase 6: dark variant of the SAME glassmorphic brand — deep
+     indigo night (never flat black, never SaaS grey), token swap only. Two
+     forms, both defining the identical token set so either input source
+     (OS-level prefers-color-scheme, or the in-page toggle's data-theme
+     attribute) repaints the whole document with zero per-component rules:
+       1. @media (prefers-color-scheme: dark), guarded by :not([data-theme=
+          "light"]) so the explicit toggle can still force light mode on a
+          dark-OS visitor;
+       2. [data-theme="dark"] on the root, which wins regardless of OS
+          preference once the toggle is clicked.
+     Every color below is a text-role token verified >= 4.5:1 against the
+     darkest realistic backdrop (glass-over-sky composite); see the
+     contrast table in the implementing commit message, not restated here
+     so the two blocks below never drift out of sync with each other. */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --sky-top: #1a1a2e;
+      --sky-bottom: #26263e;
+      --ink: #e8e6f0;
+      --slate: #9a98b5;
+      --label: #9694ae;
+      --purple: #9d8cc4;
+      --rose: #d9a3ac;
+      --sage: #a8c29c;
+      --amber-cream: #e0b988;
+      --glass: rgba(30, 30, 46, 0.55);
+      --glass-border: rgba(255, 255, 255, 0.12);
+      --highlight: rgba(255, 255, 255, 0.14);
+      --postit-lavender: linear-gradient(135deg, #322f52 0%, #3d3860 100%);
+      --postit-rose: linear-gradient(135deg, #4a2f3d 0%, #5c3548 100%);
+      --bg: rgba(30, 30, 46, 0.35);
+      --red: #f0a9b2;
+      --red-bg: rgba(229, 128, 140, 0.22);
+      --amber: #f0c58c;
+      --amber-bg: rgba(224, 163, 85, 0.24);
+      --green: #a9dd98;
+      --green-bg: rgba(143, 194, 122, 0.22);
+    }
+  }
+  :root[data-theme="dark"] {
+    --sky-top: #1a1a2e;
+    --sky-bottom: #26263e;
+    --ink: #e8e6f0;
+    --slate: #9a98b5;
+    --label: #9694ae;
+    --purple: #9d8cc4;
+    --rose: #d9a3ac;
+    --sage: #a8c29c;
+    --amber-cream: #e0b988;
+    --glass: rgba(30, 30, 46, 0.55);
+    --glass-border: rgba(255, 255, 255, 0.12);
+    --highlight: rgba(255, 255, 255, 0.14);
+    --postit-lavender: linear-gradient(135deg, #322f52 0%, #3d3860 100%);
+    --postit-rose: linear-gradient(135deg, #4a2f3d 0%, #5c3548 100%);
+    --bg: rgba(30, 30, 46, 0.35);
+    --red: #f0a9b2;
+    --red-bg: rgba(229, 128, 140, 0.22);
+    --amber: #f0c58c;
+    --amber-bg: rgba(224, 163, 85, 0.24);
+    --green: #a9dd98;
+    --green-bg: rgba(143, 194, 122, 0.22);
+  }
   * { box-sizing: border-box; }
   html, body {
     margin: 0;
@@ -88,6 +157,11 @@
   header.hero {
     margin-bottom: 2rem;
   }
+  .hero-title-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
   header.hero h1 {
     font-family: var(--serif);
     font-weight: 700;
@@ -95,6 +169,32 @@
     margin: 0 0 0.35rem;
     letter-spacing: -0.01em;
     color: var(--ink);
+  }
+  /* Journal v2 Phase 6: theme toggle — cycles auto -> dark -> light ->
+     auto, nothing persisted (default is always "auto" on reload). Token-
+     driven only, so it repaints for free under both dark blocks above;
+     font-family is reset off the h1's serif since a <button> would
+     otherwise inherit it from this row. */
+  .theme-toggle {
+    flex: none;
+    width: 1.9rem;
+    height: 1.9rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 0.95rem;
+    line-height: 1;
+    color: var(--ink);
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: 999px;
+    cursor: pointer;
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+  }
+  .theme-toggle:hover {
+    border-color: var(--purple);
   }
   header.hero .subtitle {
     color: var(--fg-muted);
@@ -239,7 +339,10 @@
 <div class="wrap">
 
   <header class="hero">
-    <h1>☾ CSR Dream Journal</h1>
+    <div class="hero-title-row">
+      <h1>☾ CSR Dream Journal</h1>
+      <button type="button" class="theme-toggle" data-theme-state="auto" aria-label="Theme: auto (click to change)">&#9680;</button>
+    </div>
     <p class="subtitle">Deterministic supersession verdicts drawn from content-hash stamps and git ancestry — zero LLM, zero guessing.</p>
     <div class="meta-row">
       {% if data.has_run %}

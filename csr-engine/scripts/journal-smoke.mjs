@@ -1193,6 +1193,66 @@ async function main() {
       );
       check("since-then-absent", sinceThenAbsent.hasPanel === false, JSON.stringify(sinceThenAbsent));
 
+      // ---- dark-mode-emulated (journal v2 Phase 6) -------------------------
+      // Headless Chrome's own default color-scheme preference is not
+      // reliably "light" (it follows the host OS), so both ends of this
+      // comparison are explicitly emulated rather than assuming the
+      // pre-emulation render is the light one. Confirm the background
+      // actually moves between the two and the dark render lands on the
+      // dark sky-bottom token (#26263e = rgb(38, 38, 62)).
+      await cdp.send("Emulation.setEmulatedMedia", {
+        features: [{ name: "prefers-color-scheme", value: "light" }],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const lightBg = await evalJS(cdp, `getComputedStyle(document.body).backgroundImage`);
+      await cdp.send("Emulation.setEmulatedMedia", {
+        features: [{ name: "prefers-color-scheme", value: "dark" }],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const darkBg = await evalJS(cdp, `getComputedStyle(document.body).backgroundImage`);
+      check(
+        "dark-mode-emulated",
+        darkBg !== lightBg && /38, ?38, ?62/.test(darkBg),
+        JSON.stringify({ lightBg, darkBg }),
+      );
+
+      // ---- theme-toggle (journal v2 Phase 6) --------------------------------
+      // Force the OS-level scheme back to light so only the in-page toggle
+      // drives the attribute; walk one full auto -> dark -> light -> auto
+      // cycle and check the `data-theme` attribute and the computed
+      // background move together at every step.
+      await cdp.send("Emulation.setEmulatedMedia", {
+        features: [{ name: "prefers-color-scheme", value: "light" }],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const cycle = await evalJS(
+        cdp,
+        `(async () => {
+          const toggle = document.querySelector(".theme-toggle");
+          const bg = () => getComputedStyle(document.body).backgroundImage;
+          const initialBg = bg();
+          const steps = [];
+          for (let i = 0; i < 3; i++) {
+            toggle.click();
+            await new Promise(resolve => setTimeout(resolve, 20));
+            steps.push({ theme: document.documentElement.getAttribute("data-theme"), bg: bg() });
+          }
+          return { initialBg, steps };
+        })()`,
+      );
+      const [afterDark, afterLight, afterAuto] = cycle.steps;
+      check(
+        "theme-toggle",
+        afterDark?.theme === "dark" &&
+          /38, ?38, ?62/.test(afterDark.bg) &&
+          afterLight?.theme === "light" &&
+          afterLight.bg === cycle.initialBg &&
+          afterAuto?.theme === null &&
+          afterAuto.bg === cycle.initialBg,
+        JSON.stringify(cycle),
+      );
+      await cdp.send("Emulation.setEmulatedMedia", { features: [] });
+
       cdp.close();
     } finally {
       chrome.kill("SIGKILL");

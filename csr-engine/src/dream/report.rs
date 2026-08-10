@@ -438,9 +438,9 @@ const MAILBOX_CSS: &str = r#"
   }
   .stage-card:hover, .artifact-tile:hover {
     transform: translateY(-2px);
-    border-color: rgba(255, 255, 255, 0.55);
+    border-color: var(--highlight);
   }
-  .index-row.selected { background: rgba(255, 255, 255, 0.55); }
+  .index-row.selected { background: var(--highlight); }
 
   /* Editorial small-caps kicker labels — same muted-purple-adjacent grey the
      docs-site DocPage register uses for breadcrumbs/section labels. */
@@ -716,6 +716,26 @@ const MAILBOX_SCRIPT: &str = r#"
     chip.addEventListener("pointermove", positionPopover);
     chip.addEventListener("pointerleave", () => { popover.hidden = true; });
   });
+
+  // --- theme toggle (Journal v2 Phase 6) ---------------------------------
+  // auto -> dark -> light -> auto, never persisted: every reload starts
+  // back at "auto" (no data-theme attribute), so the rendered HTML bytes
+  // stay identical run to run — this only ever touches the live DOM.
+  const themeToggle = document.querySelector(".theme-toggle");
+  if (themeToggle) {
+    const THEME_STATES = ["auto", "dark", "light"];
+    const GLYPH = { auto: "◐", dark: "●", light: "○" };
+    let themeIndex = 0;
+    themeToggle.addEventListener("click", () => {
+      themeIndex = (themeIndex + 1) % THEME_STATES.length;
+      const state = THEME_STATES[themeIndex];
+      if (state === "auto") document.documentElement.removeAttribute("data-theme");
+      else document.documentElement.setAttribute("data-theme", state);
+      themeToggle.dataset.themeState = state;
+      themeToggle.textContent = GLYPH[state];
+      themeToggle.setAttribute("aria-label", `Theme: ${state} (click to change)`);
+    });
+  }
 })();
 "#;
 
@@ -4522,6 +4542,72 @@ mod tests {
             html_a, html_b,
             "rendering the same fixture twice must be byte-identical"
         );
+    }
+
+    /// Journal v2 Phase 6 (dark mode): the report must ship a dark variant
+    /// of the SAME token set reachable through both the OS-level
+    /// `prefers-color-scheme: dark` media query and the client-side
+    /// `[data-theme="dark"]` attribute override — one block covers a
+    /// dark-OS visitor who never touches the toggle, the other covers the
+    /// toggle winning regardless of OS preference. Both must define every
+    /// token that changes for dark mode, or the two forms would silently
+    /// drift out of sync.
+    #[test]
+    fn dark_tokens_present_in_both_media_query_and_attribute_forms() {
+        let storage = Storage::open_memory().unwrap();
+        seed_rich_sessions(&storage, 1);
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+
+        let media_start = html
+            .find(r#"@media (prefers-color-scheme: dark)"#)
+            .expect("prefers-color-scheme: dark media query must be present");
+        let media_end = html[media_start..]
+            .find(r#":root[data-theme="dark"]"#)
+            .map(|offset| media_start + offset)
+            .expect(r#"[data-theme="dark"] block must follow the media query block"#);
+        let media_block = &html[media_start..media_end];
+        assert!(
+            media_block.contains(r#":not([data-theme="light"])"#),
+            "the media-query block must be guarded so an explicit light toggle can still win"
+        );
+
+        let attr_start = media_end;
+        let attr_end = html[attr_start..]
+            .find("* { box-sizing: border-box; }")
+            .map(|offset| attr_start + offset)
+            .expect("attribute block must be followed by the base stylesheet");
+        let attr_block = &html[attr_start..attr_end];
+
+        let dark_tokens = [
+            "--sky-top: #1a1a2e",
+            "--sky-bottom: #26263e",
+            "--ink: #e8e6f0",
+            "--slate: #9a98b5",
+            "--label: #9694ae",
+            "--purple: #9d8cc4",
+            "--rose: #d9a3ac",
+            "--sage: #a8c29c",
+            "--amber-cream: #e0b988",
+            "--glass: rgba(30, 30, 46, 0.55)",
+            "--glass-border: rgba(255, 255, 255, 0.12)",
+            "--bg: rgba(30, 30, 46, 0.35)",
+            "--red: #f0a9b2",
+            "--amber: #f0c58c",
+            "--green: #a9dd98",
+        ];
+        for token in dark_tokens {
+            assert!(
+                media_block.contains(token),
+                "prefers-color-scheme block missing dark token {token:?}"
+            );
+            assert!(
+                attr_block.contains(token),
+                "[data-theme=\"dark\"] block missing dark token {token:?}"
+            );
+        }
     }
 
     // ---- §7.2 pinned Phase 2 tests ---------------------------------------
