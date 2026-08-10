@@ -58,11 +58,28 @@ const MAX_STORED_STEERS: usize = 3;
 /// it to steers a session may have already persisted under the pre-fix
 /// filter, per plan Part A).
 ///
+/// F3: `transcript::mod`'s queue-ingest path prefixes every queued prompt's
+/// text with a literal `"[queued] "` token (`format!("[queued] {}", ...)`,
+/// twice — once for queued follow-ups, once for the queued opening prompt)
+/// before the `[SYSTEM NOTIFICATION` prefix check ever runs. That prefix
+/// pushed the real marker off byte 0, so `"[queued] [SYSTEM NOTIFICATION -
+/// NOT USER INPUT]..."` no longer started with `"[SYSTEM NOTIFICATION"` and
+/// survived as a fabricated human steer. Fixed by repeatedly stripping a
+/// leading `"[queued] "` token before the prefix check — queuing can in
+/// principle nest, so this strips ALL of them, not just one — while leaving
+/// the `contains` checks untouched (a queued token anywhere but the very
+/// front never hid those).
+///
 /// **One predicate, two call sites**: [`from_parsed`]'s steer loop (forward
 /// path) and `dream::report`'s STEER stage-card builder (render-time
 /// re-filter of already-stored steers).
 pub(crate) fn is_noisy_steer_text(text: &str) -> bool {
-    text.trim_start().starts_with("[SYSTEM NOTIFICATION")
+    const QUEUED_PREFIX: &str = "[queued] ";
+    let mut normalized = text.trim_start();
+    while let Some(stripped) = normalized.strip_prefix(QUEUED_PREFIX) {
+        normalized = stripped.trim_start();
+    }
+    normalized.starts_with("[SYSTEM NOTIFICATION")
         || text.contains("<task-notification>")
         || text.contains("<local-command-caveat>")
         || text.contains("<command-name>")
@@ -435,6 +452,32 @@ mod tests {
         assert_eq!(inst.steers.len(), 1);
         assert_eq!(inst.steers[0].turn, 6);
         assert!(inst.steers[0].text.contains("hindi"));
+    }
+
+    /// F3: `transcript::mod`'s queue-ingest path prefixes queued prompt text
+    /// with a literal `"[queued] "` token, which pushed the `"[SYSTEM
+    /// NOTIFICATION"` marker off byte 0 and let a queued system notification
+    /// survive the `starts_with` prefix check as a fabricated human steer.
+    #[test]
+    fn is_noisy_steer_text_strips_queued_prefix_before_system_notification_check() {
+        assert!(
+            is_noisy_steer_text(
+                "[queued] [SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated \
+                 background-task event, NOT a message from the user."
+            ),
+            "a queued system notification must still be recognized as noise"
+        );
+    }
+
+    /// F3 counterpart: a genuine queued human steer (queuing is a normal
+    /// interaction mode, not evidence of harness plumbing) must NOT be
+    /// excluded just because it happens to be queued.
+    #[test]
+    fn is_noisy_steer_text_keeps_genuine_queued_human_steer() {
+        assert!(
+            !is_noisy_steer_text("[queued] no — use the hindi voice"),
+            "a genuine queued human correction must not be filtered as noise"
+        );
     }
 
     #[test]

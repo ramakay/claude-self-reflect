@@ -937,6 +937,14 @@ pub struct SinceThenConclusion {
     /// dreaming principles doc ("honest forgetting") absence of evidence is
     /// never rendered as "live."
     pub witnessed: bool,
+    /// `MAX(witness_ledger.created_at)` for this anchor when `witnessed` is
+    /// `true` and no verdict event exists — the date to show alongside
+    /// "witnessed ... unverified since" (F1: a witness at commit A is NOT
+    /// evidence the symbol is still intact at HEAD; we can only honestly
+    /// report *when* it was last witnessed, never that it is "still live").
+    /// `None` whenever `witnessed` is `false`, or a verdict event exists
+    /// (that event's own `event_date` is authoritative in that case).
+    pub witnessed_at: Option<String>,
 }
 
 /// Resolve [`SinceThenConclusion`] for one symbol. Deliberately a plain
@@ -975,19 +983,22 @@ pub fn since_then_conclusion(
             receipt_oid,
             event_date: Some(event_date),
             witnessed: true,
+            witnessed_at: None,
         });
     }
-    let witnessed: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM witness_ledger
-             WHERE project = ?1 AND file = ?2 AND symbol = ?3)",
+    let witnessed_at: Option<String> = conn.query_row(
+        "SELECT MAX(created_at) FROM witness_ledger
+             WHERE project = ?1 AND file = ?2 AND symbol = ?3",
         params![project, file, symbol],
-        |row| row.get(0),
+        |row| row.get::<_, Option<String>>(0),
     )?;
+    let witnessed = witnessed_at.is_some();
     Ok(SinceThenConclusion {
         verdict: None,
         receipt_oid: None,
         event_date: None,
         witnessed,
+        witnessed_at,
     })
 }
 
@@ -1737,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn since_then_conclusion_still_live_when_witnessed_but_no_verdict() {
+    fn since_then_conclusion_witnessed_unverified_when_no_verdict() {
         let conn = open();
         witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
         let conclusion = since_then_conclusion(&conn, "proj", "/repo/src/lib.rs", "foo").unwrap();
@@ -1745,6 +1756,11 @@ mod tests {
         assert!(
             conclusion.witnessed,
             "a ledger row exists — absence of a verdict must not read the same as absence of evidence"
+        );
+        assert!(
+            conclusion.witnessed_at.is_some(),
+            "F1: a witness with no verdict is 'witnessed <date> · unverified since', never a \
+             fabricated 'still live' claim — the date must come from the ledger row, not from HEAD"
         );
     }
 

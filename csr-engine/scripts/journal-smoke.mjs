@@ -1137,9 +1137,11 @@ async function main() {
 
       // ---- since-then-panel (journal v2 Phase 5) ----------------------------
       // "rich9" carries 3 attributed symbols: retry_backoff (superseded, with
-      // a receipt), compute_delay (witnessed, no verdict -> still live, and
-      // named by an open todo -> gets a so-clause), parse_config (attributed
-      // but never witnessed -> unverified, no so-clause).
+      // a receipt), compute_delay (witnessed, no verdict -> honest
+      // "witnessed <date> · unverified since" (F1: never a fabricated
+      // HEAD-verified "still live"), and named by an open todo -> gets a
+      // so-clause), parse_config (attributed but never witnessed ->
+      // unverified, no so-clause).
       const sinceThenPanel = await evalJS(
         cdp,
         `(() => {
@@ -1169,14 +1171,18 @@ async function main() {
         sinceThenPanel.bySymbol.retry_backoff?.conclusionSlug === "superseded" &&
         /superseded ⌗deadbeef/.test(sinceThenPanel.bySymbol.retry_backoff?.conclusionText || "") &&
         sinceThenPanel.bySymbol.retry_backoff?.hasSoClause &&
-        sinceThenPanel.bySymbol.compute_delay?.conclusionSlug === "live" &&
+        sinceThenPanel.bySymbol.compute_delay?.conclusionSlug === "witnessed_unverified" &&
+        /^witnessed \d{4}-\d{2}-\d{2} · unverified since$/.test(
+          sinceThenPanel.bySymbol.compute_delay?.conclusionText || "",
+        ) &&
         sinceThenPanel.bySymbol.compute_delay?.hasSoClause &&
         sinceThenPanel.bySymbol.parse_config?.conclusionSlug === "unverified" &&
         !sinceThenPanel.bySymbol.parse_config?.hasSoClause &&
         sinceThenPanel.bySymbol.retry_backoff?.whyHint === 'csr_why("retry_backoff")' &&
         /3 symbols? touched/.test(sinceThenPanel.kpiText) &&
         /1 superseded since/.test(sinceThenPanel.kpiText) &&
-        /1 still live/.test(sinceThenPanel.kpiText) &&
+        !/still live/.test(sinceThenPanel.kpiText) &&
+        /1 witnessed, unverified/.test(sinceThenPanel.kpiText) &&
         /1 unverified/.test(sinceThenPanel.kpiText);
       check("since-then-panel", sinceThenOk, JSON.stringify(sinceThenPanel));
 

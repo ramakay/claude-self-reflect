@@ -146,7 +146,7 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section class="mailbox" aria-label
           <p class="since-then-kpi">
             <span>{{ pane.since_then.kpi.symbols }} symbol{% if pane.since_then.kpi.symbols != 1 %}s{% endif %} touched</span>
             {% if pane.since_then.kpi.superseded %}<span>{{ pane.since_then.kpi.superseded }} superseded since</span>{% endif %}
-            {% if pane.since_then.kpi.live %}<span>{{ pane.since_then.kpi.live }} still live</span>{% endif %}
+            {% if pane.since_then.kpi.witnessed_unverified %}<span>{{ pane.since_then.kpi.witnessed_unverified }} witnessed, unverified</span>{% endif %}
             {% if pane.since_then.kpi.unverified %}<span>{{ pane.since_then.kpi.unverified }} unverified</span>{% endif %}
           </p>
           <div class="since-then-rows">
@@ -540,6 +540,12 @@ const MAILBOX_CSS: &str = r#"
   .since-then-row .conclusion.superseded,
   .since-then-row .conclusion.obsolete { color: var(--red); }
   .since-then-row .conclusion.unverified { color: var(--fg-muted); font-style: italic; font-weight: 550; }
+  /* F1: witnessed-but-unverified is deliberately NOT the purple "dream
+     concluded something" accent — it is neutral, distinct from both the
+     italic "unverified" (no evidence at all) and any positive/live
+     treatment, since a witness with no later verdict is not proof of
+     liveness at HEAD. */
+  .since-then-row .conclusion.witnessed_unverified { color: var(--fg-muted); font-weight: 650; }
   .since-then-row .so-clause { margin: 0.3rem 0 0; color: var(--ink); overflow-wrap: anywhere; }
   .since-then-row .why-hint {
     display: block; margin-top: 0.35rem; font-size: 0.68rem; color: var(--fg-muted);
@@ -764,11 +770,14 @@ struct SinceThenRowView {
     /// disclosure.
     anchor_only: bool,
     /// Always present: "superseded ⌗oid8 · date", "obsolete, anchor gone ·
-    /// date", "reinstated · date", "still live, re-verified at HEAD", or
-    /// "unverified" — never omitted, never a fabricated "live".
+    /// date", "reinstated · date", "witnessed <date> · unverified since", or
+    /// "unverified" — never omitted, never a fabricated "still live at
+    /// HEAD" (F1: a `witness_ledger` row proves the symbol was intact when
+    /// witnessed, not that it still is — no dream verdict re-checked it
+    /// since).
     conclusion_label: String,
     /// CSS hook / KPI bucket: "superseded" | "obsolete" | "reinstated" |
-    /// "live" | "unverified".
+    /// "witnessed_unverified" | "unverified".
     conclusion_slug: &'static str,
     /// `csr_why("<symbol>")` — rendered as copyable `<code>` text, never a
     /// hyperlink (this is a static file, no MCP transport from HTML).
@@ -784,7 +793,10 @@ struct SinceThenKpiView {
     /// Only segments with evidence are ever non-zero; the template drops a
     /// zero segment entirely rather than rendering "0 superseded".
     superseded: usize,
-    live: usize,
+    /// Count of `witnessed_unverified` rows (F1: "witnessed" is the honest
+    /// KPI word — there is no "still live" count, since a witness with no
+    /// subsequent verdict is not proof of liveness at HEAD).
+    witnessed_unverified: usize,
     unverified: usize,
 }
 
@@ -907,6 +919,11 @@ struct StoryCardView {
     /// mutated in place by the report-time backfill (step 3, live scan) if
     /// still `None` when the backfill runs.
     instrumentation: Option<SessionInstrumentation>,
+    /// F4: which step produced `instrumentation` — tells the backfill
+    /// whether it may skip this card outright (`Episode`, authoritative) or
+    /// must validate it against the current transcript stat before trusting
+    /// it (`Cache`). See [`crate::storage::dream_report::InstrumentationSource`].
+    instrumentation_source: crate::storage::dream_report::InstrumentationSource,
     /// Set by the backfill when a transcript was located on disk but did
     /// not end up contributing measured instrumentation (oversized, budget
     /// exhausted, kill switch, or a read/parse failure) — drives the "⚠ not
@@ -1395,6 +1412,7 @@ fn build_story_card(session: &StorySession) -> StoryCardView {
         episode_json,
         error_signatures: session.error_signatures.clone(),
         instrumentation: session.instrumentation.clone(),
+        instrumentation_source: session.instrumentation_source.clone(),
         unscanned: false,
         has_subagents: false,
         since_then: None,
@@ -1489,6 +1507,24 @@ fn is_bare_slug(text: &str) -> bool {
     !trimmed.is_empty() && trimmed.split_whitespace().count() <= 1 && trimmed.chars().count() <= 24
 }
 
+/// F2: the FULL provenance chain a persisted steer text must survive to
+/// render as a genuine mid-flight human correction. `is_noisy_steer_text`
+/// alone (the render path's pre-F2 re-filter) only catches harness-shaped
+/// plumbing (`<task-notification>`, `[SYSTEM NOTIFICATION`, …) — it does NOT
+/// catch a persisted CSR self-emission such as a `"CSR CONTINUUM [...]"`
+/// echo, which is harness-shaped fine but is CSR's own voice, not the
+/// human's. `is_csr_emission` and `extractable` are the same guards
+/// `instrumentation::from_parsed`'s forward path already runs on the raw
+/// entry text before a steer is ever persisted (module doc, "Steer detection
+/// reuses the exact same self-contamination guard"); re-running them here on
+/// the *persisted* text closes the gap for episodes stored before a filter
+/// fix landed, or before `is_noisy_steer_text` grew a new pattern.
+fn steer_survives(text: &str) -> bool {
+    !crate::extraction::provenance::is_csr_emission(text)
+        && crate::extraction::provenance::extractable(text).is_some()
+        && !crate::transcript::instrumentation::is_noisy_steer_text(text)
+}
+
 /// Only the stages with real evidence are drawn — a session with no todos
 /// and no steers gets a shorter rail, never a padded-out four-node one.
 fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
@@ -1543,30 +1579,49 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
         });
     }
 
-    let steer_count = card.instrumentation.as_ref().map(|i| i.steer_count);
+    // F2: `steer_count`/`steers` are the *stored* cache, computed once at
+    // episode-persist time. An episode persisted before a provenance-filter
+    // fix landed (or before `is_noisy_steer_text` grew a new pattern) can
+    // carry a stale "steer" that is actually a CSR self-emission or harness
+    // notification. Re-running only `is_noisy_steer_text` (the old fix) left
+    // a gap: a persisted `"CSR CONTINUUM [...]"` steer is harness-shaped
+    // fine but IS a CSR emission, so it survived. The render path must not
+    // trust the cache at all — it re-runs the FULL provenance chain
+    // (`is_csr_emission`, `extractable`, `is_noisy_steer_text`) on every
+    // persisted steer text, and the *displayed* count is derived from how
+    // many of the (at most `MAX_STORED_STEERS`) persisted quotes survive,
+    // not blindly reused from the stored `steer_count` — otherwise a steer
+    // count of "1" can render with zero surviving quotes underneath it.
+    let stored_steers: &[crate::transcript::instrumentation::SteerEvent] = card
+        .instrumentation
+        .as_ref()
+        .map(|i| i.steers.as_slice())
+        .unwrap_or(&[]);
+    let filtered_out_count = stored_steers
+        .iter()
+        .filter(|s| !steer_survives(&s.text))
+        .count() as u32;
+    // The raw stored count may exceed `stored_steers.len()` (only the first
+    // `MAX_STORED_STEERS` texts are ever persisted, plan §3.3b) — subtract
+    // only what we can prove is noise among the texts we actually have,
+    // rather than collapsing the true total down to the capped list length
+    // (pinned test `steer_lines_are_capped_at_three_with_a_count_line`:
+    // steer_count=5 with 3 genuine stored quotes must still show "5", not 3).
+    let steer_count = card
+        .instrumentation
+        .as_ref()
+        .map(|i| i.steer_count.saturating_sub(filtered_out_count));
     let has_steers = steer_count.is_some_and(|n| n > 0);
     if !card.todos.is_empty() || has_steers {
-        let steers: Vec<SteerLineView> = card
-            .instrumentation
-            .as_ref()
-            .map(|i| {
-                i.steers
-                    .iter()
-                    // Re-apply the same harness-noise predicate `from_parsed`
-                    // uses (plan Part A): episodes stored before this fix may
-                    // still carry a `<task-notification>`/`[SYSTEM
-                    // NOTIFICATION`-shaped "steer" from the old, narrower
-                    // filter — the render path must not trust the cache
-                    // blindly.
-                    .filter(|s| !crate::transcript::instrumentation::is_noisy_steer_text(&s.text))
-                    .take(3)
-                    .map(|s| SteerLineView {
-                        turn: s.turn,
-                        text: s.text.clone(),
-                    })
-                    .collect()
+        let steers: Vec<SteerLineView> = stored_steers
+            .iter()
+            .filter(|s| steer_survives(&s.text))
+            .take(3)
+            .map(|s| SteerLineView {
+                turn: s.turn,
+                text: s.text.clone(),
             })
-            .unwrap_or_default();
+            .collect();
         stages.push(StageCardView {
             id: "S_STEER",
             label: "STEER",
@@ -1798,9 +1853,14 @@ const SINCE_THEN_CAP: usize = 20;
 
 /// Render one symbol's conclusion into its always-present label, CSS slug,
 /// and adverse-sort rank (0 = worst news, sorts first). Wording choices:
-/// "obsolete, anchor gone" and "still live, re-verified at HEAD" are the
-/// literal phrases from the Phase 5 spec's dream-voice section; "superseded"
-/// and "reinstated" follow the same "verdict · event date" shape.
+/// "obsolete, anchor gone" is the literal phrase from the Phase 5 spec's
+/// dream-voice section; "superseded" and "reinstated" follow the same
+/// "verdict · event date" shape. F1: there is no "still live, re-verified at
+/// HEAD" state — a witness with no subsequent verdict is NOT evidence the
+/// symbol still holds at HEAD, only that it held when last witnessed, so
+/// that case renders as "witnessed <date> · unverified since" (slug
+/// `witnessed_unverified`) with neutral styling, never the positive
+/// treatment a genuine re-verification would earn.
 fn since_then_conclusion_display(conclusion: &SinceThenConclusion) -> (String, &'static str, u8) {
     match (&conclusion.verdict, conclusion.witnessed) {
         (Some(VerdictKind::SupersededBy), _) => {
@@ -1832,7 +1892,18 @@ fn since_then_conclusion_display(conclusion: &SinceThenConclusion) -> (String, &
                 .unwrap_or_default();
             (format!("reinstated · {date}"), "reinstated", 1)
         }
-        (None, true) => ("still live, re-verified at HEAD".to_string(), "live", 2),
+        (None, true) => {
+            let date = conclusion
+                .witnessed_at
+                .as_deref()
+                .map(iso_date)
+                .unwrap_or_default();
+            (
+                format!("witnessed {date} · unverified since"),
+                "witnessed_unverified",
+                2,
+            )
+        }
         (None, false) => ("unverified".to_string(), "unverified", 3),
     }
 }
@@ -1955,13 +2026,13 @@ fn build_since_then_panel(storage: &Storage, session: &StorySession) -> Option<S
     let mut kpi = SinceThenKpiView {
         symbols: total,
         superseded: 0,
-        live: 0,
+        witnessed_unverified: 0,
         unverified: 0,
     };
     for entry in &built {
         match entry.row.conclusion_slug {
             "superseded" => kpi.superseded += 1,
-            "live" => kpi.live += 1,
+            "witnessed_unverified" => kpi.witnessed_unverified += 1,
             "unverified" => kpi.unverified += 1,
             _ => {}
         }
@@ -2066,22 +2137,43 @@ fn has_subagent_transcripts(transcript_path: &Path, session_id: &str) -> bool {
 }
 
 /// Report-time instrumentation backfill (plan §3.3a resolution order, step
-/// 3 — live scan). Mutates `cards` in place: any card whose
-/// `instrumentation` is still `None` after the episode/cache resolution in
-/// `StorySession` gets one attempt at a fresh scan, bounded by the wall
-/// budget and the existing `MAX_STORY_CARDS` cap on `cards.len()` itself
-/// (the plan's "at most 50 sessions per run"). A transcript over
+/// 3 — live scan). Mutates `cards` in place, bounded by the wall budget and
+/// the existing `MAX_STORY_CARDS` cap on `cards.len()` itself (the plan's
+/// "at most 50 sessions per run"). A transcript over
 /// `MAX_TRANSCRIPT_SCAN_BYTES` is never parsed; it only sets `unscanned`. A
 /// cache hit found here (a prior run's backfill result the DB-only
 /// `load_story_sessions` join could not see freshness for) does not count
 /// against the wall budget — only an actual `parse_transcript` call does.
+///
+/// F4: `instrumentation_source` gates what this loop does per card.
+/// `Episode`-sourced instrumentation is the Stop hook's own tool-verified
+/// scan — authoritative, skipped outright, exactly as before. `Cache`-sourced
+/// instrumentation (a `session_instrumentation` row `load_story_sessions`
+/// attached without ever statting the transcript) is no longer trusted
+/// blindly: this loop resolves the path, stats the file, and compares
+/// against the `(transcript_size, transcript_mtime)` the row was cached
+/// under. A match is a real fact ("this transcript has not changed since it
+/// was scanned") and costs one stat, zero rescans. A mismatch means the
+/// transcript has since grown/shrunk — the stale value is discarded and the
+/// card falls through to the same resolve-cache-then-scan path a never-cached
+/// (`None`-sourced) card already took, so a transcript cached at "0 errors"
+/// can no longer render "0 errors" forever after it starts producing real
+/// ones. An unresolvable path or failed stat proves nothing either way, so
+/// the cached value is left exactly as loaded — F4's "cannot stat → keep,
+/// disclosed nothing".
 fn backfill_instrumentation(storage: &Storage, projects_dir: &Path, cards: &mut [StoryCardView]) {
     let scan_enabled = journal_scan_enabled();
     let start = std::time::Instant::now();
     for card in cards.iter_mut() {
-        if card.instrumentation.is_some() {
-            continue;
-        }
+        let cached_stat = match card.instrumentation_source {
+            dream_report::InstrumentationSource::Episode => continue,
+            dream_report::InstrumentationSource::Cache {
+                transcript_size,
+                transcript_mtime,
+            } => Some((transcript_size, transcript_mtime)),
+            dream_report::InstrumentationSource::None => None,
+        };
+
         let lookup = crate::transcript::resolve_session_path(
             projects_dir,
             &card.session_id,
@@ -2089,16 +2181,18 @@ fn backfill_instrumentation(storage: &Storage, projects_dir: &Path, cards: &mut 
         );
         let path = match lookup {
             crate::mcp::tools::ConversationLookup::Found(path, _) => path,
-            _ => continue, // no transcript at all -> no chip, segment stays Absent/Degraded.
+            // No transcript resolvable at all: a `None`-sourced card stays
+            // Absent/Degraded exactly as before; a `Cache`-sourced card's
+            // stat cannot be checked, so its existing value is left as-is
+            // (cannot prove staleness -> not discarded).
+            _ => continue,
         };
         let Ok(metadata) = std::fs::metadata(&path) else {
+            // Same reasoning: a failed stat proves nothing, so any
+            // already-loaded cached value is kept untouched.
             continue;
         };
         card.has_subagents = has_subagent_transcripts(&path, &card.session_id);
-        if metadata.len() > crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES {
-            card.unscanned = true;
-            continue;
-        }
         let mtime = metadata
             .modified()
             .ok()
@@ -2106,10 +2200,27 @@ fn backfill_instrumentation(storage: &Storage, projects_dir: &Path, cards: &mut 
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        // A cache row from a prior run may already be fresh even though the
-        // DB-only join in `load_story_sessions` could not validate it
-        // without this filesystem stat. Reusing it here costs one read, no
-        // parse, and does not count against the wall budget.
+        if let Some((cached_size, cached_mtime)) = cached_stat {
+            if cached_size == metadata.len() && cached_mtime == mtime {
+                // Fresh: the transcript has not changed since this row was
+                // computed. Zero rescans, keep the loaded value as-is.
+                continue;
+            }
+            // Stale: discard so the logic below re-resolves it exactly like
+            // a session that was never cached.
+            card.instrumentation = None;
+        }
+
+        if metadata.len() > crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES {
+            card.unscanned = true;
+            continue;
+        }
+
+        // A cache row from a prior run — or the same row just proven stale
+        // above via a size/mtime mismatch — may still turn out fresh here
+        // (e.g. a concurrent writer refreshed it since); reusing it here
+        // costs one read, no parse, and does not count against the wall
+        // budget.
         let cached = storage
             .with_connection(|conn| {
                 dream_report::read_instrumentation_cache(
@@ -2392,8 +2503,24 @@ fn render_html(data: &DreamReportData) -> Result<String> {
 // line of every uncached card with a single verb-first ask->outcome sentence
 // (plan §5.1); results are cached in `journal_headlines` by a content hash,
 // so an unchanged corpus re-renders at zero cost. The kill switch
-// (`CSR_NO_AI_NARRATIVES=1`) suppresses the invocation but still applies
-// previously cached sentences — they are already paid for.
+// (`CSR_NO_AI_NARRATIVES=1`, `allow_invoke: false` below) applies previously
+// cached sentences exactly as if the switch were off — they are already
+// paid for, so suppressing them would waste money already spent — and
+// forces fallbacks only for the misses: it never invokes the model, and a
+// miss keeps the deterministic `fallback_sentence` `build_story_card`
+// already set, uncached, forever (nothing to converge — no spend was made,
+// so there is no purchased result to preserve).
+//
+// F5 (AI-spend convergence by construction): when the switch IS off and the
+// model IS invoked, `narrative_usage` is recorded for the whole batch the
+// instant a reply comes back — before anyone knows whether every requested
+// card actually produced an acceptable sentence. A missing id, unparseable
+// JSON, or a verb-disagreeing reply must therefore never leave a card
+// uncached: `apply_sentence_replies` caches that card's deterministic
+// fallback instead (tagged `FALLBACK_MODEL_TAG` in `journal_headlines.model`
+// — the model's own rejected/missing LINE is still never cached, only the
+// fallback is). Without this, a batch that pays once but parses badly kept
+// re-paying every subsequent run for the same misses, forever.
 //
 // No schema change (plan §5.2): the cache table and its `headline`/
 // `description` columns are reused verbatim — `headline` now holds the fused
@@ -2609,10 +2736,29 @@ fn sentence_prompt(misses: &[(&StoryCardView, String)]) -> String {
     )
 }
 
+/// Tag stored in `journal_headlines.model` for a row cached with the
+/// deterministic fallback sentence rather than an accepted model line (F5)
+/// — disambiguates "the model never produced an acceptable sentence for
+/// this card, so its fallback was cached instead" from a genuine model
+/// attribution, for anyone inspecting the cache directly.
+const FALLBACK_MODEL_TAG: &str = "fallback";
+
 /// Applies one parsed reply map to `cards`/`storage` for `chunk`'s miss
 /// indices. Split out from `curate_sentences_with` so the verb-agreement /
 /// caching contract (plan §5.1: a disagreeing reply is rejected and NOT
-/// cached) is unit-testable without spawning `claude`.
+/// cached with the MODEL'S line) is unit-testable without spawning `claude`.
+///
+/// F5 (AI-spend convergence by construction): `curate_sentences_with`
+/// already recorded `narrative_usage` for this batch by the time this runs
+/// — the call was paid for regardless of what the model returned. So EVERY
+/// card in `chunk` must leave this function cached in `journal_headlines`
+/// under the current hash: an accepted model sentence when one exists and
+/// agrees with the outcome slug, otherwise the deterministic
+/// `fallback_sentence` — a card missing from `replies` entirely (unparsed/
+/// malformed JSON, or an id the model simply dropped) or verb-disagreeing is
+/// no longer left uncached. Without this, a malformed or partial reply made
+/// the same cards re-purchase a `claude -p` call every single run, forever,
+/// for money already spent once.
 fn apply_sentence_replies(
     storage: &Storage,
     cards: &mut [StoryCardView],
@@ -2623,11 +2769,11 @@ fn apply_sentence_replies(
 ) {
     for &index in chunk {
         let (session_short, hash) = (cards[index].session_short.clone(), hashes[index].clone());
-        let Some(reply) = replies.get(&session_short) else {
-            continue;
-        };
         let slug = cards[index].outcome_slug;
-        if verb_agrees(slug, reply) {
+        let reply = replies.get(&session_short);
+        let accepted = reply.filter(|reply| verb_agrees(slug, reply));
+
+        if let Some(reply) = accepted {
             // Store a non-empty description unconditionally so the row
             // counts as a cache hit next run: the card's deterministic
             // subtitle when it has one, else the sentence itself. Without
@@ -2652,20 +2798,53 @@ fn apply_sentence_replies(
             } else {
                 stored_description
             };
-        } else {
+            continue;
+        }
+
+        if let Some(reply) = reply {
             tracing::warn!(
                 session = %session_short,
                 reply = %reply,
                 slug,
                 "curated sentence disagreed with the outcome slug — using the \
-                 deterministic fallback, not caching the model's line"
+                 deterministic fallback and caching IT, not the model's line"
             );
-            let narrative_or_request = cards[index]
-                .narrative
-                .clone()
-                .or_else(|| cards[index].request_text.clone());
-            cards[index].summary = fallback_sentence(slug, narrative_or_request.as_deref());
+        } else {
+            tracing::warn!(
+                session = %session_short,
+                slug,
+                "no curated sentence for this session in the batch reply (missing id or \
+                 unparseable JSON) — using the deterministic fallback and caching it"
+            );
         }
+
+        // F5: the fallback line — never the rejected/missing model text —
+        // is what gets cached, so this card converges to zero spend next
+        // run exactly like an accepted sentence would.
+        let narrative_or_request = cards[index]
+            .narrative
+            .clone()
+            .or_else(|| cards[index].request_text.clone());
+        let fallback = fallback_sentence(slug, narrative_or_request.as_deref());
+        let stored_description = if !cards[index].description.is_empty() {
+            cards[index].description.clone()
+        } else {
+            fallback.clone()
+        };
+        store_sentence(
+            storage,
+            &session_short,
+            &hash,
+            &fallback,
+            &stored_description,
+            FALLBACK_MODEL_TAG,
+        );
+        cards[index].summary = fallback.clone();
+        cards[index].description = if stored_description == fallback {
+            String::new()
+        } else {
+            stored_description
+        };
     }
 }
 
@@ -2735,9 +2914,16 @@ fn curate_sentences_with(storage: &Storage, cards: &mut [StoryCardView], allow_i
 
         let replies = parse_sentence_batch(&parsed.text);
         if replies.is_empty() {
-            tracing::warn!("journal sentence chunk parsed to nothing — reply likely malformed");
-            continue;
+            tracing::warn!(
+                "journal sentence chunk parsed to nothing — reply likely malformed; every card \
+                 in this already-paid-for batch gets its deterministic fallback cached (F5)"
+            );
         }
+        // F5: run unconditionally, even on a fully malformed reply —
+        // `apply_sentence_replies` now caches a fallback for every card that
+        // did not receive an accepted model sentence, so the usage just
+        // recorded above converges to zero next run regardless of reply
+        // quality.
         apply_sentence_replies(storage, cards, chunk, &hashes, &replies, &parsed.model);
     }
 }
@@ -3014,7 +3200,8 @@ mod tests {
     }
 
     /// Seed a `witness_ledger` row for `(project, file, symbol)` and return
-    /// its id — the "witnessed" evidence behind a `still live` conclusion.
+    /// its id — the "witnessed" evidence behind a `witnessed_unverified`
+    /// conclusion.
     fn seed_witness(
         storage: &Storage,
         project: &str,
@@ -3166,9 +3353,15 @@ mod tests {
         assert!(parse_sentence_batch("{\"id\": \"   \"}").is_empty());
     }
 
-    /// Test 2.
+    /// Test 2. F5: a verb-disagreeing reply's own LINE must never be
+    /// cached ("Shipped the podcast" over a `failed` session), but the
+    /// session must not stay uncached either — `narrative_usage` was
+    /// already spent for this batch, so the card's deterministic fallback
+    /// gets cached in its place (convergence by construction). Renamed from
+    /// its pre-F5 name (`..._is_rejected`) — rejection of the model's line
+    /// still happens, but the card no longer stays a permanent miss.
     #[test]
-    fn verb_disagreeing_with_the_outcome_slug_is_rejected() {
+    fn verb_disagreeing_reply_rejected_but_fallback_cached_in_its_place() {
         let storage = Storage::open_memory().unwrap();
         let session = StorySession {
             session_id: "failed-session".into(),
@@ -3195,9 +3388,25 @@ mod tests {
             "got: {}",
             cards[0].summary
         );
+        let cached = cached_sentence(&storage, &cards[0].session_short, &hash);
         assert!(
-            cached_sentence(&storage, &cards[0].session_short, &hash).is_none(),
-            "a verb-disagreeing reply must not be cached"
+            cached.is_some(),
+            "F5: the session must converge to a cache hit even though the model's line was \
+             rejected — narrative_usage was already spent for this batch"
+        );
+        let (cached_headline, _) = cached.unwrap();
+        assert!(
+            cached_headline.starts_with("Failed:") && cached_headline != "Shipped the podcast",
+            "the model's disagreeing LINE must never be cached, only the deterministic \
+             fallback — got: {cached_headline}"
+        );
+        assert_eq!(
+            cached_headline, cards[0].summary,
+            "the cached headline must match the fallback actually displayed"
+        );
+        assert!(
+            curation_misses(&storage, &cards).is_empty(),
+            "the card must not remain a miss on the next run"
         );
     }
 
@@ -3367,6 +3576,150 @@ mod tests {
         // "rerun costs zero").
         curate_sentences_with(&storage, &mut cards, false);
         assert!(curation_misses(&storage, &cards).is_empty());
+    }
+
+    /// Helper: the `model` `journal_headlines` stored a card's row under.
+    fn cached_model(storage: &Storage, session_short: &str) -> Option<String> {
+        storage
+            .with_connection(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT model FROM journal_headlines WHERE session_id = ?1",
+                        rusqlite::params![session_short],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok())
+            })
+            .unwrap()
+    }
+
+    /// F5 regression: a fully malformed/unparseable batch reply
+    /// (`parse_sentence_batch` returns an empty map, exactly as it does for
+    /// `"not json at all"`) must still leave every card in the batch cached
+    /// — with its deterministic fallback, since `apply_sentence_replies` is
+    /// what `curate_sentences_with` now calls unconditionally after
+    /// `narrative_usage` is recorded, regardless of reply quality.
+    #[test]
+    fn malformed_batch_reply_caches_fallbacks_for_every_card_converging_next_pass() {
+        let storage = Storage::open_memory().unwrap();
+        let mut cards: Vec<StoryCardView> = (0..3)
+            .map(|index| {
+                build_story_card(&StorySession {
+                    session_id: format!("mal{index}-malformed-session"),
+                    project: "proj".into(),
+                    timestamp: "2026-08-10T00:00:00Z".into(),
+                    request: Some(format!("do malformed task {index}")),
+                    outcome: Some("shipped".into()),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        assert_eq!(curation_misses(&storage, &cards).len(), cards.len());
+
+        let hashes: Vec<String> = cards.iter().map(sentence_hash).collect();
+        // The exact shape `curate_sentences_with` produces from an
+        // unparseable model reply: `parse_sentence_batch` on garbage text.
+        let replies = parse_sentence_batch("this is not json at all");
+        assert!(replies.is_empty(), "fixture must actually be unparseable");
+
+        let all_indices: Vec<usize> = (0..cards.len()).collect();
+        apply_sentence_replies(
+            &storage,
+            &mut cards,
+            &all_indices,
+            &hashes,
+            &replies,
+            "test-model",
+        );
+
+        assert!(
+            curation_misses(&storage, &cards).is_empty(),
+            "a malformed reply must not leave any batch card as a permanent miss"
+        );
+        for card in &cards {
+            let expected_fallback = fallback_sentence("success", card.request_text.as_deref());
+            assert_eq!(
+                card.summary, expected_fallback,
+                "displayed summary must be the deterministic fallback"
+            );
+            assert_eq!(
+                cached_sentence(&storage, &card.session_short, &sentence_hash(card))
+                    .map(|(headline, _)| headline),
+                Some(expected_fallback),
+                "cached headline must be the fallback, not any model text"
+            );
+            assert_eq!(
+                cached_model(&storage, &card.session_short).as_deref(),
+                Some(FALLBACK_MODEL_TAG),
+                "a fallback-cached row must be tagged as such, not attributed to the model"
+            );
+        }
+    }
+
+    /// F5 regression: a partial reply — some ids present and acceptable,
+    /// the rest missing from the model's JSON entirely — must cache BOTH
+    /// kinds: the present, verb-agreeing sessions get the model's sentence;
+    /// every missing session gets its deterministic fallback. No card is
+    /// left as a miss.
+    #[test]
+    fn partial_batch_reply_caches_model_sentences_and_fallbacks_together() {
+        let storage = Storage::open_memory().unwrap();
+        let mut cards: Vec<StoryCardView> = (0..10)
+            .map(|index| {
+                build_story_card(&StorySession {
+                    session_id: format!("prt{index}-partial-session"),
+                    project: "proj".into(),
+                    timestamp: "2026-08-10T00:00:00Z".into(),
+                    request: Some(format!("do partial task {index}")),
+                    outcome: Some("shipped".into()),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let hashes: Vec<String> = cards.iter().map(sentence_hash).collect();
+
+        // Only the first 3 of 10 ids come back from the model.
+        let mut replies = std::collections::BTreeMap::new();
+        for card in cards.iter().take(3) {
+            replies.insert(
+                card.session_short.clone(),
+                format!("Shipped task {}", card.session_short),
+            );
+        }
+        assert_eq!(replies.len(), 3);
+
+        let all_indices: Vec<usize> = (0..cards.len()).collect();
+        apply_sentence_replies(
+            &storage,
+            &mut cards,
+            &all_indices,
+            &hashes,
+            &replies,
+            "test-model",
+        );
+
+        assert!(
+            curation_misses(&storage, &cards).is_empty(),
+            "every one of the 10 cards must be cached after this batch, present or not"
+        );
+
+        let mut model_cached = 0;
+        let mut fallback_cached = 0;
+        for card in &cards {
+            match cached_model(&storage, &card.session_short).as_deref() {
+                Some("test-model") => model_cached += 1,
+                Some(FALLBACK_MODEL_TAG) => fallback_cached += 1,
+                other => panic!("unexpected model tag: {other:?}"),
+            }
+        }
+        assert_eq!(
+            model_cached, 3,
+            "the 3 present ids get the model's sentence cached"
+        );
+        assert_eq!(
+            fallback_cached, 7,
+            "the 7 missing ids get their deterministic fallback cached"
+        );
     }
 
     /// Test 7.
@@ -3721,7 +4074,7 @@ mod tests {
             "sym_superseded",
             "sym_obsolete",
             "sym_reinstated",
-            "sym_live",
+            "sym_witnessed",
             "sym_unverified",
         ] {
             seed_attribution(
@@ -3775,8 +4128,16 @@ mod tests {
             None,
             "2026-02-01 12:00:00",
         );
-        // "sym_live": witnessed, no verdict event ever recorded.
-        seed_witness(&storage, "proj", "/repo/src/lib.rs", "sym_live", "aoid4");
+        // "sym_witnessed": witnessed, no verdict event ever recorded — F1:
+        // this must NOT render as "still live", only as "witnessed <date> ·
+        // unverified since" (no dream verdict re-checked it at HEAD).
+        seed_witness(
+            &storage,
+            "proj",
+            "/repo/src/lib.rs",
+            "sym_witnessed",
+            "aoid4",
+        );
         // "sym_unverified": attribution only, no witness_ledger row at all.
 
         let html = render(
@@ -3791,7 +4152,16 @@ mod tests {
             html.contains(r#"class="conclusion obsolete">obsolete, anchor gone · 2026-02-01</p>"#)
         );
         assert!(html.contains(r#"class="conclusion reinstated">reinstated · 2026-02-01</p>"#));
-        assert!(html.contains(r#"class="conclusion live">still live, re-verified at HEAD</p>"#));
+        assert!(
+            !html.contains("still live"),
+            "F1: witnessed-with-no-verdict must never be rendered as HEAD-verified 'still live'"
+        );
+        assert!(
+            html.contains(r#"class="conclusion witnessed_unverified">witnessed "#)
+                && html.contains(" · unverified since</p>"),
+            "witnessed-with-no-verdict renders the honest 'witnessed <date> · unverified since' \
+             chip, not a liveness claim"
+        );
         assert!(html.contains(r#"class="conclusion unverified">unverified</p>"#));
         assert!(html.contains(r#"5 symbols touched"#));
     }
@@ -4766,6 +5136,120 @@ mod tests {
         );
     }
 
+    /// F2 regression: a persisted episode whose stored steers mix a CSR
+    /// self-emission (`"CSR CONTINUUM [...]"`, caught only by
+    /// `is_csr_emission`/`extractable`, not by `is_noisy_steer_text`), a
+    /// harness task-notification (caught by `is_noisy_steer_text`), and one
+    /// genuine human steer — the render path must re-filter with the FULL
+    /// chain and show exactly the one surviving quote with a count of 1, not
+    /// the stale stored count of 3.
+    #[test]
+    fn steer_render_reapplies_full_provenance_chain_not_just_noise_filter() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode_with_extra(
+            &storage,
+            "mixed-steer-session",
+            "2026-03-05T01:00:00Z",
+            "wire the feature end to end",
+            "done",
+            serde_json::json!({
+                "error_count": 0,
+                "top_errors": [],
+                "steer_count": 3,
+                "steers": [
+                    {"turn": 2, "text": "CSR CONTINUUM [2m ago]: stale context echo"},
+                    {"turn": 4, "text": "<task-notification>queued job finished</task-notification>"},
+                    {"turn": 6, "text": "no, use the october script instead"},
+                ],
+            }),
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        let (_, detail_html) = split_panes(&html);
+        let short = short_oid("mixed-steer-session");
+        let pane_start = detail_html
+            .find(&format!(r#"data-session="{short}""#))
+            .unwrap();
+        let pane_end = detail_html[pane_start..]
+            .find("</article>")
+            .map(|offset| pane_start + offset)
+            .unwrap();
+        let pane = &detail_html[pane_start..pane_end];
+
+        assert!(
+            pane.contains("1 mid-flight steer") && !pane.contains("1 mid-flight steers"),
+            "the recomputed, surviving-only count must be 1 (singular), not the stale stored 3: {pane}"
+        );
+        assert_eq!(
+            pane.matches("class=\"steer-line post-it\"").count(),
+            1,
+            "only the one genuine steer may render as a quote: {pane}"
+        );
+        assert!(
+            pane.contains("october script"),
+            "the surviving genuine steer's text must still render: {pane}"
+        );
+        assert!(
+            !pane.contains("CSR CONTINUUM") && !pane.contains("task-notification"),
+            "neither the CSR self-emission nor the harness notification may render as a steer: {pane}"
+        );
+    }
+
+    /// F2 regression: when EVERY persisted steer is noise (by any of the
+    /// three provenance guards), the STEER card renders no count line and no
+    /// steer quotes at all — never "N mid-flight steers" with an empty list
+    /// underneath it.
+    #[test]
+    fn steer_render_shows_no_line_when_all_persisted_steers_are_noise() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode_with_extra(
+            &storage,
+            "all-noise-steer-session",
+            "2026-03-06T01:00:00Z",
+            "clean up the queue",
+            "done",
+            serde_json::json!({
+                "error_count": 0,
+                "top_errors": [],
+                "steer_count": 1,
+                "steers": [
+                    {"turn": 2, "text": "CSR CONTINUUM [5m ago]: stale context echo"},
+                ],
+            }),
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        let (_, detail_html) = split_panes(&html);
+        let short = short_oid("all-noise-steer-session");
+        let pane_start = detail_html
+            .find(&format!(r#"data-session="{short}""#))
+            .unwrap();
+        let pane_end = detail_html[pane_start..]
+            .find("</article>")
+            .map(|offset| pane_start + offset)
+            .unwrap();
+        let pane = &detail_html[pane_start..pane_end];
+
+        assert!(
+            !pane.contains("mid-flight steer"),
+            "an all-noise stored steer list must render no count line at all: {pane}"
+        );
+        assert!(
+            !pane.contains("class=\"steer-line post-it\""),
+            "an all-noise stored steer list must render no steer quotes: {pane}"
+        );
+        assert!(
+            !pane.contains("CSR CONTINUUM"),
+            "the filtered CSR emission must never leak into the rendered pane: {pane}"
+        );
+    }
+
     /// Pinned test 18.
     #[test]
     fn unscanned_session_shows_the_warning_chip() {
@@ -4840,6 +5324,194 @@ mod tests {
         assert!(
             !detail_html[pane_start..pane_end].contains("not scanned"),
             "a session with no transcript on disk at all must show no warning chip"
+        );
+    }
+
+    /// F4 regression: a `session_instrumentation` cache row whose
+    /// `(transcript_size, transcript_mtime)` still matches the transcript on
+    /// disk must be reused with ZERO rescans — the pre-existing cost
+    /// property the backfill relies on to stay cheap. Proven by caching a
+    /// deliberately wrong error count against the file's REAL stat: if the
+    /// backfill ever re-parsed the transcript, the wrong count would be
+    /// overwritten with the real one (0), so seeing the wrong count survive
+    /// is direct evidence no rescan happened.
+    #[test]
+    fn backfill_reuses_fresh_cache_row_with_zero_rescans() {
+        let storage = Storage::open_memory().unwrap();
+        let projects_dir = tempfile::tempdir().unwrap();
+        let project_dir = projects_dir.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let session_id = "fresh-cache-sess";
+        let transcript_path = project_dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(
+            &transcript_path,
+            r#"{"type":"user","message":{"content":"do a small task"}}"#,
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(&transcript_path).unwrap();
+        let mtime = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Episode carries NO instrumentation fields -> resolution falls to
+        // the cache row below, tagging this session `InstrumentationSource::
+        // Cache` (not `Episode`).
+        seed_episode(
+            &storage,
+            session_id,
+            "2026-03-07T01:00:00Z",
+            "do a small task",
+            "done",
+            &[],
+            &[],
+        );
+        storage
+            .with_connection(|conn| {
+                crate::storage::dream_report::write_instrumentation_cache(
+                    conn,
+                    session_id,
+                    metadata.len(),
+                    mtime,
+                    &SessionInstrumentation {
+                        error_count: 77,
+                        top_errors: vec![],
+                        steer_count: 0,
+                        steers: vec![],
+                        turn_count: 1,
+                    },
+                )
+            })
+            .unwrap();
+
+        let html = render_with_projects_dir(
+            &storage,
+            projects_dir.path(),
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        let (index_html, _) = split_panes(&html);
+        let short = short_oid(session_id);
+        let row_start = index_html
+            .find(&format!(r#"data-session="{short}""#))
+            .unwrap();
+        let row_end = index_html[row_start..]
+            .find("</button>")
+            .map(|offset| row_start + offset)
+            .unwrap();
+        let row = &index_html[row_start..row_end];
+        assert!(
+            row.contains("77 errors"),
+            "a stat-matched cache row must be reused verbatim, not rescanned: {row}"
+        );
+    }
+
+    /// F4 regression: a `session_instrumentation` cache row whose stat no
+    /// longer matches the transcript on disk (it grew) must be discarded and
+    /// rescanned — never left rendering forever-stale numbers. The
+    /// transcript is rewritten with real `is_error` tool_result blocks after
+    /// the stale row is cached, guaranteeing the file size (not relying on
+    /// mtime, which can share the same wall-clock second in a fast test run)
+    /// differs from what the cache row was keyed to.
+    #[test]
+    fn backfill_rescans_stale_cache_row_when_transcript_grows() {
+        let storage = Storage::open_memory().unwrap();
+        let projects_dir = tempfile::tempdir().unwrap();
+        let project_dir = projects_dir.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let session_id = "stale-cache-sess";
+        let transcript_path = project_dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(
+            &transcript_path,
+            r#"{"type":"user","message":{"content":"do a small task"}}"#,
+        )
+        .unwrap();
+        let stale_metadata = std::fs::metadata(&transcript_path).unwrap();
+        let stale_mtime = stale_metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        seed_episode(
+            &storage,
+            session_id,
+            "2026-03-08T01:00:00Z",
+            "do a small task",
+            "done",
+            &[],
+            &[],
+        );
+        storage
+            .with_connection(|conn| {
+                crate::storage::dream_report::write_instrumentation_cache(
+                    conn,
+                    session_id,
+                    stale_metadata.len(),
+                    stale_mtime,
+                    &SessionInstrumentation {
+                        error_count: 1,
+                        top_errors: vec![],
+                        steer_count: 0,
+                        steers: vec![],
+                        turn_count: 1,
+                    },
+                )
+            })
+            .unwrap();
+
+        // The transcript "grows": real content with two tool-verified errors
+        // now on disk, guaranteed larger than the single-line fixture the
+        // cache row above was keyed to.
+        std::fs::write(
+            &transcript_path,
+            concat!(
+                r#"{"type":"user","message":{"content":"do a small task"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ffmpeg"}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","is_error":true,"content":"ffmpeg exit 1"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"ffmpeg2"}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu2","is_error":true,"content":"ffmpeg exit 2"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_ne!(
+            std::fs::metadata(&transcript_path).unwrap().len(),
+            stale_metadata.len(),
+            "fixture must actually grow for this test to mean anything"
+        );
+
+        let html = render_with_projects_dir(
+            &storage,
+            projects_dir.path(),
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        let (index_html, _) = split_panes(&html);
+        let short = short_oid(session_id);
+        let row_start = index_html
+            .find(&format!(r#"data-session="{short}""#))
+            .unwrap();
+        let row_end = index_html[row_start..]
+            .find("</button>")
+            .map(|offset| row_start + offset)
+            .unwrap();
+        let row = &index_html[row_start..row_end];
+        assert!(
+            row.contains("2 errors"),
+            "a size-mismatched cache row must trigger a rescan producing the real, current \
+             count, within the existing wall budget: {row}"
+        );
+        assert!(
+            !row.contains(">1 error<"),
+            "the stale cached count must never survive the rescan: {row}"
         );
     }
 }

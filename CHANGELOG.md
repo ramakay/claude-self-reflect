@@ -35,7 +35,18 @@ sentence, omitted entirely when there is nothing beyond the first clause.
   cached headline to a deterministic fallback (`Shipped: …` / `Partly done:
   …` / `Failed: …` / `Noted: …`) after upgrading — correct behavior (a stale
   headline is never silently presented as the new fused sentence), but a
-  visible one-time change for that path.
+  visible one-time change for that path. `CSR_NO_AI_NARRATIVES` applies
+  previously cached sentences and forces fallbacks only for the misses —
+  it never invokes the model.
+- **AI-spend convergence fix.** A `claude -p` batch reply that came back
+  malformed, partial (missing some session ids), or verb-disagreeing for
+  some sessions used to leave those sessions uncached even though
+  `narrative_usage` had already recorded the spend for the whole batch —
+  every subsequent `dream --report` re-purchased the same misses forever.
+  Every card in an already-paid-for batch is now cached with either an
+  accepted model sentence or its deterministic fallback, so a run converges
+  to zero new `claude -p` calls on the next `dream --report` regardless of
+  how the model's reply parsed.
 
 ## [10.1.0] - 2026-08-08
 

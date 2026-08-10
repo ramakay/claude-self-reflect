@@ -29,6 +29,30 @@ pub(crate) struct StoryArtifact {
     pub conversations: Vec<String>,
 }
 
+/// F4: which resolution-order step (plan §3.3a) produced `StorySession::
+/// instrumentation`, and — for the cache step — the filesystem stat it was
+/// computed against. `load_story_sessions` is a DB-only loader (module doc:
+/// "read here without a freshness check — that requires a filesystem stat
+/// this DB-only loader deliberately does not perform"); `dream::report`'s
+/// report-time backfill is the layer that CAN stat a file, and it needs this
+/// tag to know which cards it is still responsible for freshness-checking.
+/// Episode-sourced instrumentation is the Stop hook's own tool-verified scan
+/// of the transcript at Stop time — authoritative, never re-validated.
+/// Cache-sourced instrumentation is a `session_instrumentation` row that may
+/// have been computed against a transcript that has since grown, shrunk, or
+/// moved — untrusted for display until the backfill confirms the stat still
+/// matches.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) enum InstrumentationSource {
+    #[default]
+    None,
+    Episode,
+    Cache {
+        transcript_size: u64,
+        transcript_mtime: i64,
+    },
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct StorySession {
     pub session_id: String,
@@ -67,6 +91,9 @@ pub(crate) struct StorySession {
     /// actually renders). `None` means "never measured" and must never be
     /// confused with `Some(0)` ("measured, zero found").
     pub instrumentation: Option<SessionInstrumentation>,
+    /// F4: provenance of `instrumentation`, `None` (unset) whenever
+    /// `instrumentation` is `None`. See [`InstrumentationSource`].
+    pub instrumentation_source: InstrumentationSource,
 }
 
 #[derive(Debug, Default)]
@@ -89,6 +116,7 @@ struct SessionBuilder {
     blockers: Option<String>,
     error_signatures: Vec<String>,
     instrumentation: Option<SessionInstrumentation>,
+    instrumentation_source: InstrumentationSource,
 }
 
 impl SessionBuilder {
@@ -266,6 +294,10 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
                         // baseline-relative feature (plan §9 Q6).
                         turn_count: 0,
                     });
+                    // F4: episode-sourced instrumentation is the Stop hook's
+                    // own tool-verified scan — authoritative, never
+                    // re-validated or rescanned by the report-time backfill.
+                    builder.instrumentation_source = InstrumentationSource::Episode;
                 }
             }
         }
@@ -503,21 +535,33 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
     // would wrongly promote it out of "omitted" on cache evidence alone.
     {
         let mut stmt = conn.prepare(
-            "SELECT session_id, error_count, steer_count, turn_count, errors_json, steers_json
+            "SELECT session_id, transcript_size, transcript_mtime, error_count, steer_count,
+                    turn_count, errors_json, steers_json
              FROM session_instrumentation",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, u32>(1)?,
-                row.get::<_, u32>(2)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
                 row.get::<_, u32>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
+                row.get::<_, u32>(4)?,
+                row.get::<_, u32>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })?;
         for row in rows {
-            let (session_id, error_count, steer_count, turn_count, errors_json, steers_json) = row?;
+            let (
+                session_id,
+                transcript_size,
+                transcript_mtime,
+                error_count,
+                steer_count,
+                turn_count,
+                errors_json,
+                steers_json,
+            ) = row?;
             if let Some(builder) = sessions.get_mut(&session_id) {
                 if builder.instrumentation.is_none() {
                     let top_errors: Vec<ErrorEvent> =
@@ -531,6 +575,13 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
                         steers,
                         turn_count,
                     });
+                    // F4: cache-sourced — untrusted for display until the
+                    // report-time backfill confirms `transcript_size`/
+                    // `transcript_mtime` still match the file on disk.
+                    builder.instrumentation_source = InstrumentationSource::Cache {
+                        transcript_size: transcript_size.max(0) as u64,
+                        transcript_mtime,
+                    };
                 }
             }
         }
@@ -561,6 +612,7 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
                     blockers: builder.blockers,
                     error_signatures: builder.error_signatures,
                     instrumentation: builder.instrumentation,
+                    instrumentation_source: builder.instrumentation_source,
                 },
             )
         })
