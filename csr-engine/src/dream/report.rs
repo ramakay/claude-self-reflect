@@ -56,7 +56,7 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section>
     <h2>Session stories</h2>
     <div class="story-list">
     {% for card in data.cards %}
-      <details class="story-card {{ card.tier_slug }}" data-tier="{{ card.tier_slug }}">
+      <details class="story-card {{ card.tier_slug }}" data-tier="{{ card.tier_slug }}" open>
         <summary>
           <span class="story-head">
             <span class="story-summary">{{ card.summary }}</span>
@@ -142,10 +142,19 @@ const STORY_HERO_META: &str = r#"    <p class="subtitle">What each session set o
     </div>"#;
 
 const STORY_CSS: &str = r#"
-  .story-list { display: grid; gap: 0.7rem; }
+  .story-list {
+    display: grid; gap: 0.9rem; align-items: start;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  }
   .story-card {
     background: var(--bg-card); border: 1px solid var(--border);
-    border-radius: 12px; overflow: visible;
+    border-radius: 12px; overflow: visible; min-width: 0;
+  }
+  /* News-index bento: the newest story leads full-width; rich cards span two
+     tracks where the grid is wide enough. */
+  .story-card:first-child { grid-column: 1 / -1; }
+  @media (min-width: 900px) {
+    .story-card.full { grid-column: span 2; }
   }
   .story-card > summary {
     list-style: none; cursor: pointer; padding: 0.9rem 1rem;
@@ -181,7 +190,7 @@ const STORY_CSS: &str = r#"
     border-top: 1px solid var(--border); padding: 1rem;
     min-height: 7rem; overflow-x: auto;
   }
-  .story-flow .mermaid { margin: 0; min-width: 30rem; text-align: center; }
+  .story-flow .mermaid { margin: 0; min-width: 0; text-align: center; }
   .story-flow svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
   .artifact-list {
     display: flex; flex-wrap: wrap; gap: 0.45rem; padding: 0 1rem 1rem;
@@ -1725,7 +1734,10 @@ mod tests {
         .unwrap();
         let html = render_html(&data).unwrap();
 
-        assert!(html.contains("data-tier=\"template\""));
+        assert!(
+            html.contains("data-tier=\"template\" open>"),
+            "news-index cards must render expanded by default"
+        );
         let blocks = mermaid_blocks(&html);
         assert_eq!(blocks.len(), 1);
         assert_eq!(
