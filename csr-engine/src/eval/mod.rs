@@ -354,11 +354,20 @@ fn test_tool_count() -> EvalResult {
     // Counted from the live rmcp router, not a constant — a hardcoded expectation
     // sat at 14 while the server shipped 15 tools (silently-inert eval).
     // 16 as of csr_transcript (transcript-query-tool-design.md phase 3).
-    let actual = crate::mcp::CsrServer::tool_count();
+    //
+    // A bare count only proves *some* 16 tools exist — it would still pass
+    // if csr_transcript were silently dropped and replaced by a duplicate
+    // of another tool. Assert the specific named tool is present too
+    // (adversarial review finding 6).
+    let names = crate::mcp::CsrServer::tool_names();
+    let actual = names.len();
     let expected = 16;
-    let detail = format!("{actual} MCP tools defined (expected {expected})");
+    let has_transcript = names.iter().any(|n| n == "csr_transcript");
+    let detail = format!(
+        "{actual} MCP tools defined (expected {expected}); csr_transcript present={has_transcript}"
+    );
     let ms = t.elapsed().as_secs_f64() * 1000.0;
-    if actual == expected {
+    if actual == expected && has_transcript {
         EvalResult::pass("Tool Count", "infrastructure", ms, detail)
     } else {
         EvalResult::fail("Tool Count", "infrastructure", ms, detail)
@@ -802,5 +811,49 @@ mod tests {
             "Quality analysis should pass: {}",
             result.detail
         );
+    }
+
+    // ─── adversarial review finding 6: tool-count gate must name csr_transcript ───
+
+    #[test]
+    fn test_tool_count_gate_asserts_csr_transcript_present() {
+        let result = test_tool_count();
+        assert!(
+            result.passed,
+            "tool count gate should pass: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("csr_transcript present=true"),
+            "gate detail must name csr_transcript explicitly, got: {}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn test_csr_transcript_tool_schema_and_annotations() {
+        let tool = crate::mcp::CsrServer::find_tool("csr_transcript")
+            .expect("csr_transcript must be registered in the rmcp tool router");
+
+        // Schema generation actually ran (not a degenerate/empty schema):
+        // the two required params show up as real object-schema properties.
+        let props = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("csr_transcript input_schema must have a properties object");
+        assert!(
+            props.contains_key("session"),
+            "schema missing 'session' property"
+        );
+        assert!(props.contains_key("view"), "schema missing 'view' property");
+
+        let annotations = tool
+            .annotations
+            .as_ref()
+            .expect("csr_transcript must declare tool annotations");
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert_eq!(annotations.idempotent_hint, Some(true));
     }
 }

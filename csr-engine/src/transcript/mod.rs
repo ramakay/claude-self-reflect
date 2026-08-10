@@ -33,10 +33,10 @@ pub mod query;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // ─── Entry model ───
 
@@ -118,12 +118,23 @@ impl Entry {
 #[derive(Debug, Clone, Default)]
 pub struct ParsedTranscript {
     pub entries: Vec<Entry>,
-    /// Total non-blank lines seen (recognized + unrecognized).
+    /// Total non-blank lines seen (recognized + metadata + unrecognized).
     pub total_lines: usize,
-    /// Lines that were malformed JSON, or whose `type` is not one of
-    /// user/assistant/system. Never causes a panic or an abort — the
-    /// fail-honest pattern `aux_schema_miss:*` already uses on the import
-    /// side (see repo CLAUDE.md).
+    /// Lines whose shape IS a known Claude Code vendor kind (queue
+    /// bookkeeping other than a fresh `enqueue`, hook/task/plan
+    /// attachments, session UI state, bulk file-tracking checkpoints, …)
+    /// but that carry no fidelity-critical content for v1 views, so they
+    /// are counted rather than turned into an `Entry`. Kept separate from
+    /// `unrecognized_entries` so `stats` shows the real schema-drift
+    /// signal instead of drowning it in expected, already-classified noise
+    /// (adversarial review finding 1).
+    pub metadata_entries: usize,
+    /// Lines that were malformed JSON, or whose shape does not match any
+    /// known kind (recognized message type or metadata kind). Never causes
+    /// a panic or an abort — the fail-honest pattern `aux_schema_miss:*`
+    /// already uses on the import side (see repo CLAUDE.md). This is the
+    /// number that should stay near zero on a real transcript; a nonzero
+    /// count is the actual schema-drift signal.
     pub unrecognized_entries: usize,
 }
 
@@ -142,6 +153,13 @@ pub fn parse_transcript(path: &Path) -> Result<ParsedTranscript> {
     let reader = BufReader::new(file);
     let mut out = ParsedTranscript::default();
     let mut turn = 0usize;
+    // (timestamp, text) pairs already materialized as a queued-instruction
+    // entry — Claude Code records the same "enqueue" event under two
+    // different top-level line shapes (`queue-operation` and
+    // `attachment.queued_command`); this dedupes them across the whole
+    // file so the same instruction is never shown twice (see
+    // `classify_queue_operation`/`classify_attachment`).
+    let mut seen_queued: HashSet<(String, String)> = HashSet::new();
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -165,25 +183,79 @@ pub fn parse_transcript(path: &Path) -> Result<ParsedTranscript> {
             }
         };
 
-        match entry_from_value(&value, turn + 1) {
-            Some(entry) => {
+        match classify_line(&value, &mut seen_queued) {
+            LineOutcome::Entry(mut entry) => {
                 turn += 1;
+                entry.turn = turn;
                 out.entries.push(entry);
             }
-            None => out.unrecognized_entries += 1,
+            LineOutcome::Metadata => out.metadata_entries += 1,
+            LineOutcome::Unrecognized => out.unrecognized_entries += 1,
         }
     }
 
     Ok(out)
 }
 
-fn entry_from_value(value: &serde_json::Value, turn: usize) -> Option<Entry> {
-    let type_str = value.get("type").and_then(|v| v.as_str())?;
+/// What one JSONL line resolves to.
+enum LineOutcome {
+    /// A recognized, fidelity-critical entry — consumes a turn number.
+    /// `Entry::turn` is a placeholder (0) here; the caller assigns the
+    /// real turn once it knows the line will be kept.
+    Entry(Entry),
+    /// A recognized vendor/harness line whose content is not
+    /// fidelity-critical for v1 views (see `ParsedTranscript::metadata_entries`).
+    Metadata,
+    /// Malformed JSON or a shape we don't recognize at all — the actual
+    /// schema-drift signal.
+    Unrecognized,
+}
+
+/// Classify one already-JSON-parsed transcript line. Dispatches on the
+/// top-level `type` field; see module doc + `.plans/transcript-query-tool-design.md`
+/// for the full inventory of Claude Code JSONL line kinds this was verified
+/// against (a real 12,270-line transcript — every kind below is a shape
+/// actually observed there).
+fn classify_line(
+    value: &serde_json::Value,
+    seen_queued: &mut HashSet<(String, String)>,
+) -> LineOutcome {
+    let Some(type_str) = value.get("type").and_then(|v| v.as_str()) else {
+        return LineOutcome::Unrecognized;
+    };
+
+    match type_str {
+        "user" | "assistant" | "system" => LineOutcome::Entry(build_message_entry(type_str, value)),
+        "queue-operation" => classify_queue_operation(value, seen_queued),
+        "attachment" => classify_attachment(value, seen_queued),
+        "file-history-delta" => classify_file_history_delta(value),
+        // Recognized vendor/harness metadata kinds that carry no
+        // fidelity-critical content for v1 views: session UI/CLI state
+        // (mode, permission-mode, ai-title, agent-name, last-prompt,
+        // bridge-session), PR linkage (pr-link), and bulk file-tracking
+        // checkpoints (file-history-snapshot — a cumulative map of every
+        // currently-tracked file's backup metadata, not a single-file
+        // touch event; `file-history-delta` above is the per-touch signal
+        // that feeds the `files` view).
+        "last-prompt"
+        | "mode"
+        | "permission-mode"
+        | "ai-title"
+        | "agent-name"
+        | "bridge-session"
+        | "pr-link"
+        | "file-history-snapshot" => LineOutcome::Metadata,
+        _ => LineOutcome::Unrecognized,
+    }
+}
+
+/// Build a recognized `user`/`assistant`/`system` entry. `turn` is left at
+/// 0 — the caller in `parse_transcript` assigns it.
+fn build_message_entry(type_str: &str, value: &serde_json::Value) -> Entry {
     let role = match type_str {
         "user" => Role::User,
         "assistant" => Role::Assistant,
-        "system" => Role::System,
-        _ => return None,
+        _ => Role::System,
     };
 
     let timestamp = value
@@ -204,20 +276,28 @@ fn entry_from_value(value: &serde_json::Value, turn: usize) -> Option<Entry> {
     let mut tool_results = Vec::new();
 
     if role == Role::System {
-        // `system` entries (e.g. stop_hook_summary) carry metadata, not a
-        // `message.content` block. Surface the subtype as a short label so
-        // `slice`/`grep` still have something to show.
-        if let Some(subtype) = value.get("subtype").and_then(|v| v.as_str()) {
-            text = format!("[system:{subtype}]");
-        } else {
-            text = "[system]".to_string();
-        }
+        // Most `system` entries (stop_hook_summary, turn_duration) carry
+        // structured metadata, not prose — surface the subtype as a short
+        // label so `slice`/`grep` still have something to show. A few
+        // subtypes (away_summary, compact_boundary) DO carry a genuine
+        // `content` string — preserve it instead of discarding it (this was
+        // finding 1's "29 recognized summary entries lose their content").
+        let subtype = value.get("subtype").and_then(|v| v.as_str());
+        let content = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .filter(|c| !c.trim().is_empty());
+        text = match (subtype, content) {
+            (Some(st), Some(c)) => format!("[system:{st}] {}", strip_control_chars(c)),
+            (Some(st), None) => format!("[system:{st}]"),
+            (None, _) => "[system]".to_string(),
+        };
     } else if let Some(content) = value.get("message").and_then(|m| m.get("content")) {
         flatten_content(content, &mut text, &mut tool_uses, &mut tool_results);
     }
 
-    Some(Entry {
-        turn,
+    Entry {
+        turn: 0,
         role,
         timestamp,
         uuid,
@@ -225,6 +305,139 @@ fn entry_from_value(value: &serde_json::Value, turn: usize) -> Option<Entry> {
         text,
         tool_uses,
         tool_results,
+    }
+}
+
+/// `{"type":"queue-operation","operation":"enqueue"|"dequeue"|"remove"|"popAll",...}`
+/// records queued-input-box bookkeeping. Only `enqueue` introduces text
+/// that doesn't appear anywhere else in the transcript (verified against a
+/// real transcript: `dequeue`/`remove` entries' `content`, when present,
+/// duplicates an earlier `enqueue`'s text word-for-word) — materializing
+/// every operation would just repeat the same queued instruction.
+fn classify_queue_operation(
+    value: &serde_json::Value,
+    seen_queued: &mut HashSet<(String, String)>,
+) -> LineOutcome {
+    if value.get("operation").and_then(|v| v.as_str()) != Some("enqueue") {
+        return LineOutcome::Metadata;
+    }
+    let Some(content) = value.get("content").and_then(|v| v.as_str()) else {
+        return LineOutcome::Metadata;
+    };
+    if content.trim().is_empty() {
+        return LineOutcome::Metadata;
+    }
+    let timestamp = value
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    if !remember_queued(seen_queued, timestamp.as_deref(), content) {
+        return LineOutcome::Metadata; // already captured via a matching attachment/queue-operation line
+    }
+    LineOutcome::Entry(Entry {
+        turn: 0,
+        role: Role::User,
+        timestamp,
+        uuid: None,
+        is_sidechain: false,
+        text: format!("[queued] {}", strip_control_chars(content)),
+        tool_uses: vec![],
+        tool_results: vec![],
+    })
+}
+
+/// `{"type":"attachment","attachment":{"type":"queued_command","prompt":...}}`
+/// is a second on-disk representation of the same enqueue event
+/// `queue-operation` records (verified: 145/147 real `queued_command`
+/// attachments share an exact `(timestamp, text)` pair with a
+/// `queue-operation` line) — deduped via `seen_queued` against whichever
+/// shape was seen first. Every other attachment kind (hook_success,
+/// task_reminder, file, plan_mode, …) is harness/UI bookkeeping, not a
+/// user instruction, so it stays metadata.
+fn classify_attachment(
+    value: &serde_json::Value,
+    seen_queued: &mut HashSet<(String, String)>,
+) -> LineOutcome {
+    let Some(attachment) = value.get("attachment") else {
+        return LineOutcome::Metadata;
+    };
+    if attachment.get("type").and_then(|v| v.as_str()) != Some("queued_command") {
+        return LineOutcome::Metadata;
+    }
+    let Some(prompt) = attachment.get("prompt").and_then(|v| v.as_str()) else {
+        return LineOutcome::Metadata;
+    };
+    if prompt.trim().is_empty() {
+        return LineOutcome::Metadata;
+    }
+    let timestamp = attachment
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("timestamp").and_then(|v| v.as_str()))
+        .map(str::to_string);
+    if !remember_queued(seen_queued, timestamp.as_deref(), prompt) {
+        return LineOutcome::Metadata;
+    }
+    let uuid = value
+        .get("uuid")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    LineOutcome::Entry(Entry {
+        turn: 0,
+        role: Role::User,
+        timestamp,
+        uuid,
+        is_sidechain: value
+            .get("isSidechain")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        text: format!("[queued] {}", strip_control_chars(prompt)),
+        tool_uses: vec![],
+        tool_results: vec![],
+    })
+}
+
+/// Records `(timestamp, content)` as seen; returns `false` if it was
+/// already recorded (i.e. this is a duplicate representation of an
+/// instruction already turned into an entry).
+fn remember_queued(
+    seen: &mut HashSet<(String, String)>,
+    timestamp: Option<&str>,
+    content: &str,
+) -> bool {
+    seen.insert((timestamp.unwrap_or("").to_string(), content.to_string()))
+}
+
+/// `{"type":"file-history-delta","trackingPath":"...",...}` is the
+/// per-touch signal for the `files` view: one delta = one file changed.
+/// Modeled as a `System`-role entry with a synthetic `FileHistory` tool_use
+/// so it flows through the exact same `files`/`tools` aggregation path real
+/// tool calls do (see `FILE_TOUCHING_TOOLS` in `query.rs`), rather than
+/// requiring a second code path.
+fn classify_file_history_delta(value: &serde_json::Value) -> LineOutcome {
+    let Some(tracking_path) = value.get("trackingPath").and_then(|v| v.as_str()) else {
+        return LineOutcome::Metadata;
+    };
+    let timestamp = value
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    LineOutcome::Entry(Entry {
+        turn: 0,
+        role: Role::System,
+        timestamp,
+        uuid: None,
+        is_sidechain: false,
+        text: format!("[file-history] {tracking_path}"),
+        tool_uses: vec![ToolUse {
+            id: None,
+            name: "FileHistory".to_string(),
+            file_path: Some(tracking_path.to_string()),
+            command: None,
+            pattern: None,
+            prompt: None,
+        }],
+        tool_results: vec![],
     })
 }
 
@@ -241,7 +454,7 @@ fn flatten_content(
     tool_results: &mut Vec<ToolResult>,
 ) {
     if let Some(s) = content.as_str() {
-        text.push_str(s);
+        text.push_str(&strip_control_chars(s));
         return;
     }
     let Some(items) = content.as_array() else {
@@ -254,7 +467,7 @@ fn flatten_content(
                     if !text.is_empty() {
                         text.push('\n');
                     }
-                    text.push_str(t);
+                    text.push_str(&strip_control_chars(t));
                 }
             }
             Some("tool_use") => {
@@ -269,7 +482,7 @@ fn flatten_content(
                     input
                         .and_then(|i| i.get(k))
                         .and_then(|v| v.as_str())
-                        .map(str::to_string)
+                        .map(strip_control_chars)
                 };
                 tool_uses.push(ToolUse {
                     id,
@@ -289,7 +502,8 @@ fn flatten_content(
                     .get("is_error")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let result_text = extract_tool_result_text(item.get("content"));
+                let result_text =
+                    strip_control_chars(&extract_tool_result_text(item.get("content")));
                 let byte_size = result_text.len();
                 let preview = truncate_chars(&result_text, TOOL_RESULT_PREVIEW_CHARS);
                 tool_results.push(ToolResult {
@@ -302,6 +516,25 @@ fn flatten_content(
             _ => {} // thinking / image / redacted_thinking / unknown: not surfaced in v1 views
         }
     }
+}
+
+/// Strip C0 control characters other than `\n`/`\t` (plus DEL) from `s`.
+/// Applied once at ingestion so every downstream view — text AND JSON —
+/// inherits clean text automatically; no per-view call site can forget it.
+/// The highest-value case is ANSI escape sequences (ESC, `0x1B`), which
+/// would otherwise reach a terminal unchanged when a hostile transcript
+/// entry is rendered (adversarial review finding 2 — 3 real entries in a
+/// live transcript carried raw ANSI).
+pub(crate) fn strip_control_chars(s: &str) -> String {
+    if !s.chars().any(is_stripped_control) {
+        return s.to_string();
+    }
+    s.chars().filter(|c| !is_stripped_control(*c)).collect()
+}
+
+fn is_stripped_control(c: char) -> bool {
+    let cp = c as u32;
+    (cp <= 0x1F && c != '\n' && c != '\t') || cp == 0x7F
 }
 
 /// A `tool_result` block's `content` field is itself either a plain string
@@ -358,15 +591,17 @@ pub(crate) fn index_tool_results(entries: &[Entry]) -> HashMap<String, (usize, T
 
 // ─── Session resolution ───
 
-/// Resolve a session identifier (substring id match, same rule
-/// `get_full_conversation` uses) or an explicit filesystem path to a
-/// transcript file. An explicit path is checked first and bypasses the
+/// Resolve a session identifier (substring/exact id match, same rule
+/// `get_full_conversation` uses via [`crate::mcp::tools::find_conversation_file`],
+/// including its ambiguous-match handling) or an explicit filesystem path to
+/// a transcript file. An explicit path is checked first and bypasses the
 /// projects-dir walk entirely.
-pub fn resolve_session_path(
+pub(crate) fn resolve_session_path(
     projects_dir: &Path,
     session: &str,
     project: Option<&str>,
-) -> Option<(PathBuf, String)> {
+) -> crate::mcp::tools::ConversationLookup {
+    use crate::mcp::tools::ConversationLookup;
     let direct = Path::new(session);
     if direct.is_file() {
         let project_name = direct
@@ -374,7 +609,7 @@ pub fn resolve_session_path(
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        return Some((direct.to_path_buf(), project_name));
+        return ConversationLookup::Found(direct.to_path_buf(), project_name);
     }
     crate::mcp::tools::find_conversation_file(projects_dir, session, project)
 }
@@ -546,6 +781,36 @@ fn not_found_message(session: &str, json: bool) -> String {
     }
 }
 
+/// Honest error for finding 5's ambiguous-substring-match case: lists every
+/// distinct candidate instead of silently resolving to whichever file the
+/// filesystem happened to enumerate first.
+fn ambiguous_message(session: &str, candidates: &[(String, String)], json: bool) -> String {
+    if json {
+        serde_json::json!({
+            "error": format!(
+                "Session id '{session}' is ambiguous: {} files match this substring.",
+                candidates.len()
+            ),
+            "candidates": candidates
+                .iter()
+                .map(|(id, project)| serde_json::json!({ "id": id, "project": project }))
+                .collect::<Vec<_>>(),
+            "suggestion": "Use a longer/more specific id, or pass --project to narrow the search.",
+        })
+        .to_string()
+    } else {
+        let listing = candidates
+            .iter()
+            .map(|(id, project)| format!("  <candidate id=\"{id}\" project=\"{project}\"/>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "<transcript_error>\n<error>Session id '{session}' is ambiguous: {} files match this substring.</error>\n<candidates>\n{listing}\n</candidates>\n<suggestion>Use a longer/more specific id, or pass --project to narrow the search.</suggestion>\n</transcript_error>",
+            candidates.len()
+        )
+    }
+}
+
 fn sidechains_reserved_message(json: bool) -> String {
     let msg = "--sidechains is reserved and not yet supported in v1 (design doc: 'Sidechain inclusion: v1 excludes'). Query the parent session's transcript instead, or the subagent's own agent-*.jsonl directly by path.";
     if json {
@@ -564,11 +829,15 @@ pub fn run(projects_dir: &Path, req: &TranscriptRequest) -> String {
         return sidechains_reserved_message(req.json);
     }
 
-    let Some((path, project)) =
-        resolve_session_path(projects_dir, &req.session, req.project.as_deref())
-    else {
-        return not_found_message(&req.session, req.json);
-    };
+    use crate::mcp::tools::ConversationLookup;
+    let (path, project) =
+        match resolve_session_path(projects_dir, &req.session, req.project.as_deref()) {
+            ConversationLookup::Found(p, proj) => (p, proj),
+            ConversationLookup::NotFound => return not_found_message(&req.session, req.json),
+            ConversationLookup::Ambiguous(candidates) => {
+                return ambiguous_message(&req.session, &candidates, req.json)
+            }
+        };
 
     let parsed = match parse_transcript(&path) {
         Ok(p) => p,

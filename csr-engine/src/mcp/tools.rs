@@ -1717,22 +1717,42 @@ async fn get_more_results_with_vec_active(
     Ok(format::format_more_results(&page, query, offset, total))
 }
 
-/// Locate a conversation's JSONL file by id substring match across
-/// `projects_dir` (optionally scoped to a project-name substring). Shared by
+/// Outcome of resolving a session id against the filesystem.
+///
+/// Adversarial review finding 5: a bare substring match used to return the
+/// first filesystem-order hit even when it wasn't the only match — an
+/// ambiguous short id could silently resolve to the wrong transcript
+/// (different machine, different project). `Ambiguous` makes that
+/// impossible to hit silently: callers must surface the candidate list.
+pub(crate) enum ConversationLookup {
+    Found(PathBuf, String),
+    NotFound,
+    /// More than one distinct file matched and no single exact stem match
+    /// broke the tie. `(id, project)` pairs, sorted deterministically.
+    Ambiguous(Vec<(String, String)>),
+}
+
+/// Locate a conversation's JSONL file by id across `projects_dir`
+/// (optionally scoped to a project-name substring). Shared by
 /// `get_full_conversation` and `crate::transcript::resolve_session_path` so
-/// both surfaces agree on exactly one lookup rule.
+/// both surfaces agree on exactly one lookup rule: an exact stem match
+/// always wins outright; otherwise every distinct substring match is
+/// collected and, if more than one remains, the lookup is reported
+/// `Ambiguous` rather than picking whichever the filesystem enumerated
+/// first (`read_dir` order is not guaranteed and is not stable across
+/// machines).
 pub(crate) fn find_conversation_file(
     projects_dir: &Path,
     conversation_id: &str,
     project: Option<&str>,
-) -> Option<(PathBuf, String)> {
+) -> ConversationLookup {
     // Validate conversation_id: must be non-empty, alphanumeric + hyphens + underscores only
     if conversation_id.is_empty()
         || !conversation_id
             .chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
     {
-        return None;
+        return ConversationLookup::NotFound;
     }
 
     // Search for JSONL file matching conversation_id
@@ -1763,26 +1783,81 @@ pub(crate) fn find_conversation_file(
         }
     };
 
+    // Collect every candidate .jsonl file whose stem matches, tagging
+    // whether the match is exact.
+    let mut candidates: Vec<(PathBuf, String, bool)> = Vec::new(); // (path, project_name, is_exact)
     for dir in &search_dirs {
         if let Ok(files) = std::fs::read_dir(dir) {
             for entry in files.flatten() {
                 let path = entry.path();
                 if path.extension().is_some_and(|ext| ext == "jsonl") {
                     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-                    if stem.contains(conversation_id) || &*stem == conversation_id {
+                    let is_exact = &*stem == conversation_id;
+                    if is_exact || stem.contains(conversation_id) {
                         let project_name = dir
                             .file_name()
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
-                        return Some((path, project_name));
+                        candidates.push((path.clone(), project_name, is_exact));
                     }
                 }
             }
         }
     }
 
-    None
+    // An exact stem match wins outright — but only if it's the only one
+    // (two files with the literal same session id is pathological, and
+    // still needs a human to disambiguate rather than a coin flip).
+    let exact: Vec<&(PathBuf, String, bool)> = candidates.iter().filter(|c| c.2).collect();
+    if exact.len() == 1 {
+        let (path, project_name, _) = exact[0];
+        return ConversationLookup::Found(path.clone(), project_name.clone());
+    }
+    if exact.len() > 1 {
+        return ConversationLookup::Ambiguous(candidate_listing(&exact));
+    }
+
+    if candidates.is_empty() {
+        return ConversationLookup::NotFound;
+    }
+
+    // Deduplicate by path (defensive: overlapping search_dirs should not
+    // happen, but a duplicate PathBuf must never count as a second
+    // distinct candidate).
+    let mut distinct: Vec<&(PathBuf, String, bool)> = Vec::new();
+    for c in &candidates {
+        if !distinct.iter().any(|d| d.0 == c.0) {
+            distinct.push(c);
+        }
+    }
+
+    if distinct.len() == 1 {
+        let (path, project_name, _) = distinct[0];
+        return ConversationLookup::Found(path.clone(), project_name.clone());
+    }
+
+    ConversationLookup::Ambiguous(candidate_listing(&distinct))
+}
+
+/// Sorted, deterministic `(id, project)` listing for an ambiguous lookup —
+/// order must not depend on filesystem enumeration order.
+fn candidate_listing(candidates: &[&(PathBuf, String, bool)]) -> Vec<(String, String)> {
+    let mut listing: Vec<(String, String)> = candidates
+        .iter()
+        .map(|(path, project_name, _)| {
+            (
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                project_name.clone(),
+            )
+        })
+        .collect();
+    listing.sort();
+    listing.dedup();
+    listing
 }
 
 /// Locate the JSONL file for a conversation.
@@ -1792,13 +1867,36 @@ pub fn get_full_conversation(
     project: Option<&str>,
 ) -> String {
     match find_conversation_file(projects_dir, conversation_id, project) {
-        Some((path, project_name)) => format::format_full_conversation(
+        ConversationLookup::Found(path, project_name) => format::format_full_conversation(
             conversation_id,
             Some(&path.to_string_lossy()),
             Some(&project_name),
         ),
-        None => format::format_full_conversation(conversation_id, None, None),
+        ConversationLookup::NotFound => {
+            format::format_full_conversation(conversation_id, None, None)
+        }
+        ConversationLookup::Ambiguous(candidates) => {
+            format_ambiguous_conversation(conversation_id, &candidates)
+        }
     }
+}
+
+/// Same envelope style as `format::format_full_conversation`'s not-found
+/// branch, for the ambiguous-substring-match case (finding 5): list every
+/// distinct candidate instead of silently picking whichever the filesystem
+/// happened to enumerate first. Kept local to this module (not added to
+/// `crate::format`, which is out of scope for this fix) but mirrors its
+/// XML-ish shape for consistency.
+fn format_ambiguous_conversation(conversation_id: &str, candidates: &[(String, String)]) -> String {
+    let listing = candidates
+        .iter()
+        .map(|(id, project)| format!("  <candidate id=\"{id}\" project=\"{project}\"/>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "<conversation_file>\n<error>Conversation ID '{conversation_id}' is ambiguous: {} files match this substring.</error>\n<candidates>\n{listing}\n</candidates>\n<suggestion>Use a longer/more specific id, or pass --project to narrow the search.</suggestion>\n</conversation_file>",
+        candidates.len()
+    )
 }
 
 /// Server-side cap on `csr_transcript`'s response, applied regardless of the
@@ -6009,6 +6107,108 @@ mod tests {
             !rendered.contains('↑'),
             "items on different anchors must not carry a marker:\n{rendered}"
         );
+    }
+
+    // ─── adversarial review finding 5: substring session-id resolution
+    // must not silently pick whichever file the filesystem enumerates
+    // first when more than one distinct file matches ───
+
+    fn write_session_file(
+        projects_dir: &std::path::Path,
+        project: &str,
+        session_stem: &str,
+    ) -> std::path::PathBuf {
+        let proj_dir = projects_dir.join(project);
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let path = proj_dir.join(format!("{session_stem}.jsonl"));
+        std::fs::write(
+            &path,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn exact_stem_match_wins_over_a_substring_match_in_another_project() {
+        let dir = tempfile::tempdir().unwrap();
+        // proj-a's session id is an EXACT match for the query; proj-b's
+        // session id merely CONTAINS the query as a substring. The exact
+        // match must win regardless of filesystem enumeration order.
+        write_session_file(dir.path(), "proj-a", "abc123");
+        write_session_file(dir.path(), "proj-b", "abc123-extra-suffix");
+
+        match find_conversation_file(dir.path(), "abc123", None) {
+            ConversationLookup::Found(path, project) => {
+                assert_eq!(project, "proj-a");
+                assert!(path.to_string_lossy().contains("proj-a"));
+            }
+            ConversationLookup::NotFound => panic!("expected a match"),
+            ConversationLookup::Ambiguous(candidates) => {
+                panic!("exact match must win outright, not report ambiguous: {candidates:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_substring_match_reports_every_candidate_instead_of_picking_one() {
+        let dir = tempfile::tempdir().unwrap();
+        // Neither file is an exact match for "abc123" — both merely
+        // contain it. With no exact match to break the tie, this must be
+        // reported ambiguous rather than resolved to whichever the
+        // filesystem happened to enumerate first.
+        write_session_file(dir.path(), "proj-a", "abc123-one");
+        write_session_file(dir.path(), "proj-b", "abc123-two");
+
+        match find_conversation_file(dir.path(), "abc123", None) {
+            ConversationLookup::Ambiguous(mut candidates) => {
+                candidates.sort();
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(
+                    candidates[0],
+                    ("abc123-one".to_string(), "proj-a".to_string())
+                );
+                assert_eq!(
+                    candidates[1],
+                    ("abc123-two".to_string(), "proj-b".to_string())
+                );
+            }
+            other => panic!(
+                "expected Ambiguous with 2 candidates, got a resolved/not-found result instead: {}",
+                matches!(other, ConversationLookup::Found(..))
+            ),
+        }
+    }
+
+    #[test]
+    fn get_full_conversation_surfaces_ambiguous_candidates_instead_of_a_wrong_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_session_file(dir.path(), "proj-a", "abc123-one");
+        write_session_file(dir.path(), "proj-b", "abc123-two");
+
+        let out = get_full_conversation(dir.path(), "abc123", None);
+        assert!(out.contains("is ambiguous"));
+        assert!(out.contains("abc123-one"));
+        assert!(out.contains("abc123-two"));
+        assert!(out.contains("proj-a"));
+        assert!(out.contains("proj-b"));
+    }
+
+    #[test]
+    fn transcript_run_surfaces_ambiguous_session_id_honestly() {
+        let dir = tempfile::tempdir().unwrap();
+        write_session_file(dir.path(), "proj-a", "abc123-one");
+        write_session_file(dir.path(), "proj-b", "abc123-two");
+
+        let req = crate::transcript::TranscriptRequest {
+            session: "abc123".to_string(),
+            view: crate::transcript::ViewKind::Stats,
+            ..Default::default()
+        };
+        let out = crate::transcript::run(dir.path(), &req);
+        assert!(out.contains("ambiguous"));
+        assert!(out.contains("abc123-one"));
+        assert!(out.contains("abc123-two"));
     }
 }
 
