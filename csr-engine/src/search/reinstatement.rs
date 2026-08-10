@@ -347,19 +347,31 @@ fn truncate_with_episode_quota(
     if ranked.len() <= k {
         return ranked;
     }
-    let episode_candidate = ranked.iter().find(|candidate| {
-        candidate
-            .route_scores
-            .get(&Via::Episode)
-            .is_some_and(|score| *score >= min_episode_score)
-    });
     let mut surfaced: Vec<Candidate> = ranked.iter().take(k).cloned().collect();
-    if !surfaced
-        .iter()
-        .any(|candidate| candidate.route_scores.contains_key(&Via::Episode))
-    {
-        if let Some(candidate) = episode_candidate {
-            surfaced[k - 1] = candidate.clone();
+    // Route-diversity quota: the tool's purpose is provenance ROUTES, and a
+    // pure-similarity top-k lets the hop-1 blend pool drown every walked
+    // route (measured live: Q1 graph walks=13 accepted=3 surfaced=0, eval
+    // --provenance 2026-08-09). Reserve the last slots for the best accepted
+    // episode and graph candidates when neither survived on score alone —
+    // quota only re-seats candidates that genuinely cleared their acceptance
+    // floors; it never fabricates or re-scores.
+    for (route, slot_from_end) in [(Via::Episode, 1), (Via::Graph, 2)] {
+        if surfaced
+            .iter()
+            .any(|candidate| candidate.route_scores.contains_key(&route))
+        {
+            continue;
+        }
+        let replacement = ranked.iter().find(|candidate| {
+            candidate
+                .route_scores
+                .get(&route)
+                .is_some_and(|score| *score >= min_episode_score)
+        });
+        if let Some(candidate) = replacement {
+            if k >= slot_from_end {
+                surfaced[k - slot_from_end] = candidate.clone();
+            }
         }
     }
     surfaced
@@ -775,6 +787,25 @@ pub async fn reinstate(
         }
     }
 
+    // Every hop-1 hit competes in the fused pool, not just the selected
+    // seeds. Dropping ranks 4+ made reinstate() a SUBSET of plain blend
+    // retrieval — measured live (eval --provenance, 2026-08-09): two
+    // queries where one-shot kNN found GT sessions and arm B found zero.
+    // Reinstatement adds routes; it must never subtract hop-1 evidence.
+    for hit in &chunk_hits {
+        if let Some(chunk) = meta_by_id.get(hit.id.as_str()) {
+            push_candidate(
+                &mut pool,
+                Candidate::new(
+                    hit.id.clone(),
+                    chunk.conversation_id.clone(),
+                    hit.score,
+                    Via::Blend,
+                ),
+            );
+        }
+    }
+
     // Exact query identifiers launch structural seeds from node attribution
     // and incident edge provenance. These bypass the semantic score floor.
     let identifiers = query_identifier_candidates(query);
@@ -851,6 +882,51 @@ pub async fn reinstate(
         .collect();
     let mut launched_conversations = HashSet::new();
     launches.retain(|(_, conv)| launched_conversations.insert(conv.clone()));
+    // Widen the walk beyond the selected seeds: up to cfg.seeds additional
+    // launch anchors from the remaining hop-1 hits (score order, distinct
+    // conversations), preferring conversations that HAVE file attribution —
+    // those are the ones a co-edit walk can actually spread from. When the
+    // top seeds land in conversations with no attribution and no episode
+    // links, the walk stages ran zero times and the machinery sat inert on
+    // live prose queries (Q1/Q7, eval --provenance 2026-08-09). Still
+    // evidence-driven: every extra anchor was itself retrieved for this
+    // query; attribution only orders the scan, it never fabricates a hit.
+    const EXTRA_ANCHOR_SCAN: usize = 24;
+    let mut attributed: Vec<(String, String)> = Vec::new();
+    let mut unattributed: Vec<(String, String)> = Vec::new();
+    let mut scanned_conversations = launched_conversations.clone();
+    for hit in chunk_hits.iter().take(EXTRA_ANCHOR_SCAN) {
+        let Some(chunk) = meta_by_id.get(hit.id.as_str()) else {
+            continue;
+        };
+        if !scanned_conversations.insert(chunk.conversation_id.clone()) {
+            continue;
+        }
+        let has_files = !storage
+            .with_connection(|conn| {
+                crate::storage::queries::files_for_session_in_projects(
+                    conn,
+                    &chunk.conversation_id,
+                    &family_projects,
+                    1,
+                )
+            })?
+            .is_empty();
+        let entry = (hit.id.clone(), chunk.conversation_id.clone());
+        if has_files {
+            attributed.push(entry);
+        } else {
+            unattributed.push(entry);
+        }
+    }
+    for (chunk_id, conv) in attributed.into_iter().chain(unattributed) {
+        if launches.len() >= cfg.seeds * 2 + 2 {
+            break;
+        }
+        if launched_conversations.insert(conv.clone()) {
+            launches.push((chunk_id, conv));
+        }
+    }
     let mut episode_accepted_ids = BTreeSet::new();
 
     for (seed_id, seed_conv) in launches {
