@@ -60,6 +60,21 @@ pub struct Episode {
     pub prev_episode_id: Option<String>,
     #[serde(default)]
     pub anchors: Vec<crate::extraction::anchors::FunctionAnchor>,
+
+    // Journal v2 instrumentation feeds (plan `.plans/journal-v2-mailbox-plan.md`
+    // §3.3/§4.1). `Option<u32>`, not `u32`: `None` means "never measured"
+    // (no transcript pass ran — old episode, oversized transcript, read
+    // failure); `Some(0)` means "measured, and there were none". This
+    // distinction is the entire honest-degradation story and must survive to
+    // the renderer unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_count: Option<u32>,
+    #[serde(default)]
+    pub top_errors: Vec<crate::transcript::instrumentation::ErrorEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_count: Option<u32>,
+    #[serde(default)]
+    pub steers: Vec<crate::transcript::instrumentation::SteerEvent>,
 }
 
 /// Extract a structured episode from JSONL transcript lines.
@@ -389,6 +404,10 @@ fn extract_episode_from_messages(
         approved_plan,
         prev_episode_id: None,
         anchors: Vec::new(),
+        error_count: None,
+        top_errors: Vec::new(),
+        steer_count: None,
+        steers: Vec::new(),
     }
 }
 
@@ -487,6 +506,27 @@ pub async fn store_episode(engine: &Engine, episode: &Episode) -> Result<()> {
     Ok(())
 }
 
+/// Instrumentation scan skip bound (plan §3.3a cost table): above this size
+/// the extra streaming pass is skipped rather than paying an unbounded cost
+/// on the Stop hook's hot path.
+const MAX_INSTRUMENTATION_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Best-effort instrumentation scan over the transcript at `transcript_path`.
+/// Returns `None` on ANY failure — oversized file, the file having vanished
+/// between the caller's existence check and this scan, or a parse error —
+/// so the caller can leave the episode's instrumentation fields at `None`
+/// ("never measured") without the Stop hook itself ever failing.
+fn scan_instrumentation(
+    transcript_path: &Path,
+) -> Option<crate::transcript::instrumentation::SessionInstrumentation> {
+    let metadata = std::fs::metadata(transcript_path).ok()?;
+    if metadata.len() > MAX_INSTRUMENTATION_SCAN_BYTES {
+        return None;
+    }
+    let parsed = crate::transcript::parse_transcript(transcript_path).ok()?;
+    Some(crate::transcript::instrumentation::from_parsed(&parsed))
+}
+
 /// Read transcript, extract episode, and store it. Non-fatal wrapper.
 pub async fn extract_and_store_episode(
     input: &HookInput,
@@ -515,6 +555,21 @@ pub async fn extract_and_store_episode(
     let lines: Vec<&str> = raw.lines().collect();
 
     let mut episode = extract_episode(&lines, session_id, project_name);
+
+    // Journal v2 instrumentation feeds (plan `.plans/journal-v2-mailbox-plan.md`
+    // §3.3/§4.1): one extra streaming pass over the same transcript file
+    // (already in page cache from the `read_to_string` above for anything
+    // under the size cap). Wrapped so ANY failure — oversized file,
+    // transcript deleted between the existence check above and this scan,
+    // malformed content — leaves the fields `None` ("never measured")
+    // rather than ever failing the hook (repo CLAUDE.md: hooks must never
+    // block Claude Code; plan §8 R4).
+    if let Some(instrumentation) = scan_instrumentation(&tp) {
+        episode.error_count = Some(instrumentation.error_count);
+        episode.top_errors = instrumentation.top_errors;
+        episode.steer_count = Some(instrumentation.steer_count);
+        episode.steers = instrumentation.steers;
+    }
 
     // Authoritative on-disk task directory overrides transcript-mined todos
     // when present and non-empty (Claude Code's ~/.claude/tasks/<session_id>/).
@@ -1243,6 +1298,10 @@ mod tests {
             approved_plan: None,
             prev_episode_id: None,
             anchors: vec![],
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
         };
 
         let json = serde_json::to_string(&ep).unwrap();
@@ -1289,6 +1348,10 @@ mod tests {
             approved_plan: None,
             prev_episode_id: None,
             anchors: vec![],
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
         };
 
         let tags = episode_tags(&ep);
@@ -1351,7 +1414,9 @@ mod tests {
     }
 
     #[test]
-    fn episode_v1_json_still_deserializes() {
+    fn episode_v1_and_v2_without_instrumentation_still_deserialize() {
+        // v1: no todos/approved_plan/prev_episode_id/anchors, and (this
+        // extension) no instrumentation fields either.
         let v1 = r#"{"schema":"v1","session_id":"s","project":"p","timestamp":"t",
             "request":"r","investigated":[],"completed":"c","next_steps":null,
             "blockers":null,"outcome":"partial","error_signatures":[],"tools_used":[],
@@ -1359,6 +1424,176 @@ mod tests {
         let ep: Episode = serde_json::from_str(v1).expect("v1 compat");
         assert!(ep.todos.is_empty());
         assert!(ep.approved_plan.is_none());
+        assert!(ep.error_count.is_none());
+        assert!(ep.top_errors.is_empty());
+        assert!(ep.steer_count.is_none());
+        assert!(ep.steers.is_empty());
+
+        // v2: has the working-state fields but predates instrumentation
+        // (plan §4.1) — must still deserialize, with the four new fields
+        // defaulting to "never measured", not a deserialize error.
+        let v2 = r#"{"schema":"v2","session_id":"s","project":"p","timestamp":"t",
+            "request":"r","investigated":[],"completed":"c","next_steps":null,
+            "blockers":null,"outcome":"success","error_signatures":[],"tools_used":[],
+            "files_modified":[],"message_count":1,"duration_minutes":0,
+            "todos":[{"content":"x","status":"completed"}],"approved_plan":null,
+            "prev_episode_id":null,"anchors":[]}"#;
+        let ep2: Episode = serde_json::from_str(v2).expect("v2 (pre-instrumentation) compat");
+        assert_eq!(ep2.todos.len(), 1);
+        assert!(ep2.error_count.is_none());
+        assert!(ep2.top_errors.is_empty());
+        assert!(ep2.steer_count.is_none());
+        assert!(ep2.steers.is_empty());
+    }
+
+    // --- extract_and_store_episode instrumentation wiring (plan §4.1) ---
+
+    fn instrumentation_test_engine() -> (Engine, std::sync::Arc<crate::storage::Storage>) {
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let embeddings = std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap());
+        let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::search::SearchEngine::new(100),
+        ));
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings,
+            search,
+            std::path::PathBuf::from("/tmp"),
+        );
+        (engine, storage)
+    }
+
+    /// Fetch and deserialize the stored `session_episode` reflection for
+    /// `session_id`, panicking with a descriptive message if none was
+    /// stored — tests call this only after asserting `extract_and_store_episode`
+    /// returned `Ok`.
+    fn stored_episode(storage: &crate::storage::Storage, session_id: &str) -> Episode {
+        let rows = storage
+            .get_reflections_by_tag(&format!("conv_{session_id}"), 10)
+            .unwrap();
+        let (_, content, _, _) = rows
+            .into_iter()
+            .find(|(_, _, tags, _)| tags.iter().any(|t| t == "session_episode"))
+            .expect("episode reflection must have been stored");
+        serde_json::from_str(&content).expect("stored episode must deserialize")
+    }
+
+    #[tokio::test]
+    async fn episode_carries_instrumentation_when_transcript_is_readable() {
+        let (engine, storage) = instrumentation_test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let transcript = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","message":{"content":"make the podcast episode"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ffmpeg"}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","is_error":true,"content":"ffmpeg exit 1"}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":"no — hindi, not english"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Retried with the hindi voice id."}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let session_id = "aaaaaaaa-1111-2222-3333-444444444444";
+        let input = HookInput {
+            transcript_path: Some(transcript.to_string_lossy().to_string()),
+            session_id: Some(session_id.to_string()),
+            cwd: Some(tmp.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        extract_and_store_episode(&input, &engine, tmp.path())
+            .await
+            .expect("readable transcript must store an episode");
+
+        let ep = stored_episode(&storage, session_id);
+        assert_eq!(ep.error_count, Some(1));
+        assert_eq!(ep.top_errors.len(), 1);
+        assert_eq!(ep.top_errors[0].tool, "Bash");
+        assert_eq!(ep.steer_count, Some(1));
+        assert_eq!(ep.steers.len(), 1);
+        assert!(ep.steers[0].text.contains("hindi"));
+    }
+
+    #[tokio::test]
+    async fn oversized_transcript_is_skipped_without_error() {
+        let (engine, storage) = instrumentation_test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let transcript = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"content":"make the podcast episode"}}"#,
+        )
+        .unwrap();
+        // Stub an over-cap size without writing 64 MiB of real bytes: a
+        // sparse `set_len` bump makes `metadata().len()` read as huge while
+        // the file's real content — and disk usage — stay tiny.
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&transcript)
+                .unwrap();
+            f.set_len(MAX_INSTRUMENTATION_SCAN_BYTES + 1).unwrap();
+        }
+        assert!(
+            std::fs::metadata(&transcript).unwrap().len() > MAX_INSTRUMENTATION_SCAN_BYTES,
+            "fixture must actually exceed the cap for this test to mean anything"
+        );
+
+        let session_id = "bbbbbbbb-1111-2222-3333-444444444444";
+        let input = HookInput {
+            transcript_path: Some(transcript.to_string_lossy().to_string()),
+            session_id: Some(session_id.to_string()),
+            cwd: Some(tmp.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        extract_and_store_episode(&input, &engine, tmp.path())
+            .await
+            .expect("an oversized transcript must not fail the hook");
+
+        let ep = stored_episode(&storage, session_id);
+        assert!(
+            ep.error_count.is_none(),
+            "oversized scan must leave error_count None"
+        );
+        assert!(ep.top_errors.is_empty());
+        assert!(
+            ep.steer_count.is_none(),
+            "oversized scan must leave steer_count None"
+        );
+        assert!(ep.steers.is_empty());
+    }
+
+    #[test]
+    fn missing_transcript_never_fails_the_hook() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let transcript = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"content":"do the work"}}"#,
+        )
+        .unwrap();
+
+        // File present at the point the caller would normally scan it.
+        assert!(scan_instrumentation(&transcript).is_some());
+
+        // The transcript vanishes between the hook's initial existence
+        // check/read and a later instrumentation scan attempt (real-world
+        // race: session rotation, watcher move, Ctrl+C mid-write).
+        // `scan_instrumentation` must degrade to `None` — never panic, never
+        // propagate an I/O error — which is exactly what lets its caller
+        // (`extract_and_store_episode`) leave the instrumentation fields at
+        // `None` while still storing the rest of the episode. Hooks must
+        // never block Claude Code (repo CLAUDE.md).
+        std::fs::remove_file(&transcript).unwrap();
+        assert!(scan_instrumentation(&transcript).is_none());
     }
 
     /// Assistant tool_use line with an explicit block id and free-form input.

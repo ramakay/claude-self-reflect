@@ -29,6 +29,7 @@
 //! Session-id → path resolution, however, *is* shared: both this module and
 //! `get_full_conversation` call [`crate::mcp::tools::find_conversation_file`].
 
+pub mod instrumentation;
 pub mod query;
 
 use anyhow::{Context, Result};

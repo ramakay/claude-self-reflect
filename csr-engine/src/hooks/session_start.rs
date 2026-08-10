@@ -1597,6 +1597,10 @@ mod tests {
             ],
             approved_plan: None,
             prev_episode_id: None,
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
             anchors: vec![],
         };
         let verdicts = vec![
@@ -1650,6 +1654,10 @@ mod tests {
             todos: vec![],
             approved_plan: None,
             prev_episode_id: None,
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2h ago");
@@ -1682,6 +1690,10 @@ mod tests {
             todos: vec![],
             approved_plan: None,
             prev_episode_id: None,
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1w ago");
@@ -1716,6 +1728,10 @@ mod tests {
             todos: vec![],
             approved_plan: None,
             prev_episode_id: None,
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2m ago");
@@ -1751,6 +1767,10 @@ mod tests {
             todos: vec![],
             approved_plan: None,
             prev_episode_id: None,
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1m ago");
@@ -1956,6 +1976,10 @@ mod tests {
             todos: vec![],
             approved_plan: None,
             prev_episode_id: None,
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
             anchors: vec![],
         }
     }

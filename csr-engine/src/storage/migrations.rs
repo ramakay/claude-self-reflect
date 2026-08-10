@@ -562,6 +562,17 @@ pub fn run(conn: &Connection) -> Result<()> {
             ledger_refs TEXT,
             extractor_version TEXT NOT NULL,
             extracted_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS session_instrumentation (
+             session_id       TEXT PRIMARY KEY,
+             transcript_size  INTEGER NOT NULL DEFAULT 0,
+             transcript_mtime INTEGER NOT NULL DEFAULT 0,
+             error_count      INTEGER NOT NULL DEFAULT 0,
+             steer_count      INTEGER NOT NULL DEFAULT 0,
+             turn_count       INTEGER NOT NULL DEFAULT 0,
+             errors_json      TEXT NOT NULL DEFAULT '[]',
+             steers_json      TEXT NOT NULL DEFAULT '[]',
+             computed_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
          );",
     )?;
 
@@ -1039,6 +1050,22 @@ mod tests {
             )
             .is_ok(),
             "repo_defs table must exist after migration"
+        );
+    }
+
+    #[test]
+    fn session_instrumentation_table_exists_with_expected_columns() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare(
+                "SELECT session_id, transcript_size, transcript_mtime, error_count, \
+                 steer_count, turn_count, errors_json, steers_json, computed_at \
+                 FROM session_instrumentation LIMIT 0"
+            )
+            .is_ok(),
+            "session_instrumentation table must exist with the exact §3.3(a) columns"
         );
     }
 

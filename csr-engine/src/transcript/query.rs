@@ -589,7 +589,7 @@ fn render_files(parsed: &ParsedTranscript, req: &TranscriptRequest) -> ViewData 
 
 // ─── errors ───
 
-fn index_tool_use_names(entries: &[Entry]) -> HashMap<String, String> {
+pub(crate) fn index_tool_use_names(entries: &[Entry]) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for entry in entries {
         for tu in &entry.tool_uses {

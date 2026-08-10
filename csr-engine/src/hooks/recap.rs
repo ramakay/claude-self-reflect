@@ -513,6 +513,10 @@ mod tests {
             ],
             approved_plan: None,
             prev_episode_id: None,
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
             anchors: vec![],
         }
     }

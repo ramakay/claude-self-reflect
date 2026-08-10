@@ -1183,6 +1183,10 @@ fn test_explore_prompt_never_fails() {
         todos: vec![],
         approved_plan: None,
         prev_episode_id: None,
+        error_count: None,
+        top_errors: vec![],
+        steer_count: None,
+        steers: vec![],
         anchors: vec![],
     };
 
@@ -1691,6 +1695,10 @@ fn test_episode_struct_serialization() {
         todos: vec![],
         approved_plan: None,
         prev_episode_id: None,
+        error_count: None,
+        top_errors: vec![],
+        steer_count: None,
+        steers: vec![],
         anchors: vec![],
     };
 
