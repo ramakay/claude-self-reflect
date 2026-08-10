@@ -627,16 +627,66 @@ fn gather_report_data_with(
     })
 }
 
+/// Replace exactly one occurrence of `legacy` with `replacement`, panicking
+/// with a message naming the drifted fragment if `legacy` does not occur in
+/// `template` exactly once.
+///
+/// `str::replacen(..., 1)` silently no-ops when the needle is absent, and
+/// silently leaves a second copy in place when the needle occurs more than
+/// once — either way the embedded template could drift out from under this
+/// renderer's assumptions without any error (finding 9). This asserts the
+/// precondition up front, at report-generation time, instead of hoping a
+/// downstream substring check happens to catch the drift.
+fn replace_exactly_once(template: &str, legacy: &str, replacement: &str, name: &str) -> String {
+    let occurrences = template.matches(legacy).count();
+    assert_eq!(
+        occurrences, 1,
+        "embedded dream report template fragment {name} must occur exactly once \
+         before replacement (found {occurrences}); the compiled-in template \
+         (report_template.html.jinja) has drifted from what report.rs expects — \
+         update the LEGACY_* constant in report.rs to match"
+    );
+    template.replacen(legacy, replacement, 1)
+}
+
 /// Render `data` through the embedded template into a complete, standalone
 /// HTML document.
 fn render_html(data: &DreamReportData) -> Result<String> {
-    let template = TEMPLATE
-        .replacen(LEGACY_HERO_META, STORY_HERO_META, 1)
-        .replacen(LEGACY_EMPTY_TEMPLATE, STORY_EMPTY_TEMPLATE, 1)
-        .replacen(LEGACY_TIMELINE_TEMPLATE, JOURNAL_TIMELINE_TEMPLATE, 1)
-        .replacen(LEGACY_FORGOTTEN_TEMPLATE, "", 1)
-        .replacen("</style>", &format!("{STORY_CSS}</style>"), 1);
-    if template.contains("Generated {{ data.generated_at }}")
+    let template = replace_exactly_once(
+        TEMPLATE,
+        LEGACY_HERO_META,
+        STORY_HERO_META,
+        "LEGACY_HERO_META",
+    );
+    let template = replace_exactly_once(
+        &template,
+        LEGACY_EMPTY_TEMPLATE,
+        STORY_EMPTY_TEMPLATE,
+        "LEGACY_EMPTY_TEMPLATE",
+    );
+    let template = replace_exactly_once(
+        &template,
+        LEGACY_TIMELINE_TEMPLATE,
+        JOURNAL_TIMELINE_TEMPLATE,
+        "LEGACY_TIMELINE_TEMPLATE",
+    );
+    let template = replace_exactly_once(
+        &template,
+        LEGACY_FORGOTTEN_TEMPLATE,
+        "",
+        "LEGACY_FORGOTTEN_TEMPLATE",
+    );
+    let template = replace_exactly_once(
+        &template,
+        "</style>",
+        &format!("{STORY_CSS}</style>"),
+        "</style> (STORY_CSS insertion point)",
+    );
+    if template.contains(LEGACY_HERO_META)
+        || template.contains(LEGACY_EMPTY_TEMPLATE)
+        || template.contains(LEGACY_TIMELINE_TEMPLATE)
+        || template.contains(LEGACY_FORGOTTEN_TEMPLATE)
+        || template.contains("Generated {{ data.generated_at }}")
         || template.contains("<h2>Timeline</h2>")
         || template.contains("<h2>What CSR forgot</h2>")
     {
@@ -1020,6 +1070,34 @@ mod tests {
     fn short_oid_truncates_to_eight_chars() {
         assert_eq!(short_oid("0123456789abcdef"), "01234567");
         assert_eq!(short_oid("abc"), "abc");
+    }
+
+    /// Regression for finding 9: `replace_exactly_once` must reject a
+    /// missing legacy fragment loudly rather than let `replacen` silently
+    /// no-op, which would leave stale legacy markup in the rendered report
+    /// with no error at all.
+    #[test]
+    #[should_panic(expected = "SOME_FRAGMENT")]
+    fn replace_exactly_once_panics_when_fragment_is_absent() {
+        replace_exactly_once("nothing to see here", "NEEDLE", "X", "SOME_FRAGMENT");
+    }
+
+    /// Regression for finding 9: a fragment that drifted into occurring more
+    /// than once must also be rejected — `replacen(..., 1)` would otherwise
+    /// silently leave a second stale copy behind after replacing only the
+    /// first.
+    #[test]
+    #[should_panic(expected = "found 2")]
+    fn replace_exactly_once_panics_when_fragment_repeats() {
+        replace_exactly_once("NEEDLE and NEEDLE again", "NEEDLE", "X", "SOME_FRAGMENT");
+    }
+
+    #[test]
+    fn replace_exactly_once_replaces_the_single_occurrence() {
+        assert_eq!(
+            replace_exactly_once("a NEEDLE b", "NEEDLE", "X", "SOME_FRAGMENT"),
+            "a X b"
+        );
     }
 
     #[test]

@@ -6,6 +6,12 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+/// Bound on how many sessions a single shared-identity artifact carries in
+/// its `conversations` list. Prevents a hot symbol touched by hundreds of
+/// sessions from forcing unbounded per-session cloning (finding 8); the
+/// newest sessions by anchor timestamp are kept, oldest are dropped first.
+const MAX_SHARED_ARTIFACT_SESSIONS: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct StoryTodo {
     pub content: String,
@@ -284,6 +290,37 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
         .collect::<Vec<_>>();
     let transcript_conversations =
         super::witness_verdicts::conversation_ids_for_anchors(conn, &identities)?;
+
+    // One artifact template per identity (project, file, symbol), built from
+    // whichever anchor row establishes it first. Every row sharing an
+    // identity carries the same receipt (looked up by project/file/symbol
+    // alone, not by session), so there is nothing session-specific to
+    // preserve beyond this template.
+    let mut identity_templates: BTreeMap<(String, String, String), StoryArtifact> = BTreeMap::new();
+    // Each linked anchor's own (session, sort_key) — used below to rank a
+    // shared identity's candidate sessions by recency without an extra
+    // query. Sessions known only via `transcript_conversations` have no
+    // entry here and sort last (oldest), since we have no evidence they are
+    // newer than the sessions that actually own an anchor for this identity.
+    let mut linked_anchor_sort_keys: BTreeMap<String, f64> = BTreeMap::new();
+    for (session_id, project, _, sort_key, artifact) in &linked_anchors {
+        let Some(symbol) = artifact.symbol.clone() else {
+            continue;
+        };
+        let key = (project.clone(), artifact.file.clone(), symbol);
+        identity_templates
+            .entry(key)
+            .or_insert_with(|| artifact.clone());
+        linked_anchor_sort_keys
+            .entry(session_id.clone())
+            .and_modify(|existing| {
+                if *sort_key > *existing {
+                    *existing = *sort_key;
+                }
+            })
+            .or_insert(*sort_key);
+    }
+
     let mut artifact_conversations: BTreeMap<(String, String, String), Vec<String>> =
         BTreeMap::new();
     for (session_id, project, _, _, artifact) in &linked_anchors {
@@ -305,21 +342,37 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
     for session_ids in artifact_conversations.values_mut() {
         session_ids.sort();
         session_ids.dedup();
+        // Select the newest candidate sessions BEFORE the attach/clone step
+        // below runs, and cap the result. Without this, an identity shared
+        // by hundreds of sessions would force every one of those sessions to
+        // carry a full, independently cloned copy of the others' IDs —
+        // quadratic attach work and cubic string cloning for a single hot
+        // symbol (finding 8).
+        session_ids.sort_by(|a, b| {
+            let key_a = linked_anchor_sort_keys.get(a).copied().unwrap_or(f64::MIN);
+            let key_b = linked_anchor_sort_keys.get(b).copied().unwrap_or(f64::MIN);
+            key_b.total_cmp(&key_a).then_with(|| a.cmp(b))
+        });
+        session_ids.truncate(MAX_SHARED_ARTIFACT_SESSIONS);
     }
 
-    for (_, project, timestamp, sort_key, artifact) in &linked_anchors {
-        let Some(symbol) = artifact.symbol.as_ref() else {
+    // Attach each identity's artifact exactly once per identity — not once
+    // per anchor row that established it — so a symbol shared by many
+    // sessions does bounded attachment work instead of work proportional to
+    // (anchor rows for the identity) x (sessions sharing the identity)
+    // (finding 8). Only the anchor's OWNING session had its timestamp
+    // applied above (loop over `episode_anchors` rows); sessions that merely
+    // share the identity must never borrow another session's date here —
+    // each session's sort position stays derived solely from its own
+    // records (finding 7).
+    for (key, session_ids) in &artifact_conversations {
+        let Some(template) = identity_templates.get(key) else {
             continue;
         };
-        let key = (project.clone(), artifact.file.clone(), symbol.clone());
-        let mut artifact = artifact.clone();
-        artifact.conversations = artifact_conversations
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
-        for session_id in &artifact.conversations {
+        let mut artifact = template.clone();
+        artifact.conversations = session_ids.clone();
+        for session_id in session_ids {
             let builder = sessions.entry(session_id.clone()).or_default();
-            builder.touch(project, timestamp, *sort_key);
             builder.add_artifact(artifact.clone());
         }
     }
@@ -490,5 +543,107 @@ mod tests {
         assert!(sessions[0].artifacts.iter().any(|artifact| {
             artifact.file == "/repo/src/extra.rs" && artifact.symbol.is_none()
         }));
+    }
+
+    /// Regression for finding 7: two sessions sharing an anchor identity
+    /// (same project/file/symbol) must not cross-pollute each other's
+    /// timestamp/sort key. Before the fix, propagating the shared artifact
+    /// re-touched every session sharing the identity with whichever anchor
+    /// row happened to be processed, so the older session inherited the
+    /// newer session's date and could displace genuinely newer stories in
+    /// the report's newest-first ordering.
+    #[test]
+    fn shared_symbol_across_sessions_keeps_each_sessions_own_timestamp() {
+        let conn = memory_db();
+        conn.execute_batch(
+            r#"
+            INSERT INTO episode_anchors
+                (session_id, project, file, node_kind, name, body_hash, created_at)
+            VALUES
+                ('session-old', 'proj', '/repo/src/lib.rs', 'function_item',
+                 'shared_symbol', 'hash', '2026-01-01 00:00:00'),
+                ('session-new', 'proj', '/repo/src/lib.rs', 'function_item',
+                 'shared_symbol', 'hash', '2026-02-01 00:00:00');
+            "#,
+        )
+        .unwrap();
+
+        let sessions = load_story_sessions(&conn).unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        let old = sessions
+            .iter()
+            .find(|s| s.session_id == "session-old")
+            .expect("older session must be present");
+        let new = sessions
+            .iter()
+            .find(|s| s.session_id == "session-new")
+            .expect("newer session must be present");
+
+        assert_eq!(
+            old.timestamp, "2026-01-01 00:00:00",
+            "the older session must keep deriving its own timestamp, not the newer session's"
+        );
+        assert_eq!(new.timestamp, "2026-02-01 00:00:00");
+
+        // Newest-first ordering must reflect each session's own timestamp,
+        // not a timestamp borrowed from a session it merely shares a symbol
+        // with.
+        assert_eq!(sessions[0].session_id, "session-new");
+        assert_eq!(sessions[1].session_id, "session-old");
+    }
+
+    /// Regression for finding 8: an identity shared by far more sessions
+    /// than the report's card cap must not force unbounded per-session
+    /// cloning of the full conversation list, and the sessions that do get
+    /// attached must be the newest ones by anchor timestamp — selected
+    /// before the attach/clone step runs, not after.
+    #[test]
+    fn shared_identity_across_many_sessions_bounds_and_keeps_newest_candidates() {
+        let conn = memory_db();
+        let base = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        let mut batch = String::new();
+        for i in 0..200i64 {
+            let date = base + chrono::Duration::days(i);
+            batch.push_str(&format!(
+                "INSERT INTO episode_anchors \
+                 (session_id, project, file, node_kind, name, body_hash, created_at) \
+                 VALUES ('session-{i:04}', 'proj', '/repo/src/lib.rs', 'function_item', \
+                 'shared_symbol', 'hash', '{date} 00:00:00');\n"
+            ));
+        }
+        conn.execute_batch(&batch).unwrap();
+
+        let sessions = load_story_sessions(&conn).unwrap();
+        assert_eq!(
+            sessions.len(),
+            200,
+            "every session still gets its own entry"
+        );
+
+        let newest = sessions
+            .iter()
+            .find(|s| s.session_id == "session-0199")
+            .expect("newest session must be present");
+        let artifact = newest
+            .artifacts
+            .iter()
+            .find(|a| a.symbol.as_deref() == Some("shared_symbol"))
+            .expect("newest session must carry the shared artifact");
+
+        assert!(
+            artifact.conversations.len() <= super::MAX_SHARED_ARTIFACT_SESSIONS,
+            "conversation list must be capped, got {}",
+            artifact.conversations.len()
+        );
+        assert!(
+            artifact.conversations.contains(&"session-0199".to_string()),
+            "the newest session must retain itself in the capped candidate set"
+        );
+        assert!(
+            !artifact.conversations.contains(&"session-0000".to_string()),
+            "the oldest session must be dropped once the shared identity exceeds the cap \
+             (proves selection happens before expansion, not after)"
+        );
     }
 }
