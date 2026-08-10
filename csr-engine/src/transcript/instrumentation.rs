@@ -43,6 +43,31 @@ const STEER_TEXT_CHARS: usize = 120;
 const MAX_STORED_ERRORS: usize = 3;
 const MAX_STORED_STEERS: usize = 3;
 
+/// True if `text` is harness-generated plumbing shaped like a human steer but
+/// never typed by one: a background task-completion notification injected as
+/// a user turn, a `[SYSTEM NOTIFICATION - NOT USER INPUT]` block, a leaked
+/// `<local-command-caveat>` wrapper, or `<command-name>` command plumbing.
+/// None of the first three register in `extraction::provenance`'s
+/// `strip_plumbing` tag list or `is_csr_emission`'s header/token registries —
+/// that module owns CSR's OWN emissions and Claude Code's known command
+/// wrappers, not the harness's task/session-management XML, so a live report
+/// showed a raw `<task-notification>` block and a `[SYSTEM NOTIFICATION`
+/// block counted as mid-flight human steers. `<command-name>` is already
+/// stripped to empty by `extractable` (kept here too so this predicate is
+/// self-sufficient at its second call site — the report renderer re-applying
+/// it to steers a session may have already persisted under the pre-fix
+/// filter, per plan Part A).
+///
+/// **One predicate, two call sites**: [`from_parsed`]'s steer loop (forward
+/// path) and `dream::report`'s STEER stage-card builder (render-time
+/// re-filter of already-stored steers).
+pub(crate) fn is_noisy_steer_text(text: &str) -> bool {
+    text.trim_start().starts_with("[SYSTEM NOTIFICATION")
+        || text.contains("<task-notification>")
+        || text.contains("<local-command-caveat>")
+        || text.contains("<command-name>")
+}
+
 /// One `tool_result` block with `is_error: true`, resolved to its owning
 /// tool's real name via the `tool_use_id` index (`"unknown"` when unpaired —
 /// matching `transcript::query::render_errors`'s existing convention).
@@ -149,6 +174,12 @@ pub fn from_parsed(parsed: &ParsedTranscript) -> SessionInstrumentation {
         // self-contamination echo must not become a steer regardless of
         // which stage of the pipeline would have caught it.
         if crate::extraction::provenance::is_csr_emission(&entry.text) {
+            continue;
+        }
+        // Harness noise (task-completion notifications, system-injected
+        // non-user-input blocks) shaped like a real user turn — see
+        // `is_noisy_steer_text` doc.
+        if is_noisy_steer_text(&entry.text) {
             continue;
         }
         let Some(cleaned) = crate::extraction::provenance::extractable(&entry.text) else {
@@ -363,6 +394,46 @@ mod tests {
         assert_eq!(inst.steer_count, 1, "only the genuine turn should count");
         assert_eq!(inst.steers.len(), 1);
         assert_eq!(inst.steers[0].turn, 5);
+        assert!(inst.steers[0].text.contains("hindi"));
+    }
+
+    #[test]
+    fn steers_exclude_task_notifications_and_system_blocks() {
+        let entries = vec![
+            user_text(1, "make the podcast episode"),
+            // [queued] background-task-completion notification injected as a
+            // user turn — real shape observed in a live corpus.
+            user_text(
+                2,
+                "[queued] <task-notification>\n<task-id>ac58728b340b16885</task-id>\n\
+                 <tool-use-id>toolu_01QwFvBiPYrLbm7iEC3ta8Bq</tool-use-id>\n\
+                 <status>completed</status>\n<summary>Agent finished</summary>\n\
+                 </task-notification>",
+            ),
+            // harness system-injected "not user input" block.
+            user_text(
+                3,
+                "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated \
+                 background-task event, NOT a message from the user.",
+            ),
+            // leaked/unclosed local-command-caveat wrapper.
+            user_text(
+                4,
+                "<local-command-caveat>Caveat: The messages below were generated \
+                 by the user while running local commands. DO NOT respond",
+            ),
+            // skill-invocation command-name plumbing.
+            user_text(5, "<command-name>/memory-feedback</command-name>"),
+            // the one genuine positive control.
+            user_text(6, "no — use hindi"),
+        ];
+        let inst = from_parsed(&parsed(entries));
+        assert_eq!(
+            inst.steer_count, 1,
+            "only the genuine human steer should count"
+        );
+        assert_eq!(inst.steers.len(), 1);
+        assert_eq!(inst.steers[0].turn, 6);
         assert!(inst.steers[0].text.contains("hindi"));
     }
 

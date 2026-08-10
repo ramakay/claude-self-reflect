@@ -1007,6 +1007,57 @@ async function main() {
         JSON.stringify(scrollResults),
       );
 
+      // ---- glass-tokens (journal v2 Phase 4, brand polish) -----------------
+      // The index pane must actually carry the glassmorphic blur — not just
+      // a translucent background color.
+      const glassTokens = await evalJS(
+        cdp,
+        `(() => {
+          const pane = document.querySelector(".index-pane");
+          if (!pane) return { skipped: true };
+          const style = getComputedStyle(pane);
+          const backdropFilter = style.backdropFilter || style.webkitBackdropFilter || "";
+          return { backdropFilter };
+        })()`,
+      );
+      check(
+        "glass-tokens",
+        glassTokens.skipped || /blur/.test(glassTokens.backdropFilter),
+        JSON.stringify(glassTokens),
+      );
+
+      // ---- font-embedded (journal v2 Phase 4, brand polish) ----------------
+      // Playfair Display must load from the embedded data: URI (no network
+      // request — already asserted by no-external-requests above) and
+      // actually be usable once loaded.
+      await evalJS(cdp, `document.fonts.ready.then(() => true)`);
+      const fontEmbedded = await evalJS(
+        cdp,
+        `document.fonts.check('16px "Playfair Display"')`,
+      );
+      check("font-embedded", fontEmbedded === true, JSON.stringify(fontEmbedded));
+
+      // ---- postit-steers (journal v2 Phase 4, brand polish) ----------------
+      // "rich7" carries stored steer quotes (see steer-lines above) — each
+      // rendered steer-line element must also carry the post-it class.
+      const postitSteers = await evalJS(
+        cdp,
+        `(() => {
+          document.querySelector('.index-row[data-session="rich7"]').click();
+          const pane = document.querySelector('.detail-pane[data-session="rich7"]');
+          const lines = pane ? Array.from(pane.querySelectorAll(".steer-line")) : [];
+          return {
+            lineCount: lines.length,
+            allPostIt: lines.length > 0 && lines.every((el) => el.classList.contains("post-it")),
+          };
+        })()`,
+      );
+      check(
+        "postit-steers",
+        postitSteers.lineCount > 0 && postitSteers.allPostIt,
+        JSON.stringify(postitSteers),
+      );
+
       cdp.close();
     } finally {
       chrome.kill("SIGKILL");

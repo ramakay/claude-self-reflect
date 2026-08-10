@@ -576,6 +576,22 @@ pub fn run(conn: &Connection) -> Result<()> {
          );",
     )?;
 
+    // One-time cache invalidation (steer-noise fix, `transcript::instrumentation::
+    // is_noisy_steer_text`): rows cached under the pre-fix steer filter may carry
+    // harness noise (`<task-notification>` blocks, `[SYSTEM NOTIFICATION` wrappers)
+    // that no human ever typed. `run()` executes on every `Storage::open`, so an
+    // unconditional DELETE here would wipe the cache on every process start instead
+    // of once — guarded by `meta` so it fires exactly once per database. The table
+    // self-heals: `dream::report`'s backfill refills it in ~1.3s at the next report.
+    {
+        let already_purged =
+            crate::storage::queries::get_meta(conn, "steer_noise_filter_v1")?.is_some();
+        if !already_purged {
+            conn.execute_batch("DELETE FROM session_instrumentation;")?;
+            crate::storage::queries::set_meta(conn, "steer_noise_filter_v1", "1")?;
+        }
+    }
+
     // Migration: journal_headlines gained `description` after first ship on
     // 2026-08-10; DBs created between the two shapes lack the column. Same
     // idempotent ALTER-guard pattern as the code_edges columns above.

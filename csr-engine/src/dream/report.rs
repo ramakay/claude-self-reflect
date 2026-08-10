@@ -75,6 +75,7 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section class="mailbox" aria-label
           <span class="row-head"><span class="glyph {{ row.outcome_slug }}">{{ row.glyph }}</span><span class="project-pill">{{ row.project }}</span></span>
           <span class="sentence">{{ row.sentence }}</span>
           <span class="instrumentation">{% for segment in row.segments %}<span class="chip{% if segment.degraded %} degraded{% endif %}"{% if segment.popover %} data-popover="{{ segment.popover }}"{% endif %}{% if segment.title %} title="{{ segment.title }}"{% endif %}>{{ segment.text }}</span>{% if not loop.last %} · {% endif %}{% endfor %}</span>
+          {% if row.has_todo_bar %}<span class="microchart" aria-label="todo completion" style="--pct: {{ row.todo_pct }}%;"><span></span></span>{% endif %}
         </button>
         {% endfor %}
         {% endfor %}
@@ -123,7 +124,7 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section class="mailbox" aria-label
                 </ul>
                 {% if stage.steer_count %}
                 <p class="steer-count">{{ stage.steer_count }} mid-flight steer{% if stage.steer_count != 1 %}s{% endif %}</p>
-                {% for steer in stage.steers %}<p class="steer-line">&#8627; turn {{ steer.turn }} &ldquo;{{ steer.text }}&rdquo;</p>{% endfor %}
+                {% for steer in stage.steers %}<p class="steer-line post-it">&#8627; turn {{ steer.turn }} &ldquo;{{ steer.text }}&rdquo;</p>{% endfor %}
                 {% endif %}
               {% elif stage.kind == "outcome" %}
                 {% if stage.outcome_stats %}<p class="outcome-stats">{{ stage.outcome_stats }}</p>{% endif %}
@@ -380,6 +381,135 @@ const MAILBOX_CSS: &str = r#"
     .index-pane { border-right: none; border-bottom: 1px solid var(--border); }
     .stage-rail { padding-left: 1.6rem; }
     .stage-glyph { left: -1.6rem; }
+  }
+
+  /* ---- Journal v2 Phase 4: glassmorphic brand pass ----
+     Chrome + cards register (landing glass, docs-site DESIGN_SYSTEM.md):
+     translucent blur, soft radius, gentle hover lift. Long-form text inside
+     cards (the detail-pane headline) borrows the DocPage editorial register
+     — serif headline over quiet prose. Additive only: every rule above still
+     stands, these just layer the polish on top via the later cascade
+     position (this block is the tail of MAILBOX_CSS, spliced in right
+     before the document's closing style tag — literally naming that tag
+     here would truncate the HTML raw-text element at parse time, hiding
+     every rule after it; that is not hypothetical, it is exactly the bug
+     this comment replaced). */
+  .totals .stat, .event, .forgotten-row, .empty-state, .meta-row code,
+  .index-pane, .stage-card, .artifact-tile, .chip-popover, .thin-group {
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+  }
+  .mailbox {
+    border-radius: var(--radius-pane);
+    box-shadow: 0 4px 30px rgba(42, 38, 66, 0.1);
+  }
+  .stage-card, .artifact-tile, .thin-group,
+  .totals .stat, .event, .forgotten-row, .empty-state {
+    border-radius: var(--radius-tile);
+  }
+  .stage-card, .artifact-tile {
+    transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1), border-color 180ms ease-out;
+  }
+  .stage-card:hover, .artifact-tile:hover {
+    transform: translateY(-2px);
+    border-color: rgba(255, 255, 255, 0.55);
+  }
+  .index-row.selected { background: rgba(255, 255, 255, 0.55); }
+
+  /* Editorial small-caps kicker labels — same muted-purple-adjacent grey the
+     docs-site DocPage register uses for breadcrumbs/section labels. */
+  .group-header, .sort-label, .stage-label, .thin-rollup-header, .thin-count {
+    color: var(--label);
+  }
+
+  /* DocPage editorial register: serif headline for the one piece of
+     long-form text a card carries — the fused ask->outcome sentence. Index
+     rows stay in the landing-glass chrome register (dense, scannable, sans)
+     — only the detail pane's headline gets the editorial treatment. */
+  header.hero h1, .detail-pane .sentence {
+    font-family: var(--serif);
+  }
+  .detail-pane .sentence {
+    font-weight: 700;
+    color: var(--ink);
+  }
+
+  /* Steer quotes as post-it notes (plan: "steers ARE handwritten human
+     interjections; the metaphor is exact"). Alternating lavender/rose tints
+     and rotation so a run of three doesn't read as one flat block. */
+  .steer-line.post-it {
+    display: inline-block;
+    max-width: 100%;
+    font-family: var(--cursive);
+    font-size: 1.05rem;
+    line-height: 1.35;
+    color: var(--ink);
+    background: var(--postit-lavender);
+    border-radius: 4px;
+    padding: 0.45rem 0.75rem;
+    margin: 0 0 0.6rem;
+    transform: rotate(-3deg);
+    box-shadow: 2px 3px 8px rgba(42, 38, 66, 0.15);
+    transition: transform 160ms ease-out;
+  }
+  .steer-line.post-it:nth-of-type(even) {
+    background: var(--postit-rose);
+    transform: rotate(2deg);
+  }
+  .steer-line.post-it:hover { transform: rotate(0deg) scale(1.03); }
+
+  /* Todo-completion microchart (real data only — server omits the element
+     entirely when a session has no todos; never a fabricated 0%). */
+  .microchart {
+    display: block;
+    margin-top: 0.3rem;
+    height: 4px;
+    border-radius: 999px;
+    background: rgba(26, 26, 46, 0.08);
+    overflow: hidden;
+  }
+  .microchart > span {
+    display: block;
+    height: 100%;
+    width: var(--pct, 0%);
+    background: var(--sage);
+    border-radius: 999px;
+  }
+
+  /* Staggered reveal (CSS-only — no data attribute, no JS, so the rendered
+     HTML bytes are identical run to run; the determinism test asserts the
+     markup, not the paint). `:nth-of-type` counts only sibling <button>s
+     inside `.session-rows` (the interspersed `.group-header` <p>s are a
+     different tag), so it stays a stable per-row stagger across every
+     client-side re-sort too — the JS re-sort only moves existing button
+     nodes, it never creates new ones. */
+  @keyframes csrRowReveal {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .index-row { animation: csrRowReveal 360ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+  .index-row:nth-of-type(1) { animation-delay: 0ms; }
+  .index-row:nth-of-type(2) { animation-delay: 18ms; }
+  .index-row:nth-of-type(3) { animation-delay: 36ms; }
+  .index-row:nth-of-type(4) { animation-delay: 54ms; }
+  .index-row:nth-of-type(5) { animation-delay: 72ms; }
+  .index-row:nth-of-type(6) { animation-delay: 90ms; }
+  .index-row:nth-of-type(7) { animation-delay: 108ms; }
+  .index-row:nth-of-type(8) { animation-delay: 126ms; }
+  .index-row:nth-of-type(9) { animation-delay: 144ms; }
+  .index-row:nth-of-type(10) { animation-delay: 162ms; }
+  .index-row:nth-of-type(11) { animation-delay: 180ms; }
+  .index-row:nth-of-type(12) { animation-delay: 198ms; }
+  .index-row:nth-of-type(13) { animation-delay: 216ms; }
+  .index-row:nth-of-type(14) { animation-delay: 234ms; }
+  .index-row:nth-of-type(15) { animation-delay: 252ms; }
+  .index-row:nth-of-type(16) { animation-delay: 270ms; }
+  .index-row:nth-of-type(17) { animation-delay: 288ms; }
+  .index-row:nth-of-type(18) { animation-delay: 306ms; }
+  .index-row:nth-of-type(19) { animation-delay: 324ms; }
+  .index-row:nth-of-type(20) { animation-delay: 342ms; }
+  @media (prefers-reduced-motion: reduce) {
+    .index-row { animation: none; }
   }
 "#;
 
@@ -664,6 +794,14 @@ struct IndexRowView {
     /// `YYYY-MM-DD` — sort/group key for the client-side re-sort.
     day: String,
     selected: bool,
+    /// Todo-completion microchart (plan Phase 4): `true` only when this
+    /// session has at least one todo — real data only, absent (no bar at
+    /// all) when there is nothing to measure. A bare `Option<u8>` risks a
+    /// minijinja truthiness footgun (`Some(0)` reads falsy same as `None`
+    /// under `{% if %}`), so presence and value are two separate fields.
+    has_todo_bar: bool,
+    /// 0-100, meaningful only when `has_todo_bar` is true.
+    todo_pct: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1258,6 +1396,13 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
             .map(|i| {
                 i.steers
                     .iter()
+                    // Re-apply the same harness-noise predicate `from_parsed`
+                    // uses (plan Part A): episodes stored before this fix may
+                    // still carry a `<task-notification>`/`[SYSTEM
+                    // NOTIFICATION`-shaped "steer" from the old, narrower
+                    // filter — the render path must not trust the cache
+                    // blindly.
+                    .filter(|s| !crate::transcript::instrumentation::is_noisy_steer_text(&s.text))
                     .take(3)
                     .map(|s| SteerLineView {
                         turn: s.turn,
@@ -1432,7 +1577,18 @@ fn instrumentation_segments(
     segments
 }
 
+/// Real-data-only todo-completion fraction (plan Phase 4 microchart): `None`
+/// when the session carries no todos at all — never a fabricated 0%.
+fn todo_completion_pct(todos: &[StoryTodoView]) -> Option<u8> {
+    if todos.is_empty() {
+        return None;
+    }
+    let done = todos.iter().filter(|todo| todo.slug == "done").count();
+    Some(((done * 100) / todos.len()) as u8)
+}
+
 fn index_row(card: &StoryCardView, selected: bool) -> IndexRowView {
+    let todo_pct = todo_completion_pct(&card.todos);
     IndexRowView {
         session_short: card.session_short.clone(),
         glyph: outcome_glyph(card.outcome_slug),
@@ -1449,6 +1605,8 @@ fn index_row(card: &StoryCardView, selected: bool) -> IndexRowView {
         ts: card.timestamp.clone(),
         day: card.date.clone(),
         selected,
+        has_todo_bar: todo_pct.is_some(),
+        todo_pct: todo_pct.unwrap_or(0),
     }
 }
 
@@ -3670,7 +3828,7 @@ mod tests {
             "the count line must show the true total, not the capped list length: {pane}"
         );
         assert_eq!(
-            pane.matches("class=\"steer-line\"").count(),
+            pane.matches("class=\"steer-line post-it\"").count(),
             3,
             "at most 3 steer lines must render regardless of steer_count: {pane}"
         );
