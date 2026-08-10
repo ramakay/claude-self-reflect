@@ -1413,7 +1413,7 @@ pub async fn why(
 ) -> Result<String> {
     let (effective_project, _) = cross_project::normalize_project_scope(project);
 
-    let items = crate::search::reinstatement::reinstate(
+    let reinstatement = crate::search::reinstatement::reinstate(
         storage,
         embeddings,
         search,
@@ -1424,8 +1424,8 @@ pub async fn why(
     .await?;
 
     // D2: local recency tie-break, csr_why only — see apply_why_recency_tiebreak.
-    let anchors = resolve_why_anchors(storage, &items);
-    let ranking = apply_why_recency_tiebreak(items, &anchors);
+    let anchors = resolve_why_anchors(storage, &reinstatement.items);
+    let ranking = apply_why_recency_tiebreak(reinstatement.items, &anchors);
 
     // TAD: log each returned chunk as an MCP-search retrieval event. session_id="mcp" is
     // the sentinel (MCP has no session id) — same pattern as reflect_on_past. Non-fatal:
@@ -1438,78 +1438,79 @@ pub async fn why(
         query,
         &ranking.items,
         &ranking.hoisted_chunk_ids,
+        &reinstatement.trace,
     ))
 }
 
 /// Format evidence items as: header, grouped-by-conversation body (in the
 /// ranked order `items` already carries), footer summary.
-fn format_why(
+pub(crate) fn format_why(
     query: &str,
     items: &[crate::search::reinstatement::EvidenceItem],
     hoisted_chunk_ids: &HashSet<String>,
+    trace: &crate::search::reinstatement::ReinstateTrace,
 ) -> String {
-    use crate::search::reinstatement::Via;
-
     let mut out = String::new();
     out.push_str(&format!("WHY: {query}\n\n"));
 
     if items.is_empty() {
         out.push_str("No evidence chain found.\n");
-        return out;
-    }
-
-    // Group by conversation, preserving first-seen (= highest-relevance) order.
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<&crate::search::reinstatement::EvidenceItem>> =
-        HashMap::new();
-    for item in items {
-        if !groups.contains_key(&item.conversation_id) {
-            order.push(item.conversation_id.clone());
+    } else {
+        // Group by conversation, preserving first-seen (= highest-relevance) order.
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, Vec<&crate::search::reinstatement::EvidenceItem>> =
+            HashMap::new();
+        for item in items {
+            if !groups.contains_key(&item.conversation_id) {
+                order.push(item.conversation_id.clone());
+            }
+            groups
+                .entry(item.conversation_id.clone())
+                .or_default()
+                .push(item);
         }
-        groups
-            .entry(item.conversation_id.clone())
-            .or_default()
-            .push(item);
-    }
 
-    for conv in &order {
-        // Render in the order `items` already carries: score-descending, with
-        // the D2 same-anchor recency tie-break applied. This group previously
-        // re-sorted by ASCENDING timestamp, which silently discarded both —
-        // and, being oldest-first, rendered a superseded claim above the very
-        // correction D2 exists to surface. Ranking decided upstream must not be
-        // undone at render time.
-        let group = groups.remove(conv).unwrap_or_default();
-        out.push_str(&format!("conv_{conv}:\n"));
-        for it in &group {
-            let score_marker = if hoisted_chunk_ids.contains(&it.chunk_id) {
-                WHY_RECENCY_HOIST_MARKER
-            } else {
-                ""
-            };
-            out.push_str(&format!(
-                "  via={} score={:.3}{} [{}] conv_{}: {}\n",
-                it.via,
-                it.score,
-                score_marker,
-                format::age_stamp(&it.timestamp),
-                it.conversation_id,
-                it.excerpt
-            ));
+        for conv in &order {
+            // Render in the order `items` already carries: score-descending, with
+            // the D2 same-anchor recency tie-break applied.
+            let group = groups.remove(conv).unwrap_or_default();
+            out.push_str(&format!("conv_{conv}:\n"));
+            for it in &group {
+                let score_marker = if hoisted_chunk_ids.contains(&it.chunk_id) {
+                    WHY_RECENCY_HOIST_MARKER
+                } else {
+                    ""
+                };
+                let reached_by = it
+                    .routes
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("+");
+                let route_scores = it
+                    .route_scores
+                    .iter()
+                    .map(|(route, score)| format!("{route}:{score:.3}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                out.push_str(&format!(
+                    "  best_via={} reached_by={} route_scores={} score={:.3}{} [{}] conv_{}: {}\n",
+                    it.best_route,
+                    reached_by,
+                    route_scores,
+                    it.score,
+                    score_marker,
+                    format::age_stamp(&it.timestamp),
+                    it.conversation_id,
+                    it.excerpt
+                ));
+            }
+            out.push('\n');
         }
-        out.push('\n');
     }
 
-    let seed_count = items.iter().filter(|i| i.via == Via::Seed).count();
-    let graph_count = items.iter().filter(|i| i.via == Via::Graph).count();
-    let episode_count = items.iter().filter(|i| i.via == Via::Episode).count();
-    out.push_str(&format!(
-        "conversations: {} | seeds -> graph/episode reach: {} seed(s), {} graph hop(s), {} episode hop(s)\n",
-        order.len(),
-        seed_count,
-        graph_count,
-        episode_count
-    ));
+    out.push_str(&crate::search::reinstatement::render_receipt(trace, items));
+    out.push('\n');
 
     out
 }
@@ -5369,11 +5370,371 @@ mod tests {
             chunk_id: chunk_id.into(),
             conversation_id: conv_id.into(),
             score,
-            via: crate::search::reinstatement::Via::Seed,
+            best_route: crate::search::reinstatement::Via::Seed,
+            routes: std::collections::BTreeSet::from([crate::search::reinstatement::Via::Seed]),
+            route_scores: std::collections::BTreeMap::from([(
+                crate::search::reinstatement::Via::Seed,
+                score,
+            )]),
             timestamp: timestamp.into(),
             excerpt: "excerpt".into(),
             ratification: None,
         }
+    }
+
+    #[tokio::test]
+    async fn why_rendered_receipt_resolves_family_symbol_and_preserves_all_routes() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let query = "why does `retire_missing_nodes` preserve attribution";
+        let query_vec = embeddings.embed_single(query).unwrap();
+        let base_project = "claude-self-reflect";
+        let alias_project = "claude-self-reflect-csr-engine";
+
+        let chunks = [
+            crate::import::ConversationChunk {
+                id: "why-base-chunk".into(),
+                conversation_id: "why-base-conv".into(),
+                project_name: base_project.into(),
+                timestamp: "2026-08-01T00:00:00Z".into(),
+                content: "general provenance discussion".into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            },
+            crate::import::ConversationChunk {
+                id: "why-symbol-chunk".into(),
+                conversation_id: "why-symbol-conv".into(),
+                project_name: alias_project.into(),
+                timestamp: "2026-08-02T00:00:00Z".into(),
+                content: "retire_missing_nodes preserves attribution provenance".into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            },
+        ];
+        let mut engine = SearchEngine::new(query_vec.len());
+        for chunk in &chunks {
+            storage.insert_chunk(chunk, &query_vec).unwrap();
+            engine.insert_chunk(chunk.id.clone(), query_vec.clone());
+        }
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO code_nodes
+                     (id, repo, project, file, lang, kind, name, fqname,
+                      first_conv_id, last_conv_id, last_session_id)
+                     VALUES (?1, 'repo', ?2, 'src/search.rs', 'rust', 'function',
+                             'retire_missing_nodes',
+                             'search::retire_missing_nodes',
+                             'legacy-wrong-conv', 'legacy-wrong-conv', 'legacy-wrong-conv')",
+                    rusqlite::params!["why-symbol-node", alias_project],
+                )?;
+                conn.execute(
+                    "INSERT INTO code_node_attribution
+                     (node_id, channel, source_id, observed_ts, evidence)
+                     VALUES (?1, 'transcript', ?2, '2026-08-02T00:00:00Z', 'coedit_event')",
+                    rusqlite::params!["why-symbol-node", "why-symbol-conv"],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let rendered = why(
+            &storage,
+            &embeddings,
+            &Arc::new(RwLock::new(engine)),
+            query,
+            Some(base_project),
+            &crate::search::reinstatement::ReinstateConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            rendered.contains("scope=claude-self-reflect,claude-self-reflect-csr-engine"),
+            "family scope must be visible in the receipt:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("symbols matched=1 [retire_missing_nodes]"),
+            "the exact query identifier must resolve across the family:\n{rendered}"
+        );
+        assert!(rendered.contains("conv_why-symbol-conv:"), "{rendered}");
+        assert!(
+            rendered.contains("reached_by=seed+blend+graph"),
+            "dedup must preserve both routes to the same evidence:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("graph walks=1 accepted=1 surfaced=1"),
+            "walked, accepted, and surfaced must be separate rendered counters:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn why_rendered_receipt_reports_dangling_episode_without_a_fake_hop() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let query = "why provenance episodes can abstain safely";
+        let query_vec = embeddings.embed_single(query).unwrap();
+        let chunk = crate::import::ConversationChunk {
+            id: "episode-current-chunk".into(),
+            conversation_id: "episode-current".into(),
+            project_name: "claude-self-reflect".into(),
+            timestamp: "2026-08-03T00:00:00Z".into(),
+            content: "provenance episodes abstain safely".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &query_vec).unwrap();
+        storage
+            .insert_reflection(
+                "episode-current-reflection",
+                &serde_json::json!({ "prev_episode_id": "missing-episode-target" }).to_string(),
+                &[
+                    "session_episode".to_string(),
+                    "conv_episode-current".to_string(),
+                ],
+                &[],
+            )
+            .unwrap();
+        let mut engine = SearchEngine::new(query_vec.len());
+        engine.insert_chunk(chunk.id.clone(), query_vec);
+
+        let rendered = why(
+            &storage,
+            &embeddings,
+            &Arc::new(RwLock::new(engine)),
+            query,
+            Some("claude-self-reflect"),
+            &crate::search::reinstatement::ReinstateConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            rendered.contains(
+                "episodes links=1 resolved=0 accepted=0 surfaced=0 (below-cut=0, below-threshold=0, dangling=1, out-of-scope=0, unembedded=0)"
+            ),
+            "dangling targets must remain an explicit abstention:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("reached_by=episode"),
+            "a dangling target must never fabricate episode evidence:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn why_rendered_receipt_selects_three_distinct_semantic_conversations() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let query = "why semantic seeds remain distinct conversations";
+        let query_vec = embeddings.embed_single(query).unwrap();
+        let rows = [
+            ("seed-a-1", "seed-conv-a"),
+            ("seed-a-2", "seed-conv-a"),
+            ("seed-b", "seed-conv-b"),
+            ("seed-c", "seed-conv-c"),
+        ];
+        let mut engine = SearchEngine::new(query_vec.len());
+        for (seq, (id, conv)) in rows.into_iter().enumerate() {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conv.into(),
+                project_name: "claude-self-reflect".into(),
+                timestamp: format!("2026-08-0{}T00:00:00Z", seq + 1),
+                content: format!("semantic evidence from {conv}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &query_vec).unwrap();
+            engine.insert_chunk(chunk.id, query_vec.clone());
+        }
+
+        let rendered = why(
+            &storage,
+            &embeddings,
+            &Arc::new(RwLock::new(engine)),
+            query,
+            Some("claude-self-reflect"),
+            &crate::search::reinstatement::ReinstateConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            rendered.contains("seeds selected=3 conversations=3 surfaced=3"),
+            "multiple chunks from one conversation must consume one seed slot:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn why_rendered_receipt_surfaces_resolved_episode_under_conditional_quota() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let query = "why episode provenance remains reachable";
+        let query_vec = embeddings.embed_single(query).unwrap();
+        let mut orthogonal = vec![0.0; query_vec.len()];
+        orthogonal[0] = -query_vec[1];
+        orthogonal[1] = query_vec[0];
+        let orthogonal_norm = orthogonal.iter().map(|v| v * v).sum::<f32>().sqrt();
+        for value in &mut orthogonal {
+            *value /= orthogonal_norm;
+        }
+        let episode_vec: Vec<f32> = query_vec
+            .iter()
+            .zip(orthogonal)
+            .map(|(query_value, orthogonal_value)| {
+                0.40 * query_value + (1.0_f32 - 0.40_f32.powi(2)).sqrt() * orthogonal_value
+            })
+            .collect();
+        let chunks = [
+            ("episode-seed-chunk", "episode-seed-conv", query_vec.clone()),
+            ("episode-target-chunk", "episode-target-conv", episode_vec),
+        ];
+        let mut engine = SearchEngine::new(query_vec.len());
+        for (seq, (id, conv, vector)) in chunks.into_iter().enumerate() {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conv.into(),
+                project_name: "claude-self-reflect".into(),
+                timestamp: format!("2026-08-0{}T00:00:00Z", seq + 1),
+                content: format!("episode evidence from {conv}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            engine.insert_chunk(chunk.id, vector);
+        }
+        storage
+            .insert_reflection(
+                "episode-positive-reflection",
+                &serde_json::json!({ "prev_episode_id": "episode-target-conv" }).to_string(),
+                &[
+                    "session_episode".to_string(),
+                    "conv_episode-seed-conv".to_string(),
+                ],
+                &[],
+            )
+            .unwrap();
+        let cfg = crate::search::reinstatement::ReinstateConfig {
+            k: 1,
+            ..crate::search::reinstatement::ReinstateConfig::default()
+        };
+
+        let rendered = why(
+            &storage,
+            &embeddings,
+            &Arc::new(RwLock::new(engine)),
+            query,
+            Some("claude-self-reflect"),
+            &cfg,
+        )
+        .await
+        .unwrap();
+
+        assert!(rendered.contains("conv_episode-target-conv:"), "{rendered}");
+        assert!(
+            rendered.contains("reached_by=blend+episode"),
+            "the episode route must survive even when blend also reached the chunk:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "episodes links=1 resolved=1 accepted=1 surfaced=1 (below-cut=0, below-threshold=0, dangling=0, out-of-scope=0, unembedded=0)"
+            ),
+            "a valid episode above the structural floor must receive the conditional slot:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn why_rendered_receipt_abstains_from_weak_episode_target() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let query = "why weak episode evidence must abstain";
+        let query_vec = embeddings.embed_single(query).unwrap();
+        let mut orthogonal = vec![0.0; query_vec.len()];
+        orthogonal[0] = -query_vec[1];
+        orthogonal[1] = query_vec[0];
+        let orthogonal_norm = orthogonal.iter().map(|v| v * v).sum::<f32>().sqrt();
+        for value in &mut orthogonal {
+            *value /= orthogonal_norm;
+        }
+        let weak_vec: Vec<f32> = query_vec
+            .iter()
+            .zip(orthogonal)
+            .map(|(query_value, orthogonal_value)| {
+                0.10 * query_value + (1.0_f32 - 0.10_f32.powi(2)).sqrt() * orthogonal_value
+            })
+            .collect();
+        let chunks = [
+            (
+                "episode-weak-seed",
+                "episode-weak-seed-conv",
+                query_vec.clone(),
+            ),
+            ("episode-weak-target", "episode-weak-target-conv", weak_vec),
+        ];
+        let mut engine = SearchEngine::new(query_vec.len());
+        for (seq, (id, conv, vector)) in chunks.into_iter().enumerate() {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conv.into(),
+                project_name: "claude-self-reflect".into(),
+                timestamp: format!("2026-08-0{}T00:00:00Z", seq + 1),
+                content: format!("episode evidence from {conv}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            engine.insert_chunk(chunk.id, vector);
+        }
+        storage
+            .insert_reflection(
+                "episode-weak-reflection",
+                &serde_json::json!({ "prev_episode_id": "episode-weak-target-conv" }).to_string(),
+                &[
+                    "session_episode".to_string(),
+                    "conv_episode-weak-seed-conv".to_string(),
+                ],
+                &[],
+            )
+            .unwrap();
+
+        let rendered = why(
+            &storage,
+            &embeddings,
+            &Arc::new(RwLock::new(engine)),
+            query,
+            Some("claude-self-reflect"),
+            &crate::search::reinstatement::ReinstateConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !rendered.contains("conv_episode-weak-target-conv:"),
+            "a below-floor episode must abstain rather than surface:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("episodes links=1 resolved=1 accepted=0 surfaced=0"),
+            "resolution and acceptance must be separate stages:\n{rendered}"
+        );
+        assert!(rendered.contains("below-threshold=1"), "{rendered}");
     }
 
     /// The chain that a pairwise near-tie comparator gets wrong. Scores 0.90 /
@@ -5441,7 +5802,12 @@ mod tests {
             "precondition: ranking puts the correction first"
         );
 
-        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+        let rendered = format_why(
+            "why",
+            &ranking.items,
+            &ranking.hoisted_chunk_ids,
+            &crate::search::reinstatement::ReinstateTrace::default(),
+        );
         let newer_at = rendered.find("0.810").expect("newer item must render");
         let older_at = rendered.find("0.840").expect("older item must render");
         assert!(
@@ -5470,7 +5836,12 @@ mod tests {
             ranking.items[0].chunk_id, "fixed",
             "newer correction must rank first within epsilon on the same anchor"
         );
-        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+        let rendered = format_why(
+            "why",
+            &ranking.items,
+            &ranking.hoisted_chunk_ids,
+            &crate::search::reinstatement::ReinstateTrace::default(),
+        );
         assert!(
             rendered.contains("score=0.696 [recent↑]"),
             "the lower-scored item hoisted by recency must carry a marker:\n{rendered}"
@@ -5506,7 +5877,12 @@ mod tests {
             ranking.items[0].chunk_id, "higher",
             "outside epsilon must not be reordered by recency"
         );
-        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+        let rendered = format_why(
+            "why",
+            &ranking.items,
+            &ranking.hoisted_chunk_ids,
+            &crate::search::reinstatement::ReinstateTrace::default(),
+        );
         assert!(
             !rendered.contains('↑'),
             "strict score ordering outside epsilon must not carry a marker:\n{rendered}"
@@ -5533,7 +5909,12 @@ mod tests {
             ranking.items[0].chunk_id, "a-old",
             "different anchors must never be reordered by recency, even within epsilon"
         );
-        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+        let rendered = format_why(
+            "why",
+            &ranking.items,
+            &ranking.hoisted_chunk_ids,
+            &crate::search::reinstatement::ReinstateTrace::default(),
+        );
         assert!(
             !rendered.contains('↑'),
             "items on different anchors must not carry a marker:\n{rendered}"
@@ -5554,7 +5935,12 @@ mod why_marker_tests {
             chunk_id: chunk_id.to_string(),
             conversation_id: "conv-x".to_string(),
             score,
-            via: crate::search::reinstatement::Via::Seed,
+            best_route: crate::search::reinstatement::Via::Seed,
+            routes: std::collections::BTreeSet::from([crate::search::reinstatement::Via::Seed]),
+            route_scores: std::collections::BTreeMap::from([(
+                crate::search::reinstatement::Via::Seed,
+                score,
+            )]),
             timestamp: timestamp.to_string(),
             excerpt: chunk_id.to_string(),
             ratification: None,
@@ -5577,7 +5963,12 @@ mod why_marker_tests {
         ]);
 
         let ranking = apply_why_recency_tiebreak(vec![higher, newer], &anchors);
-        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+        let rendered = format_why(
+            "why",
+            &ranking.items,
+            &ranking.hoisted_chunk_ids,
+            &crate::search::reinstatement::ReinstateTrace::default(),
+        );
 
         assert_eq!(ranking.items[0].chunk_id, "newer");
         assert!(ranking.hoisted_chunk_ids.contains("newer"));
@@ -5601,7 +5992,12 @@ mod why_marker_tests {
         ]);
 
         let ranking = apply_why_recency_tiebreak(vec![newer, higher], &anchors);
-        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+        let rendered = format_why(
+            "why",
+            &ranking.items,
+            &ranking.hoisted_chunk_ids,
+            &crate::search::reinstatement::ReinstateTrace::default(),
+        );
 
         assert_eq!(ranking.items[0].chunk_id, "higher");
         assert!(ranking.hoisted_chunk_ids.is_empty());
@@ -5624,7 +6020,12 @@ mod why_marker_tests {
         ]);
 
         let ranking = apply_why_recency_tiebreak(vec![newer, higher], &anchors);
-        let rendered = format_why("why", &ranking.items, &ranking.hoisted_chunk_ids);
+        let rendered = format_why(
+            "why",
+            &ranking.items,
+            &ranking.hoisted_chunk_ids,
+            &crate::search::reinstatement::ReinstateTrace::default(),
+        );
 
         assert_eq!(ranking.items[0].chunk_id, "higher");
         assert!(ranking.hoisted_chunk_ids.is_empty());

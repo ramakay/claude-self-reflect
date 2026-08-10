@@ -2097,6 +2097,204 @@ pub fn get_chunk_ids_for_conversation(
         .map_err(Into::into)
 }
 
+/// Distinct project namespaces participating in reinstatement. The corpus can
+/// be split across chunk, co-edit, and code-graph tables, so resolving the
+/// family from only one table silently loses valid aliases.
+pub fn reinstatement_project_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT project_name FROM chunks WHERE project_name <> ''
+         UNION SELECT project_name FROM code_evolution WHERE project_name <> ''
+         UNION SELECT project FROM code_nodes WHERE project <> ''
+         ORDER BY 1",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn string_placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Chunk ids from every namespace in an already-resolved project family.
+/// An empty family means unscoped/all projects.
+pub fn get_chunk_ids_for_projects(conn: &Connection, projects: &[String]) -> Result<Vec<String>> {
+    if projects.is_empty() {
+        let mut stmt = conn.prepare("SELECT id FROM chunks ORDER BY rowid")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        return rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into);
+    }
+    let sql = format!(
+        "SELECT id FROM chunks WHERE project_name IN ({}) ORDER BY rowid",
+        string_placeholders(projects.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = projects
+        .iter()
+        .map(|project| project as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Conversation chunk ids constrained to an already-resolved project family.
+pub fn get_chunk_ids_for_conversation_in_projects(
+    conn: &Connection,
+    conversation_id: &str,
+    projects: &[String],
+) -> Result<Vec<String>> {
+    if projects.is_empty() {
+        return get_chunk_ids_for_conversation(conn, conversation_id);
+    }
+    let sql = format!(
+        "SELECT id FROM chunks WHERE conversation_id = ? AND project_name IN ({}) ORDER BY rowid",
+        string_placeholders(projects.len())
+    );
+    let mut values = Vec::with_capacity(projects.len() + 1);
+    values.push(conversation_id.to_string());
+    values.extend(projects.iter().cloned());
+    let params: Vec<&dyn rusqlite::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Lean exact-symbol row used by query-aware reinstatement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReinstatementSymbolNode {
+    pub id: String,
+    pub project: String,
+    pub name: String,
+    pub fqname: String,
+}
+
+/// Validate identifier candidates through exact node name/fqname matches in
+/// the already-resolved project family.
+pub fn exact_code_nodes_in_projects(
+    conn: &Connection,
+    identifiers: &[String],
+    projects: &[String],
+    preferred_project: &str,
+    limit: usize,
+) -> Result<Vec<ReinstatementSymbolNode>> {
+    if identifiers.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let identifiers_sql = string_placeholders(identifiers.len());
+    let project_clause = if projects.is_empty() {
+        String::new()
+    } else {
+        format!(" AND project IN ({})", string_placeholders(projects.len()))
+    };
+    let sql = format!(
+        "SELECT id, project, name, fqname
+         FROM code_nodes
+         WHERE (name IN ({identifiers_sql}) OR fqname IN ({identifiers_sql})){project_clause}
+         ORDER BY CASE WHEN project = ? THEN 0 ELSE 1 END, project, name, id
+         LIMIT ?"
+    );
+    let mut values = Vec::with_capacity(identifiers.len() * 2 + projects.len() + 1);
+    values.extend(identifiers.iter().cloned());
+    values.extend(identifiers.iter().cloned());
+    values.extend(projects.iter().cloned());
+    values.push(preferred_project.to_string());
+    let mut params: Vec<&dyn rusqlite::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let limit_value = limit as i64;
+    params.push(&limit_value);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok(ReinstatementSymbolNode {
+            id: row.get(0)?,
+            project: row.get(1)?,
+            name: row.get(2)?,
+            fqname: row.get(3)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Trusted transcript-channel symbol attribution. Legacy first/last node
+/// sightings are deliberately excluded: they are file-level projections, not
+/// per-symbol provenance.
+pub fn transcript_attribution_conversations(
+    conn: &Connection,
+    node_ids: &[String],
+) -> Result<Vec<String>> {
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT source_id FROM code_node_attribution
+         WHERE channel = 'transcript' AND node_id IN ({})
+         ORDER BY node_id",
+        string_placeholders(node_ids.len())
+    );
+    let params: Vec<&dyn rusqlite::ToSql> = node_ids
+        .iter()
+        .map(|node_id| node_id as &dyn rusqlite::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Conversation/session provenance carried by edges incident to matched
+/// symbols. The node ids are already family-scoped by
+/// [`exact_code_nodes_in_projects`].
+pub fn incident_edge_conversations(
+    conn: &Connection,
+    node_ids: &[String],
+    limit: usize,
+) -> Result<Vec<String>> {
+    if node_ids.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let placeholders = string_placeholders(node_ids.len());
+    let sql = format!(
+        "SELECT conv_id, session_id FROM code_edges
+         WHERE src_id IN ({placeholders}) OR dst_id IN ({placeholders})
+         ORDER BY src_id, dst_id, kind LIMIT ?"
+    );
+    let mut values = Vec::with_capacity(node_ids.len() * 2);
+    values.extend(node_ids.iter().cloned());
+    values.extend(node_ids.iter().cloned());
+    let mut params: Vec<&dyn rusqlite::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let limit_value = limit as i64;
+    params.push(&limit_value);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut conversations = Vec::new();
+    for row in rows {
+        let (conv_id, session_id) = row?;
+        if !conv_id.is_empty() {
+            conversations.push(conv_id);
+        }
+        if !session_id.is_empty() {
+            conversations.push(session_id);
+        }
+    }
+    Ok(conversations)
+}
+
 /// Embeddings for a specific set of chunk ids, chunked into ~500-id IN-clauses to stay
 /// under SQLite's default parameter limit. Decodes the same little-endian f32 blob format
 /// as `load_all_chunk_vectors`.
@@ -2146,6 +2344,38 @@ pub fn files_for_session(conn: &Connection, session_id: &str, limit: usize) -> R
         .map_err(Into::into)
 }
 
+/// Family-scoped variant for reinstatement. An empty family is the explicit
+/// all-project escape hatch.
+pub fn files_for_session_in_projects(
+    conn: &Connection,
+    session_id: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<String>> {
+    if projects.is_empty() {
+        return files_for_session(conn, session_id, limit);
+    }
+    let sql = format!(
+        "SELECT file_path FROM code_evolution
+         WHERE session_id = ? AND project_name IN ({})
+         GROUP BY file_path ORDER BY COUNT(*) DESC LIMIT ?",
+        string_placeholders(projects.len())
+    );
+    let mut values = Vec::with_capacity(projects.len() + 1);
+    values.push(session_id.to_string());
+    values.extend(projects.iter().cloned());
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let limit_value = limit as i64;
+    params.push(&limit_value);
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// Other sessions that touched the same file (code_evolution), excluding one session.
 /// Optionally scoped to a project (saga project-scoping fix — prevents cross-project
 /// graph spread in the reinstatement walk).
@@ -2184,6 +2414,40 @@ pub fn sessions_for_file(
                 .map_err(Into::into)
         }
     }
+}
+
+/// Other sessions touching a file anywhere inside an already-resolved project
+/// family. An empty family is unscoped.
+pub fn sessions_for_file_in_projects(
+    conn: &Connection,
+    file_path: &str,
+    exclude_session: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<String>> {
+    if projects.is_empty() {
+        return sessions_for_file(conn, file_path, exclude_session, None, limit);
+    }
+    let sql = format!(
+        "SELECT DISTINCT session_id FROM code_evolution
+         WHERE file_path = ? AND session_id <> ? AND project_name IN ({}) LIMIT ?",
+        string_placeholders(projects.len())
+    );
+    let mut values = Vec::with_capacity(projects.len() + 2);
+    values.push(file_path.to_string());
+    values.push(exclude_session.to_string());
+    values.extend(projects.iter().cloned());
+    let params_strings: Vec<&dyn rusqlite::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let limit_value = limit as i64;
+    let mut params = params_strings;
+    params.push(&limit_value);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 /// Backfill UPDATE: set seq/is_sidechain on an existing chunk row by id.
@@ -2857,5 +3121,21 @@ mod tests {
             got.contains(&"sess_b".to_string()),
             "unscoped lookup must return other-project sessions: {got:?}"
         );
+    }
+
+    #[test]
+    fn sessions_for_file_accepts_every_namespace_in_resolved_family() {
+        let conn = mem();
+        seed_cross_project_shared_file(&conn);
+
+        let got = sessions_for_file_in_projects(
+            &conn,
+            "shared.rs",
+            "sess_a",
+            &["proj_a".to_string(), "proj_b".to_string()],
+            10,
+        )
+        .unwrap();
+        assert_eq!(got, vec!["sess_b"]);
     }
 }

@@ -1,7 +1,8 @@
 //! Saga reinstatement recall — the proven Phase 0 spike walk, productionized.
 //!
-//! Two-hop reinstatement: seed retrieval (hop 1) -> blended re-query + code-graph
-//! spread + episode-chain hop (hop 2), fused and deduped by max score. See
+//! Query-aware reinstatement: exact-symbol + semantic seeds (hop 1) -> blended
+//! re-query + code-graph spread + episode-chain hop (hop 2), fused by max score
+//! while retaining every route that reached each candidate. See
 //! `docs/plans/saga-reinstatement-spike.md` and `examples/saga_spike.rs` for the
 //! design and the Phase 0 evidence (+53% provenance coverage vs one-shot kNN).
 //!
@@ -14,7 +15,7 @@
 //! the latency budget. Conversations average ~136 chunks; exact cosine over that is
 //! microseconds.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -27,10 +28,12 @@ use crate::search::SearchEngine;
 use crate::storage::Storage;
 
 /// How an evidence item was reached during the walk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Via {
     /// Hop-1 direct semantic seed hit.
     Seed,
+    /// The single permitted semantic seed in the 0.20..0.30 fallback band.
+    SeedLowConfidence,
     /// Hop-2 blended query+seed vector re-query.
     Blend,
     /// Hop-2 code-graph spread (seed session -> shared files -> neighbor sessions).
@@ -45,6 +48,7 @@ impl std::fmt::Display for Via {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             Via::Seed => "seed",
+            Via::SeedLowConfidence => "seed-low-confidence",
             Via::Blend => "blend",
             Via::Graph => "graph",
             Via::Episode => "episode",
@@ -67,7 +71,8 @@ pub struct ReinstateConfig {
     pub graph_boost: f32,
     /// Max graph candidates kept per seed (post-sort, pre-fusion).
     pub graph_cap_per_seed: usize,
-    /// Minimum similarity score for a candidate to be considered.
+    /// Minimum similarity for blend/reflection candidates. Semantic seed
+    /// policy uses the fixed 0.30 primary and 0.20 fallback floors.
     pub min_score: f32,
 }
 
@@ -90,7 +95,12 @@ pub struct EvidenceItem {
     pub chunk_id: String,
     pub conversation_id: String,
     pub score: f32,
-    pub via: Via,
+    /// Route whose score won fusion for ordering.
+    pub best_route: Via,
+    /// Every route that reached this candidate, retained across deduplication.
+    pub routes: BTreeSet<Via>,
+    /// Best score observed independently for each route.
+    pub route_scores: BTreeMap<Via, f32>,
     pub timestamp: String,
     /// ~200 chars, cleaned (newlines -> spaces).
     pub excerpt: String,
@@ -101,6 +111,119 @@ pub struct EvidenceItem {
     pub ratification: Option<f32>,
 }
 
+/// Auditable stage counters for one reinstatement walk. Surfaced counts are
+/// intentionally recomputed from final [`EvidenceItem::routes`] by the
+/// renderer rather than stored here, preventing receipt drift.
+#[derive(Debug, Clone, Default)]
+pub struct ReinstateTrace {
+    pub scope_projects: Vec<String>,
+    pub seeds_selected: usize,
+    pub seed_conversations: usize,
+    pub symbols_matched: usize,
+    pub symbol_names: Vec<String>,
+    pub graph_walks: usize,
+    pub graph_accepted: usize,
+    pub structural_graph_accepted: usize,
+    pub episode_links: usize,
+    pub episode_resolved: usize,
+    pub episode_accepted: usize,
+    pub episode_below_cut: usize,
+    pub episode_below_threshold: usize,
+    pub episode_dangling: usize,
+    pub episode_out_of_scope: usize,
+    pub episode_unembedded: usize,
+}
+
+/// Evidence plus the walk receipt used to render honest stage accounting.
+#[derive(Debug, Clone, Default)]
+pub struct ReinstateResult {
+    pub items: Vec<EvidenceItem>,
+    pub trace: ReinstateTrace,
+}
+
+impl IntoIterator for ReinstateResult {
+    type Item = EvidenceItem;
+    type IntoIter = std::vec::IntoIter<EvidenceItem>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a ReinstateResult {
+    type Item = &'a EvidenceItem;
+    type IntoIter = std::slice::Iter<'a, EvidenceItem>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
+}
+
+fn surfaced_counts(items: &[EvidenceItem]) -> (usize, usize, usize) {
+    let seeds = items
+        .iter()
+        .filter(|item| {
+            item.routes.contains(&Via::Seed) || item.routes.contains(&Via::SeedLowConfidence)
+        })
+        .count();
+    let graph = items
+        .iter()
+        .filter(|item| item.routes.contains(&Via::Graph))
+        .count();
+    let episodes = items
+        .iter()
+        .filter(|item| item.routes.contains(&Via::Episode))
+        .count();
+    (seeds, graph, episodes)
+}
+
+/// Render the canonical receipt shared by csr_why and the provenance gate.
+pub fn render_receipt(trace: &ReinstateTrace, items: &[EvidenceItem]) -> String {
+    let (seed_count, graph_count, episode_count) = surfaced_counts(items);
+    format!(
+        "receipt: scope={} | seeds selected={} conversations={} surfaced={} | symbols matched={} [{}] | graph walks={} accepted={} surfaced={} | episodes links={} resolved={} accepted={} surfaced={} (below-cut={}, below-threshold={}, dangling={}, out-of-scope={}, unembedded={})",
+        trace.scope_projects.join(","),
+        trace.seeds_selected,
+        trace.seed_conversations,
+        seed_count,
+        trace.symbols_matched,
+        trace.symbol_names.join(","),
+        trace.graph_walks,
+        trace.graph_accepted,
+        graph_count,
+        trace.episode_links,
+        trace.episode_resolved,
+        trace.episode_accepted,
+        episode_count,
+        trace.episode_below_cut,
+        trace.episode_below_threshold,
+        trace.episode_dangling,
+        trace.episode_out_of_scope,
+        trace.episode_unembedded,
+    )
+}
+
+/// Verify that a rendered receipt's surfaced counters equal the route sets on
+/// the final evidence. This catches renderer/gate drift rather than merely
+/// checking internal counters.
+pub fn rendered_receipt_surface_counts_match(
+    receipt: &str,
+    trace: &ReinstateTrace,
+    items: &[EvidenceItem],
+) -> bool {
+    let (seeds, graph, episodes) = surfaced_counts(items);
+    receipt.contains(&format!(
+        "seeds selected={} conversations={} surfaced={seeds}",
+        trace.seeds_selected, trace.seed_conversations
+    )) && receipt.contains(&format!(
+        "graph walks={} accepted={} surfaced={graph}",
+        trace.graph_walks, trace.graph_accepted
+    )) && receipt.contains(&format!(
+        "episodes links={} resolved={} accepted={} surfaced={episodes}",
+        trace.episode_links, trace.episode_resolved, trace.episode_accepted
+    ))
+}
+
 /// Internal fusion candidate — pre-enrichment (no timestamp/excerpt yet, those are
 /// batch-filled once at the end so hop-2 stays cheap).
 #[derive(Clone)]
@@ -108,7 +231,28 @@ struct Candidate {
     id: String,
     conversation_id: String,
     score: f32,
-    via: Via,
+    best_route: Via,
+    route_scores: BTreeMap<Via, f32>,
+}
+
+impl Candidate {
+    fn new(id: String, conversation_id: String, score: f32, via: Via) -> Self {
+        Self {
+            id,
+            conversation_id,
+            score,
+            best_route: via,
+            route_scores: BTreeMap::from([(via, score)]),
+        }
+    }
+
+    fn routes(&self) -> BTreeSet<Via> {
+        self.route_scores.keys().copied().collect()
+    }
+
+    fn is_reflection_only(&self) -> bool {
+        self.route_scores.len() == 1 && self.route_scores.contains_key(&Via::Reflection)
+    }
 }
 
 /// Per-candidate detail for provenance rerank and final item assembly:
@@ -124,6 +268,9 @@ type CandidateDetail = (Option<ChunkProvenance>, String, String);
 /// coincidence.
 const W_QUERY_ECHO: f32 = 0.35;
 const QUERY_ECHO_MIN_LEN: usize = 15;
+const MAX_IDENTIFIER_CANDIDATES: usize = 16;
+const MAX_SYMBOL_NODES: usize = 32;
+const MAX_STRUCTURAL_CONVERSATIONS: usize = 64;
 
 /// True when `content` quotes the query verbatim (both lowercased) and the
 /// query is long enough for that to be a signal rather than coincidence.
@@ -192,11 +339,45 @@ fn rerank_pool(
     fused
 }
 
+fn truncate_with_episode_quota(
+    ranked: Vec<Candidate>,
+    k: usize,
+    min_episode_score: f32,
+) -> Vec<Candidate> {
+    if ranked.len() <= k {
+        return ranked;
+    }
+    let episode_candidate = ranked.iter().find(|candidate| {
+        candidate
+            .route_scores
+            .get(&Via::Episode)
+            .is_some_and(|score| *score >= min_episode_score)
+    });
+    let mut surfaced: Vec<Candidate> = ranked.iter().take(k).cloned().collect();
+    if !surfaced
+        .iter()
+        .any(|candidate| candidate.route_scores.contains_key(&Via::Episode))
+    {
+        if let Some(candidate) = episode_candidate {
+            surfaced[k - 1] = candidate.clone();
+        }
+    }
+    surfaced
+}
+
 fn push_candidate(pool: &mut HashMap<String, Candidate>, c: Candidate) {
     pool.entry(c.id.clone())
         .and_modify(|e| {
+            for (route, score) in &c.route_scores {
+                e.route_scores
+                    .entry(*route)
+                    .and_modify(|existing| *existing = existing.max(*score))
+                    .or_insert(*score);
+            }
             if c.score > e.score {
-                *e = c.clone();
+                e.score = c.score;
+                e.best_route = c.best_route;
+                e.conversation_id = c.conversation_id.clone();
             }
         })
         .or_insert(c);
@@ -248,8 +429,15 @@ fn best_chunk_for_conv(
     storage: &Storage,
     query_vec: &[f32],
     conv: &str,
+    family_projects: &[String],
 ) -> Result<Option<(String, f32)>> {
-    let ids = storage.get_chunk_ids_for_conversation(conv)?;
+    let ids = storage.with_connection(|conn| {
+        crate::storage::queries::get_chunk_ids_for_conversation_in_projects(
+            conn,
+            conv,
+            family_projects,
+        )
+    })?;
     if ids.is_empty() {
         return Ok(None);
     }
@@ -262,6 +450,187 @@ fn best_chunk_for_conv(
         }
     }
     Ok(best)
+}
+
+enum EpisodeTarget {
+    Resolved { chunk_id: String, cosine: f32 },
+    Dangling,
+    OutOfScope,
+    Unembedded,
+}
+
+fn resolve_episode_target(
+    storage: &Storage,
+    query_vec: &[f32],
+    conv: &str,
+    family_projects: &[String],
+) -> Result<EpisodeTarget> {
+    let all_ids = storage.get_chunk_ids_for_conversation(conv)?;
+    if all_ids.is_empty() {
+        return Ok(EpisodeTarget::Dangling);
+    }
+    let scoped_ids = if family_projects.is_empty() {
+        all_ids
+    } else {
+        storage.with_connection(|conn| {
+            crate::storage::queries::get_chunk_ids_for_conversation_in_projects(
+                conn,
+                conv,
+                family_projects,
+            )
+        })?
+    };
+    if scoped_ids.is_empty() {
+        return Ok(EpisodeTarget::OutOfScope);
+    }
+    let vectors = storage.get_chunk_vectors_by_ids(&scoped_ids)?;
+    let Some((chunk_id, cosine)) = vectors
+        .into_iter()
+        .map(|(id, vector)| {
+            let score = cosine(query_vec, &vector);
+            (id, score)
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+    else {
+        return Ok(EpisodeTarget::Unembedded);
+    };
+    Ok(EpisodeTarget::Resolved { chunk_id, cosine })
+}
+
+fn resolve_family_projects(storage: &Storage, project: Option<&str>) -> Result<Vec<String>> {
+    let Some(anchor) = project else {
+        return Ok(Vec::new());
+    };
+    let mut projects =
+        storage.with_connection(crate::storage::queries::reinstatement_project_names)?;
+    projects
+        .retain(|candidate| crate::search::cross_project::same_project_family(anchor, candidate));
+    if !projects.iter().any(|candidate| candidate == anchor) {
+        projects.push(anchor.to_string());
+    }
+    projects.sort_by(|a, b| (a != anchor, a).cmp(&(b != anchor, b)));
+    projects.dedup();
+    Ok(projects)
+}
+
+fn add_identifier_variants(token: &str, out: &mut BTreeSet<String>) {
+    let token = token.trim_matches(|c: char| {
+        matches!(
+            c,
+            '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '?' | '!'
+        )
+    });
+    if token.is_empty()
+        || !token
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '/' | '\\' | '.' | '-'))
+    {
+        return;
+    }
+    out.insert(token.to_string());
+    if token.contains("::") {
+        if let Some(bare) = token.rsplit("::").next().filter(|part| !part.is_empty()) {
+            out.insert(bare.to_string());
+        }
+    }
+    if token.contains(['/', '\\']) || token.contains('.') {
+        for part in token.split(['/', '\\']) {
+            let stem = part.split('.').next().unwrap_or(part);
+            if !stem.is_empty() {
+                out.insert(stem.to_string());
+            }
+        }
+    }
+}
+
+/// Extract identifier-shaped query tokens. Plain lowercase prose is ignored;
+/// exact node validation is the final authority for every candidate.
+fn query_identifier_candidates(query: &str) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    let mut rest = query;
+    while let Some(open) = rest.find('`') {
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('`') else {
+            break;
+        };
+        add_identifier_variants(&rest[..close], &mut out);
+        rest = &rest[close + 1..];
+    }
+    for raw in query.split_whitespace() {
+        let token = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        let has_snake = token.contains('_');
+        let has_scope_or_path = raw.contains("::") || raw.contains('/') || raw.contains('\\');
+        let has_camel =
+            token.chars().any(char::is_uppercase) && token.chars().any(char::is_lowercase);
+        if has_snake || has_scope_or_path || has_camel {
+            add_identifier_variants(raw, &mut out);
+        }
+    }
+    out.into_iter().take(MAX_IDENTIFIER_CANDIDATES).collect()
+}
+
+fn select_semantic_seed_hits(
+    hits: &[crate::search::SearchResult],
+    meta_by_id: &HashMap<&str, &crate::import::ConversationChunk>,
+    query_lower: &str,
+    limit: usize,
+) -> Vec<(crate::search::SearchResult, Via)> {
+    if limit == 0 || hits.is_empty() {
+        return Vec::new();
+    }
+    let contents: Vec<Option<&str>> = hits
+        .iter()
+        .map(|hit| {
+            meta_by_id
+                .get(hit.id.as_str())
+                .map(|chunk| chunk.content.as_str())
+        })
+        .collect();
+    let ordered = select_seed_indexes(&contents, query_lower, hits.len());
+    let best_score = ordered
+        .iter()
+        .find_map(|index| {
+            meta_by_id
+                .contains_key(hits[*index].id.as_str())
+                .then_some(hits[*index].score)
+        })
+        .unwrap_or(0.0);
+    let mut conversations = HashSet::new();
+    let mut selected = Vec::new();
+    for index in &ordered {
+        let hit = &hits[*index];
+        let Some(conv) = meta_by_id
+            .get(hit.id.as_str())
+            .map(|chunk| chunk.conversation_id.as_str())
+        else {
+            continue;
+        };
+        if hit.score >= 0.30
+            && hit.score >= best_score - 0.12
+            && conversations.insert(conv.to_string())
+        {
+            selected.push((hit.clone(), Via::Seed));
+            if selected.len() == limit {
+                return selected;
+            }
+        }
+    }
+    if selected.len() < limit {
+        for index in ordered {
+            let hit = &hits[index];
+            let Some(conv) = meta_by_id
+                .get(hit.id.as_str())
+                .map(|chunk| chunk.conversation_id.as_str())
+            else {
+                continue;
+            };
+            if (0.20..0.30).contains(&hit.score) && conversations.insert(conv.to_string()) {
+                selected.push((hit.clone(), Via::SeedLowConfidence));
+                break;
+            }
+        }
+    }
+    selected
 }
 
 /// Walk the episode chain from `conv`'s session-episode reflection to
@@ -291,8 +660,9 @@ fn episode_prev_session(storage: &Storage, conv: &str) -> Result<Option<String>>
         .map(str::to_string))
 }
 
-/// The proven reinstatement walk: seed (hop 1) -> blend + graph spread + episode
-/// chain (hop 2), fused by max score per chunk id and truncated to `cfg.k`.
+/// The proven reinstatement walk: query symbols + semantic seeds (hop 1) ->
+/// blend + graph spread + episode chain (hop 2), fused by max score per chunk
+/// id while preserving route sets, then truncated to `cfg.k`.
 /// Reflections are intentionally global (never project-filtered — parity with
 /// `reflect_on_past`); callers pass `project: "all"` normalized to `None` upstream
 /// (in `crate::search::cross_project::normalize_project_scope`) as the cross-project
@@ -308,9 +678,9 @@ pub async fn reinstate(
     query: &str,
     project: Option<&str>,
     cfg: &ReinstateConfig,
-) -> Result<Vec<EvidenceItem>> {
+) -> Result<ReinstateResult> {
     if cfg.k == 0 {
-        return Ok(Vec::new());
+        return Ok(ReinstateResult::default());
     }
 
     let query_vec: Vec<f32> = {
@@ -319,24 +689,41 @@ pub async fn reinstate(
         tokio::task::spawn_blocking(move || emb.embed_single(&q)).await??
     };
 
-    // Project chunk-id set, hoisted so hop-1 seed search and hop-2 blend share one
-    // lookup. Reflections stay unfiltered (global).
-    let project_chunk_ids: Option<std::collections::HashSet<String>> = match project {
-        Some(p) => Some(storage.get_chunk_ids_for_project(p)?.into_iter().collect()),
-        None => None,
+    // Resolve the family exactly once, then carry the same set through chunks,
+    // code_evolution, nodes, edges, and episode target validation.
+    let family_projects = resolve_family_projects(storage, project)?;
+    let mut trace = ReinstateTrace {
+        scope_projects: if project.is_some() {
+            family_projects.clone()
+        } else {
+            vec!["all".to_string()]
+        },
+        ..ReinstateTrace::default()
+    };
+    let project_chunk_ids: Option<HashSet<String>> = if project.is_some() {
+        Some(
+            storage
+                .with_connection(|conn| {
+                    crate::storage::queries::get_chunk_ids_for_projects(conn, &family_projects)
+                })?
+                .into_iter()
+                .collect(),
+        )
+    } else {
+        None
     };
 
     // ---- hop 1: chunks (project-scoped if given) + reflections, merged ----
     // 2x over-fetch so seed selection can skip verbatim query echoes and still
     // find cfg.seeds real seeds — on a re-asked question the top hits are all
     // prior askings of it. Final output stays capped at cfg.k after rerank.
-    let hop1_k = cfg.k * 2;
+    let hop1_k = (cfg.k * 4).max(cfg.seeds * 8);
     let (chunk_hits, reflection_hits) = {
         let idx = search.read().await;
         let chunks = if let Some(ref ids) = project_chunk_ids {
-            idx.search_chunks_filtered(&query_vec, hop1_k, cfg.min_score, ids)
+            idx.search_chunks_filtered(&query_vec, hop1_k, 0.20, ids)
         } else {
-            idx.search_chunks(&query_vec, hop1_k, cfg.min_score)
+            idx.search_chunks(&query_vec, hop1_k, 0.20)
         };
         let reflections = idx.search_reflections(&query_vec, cfg.k, cfg.min_score);
         (chunks, reflections)
@@ -349,19 +736,6 @@ pub async fn reinstate(
     let meta_by_id: HashMap<&str, &crate::import::ConversationChunk> =
         chunk_meta.iter().map(|c| (c.id.as_str(), c)).collect();
 
-    for r in &chunk_hits {
-        if let Some(c) = meta_by_id.get(r.id.as_str()) {
-            push_candidate(
-                &mut pool,
-                Candidate {
-                    id: r.id.clone(),
-                    conversation_id: c.conversation_id.clone(),
-                    score: r.score,
-                    via: Via::Seed,
-                },
-            );
-        }
-    }
     for r in &reflection_hits {
         if let Ok(Some((_content, tags, _timestamp))) = storage.get_reflection_by_id(&r.id) {
             let conv = tags
@@ -370,12 +744,7 @@ pub async fn reinstate(
                 .unwrap_or_else(|| format!("refl_{}", r.id));
             push_candidate(
                 &mut pool,
-                Candidate {
-                    id: r.id.clone(),
-                    conversation_id: conv,
-                    score: r.score,
-                    via: Via::Reflection,
-                },
+                Candidate::new(r.id.clone(), conv, r.score, Via::Reflection),
             );
         }
     }
@@ -383,31 +752,110 @@ pub async fn reinstate(
     // seeds = top-N NON-ECHO chunk hits (hits are already score-sorted by
     // SearchEngine; echoes only fill in when nothing else matched)
     let query_lower = query.to_lowercase();
-    let hit_contents: Vec<Option<&str>> = chunk_hits
+    let semantic_seeds =
+        select_semantic_seed_hits(&chunk_hits, &meta_by_id, &query_lower, cfg.seeds);
+    trace.seeds_selected = semantic_seeds.len();
+    trace.seed_conversations = semantic_seeds
         .iter()
-        .map(|r| meta_by_id.get(r.id.as_str()).map(|c| c.content.as_str()))
+        .filter_map(|(seed, _)| meta_by_id.get(seed.id.as_str()))
+        .map(|chunk| chunk.conversation_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    for (seed, route) in &semantic_seeds {
+        if let Some(chunk) = meta_by_id.get(seed.id.as_str()) {
+            push_candidate(
+                &mut pool,
+                Candidate::new(
+                    seed.id.clone(),
+                    chunk.conversation_id.clone(),
+                    seed.score,
+                    *route,
+                ),
+            );
+        }
+    }
+
+    // Exact query identifiers launch structural seeds from node attribution
+    // and incident edge provenance. These bypass the semantic score floor.
+    let identifiers = query_identifier_candidates(query);
+    let mut symbol_nodes = storage.with_connection(|conn| {
+        crate::storage::queries::exact_code_nodes_in_projects(
+            conn,
+            &identifiers,
+            &family_projects,
+            project.unwrap_or(""),
+            MAX_SYMBOL_NODES,
+        )
+    })?;
+    if let Some(anchor) = project {
+        symbol_nodes.sort_by_key(|node| node.project != anchor);
+    }
+    trace.symbol_names = symbol_nodes
+        .iter()
+        .map(|node| node.name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect();
-    let seeds: Vec<crate::search::SearchResult> =
-        select_seed_indexes(&hit_contents, &query_lower, cfg.seeds)
-            .into_iter()
-            .map(|i| chunk_hits[i].clone())
-            .collect();
-    let seed_ids: Vec<String> = seeds.iter().map(|s| s.id.clone()).collect();
+    trace.symbols_matched = trace.symbol_names.len();
+
+    let mut structural_conversations = BTreeSet::new();
+    let node_ids: Vec<String> = symbol_nodes.iter().map(|node| node.id.clone()).collect();
+    structural_conversations.extend(storage.with_connection(|conn| {
+        crate::storage::queries::transcript_attribution_conversations(conn, &node_ids)
+    })?);
+    structural_conversations.extend(storage.with_connection(|conn| {
+        crate::storage::queries::incident_edge_conversations(
+            conn,
+            &node_ids,
+            MAX_STRUCTURAL_CONVERSATIONS,
+        )
+    })?);
+    let structural_conversations: Vec<String> = structural_conversations
+        .into_iter()
+        .take(MAX_STRUCTURAL_CONVERSATIONS)
+        .collect();
+
+    let mut structural_launches = Vec::new();
+    for conv in structural_conversations {
+        trace.graph_walks += 1;
+        if let Some((id, cos)) = best_chunk_for_conv(storage, &query_vec, &conv, &family_projects)?
+        {
+            trace.graph_accepted += 1;
+            trace.structural_graph_accepted += 1;
+            push_candidate(
+                &mut pool,
+                Candidate::new(id.clone(), conv.clone(), cos * cfg.graph_boost, Via::Graph),
+            );
+            structural_launches.push((id, conv));
+        }
+    }
+
+    let seed_ids: Vec<String> = semantic_seeds
+        .iter()
+        .map(|(seed, _)| seed.id.clone())
+        .chain(structural_launches.iter().map(|(id, _)| id.clone()))
+        .collect();
     let seed_vecs: HashMap<String, Vec<f32>> = storage
         .get_chunk_vectors_by_ids(&seed_ids)?
         .into_iter()
         .collect();
 
-    for seed in &seeds {
-        let Some(seed_conv) = meta_by_id
-            .get(seed.id.as_str())
-            .map(|c| c.conversation_id.clone())
-        else {
-            continue;
-        };
+    let mut launches: Vec<(String, String)> = semantic_seeds
+        .iter()
+        .filter_map(|(seed, _)| {
+            meta_by_id
+                .get(seed.id.as_str())
+                .map(|chunk| (seed.id.clone(), chunk.conversation_id.clone()))
+        })
+        .chain(structural_launches)
+        .collect();
+    let mut launched_conversations = HashSet::new();
+    launches.retain(|(_, conv)| launched_conversations.insert(conv.clone()));
+    let mut episode_accepted_ids = BTreeSet::new();
 
+    for (seed_id, seed_conv) in launches {
         // (1) blended context vector, second-hop chunk search (project-filtered when scoped)
-        if let Some(sv) = seed_vecs.get(&seed.id) {
+        if let Some(sv) = seed_vecs.get(&seed_id) {
             let bv = blend(&query_vec, sv, cfg.blend_query_weight);
             let blend_hits = {
                 let idx = search.read().await;
@@ -423,51 +871,88 @@ pub async fn reinstate(
                 if let Some(c) = bmeta.iter().find(|c| c.id == r.id) {
                     push_candidate(
                         &mut pool,
-                        Candidate {
-                            id: r.id.clone(),
-                            conversation_id: c.conversation_id.clone(),
-                            score: r.score,
-                            via: Via::Blend,
-                        },
+                        Candidate::new(
+                            r.id.clone(),
+                            c.conversation_id.clone(),
+                            r.score,
+                            Via::Blend,
+                        ),
                     );
                 }
             }
         }
 
-        // (2) code-graph spread: seed session -> shared files -> neighbor sessions
-        // Neighbor lookup is project-scoped when `project` is Some, so graph spread
-        // cannot leak across projects that share a file path.
-        let mut graph_cands: Vec<Candidate> = Vec::new();
-        for file in storage.files_for_session(&seed_conv, 4)? {
-            for neighbor in storage.sessions_for_file(&file, &seed_conv, project, 12)? {
-                if let Some((id, cos)) = best_chunk_for_conv(storage, &query_vec, &neighbor)? {
-                    graph_cands.push(Candidate {
-                        id,
-                        conversation_id: neighbor,
-                        score: cos * cfg.graph_boost,
-                        via: Via::Graph,
-                    });
+        // (2) co-edit spread is the fallback when the query did not resolve a
+        // symbol. Every attempted neighbor is a walk; only candidates meeting
+        // the structural one-hop cosine floor are accepted.
+        if symbol_nodes.is_empty() {
+            let mut graph_cands: Vec<Candidate> = Vec::new();
+            let files = storage.with_connection(|conn| {
+                crate::storage::queries::files_for_session_in_projects(
+                    conn,
+                    &seed_conv,
+                    &family_projects,
+                    4,
+                )
+            })?;
+            for file in files {
+                let neighbors = storage.with_connection(|conn| {
+                    crate::storage::queries::sessions_for_file_in_projects(
+                        conn,
+                        &file,
+                        &seed_conv,
+                        &family_projects,
+                        12,
+                    )
+                })?;
+                for neighbor in neighbors {
+                    trace.graph_walks += 1;
+                    if let Some((id, cos)) =
+                        best_chunk_for_conv(storage, &query_vec, &neighbor, &family_projects)?
+                    {
+                        if cos >= 0.30 {
+                            trace.graph_accepted += 1;
+                            graph_cands.push(Candidate::new(
+                                id,
+                                neighbor,
+                                cos * cfg.graph_boost,
+                                Via::Graph,
+                            ));
+                        }
+                    }
                 }
             }
-        }
-        graph_cands.sort_by(|a, b| b.score.total_cmp(&a.score));
-        graph_cands.truncate(cfg.graph_cap_per_seed);
-        for c in graph_cands {
-            push_candidate(&mut pool, c);
+            graph_cands.sort_by(|a, b| b.score.total_cmp(&a.score));
+            graph_cands.truncate(cfg.graph_cap_per_seed);
+            for candidate in graph_cands {
+                push_candidate(&mut pool, candidate);
+            }
         }
 
         // (3) episode chain: seed session's episode -> prev episode -> its session
         if let Some(prev_conv) = episode_prev_session(storage, &seed_conv)? {
-            if let Some((id, cos)) = best_chunk_for_conv(storage, &query_vec, &prev_conv)? {
-                push_candidate(
-                    &mut pool,
-                    Candidate {
-                        id,
-                        conversation_id: prev_conv,
-                        score: cos * cfg.graph_boost,
-                        via: Via::Episode,
-                    },
-                );
+            trace.episode_links += 1;
+            match resolve_episode_target(storage, &query_vec, &prev_conv, &family_projects)? {
+                EpisodeTarget::Resolved { chunk_id, cosine } => {
+                    trace.episode_resolved += 1;
+                    if cosine >= 0.30 {
+                        episode_accepted_ids.insert(chunk_id.clone());
+                        push_candidate(
+                            &mut pool,
+                            Candidate::new(
+                                chunk_id,
+                                prev_conv,
+                                cosine * cfg.graph_boost,
+                                Via::Episode,
+                            ),
+                        );
+                    } else {
+                        trace.episode_below_threshold += 1;
+                    }
+                }
+                EpisodeTarget::Dangling => trace.episode_dangling += 1,
+                EpisodeTarget::OutOfScope => trace.episode_out_of_scope += 1,
+                EpisodeTarget::Unembedded => trace.episode_unembedded += 1,
             }
         }
     }
@@ -483,7 +968,7 @@ pub async fn reinstate(
     // by cfg.seeds) resolve individually since they live in a different table.
     let chunk_pool_ids: Vec<String> = fused
         .iter()
-        .filter(|c| c.via != Via::Reflection)
+        .filter(|c| !c.is_reflection_only())
         .map(|c| c.id.clone())
         .collect();
     let mut detail: HashMap<String, CandidateDetail> = HashMap::new();
@@ -491,7 +976,7 @@ pub async fn reinstate(
         let prov = storage.get_chunk_provenance(&m.id).ok().flatten();
         detail.insert(m.id, (prov, m.timestamp, m.content));
     }
-    for c in fused.iter().filter(|c| c.via == Via::Reflection) {
+    for c in fused.iter().filter(|c| c.is_reflection_only()) {
         if let Ok(Some((content, _tags, timestamp))) = storage.get_reflection_by_id(&c.id) {
             detail.insert(c.id.clone(), (None, timestamp, content));
         }
@@ -500,8 +985,8 @@ pub async fn reinstate(
     // reflection) BEFORE ranking so they don't occupy ranked slots.
     fused.retain(|c| detail.contains_key(&c.id));
 
-    let mut fused = rerank_pool(fused, &detail, query);
-    fused.truncate(cfg.k);
+    let fused = rerank_pool(fused, &detail, query);
+    let fused = truncate_with_episode_quota(fused, cfg.k, 0.30 * cfg.graph_boost);
 
     // Shadow signal only: fetch after ordering is fully fixed (sort + rerank +
     // truncate). Never used for ranking, filtering, or score mutation.
@@ -516,16 +1001,30 @@ pub async fn reinstate(
             continue;
         };
         let ratification = ratification_scores.get(&c.conversation_id).copied();
+        let routes = c.routes();
         items.push(EvidenceItem {
             chunk_id: c.id,
             conversation_id: c.conversation_id,
             score: c.score,
-            via: c.via,
+            best_route: c.best_route,
+            routes,
+            route_scores: c.route_scores,
             timestamp: timestamp.clone(),
             excerpt: clean_excerpt(content),
             ratification,
         });
     }
+
+    trace.episode_accepted = episode_accepted_ids.len();
+    let surfaced_episode_ids: HashSet<&str> = items
+        .iter()
+        .filter(|item| item.routes.contains(&Via::Episode))
+        .map(|item| item.chunk_id.as_str())
+        .collect();
+    trace.episode_below_cut = episode_accepted_ids
+        .iter()
+        .filter(|chunk_id| !surfaced_episode_ids.contains(chunk_id.as_str()))
+        .count();
 
     let shadow_log: Vec<serde_json::Value> = items
         .iter()
@@ -546,7 +1045,7 @@ pub async fn reinstate(
         "ratification_shadow"
     );
 
-    Ok(items)
+    Ok(ReinstateResult { items, trace })
 }
 
 #[cfg(test)]
@@ -605,35 +1104,24 @@ mod tests {
         let mut pool: HashMap<String, Candidate> = HashMap::new();
         push_candidate(
             &mut pool,
-            Candidate {
-                id: "c1".into(),
-                conversation_id: "conv1".into(),
-                score: 0.5,
-                via: Via::Seed,
-            },
+            Candidate::new("c1".into(), "conv1".into(), 0.5, Via::Seed),
         );
         push_candidate(
             &mut pool,
-            Candidate {
-                id: "c1".into(),
-                conversation_id: "conv1".into(),
-                score: 0.8,
-                via: Via::Blend,
-            },
+            Candidate::new("c1".into(), "conv1".into(), 0.8, Via::Blend),
         );
         push_candidate(
             &mut pool,
-            Candidate {
-                id: "c1".into(),
-                conversation_id: "conv1".into(),
-                score: 0.3,
-                via: Via::Graph,
-            },
+            Candidate::new("c1".into(), "conv1".into(), 0.3, Via::Graph),
         );
         assert_eq!(pool.len(), 1);
         let c = &pool["c1"];
         assert!((c.score - 0.8).abs() < f32::EPSILON);
-        assert_eq!(c.via, Via::Blend);
+        assert_eq!(c.best_route, Via::Blend);
+        assert_eq!(
+            c.routes(),
+            BTreeSet::from([Via::Seed, Via::Blend, Via::Graph])
+        );
     }
 
     #[test]
@@ -641,21 +1129,11 @@ mod tests {
         let mut pool: HashMap<String, Candidate> = HashMap::new();
         push_candidate(
             &mut pool,
-            Candidate {
-                id: "c1".into(),
-                conversation_id: "conv1".into(),
-                score: 0.5,
-                via: Via::Seed,
-            },
+            Candidate::new("c1".into(), "conv1".into(), 0.5, Via::Seed),
         );
         push_candidate(
             &mut pool,
-            Candidate {
-                id: "c2".into(),
-                conversation_id: "conv1".into(),
-                score: 0.4,
-                via: Via::Graph,
-            },
+            Candidate::new("c2".into(), "conv1".into(), 0.4, Via::Graph),
         );
         assert_eq!(pool.len(), 2);
     }
@@ -670,12 +1148,7 @@ mod tests {
     }
 
     fn cand(id: &str, conv: &str, score: f32, via: Via) -> Candidate {
-        Candidate {
-            id: id.into(),
-            conversation_id: conv.into(),
-            score,
-            via,
-        }
+        Candidate::new(id.into(), conv.into(), score, via)
     }
 
     fn detail_entry(
@@ -725,7 +1198,7 @@ mod tests {
         let ranked = rerank_pool(fused, &detail, "unrelated query wording");
         assert_eq!(ranked[0].id, "origin");
         // via/score survive reordering untouched.
-        assert_eq!(ranked[0].via, Via::Graph);
+        assert_eq!(ranked[0].best_route, Via::Graph);
         assert!((ranked[0].score - 0.60).abs() < f32::EPSILON);
     }
 
@@ -836,8 +1309,124 @@ mod tests {
     }
 
     #[test]
+    fn semantic_seeds_are_distinct_banded_and_allow_one_labelled_fallback() {
+        let make_chunk = |id: &str, conv: &str| crate::import::ConversationChunk {
+            id: id.into(),
+            conversation_id: conv.into(),
+            project_name: "project".into(),
+            timestamp: "2026-08-01T00:00:00Z".into(),
+            content: "organic evidence".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let chunks = [
+            make_chunk("a1", "conv-a"),
+            make_chunk("a2", "conv-a"),
+            make_chunk("b", "conv-b"),
+            make_chunk("outside-band", "conv-c"),
+            make_chunk("fallback", "conv-d"),
+        ];
+        let meta: HashMap<&str, &crate::import::ConversationChunk> = chunks
+            .iter()
+            .map(|chunk| (chunk.id.as_str(), chunk))
+            .collect();
+        let hits = vec![
+            crate::search::SearchResult {
+                id: "a1".into(),
+                score: 0.90,
+            },
+            crate::search::SearchResult {
+                id: "a2".into(),
+                score: 0.88,
+            },
+            crate::search::SearchResult {
+                id: "b".into(),
+                score: 0.80,
+            },
+            crate::search::SearchResult {
+                id: "outside-band".into(),
+                score: 0.77,
+            },
+            crate::search::SearchResult {
+                id: "fallback".into(),
+                score: 0.25,
+            },
+        ];
+
+        let selected = select_semantic_seed_hits(&hits, &meta, "unquoted query", 3);
+        let selected_ids: Vec<(&str, Via)> = selected
+            .iter()
+            .map(|(hit, route)| (hit.id.as_str(), *route))
+            .collect();
+        assert_eq!(
+            selected_ids,
+            vec![
+                ("a1", Via::Seed),
+                ("b", Via::Seed),
+                ("fallback", Via::SeedLowConfidence),
+            ]
+        );
+    }
+
+    #[test]
+    fn identifier_lexer_handles_backticks_snake_camel_scope_and_paths() {
+        let got = query_identifier_candidates(
+            "why `plain` retire_missing_nodes CamelCase module::symbol src/search/reinstatement.rs",
+        );
+        for expected in [
+            "plain",
+            "retire_missing_nodes",
+            "CamelCase",
+            "module::symbol",
+            "symbol",
+            "reinstatement",
+        ] {
+            assert!(got.iter().any(|candidate| candidate == expected), "{got:?}");
+        }
+    }
+
+    #[test]
+    fn rendered_receipt_invariant_detects_surface_counter_drift() {
+        let item = EvidenceItem {
+            chunk_id: "chunk".into(),
+            conversation_id: "conv".into(),
+            score: 0.8,
+            best_route: Via::Graph,
+            routes: BTreeSet::from([Via::Seed, Via::Graph]),
+            route_scores: BTreeMap::from([(Via::Seed, 0.7), (Via::Graph, 0.8)]),
+            timestamp: "2026-08-01T00:00:00Z".into(),
+            excerpt: "evidence".into(),
+            ratification: None,
+        };
+        let trace = ReinstateTrace {
+            scope_projects: vec!["project".into()],
+            seeds_selected: 1,
+            seed_conversations: 1,
+            graph_walks: 3,
+            graph_accepted: 2,
+            ..ReinstateTrace::default()
+        };
+        let receipt = render_receipt(&trace, std::slice::from_ref(&item));
+        assert!(rendered_receipt_surface_counts_match(
+            &receipt,
+            &trace,
+            std::slice::from_ref(&item)
+        ));
+        let tampered = receipt.replace("accepted=2 surfaced=1", "accepted=2 surfaced=0");
+        assert!(!rendered_receipt_surface_counts_match(
+            &tampered,
+            &trace,
+            &[item]
+        ));
+    }
+
+    #[test]
     fn via_display_is_lowercase() {
         assert_eq!(Via::Seed.to_string(), "seed");
+        assert_eq!(Via::SeedLowConfidence.to_string(), "seed-low-confidence");
         assert_eq!(Via::Blend.to_string(), "blend");
         assert_eq!(Via::Graph.to_string(), "graph");
         assert_eq!(Via::Episode.to_string(), "episode");
