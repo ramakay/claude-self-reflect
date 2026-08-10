@@ -99,6 +99,7 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section class="mailbox" aria-label
       <article class="detail-pane" data-session="{{ pane.session_short }}"{% if not loop.first %} hidden{% endif %}>
         <header class="detail-head">
           <h2 class="sentence">{{ pane.sentence }}</h2>
+          {% if pane.description %}<p class="description">{{ pane.description }}</p>{% endif %}
           <p class="detail-meta"><span class="project-pill">{{ pane.project }}</span><span>{{ pane.date }}</span><span>{{ pane.session_short }}</span>{% if pane.outcome_badge %}<span class="outcome-badge {{ pane.outcome_slug }}">{{ pane.outcome_badge }}</span>{% endif %}{% if pane.unscanned %}<span class="warn-chip" title="transcript not scanned for instrumentation">&#9888; not scanned</span>{% endif %}</p>
         </header>
         <div class="stage-rail">
@@ -297,6 +298,7 @@ const MAILBOX_CSS: &str = r#"
   .detail-pane-wrap { min-width: 0; padding: 1rem 1.1rem; overflow-x: hidden; }
   .detail-pane .detail-head { margin-bottom: 0.9rem; }
   .detail-pane .sentence { font-size: 1.1rem; margin: 0 0 0.3rem; overflow-wrap: anywhere; }
+  .detail-pane .description { font-size: 0.82rem; color: var(--fg-muted); margin: 0 0 0.5rem; overflow-wrap: anywhere; }
   .detail-meta { display: flex; align-items: center; gap: 0.5rem; color: var(--fg-muted); font-size: 0.75rem; flex-wrap: wrap; }
   .detail-meta .project-pill { border: 1px solid var(--border); border-radius: 999px; padding: 0.05rem 0.5rem; font-weight: 700; }
   .outcome-badge {
@@ -587,16 +589,18 @@ struct StageCardView {
 }
 
 /// Intermediate, curation-facing representation of one rich session. This is
-/// the type `curate_headlines` mutates (`summary`/`description`) — it is
+/// the type `curate_sentences` mutates (`summary`/`description`) — it is
 /// deliberately unchanged in shape from the pre-mailbox renderer so the
 /// caching/curation code below needs no edits. `index_row`/`detail_pane`
 /// project it into the view types the template actually walks.
 #[derive(Debug, Clone)]
 struct StoryCardView {
+    /// The mailbox's one-line fused ask->outcome sentence. Index row and
+    /// detail-pane header both render this; nothing else.
     summary: String,
     /// Written for the `journal_headlines` cache-hit predicate
-    /// (`description != ''`); no longer rendered in the mailbox layout —
-    /// Phase 3 relocates it to a detail-pane subtitle.
+    /// (`description != ''`); rendered as the detail-pane subtitle under
+    /// `summary`, omitted entirely when empty. Never shown in the index.
     description: String,
     project: String,
     date: String,
@@ -666,6 +670,10 @@ struct IndexRowView {
 struct DetailPaneView {
     session_short: String,
     sentence: String,
+    /// Detail-pane subtitle under `sentence` (plan §5.2); empty means the
+    /// template omits the element entirely rather than rendering an empty
+    /// `<p>`.
+    description: String,
     project: String,
     date: String,
     outcome_slug: &'static str,
@@ -1014,38 +1022,31 @@ fn build_story_card(session: &StorySession) -> StoryCardView {
         todos: &session.todos,
     });
 
-    let summary = narrative
-        .map(first_sentence)
-        .filter(|summary| !summary.is_empty())
-        .unwrap_or_else(|| match (request, outcome) {
-            (Some(request), Some(outcome)) => truncate_chars(
-                &format!(
-                    "{} — outcome: {}.",
-                    plain_text(request),
-                    plain_text(outcome)
-                ),
-                180,
-            ),
-            _ => format!(
-                "Evidence recorded for session {}.",
-                short_oid(&session.session_id)
-            ),
-        });
+    let (outcome_slug, outcome_badge) = outcome_badge(outcome);
 
-    // Deterministic description: the narrative (or request) beyond what the
-    // headline already says. Curation replaces this with a written version.
-    // Kept only so a cached row still hits (`description != ''`); Phase 1
-    // never displays it.
+    // Fused ask->outcome sentence (plan §5.1/§5.2): the deterministic,
+    // zero-AI baseline that AI curation overwrites when its reply agrees
+    // with the outcome slug. Never wrong about the outcome — it is what
+    // every card shows when curation is off, fails, or its reply's first
+    // word disagrees with `outcome_slug` (`verb_agrees`).
+    let summary = fallback_sentence(outcome_slug, narrative.or(input_text));
+
+    // Deterministic subtitle: the narrative (or request) *beyond* what the
+    // fused sentence's first clause already says — empty for the common
+    // single-clause ask ("fix the flaky test"), non-empty only when there is
+    // a genuine second sentence of detail. Written unconditionally (even
+    // when empty) so a cached row still hits (`description != ''`, see
+    // `cached_sentence`); the detail pane renders it as the subtitle under
+    // the fused sentence, omitting the element entirely when it is empty.
     let description = {
         let source = narrative.or(input_text).map(plain_text).unwrap_or_default();
-        let candidate = truncate_chars(&source, 260);
-        if candidate == summary {
-            String::new()
-        } else {
-            candidate
-        }
+        let head = first_sentence(&source);
+        let remainder = source
+            .strip_prefix(head.as_str())
+            .unwrap_or(&source)
+            .trim_start();
+        truncate_chars(remainder, 260)
     };
-    let (outcome_slug, outcome_badge) = outcome_badge(outcome);
 
     // Index row `F files` count (plan §6 Phase 2): investigated ∪
     // files_modified, deduped. The DELIBERATION stage keeps showing
@@ -1456,6 +1457,7 @@ fn detail_pane(card: &StoryCardView) -> DetailPaneView {
     DetailPaneView {
         session_short: card.session_short.clone(),
         sentence: card.summary.clone(),
+        description: card.description.clone(),
         project: card.project.clone(),
         date: card.date.clone(),
         outcome_slug: card.outcome_slug,
@@ -1469,8 +1471,8 @@ fn detail_pane(card: &StoryCardView) -> DetailPaneView {
 }
 
 /// Raw, uncurated projection — gathered once from storage, curated in place
-/// (`curate_headlines`, unchanged from the pre-mailbox renderer), then
-/// projected into `DreamReportData` by `finalize_report_data`.
+/// (`curate_sentences`), then projected into `DreamReportData` by
+/// `finalize_report_data`.
 struct RawReportData {
     has_run: bool,
     last_run_head_short: Option<String>,
@@ -1810,42 +1812,120 @@ fn render_html(data: &DreamReportData) -> Result<String> {
     Ok(rendered.replacen("</body>", &scripts, 1))
 }
 
-// --- AI-curated headlines -------------------------------------------------
+// --- AI-curated fused sentences ---------------------------------------------
 //
-// Raw first-prompts make poor card headlines ("pull the latest data."). When
-// AI narratives are enabled, one batched `claude -p` call rewrites the summary
-// line of every uncached card; results are cached in `journal_headlines` by a
-// content hash, so an unchanged corpus re-renders at zero cost. The kill
-// switch (`CSR_NO_AI_NARRATIVES=1`) suppresses the invocation but still
-// applies previously cached headlines — they are already paid for.
+// Raw first-prompts make poor headlines ("pull the latest data."). When AI
+// narratives are enabled, one batched `claude -p` call rewrites the summary
+// line of every uncached card with a single verb-first ask->outcome sentence
+// (plan §5.1); results are cached in `journal_headlines` by a content hash,
+// so an unchanged corpus re-renders at zero cost. The kill switch
+// (`CSR_NO_AI_NARRATIVES=1`) suppresses the invocation but still applies
+// previously cached sentences — they are already paid for.
 //
-// Phase 1 of the mailbox layout uses this system entirely unchanged: the
-// curated headline is the mailbox's fused sentence source (the real
-// fused ask->outcome sentence is a Phase 3 prompt change).
+// No schema change (plan §5.2): the cache table and its `headline`/
+// `description` columns are reused verbatim — `headline` now holds the fused
+// sentence, `description` holds the detail-pane subtitle. Migration is by
+// `CURATION_PROMPT_VERSION` folded into the content hash, not by ALTER or
+// backfill: every row cached under the old two-field prompt misses exactly
+// once and is overwritten.
 
-const HEADLINE_MAX_CHARS: usize = 110;
-const DESCRIPTION_MAX_CHARS: usize = 280;
+/// Bumped whenever the curation prompt or its output contract changes.
+/// Folded into `sentence_hash` so every cached row from an older prompt
+/// misses deterministically — no ALTER, no backfill script, no dual-read.
+const CURATION_PROMPT_VERSION: u32 = 2;
 
-fn headline_hash(card: &StoryCardView) -> String {
-    let payload = format!("{}\u{1}{}", card.summary, card.episode_json);
+/// Asked for in the prompt text itself (90); the cache/parse ceiling below
+/// carries a little slack before truncation kicks in.
+const SENTENCE_MAX_CHARS: usize = 96;
+
+/// Number of misses batched into one `claude -p` call. A 50-card batch
+/// overruns the model's output cap (measured ~1.2k output tokens per card on
+/// haiku), truncating the JSON so the whole reply fails to parse and NOTHING
+/// caches — which made every render re-pay the full batch. Small chunks keep
+/// each reply well inside the cap, and a failed chunk no longer sinks the
+/// others. Unchanged from Phase 1/2 (plan: "chunk size stays 10").
+const SENTENCE_CHUNK: usize = 10;
+
+/// Structural chunk-count bound (plan §7.3 test 7): the number of `claude -p`
+/// calls a given miss-count would spend, `ceil(misses / SENTENCE_CHUNK)`.
+fn curation_chunk_plan(misses: usize) -> usize {
+    misses.div_ceil(SENTENCE_CHUNK)
+}
+
+/// Deterministic, zero-AI sentence (plan §5.2) used when curation is off,
+/// fails, or its reply's first word disagrees with `outcome_slug`
+/// (`verb_agrees`). Format: `"{prefix}: {first_sentence(source)}"`, clamped
+/// to `SENTENCE_MAX_CHARS`. Never as good as a curated line; never wrong
+/// about the outcome, which matters more.
+fn fallback_sentence(outcome_slug: &str, source: Option<&str>) -> String {
+    let prefix = match outcome_slug {
+        "success" => "Shipped",
+        "partial" => "Partly done",
+        "failed" => "Failed",
+        _ => "Noted",
+    };
+    let body = source
+        .map(first_sentence)
+        .filter(|body| !body.is_empty())
+        .unwrap_or_else(|| "session recorded".to_string());
+    let body = body.trim_end_matches(['.', '!', '?']);
+    truncate_chars(&format!("{prefix}: {body}"), SENTENCE_MAX_CHARS)
+}
+
+/// Verb-agreement table (plan §5.1): a curated reply whose opening words
+/// contradict the outcome slug is rejected outright rather than displayed —
+/// a model saying "Shipped" over a session recorded as `failed` is worse
+/// than the plain deterministic fallback.
+fn verb_agrees(slug: &str, sentence: &str) -> bool {
+    let lower = sentence.trim().to_lowercase();
+    let starts_with_any = |verbs: &[&str]| verbs.iter().any(|verb| lower.starts_with(verb));
+    match slug {
+        "success" => starts_with_any(&["shipped", "fixed", "built", "landed", "closed", "merged"]),
+        "partial" => {
+            lower.starts_with("partly ")
+                || lower.starts_with("got as far as")
+                || lower.starts_with("half-")
+                || lower.starts_with("half ")
+        }
+        "failed" => starts_with_any(&["failed", "gave up on", "broke"]),
+        _ => starts_with_any(&["noted", "looked at", "recorded"]),
+    }
+}
+
+/// Folds `CURATION_PROMPT_VERSION` into the content hash so every cached row
+/// from an older prompt misses deterministically (plan §5.2 code block).
+/// Deliberately independent of `card.summary` (which the previous curation
+/// pass may already have overwritten) — the hash is a pure function of
+/// evidence: the outcome slug, the deterministic fallback derived from
+/// narrative/request, and the episode JSON.
+fn sentence_hash(card: &StoryCardView) -> String {
+    let fallback = fallback_sentence(
+        card.outcome_slug,
+        card.narrative.as_deref().or(card.request_text.as_deref()),
+    );
+    let payload = format!(
+        "{CURATION_PROMPT_VERSION}\u{1}{}\u{1}{}\u{1}{}",
+        card.outcome_slug, fallback, card.episode_json
+    );
     format!("{:016x}", crate::narrative::fnv1a_64(payload.as_bytes()))
 }
 
 /// Parse the model's batch response: a JSON object mapping session-short ids
-/// to `{headline, description}` objects (bare strings tolerated as
-/// headline-only), possibly wrapped in code fences or prose. Fail-open: any
-/// shape problem yields an empty map and the cards keep their raw summaries.
-fn parse_headline_batch(text: &str) -> std::collections::BTreeMap<String, (String, String)> {
+/// to a bare sentence string, or (defensively) to an object carrying a
+/// `sentence` or `headline` key — possibly wrapped in code fences or prose.
+/// Fail-open: any shape problem yields an empty map and the cards keep their
+/// deterministic fallback sentences.
+fn parse_sentence_batch(text: &str) -> std::collections::BTreeMap<String, String> {
     let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) else {
         return Default::default();
     };
     if end < start {
         return Default::default();
     }
-    let clean = |value: &str, limit: usize| -> String {
+    let clean = |value: &str| -> String {
         truncate_chars(
             &value.split_whitespace().collect::<Vec<_>>().join(" "),
-            limit,
+            SENTENCE_MAX_CHARS,
         )
     };
     serde_json::from_str::<std::collections::BTreeMap<String, serde_json::Value>>(
@@ -1854,31 +1934,26 @@ fn parse_headline_batch(text: &str) -> std::collections::BTreeMap<String, (Strin
     .unwrap_or_default()
     .into_iter()
     .filter_map(|(id, value)| {
-        let (headline, description) = match value {
-            serde_json::Value::String(headline) => (headline, String::new()),
-            serde_json::Value::Object(fields) => (
-                fields
-                    .get("headline")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                fields
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
+        let sentence = match value {
+            serde_json::Value::String(sentence) => sentence,
+            serde_json::Value::Object(fields) => fields
+                .get("sentence")
+                .or_else(|| fields.get("headline"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
             _ => return None,
         };
-        let headline = clean(&headline, HEADLINE_MAX_CHARS);
-        (!headline.is_empty()).then(|| (id, (headline, clean(&description, DESCRIPTION_MAX_CHARS))))
+        let sentence = clean(&sentence);
+        (!sentence.is_empty()).then_some((id, sentence))
     })
     .collect()
 }
 
-/// A cached row is only a hit when it carries a description too — rows written
-/// by the description-less first shape re-curate once and are then complete.
-fn cached_headline(storage: &Storage, session_id: &str, hash: &str) -> Option<(String, String)> {
+/// A cached row is only a hit when it carries a description too — rows
+/// written by a description-less shape re-curate once and are then
+/// complete (plan §5.2 / test `description_still_written_...`).
+fn cached_sentence(storage: &Storage, session_id: &str, hash: &str) -> Option<(String, String)> {
     storage
         .with_connection(|conn| {
             Ok(conn
@@ -1895,11 +1970,13 @@ fn cached_headline(storage: &Storage, session_id: &str, hash: &str) -> Option<(S
         .flatten()
 }
 
-fn store_headline(
+/// No schema change (plan §5.2): `headline` holds the fused sentence,
+/// `description` holds the detail-pane subtitle. Column names unchanged.
+fn store_sentence(
     storage: &Storage,
     session_id: &str,
     hash: &str,
-    headline: &str,
+    sentence: &str,
     description: &str,
     model: &str,
 ) {
@@ -1913,61 +1990,136 @@ fn store_headline(
                 description = excluded.description,
                 model = excluded.model,
                 created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-            rusqlite::params![session_id, hash, headline, description, model],
+            rusqlite::params![session_id, hash, sentence, description, model],
         )?;
         Ok(())
     });
 }
 
-fn headline_prompt(misses: &[(&StoryCardView, String)]) -> String {
+/// Plan §5.1's prompt, verbatim, plus the batched session payload (which now
+/// carries an `outcome` field — the deterministic slug from `outcome_badge`
+/// — so the model's verb has something to agree with).
+fn sentence_prompt(misses: &[(&StoryCardView, String)]) -> String {
     let sessions = misses
         .iter()
         .map(|(card, _)| {
             serde_json::json!({
                 "id": card.session_short,
                 "project": card.project,
+                "outcome": card.outcome_slug,
                 "text": truncate_chars(&card.summary, 300),
                 "detail": truncate_chars(&card.episode_json, 600),
             })
         })
         .collect::<Vec<_>>();
     format!(
-        "You are curating cards for a developer's private session journal. For each \
-         session below produce: a headline (max {HEADLINE_MAX_CHARS} characters) \
-         stating what the session actually did or found — name the feature, bug, or \
-         artifact, never generic filler like 'worked on project'; and a description \
-         (1-3 sentences, max {DESCRIPTION_MAX_CHARS} characters) adding the concrete \
-         specifics — what was tried, what changed, what remains. Use only the text and \
-         detail fields as evidence; do not invent outcomes they don't support. Return \
-         ONLY a JSON object mapping each id to {{\"headline\": \"...\", \
-         \"description\": \"...\"}}, no code fences, no commentary.\nSessions: {}",
+        "You are writing one line per session for a developer's private journal.\n\
+         For each session below write ONE sentence, max 90 characters, that fuses what\n\
+         was asked with how it ended.\n\
+         \n\
+         Rules:\n\
+         - Start with a past-tense verb that carries the outcome. The outcome slug is\n\
+         \u{20}\u{20}given for each session and your verb MUST agree with it:\n\
+         \u{20}\u{20}\u{20}\u{20}success -> Shipped / Fixed / Built / Landed / Closed / Merged\n\
+         \u{20}\u{20}\u{20}\u{20}partial -> Partly <verb> / Got as far as / Half-<verb>\n\
+         \u{20}\u{20}\u{20}\u{20}failed  -> Failed at / Gave up on / Broke\n\
+         \u{20}\u{20}\u{20}\u{20}noted   -> Noted / Looked at / Recorded\n\
+         - Name the concrete thing: the feature, file, bug, or artifact. Never\n\
+         \u{20}\u{20}\"worked on the project\", never \"made progress\".\n\
+         - No trailing period. No quotes. No markdown.\n\
+         - Use ONLY the given text/detail as evidence. Do not invent an outcome the\n\
+         \u{20}\u{20}evidence does not support.\n\
+         \n\
+         Return ONLY a JSON object mapping each id to a bare string.\n\
+         Sessions: {}",
         serde_json::to_string(&sessions).unwrap_or_default()
     )
 }
 
-/// Apply cached headlines and, unless narratives are disabled, batch-generate
-/// the missing ones. Every failure path leaves the raw summaries in place.
-fn curate_headlines(storage: &Storage, cards: &mut [StoryCardView]) {
-    curate_headlines_with(storage, cards, !crate::narrative::narratives_disabled())
+/// Applies one parsed reply map to `cards`/`storage` for `chunk`'s miss
+/// indices. Split out from `curate_sentences_with` so the verb-agreement /
+/// caching contract (plan §5.1: a disagreeing reply is rejected and NOT
+/// cached) is unit-testable without spawning `claude`.
+fn apply_sentence_replies(
+    storage: &Storage,
+    cards: &mut [StoryCardView],
+    chunk: &[usize],
+    hashes: &[String],
+    replies: &std::collections::BTreeMap<String, String>,
+    model: &str,
+) {
+    for &index in chunk {
+        let (session_short, hash) = (cards[index].session_short.clone(), hashes[index].clone());
+        let Some(reply) = replies.get(&session_short) else {
+            continue;
+        };
+        let slug = cards[index].outcome_slug;
+        if verb_agrees(slug, reply) {
+            // Store a non-empty description unconditionally so the row
+            // counts as a cache hit next run: the card's deterministic
+            // subtitle when it has one, else the sentence itself. Without
+            // this, sentence-only replies made the same cards re-curate
+            // forever.
+            let stored_description = if !cards[index].description.is_empty() {
+                cards[index].description.clone()
+            } else {
+                reply.clone()
+            };
+            store_sentence(
+                storage,
+                &session_short,
+                &hash,
+                reply,
+                &stored_description,
+                model,
+            );
+            cards[index].summary = reply.clone();
+            cards[index].description = if stored_description == *reply {
+                String::new()
+            } else {
+                stored_description
+            };
+        } else {
+            tracing::warn!(
+                session = %session_short,
+                reply = %reply,
+                slug,
+                "curated sentence disagreed with the outcome slug — using the \
+                 deterministic fallback, not caching the model's line"
+            );
+            let narrative_or_request = cards[index]
+                .narrative
+                .clone()
+                .or_else(|| cards[index].request_text.clone());
+            cards[index].summary = fallback_sentence(slug, narrative_or_request.as_deref());
+        }
+    }
+}
+
+/// Apply cached sentences and, unless narratives are disabled, batch-generate
+/// the missing ones. Every failure path leaves the deterministic fallback
+/// sentence in place.
+fn curate_sentences(storage: &Storage, cards: &mut [StoryCardView]) {
+    curate_sentences_with(storage, cards, !crate::narrative::narratives_disabled())
 }
 
 /// `allow_invoke` is threaded as a parameter (not read from the environment
 /// here) so tests can exercise the cache paths without racing other tests on
 /// the process-global `CSR_NO_AI_NARRATIVES` variable.
-fn curate_headlines_with(storage: &Storage, cards: &mut [StoryCardView], allow_invoke: bool) {
-    let hashes: Vec<String> = cards.iter().map(headline_hash).collect();
+fn curate_sentences_with(storage: &Storage, cards: &mut [StoryCardView], allow_invoke: bool) {
+    let hashes: Vec<String> = cards.iter().map(sentence_hash).collect();
     let mut misses: Vec<usize> = Vec::new();
     for (index, card) in cards.iter_mut().enumerate() {
-        match cached_headline(storage, &card.session_short, &hashes[index]) {
-            Some((headline, description)) => {
-                // A description equal to the headline is a convergence
+        match cached_sentence(storage, &card.session_short, &hashes[index]) {
+            Some((sentence, description)) => {
+                // A description equal to the sentence is a convergence
                 // placeholder, not display content.
-                card.description = if description == headline {
+                card.description = if description == sentence {
                     String::new()
                 } else {
                     description
                 };
-                card.summary = headline;
+                card.summary = sentence;
             }
             None => misses.push(index),
         }
@@ -1975,27 +2127,28 @@ fn curate_headlines_with(storage: &Storage, cards: &mut [StoryCardView], allow_i
     if misses.is_empty() || !allow_invoke {
         return;
     }
+    tracing::debug!(
+        misses = misses.len(),
+        chunks = curation_chunk_plan(misses.len()),
+        "journal sentence curation: claude -p calls about to be spent"
+    );
 
-    // Chunked invocation: a 50-card batch overruns the model's output cap
-    // (measured ~1.2k output tokens per card on haiku), truncating the JSON so
-    // the whole reply fails to parse and NOTHING caches — which made every
-    // render re-pay the full batch. Small chunks keep each reply well inside
-    // the cap, and a failed chunk no longer sinks the others.
-    const HEADLINE_CHUNK: usize = 10;
-    for chunk in misses.chunks(HEADLINE_CHUNK) {
+    for chunk in misses.chunks(SENTENCE_CHUNK) {
         let batch: Vec<(&StoryCardView, String)> = chunk
             .iter()
             .map(|&index| (&cards[index] as &StoryCardView, hashes[index].clone()))
             .collect();
-        let prompt = headline_prompt(&batch);
+        let prompt = sentence_prompt(&batch);
         let started = std::time::Instant::now();
         let parsed = match crate::hooks::session_briefing::invoke_narrative_briefing(&prompt) {
             Ok(parsed) => parsed,
             Err(err) => {
-                tracing::warn!(error = %err, "journal headline chunk failed — keeping raw summaries");
+                tracing::warn!(error = %err, "journal sentence chunk failed — keeping deterministic fallbacks");
                 continue;
             }
         };
+        // `call_site` stays "journal_headline" (plan §6 Phase 3: renaming it
+        // would reset the maintainer's cost history in `narrative_usage`).
         let _ = storage.record_narrative_usage(&crate::storage::NarrativeUsageRow {
             call_site: "journal_headline".into(),
             model: parsed.model.clone(),
@@ -2007,42 +2160,12 @@ fn curate_headlines_with(storage: &Storage, cards: &mut [StoryCardView], allow_i
             success: true,
         });
 
-        let headlines = parse_headline_batch(&parsed.text);
-        if headlines.is_empty() {
-            tracing::warn!("journal headline chunk parsed to nothing — reply likely malformed");
+        let replies = parse_sentence_batch(&parsed.text);
+        if replies.is_empty() {
+            tracing::warn!("journal sentence chunk parsed to nothing — reply likely malformed");
             continue;
         }
-        for &index in chunk {
-            let (session_short, hash) = (cards[index].session_short.clone(), hashes[index].clone());
-            if let Some((headline, description)) = headlines.get(&session_short) {
-                // Store a non-empty description unconditionally so the row
-                // counts as a cache hit next run: the model's version when it
-                // gave one, else the card's deterministic fallback, else the
-                // headline itself. Without this, headline-only replies made
-                // the same cards re-curate forever.
-                let stored_description = if !description.is_empty() {
-                    description.clone()
-                } else if !cards[index].description.is_empty() {
-                    cards[index].description.clone()
-                } else {
-                    headline.clone()
-                };
-                store_headline(
-                    storage,
-                    &session_short,
-                    &hash,
-                    headline,
-                    &stored_description,
-                    &parsed.model,
-                );
-                cards[index].summary = headline.clone();
-                cards[index].description = if stored_description == *headline {
-                    String::new()
-                } else {
-                    stored_description
-                };
-            }
-        }
+        apply_sentence_replies(storage, cards, chunk, &hashes, &replies, &parsed.model);
     }
 }
 
@@ -2078,7 +2201,7 @@ pub fn run_report(
     no_open: bool,
 ) -> Result<PathBuf> {
     let mut raw = gather_report_data(storage, projects_dir)?;
-    curate_headlines(storage, &mut raw.rich_cards);
+    curate_sentences(storage, &mut raw.rich_cards);
     let data = finalize_report_data(raw);
     let html = render_html(&data)?;
 
@@ -2306,7 +2429,7 @@ mod tests {
         mode: crate::storage::recap_feeds::ConsumptionMode,
     ) -> String {
         let mut raw = gather_report_data_with(storage, projects_dir, mode).unwrap();
-        curate_headlines_with(storage, &mut raw.rich_cards, false);
+        curate_sentences_with(storage, &mut raw.rich_cards, false);
         let data = finalize_report_data(raw);
         render_html(&data).unwrap()
     }
@@ -2327,54 +2450,183 @@ mod tests {
         }
     }
 
+    /// Returns the indices of `cards` that would still need a `claude -p`
+    /// call: those whose `sentence_hash` has no matching, non-empty-
+    /// description row in `journal_headlines`. Test-only projection of the
+    /// same predicate `curate_sentences_with`'s cache-application loop uses.
+    fn curation_misses(storage: &Storage, cards: &[StoryCardView]) -> Vec<usize> {
+        cards
+            .iter()
+            .enumerate()
+            .filter_map(|(index, card)| {
+                let hash = sentence_hash(card);
+                cached_sentence(storage, &card.session_short, &hash)
+                    .is_none()
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    /// Test 1 (replaces `parse_headline_batch_tolerates_fences_prose_and_clamps_length`).
     #[test]
-    fn parse_headline_batch_tolerates_fences_prose_and_clamps_length() {
-        // New object shape: headline + description.
-        let object = "```json\n{\"abc12345\": {\"headline\": \"Fixed the relevance gate in guardrails\", \"description\": \"Traced the broken gate, rewired it, added a test.\"}}\n```";
-        let map = parse_headline_batch(object);
-        let (headline, description) = map.get("abc12345").unwrap();
-        assert_eq!(headline, "Fixed the relevance gate in guardrails");
+    fn parse_sentence_batch_accepts_bare_strings_and_objects_and_clamps() {
+        // Bare string shape — the new prompt's actual contract.
+        let bare = "{\"abc12345\": \"Fixed the relevance gate in guardrails\"}";
         assert_eq!(
-            description,
-            "Traced the broken gate, rewired it, added a test."
+            parse_sentence_batch(bare)
+                .get("abc12345")
+                .map(String::as_str),
+            Some("Fixed the relevance gate in guardrails")
         );
 
-        // Legacy bare-string shape still parses as headline-only.
-        let legacy = "{\"legacy01\": \"Plain headline\"}";
+        // Defensive object shapes: {"sentence": ...} and {"headline": ...}.
+        let sentence_obj =
+            "```json\n{\"id1\": {\"sentence\": \"Shipped the queue retry path\"}}\n```";
         assert_eq!(
-            parse_headline_batch(legacy).get("legacy01"),
-            Some(&("Plain headline".to_string(), String::new()))
+            parse_sentence_batch(sentence_obj)
+                .get("id1")
+                .map(String::as_str),
+            Some("Shipped the queue retry path")
         );
-
-        let long = format!(
-            "{{\"id1\": {{\"headline\": \"{}\", \"description\": \"{}\"}}}}",
-            "x".repeat(400),
-            "y".repeat(600)
-        );
-        let clamped = parse_headline_batch(&long);
-        let (h, d) = clamped.get("id1").unwrap();
-        assert!(h.chars().count() <= HEADLINE_MAX_CHARS);
-        assert!(d.chars().count() <= DESCRIPTION_MAX_CHARS);
-
-        assert!(parse_headline_batch("no json here").is_empty());
-        assert!(parse_headline_batch("{\"id\": \"   \"}").is_empty());
-        let multiline = "{\"id2\": \"line one\\n   line two\"}";
+        let headline_obj = "{\"id2\": {\"headline\": \"Failed at the render step\"}}";
         assert_eq!(
-            parse_headline_batch(multiline)
+            parse_sentence_batch(headline_obj)
                 .get("id2")
-                .map(|v| v.0.as_str()),
+                .map(String::as_str),
+            Some("Failed at the render step")
+        );
+
+        // Prose wrapper + code fence + whitespace collapse.
+        let prose = "Sure, here you go:\n```json\n{\"id3\": \"line one\\n   line two\"}\n```\nHope that helps!";
+        assert_eq!(
+            parse_sentence_batch(prose).get("id3").map(String::as_str),
             Some("line one line two")
+        );
+
+        // A 400-char reply clamps to SENTENCE_MAX_CHARS.
+        let long = format!("{{\"id4\": \"{}\"}}", "x".repeat(400));
+        let clamped = parse_sentence_batch(&long);
+        assert!(clamped.get("id4").unwrap().chars().count() <= SENTENCE_MAX_CHARS);
+
+        assert!(parse_sentence_batch("no json here").is_empty());
+        assert!(parse_sentence_batch("{\"id\": \"   \"}").is_empty());
+    }
+
+    /// Test 2.
+    #[test]
+    fn verb_disagreeing_with_the_outcome_slug_is_rejected() {
+        let storage = Storage::open_memory().unwrap();
+        let session = StorySession {
+            session_id: "failed-session".into(),
+            project: "proj".into(),
+            timestamp: "2026-08-10T00:00:00Z".into(),
+            request: Some("create the Ekadashi podcast episode".into()),
+            outcome: Some("failed: render aborted".into()),
+            ..Default::default()
+        };
+        let mut cards = vec![build_story_card(&session)];
+        assert_eq!(cards[0].outcome_slug, "failed");
+        let hash = sentence_hash(&cards[0]);
+        let hashes = vec![hash.clone()];
+
+        let mut replies = std::collections::BTreeMap::new();
+        replies.insert(
+            cards[0].session_short.clone(),
+            "Shipped the podcast".to_string(),
+        );
+        apply_sentence_replies(&storage, &mut cards, &[0], &hashes, &replies, "test-model");
+
+        assert!(
+            cards[0].summary.starts_with("Failed:"),
+            "got: {}",
+            cards[0].summary
+        );
+        assert!(
+            cached_sentence(&storage, &cards[0].session_short, &hash).is_none(),
+            "a verb-disagreeing reply must not be cached"
         );
     }
 
+    /// Test 3.
     #[test]
-    fn cached_headlines_apply_without_any_ai_invocation() {
-        // Invocation disabled: curate must never spawn claude, yet a
-        // previously cached headline (already paid for) still applies, and an
-        // uncached card keeps its raw summary.
+    fn deterministic_fallback_sentence_carries_the_outcome_verb() {
+        assert!(
+            fallback_sentence("success", Some("ship the mailbox layout")).starts_with("Shipped:")
+        );
+        assert!(
+            fallback_sentence("partial", Some("fix the cache miss")).starts_with("Partly done:")
+        );
+        assert!(fallback_sentence("failed", Some("debug the flaky test")).starts_with("Failed:"));
+        assert!(fallback_sentence("noted", Some("look at the alert")).starts_with("Noted:"));
+        // No source text at all still produces a non-empty, correctly
+        // prefixed sentence rather than panicking or returning empty.
+        assert!(fallback_sentence("failed", None).starts_with("Failed:"));
+    }
+
+    /// Test 4.
+    #[test]
+    fn prompt_version_bump_invalidates_every_cached_row() {
         let storage = Storage::open_memory().unwrap();
         let session = StorySession {
-            session_id: "cached-headline-session".into(),
+            session_id: "version-bump-session".into(),
+            project: "proj".into(),
+            timestamp: "2026-08-10T00:00:00Z".into(),
+            request: Some("wire the sort controls".into()),
+            outcome: Some("shipped".into()),
+            ..Default::default()
+        };
+        let card = build_story_card(&session);
+
+        // A row cached under a hash that is not today's `sentence_hash`
+        // formula — stands in for "an older prompt version's hash", however
+        // it was actually produced.
+        let stale_hash = format!(
+            "{:016x}",
+            crate::narrative::fnv1a_64(
+                format!("1\u{1}{}\u{1}{}", card.summary, card.episode_json).as_bytes()
+            )
+        );
+        store_sentence(
+            &storage,
+            &card.session_short,
+            &stale_hash,
+            "Stale sentence from an older prompt",
+            "Stale description.",
+            "test-model",
+        );
+        assert!(
+            cached_sentence(&storage, &card.session_short, &sentence_hash(&card)).is_none(),
+            "a stale-prompt-version hash must miss"
+        );
+
+        // A row cached under today's `sentence_hash` formula hits.
+        let current_hash = sentence_hash(&card);
+        store_sentence(
+            &storage,
+            &card.session_short,
+            &current_hash,
+            "Shipped the sort controls",
+            "Wired recency, group, and type sort.",
+            "test-model",
+        );
+        assert_eq!(
+            cached_sentence(&storage, &card.session_short, &current_hash),
+            Some((
+                "Shipped the sort controls".to_string(),
+                "Wired recency, group, and type sort.".to_string()
+            ))
+        );
+    }
+
+    /// Test 5 (adapts `cached_headlines_apply_without_any_ai_invocation`).
+    #[test]
+    fn cached_sentences_apply_without_any_ai_invocation() {
+        // Invocation disabled: curate must never spawn claude, yet a
+        // previously cached sentence (already paid for) still applies, and
+        // an uncached card keeps its deterministic fallback summary.
+        let storage = Storage::open_memory().unwrap();
+        let session = StorySession {
+            session_id: "cached-sentence-session".into(),
             project: "proj".into(),
             timestamp: "2026-08-10T00:00:00Z".into(),
             request: Some("pull the latest data.".into()),
@@ -2382,12 +2634,12 @@ mod tests {
             ..Default::default()
         };
         let raw_card = build_story_card(&session);
-        let hash = headline_hash(&raw_card);
-        store_headline(
+        let hash = sentence_hash(&raw_card);
+        store_sentence(
             &storage,
             &raw_card.session_short,
             &hash,
-            "Overnight metrics pull: MRR snapshot + spend check",
+            "Noted the overnight metrics pull",
             "Pulled Meta spend and account balances; MRR snapshot confirmed at $25k.",
             "test-model",
         );
@@ -2403,17 +2655,150 @@ mod tests {
         let mut cards = vec![raw_card, build_story_card(&uncached)];
         let raw_summary = cards[1].summary.clone();
 
-        curate_headlines_with(&storage, &mut cards, false);
+        curate_sentences_with(&storage, &mut cards, false);
 
-        assert_eq!(
-            cards[0].summary,
-            "Overnight metrics pull: MRR snapshot + spend check"
-        );
+        assert_eq!(cards[0].summary, "Noted the overnight metrics pull");
         assert_eq!(
             cards[0].description,
             "Pulled Meta spend and account balances; MRR snapshot confirmed at $25k."
         );
         assert_eq!(cards[1].summary, raw_summary);
+    }
+
+    /// Test 6.
+    #[test]
+    fn curation_converges_second_pass_has_zero_misses() {
+        let storage = Storage::open_memory().unwrap();
+        let mut cards: Vec<StoryCardView> = (0..6)
+            .map(|index| {
+                // `session_short` is the first 8 chars of `session_id` (no
+                // hashing) — the index must land inside that prefix or every
+                // card collides onto the same `journal_headlines` row.
+                build_story_card(&StorySession {
+                    session_id: format!("cvg{index}-converge-session"),
+                    project: "proj".into(),
+                    timestamp: "2026-08-10T00:00:00Z".into(),
+                    request: Some(format!("do task number {index}")),
+                    outcome: Some("shipped".into()),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        assert_eq!(curation_misses(&storage, &cards).len(), cards.len());
+
+        // Simulate one curation pass: the model agrees with every outcome
+        // slug, so `apply_sentence_replies` caches every card (the same
+        // store path `curate_sentences_with` uses on a real reply).
+        let hashes: Vec<String> = cards.iter().map(sentence_hash).collect();
+        let mut replies = std::collections::BTreeMap::new();
+        for card in &cards {
+            replies.insert(
+                card.session_short.clone(),
+                format!("Shipped task {}", card.session_short),
+            );
+        }
+        let all_indices: Vec<usize> = (0..cards.len()).collect();
+        apply_sentence_replies(
+            &storage,
+            &mut cards,
+            &all_indices,
+            &hashes,
+            &replies,
+            "test-model",
+        );
+        assert!(curation_misses(&storage, &cards).is_empty());
+
+        // Second pass, allow_invoke=false: everything already hits, so this
+        // must spawn nothing and leave zero misses (the unit-level form of
+        // "rerun costs zero").
+        curate_sentences_with(&storage, &mut cards, false);
+        assert!(curation_misses(&storage, &cards).is_empty());
+    }
+
+    /// Test 7.
+    #[test]
+    fn curation_chunk_plan_is_ceil_over_ten_and_capped() {
+        assert_eq!(curation_chunk_plan(50), 5);
+        assert_eq!(curation_chunk_plan(1), 1);
+        assert_eq!(curation_chunk_plan(0), 0);
+        assert!(curation_chunk_plan(MAX_STORY_CARDS) <= 5);
+    }
+
+    /// Test 8.
+    #[test]
+    fn thin_rollup_rows_are_never_sent_to_curation() {
+        let storage = Storage::open_memory().unwrap();
+        seed_rich_sessions(&storage, 5);
+        // Artifact-only sessions classify as THIN (Q2) — never curated.
+        for index in 0..40 {
+            let session_id = format!("thin-session-{index:03}");
+            let timestamp = format!("2026-05-{:02}T0{}:00:00Z", (index % 27) + 1, index % 9);
+            seed_anchor(
+                &storage,
+                &session_id,
+                &timestamp,
+                &format!("thin_fn_{index}"),
+            );
+        }
+        let empty_dir = tempfile::tempdir().unwrap();
+        let raw = gather_report_data_with(
+            &storage,
+            empty_dir.path(),
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        )
+        .unwrap();
+        assert_eq!(raw.rich_cards.len(), 5);
+        assert!(raw.thin_entries.len() >= 40);
+        assert!(curation_misses(&storage, &raw.rich_cards).len() <= 5);
+    }
+
+    /// Test 9.
+    #[test]
+    fn description_still_written_so_cache_hit_predicate_holds() {
+        let storage = Storage::open_memory().unwrap();
+        let session = StorySession {
+            session_id: "sentence-only-reply-session".into(),
+            project: "proj".into(),
+            timestamp: "2026-08-10T00:00:00Z".into(),
+            request: Some("ship the mailbox layout".into()),
+            outcome: Some("shipped and merged".into()),
+            ..Default::default()
+        };
+        let mut cards = vec![build_story_card(&session)];
+        let hash = sentence_hash(&cards[0]);
+        let hashes = vec![hash.clone()];
+
+        // A reply carrying only a bare sentence — the new prompt's actual
+        // contract has no description field at all.
+        let mut replies = std::collections::BTreeMap::new();
+        replies.insert(
+            cards[0].session_short.clone(),
+            "Shipped the mailbox layout".to_string(),
+        );
+        apply_sentence_replies(&storage, &mut cards, &[0], &hashes, &replies, "test-model");
+
+        let stored: Option<(String, String)> = storage
+            .with_connection(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT headline, description FROM journal_headlines WHERE session_id = ?1",
+                        rusqlite::params![cards[0].session_short],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .ok())
+            })
+            .unwrap();
+        let (stored_headline, stored_description) = stored.expect("row must exist after apply");
+        assert_eq!(stored_headline, "Shipped the mailbox layout");
+        assert!(
+            !stored_description.is_empty(),
+            "description must be non-empty so the row hits next run"
+        );
+
+        // Next run, same hash: must be a cache hit, not a miss — the exact
+        // regression the description fallback (`else { reply.clone() }`)
+        // guards against.
+        assert!(cached_sentence(&storage, &cards[0].session_short, &hash).is_some());
     }
 
     #[test]
@@ -2448,17 +2833,17 @@ mod tests {
             ..Default::default()
         };
         let card = build_story_card(&session);
-        store_headline(
+        store_sentence(
             &storage,
             &card.session_short,
             "0000000000000000",
-            "Headline for content that no longer exists",
+            "Sentence for content that no longer exists",
             "Description for content that no longer exists.",
             "test-model",
         );
         let mut cards = vec![card];
         let raw_summary = cards[0].summary.clone();
-        curate_headlines_with(&storage, &mut cards, false);
+        curate_sentences_with(&storage, &mut cards, false);
         assert_eq!(
             cards[0].summary, raw_summary,
             "a hash-mismatched cache row must not be applied"
@@ -2509,7 +2894,10 @@ mod tests {
             "request text leaked scaffold"
         );
         assert!(!card.episode_json.contains("completion_status"));
-        assert!(card.summary.starts_with("generate a cover photo"));
+        // Phase 3's fused sentence prefixes the scrubbed text with the
+        // outcome verb ("Partly done: ...") rather than starting with it
+        // verbatim.
+        assert!(card.summary.contains("generate a cover photo"));
     }
 
     #[test]

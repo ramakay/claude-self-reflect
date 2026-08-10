@@ -188,6 +188,24 @@ function buildFixtureSql() {
         ],
       },
     },
+    // Phase 3 (§7.3): a two-sentence request — the fused sentence's first
+    // clause covers "Traced the TTS chain...", leaving a genuine second
+    // sentence as the detail-pane subtitle. "rich1" through "rich7" are all
+    // single-clause asks, so their deterministic subtitle is empty and the
+    // element must be entirely absent (no empty <p>).
+    {
+      id: "rich8",
+      daysAgo: 0,
+      hour: 22,
+      minute: 0,
+      project: "proj-alpha",
+      request:
+        "Traced the TTS chain and found the hindi voice id unset. Fell back to the english preset twice.",
+      outcome: "Shipped the hindi voice fix",
+      todos: [],
+      investigated: [],
+      artifacts: [],
+    },
   ];
   // Phase 2 (§7.2): "rich2" is deliberately left uninstrumented at the
   // episode layer (no `instrumentation` above) AND given an oversized
@@ -877,6 +895,65 @@ async function main() {
         "warning-chip",
         warningChip.hasWarnOversized && !warningChip.hasWarnNoTranscript,
         JSON.stringify(warningChip),
+      );
+
+      // ---- one-line-index (§7.3, Phase 3) ----------------------------------
+      // The index row's fused sentence must render as at most 3 visual lines
+      // (`-webkit-line-clamp: 3`), and no `.description` element may appear
+      // anywhere inside `.index-row` — the subtitle is a detail-pane-only
+      // surface.
+      const oneLineIndex = await evalJS(
+        cdp,
+        `(() => {
+          const rows = Array.from(document.querySelectorAll(".index-row"));
+          const lineHeightCap = rows.map((row) => {
+            const sentence = row.querySelector(".sentence");
+            if (!sentence) return { skipped: true };
+            const style = getComputedStyle(sentence);
+            const lineHeight = parseFloat(style.lineHeight) || sentence.clientHeight;
+            const maxLines = lineHeight > 0 ? sentence.scrollHeight / lineHeight : 0;
+            return { session: row.dataset.session, maxLines };
+          });
+          const anyDescription = rows.some((row) => row.querySelector(".description"));
+          return { lineHeightCap, anyDescription };
+        })()`,
+      );
+      const withinThreeLines = oneLineIndex.lineHeightCap.every(
+        (r) => r.skipped || r.maxLines <= 3.5,
+      );
+      check(
+        "one-line-index",
+        withinThreeLines && !oneLineIndex.anyDescription,
+        JSON.stringify(oneLineIndex),
+      );
+
+      // ---- detail-subtitle (§7.3, Phase 3) ---------------------------------
+      // "rich8" has a genuine second sentence in its request, so its detail
+      // pane must show a `.description` subtitle under the fused sentence.
+      // "rich1" is a single-clause ask, so its deterministic subtitle is
+      // empty and the element must be entirely absent — never an empty `<p>`.
+      const detailSubtitle = await evalJS(
+        cdp,
+        `(() => {
+          document.querySelector('.index-row[data-session="rich8"]').click();
+          const withSubtitlePane = document.querySelector('.detail-pane[data-session="rich8"]');
+          const subtitleEl = withSubtitlePane ? withSubtitlePane.querySelector(".description") : null;
+          document.querySelector('.index-row[data-session="rich1"]').click();
+          const withoutSubtitlePane = document.querySelector('.detail-pane[data-session="rich1"]');
+          const noSubtitleEl = withoutSubtitlePane ? withoutSubtitlePane.querySelector(".description") : null;
+          return {
+            hasSubtitle: !!subtitleEl,
+            subtitleText: subtitleEl ? subtitleEl.textContent : null,
+            hasNoSubtitle: !noSubtitleEl,
+          };
+        })()`,
+      );
+      check(
+        "detail-subtitle",
+        detailSubtitle.hasSubtitle &&
+          Boolean(detailSubtitle.subtitleText && detailSubtitle.subtitleText.trim().length > 0) &&
+          detailSubtitle.hasNoSubtitle,
+        JSON.stringify(detailSubtitle),
       );
 
       // ---- thin-expand ---------------------------------------------------

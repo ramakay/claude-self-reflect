@@ -5,6 +5,38 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Dream journal: fused ask->outcome sentence replaces the two-line headline
+
+`csr-engine dream --report`'s index row used to show a curated headline plus
+a description, neither verb-first — reading a card's outcome meant reading
+the badge, the description, and the todo list. Curation now writes one
+verb-first sentence per session that fuses what was asked with how it ended
+("Failed at creating the Ekadashi podcast"), with the outcome slug passed to
+the model so its verb is checked before display — a reply whose first word
+disagrees with the outcome (e.g. "Shipped" over a `failed` session) is
+rejected and replaced with a deterministic fallback (`Failed: …`), and the
+disagreeing model line is never cached. The old description field is kept
+(no schema change) and now renders as a detail-pane subtitle under the fused
+sentence, omitted entirely when there is nothing beyond the first clause.
+
+- **One-time re-curation, disclosed.** The prompt/output contract changed,
+  so every cached row misses exactly once against the new content hash and
+  is re-curated on the next `dream --report`. On the maintainer's corpus
+  (50-card cap, chunk size 10) that cost 5 `claude -p` calls, one time; a
+  second run afterward added zero new calls and produced byte-identical
+  output. Cost is bounded by the card cap, not by corpus size — a rerun on
+  an unchanged corpus still costs nothing.
+- **Kill-switch regression, disclosed.** `CSR_NO_AI_NARRATIVES=1` still
+  applies previously cached rows, but every row cached under the old
+  headline/description prompt misses under the new content hash. Users
+  running with the kill switch set will see every card's sentence go from a
+  cached headline to a deterministic fallback (`Shipped: …` / `Partly done:
+  …` / `Failed: …` / `Noted: …`) after upgrading — correct behavior (a stale
+  headline is never silently presented as the new fused sentence), but a
+  visible one-time change for that path.
+
 ## [10.1.0] - 2026-08-08
 
 ### Dreaming and recap: memory that forgets on evidence and hands back one paragraph
