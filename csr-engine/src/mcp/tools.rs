@@ -1693,16 +1693,82 @@ async fn get_more_results_with_vec_active(
     consumption_mode: ConsumptionMode,
     active_forgetting: bool,
 ) -> Result<String> {
-    let (effective_project, _) = cross_project::normalize_project_scope(project);
+    // Same scope resolution as the initial search: family-widened project
+    // filter, and in scope=all the current-project family boost. Without
+    // this, pagination reconstructed RAW HNSW order while page one was
+    // boost-adjusted — a family chunk boosted onto page one reappeared on
+    // page two (raw order) while the chunk it displaced was skipped
+    // entirely (certified live with a 0.89-family / 0.90-other pair).
+    let current_project = cross_project::resolve_current_project();
+    let scope =
+        SearchProjectScope::resolve_with(storage, project, current_project.as_deref(), None)?;
+    get_more_results_in_scope(
+        storage,
+        search,
+        query_vec,
+        query,
+        offset,
+        limit,
+        min_score,
+        &scope,
+        consumption_mode,
+        active_forgetting,
+    )
+    .await
+}
 
-    let all_results = if let Some(ref p) = effective_project {
-        let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+/// Everything after scope resolution — the seam pagination-ordering tests
+/// drive with a constructed [`SearchProjectScope`] (no `MCP_CLIENT_CWD` env
+/// dependency, same rationale as `reflect_on_past_with_vec_in_scope`).
+#[allow(clippy::too_many_arguments)]
+async fn get_more_results_in_scope(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query_vec: &[f32],
+    query: &str,
+    offset: usize,
+    limit: usize,
+    min_score: f32,
+    scope: &SearchProjectScope,
+    consumption_mode: ConsumptionMode,
+    active_forgetting: bool,
+) -> Result<String> {
+    let mut all_results = if scope.effective_project.is_some() {
+        let mut ids = HashSet::new();
+        for family_project in &scope.family_projects {
+            ids.extend(storage.get_chunk_ids_for_project(family_project)?);
+        }
         let idx = search.read().await;
         idx.search_chunks_filtered(query_vec, GET_MORE_WINDOW, min_score, &ids)
     } else {
         let idx = search.read().await;
         idx.search_chunks(query_vec, GET_MORE_WINDOW, min_score)
     };
+
+    // Apply the scope multiplier to the whole window and re-sort BEFORE
+    // enrichment (which preserves input order), so every page is cut from
+    // one boost-consistent global order. Remaining known divergence from
+    // page one: pagination does not re-run TAD decay or provenance rerank.
+    {
+        let ids: Vec<String> = all_results.iter().map(|r| r.id.clone()).collect();
+        let project_by_id: HashMap<String, String> = storage
+            .get_chunks_by_ids(&ids)?
+            .into_iter()
+            .map(|chunk| (chunk.id.clone(), chunk.project_name))
+            .collect();
+        for result in &mut all_results {
+            if let Some(project_name) = project_by_id.get(&result.id) {
+                result.score *= project_scope_multiplier(project_name, scope);
+            }
+        }
+        all_results.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
 
     // Enrich + resolution sink + validity partition ONCE over the FULL
     // fixed window, THEN slice the page.
@@ -5203,6 +5269,103 @@ mod tests {
         assert_eq!(
             demoted_page, demoted_page_again,
             "repeated get_more requests must return identical ordering"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_more_continues_the_family_boosted_order_not_raw_hnsw() {
+        // The certified live failure: scope=all with a current project. A
+        // family chunk at raw 0.89 boosts to ~1.02 and wins page one over an
+        // other-project chunk at raw 0.90. Pagination that reconstructs RAW
+        // order sees [other, family], so offset=1 returns the family chunk
+        // AGAIN and the other chunk is skipped forever.
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mk = |id: &str, project: &str, content: &str| crate::import::ConversationChunk {
+            id: id.into(),
+            conversation_id: format!("conv-{id}"),
+            project_name: project.into(),
+            timestamp: "2099-01-01T00:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let rows = [
+            (
+                mk(
+                    "chunk-family",
+                    "alpha-proj",
+                    "family claim about pagination",
+                ),
+                vec![0.89f32, 0.455_960_5, 0.0, 0.0],
+            ),
+            (
+                mk(
+                    "chunk-other",
+                    "beta-proj",
+                    "other-project claim about pagination",
+                ),
+                vec![0.90f32, 0.435_889_9, 0.0, 0.0],
+            ),
+        ];
+        let mut engine = SearchEngine::new(16);
+        for (chunk, vector) in &rows {
+            storage.insert_chunk(chunk, vector).unwrap();
+            engine.insert_chunk(chunk.id.clone(), vector.clone());
+        }
+        let search = Arc::new(RwLock::new(engine));
+        let scope =
+            SearchProjectScope::resolve_with(&storage, Some("all"), Some("alpha-proj"), None)
+                .unwrap();
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+
+        let page1 = reflect_on_past_with_vec_in_scope(
+            &storage,
+            &search,
+            &q,
+            "pagination",
+            1,
+            0.1,
+            &scope,
+            0,
+            true,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            page1.contains("family claim about pagination"),
+            "boosted family chunk must win page one:\n{page1}"
+        );
+        assert!(
+            !page1.contains("other-project claim about pagination"),
+            "page one has room for exactly one result:\n{page1}"
+        );
+
+        let page2 = get_more_results_in_scope(
+            &storage,
+            &search,
+            &q,
+            "pagination",
+            1,
+            1,
+            0.1,
+            &scope,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            page2.contains("other-project claim about pagination"),
+            "offset=1 must surface the chunk page one displaced, not skip it:\n{page2}"
+        );
+        assert!(
+            !page2.contains("family claim about pagination"),
+            "the boosted family chunk must not be duplicated onto page two:\n{page2}"
         );
     }
 
