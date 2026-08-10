@@ -13,6 +13,7 @@
 //! Run `csr-engine dream` (no `--report`) first to actually produce new
 //! verdicts; this just narrates whatever is already on record.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -29,6 +30,92 @@ use crate::storage::Storage;
 const TEMPLATE: &str = include_str!("report_template.html.jinja");
 const TEMPLATE_NAME: &str = "report.html";
 
+// The standalone template is shared with older report shapes and is outside
+// this renderer's change boundary. Replace only its timeline fragment before
+// compilation, keeping the rest of the established document and CSS intact.
+const LEGACY_TIMELINE_TEMPLATE: &str = r#"  <section>
+    <h2>Timeline</h2>
+    {% for day in data.days %}
+    <div class="day-group">
+      <p class="day-heading">{{ day.date }}</p>
+      {% for event in day.events %}
+      <div class="event">
+        <span class="badge {{ event.verdict_slug }}">{{ event.verdict_label }}</span>
+        <span class="symbol">{{ event.symbol }}</span>
+        <span class="file">{{ event.file_relative }}</span>
+        <span class="oids">receipt {{ event.receipt_short | default("—") }} · HEAD {{ event.observed_head_short }} · {{ event.time }}</span>
+        {% if event.successor_line %}
+        <span class="successor-line">{{ event.successor_line }}</span>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% endfor %}
+  </section>"#;
+
+const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section>
+    <h2>Timeline</h2>
+    <p class="subtitle">Searches touching these anchors carry [evolved] annotations with these receipts</p>
+
+    {% for group in data.superseded_groups %}
+    <div class="day-group">
+      <p class="day-heading">{{ group.project }} · {{ group.file_relative }}</p>
+      {% for event in group.events %}
+      <div class="event">
+        <span class="badge superseded">Superseded</span>
+        <span class="symbol">{{ event.symbol }}</span>
+        <span class="file">{{ event.file_relative }}</span>
+        <span class="oids">receipt {{ event.receipt_short | default("—") }}</span>
+        <span class="successor-line">{{ event.conversation_line }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% endfor %}
+
+    {% for day in data.other_days %}
+    <div class="day-group">
+      <p class="day-heading">{{ day.date }}</p>
+      {% for event in day.events %}
+      <div class="event">
+        <span class="badge {{ event.verdict_slug }}">{{ event.verdict_label }}</span>
+        <span class="symbol">{{ event.symbol }}</span>
+        <span class="file">{{ event.file_relative }}</span>
+        <span class="oids">receipt {{ event.receipt_short | default("—") }} · HEAD {{ event.observed_head_short }} · {{ event.time }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% endfor %}
+
+    {% for group in data.internal_groups %}
+    <details class="day-group">
+      <summary>{{ group.events | length }} internal/test symbols · {{ group.project }}</summary>
+      {% for event in group.events %}
+      <div class="event">
+        <span class="badge {{ event.verdict_slug }}">{{ event.verdict_label }}</span>
+        <span class="symbol">{{ event.symbol }}</span>
+        <span class="file">{{ event.file_relative }}</span>
+        {% if event.receipt_short %}<span class="oids">receipt {{ event.receipt_short }}</span>{% endif %}
+        {% if event.conversation_line %}<span class="successor-line">{{ event.conversation_line }}</span>{% endif %}
+      </div>
+      {% endfor %}
+    </details>
+    {% endfor %}
+
+    {% if data.reinstated %}
+    <details class="day-group">
+      <summary>{{ data.reinstated.count }} anchors re-observed at HEAD {{ data.reinstated.head_short }}</summary>
+      {% for event in data.reinstated.events %}
+      <div class="event">
+        <span class="badge reinstated">Reinstated</span>
+        <span class="symbol">{{ event.symbol }}</span>
+        <span class="file">{{ event.file_relative }}</span>
+        <span class="oids">HEAD {{ event.observed_head_short }} · {{ event.time }}</span>
+      </div>
+      {% endfor %}
+    </details>
+    {% endif %}
+  </section>"#;
+
 /// One rendered timeline event — the shape the template walks per day group.
 #[derive(Debug, Clone, Serialize)]
 struct EventView {
@@ -43,6 +130,7 @@ struct EventView {
     /// no richer successor identity to show than that, since `witness_id`
     /// has no stable human-facing name).
     successor_line: Option<String>,
+    conversation_line: Option<String>,
     /// `HH:MM:SS` slice of `created_at`.
     time: String,
 }
@@ -54,6 +142,31 @@ struct EventView {
 struct DayGroup {
     /// `YYYY-MM-DD`.
     date: String,
+    events: Vec<EventView>,
+}
+
+/// User-code supersessions are the journal's primary evidence, grouped by
+/// the exact source file whose anchor evolved.
+#[derive(Debug, Clone, Serialize)]
+struct SupersededFileGroup {
+    project: String,
+    file_relative: String,
+    events: Vec<EventView>,
+}
+
+/// Test and fixture anchors remain available without dominating the journal.
+#[derive(Debug, Clone, Serialize)]
+struct InternalProjectGroup {
+    project: String,
+    events: Vec<EventView>,
+}
+
+/// Reinstatement receipts equal the observed HEAD, so they are narrated once
+/// and their anchors are kept in a receipt-free disclosure list.
+#[derive(Debug, Clone, Serialize)]
+struct ReinstatedSummary {
+    count: usize,
+    head_short: String,
     events: Vec<EventView>,
 }
 
@@ -84,6 +197,10 @@ struct DreamReportData {
     last_run_at: Option<String>,
     totals: VerdictTotals,
     days: Vec<DayGroup>,
+    superseded_groups: Vec<SupersededFileGroup>,
+    other_days: Vec<DayGroup>,
+    internal_groups: Vec<InternalProjectGroup>,
+    reinstated: Option<ReinstatedSummary>,
     forgotten: Vec<ForgottenView>,
     /// `true` iff zero events have ever been recorded — drives the "no
     /// dreams yet" empty state (the timeline section is skipped entirely;
@@ -148,7 +265,36 @@ fn repo_relative_file(storage: &Storage, file: &str) -> String {
     }
 }
 
-fn event_view(storage: &Storage, e: &DreamEventRow) -> EventView {
+fn conversation_line(
+    e: &DreamEventRow,
+    links: &BTreeMap<(String, String, String), Vec<String>>,
+) -> Option<String> {
+    if e.verdict != VerdictKind::SupersededBy {
+        return None;
+    }
+    let ids = e
+        .symbol
+        .as_ref()
+        .and_then(|symbol| links.get(&(e.project.clone(), e.file.clone(), symbol.clone())));
+    Some(match ids {
+        Some(ids) if !ids.is_empty() => {
+            let previews = ids
+                .iter()
+                .take(3)
+                .map(|id| id.chars().take(8).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("appears in {} conversation(s): {previews}", ids.len())
+        }
+        _ => "no linked conversations".to_string(),
+    })
+}
+
+fn event_view(
+    storage: &Storage,
+    e: &DreamEventRow,
+    links: &BTreeMap<(String, String, String), Vec<String>>,
+) -> EventView {
     let successor_line = if e.verdict == VerdictKind::SupersededBy {
         short_oid_opt(e.receipt_oid.as_deref())
             .map(|r| format!("superseded by the witness recorded at receipt {r}"))
@@ -160,9 +306,12 @@ fn event_view(storage: &Storage, e: &DreamEventRow) -> EventView {
         file_relative: repo_relative_file(storage, &e.file),
         verdict_slug: verdict_slug(e.verdict),
         verdict_label: verdict_label(e.verdict),
-        receipt_short: short_oid_opt(e.receipt_oid.as_deref()),
+        receipt_short: (e.verdict != VerdictKind::AnchorReinstated)
+            .then(|| short_oid_opt(e.receipt_oid.as_deref()))
+            .flatten(),
         observed_head_short: short_oid(&e.observed_head_oid),
         successor_line,
+        conversation_line: conversation_line(e, links),
         time: e.created_at.get(11..19).unwrap_or("").to_string(),
     }
 }
@@ -182,11 +331,15 @@ fn forgotten_view(storage: &Storage, d: &DemotedSymbol) -> ForgottenView {
 /// buckets (date = `created_at`'s first 10 chars, `YYYY-MM-DD`) — same
 /// "already sorted, just group contiguous runs" shape as
 /// `dream::group_by_anchor`.
-fn group_by_day(storage: &Storage, events: &[DreamEventRow]) -> Vec<DayGroup> {
+fn group_by_day(
+    storage: &Storage,
+    events: &[DreamEventRow],
+    links: &BTreeMap<(String, String, String), Vec<String>>,
+) -> Vec<DayGroup> {
     let mut days: Vec<DayGroup> = Vec::new();
     for e in events {
         let date = e.created_at.get(..10).unwrap_or(&e.created_at).to_string();
-        let view = event_view(storage, e);
+        let view = event_view(storage, e, links);
         match days.last_mut() {
             Some(d) if d.date == date => d.events.push(view),
             _ => days.push(DayGroup {
@@ -196,6 +349,98 @@ fn group_by_day(storage: &Storage, events: &[DreamEventRow]) -> Vec<DayGroup> {
         }
     }
     days
+}
+
+fn is_testish(e: &DreamEventRow) -> bool {
+    let symbol_is_test = e
+        .symbol
+        .as_deref()
+        .is_some_and(|symbol| symbol.starts_with("test_") || symbol.starts_with("fixture_"));
+    let normalized = e.file.replace('\\', "/");
+    symbol_is_test || normalized.contains("/tests/") || normalized.starts_with("tests/")
+}
+
+fn journal_sections(
+    storage: &Storage,
+    events: &[DreamEventRow],
+    links: &BTreeMap<(String, String, String), Vec<String>>,
+) -> (
+    Vec<SupersededFileGroup>,
+    Vec<DayGroup>,
+    Vec<InternalProjectGroup>,
+    Option<ReinstatedSummary>,
+) {
+    let mut superseded: BTreeMap<(String, String), Vec<&DreamEventRow>> = BTreeMap::new();
+    let mut other = Vec::new();
+    let mut internal: BTreeMap<String, Vec<&DreamEventRow>> = BTreeMap::new();
+    let mut reinstated = Vec::new();
+
+    for event in events {
+        if event.verdict == VerdictKind::AnchorReinstated {
+            reinstated.push(event);
+        } else if is_testish(event) {
+            internal
+                .entry(event.project.clone())
+                .or_default()
+                .push(event);
+        } else if event.verdict == VerdictKind::SupersededBy {
+            superseded
+                .entry((event.project.clone(), event.file.clone()))
+                .or_default()
+                .push(event);
+        } else {
+            other.push(event.clone());
+        }
+    }
+
+    let superseded_groups = superseded
+        .into_iter()
+        .map(|((project, file), mut rows)| {
+            rows.sort_by_key(|event| std::cmp::Reverse(event.event_id));
+            SupersededFileGroup {
+                project,
+                file_relative: repo_relative_file(storage, &file),
+                events: rows
+                    .into_iter()
+                    .map(|event| event_view(storage, event, links))
+                    .collect(),
+            }
+        })
+        .collect();
+    let internal_groups = internal
+        .into_iter()
+        .map(|(project, mut rows)| {
+            rows.sort_by_key(|event| std::cmp::Reverse(event.event_id));
+            InternalProjectGroup {
+                project,
+                events: rows
+                    .into_iter()
+                    .map(|event| event_view(storage, event, links))
+                    .collect(),
+            }
+        })
+        .collect();
+    let reinstated_summary = if let Some(newest) = reinstated.first() {
+        let count = reinstated.len();
+        let head_short = short_oid(&newest.observed_head_oid);
+        Some(ReinstatedSummary {
+            count,
+            head_short,
+            events: reinstated
+                .into_iter()
+                .map(|event| event_view(storage, event, links))
+                .collect(),
+        })
+    } else {
+        None
+    };
+
+    (
+        superseded_groups,
+        group_by_day(storage, &other, links),
+        internal_groups,
+        reinstated_summary,
+    )
 }
 
 /// Gather every piece of data the template needs. Read-only: three existing
@@ -240,6 +485,10 @@ fn gather_report_data_with(
                 total: 0,
             },
             days: Vec::new(),
+            superseded_groups: Vec::new(),
+            other_days: Vec::new(),
+            internal_groups: Vec::new(),
+            reinstated: None,
             forgotten: Vec::new(),
             is_empty: true,
         });
@@ -263,7 +512,22 @@ fn gather_report_data_with(
         None => (None, None),
     };
 
-    let days = group_by_day(storage, &events);
+    let anchors = events
+        .iter()
+        .filter(|event| event.verdict == VerdictKind::SupersededBy)
+        .filter_map(|event| {
+            event
+                .symbol
+                .as_ref()
+                .map(|symbol| (event.project.clone(), event.file.clone(), symbol.clone()))
+        })
+        .collect::<Vec<_>>();
+    let links = storage.with_connection(|conn| {
+        crate::storage::witness_verdicts::conversation_ids_for_anchors(conn, &anchors)
+    })?;
+    let days = group_by_day(storage, &events, &links);
+    let (superseded_groups, other_days, internal_groups, reinstated_summary) =
+        journal_sections(storage, &events, &links);
     let forgotten = forgotten_raw
         .iter()
         .map(|d| forgotten_view(storage, d))
@@ -282,6 +546,10 @@ fn gather_report_data_with(
             total,
         },
         days,
+        superseded_groups,
+        other_days,
+        internal_groups,
+        reinstated: reinstated_summary,
         forgotten,
         is_empty: total == 0,
     })
@@ -290,8 +558,12 @@ fn gather_report_data_with(
 /// Render `data` through the embedded template into a complete, standalone
 /// HTML document.
 fn render_html(data: &DreamReportData) -> Result<String> {
+    let template = TEMPLATE.replacen(LEGACY_TIMELINE_TEMPLATE, JOURNAL_TIMELINE_TEMPLATE, 1);
+    if template == TEMPLATE {
+        anyhow::bail!("embedded dream report timeline fragment no longer matches renderer");
+    }
     let mut env = minijinja::Environment::new();
-    env.add_template(TEMPLATE_NAME, TEMPLATE)
+    env.add_template(TEMPLATE_NAME, &template)
         .context("compiling embedded dream report template")?;
     let tmpl = env
         .get_template(TEMPLATE_NAME)
@@ -481,6 +753,126 @@ mod tests {
         assert!(html.contains("Superseded"));
         assert!(html.contains("lib.rs"));
         assert!(!html.contains("No dreams yet"));
+    }
+
+    #[test]
+    fn journal_leads_with_user_supersessions_and_collapses_noise_with_links() {
+        let storage = Storage::open_memory().unwrap();
+        let seed_event =
+            |symbol: &str, file: &str, at_oid: &str, receipt: &str, verdict: VerdictKind| {
+                storage
+                    .insert_witness(&ledger_row("proj", file, Some(symbol), at_oid, at_oid))
+                    .unwrap();
+                let witness = storage
+                    .witnesses_for_file("proj", file)
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.at_oid.as_deref() == Some(at_oid))
+                    .unwrap();
+                storage
+                    .insert_witness_verdict(&WitnessVerdictRow {
+                        witness_id: witness.id,
+                        verdict,
+                        successor_witness_id: (verdict == VerdictKind::SupersededBy)
+                            .then_some(witness.id),
+                        receipt_oid: Some(receipt.into()),
+                        observed_head_oid: receipt.into(),
+                    })
+                    .unwrap();
+            };
+
+        seed_event(
+            "business_old",
+            "/repo/src/lib.rs",
+            "anchor-old",
+            "11111111-old",
+            VerdictKind::SupersededBy,
+        );
+        seed_event(
+            "business_new",
+            "/repo/src/lib.rs",
+            "anchor-new",
+            "22222222-new",
+            VerdictKind::SupersededBy,
+        );
+        seed_event(
+            "test_helper",
+            "/repo/src/lib.rs",
+            "anchor-test",
+            "33333333-test",
+            VerdictKind::SupersededBy,
+        );
+        seed_event(
+            "fixture_builder",
+            "/repo/src/lib.rs",
+            "anchor-fixture",
+            "44444444-fixture",
+            VerdictKind::SupersededBy,
+        );
+        seed_event(
+            "integration_helper",
+            "/repo/tests/integration.rs",
+            "anchor-integration",
+            "55555555-integration",
+            VerdictKind::SupersededBy,
+        );
+        seed_event(
+            "restored_one",
+            "/repo/src/lib.rs",
+            "anchor-restored-one",
+            "headfeed-restored",
+            VerdictKind::AnchorReinstated,
+        );
+        seed_event(
+            "restored_two",
+            "/repo/src/other.rs",
+            "anchor-restored-two",
+            "headfeed-restored",
+            VerdictKind::AnchorReinstated,
+        );
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO code_nodes
+                        (id, project, file, kind, name, first_conv_id, last_conv_id)
+                     VALUES ('business-node', 'proj', '/repo/src/lib.rs', 'function',
+                             'business_new', 'aaaaaaaa-alpha', 'bbbbbbbb-beta')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let data = gather_report_data_with(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        )
+        .unwrap();
+        let html = render_html(&data).unwrap();
+
+        assert!(html.contains(
+            "Searches touching these anchors carry [evolved] annotations with these receipts"
+        ));
+        let new_pos = html.find("business_new").unwrap();
+        let old_pos = html.find("business_old").unwrap();
+        let tests_pos = html.find("internal/test symbols").unwrap();
+        assert!(
+            new_pos < old_pos,
+            "newest receipt must render first within its file"
+        );
+        assert!(
+            old_pos < tests_pos,
+            "user symbols must lead collapsed test symbols"
+        );
+        assert!(html.contains("3 internal/test symbols"));
+        assert!(html.contains("appears in 2 conversation(s): aaaaaaaa bbbbbbbb"));
+        assert!(html.contains("no linked conversations"));
+        assert!(html.contains("2 anchors re-observed at HEAD headfeed"));
+        assert!(html.contains("<details"));
+        assert!(
+            !html.contains("receipt headfeed"),
+            "reinstatement details must not expose a tautological receipt column"
+        );
     }
 
     /// Symbol names are user code identifiers interpolated into HTML; minijinja

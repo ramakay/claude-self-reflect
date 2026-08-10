@@ -494,6 +494,77 @@ pub fn all_events_with_anchor(conn: &Connection) -> Result<Vec<DreamEventRow>> {
     Ok(rows)
 }
 
+/// Conversation provenance for exact `(project, file, symbol)` anchors.
+///
+/// Reads both endpoints recorded by `code_nodes`, preserves their database
+/// order (`first_conv_id` before `last_conv_id` per node), and removes blank
+/// and duplicate IDs. Missing anchors are absent from the returned map so
+/// callers can distinguish them honestly from linked anchors.
+pub(crate) fn conversation_ids_for_anchors(
+    conn: &Connection,
+    anchors: &[(String, String, String)],
+) -> Result<std::collections::BTreeMap<(String, String, String), Vec<String>>> {
+    let mut out = std::collections::BTreeMap::new();
+    if anchors.is_empty() {
+        return Ok(out);
+    }
+
+    let mut unique = anchors.to_vec();
+    unique.sort();
+    unique.dedup();
+
+    // Three bind variables per anchor; stay below SQLite's conservative
+    // default 999-variable ceiling.
+    const BATCH: usize = 300;
+    for batch in unique.chunks(BATCH) {
+        let filters: Vec<String> = (0..batch.len())
+            .map(|i| {
+                let base = 3 * i + 1;
+                format!(
+                    "(project = ?{base} AND file = ?{} AND name = ?{})",
+                    base + 1,
+                    base + 2
+                )
+            })
+            .collect();
+        let sql = format!(
+            "SELECT project, file, name, first_conv_id, last_conv_id
+             FROM code_nodes
+             WHERE {}
+             ORDER BY project, file, name, id",
+            filters.join(" OR ")
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = batch
+            .iter()
+            .flat_map(|(project, file, symbol)| {
+                [
+                    project as &dyn rusqlite::types::ToSql,
+                    file as &dyn rusqlite::types::ToSql,
+                    symbol as &dyn rusqlite::types::ToSql,
+                ]
+            })
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                (row.get(0)?, row.get(1)?, row.get(2)?),
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (key, first, last) = row?;
+            let ids = out.entry(key).or_insert_with(Vec::new);
+            for id in [first, last] {
+                if !id.is_empty() && !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The most recent dream cycle observed anywhere in the ledger: the globally
 /// newest event's `(observed_head_oid, created_at)`. `None` if no dream
 /// cycle has ever written an event (a fresh install, or `dream` never run).
@@ -1275,6 +1346,59 @@ mod tests {
     fn all_events_with_anchor_empty_db_returns_empty() {
         let conn = open();
         assert!(all_events_with_anchor(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn conversation_ids_for_anchors_matches_identity_and_deduplicates_first_and_last() {
+        let conn = open();
+        conn.execute(
+            "INSERT INTO code_nodes
+                (id, project, file, kind, name, first_conv_id, last_conv_id)
+             VALUES ('node-a', 'proj', '/repo/src/lib.rs', 'function', 'foo',
+                     'conversation-first', 'conversation-shared')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_nodes
+                (id, project, file, kind, name, first_conv_id, last_conv_id)
+             VALUES ('node-b', 'proj', '/repo/src/lib.rs', 'method', 'foo',
+                     'conversation-shared', 'conversation-last')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_nodes
+                (id, project, file, kind, name, first_conv_id, last_conv_id)
+             VALUES ('wrong-project', 'other', '/repo/src/lib.rs', 'function', 'foo',
+                     'wrong-project-conversation', 'wrong-project-conversation')",
+            [],
+        )
+        .unwrap();
+
+        let anchors = vec![
+            (
+                "proj".to_string(),
+                "/repo/src/lib.rs".to_string(),
+                "foo".to_string(),
+            ),
+            (
+                "proj".to_string(),
+                "/repo/src/lib.rs".to_string(),
+                "missing".to_string(),
+            ),
+        ];
+        let links = conversation_ids_for_anchors(&conn, &anchors).unwrap();
+
+        assert_eq!(
+            links.get(&anchors[0]).unwrap(),
+            &vec![
+                "conversation-first".to_string(),
+                "conversation-shared".to_string(),
+                "conversation-last".to_string(),
+            ]
+        );
+        assert!(!links.contains_key(&anchors[1]));
     }
 
     #[test]
