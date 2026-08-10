@@ -80,6 +80,13 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section>
         {% endfor %}
         </div>
         {% endif %}
+        {% if card.todos %}
+        <ul class="task-list" aria-label="Session tasks">
+        {% for todo in card.todos %}
+          <li class="task {{ todo.slug }}"><span class="glyph">{{ todo.glyph }}</span>{{ todo.content }}</li>
+        {% endfor %}
+        </ul>
+        {% endif %}
         <script type="application/json" class="episode-data">{{ card.episode_json | safe }}</script>
         <div class="stage-popover" role="tooltip" hidden></div>
         <div class="episode-detail" aria-live="polite" hidden></div>
@@ -150,12 +157,10 @@ const STORY_CSS: &str = r#"
     background: var(--bg-card); border: 1px solid var(--border);
     border-radius: 12px; overflow: visible; min-width: 0;
   }
-  /* News-index bento: the newest story leads full-width; rich cards span two
-     tracks where the grid is wide enough. */
+  /* News-index bento: only the newest story leads full-width — every other
+     card stays a single track so tiles genuinely sit side by side (span-2
+     rich cards left every row with an orphaned half-tile in practice). */
   .story-card:first-child { grid-column: 1 / -1; }
-  @media (min-width: 900px) {
-    .story-card.full { grid-column: span 2; }
-  }
   .story-card > summary {
     list-style: none; cursor: pointer; padding: 0.9rem 1rem;
     display: flex; flex-direction: column; gap: 0.4rem;
@@ -202,6 +207,14 @@ const STORY_CSS: &str = r#"
   }
   .artifact-chip .symbol { overflow-wrap: anywhere; }
   .artifact-chip .file { overflow-wrap: anywhere; }
+  .task-list { list-style: none; margin: 0; padding: 0 1rem 1rem; display: grid; gap: 0.3rem; }
+  .task { font-size: 0.78rem; line-height: 1.4; display: flex; gap: 0.45rem; overflow-wrap: anywhere; }
+  .task .glyph { font-weight: 800; flex: none; width: 1.1em; text-align: center; }
+  .task.done .glyph { color: #1a7f37; }
+  .task.doing .glyph { color: #9a6700; }
+  .task.open .glyph { color: var(--fg-muted); }
+  .task.unknown .glyph { color: var(--fg-muted); }
+  .task.done { color: var(--fg-muted); }
   .stage-popover, .episode-detail {
     background: var(--bg-card); color: var(--fg); border: 1px solid var(--border);
     border-radius: 10px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
@@ -232,8 +245,8 @@ mermaid.initialize({startOnLoad:false});
   const labels = {
     S_INPUT: "INPUT",
     S_DELIB: "DELIBERATION",
-    S_ART: "ARTIFACTS",
-    S_STEER: "STEER"
+    S_STEER: "STEER",
+    S_OUT: "OUTCOME"
   };
 
   const element = (tag, className, text) => {
@@ -268,7 +281,10 @@ mermaid.initialize({startOnLoad:false});
     } else if (stageId === "S_DELIB") {
       section(root, "Narrative", data.narrative);
       list(root, "Investigated files", data.investigated, value => value);
-    } else if (stageId === "S_ART") {
+    } else if (stageId === "S_STEER") {
+      list(root, "Human steer (todos)", data.todos, todo => todo.status ? `${todo.content} [${todo.status}]` : todo.content);
+    } else if (stageId === "S_OUT") {
+      section(root, "Outcome", data.outcome);
       (data.artifacts || []).forEach(artifact => {
         const wrapper = element("div", "detail-artifact");
         wrapper.append(element("span", "symbol", artifact.symbol || "File artifact"));
@@ -279,9 +295,6 @@ mermaid.initialize({startOnLoad:false});
         list(wrapper, "Conversations", artifact.conversations, value => value);
         root.append(wrapper);
       });
-    } else if (stageId === "S_STEER") {
-      section(root, "Outcome", data.outcome);
-      list(root, "Todos", data.todos, todo => todo.status ? `${todo.content} [${todo.status}]` : todo.content);
     }
   };
 
@@ -341,14 +354,29 @@ mermaid.initialize({startOnLoad:false});
     });
   };
 
-  const renderCard = async card => {
+  // mermaid.run derives svg ids from a millisecond timestamp; 50 same-instant
+  // renders collide and the losers come back as empty style-only shells
+  // (verified: 14 unique ids across 50 cards). mermaid.render with an explicit
+  // per-card id cannot collide, and the queue serializes renders so layout
+  // measurement never races.
+  let renderSeq = 0;
+  let renderChain = Promise.resolve();
+  const renderCard = card => {
     if (card.dataset.mermaidDone === "true") return;
     card.dataset.mermaidDone = "true";
-    const pre = card.querySelector("pre.mermaid");
-    if (pre && window.mermaid) {
-      try { await mermaid.run({nodes: [pre]}); } catch (e) { /* keep raw source visible */ }
-    }
-    bindCard(card);
+    renderChain = renderChain.then(async () => {
+      const pre = card.querySelector("pre.mermaid");
+      if (pre && window.mermaid) {
+        try {
+          const { svg } = await mermaid.render(`csr-flow-${renderSeq++}`, pre.textContent);
+          const holder = document.createElement("div");
+          holder.className = "mermaid";
+          holder.innerHTML = svg;
+          pre.replaceWith(holder);
+        } catch (e) { /* keep raw source visible */ }
+      }
+      bindCard(card);
+    });
   };
   document.querySelectorAll("details.story-card").forEach(card => {
     card.addEventListener("toggle", () => { if (card.open) renderCard(card); });
@@ -373,6 +401,13 @@ struct StoryArtifactView {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct StoryTodoView {
+    glyph: &'static str,
+    slug: &'static str,
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct StoryCardView {
     summary: String,
     /// 1–3 sentence always-visible elaboration under the headline. Deterministic
@@ -390,6 +425,8 @@ struct StoryCardView {
     stage_ids: String,
     mermaid: String,
     artifacts: Vec<StoryArtifactView>,
+    /// Visible checklist: what the session's tasks were and where they ended.
+    todos: Vec<StoryTodoView>,
     episode_json: String,
 }
 
@@ -517,11 +554,18 @@ fn basename(file: &str) -> String {
         .to_string()
 }
 
-fn artifacts_stage(artifacts: &[StoryArtifact]) -> Option<StoryStageView> {
-    (!artifacts.is_empty()).then_some(StoryStageView {
-        id: "S_ART",
-        label: "ARTIFACTS",
-    })
+/// Map a free-text todo status onto a checklist glyph slug.
+fn todo_glyph(status: &str) -> (&'static str, &'static str) {
+    let lower = status.to_lowercase();
+    if lower.contains("complete") || lower.contains("done") {
+        ("done", "✓")
+    } else if lower.contains("progress") || lower.contains("doing") {
+        ("doing", "→")
+    } else if lower.contains("pending") || lower.contains("open") || lower.contains("todo") {
+        ("open", "○")
+    } else {
+        ("unknown", "?")
+    }
 }
 
 fn mermaid_for_stages(stages: &[StoryStageView]) -> String {
@@ -599,16 +643,23 @@ fn story_card(session: &StorySession) -> Option<StoryCardView> {
             label: "DELIBERATION",
         });
 
-    let steer = (outcome.is_some() || !session.todos.is_empty()).then_some(StoryStageView {
+    // Causal order: the ask, the thinking, the human's hand on the wheel
+    // (todos/corrections), then the terminal outcome carrying the delivered
+    // artifacts and their commit receipts.
+    let steer = (!session.todos.is_empty()).then_some(StoryStageView {
         id: "S_STEER",
         label: "STEER",
+    });
+    let outcome_stage = (outcome.is_some() || has_artifacts).then_some(StoryStageView {
+        id: "S_OUT",
+        label: "OUTCOME",
     });
 
     let mut stages = Vec::with_capacity(4);
     stages.extend(input);
     stages.extend(deliberation);
-    stages.extend(artifacts_stage(&session.artifacts));
     stages.extend(steer);
+    stages.extend(outcome_stage);
     let stage_ids = stages
         .iter()
         .map(|stage| stage.id)
@@ -670,6 +721,18 @@ fn story_card(session: &StorySession) -> Option<StoryCardView> {
         }
     };
     let (outcome_slug, outcome_badge) = outcome_badge(outcome);
+    let todos = session
+        .todos
+        .iter()
+        .map(|todo| {
+            let (slug, glyph) = todo_glyph(&todo.status);
+            StoryTodoView {
+                glyph,
+                slug,
+                content: truncate_chars(&plain_text(&todo.content), 140),
+            }
+        })
+        .collect();
 
     Some(StoryCardView {
         summary,
@@ -692,6 +755,7 @@ fn story_card(session: &StorySession) -> Option<StoryCardView> {
         stage_ids,
         mermaid,
         artifacts,
+        todos,
         episode_json,
     })
 }
@@ -1706,7 +1770,7 @@ mod tests {
         assert!(html.contains("data-tier=\"full\""));
         let blocks = mermaid_blocks(&html);
         assert_eq!(blocks.len(), 2);
-        let expected = BTreeSet::from(["S_INPUT", "S_DELIB", "S_ART", "S_STEER"]);
+        let expected = BTreeSet::from(["S_INPUT", "S_DELIB", "S_STEER", "S_OUT"]);
         for block in blocks {
             assert!(block.contains("stateDiagram-v2"));
             assert!(block.contains("direction LR"));
@@ -1742,8 +1806,9 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(
             mermaid_stage_ids(blocks[0]),
-            BTreeSet::from(["S_INPUT", "S_STEER"]),
-            "tier-2 cards must draw only their populated stages"
+            BTreeSet::from(["S_INPUT", "S_OUT"]),
+            "tier-2 cards must draw only their populated stages — an outcome \
+             with no todos is OUTCOME, not STEER"
         );
     }
 
@@ -1793,7 +1858,7 @@ mod tests {
         assert!(html.contains("superseded at abcdef12"));
         let blocks = mermaid_blocks(&html);
         assert_eq!(blocks.len(), 1);
-        assert_eq!(mermaid_stage_ids(blocks[0]), BTreeSet::from(["S_ART"]));
+        assert_eq!(mermaid_stage_ids(blocks[0]), BTreeSet::from(["S_OUT"]));
     }
 
     #[test]
