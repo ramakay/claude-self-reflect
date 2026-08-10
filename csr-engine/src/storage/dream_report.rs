@@ -27,7 +27,7 @@ pub(crate) struct StoryArtifact {
     pub conversations: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct StorySession {
     pub session_id: String,
     pub project: String,

@@ -405,11 +405,39 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 
 fn first_sentence(value: &str) -> String {
     let normalized = plain_text(value);
-    let end = normalized
-        .char_indices()
-        .find_map(|(index, ch)| matches!(ch, '.' | '!' | '?').then_some(index + ch.len_utf8()))
-        .unwrap_or(normalized.len());
+    // A sentence ends at ./!/? only when followed by whitespace or the end of
+    // the text — a bare '.' inside "v10.1", "github.com", or "clip-480p.mp4"
+    // is not a boundary.
+    let mut end = normalized.len();
+    let mut chars = normalized.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if matches!(ch, '.' | '!' | '?') {
+            match chars.peek() {
+                None => {
+                    end = index + ch.len_utf8();
+                    break;
+                }
+                Some((_, next)) if next.is_whitespace() => {
+                    end = index + ch.len_utf8();
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
     truncate_chars(normalized[..end].trim(), 180)
+}
+
+/// Strip machine scaffold that leaks into stored prompts/outcomes — extractor
+/// signature blobs appended to session text ("--- Signature: {json…}").
+fn strip_scaffold(value: &str) -> &str {
+    let cut = value
+        .find("--- Signature:")
+        .or_else(|| value.find("Signature: {\""));
+    match cut {
+        Some(index) => value[..index].trim_end_matches(['-', ' ']).trim_end(),
+        None => value,
+    }
 }
 
 fn basename(file: &str) -> String {
@@ -460,20 +488,25 @@ fn story_card(session: &StorySession) -> Option<StoryCardView> {
     let request = session
         .request
         .as_deref()
+        .map(strip_scaffold)
         .filter(|value| !value.trim().is_empty());
     let outcome = session
         .outcome
         .as_deref()
+        .map(strip_scaffold)
         .filter(|value| !value.trim().is_empty());
     let narrative = session
         .narrative
         .as_deref()
+        .map(strip_scaffold)
         .filter(|value| !value.trim().is_empty());
     let has_artifacts = !session.artifacts.is_empty();
     let (tier_slug, tier_label) = if request.is_some() && narrative.is_some() && has_artifacts {
         ("full", None)
     } else if request.is_some() && outcome.is_some() {
-        ("template", Some("template"))
+        // Slug is a CSS/data-tier hook; the badge must read as English, not
+        // as the internal ladder name.
+        ("template", Some("partial record"))
     } else if has_artifacts {
         ("thin-evidence", Some("thin evidence"))
     } else {
@@ -484,6 +517,7 @@ fn story_card(session: &StorySession) -> Option<StoryCardView> {
         session
             .first_prompt
             .as_deref()
+            .map(strip_scaffold)
             .filter(|value| !value.trim().is_empty())
     });
     let input = input_text.map(|_| StoryStageView {
@@ -896,6 +930,64 @@ mod tests {
             source_kind: "backfill".into(),
             source_id: Some(at_oid.into()),
         }
+    }
+
+    #[test]
+    fn first_sentence_never_cuts_inside_decimals_urls_or_filenames() {
+        assert_eq!(
+            first_sentence("5-day v10.1 release gate hold. More detail follows."),
+            "5-day v10.1 release gate hold."
+        );
+        assert_eq!(
+            first_sentence("review https://github.com/ramakay/csr then merge"),
+            "review https://github.com/ramakay/csr then merge"
+        );
+        assert_eq!(
+            first_sentence("upscale saadhana-v6-480p.mp4 to 4k. Done overnight."),
+            "upscale saadhana-v6-480p.mp4 to 4k."
+        );
+        assert_eq!(first_sentence("ends exactly here."), "ends exactly here.");
+    }
+
+    #[test]
+    fn signature_scaffold_never_reaches_summary_or_popover_json() {
+        let session = StorySession {
+            session_id: "sig-scrub-session".into(),
+            project: "proj".into(),
+            timestamp: "2026-08-10T00:00:00Z".into(),
+            request: Some(
+                "generate a cover photo --- Signature: {\"completion_status\":\"partial\"}".into(),
+            ),
+            outcome: Some("partial".into()),
+            ..Default::default()
+        };
+        let card = story_card(&session).expect("request+outcome renders a card");
+        assert!(
+            !card.summary.contains("Signature"),
+            "summary leaked scaffold: {}",
+            card.summary
+        );
+        assert!(
+            !card.episode_json.contains("completion_status"),
+            "popover JSON leaked scaffold: {}",
+            card.episode_json
+        );
+        assert!(card.summary.starts_with("generate a cover photo"));
+    }
+
+    #[test]
+    fn template_tier_badge_reads_as_english_not_the_internal_ladder_name() {
+        let session = StorySession {
+            session_id: "tier-label-session".into(),
+            project: "proj".into(),
+            timestamp: "2026-08-10T00:00:00Z".into(),
+            request: Some("do the thing".into()),
+            outcome: Some("done".into()),
+            ..Default::default()
+        };
+        let card = story_card(&session).expect("request+outcome renders a card");
+        assert_eq!(card.tier_slug, "template", "CSS hook must stay stable");
+        assert_eq!(card.tier_label, Some("partial record"));
     }
 
     #[test]
