@@ -198,7 +198,10 @@ const STORY_CSS: &str = r#"
 "#;
 
 const STORY_SCRIPT: &str = r#"
-mermaid.initialize({startOnLoad:true});
+// startOnLoad would render every diagram while its <details> parent is still
+// closed (display:none) — mermaid measures zero geometry there and produces
+// broken, unbindable SVGs. Diagrams render lazily on first card open instead.
+mermaid.initialize({startOnLoad:false});
 (() => {
   const labels = {
     S_INPUT: "INPUT",
@@ -307,11 +310,19 @@ mermaid.initialize({startOnLoad:true});
     });
   };
 
-  const bindAll = () => document.querySelectorAll(".story-card").forEach(bindCard);
-  const storyList = document.querySelector(".story-list");
-  if (storyList) new MutationObserver(bindAll).observe(storyList, {childList: true, subtree: true});
-  bindAll();
-  window.addEventListener("load", bindAll, {once: true});
+  const renderCard = async card => {
+    if (card.dataset.mermaidDone === "true") return;
+    card.dataset.mermaidDone = "true";
+    const pre = card.querySelector("pre.mermaid");
+    if (pre && window.mermaid) {
+      try { await mermaid.run({nodes: [pre]}); } catch (e) { /* keep raw source visible */ }
+    }
+    bindCard(card);
+  };
+  document.querySelectorAll("details.story-card").forEach(card => {
+    card.addEventListener("toggle", () => { if (card.open) renderCard(card); });
+    if (card.open) renderCard(card);
+  });
 })();
 "#;
 
@@ -1012,9 +1023,15 @@ mod tests {
             "the vendored Mermaid runtime must be embedded exactly once"
         );
         assert_eq!(
-            html.matches("mermaid.initialize({startOnLoad:true})")
+            html.matches("mermaid.initialize({startOnLoad:false})")
                 .count(),
-            1
+            1,
+            "diagrams must render lazily on card open — startOnLoad renders \
+             zero-geometry SVGs inside closed <details>"
+        );
+        assert!(
+            html.contains(r#"card.addEventListener("toggle""#),
+            "the lazy-render toggle hook must be wired"
         );
     }
 
