@@ -4,19 +4,21 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use rusqlite::Connection;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct StoryTodo {
     pub content: String,
     pub status: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct StoryArtifact {
     pub file: String,
     pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_receipt: Option<String>,
+    pub conversations: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,7 +130,7 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
             if session_id.is_empty() {
                 continue;
             }
-            let builder = sessions.entry(session_id).or_default();
+            let builder = sessions.entry(session_id.clone()).or_default();
             builder.touch(&project, &timestamp, sort_key);
             builder.first_prompt = first_prompt.and_then(nonblank);
         }
@@ -259,34 +261,63 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
             if session_id.is_empty() {
                 continue;
             }
-            let builder = sessions.entry(session_id).or_default();
+            let builder = sessions.entry(session_id.clone()).or_default();
             builder.touch(&project, &timestamp, sort_key);
             let artifact = StoryArtifact {
                 file,
                 symbol: Some(symbol),
                 superseded_receipt: receipt.and_then(nonblank),
+                conversations: Vec::new(),
             };
-            builder.add_artifact(artifact.clone());
-            linked_anchors.push((project, timestamp, sort_key, artifact));
+            linked_anchors.push((session_id, project, timestamp, sort_key, artifact));
         }
     }
 
     let identities = linked_anchors
         .iter()
-        .filter_map(|(project, _, _, artifact)| {
+        .filter_map(|(_, project, _, _, artifact)| {
             artifact
                 .symbol
                 .as_ref()
                 .map(|symbol| (project.clone(), artifact.file.clone(), symbol.clone()))
         })
         .collect::<Vec<_>>();
-    let conversations = super::witness_verdicts::conversation_ids_for_anchors(conn, &identities)?;
-    for (project, timestamp, sort_key, artifact) in &linked_anchors {
+    let transcript_conversations =
+        super::witness_verdicts::conversation_ids_for_anchors(conn, &identities)?;
+    let mut artifact_conversations: BTreeMap<(String, String, String), Vec<String>> =
+        BTreeMap::new();
+    for (session_id, project, _, _, artifact) in &linked_anchors {
         let Some(symbol) = artifact.symbol.as_ref() else {
             continue;
         };
         let key = (project.clone(), artifact.file.clone(), symbol.clone());
-        for session_id in conversations.get(&key).into_iter().flatten() {
+        artifact_conversations
+            .entry(key)
+            .or_default()
+            .push(session_id.clone());
+    }
+    for (key, session_ids) in transcript_conversations {
+        artifact_conversations
+            .entry(key)
+            .or_default()
+            .extend(session_ids);
+    }
+    for session_ids in artifact_conversations.values_mut() {
+        session_ids.sort();
+        session_ids.dedup();
+    }
+
+    for (_, project, timestamp, sort_key, artifact) in &linked_anchors {
+        let Some(symbol) = artifact.symbol.as_ref() else {
+            continue;
+        };
+        let key = (project.clone(), artifact.file.clone(), symbol.clone());
+        let mut artifact = artifact.clone();
+        artifact.conversations = artifact_conversations
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        for session_id in &artifact.conversations {
             let builder = sessions.entry(session_id.clone()).or_default();
             builder.touch(project, timestamp, *sort_key);
             builder.add_artifact(artifact.clone());
@@ -317,12 +348,13 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
             if session_id.is_empty() || file.is_empty() {
                 continue;
             }
-            let builder = sessions.entry(session_id).or_default();
+            let builder = sessions.entry(session_id.clone()).or_default();
             builder.touch(&project, &timestamp, sort_key);
             builder.add_artifact(StoryArtifact {
                 file,
                 symbol: None,
                 superseded_receipt: None,
+                conversations: vec![session_id],
             });
         }
     }

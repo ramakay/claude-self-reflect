@@ -2,8 +2,8 @@
 //!
 //! Renders one story card per usable session from stored episodes, narratives,
 //! anchors, code attribution, and receipt-bearing verdicts. Everything is
-//! inlined in one HTML file — CSS in a `<style>` block, no external fonts, no
-//! JS, zero network requests. The template
+//! inlined in one HTML file — CSS, the vendored Mermaid runtime, and the
+//! interaction script are embedded directly, with zero network requests. The template
 //! (`report_template.html.jinja`) is compiled into the binary via
 //! `include_str!`, so the rendered file is fully portable: open it anywhere,
 //! offline, forever.
@@ -27,6 +27,7 @@ use crate::storage::Storage;
 /// is a real safety property, not decoration.
 const TEMPLATE: &str = include_str!("report_template.html.jinja");
 const TEMPLATE_NAME: &str = "report.html";
+const MERMAID_SOURCE: &str = include_str!("../../assets/mermaid.min.js");
 
 // The standalone template is shared with older report shapes and is outside
 // this renderer's change boundary. Replace only its timeline fragment before
@@ -61,16 +62,23 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section>
           <span class="story-meta">{{ card.project }} · {{ card.date }} · {{ card.session_short }}</span>
           {% if card.tier_label %}<span class="tier-badge">{{ card.tier_label }}</span>{% endif %}
         </summary>
-        <div class="story-flow" aria-label="Session flow">
-        {% for stage in card.stages %}
-          <div class="story-stage {{ stage.slug }}" data-stage="{{ stage.slug }}" title="{{ stage.detail }}">
-            <span class="stage-label">{{ stage.label }}</span>
-            {% for badge in stage.badges %}
-            <span class="badge superseded">{{ badge.text }}</span>
-            {% endfor %}
-          </div>
+        <div class="story-flow" aria-label="Session flow" data-stage-ids="{{ card.stage_ids }}">
+          <pre class="mermaid">{{ card.mermaid | safe }}</pre>
+        </div>
+        {% if card.artifacts %}
+        <div class="artifact-list" aria-label="Session artifacts">
+        {% for artifact in card.artifacts %}
+          <span class="artifact-chip">
+            <span class="symbol">{{ artifact.label }}</span>
+            <span class="file">{{ artifact.file }}</span>
+            {% if artifact.receipt_badge %}<span class="badge superseded">{{ artifact.receipt_badge }}</span>{% endif %}
+          </span>
         {% endfor %}
         </div>
+        {% endif %}
+        <script type="application/json" class="episode-data">{{ card.episode_json | safe }}</script>
+        <div class="stage-popover" role="tooltip" hidden></div>
+        <div class="episode-detail" aria-live="polite" hidden></div>
       </details>
     {% endfor %}
     </div>
@@ -150,42 +158,176 @@ const STORY_CSS: &str = r#"
   }
   .story-flow {
     border-top: 1px solid var(--border); padding: 1rem;
-    display: flex; align-items: stretch; gap: 1.6rem;
+    min-height: 7rem; overflow-x: auto;
   }
-  .story-stage {
-    position: relative; flex: 1 1 0; min-width: 0; min-height: 4.2rem;
-    border: 1px solid var(--border); border-radius: 9px; padding: 0.8rem;
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
-    text-align: center; background: var(--bg); cursor: help;
+  .story-flow .mermaid { margin: 0; min-width: 30rem; text-align: center; }
+  .story-flow svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+  .artifact-list {
+    display: flex; flex-wrap: wrap; gap: 0.45rem; padding: 0 1rem 1rem;
   }
-  .story-stage + .story-stage::before {
-    content: "→"; position: absolute; left: -1.18rem; top: 50%;
-    transform: translateY(-50%); color: var(--fg-muted); font-weight: 700;
+  .artifact-chip {
+    display: inline-flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
+    max-width: 100%; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg); padding: 0.4rem 0.55rem;
   }
-  .stage-label { font-size: 0.73rem; font-weight: 800; letter-spacing: 0.06em; }
-  .story-stage .badge { margin-top: 0.45rem; text-transform: none; }
+  .artifact-chip .symbol { overflow-wrap: anywhere; }
+  .artifact-chip .file { overflow-wrap: anywhere; }
+  .stage-popover, .episode-detail {
+    background: var(--bg-card); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+    padding: 0.85rem 0.95rem; overflow-wrap: anywhere; white-space: normal;
+  }
+  .stage-popover {
+    position: fixed; z-index: 1000; width: min(360px, calc(100vw - 24px));
+    max-height: min(70vh, 34rem); overflow-y: auto; pointer-events: none;
+  }
+  .episode-detail { margin: 0 1rem 1rem; box-shadow: none; }
+  .stage-popover h3, .episode-detail h3 { margin: 0 0 0.65rem; font-size: 0.8rem; letter-spacing: 0.06em; }
+  .detail-section + .detail-section { margin-top: 0.65rem; }
+  .detail-label { display: block; margin-bottom: 0.2rem; color: var(--fg-muted); font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; }
+  .detail-value { margin: 0; font-size: 0.82rem; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .detail-list { margin: 0.25rem 0 0; padding-left: 1.15rem; font-size: 0.8rem; line-height: 1.45; }
+  .detail-artifact { border-top: 1px solid var(--border); padding-top: 0.5rem; margin-top: 0.5rem; }
+  .detail-artifact .file { display: block; margin-top: 0.2rem; }
+  [hidden] { display: none !important; }
   .omission-summary { display: flex; justify-content: center; gap: 1rem; color: var(--fg-muted); font-size: 0.75rem; }
   @media (max-width: 680px) {
     .story-card > summary { grid-template-columns: minmax(0, 1fr) auto; }
     .story-meta { grid-column: 1 / -1; grid-row: 2; }
-    .story-flow { flex-direction: column; gap: 1.4rem; }
-    .story-stage + .story-stage::before { content: "↓"; left: 50%; top: -1.15rem; transform: translateX(-50%); }
   }
+"#;
+
+const STORY_SCRIPT: &str = r#"
+mermaid.initialize({startOnLoad:true});
+(() => {
+  const labels = {
+    S_INPUT: "INPUT",
+    S_DELIB: "DELIBERATION",
+    S_ART: "ARTIFACTS",
+    S_STEER: "STEER"
+  };
+
+  const element = (tag, className, text) => {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  };
+
+  const section = (root, label, value) => {
+    if (value === undefined || value === null || value === "") return;
+    const wrapper = element("div", "detail-section");
+    wrapper.append(element("span", "detail-label", label));
+    wrapper.append(element("p", "detail-value", value));
+    root.append(wrapper);
+  };
+
+  const list = (root, label, values, format) => {
+    if (!Array.isArray(values) || values.length === 0) return;
+    const wrapper = element("div", "detail-section");
+    wrapper.append(element("span", "detail-label", label));
+    const items = element("ul", "detail-list");
+    values.forEach(value => items.append(element("li", "", format(value))));
+    wrapper.append(items);
+    root.append(wrapper);
+  };
+
+  const renderStage = (root, stageId, data) => {
+    root.replaceChildren(element("h3", "", labels[stageId]));
+    if (stageId === "S_INPUT") {
+      section(root, "Request", data.request);
+    } else if (stageId === "S_DELIB") {
+      section(root, "Narrative", data.narrative);
+      list(root, "Investigated files", data.investigated, value => value);
+    } else if (stageId === "S_ART") {
+      (data.artifacts || []).forEach(artifact => {
+        const wrapper = element("div", "detail-artifact");
+        wrapper.append(element("span", "symbol", artifact.symbol || "File artifact"));
+        wrapper.append(element("span", "file", artifact.file));
+        if (artifact.superseded_receipt) {
+          wrapper.append(element("span", "badge superseded", `superseded at ${artifact.superseded_receipt.slice(0, 8)}`));
+        }
+        list(wrapper, "Conversations", artifact.conversations, value => value);
+        root.append(wrapper);
+      });
+    } else if (stageId === "S_STEER") {
+      section(root, "Outcome", data.outcome);
+      list(root, "Todos", data.todos, todo => todo.status ? `${todo.content} [${todo.status}]` : todo.content);
+    }
+  };
+
+  const positionPopover = (popover, event) => {
+    const gap = 14;
+    const left = Math.max(12, Math.min(event.clientX + gap, window.innerWidth - popover.offsetWidth - 12));
+    const top = Math.max(12, Math.min(event.clientY + gap, window.innerHeight - popover.offsetHeight - 12));
+    popover.style.left = `${left}px`;
+    popover.style.top = `${top}px`;
+  };
+
+  const findStateNode = (svg, stageId) => {
+    const candidates = svg.querySelectorAll("[id], [data-id]");
+    const match = Array.from(candidates).find(node =>
+      node.id === stageId ||
+      node.id.startsWith(`state-${stageId}-`) ||
+      node.getAttribute("data-id") === stageId
+    );
+    return match ? (match.closest("g") || match) : null;
+  };
+
+  const bindCard = card => {
+    const svg = card.querySelector(".story-flow svg");
+    if (!svg) return;
+    const data = JSON.parse(card.querySelector(".episode-data").textContent);
+    const popover = card.querySelector(".stage-popover");
+    const panel = card.querySelector(".episode-detail");
+    const stageIds = card.querySelector(".story-flow").dataset.stageIds.split(/\s+/).filter(Boolean);
+
+    stageIds.forEach(stageId => {
+      const node = findStateNode(svg, stageId);
+      if (!node || node.dataset.episodeBound === "true") return;
+      node.dataset.episodeBound = "true";
+      node.style.cursor = "pointer";
+      node.addEventListener("pointerenter", event => {
+        renderStage(popover, stageId, data);
+        popover.hidden = false;
+        positionPopover(popover, event);
+      });
+      node.addEventListener("pointermove", event => positionPopover(popover, event));
+      node.addEventListener("pointerleave", () => { popover.hidden = true; });
+      node.addEventListener("click", () => {
+        if (!panel.hidden && panel.dataset.stageId === stageId) {
+          panel.hidden = true;
+          delete panel.dataset.stageId;
+          return;
+        }
+        renderStage(panel, stageId, data);
+        panel.dataset.stageId = stageId;
+        panel.hidden = false;
+      });
+    });
+  };
+
+  const bindAll = () => document.querySelectorAll(".story-card").forEach(bindCard);
+  const storyList = document.querySelector(".story-list");
+  if (storyList) new MutationObserver(bindAll).observe(storyList, {childList: true, subtree: true});
+  bindAll();
+  window.addEventListener("load", bindAll, {once: true});
+})();
 "#;
 
 const MAX_STORY_CARDS: usize = 50;
 
 #[derive(Debug, Clone, Serialize)]
-struct ReceiptBadgeView {
-    text: String,
+struct StoryStageView {
+    id: &'static str,
+    label: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct StoryStageView {
-    slug: &'static str,
-    label: &'static str,
-    detail: String,
-    badges: Vec<ReceiptBadgeView>,
+struct StoryArtifactView {
+    label: String,
+    file: String,
+    receipt_badge: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,7 +338,20 @@ struct StoryCardView {
     session_short: String,
     tier_slug: &'static str,
     tier_label: Option<&'static str>,
-    stages: Vec<StoryStageView>,
+    stage_ids: String,
+    mermaid: String,
+    artifacts: Vec<StoryArtifactView>,
+    episode_json: String,
+}
+
+#[derive(Serialize)]
+struct EpisodeDataView<'a> {
+    request: Option<&'a str>,
+    narrative: Option<&'a str>,
+    investigated: &'a [String],
+    artifacts: &'a [StoryArtifact],
+    outcome: Option<&'a str>,
+    todos: &'a [crate::storage::dream_report::StoryTodo],
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -267,33 +422,38 @@ fn basename(file: &str) -> String {
 }
 
 fn artifacts_stage(artifacts: &[StoryArtifact]) -> Option<StoryStageView> {
-    if artifacts.is_empty() {
-        return None;
-    }
-    let items = artifacts
-        .iter()
-        .map(|artifact| match &artifact.symbol {
-            Some(symbol) => format!("{symbol} ({})", basename(&artifact.file)),
-            None => basename(&artifact.file),
-        })
-        .collect::<Vec<_>>();
-    let badges = artifacts
-        .iter()
-        .filter_map(|artifact| {
-            artifact
-                .superseded_receipt
-                .as_deref()
-                .map(|receipt| ReceiptBadgeView {
-                    text: format!("superseded at {}", short_oid(receipt)),
-                })
-        })
-        .collect::<Vec<_>>();
-    Some(StoryStageView {
-        slug: "artifacts",
+    (!artifacts.is_empty()).then_some(StoryStageView {
+        id: "S_ART",
         label: "ARTIFACTS",
-        detail: format!("Artifacts: {}", items.join(", ")),
-        badges,
     })
+}
+
+fn mermaid_for_stages(stages: &[StoryStageView]) -> String {
+    let mut lines = vec![
+        "stateDiagram-v2".to_string(),
+        "    direction LR".to_string(),
+    ];
+    lines.extend(
+        stages
+            .iter()
+            .map(|stage| format!("    state \"{}\" as {}", stage.label, stage.id)),
+    );
+    lines.extend(
+        stages
+            .windows(2)
+            .map(|pair| format!("    {} --> {}", pair[0].id, pair[1].id)),
+    );
+    lines.join("\n")
+}
+
+fn json_for_html_script<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value)
+        .expect("episode report data contains only infallibly serializable fields")
+        .replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 fn story_card(session: &StorySession) -> Option<StoryCardView> {
@@ -320,77 +480,26 @@ fn story_card(session: &StorySession) -> Option<StoryCardView> {
         return None;
     };
 
-    let input = request
-        .or_else(|| {
-            session
-                .first_prompt
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .map(|value| StoryStageView {
-            slug: "input",
-            label: "INPUT",
-            detail: truncate_chars(&plain_text(value), 300),
-            badges: Vec::new(),
-        });
-
-    let investigated = session
-        .investigated
-        .iter()
-        .map(|file| basename(file))
-        .filter(|file| !file.is_empty())
-        .take(6)
-        .collect::<Vec<_>>();
-    let deliberation_detail = match (narrative, investigated.is_empty()) {
-        (Some(story), false) => Some(format!(
-            "{} Investigated: {}",
-            plain_text(story),
-            investigated.join(", ")
-        )),
-        (Some(story), true) => Some(plain_text(story)),
-        (None, false) => Some(format!("Investigated: {}", investigated.join(", "))),
-        (None, true) => None,
-    };
-    let deliberation = deliberation_detail.map(|detail| StoryStageView {
-        slug: "deliberation",
-        label: "DELIBERATION",
-        detail,
-        badges: Vec::new(),
+    let input_text = request.or_else(|| {
+        session
+            .first_prompt
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let input = input_text.map(|_| StoryStageView {
+        id: "S_INPUT",
+        label: "INPUT",
     });
 
-    let steer_detail = if outcome.is_none() && session.todos.is_empty() {
-        None
-    } else {
-        let mut parts = Vec::new();
-        if let Some(value) = outcome {
-            parts.push(format!("Outcome: {}", plain_text(value)));
-        }
-        if !session.todos.is_empty() {
-            let todos = session
-                .todos
-                .iter()
-                .map(|todo| {
-                    if todo.status.trim().is_empty() {
-                        plain_text(&todo.content)
-                    } else {
-                        format!(
-                            "{} [{}]",
-                            plain_text(&todo.content),
-                            plain_text(&todo.status)
-                        )
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            parts.push(format!("Todos: {todos}"));
-        }
-        Some(parts.join(". "))
-    };
-    let steer = steer_detail.map(|detail| StoryStageView {
-        slug: "steer",
+    let deliberation =
+        (narrative.is_some() || !session.investigated.is_empty()).then_some(StoryStageView {
+            id: "S_DELIB",
+            label: "DELIBERATION",
+        });
+
+    let steer = (outcome.is_some() || !session.todos.is_empty()).then_some(StoryStageView {
+        id: "S_STEER",
         label: "STEER",
-        detail,
-        badges: Vec::new(),
     });
 
     let mut stages = Vec::with_capacity(4);
@@ -398,7 +507,36 @@ fn story_card(session: &StorySession) -> Option<StoryCardView> {
     stages.extend(deliberation);
     stages.extend(artifacts_stage(&session.artifacts));
     stages.extend(steer);
-    debug_assert!(stages.iter().all(|stage| !stage.detail.trim().is_empty()));
+    let stage_ids = stages
+        .iter()
+        .map(|stage| stage.id)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mermaid = mermaid_for_stages(&stages);
+
+    let artifacts = session
+        .artifacts
+        .iter()
+        .map(|artifact| StoryArtifactView {
+            label: artifact
+                .symbol
+                .clone()
+                .unwrap_or_else(|| basename(&artifact.file)),
+            file: artifact.file.clone(),
+            receipt_badge: artifact
+                .superseded_receipt
+                .as_deref()
+                .map(|receipt| format!("superseded at {}", short_oid(receipt))),
+        })
+        .collect();
+    let episode_json = json_for_html_script(&EpisodeDataView {
+        request: input_text,
+        narrative,
+        investigated: &session.investigated,
+        artifacts: &session.artifacts,
+        outcome,
+        todos: &session.todos,
+    });
 
     let summary = narrative
         .map(first_sentence)
@@ -433,7 +571,10 @@ fn story_card(session: &StorySession) -> Option<StoryCardView> {
         session_short: short_oid(&session.session_id),
         tier_slug,
         tier_label,
-        stages,
+        stage_ids,
+        mermaid,
+        artifacts,
+        episode_json,
     })
 }
 
@@ -510,7 +651,9 @@ fn render_html(data: &DreamReportData) -> Result<String> {
     let rendered = tmpl
         .render(minijinja::context! { data => minijinja::Value::from_serialize(data) })
         .context("rendering dream report template")?;
-    Ok(rendered)
+    let scripts =
+        format!("<script>{MERMAID_SOURCE}</script>\n<script>{STORY_SCRIPT}</script>\n</body>");
+    Ok(rendered.replacen("</body>", &scripts, 1))
 }
 
 /// Default output path: `~/.claude-self-reflect/reports/dream-<YYYY-MM-DD>.html`.
@@ -561,6 +704,45 @@ mod tests {
     use super::*;
     use crate::storage::witness_ledger::{self, WitnessLedgerRow};
     use crate::storage::witness_verdicts::{self, VerdictKind, WitnessVerdictRow};
+    use std::collections::BTreeSet;
+
+    const EPISODE_DATA_OPEN: &str = r#"<script type="application/json" class="episode-data">"#;
+
+    fn mermaid_blocks(html: &str) -> Vec<&str> {
+        html.split(r#"<pre class="mermaid">"#)
+            .skip(1)
+            .filter_map(|tail| tail.split_once("</pre>").map(|(block, _)| block))
+            .collect()
+    }
+
+    fn mermaid_stage_ids(block: &str) -> BTreeSet<&str> {
+        block
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+            .filter(|token| token.starts_with("S_"))
+            .collect()
+    }
+
+    fn episode_data_blocks(html: &str) -> Vec<serde_json::Value> {
+        html.split(EPISODE_DATA_OPEN)
+            .skip(1)
+            .map(|tail| {
+                let (json, _) = tail
+                    .split_once("</script>")
+                    .expect("episode-data script must be closed");
+                serde_json::from_str(json).expect("episode-data must contain valid JSON")
+            })
+            .collect()
+    }
+
+    fn assert_no_external_resources(html: &str) {
+        let lower = html.to_ascii_lowercase();
+        for forbidden in [r#"src="http"#, r#"href="http"#, "cdn.", "integrity="] {
+            assert!(
+                !lower.contains(forbidden),
+                "report must not contain external resource reference {forbidden:?}"
+            );
+        }
+    }
 
     fn seed_episode(
         storage: &Storage,
@@ -680,9 +862,18 @@ mod tests {
         assert!(html.contains("No session has enough story signal"));
         assert!(html.contains("<!doctype html>"));
         assert!(html.contains("CSR Dream Journal"));
-        assert!(!html.to_lowercase().contains("<script"));
-        assert!(!html.contains("http://"));
-        assert!(!html.contains("https://"));
+        assert_no_external_resources(&html);
+        assert_eq!(
+            html.matches(r#""use strict";var __esbuild_esm_mermaid_nm;"#)
+                .count(),
+            1,
+            "the vendored Mermaid runtime must be embedded exactly once"
+        );
+        assert_eq!(
+            html.matches("mermaid.initialize({startOnLoad:true})")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -756,7 +947,7 @@ mod tests {
     /// auto-escaping depends on TEMPLATE_NAME ending in `.html`. This regression
     /// test fails if that wiring is ever broken (e.g. the template gets renamed).
     #[test]
-    fn hostile_symbol_names_are_html_escaped() {
+    fn hostile_symbol_names_are_escaped_in_html_and_episode_json() {
         let storage = Storage::open_memory().unwrap();
         let payload = "<script>alert(1)</script>";
         storage
@@ -793,6 +984,13 @@ mod tests {
         assert!(!html.contains(payload), "raw script tag leaked into HTML");
         // minijinja HTML-escapes `/` as well: </script> -> &lt;&#x2f;script&gt;
         assert!(html.contains("&lt;script&gt;alert(1)&lt;&#x2f;script&gt;"));
+        assert!(
+            html.contains(r#"\u003cscript\u003ealert(1)\u003c/script\u003e"#),
+            "JSON script context must neutralize HTML delimiters"
+        );
+        let episode_data = episode_data_blocks(&html);
+        assert_eq!(episode_data.len(), 1);
+        assert_eq!(episode_data[0]["artifacts"][0]["symbol"], payload);
     }
 
     #[test]
@@ -835,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn story_cards_render_full_flow_newest_first_without_scripts() {
+    fn story_cards_render_full_mermaid_flow_newest_first() {
         let storage = Storage::open_memory().unwrap();
         for (session, timestamp, story, symbol) in [
             (
@@ -875,10 +1073,14 @@ mod tests {
         let older = html.find("Older session summary.").unwrap();
         assert!(newer < older, "cards must render newest first");
         assert!(html.contains("data-tier=\"full\""));
-        for stage in ["input", "deliberation", "artifacts", "steer"] {
-            assert!(html.contains(&format!("data-stage=\"{stage}\"")));
+        let blocks = mermaid_blocks(&html);
+        assert_eq!(blocks.len(), 2);
+        let expected = BTreeSet::from(["S_INPUT", "S_DELIB", "S_ART", "S_STEER"]);
+        for block in blocks {
+            assert!(block.contains("stateDiagram-v2"));
+            assert!(block.contains("direction LR"));
+            assert_eq!(mermaid_stage_ids(block), expected);
         }
-        assert!(!html.to_lowercase().contains("<script"));
     }
 
     #[test]
@@ -902,10 +1104,13 @@ mod tests {
         let html = render_html(&data).unwrap();
 
         assert!(html.contains("data-tier=\"template\""));
-        assert!(html.contains("data-stage=\"input\""));
-        assert!(html.contains("data-stage=\"steer\""));
-        assert!(!html.contains("data-stage=\"deliberation\""));
-        assert!(!html.contains("data-stage=\"artifacts\""));
+        let blocks = mermaid_blocks(&html);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            mermaid_stage_ids(blocks[0]),
+            BTreeSet::from(["S_INPUT", "S_STEER"]),
+            "tier-2 cards must draw only their populated stages"
+        );
     }
 
     #[test]
@@ -952,9 +1157,68 @@ mod tests {
         assert!(html.contains("thin evidence"));
         assert!(html.contains("retired_symbol"));
         assert!(html.contains("superseded at abcdef12"));
-        assert!(html.contains("data-stage=\"artifacts\""));
-        assert!(!html.contains("data-stage=\"input\""));
-        assert!(!html.contains("data-stage=\"steer\""));
+        let blocks = mermaid_blocks(&html);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(mermaid_stage_ids(blocks[0]), BTreeSet::from(["S_ART"]));
+    }
+
+    #[test]
+    fn episode_data_json_round_trips_fixture_content() {
+        let storage = Storage::open_memory().unwrap();
+        let session_id = "episode-json-session";
+        seed_episode(
+            &storage,
+            session_id,
+            "2026-02-05T01:00:00Z",
+            "Trace the request exactly",
+            "shipped safely",
+            &["/repo/src/report.rs", "/repo/src/storage.rs"],
+            &[("publish follow-up", "pending")],
+        );
+        seed_story(
+            &storage,
+            session_id,
+            "2026-02-05T01:00:00Z",
+            "Narrative prose with exact fixture content.",
+        );
+        seed_anchor(
+            &storage,
+            session_id,
+            "2026-02-05T01:00:00Z",
+            "fixture_symbol",
+        );
+
+        let data = gather_report_data_with(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        )
+        .unwrap();
+        let html = render_html(&data).unwrap();
+        let episodes = episode_data_blocks(&html);
+
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0]["request"], "Trace the request exactly");
+        assert_eq!(
+            episodes[0]["narrative"],
+            "Narrative prose with exact fixture content."
+        );
+        assert_eq!(
+            episodes[0]["investigated"],
+            serde_json::json!(["/repo/src/report.rs", "/repo/src/storage.rs"])
+        );
+        assert_eq!(episodes[0]["outcome"], "shipped safely");
+        assert_eq!(
+            episodes[0]["todos"],
+            serde_json::json!([{"content": "publish follow-up", "status": "pending"}])
+        );
+        assert_eq!(
+            episodes[0]["artifacts"],
+            serde_json::json!([{
+                "symbol": "fixture_symbol",
+                "file": "/repo/src/lib.rs",
+                "conversations": [session_id]
+            }])
+        );
     }
 
     #[test]
