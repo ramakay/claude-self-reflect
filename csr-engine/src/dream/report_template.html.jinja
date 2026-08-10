@@ -212,25 +212,6 @@
     </div>
   </header>
 
-  <div class="totals">
-    <div class="stat obsolete">
-      <span class="n">{{ data.totals.obsolete }}</span>
-      <span class="label">Obsolete</span>
-    </div>
-    <div class="stat superseded">
-      <span class="n">{{ data.totals.superseded }}</span>
-      <span class="label">Superseded</span>
-    </div>
-    <div class="stat reinstated">
-      <span class="n">{{ data.totals.reinstated }}</span>
-      <span class="label">Reinstated</span>
-    </div>
-    <div class="stat">
-      <span class="n">{{ data.totals.total }}</span>
-      <span class="label">Total events</span>
-    </div>
-  </div>
-
   {% if data.is_empty %}
   <div class="empty-state">
     <span class="glyph">☾</span>
