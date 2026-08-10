@@ -114,8 +114,9 @@ enum Commands {
         /// Run the LIVE north-star probe against the real index (no fixture)
         #[arg(long = "continuity-live")]
         continuity_live: bool,
-        /// Provenance regression benchmark: reinstatement walk vs one-shot kNN (Saga
-        /// Phase 1 WS2). LOCAL opt-in only — never part of default eval/--full, never CI.
+        /// Provenance regression benchmark: reinstatement walk vs one-shot kNN.
+        /// Also runs as part of `--full` (no-op-killer gate: `csr_why` machinery
+        /// must genuinely engage — exit 1 on regression).
         #[arg(long)]
         provenance: bool,
         /// Run the deterministic code-graph release gate
@@ -428,6 +429,21 @@ async fn main() -> Result<()> {
             .await
         };
         print!("{}", report.format_text());
+        if full {
+            // No-op-killer gate: the reinstatement machinery must genuinely
+            // engage. Part of --full so it cannot silently rot as a local
+            // opt-in nobody runs.
+            let prov = csr_engine::eval::provenance::run_provenance(
+                eng.storage(),
+                eng.embeddings(),
+                eng.search(),
+            )
+            .await?;
+            print!("{}", prov.text);
+            if prov.regression {
+                std::process::exit(1);
+            }
+        }
         return Ok(());
     }
 

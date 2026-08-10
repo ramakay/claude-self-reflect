@@ -100,6 +100,7 @@ async fn arm_a_convs(
     Ok(cands.into_iter().map(|(_, c)| c).collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn provenance_gate_failed(
     ran_any: bool,
     total_a: usize,
@@ -107,12 +108,25 @@ fn provenance_gate_failed(
     structural_graph_engagement: usize,
     episode_engagement: usize,
     receipts_valid: bool,
+    gt_queries: usize,
+    gt_queries_engaged: usize,
 ) -> bool {
+    // Aggregate sums alone are theatre: one engaged query can mask every
+    // other query running inert. Every query with reachable ground truth
+    // must engage at least one machinery route on its own.
     !ran_any
         || total_b < total_a
         || structural_graph_engagement == 0
         || episode_engagement == 0
         || !receipts_valid
+        || gt_queries_engaged < gt_queries
+}
+
+/// Zero reachable ground truth while a corpus is present means the
+/// machinery is UNVERIFIABLE, not fine — fail closed. Only a genuinely
+/// empty database (fresh install, nothing imported) may skip.
+fn zero_gt_is_regression(total_chunks: usize, gt_possible: usize) -> bool {
+    gt_possible == 0 && total_chunks > 0
 }
 
 fn rendered_route_counts(output: &str) -> (usize, usize, usize) {
@@ -185,6 +199,8 @@ pub async fn run_provenance(
     let mut episode_engagement = 0usize;
     let mut receipts_valid = true;
     let mut ran_any = false;
+    let mut gt_queries = 0usize;
+    let mut gt_queries_engaged = 0usize;
 
     for (qi, q) in QUERIES.iter().enumerate() {
         let gt = storage
@@ -233,6 +249,12 @@ pub async fn run_provenance(
         structural_graph_engagement += b_result.trace.structural_graph_accepted;
         episode_engagement += b_result.trace.episode_accepted;
         receipts_valid &= receipt_valid;
+        if !gt.is_empty() {
+            gt_queries += 1;
+            if b_result.trace.structural_graph_accepted > 0 || b_result.trace.episode_accepted > 0 {
+                gt_queries_engaged += 1;
+            }
+        }
 
         lines.push_str(&format!(
             "Q{} A={} B={} gt={} structural_graph={} episodes={} receipt_ok={}\n{}\n",
@@ -248,12 +270,19 @@ pub async fn run_provenance(
     }
 
     if gt_possible == 0 {
+        let regression = zero_gt_is_regression(total_chunks, gt_possible);
         return Ok(ProvenanceReport {
             text: format!(
-                "{lines}\nprovenance eval skipped: zero GT sessions reachable across {} queries\n",
-                QUERIES.len()
+                "{lines}\nprovenance eval: zero GT sessions reachable across {} queries with {} chunks present — {}\n",
+                QUERIES.len(),
+                total_chunks,
+                if regression {
+                    "machinery unverifiable, FAILING CLOSED"
+                } else {
+                    "empty corpus, skipped"
+                }
             ),
-            regression: false,
+            regression,
         });
     }
 
@@ -268,9 +297,11 @@ pub async fn run_provenance(
         structural_graph_engagement,
         episode_engagement,
         receipts_valid,
+        gt_queries,
+        gt_queries_engaged,
     );
     lines.push_str(&format!(
-        "\n================ SUMMARY ================\nqueries: {} | total GT sessions reachable: {}\nGT coverage A={} B={} | structural graph engagement={} | episode engagement={} | rendered receipts valid={}\n",
+        "\n================ SUMMARY ================\nqueries: {} | total GT sessions reachable: {}\nGT coverage A={} B={} | structural graph engagement={} | episode engagement={} | rendered receipts valid={}\nGT-bearing queries engaged: {gt_queries_engaged}/{gt_queries} (each must engage on its own — sums alone are theatre)\n",
         QUERIES.len(),
         gt_possible,
         total_a,
@@ -341,11 +372,25 @@ mod tests {
 
     #[test]
     fn blend_only_coverage_tie_fails_the_provenance_gate() {
-        assert!(provenance_gate_failed(false, 0, 0, 0, 0, true));
-        assert!(provenance_gate_failed(true, 4, 4, 0, 0, true));
-        assert!(provenance_gate_failed(true, 4, 4, 1, 0, true));
-        assert!(provenance_gate_failed(true, 4, 4, 1, 1, false));
-        assert!(!provenance_gate_failed(true, 4, 4, 1, 1, true));
+        assert!(provenance_gate_failed(false, 0, 0, 0, 0, true, 0, 0));
+        assert!(provenance_gate_failed(true, 4, 4, 0, 0, true, 2, 2));
+        assert!(provenance_gate_failed(true, 4, 4, 1, 0, true, 2, 2));
+        assert!(provenance_gate_failed(true, 4, 4, 1, 1, false, 2, 2));
+        assert!(!provenance_gate_failed(true, 4, 4, 1, 1, true, 2, 2));
+    }
+
+    #[test]
+    fn one_engaged_query_cannot_mask_inert_gt_queries() {
+        // Sums look healthy (graph=3, episodes=2) but only 1 of 3 GT-bearing
+        // queries engaged any route — the aggregate-masking escape must fail.
+        assert!(provenance_gate_failed(true, 4, 4, 3, 2, true, 3, 1));
+        assert!(!provenance_gate_failed(true, 4, 4, 3, 2, true, 3, 3));
+    }
+
+    #[test]
+    fn zero_gt_with_corpus_present_fails_closed_but_empty_db_skips() {
+        assert!(zero_gt_is_regression(151_744, 0));
+        assert!(!zero_gt_is_regression(0, 0));
     }
 
     #[test]
