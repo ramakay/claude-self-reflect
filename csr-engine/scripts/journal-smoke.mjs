@@ -206,12 +206,31 @@ function buildFixtureSql() {
       investigated: [],
       artifacts: [],
     },
+    // Journal v2 Phase 5: a verdict-bearing session for the SINCE THEN
+    // payback panel — no episode_anchors artifacts here, since the panel's
+    // primary symbol source is `code_node_attribution` (seeded separately
+    // below via `sinceThenSql`), and mixing the two would make the "which
+    // source won" assertion ambiguous.
+    {
+      id: "rich9",
+      daysAgo: 0,
+      hour: 23,
+      minute: 0,
+      project: "proj-alpha",
+      request: "Refactor the retry backoff",
+      outcome: "shipped the backoff fix",
+      todos: [["adjust compute_delay clamp", "pending"]],
+      investigated: [],
+      artifacts: [],
+    },
   ];
   // Phase 2 (§7.2): "rich2" is deliberately left uninstrumented at the
   // episode layer (no `instrumentation` above) AND given an oversized
   // on-disk transcript below (see `makeOversizedTranscript`) — the
   // report-time backfill must resolve it, decline to parse it, and mark it
   // "not scanned" without ever fabricating an errors segment for it.
+  // "rich2" also carries no code_node_attribution/episode_anchors rows at
+  // all, making it the SINCE THEN "absent" fixture case.
 
   const thinEntries = [
     { id: "thin1", daysAgo: 0, hour: 7, minute: 0, project: "thin-alpha", prompt: "check the logs" },
@@ -264,7 +283,39 @@ function buildFixtureSql() {
       )}, 1);`,
     );
   }
-  return { sql: lines.join("\n") + "\n", episodes, thinEntries };
+
+  // Journal v2 Phase 5 SINCE THEN fixture: "rich9" touched three symbols via
+  // `code_node_attribution` (not `episode_anchors`) — one superseded (with a
+  // receipt), one witnessed-but-unverdicted ("still live"), one attributed
+  // but never witnessed at all ("unverified"). The superseded verdict is
+  // dated the same calendar day as rich9's own episode timestamp, so the
+  // day-header digest ("while away: N anchors retired") has real evidence.
+  const rich9Ts = isoDaysAgo(0, 23, 0);
+  const rich9Day = rich9Ts.slice(0, 10);
+  lines.push(
+    `INSERT INTO code_nodes (id, project, file, kind, name, first_conv_id, last_conv_id) VALUES
+      ('node-rich9-retry_backoff', 'proj-alpha', '/repo/src/retry.rs', 'function', 'retry_backoff', '', ''),
+      ('node-rich9-compute_delay', 'proj-alpha', '/repo/src/retry.rs', 'function', 'compute_delay', '', ''),
+      ('node-rich9-parse_config', 'proj-alpha', '/repo/src/retry.rs', 'function', 'parse_config', '', '');`,
+    `INSERT INTO code_node_attribution (node_id, channel, source_id, observed_ts, evidence) VALUES
+      ('node-rich9-retry_backoff', 'transcript', 'rich9', ${sqlString(rich9Ts)}, 'coedit_event'),
+      ('node-rich9-compute_delay', 'transcript', 'rich9', ${sqlString(rich9Ts)}, 'coedit_event'),
+      ('node-rich9-parse_config', 'transcript', 'rich9', ${sqlString(rich9Ts)}, 'coedit_event');`,
+    `INSERT INTO witness_ledger
+        (project, file, symbol, span_start, span_end, stamp, tier, at_oid, source_kind, source_id)
+     VALUES
+      ('proj-alpha', '/repo/src/retry.rs', 'retry_backoff', 1, 3, 'b3:retry_backoff', 'committed', 'oldoid-retry', 'backfill', 'oldoid-retry'),
+      ('proj-alpha', '/repo/src/retry.rs', 'compute_delay', 1, 3, 'b3:compute_delay', 'committed', 'oldoid-delay', 'backfill', 'oldoid-delay');`,
+    `INSERT INTO witness_verdicts
+        (witness_id, verdict, successor_witness_id, receipt_oid, observed_head_oid, created_at)
+     VALUES (
+       (SELECT id FROM witness_ledger WHERE symbol = 'retry_backoff'),
+       'superseded_by', NULL, 'deadbeefcafe0123', 'headoid',
+       ${sqlString(rich9Day + " 12:00:00")}
+     );`,
+  );
+
+  return { sql: lines.join("\n") + "\n", episodes, thinEntries, rich9Day };
 }
 
 /** 64 MiB + 1 byte — one past `MAX_TRANSCRIPT_SCAN_BYTES` (must track
@@ -316,7 +367,7 @@ function seedFixtureAndRender(workDir) {
   // for a brand-new install.
   runBinary(["--db-path", dbPath, "--projects-dir", projectsDir, "dream", "--report", "--no-open", "--out", path.join(workDir, "bootstrap.html")]);
 
-  const { sql, episodes, thinEntries } = buildFixtureSql();
+  const { sql, episodes, thinEntries, rich9Day } = buildFixtureSql();
   const sqlPath = path.join(workDir, "fixture.sql");
   writeFileSync(sqlPath, sql);
   const seed = spawnSync("sqlite3", [dbPath], { input: sql, encoding: "utf8" });
@@ -344,7 +395,7 @@ function seedFixtureAndRender(workDir) {
     reportPath,
   ]);
 
-  return { reportPath, episodes, thinEntries };
+  return { reportPath, episodes, thinEntries, rich9Day };
 }
 
 // --- minimal CDP client -------------------------------------------------
@@ -628,6 +679,32 @@ async function main() {
         JSON.stringify(recencyState),
       );
       const initialSequence = recencyState.sequence;
+
+      // ---- day-digest (journal v2 Phase 5) -----------------------------------
+      // Server-rendered only, in the default recency view before any sort
+      // button is clicked — the client-side JS re-sort (used for group/type,
+      // and for clicking back to recency) rebuilds `.group-header`s from
+      // scratch with no digest data at all, so this must run before
+      // `sort-group` below touches anything. Exactly one day-header in the
+      // fixture carries real dream activity (rich9's superseded verdict,
+      // dated the same day as its episode) — every other day-header must
+      // show no digest line.
+      const dayDigest = await evalJS(
+        cdp,
+        `(() => {
+          const headers = Array.from(document.querySelectorAll(".group-header"));
+          const digests = headers.map((header) => {
+            const next = header.nextElementSibling;
+            return next && next.classList.contains("dream-digest") ? next.textContent : null;
+          });
+          return { digestCount: digests.filter(Boolean).length, digests };
+        })()`,
+      );
+      check(
+        "day-digest",
+        dayDigest.digestCount === 1 && /1 anchor retired/.test(dayDigest.digests.find(Boolean) || ""),
+        JSON.stringify(dayDigest),
+      );
 
       // ---- sort-group ------------------------------------------------
       await evalJS(cdp, `document.querySelector('[data-sort="group"]').click(); true`);
@@ -1057,6 +1134,64 @@ async function main() {
         postitSteers.lineCount > 0 && postitSteers.allPostIt,
         JSON.stringify(postitSteers),
       );
+
+      // ---- since-then-panel (journal v2 Phase 5) ----------------------------
+      // "rich9" carries 3 attributed symbols: retry_backoff (superseded, with
+      // a receipt), compute_delay (witnessed, no verdict -> still live, and
+      // named by an open todo -> gets a so-clause), parse_config (attributed
+      // but never witnessed -> unverified, no so-clause).
+      const sinceThenPanel = await evalJS(
+        cdp,
+        `(() => {
+          document.querySelector('.index-row[data-session="rich9"]').click();
+          const pane = document.querySelector('.detail-pane[data-session="rich9"]');
+          const panel = pane ? pane.querySelector(".since-then") : null;
+          if (!panel) return { skipped: true };
+          const rows = Array.from(panel.querySelectorAll(".since-then-row"));
+          const bySymbol = {};
+          for (const row of rows) {
+            const symbol = row.querySelector(".symbol")?.textContent || "";
+            const conclusion = row.querySelector(".conclusion");
+            bySymbol[symbol] = {
+              conclusionSlug: conclusion ? conclusion.className.replace("conclusion ", "") : null,
+              conclusionText: conclusion ? conclusion.textContent : null,
+              hasSoClause: !!row.querySelector(".so-clause"),
+              whyHint: row.querySelector(".why-hint")?.textContent || null,
+            };
+          }
+          const kpiText = panel.querySelector(".since-then-kpi")?.textContent || "";
+          return { rowCount: rows.length, bySymbol, kpiText };
+        })()`,
+      );
+      const sinceThenOk =
+        !sinceThenPanel.skipped &&
+        sinceThenPanel.rowCount === 3 &&
+        sinceThenPanel.bySymbol.retry_backoff?.conclusionSlug === "superseded" &&
+        /superseded ⌗deadbeef/.test(sinceThenPanel.bySymbol.retry_backoff?.conclusionText || "") &&
+        sinceThenPanel.bySymbol.retry_backoff?.hasSoClause &&
+        sinceThenPanel.bySymbol.compute_delay?.conclusionSlug === "live" &&
+        sinceThenPanel.bySymbol.compute_delay?.hasSoClause &&
+        sinceThenPanel.bySymbol.parse_config?.conclusionSlug === "unverified" &&
+        !sinceThenPanel.bySymbol.parse_config?.hasSoClause &&
+        sinceThenPanel.bySymbol.retry_backoff?.whyHint === 'csr_why("retry_backoff")' &&
+        /3 symbols? touched/.test(sinceThenPanel.kpiText) &&
+        /1 superseded since/.test(sinceThenPanel.kpiText) &&
+        /1 still live/.test(sinceThenPanel.kpiText) &&
+        /1 unverified/.test(sinceThenPanel.kpiText);
+      check("since-then-panel", sinceThenOk, JSON.stringify(sinceThenPanel));
+
+      // ---- since-then-absent (journal v2 Phase 5) ----------------------------
+      // "rich2" has no episode_anchors and no code_node_attribution rows at
+      // all — the panel must be entirely absent, never an empty shell.
+      const sinceThenAbsent = await evalJS(
+        cdp,
+        `(() => {
+          document.querySelector('.index-row[data-session="rich2"]').click();
+          const pane = document.querySelector('.detail-pane[data-session="rich2"]');
+          return { hasPanel: !!(pane && pane.querySelector(".since-then")) };
+        })()`,
+      );
+      check("since-then-absent", sinceThenAbsent.hasPanel === false, JSON.stringify(sinceThenAbsent));
 
       cdp.close();
     } finally {

@@ -908,6 +908,168 @@ pub(crate) fn symbol_verdict_states_for_lineages(
     Ok(out)
 }
 
+// --- SINCE THEN payback panel (journal v2 Phase 5) --------------------------
+//
+// The panel renders the dream's RE-DELIBERATION about a symbol, not the
+// two-channel demote/annotate calculus `symbol_verdict_state` resolves for
+// chunk ranking (that answers "how should search treat this chunk today";
+// this answers "what did the dream conclude, last, in plain language" for a
+// human reading the journal — dreaming-subconscious-principles.md's "double
+// deliberation" frame).
+
+/// The dream's most recent conclusion about one `(project, file, symbol)`
+/// anchor: the single latest `witness_verdicts` event across every witness
+/// of the symbol (not latest-per-witness — SINCE THEN is a human-readable
+/// journal entry, not a ranking input).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SinceThenConclusion {
+    /// `None` when no verdict event has ever been recorded for this symbol
+    /// — see `witnessed` to distinguish "dream never looked at this" from
+    /// "dream looked, found it intact."
+    pub verdict: Option<VerdictKind>,
+    pub receipt_oid: Option<String>,
+    /// `witness_verdicts.created_at`; set only alongside `verdict`.
+    pub event_date: Option<String>,
+    /// `true` when at least one `witness_ledger` row exists for this
+    /// anchor — i.e. codewitness has actually observed it, even if no
+    /// verdict event ever followed. `false` combined with `verdict: None`
+    /// is the UNVERIFIED case: no evidence exists at all, and per the
+    /// dreaming principles doc ("honest forgetting") absence of evidence is
+    /// never rendered as "live."
+    pub witnessed: bool,
+}
+
+/// Resolve [`SinceThenConclusion`] for one symbol. Deliberately a plain
+/// "what happened last" read, not `symbol_verdict_state`'s current-state
+/// resolution — a symbol that was superseded and later reinstated shows as
+/// `reinstated` here (the dream's LATEST word on it), while
+/// `symbol_verdict_state` would fold that same history into "not demoted."
+/// Both are correct for their own question; SINCE THEN asks the human's
+/// question ("what's the last thing the dream concluded"), not the ranker's.
+pub fn since_then_conclusion(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    symbol: &str,
+) -> Result<SinceThenConclusion> {
+    let event = conn
+        .query_row(
+            "SELECT v.verdict, v.receipt_oid, v.created_at
+             FROM witness_verdicts v
+             JOIN witness_ledger wl ON wl.id = v.witness_id
+             WHERE wl.project = ?1 AND wl.file = ?2 AND wl.symbol = ?3
+             ORDER BY v.id DESC LIMIT 1",
+            params![project, file, symbol],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((verdict_str, receipt_oid, event_date)) = event {
+        return Ok(SinceThenConclusion {
+            verdict: VerdictKind::parse(&verdict_str),
+            receipt_oid,
+            event_date: Some(event_date),
+            witnessed: true,
+        });
+    }
+    let witnessed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM witness_ledger
+             WHERE project = ?1 AND file = ?2 AND symbol = ?3)",
+        params![project, file, symbol],
+        |row| row.get(0),
+    )?;
+    Ok(SinceThenConclusion {
+        verdict: None,
+        receipt_oid: None,
+        event_date: None,
+        witnessed,
+    })
+}
+
+/// The claim of an OPEN (not yet promoted to `resolution_ledger`) proposal
+/// bound to one of a symbol's witnesses — the SINCE THEN panel's "so"
+/// evidence source #2 (a `resolution_proposals` row awaiting `csr_resolve`).
+/// `None` when the symbol has no witness at all, or no chunk bound to one of
+/// its witnesses carries a still-open proposal. Same "not yet promoted"
+/// predicate as `Storage::recap_open_proposals`.
+pub fn open_proposal_claim_for_symbol(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    symbol: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT p.claim
+         FROM witness_ledger wl
+         JOIN witness_chunk_bindings b ON b.witness_id = wl.id
+         JOIN resolution_proposals p ON p.chunk_id = b.chunk_id
+         WHERE wl.project = ?1 AND wl.file = ?2 AND wl.symbol = ?3
+           AND NOT EXISTS (
+               SELECT 1 FROM resolution_ledger r
+               WHERE r.chunk_id = p.chunk_id
+                 AND julianday(r.created_at) > julianday(p.created_at)
+           )
+         ORDER BY p.id DESC LIMIT 1",
+        params![project, file, symbol],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// One calendar day's (`YYYY-MM-DD`, UTC) dream activity — the journal
+/// index's optional day-header digest: "while away: N anchors retired, M
+/// proposals open."
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DayDigest {
+    pub retired_count: i64,
+    pub proposal_count: i64,
+    /// Full commit oids of every retirement that day, newest first — for the
+    /// digest line's `title` attribute (receipts, not the visible chip
+    /// text).
+    pub receipts: Vec<String>,
+}
+
+/// Resolve [`DayDigest`] for one calendar day. Unscoped by project — the
+/// journal report itself groups sessions across every project in one
+/// timeline, so the digest matches that same corpus-wide scope (consistent
+/// with `DreamReportData::totals`, which is also corpus-wide).
+pub fn day_digest(conn: &Connection, day: &str) -> Result<DayDigest> {
+    let mut stmt = conn.prepare(
+        "SELECT receipt_oid FROM witness_verdicts
+         WHERE verdict IN ('superseded_by', 'anchor_obsolete')
+           AND SUBSTR(datetime(created_at), 1, 10) = ?1
+         ORDER BY id DESC",
+    )?;
+    let receipt_rows: Vec<Option<String>> = stmt
+        .query_map(params![day], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let retired_count = receipt_rows.len() as i64;
+    let receipts: Vec<String> = receipt_rows.into_iter().flatten().collect();
+
+    let proposal_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resolution_proposals p
+         WHERE SUBSTR(datetime(p.created_at), 1, 10) = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM resolution_ledger r
+               WHERE r.chunk_id = p.chunk_id
+                 AND julianday(r.created_at) > julianday(p.created_at)
+           )",
+        params![day],
+        |row| row.get(0),
+    )?;
+    Ok(DayDigest {
+        retired_count,
+        proposal_count,
+        receipts,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1560,5 +1722,133 @@ mod tests {
         let conn = open();
         witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
         assert!(all_demoted_symbols(&conn).unwrap().is_empty());
+    }
+
+    // ---- SINCE THEN (journal v2 Phase 5) -----------------------------------
+
+    #[test]
+    fn since_then_conclusion_unverified_when_never_witnessed() {
+        let conn = open();
+        let conclusion =
+            since_then_conclusion(&conn, "proj", "/repo/src/lib.rs", "never_seen").unwrap();
+        assert_eq!(conclusion.verdict, None);
+        assert!(!conclusion.witnessed);
+        assert_eq!(conclusion.receipt_oid, None);
+    }
+
+    #[test]
+    fn since_then_conclusion_still_live_when_witnessed_but_no_verdict() {
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        let conclusion = since_then_conclusion(&conn, "proj", "/repo/src/lib.rs", "foo").unwrap();
+        assert_eq!(conclusion.verdict, None);
+        assert!(
+            conclusion.witnessed,
+            "a ledger row exists — absence of a verdict must not read the same as absence of evidence"
+        );
+    }
+
+    #[test]
+    fn since_then_conclusion_reports_the_latest_event() {
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        let witness_id: i64 = conn
+            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id,
+                verdict: VerdictKind::SupersededBy,
+                successor_witness_id: None,
+                receipt_oid: Some("1234567890abcdef".into()),
+                observed_head_oid: "head1".into(),
+            },
+        )
+        .unwrap();
+        let conclusion = since_then_conclusion(&conn, "proj", "/repo/src/lib.rs", "foo").unwrap();
+        assert_eq!(conclusion.verdict, Some(VerdictKind::SupersededBy));
+        assert_eq!(conclusion.receipt_oid.as_deref(), Some("1234567890abcdef"));
+        assert!(conclusion.event_date.is_some());
+    }
+
+    #[test]
+    fn open_proposal_claim_ignores_promoted_and_absent_bindings() {
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        let witness_id: i64 = conn
+            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            open_proposal_claim_for_symbol(&conn, "proj", "/repo/src/lib.rs", "foo").unwrap(),
+            None,
+            "no chunk binding at all -> no proposal"
+        );
+        conn.execute(
+            "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES ('chunk-1', 'conv-1', 'proj', '2026-01-01T00:00:00Z', 'text', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO witness_chunk_bindings (witness_id, chunk_id) VALUES (?1, 'chunk-1')",
+            params![witness_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_proposals (chunk_id, claim, evidence, session_id, created_at)
+             VALUES ('chunk-1', 'foo looks resolved', 'task done', 'sess-1', '2026-01-02 00:00:00')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            open_proposal_claim_for_symbol(&conn, "proj", "/repo/src/lib.rs", "foo")
+                .unwrap()
+                .as_deref(),
+            Some("foo looks resolved")
+        );
+        conn.execute(
+            "INSERT INTO resolution_ledger (chunk_id, status, evidence, claim, created_at)
+             VALUES ('chunk-1', 'resolved', 'promoted', 'foo looks resolved', '2026-01-03 00:00:00')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            open_proposal_claim_for_symbol(&conn, "proj", "/repo/src/lib.rs", "foo").unwrap(),
+            None,
+            "a later promotion must retire the proposal as open evidence"
+        );
+    }
+
+    #[test]
+    fn day_digest_counts_only_the_given_day_and_carries_receipts() {
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        let witness_id: i64 = conn
+            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO witness_verdicts
+                (witness_id, verdict, receipt_oid, observed_head_oid, created_at)
+             VALUES (?1, 'superseded_by', 'deadbeef', 'head', '2026-02-10 09:00:00')",
+            params![witness_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO witness_verdicts
+                (witness_id, verdict, receipt_oid, observed_head_oid, created_at)
+             VALUES (?1, 'anchor_obsolete', NULL, 'head', '2026-02-11 09:00:00')",
+            params![witness_id],
+        )
+        .unwrap();
+
+        let digest = day_digest(&conn, "2026-02-10").unwrap();
+        assert_eq!(digest.retired_count, 1);
+        assert_eq!(digest.receipts, vec!["deadbeef".to_string()]);
+
+        let empty = day_digest(&conn, "2026-02-09").unwrap();
+        assert_eq!(empty.retired_count, 0);
+        assert_eq!(empty.proposal_count, 0);
+        assert!(empty.receipts.is_empty());
     }
 }

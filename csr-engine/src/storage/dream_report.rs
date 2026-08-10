@@ -573,6 +573,87 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
     Ok(rows.into_iter().map(|(_, session)| session).collect())
 }
 
+// --- SINCE THEN payback panel (journal v2 Phase 5) --------------------------
+
+/// One symbol row for a session's SINCE THEN panel — "this happened": the
+/// session touched `symbol` in `file`. `anchor_only` marks the fallback
+/// path (see [`load_since_then_symbols`]); `touched_at` is the row's
+/// recency sort key (an ISO-ish timestamp, sourced consistently within one
+/// call — either every row's `observed_ts`/`last_seen` or every row's
+/// `episode_anchors.created_at`, never a mix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SinceThenSymbol {
+    pub file: String,
+    pub symbol: String,
+    pub anchor_only: bool,
+    pub touched_at: String,
+}
+
+/// The symbols a session "happened" to touch, for the SINCE THEN panel
+/// (journal v2 Phase 5 spec). Primary source: `code_node_attribution` rows
+/// this session currently owns on the trusted `'transcript'` channel (one
+/// row per node — the session that last observed it, same channel
+/// `load_story_sessions`'s file-level artifact join already trusts). Only
+/// when that yields nothing does this fall back to `episode_anchors` for
+/// the session, labeled `anchor_only` — the plan's honest "anchor-only"
+/// disclosure for symbols with attribution-grade provenance never derived.
+pub(crate) fn load_since_then_symbols(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<SinceThenSymbol>> {
+    let mut out = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT cn.file, cn.name, COALESCE(a.observed_ts, cn.last_seen, '')
+             FROM code_node_attribution a
+             JOIN code_nodes cn ON cn.id = a.node_id
+             WHERE a.channel = 'transcript' AND a.source_id = ?1 AND cn.name != ''
+             ORDER BY cn.file, cn.name",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (file, symbol, touched_at) = row?;
+            out.push(SinceThenSymbol {
+                file,
+                symbol,
+                anchor_only: false,
+                touched_at,
+            });
+        }
+    }
+    if out.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT file, name, created_at
+             FROM episode_anchors
+             WHERE session_id = ?1
+             ORDER BY file, name",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (file, symbol, touched_at) = row?;
+            out.push(SinceThenSymbol {
+                file,
+                symbol,
+                anchor_only: true,
+                touched_at,
+            });
+        }
+    }
+    Ok(out)
+}
+
 // --- Report-time instrumentation backfill cache (plan §3.3a step 3) -------
 //
 // These two functions are the only place `session_instrumentation` is read
@@ -987,5 +1068,57 @@ mod tests {
         assert_eq!(session.completed.as_deref(), Some("shipped it"));
         assert_eq!(session.next_steps.as_deref(), Some("deploy"));
         assert_eq!(session.blockers.as_deref(), Some("none"));
+    }
+
+    // ---- SINCE THEN symbol loading (journal v2 Phase 5) --------------------
+
+    #[test]
+    fn since_then_symbols_prefer_attribution_over_anchors() {
+        let conn = memory_db();
+        conn.execute_batch(
+            r#"
+            INSERT INTO code_nodes (id, project, file, kind, name, first_conv_id, last_conv_id)
+            VALUES ('node-a', 'proj', '/repo/src/lib.rs', 'function', 'attributed_fn', '', '');
+            INSERT INTO code_node_attribution (node_id, channel, source_id, observed_ts, evidence)
+            VALUES ('node-a', 'transcript', 'sess-1', '2026-01-05T00:00:00Z', 'coedit_event');
+            INSERT INTO episode_anchors
+                (session_id, project, file, node_kind, name, body_hash, created_at)
+            VALUES ('sess-1', 'proj', '/repo/src/other.rs', 'function_item',
+                    'anchor_fn', 'hash', '2026-01-05 00:00:00');
+            "#,
+        )
+        .unwrap();
+
+        let symbols = super::load_since_then_symbols(&conn, "sess-1").unwrap();
+        assert_eq!(symbols.len(), 1, "attribution present -> anchors ignored");
+        assert_eq!(symbols[0].symbol, "attributed_fn");
+        assert!(!symbols[0].anchor_only);
+    }
+
+    #[test]
+    fn since_then_symbols_fall_back_to_anchors_labeled_anchor_only() {
+        let conn = memory_db();
+        conn.execute_batch(
+            r#"
+            INSERT INTO episode_anchors
+                (session_id, project, file, node_kind, name, body_hash, created_at)
+            VALUES ('sess-2', 'proj', '/repo/src/other.rs', 'function_item',
+                    'anchor_fn', 'hash', '2026-01-05 00:00:00');
+            "#,
+        )
+        .unwrap();
+
+        let symbols = super::load_since_then_symbols(&conn, "sess-2").unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].symbol, "anchor_fn");
+        assert!(symbols[0].anchor_only);
+    }
+
+    #[test]
+    fn since_then_symbols_empty_for_session_with_neither() {
+        let conn = memory_db();
+        assert!(super::load_since_then_symbols(&conn, "sess-3")
+            .unwrap()
+            .is_empty());
     }
 }

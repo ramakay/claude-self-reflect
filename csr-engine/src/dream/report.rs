@@ -17,9 +17,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::storage::dream_report::{self, StoryArtifact, StorySession};
+use crate::storage::witness_verdicts::{self, DayDigest, SinceThenConclusion, VerdictKind};
 use crate::storage::Storage;
 use crate::transcript::instrumentation::{ErrorEvent, SessionInstrumentation};
 
@@ -70,6 +72,7 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section class="mailbox" aria-label
       <div class="session-rows" role="listbox" aria-label="Sessions">
         {% for group in data.day_groups %}
         <p class="group-header">{{ group.label }}</p>
+        {% if group.digest %}<p class="dream-digest" title="{{ group.digest_title }}">{{ group.digest }}</p>{% endif %}
         {% for row in group.rows %}
         <button type="button" class="index-row{% if row.selected %} selected{% endif %}" data-session="{{ row.session_short }}" data-ts="{{ row.ts }}" data-project="{{ row.project }}" data-outcome="{{ row.outcome_slug }}" data-day="{{ row.day }}" role="option" aria-selected="{% if row.selected %}true{% else %}false{% endif %}">
           <span class="row-head"><span class="glyph {{ row.outcome_slug }}">{{ row.glyph }}</span><span class="project-pill">{{ row.project }}</span></span>
@@ -137,6 +140,29 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section class="mailbox" aria-label
           </details>
           {% endfor %}
         </div>
+        {% if pane.since_then %}
+        <div class="since-then" aria-label="Since then">
+          <p class="since-then-head">Since then</p>
+          <p class="since-then-kpi">
+            <span>{{ pane.since_then.kpi.symbols }} symbol{% if pane.since_then.kpi.symbols != 1 %}s{% endif %} touched</span>
+            {% if pane.since_then.kpi.superseded %}<span>{{ pane.since_then.kpi.superseded }} superseded since</span>{% endif %}
+            {% if pane.since_then.kpi.live %}<span>{{ pane.since_then.kpi.live }} still live</span>{% endif %}
+            {% if pane.since_then.kpi.unverified %}<span>{{ pane.since_then.kpi.unverified }} unverified</span>{% endif %}
+          </p>
+          <div class="since-then-rows">
+          {% for row in pane.since_then.rows %}
+            <div class="since-then-row">
+              <span class="symbol">{{ row.symbol }}</span>{% if row.anchor_only %} <span class="anchor-only-tag">(anchor-only)</span>{% endif %}
+              <span class="file">{{ row.file }}</span>
+              <p class="conclusion {{ row.conclusion_slug }}">{{ row.conclusion_label }}</p>
+              {% if row.so_clause %}<p class="so-clause">{{ row.so_clause }}</p>{% endif %}
+              <code class="why-hint">{{ row.why_hint }}</code>
+            </div>
+          {% endfor %}
+          </div>
+          {% if pane.since_then.more %}<p class="since-then-more">&#9656; +{{ pane.since_then.more }} more symbols</p>{% endif %}
+        </div>
+        {% endif %}
         {% if pane.artifacts %}
         <div class="artifact-bento" aria-label="Session artifacts">
         {% for artifact in pane.artifacts %}
@@ -476,6 +502,54 @@ const MAILBOX_CSS: &str = r#"
     border-radius: 999px;
   }
 
+  /* Journal v2 Phase 5: SINCE THEN payback panel — the dream's
+     re-deliberation, not a session log. Reuses the Phase 4 glass tile
+     register (--bg-card/--border/--radius-tile, same as .artifact-tile);
+     the "dream voice" text (conclusion + so-clause) takes the muted-purple
+     accent already used for --accent, distinguishing it from the plain
+     editorial black of the session's own narrative. */
+  .since-then { margin-top: 1rem; }
+  .since-then-head {
+    font-size: 0.72rem; font-weight: 800; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--fg-muted); margin: 0 0 0.4rem;
+  }
+  .since-then-kpi {
+    display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0 0 0.6rem;
+    font-size: 0.72rem; color: var(--fg-muted);
+  }
+  .since-then-kpi span {
+    border: 1px solid var(--border); border-radius: 999px; padding: 0.08rem 0.55rem;
+  }
+  .since-then-rows { display: grid; gap: 0.5rem; }
+  .since-then-row {
+    border: 1px solid var(--border); border-radius: var(--radius-tile);
+    background: var(--bg-card); padding: 0.6rem 0.75rem; font-size: 0.8rem;
+    line-height: 1.5; min-width: 0;
+  }
+  .since-then-row .symbol {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-weight: 650; overflow-wrap: anywhere;
+  }
+  .since-then-row .anchor-only-tag { color: var(--fg-muted); font-size: 0.7rem; }
+  .since-then-row .file {
+    display: block; color: var(--fg-muted); font-size: 0.74rem; overflow-wrap: anywhere;
+  }
+  .since-then-row .conclusion {
+    margin: 0.35rem 0 0; font-weight: 650; color: var(--purple); overflow-wrap: anywhere;
+  }
+  .since-then-row .conclusion.superseded,
+  .since-then-row .conclusion.obsolete { color: var(--red); }
+  .since-then-row .conclusion.unverified { color: var(--fg-muted); font-style: italic; font-weight: 550; }
+  .since-then-row .so-clause { margin: 0.3rem 0 0; color: var(--ink); overflow-wrap: anywhere; }
+  .since-then-row .why-hint {
+    display: block; margin-top: 0.35rem; font-size: 0.68rem; color: var(--fg-muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere;
+  }
+  .since-then-more { font-size: 0.72rem; color: var(--fg-muted); margin: 0.4rem 0 0; }
+  .dream-digest {
+    margin: 0 0.9rem 0.35rem; font-size: 0.68rem; color: var(--purple); opacity: 0.85;
+  }
+
   /* Staggered reveal (CSS-only — no data attribute, no JS, so the rendered
      HTML bytes are identical run to run; the determinism test asserts the
      markup, not the paint). `:nth-of-type` counts only sibling <button>s
@@ -658,6 +732,50 @@ struct StoryArtifactView {
     receipt_line: String,
 }
 
+/// One SINCE THEN row (journal v2 Phase 5): "this happened" (`symbol`/
+/// `file`) -> "the dream concluded" (`conclusion_label`) -> "so"
+/// (`so_clause`, rendered only when real evidence exists).
+#[derive(Debug, Clone, Serialize)]
+struct SinceThenRowView {
+    symbol: String,
+    file: String,
+    /// True when `symbol` came from the `episode_anchors` fallback rather
+    /// than trusted `code_node_attribution` — the template's "(anchor-only)"
+    /// disclosure.
+    anchor_only: bool,
+    /// Always present: "superseded ⌗oid8 · date", "obsolete, anchor gone ·
+    /// date", "reinstated · date", "still live, re-verified at HEAD", or
+    /// "unverified" — never omitted, never a fabricated "live".
+    conclusion_label: String,
+    /// CSS hook / KPI bucket: "superseded" | "obsolete" | "reinstated" |
+    /// "live" | "unverified".
+    conclusion_slug: &'static str,
+    /// `csr_why("<symbol>")` — rendered as copyable `<code>` text, never a
+    /// hyperlink (this is a static file, no MCP transport from HTML).
+    why_hint: String,
+    /// ONE evidenced next move — `None` means the row ends at the
+    /// conclusion with no advice (abstention-first: no evidence, no "so").
+    so_clause: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SinceThenKpiView {
+    symbols: usize,
+    /// Only segments with evidence are ever non-zero; the template drops a
+    /// zero segment entirely rather than rendering "0 superseded".
+    superseded: usize,
+    live: usize,
+    unverified: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SinceThenPanelView {
+    kpi: SinceThenKpiView,
+    rows: Vec<SinceThenRowView>,
+    /// Honest "+N more symbols" count for rows beyond `SINCE_THEN_CAP`.
+    more: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct StoryTodoView {
     glyph: &'static str,
@@ -779,6 +897,12 @@ struct StoryCardView {
     /// `<session>/subagents/agent-*.jsonl` sibling — the parent-only
     /// disclosure required by plan §8 R8.
     has_subagents: bool,
+    /// The SINCE THEN payback panel (journal v2 Phase 5) — `None` when the
+    /// session has no attributed symbols and no anchor fallback (panel
+    /// absent beats panel empty). Filled in by `build_since_then_panel`
+    /// after `build_story_card` returns, since that needs `Storage` access
+    /// this pure projection function does not take.
+    since_then: Option<SinceThenPanelView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -824,12 +948,23 @@ struct DetailPaneView {
     /// measured instrumentation (oversized, budget-exhausted, kill switch,
     /// or a read/parse failure).
     unscanned: bool,
+    /// The SINCE THEN payback panel (journal v2 Phase 5) — see
+    /// `StoryCardView::since_then`.
+    since_then: Option<SinceThenPanelView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct DayGroupView {
     label: String,
     rows: Vec<IndexRowView>,
+    /// "while away: N anchors retired, M proposals open" (journal v2 Phase
+    /// 5) — `None` when both counts are zero for this calendar day; never
+    /// an empty digest line.
+    digest: Option<String>,
+    /// Full commit oids backing `digest`, for the digest's `title`
+    /// attribute — receipts, not the visible chip text. Empty string when
+    /// `digest` is `None`.
+    digest_title: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1242,6 +1377,7 @@ fn build_story_card(session: &StorySession) -> StoryCardView {
         instrumentation: session.instrumentation.clone(),
         unscanned: false,
         has_subagents: false,
+        since_then: None,
     }
 }
 
@@ -1625,7 +1761,230 @@ fn detail_pane(card: &StoryCardView) -> DetailPaneView {
         artifacts_more,
         episode_json: card.episode_json.clone(),
         unscanned: card.unscanned,
+        since_then: card.since_then.clone(),
     }
+}
+
+// --- SINCE THEN payback panel (journal v2 Phase 5) --------------------------
+//
+// The panel renders the dream's RE-DELIBERATION about the symbols a session
+// touched, not a session log — see dreaming-subconscious-principles.md's
+// "double deliberation" frame. Every row is happened -> concluded -> so, and
+// every clause drops independently without evidence (abstention-first).
+
+/// Cap on rendered SINCE THEN rows — same discipline as `ARTIFACT_CAP`: an
+/// honest "+N more" line covers the remainder, never a silent drop.
+const SINCE_THEN_CAP: usize = 20;
+
+/// Render one symbol's conclusion into its always-present label, CSS slug,
+/// and adverse-sort rank (0 = worst news, sorts first). Wording choices:
+/// "obsolete, anchor gone" and "still live, re-verified at HEAD" are the
+/// literal phrases from the Phase 5 spec's dream-voice section; "superseded"
+/// and "reinstated" follow the same "verdict · event date" shape.
+fn since_then_conclusion_display(conclusion: &SinceThenConclusion) -> (String, &'static str, u8) {
+    match (&conclusion.verdict, conclusion.witnessed) {
+        (Some(VerdictKind::SupersededBy), _) => {
+            let oid = conclusion
+                .receipt_oid
+                .as_deref()
+                .map(short_oid)
+                .unwrap_or_else(|| "no receipt".to_string());
+            let date = conclusion
+                .event_date
+                .as_deref()
+                .map(iso_date)
+                .unwrap_or_default();
+            (format!("superseded ⌗{oid} · {date}"), "superseded", 0)
+        }
+        (Some(VerdictKind::AnchorObsolete), _) => {
+            let date = conclusion
+                .event_date
+                .as_deref()
+                .map(iso_date)
+                .unwrap_or_default();
+            (format!("obsolete, anchor gone · {date}"), "obsolete", 0)
+        }
+        (Some(VerdictKind::AnchorReinstated), _) => {
+            let date = conclusion
+                .event_date
+                .as_deref()
+                .map(iso_date)
+                .unwrap_or_default();
+            (format!("reinstated · {date}"), "reinstated", 1)
+        }
+        (None, true) => ("still live, re-verified at HEAD".to_string(), "live", 2),
+        (None, false) => ("unverified".to_string(), "unverified", 3),
+    }
+}
+
+/// The ONE evidenced "so" move for a row, or `None` (abstention-first: no
+/// evidence, no advice, row ends at the conclusion). Priority order per the
+/// Phase 5 spec: a superseded symbol ALWAYS gets the deterministic
+/// receipt-based advice (the receipt itself is the evidence); everything
+/// else checks, in order, an open todo naming the symbol, an open
+/// `resolution_proposals` claim bound to one of its witnesses, then the
+/// session's own episode blocker text.
+fn since_then_so_clause(
+    conn: &Connection,
+    session: &StorySession,
+    project: &str,
+    file: &str,
+    symbol: &str,
+    conclusion: &SinceThenConclusion,
+) -> Option<String> {
+    if matches!(conclusion.verdict, Some(VerdictKind::SupersededBy)) {
+        let oid = conclusion
+            .receipt_oid
+            .as_deref()
+            .map(short_oid)
+            .unwrap_or_else(|| "unknown".to_string());
+        return Some(format!(
+            "read the superseding change before touching this again (⌗{oid})"
+        ));
+    }
+    let symbol_lower = symbol.to_lowercase();
+    if let Some(todo) = session.todos.iter().find(|todo| {
+        !matches!(todo.status.as_str(), "completed" | "done")
+            && todo.content.to_lowercase().contains(&symbol_lower)
+    }) {
+        return Some(format!("open todo: \"{}\"", plain_text(&todo.content)));
+    }
+    if let Ok(Some(claim)) =
+        witness_verdicts::open_proposal_claim_for_symbol(conn, project, file, symbol)
+    {
+        return Some(format!(
+            "open proposal: \"{}\" — csr_resolve to confirm or reject",
+            plain_text(&claim)
+        ));
+    }
+    if let Some(blockers) = session
+        .blockers
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(format!("blocked: {}", plain_text(blockers)));
+    }
+    None
+}
+
+/// Build the SINCE THEN panel for one session, or `None` when it has no
+/// attributed symbols and no anchor fallback — panel absent beats panel
+/// empty (the plan's binding trap, carried from the payback-panel spec).
+/// One connection lock for the whole panel (symbols + every row's
+/// conclusion + so-clause lookup) rather than one lock per query.
+fn build_since_then_panel(storage: &Storage, session: &StorySession) -> Option<SinceThenPanelView> {
+    let project = if session.project.is_empty() {
+        "unknown"
+    } else {
+        session.project.as_str()
+    };
+
+    struct Built {
+        row: SinceThenRowView,
+        adverse_rank: u8,
+        touched_at: String,
+    }
+
+    let built: Vec<Built> = storage
+        .with_connection(|conn| {
+            let symbols = dream_report::load_since_then_symbols(conn, &session.session_id)?;
+            let mut built = Vec::with_capacity(symbols.len());
+            for sym in symbols {
+                let conclusion =
+                    witness_verdicts::since_then_conclusion(conn, project, &sym.file, &sym.symbol)?;
+                let (label, slug, rank) = since_then_conclusion_display(&conclusion);
+                let so_clause = since_then_so_clause(
+                    conn,
+                    session,
+                    project,
+                    &sym.file,
+                    &sym.symbol,
+                    &conclusion,
+                );
+                built.push(Built {
+                    row: SinceThenRowView {
+                        symbol: sym.symbol.clone(),
+                        file: sym.file,
+                        anchor_only: sym.anchor_only,
+                        conclusion_label: label,
+                        conclusion_slug: slug,
+                        why_hint: format!("csr_why(\"{}\")", sym.symbol),
+                        so_clause,
+                    },
+                    adverse_rank: rank,
+                    touched_at: sym.touched_at,
+                });
+            }
+            Ok(built)
+        })
+        .unwrap_or_default();
+
+    if built.is_empty() {
+        return None;
+    }
+
+    let mut built = built;
+    built.sort_by(|a, b| {
+        a.adverse_rank
+            .cmp(&b.adverse_rank)
+            .then_with(|| b.touched_at.cmp(&a.touched_at))
+            .then_with(|| a.row.symbol.cmp(&b.row.symbol))
+    });
+
+    let total = built.len();
+    let mut kpi = SinceThenKpiView {
+        symbols: total,
+        superseded: 0,
+        live: 0,
+        unverified: 0,
+    };
+    for entry in &built {
+        match entry.row.conclusion_slug {
+            "superseded" => kpi.superseded += 1,
+            "live" => kpi.live += 1,
+            "unverified" => kpi.unverified += 1,
+            _ => {}
+        }
+    }
+
+    let more = total.saturating_sub(SINCE_THEN_CAP);
+    let rows = built
+        .into_iter()
+        .take(SINCE_THEN_CAP)
+        .map(|b| b.row)
+        .collect();
+
+    Some(SinceThenPanelView { kpi, rows, more })
+}
+
+/// "while away: N anchors retired, M proposals open" (journal v2 Phase 5) —
+/// `None` when both counts are zero. Each clause drops independently
+/// (segment discipline): a day with retirements but no open proposals shows
+/// only the retirement clause, and vice versa.
+fn day_digest_line(digest: &DayDigest) -> Option<(String, String)> {
+    if digest.retired_count == 0 && digest.proposal_count == 0 {
+        return None;
+    }
+    let mut clauses = Vec::new();
+    if digest.retired_count > 0 {
+        clauses.push(format!(
+            "{} retired",
+            pluralize(digest.retired_count as usize, "anchor")
+        ));
+    }
+    if digest.proposal_count > 0 {
+        clauses.push(format!(
+            "{} open",
+            pluralize(digest.proposal_count as usize, "proposal")
+        ));
+    }
+    let title = digest
+        .receipts
+        .iter()
+        .map(|oid| format!("⌗{oid}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some((format!("while away: {}", clauses.join(", ")), title))
 }
 
 /// Raw, uncurated projection — gathered once from storage, curated in place
@@ -1640,6 +1999,10 @@ struct RawReportData {
     thin_entries: Vec<(String, String, ThinRowView)>,
     omitted: usize,
     older_omitted: usize,
+    /// Journal v2 Phase 5: one [`DayDigest`] per DISTINCT calendar day among
+    /// `rich_cards`, keyed by `StoryCardView::date` — `finalize_report_data`
+    /// attaches the matching digest when it opens a new `DayGroupView`.
+    day_digests: std::collections::BTreeMap<String, DayDigest>,
 }
 
 /// Kill switch (plan §3.3a/§6 Phase 2): when set, the report-time backfill
@@ -1796,7 +2159,11 @@ fn gather_report_data_with(
     let mut omitted = 0usize;
     for session in &sessions {
         match classify_session(session) {
-            SessionClass::Rich => rich_cards.push(build_story_card(session)),
+            SessionClass::Rich => {
+                let mut card = build_story_card(session);
+                card.since_then = build_since_then_panel(storage, session);
+                rich_cards.push(card);
+            }
             SessionClass::Thin => thin_entries.push(build_thin_entry(session)),
             SessionClass::Omitted => omitted += 1,
         }
@@ -1804,6 +2171,23 @@ fn gather_report_data_with(
     let older_omitted = rich_cards.len().saturating_sub(MAX_STORY_CARDS);
     rich_cards.truncate(MAX_STORY_CARDS);
     backfill_instrumentation(storage, projects_dir, &mut rich_cards);
+
+    // Journal v2 Phase 5 day-header digest: one `day_digest` lookup per
+    // DISTINCT calendar day actually rendered (not per card) — the shared
+    // storage lock is cheap to reacquire relative to the query itself.
+    let mut day_digests: std::collections::BTreeMap<String, DayDigest> =
+        std::collections::BTreeMap::new();
+    {
+        let mut dates: Vec<String> = rich_cards.iter().map(|card| card.date.clone()).collect();
+        dates.sort();
+        dates.dedup();
+        for date in dates {
+            let digest = storage
+                .with_connection(|conn| witness_verdicts::day_digest(conn, &date))
+                .unwrap_or_default();
+            day_digests.insert(date, digest);
+        }
+    }
 
     let total = obsolete + superseded + reinstated;
     Ok(RawReportData {
@@ -1820,6 +2204,7 @@ fn gather_report_data_with(
         thin_entries,
         omitted,
         older_omitted,
+        day_digests,
     })
 }
 
@@ -1837,10 +2222,20 @@ fn finalize_report_data(raw: RawReportData) -> DreamReportData {
         detail_panes.push(detail_pane(card));
         match day_groups.last_mut() {
             Some(group) if group.label == day_label(&card.date, today) => group.rows.push(row),
-            _ => day_groups.push(DayGroupView {
-                label: day_label(&card.date, today),
-                rows: vec![row],
-            }),
+            _ => {
+                let (digest, digest_title) = raw
+                    .day_digests
+                    .get(&card.date)
+                    .and_then(day_digest_line)
+                    .map(|(text, title)| (Some(text), title))
+                    .unwrap_or((None, String::new()));
+                day_groups.push(DayGroupView {
+                    label: day_label(&card.date, today),
+                    rows: vec![row],
+                    digest,
+                    digest_title,
+                })
+            }
         }
     }
 
@@ -2568,6 +2963,87 @@ mod tests {
         }
     }
 
+    // ---- SINCE THEN payback panel fixtures (journal v2 Phase 5) -----------
+
+    /// Seed one `code_node_attribution` row (channel `'transcript'`) plus its
+    /// backing `code_nodes` row — the SINCE THEN panel's primary "happened"
+    /// symbol source.
+    fn seed_attribution(
+        storage: &Storage,
+        session_id: &str,
+        file: &str,
+        symbol: &str,
+        observed_ts: &str,
+    ) {
+        storage
+            .with_connection(|conn| {
+                let node_id = format!("node-{session_id}-{symbol}");
+                conn.execute(
+                    "INSERT INTO code_nodes (id, project, file, kind, name, first_conv_id, last_conv_id)
+                     VALUES (?1, 'proj', ?2, 'function', ?3, '', '')",
+                    rusqlite::params![node_id, file, symbol],
+                )?;
+                conn.execute(
+                    "INSERT INTO code_node_attribution (node_id, channel, source_id, observed_ts, evidence)
+                     VALUES (?1, 'transcript', ?2, ?3, 'coedit_event')",
+                    rusqlite::params![node_id, session_id, observed_ts],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Seed a `witness_ledger` row for `(project, file, symbol)` and return
+    /// its id — the "witnessed" evidence behind a `still live` conclusion.
+    fn seed_witness(
+        storage: &Storage,
+        project: &str,
+        file: &str,
+        symbol: &str,
+        at_oid: &str,
+    ) -> i64 {
+        storage
+            .insert_witness(&ledger_row(
+                project,
+                file,
+                Some(symbol),
+                at_oid,
+                &format!("b3:{symbol}"),
+            ))
+            .unwrap();
+        storage
+            .witnesses_for_file(project, file)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.symbol.as_deref() == Some(symbol))
+            .unwrap()
+            .id
+    }
+
+    /// Seed one `witness_verdicts` event at an explicit `created_at` — direct
+    /// SQL because `Storage::insert_witness_verdict` always stamps
+    /// `datetime('now')`, and SINCE THEN's date-ordering / day-digest tests
+    /// need deterministic dates.
+    fn seed_verdict_event(
+        storage: &Storage,
+        witness_id: i64,
+        verdict: &str,
+        receipt_oid: Option<&str>,
+        created_at: &str,
+    ) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO witness_verdicts
+                        (witness_id, verdict, successor_witness_id, receipt_oid, observed_head_oid, created_at)
+                     VALUES (?1, ?2, NULL, ?3, 'head', ?4)",
+                    rusqlite::params![witness_id, verdict, receipt_oid, created_at],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
     /// Full pipeline (gather -> curate with no AI invocation -> finalize ->
     /// render), the shape every test below needs. Curation always runs with
     /// `allow_invoke=false` so tests never spawn `claude` or race the
@@ -3203,6 +3679,376 @@ mod tests {
         assert_eq!(episode_data[0]["artifacts"][0]["symbol"], payload);
         // The thin-rollup excerpt must escape too.
         assert!(html.contains("class=\"thin-excerpt\""));
+    }
+
+    // ---- SINCE THEN payback panel (journal v2 Phase 5) ---------------------
+
+    /// All four `witness_verdicts` states plus the no-verdict-at-all case
+    /// render their exact, receipt-grounded chip text.
+    #[test]
+    fn since_then_rows_carry_receipts_for_all_verdict_states() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode(
+            &storage,
+            "s1",
+            "2026-02-01T09:00:00Z",
+            "Audit the retry symbols",
+            "done",
+            &[],
+            &[],
+        );
+        for symbol in [
+            "sym_superseded",
+            "sym_obsolete",
+            "sym_reinstated",
+            "sym_live",
+            "sym_unverified",
+        ] {
+            seed_attribution(
+                &storage,
+                "s1",
+                "/repo/src/lib.rs",
+                symbol,
+                "2026-02-01T09:00:00Z",
+            );
+        }
+
+        let w_superseded = seed_witness(
+            &storage,
+            "proj",
+            "/repo/src/lib.rs",
+            "sym_superseded",
+            "aoid1",
+        );
+        seed_verdict_event(
+            &storage,
+            w_superseded,
+            "superseded_by",
+            Some("1234567890abcdef"),
+            "2026-02-01 10:00:00",
+        );
+        let w_obsolete = seed_witness(
+            &storage,
+            "proj",
+            "/repo/src/lib.rs",
+            "sym_obsolete",
+            "aoid2",
+        );
+        seed_verdict_event(
+            &storage,
+            w_obsolete,
+            "anchor_obsolete",
+            None,
+            "2026-02-01 11:00:00",
+        );
+        let w_reinstated = seed_witness(
+            &storage,
+            "proj",
+            "/repo/src/lib.rs",
+            "sym_reinstated",
+            "aoid3",
+        );
+        seed_verdict_event(
+            &storage,
+            w_reinstated,
+            "anchor_reinstated",
+            None,
+            "2026-02-01 12:00:00",
+        );
+        // "sym_live": witnessed, no verdict event ever recorded.
+        seed_witness(&storage, "proj", "/repo/src/lib.rs", "sym_live", "aoid4");
+        // "sym_unverified": attribution only, no witness_ledger row at all.
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        assert!(html.contains("class=\"since-then\""));
+        assert!(
+            html.contains(r#"class="conclusion superseded">superseded ⌗12345678 · 2026-02-01</p>"#)
+        );
+        assert!(
+            html.contains(r#"class="conclusion obsolete">obsolete, anchor gone · 2026-02-01</p>"#)
+        );
+        assert!(html.contains(r#"class="conclusion reinstated">reinstated · 2026-02-01</p>"#));
+        assert!(html.contains(r#"class="conclusion live">still live, re-verified at HEAD</p>"#));
+        assert!(html.contains(r#"class="conclusion unverified">unverified</p>"#));
+        assert!(html.contains(r#"5 symbols touched"#));
+    }
+
+    /// A rich session with no `code_node_attribution` rows and no
+    /// `episode_anchors` rows renders no `.since-then` element at all —
+    /// panel absent beats panel empty.
+    #[test]
+    fn since_then_absent_without_attribution_or_anchors() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode(
+            &storage,
+            "s2",
+            "2026-02-02T09:00:00Z",
+            "Read the logs, nothing to change",
+            "done",
+            &[],
+            &[],
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        assert!(!html.contains("class=\"since-then\""));
+    }
+
+    /// A symbol named by an open todo gets a "so" clause; a symbol with no
+    /// evidence anywhere in the chain ends at the conclusion with no advice.
+    #[test]
+    fn so_clause_renders_only_with_evidence() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode(
+            &storage,
+            "s3",
+            "2026-02-03T09:00:00Z",
+            "Look at the queue helpers",
+            "partial",
+            &[],
+            &[("check flush_queue reset path", "pending")],
+        );
+        seed_attribution(
+            &storage,
+            "s3",
+            "/repo/src/lib.rs",
+            "flush_queue",
+            "2026-02-03T09:00:00Z",
+        );
+        seed_attribution(
+            &storage,
+            "s3",
+            "/repo/src/lib.rs",
+            "quiet_helper",
+            "2026-02-03T09:00:01Z",
+        );
+        // Neither symbol is ever witnessed -> both are UNVERIFIED, isolating
+        // the so-clause evidence chain from the deterministic superseded case.
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        assert_eq!(
+            html.matches("class=\"so-clause\"").count(),
+            1,
+            "exactly one row has evidence for a so-clause: {html}"
+        );
+        // minijinja HTML-escapes the quotes around the todo text.
+        assert!(html.contains("open todo: &quot;check flush_queue reset path&quot;"));
+    }
+
+    /// A superseded symbol's "so" clause always names the receipt, even with
+    /// no todo/proposal/blocker evidence at all.
+    #[test]
+    fn superseded_symbol_so_clause_names_the_receipt() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode(
+            &storage,
+            "s4",
+            "2026-02-04T09:00:00Z",
+            "Touch the core function",
+            "done",
+            &[],
+            &[],
+        );
+        seed_attribution(
+            &storage,
+            "s4",
+            "/repo/src/lib.rs",
+            "core_fn",
+            "2026-02-04T09:00:00Z",
+        );
+        let witness_id = seed_witness(&storage, "proj", "/repo/src/lib.rs", "core_fn", "aoid5");
+        seed_verdict_event(
+            &storage,
+            witness_id,
+            "superseded_by",
+            Some("abcdef0123456789"),
+            "2026-02-04 10:00:00",
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        assert!(html.contains("read the superseding change before touching this again (⌗abcdef01)"));
+    }
+
+    /// 25 symbols (5 superseded, 20 unverified): the cap renders 20 rows with
+    /// an honest "+5 more", and every superseded row sorts before every
+    /// rendered unverified row (adverse-verdict-first).
+    #[test]
+    fn symbol_cap_and_adverse_first_ordering() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode(
+            &storage,
+            "s5",
+            "2026-02-05T09:00:00Z",
+            "Sweep the legacy module",
+            "done",
+            &[],
+            &[],
+        );
+        for index in 0..5 {
+            let symbol = format!("sup{index:02}");
+            seed_attribution(
+                &storage,
+                "s5",
+                "/repo/src/lib.rs",
+                &symbol,
+                &format!("2026-02-05T00:{index:02}:00Z"),
+            );
+            let witness_id = seed_witness(
+                &storage,
+                "proj",
+                "/repo/src/lib.rs",
+                &symbol,
+                &format!("aoid-sup-{index}"),
+            );
+            seed_verdict_event(
+                &storage,
+                witness_id,
+                "superseded_by",
+                Some(&format!("receipt{index:02}abcdef")),
+                "2026-02-05 12:00:00",
+            );
+        }
+        for index in 0..20 {
+            let symbol = format!("unv{index:02}");
+            seed_attribution(
+                &storage,
+                "s5",
+                "/repo/src/lib.rs",
+                &symbol,
+                &format!("2026-02-05T01:{index:02}:00Z"),
+            );
+        }
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        assert_eq!(html.matches("class=\"since-then-row\"").count(), 20);
+        assert!(html.contains("+5 more symbols"));
+        assert_eq!(
+            html.matches("class=\"conclusion superseded\"").count(),
+            5,
+            "all 5 superseded rows must survive the cap"
+        );
+        let last_superseded = html.rfind("class=\"conclusion superseded\"").unwrap();
+        let first_unverified = html.find("class=\"conclusion unverified\"").unwrap();
+        assert!(
+            last_superseded < first_unverified,
+            "every superseded row must sort before every rendered unverified row"
+        );
+    }
+
+    /// A day with a retirement event shows the digest; a day with neither
+    /// retirements nor open proposals shows no digest line at all.
+    #[test]
+    fn day_digest_only_when_nonzero() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode(
+            &storage,
+            "d1",
+            "2026-03-05T10:00:00Z",
+            "Retire the old validator",
+            "done",
+            &[],
+            &[],
+        );
+        seed_attribution(
+            &storage,
+            "d1",
+            "/repo/src/lib.rs",
+            "old_validator",
+            "2026-03-05T10:00:00Z",
+        );
+        let witness_id = seed_witness(
+            &storage,
+            "proj",
+            "/repo/src/lib.rs",
+            "old_validator",
+            "aoid6",
+        );
+        seed_verdict_event(
+            &storage,
+            witness_id,
+            "superseded_by",
+            Some("cafebabe01234567"),
+            "2026-03-05 12:00:00",
+        );
+
+        seed_episode(
+            &storage,
+            "d2",
+            "2026-03-06T10:00:00Z",
+            "Look at unrelated code",
+            "done",
+            &[],
+            &[],
+        );
+        seed_attribution(
+            &storage,
+            "d2",
+            "/repo/src/lib.rs",
+            "unrelated_fn",
+            "2026-03-06T10:00:00Z",
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        assert_eq!(
+            html.matches("class=\"dream-digest\"").count(),
+            1,
+            "only the day with real dream activity gets a digest line"
+        );
+        assert!(html.contains("while away: 1 anchor retired"));
+    }
+
+    /// Extends the hostile-payload regression (test above) to the new SINCE
+    /// THEN sinks: symbol name, `csr_why(...)` hint, and the "so" clause's
+    /// open-todo evidence.
+    #[test]
+    fn hostile_symbol_names_escaped_in_since_then() {
+        let storage = Storage::open_memory().unwrap();
+        let payload = "<script>alert(2)</script>";
+        let todo_content = format!("investigate {payload}");
+        seed_episode(
+            &storage,
+            "hostile-since-then",
+            "2026-01-04T01:00:00Z",
+            "investigate the hostile symbol",
+            "done",
+            &[],
+            &[(todo_content.as_str(), "pending")],
+        );
+        seed_attribution(
+            &storage,
+            "hostile-since-then",
+            "/repo/src/lib.rs",
+            payload,
+            "2026-01-04T01:00:00Z",
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        assert!(html.contains("class=\"since-then\""));
+        assert!(
+            !html.contains(payload),
+            "raw hostile payload leaked into a since-then sink"
+        );
+        assert!(html.contains("&lt;script&gt;alert(2)&lt;&#x2f;script&gt;"));
     }
 
     #[test]
