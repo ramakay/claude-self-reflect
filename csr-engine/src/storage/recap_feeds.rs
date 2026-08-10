@@ -690,6 +690,7 @@ mod tests {
             top_errors: vec![],
             steer_count: None,
             steers: vec![],
+            instrumentation_version: None,
             anchors: vec![],
         };
         let feeds = RecapFeeds {

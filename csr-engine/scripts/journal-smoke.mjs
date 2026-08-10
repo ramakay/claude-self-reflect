@@ -186,6 +186,10 @@ function buildFixtureSql() {
           { turn: 7, text: "actually revert that" },
           { turn: 12, text: "retry with backoff instead" },
         ],
+        // Delta-review F2: only a version-stamped total (measured by the
+        // current steer-filter generation) may render beyond the persisted
+        // quotes — unstamped legacy episodes show the surviving-quote count.
+        instrumentation_version: 2,
       },
     },
     // Phase 3 (§7.3): a two-sentence request — the fused sentence's first

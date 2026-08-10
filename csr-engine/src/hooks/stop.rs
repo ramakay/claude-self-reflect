@@ -75,6 +75,12 @@ pub struct Episode {
     pub steer_count: Option<u32>,
     #[serde(default)]
     pub steers: Vec<crate::transcript::instrumentation::SteerEvent>,
+    /// Which steer-filter generation measured `steer_count`/`steers`.
+    /// `None` (legacy episodes) means the stored total may include harness
+    /// noise the current filter would reject — the renderer must then derive
+    /// the displayed count from surviving quotes only, never trust this total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instrumentation_version: Option<u32>,
 }
 
 /// Extract a structured episode from JSONL transcript lines.
@@ -408,6 +414,7 @@ fn extract_episode_from_messages(
         top_errors: Vec::new(),
         steer_count: None,
         steers: Vec::new(),
+        instrumentation_version: None,
     }
 }
 
@@ -564,6 +571,8 @@ pub async fn extract_and_store_episode(
         episode.top_errors = instrumentation.top_errors;
         episode.steer_count = Some(instrumentation.steer_count);
         episode.steers = instrumentation.steers;
+        episode.instrumentation_version =
+            Some(crate::transcript::instrumentation::STEER_FILTER_VERSION);
     }
 
     // Authoritative on-disk task directory overrides transcript-mined todos
@@ -1297,6 +1306,7 @@ mod tests {
             top_errors: vec![],
             steer_count: None,
             steers: vec![],
+            instrumentation_version: None,
         };
 
         let json = serde_json::to_string(&ep).unwrap();
@@ -1347,6 +1357,7 @@ mod tests {
             top_errors: vec![],
             steer_count: None,
             steers: vec![],
+            instrumentation_version: None,
         };
 
         let tags = episode_tags(&ep);

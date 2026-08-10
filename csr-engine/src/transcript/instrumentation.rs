@@ -73,6 +73,14 @@ const MAX_STORED_STEERS: usize = 3;
 /// **One predicate, two call sites**: [`from_parsed`]'s steer loop (forward
 /// path) and `dream::report`'s STEER stage-card builder (render-time
 /// re-filter of already-stored steers).
+/// Generation of the steer-filter chain that produced a stored measurement.
+/// Bumped whenever the exclusion rules change (v2 = full provenance chain +
+/// queued-prefix normalization). Episodes stamped with the current version
+/// have trustworthy stored totals; unstamped (legacy) episodes were measured
+/// under weaker filters, so the renderer derives counts from surviving
+/// quotes only.
+pub const STEER_FILTER_VERSION: u32 = 2;
+
 pub(crate) fn is_noisy_steer_text(text: &str) -> bool {
     const QUEUED_PREFIX: &str = "[queued] ";
     let mut normalized = text.trim_start();

@@ -552,8 +552,11 @@ const MAILBOX_CSS: &str = r#"
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere;
   }
   .since-then-more { font-size: 0.72rem; color: var(--fg-muted); margin: 0.4rem 0 0; }
+  /* Delta-review MED: at 0.85 opacity the dark-mode purple fell to ≈4.16:1
+     against the index-pane glass — below the 4.5:1 floor. Full opacity
+     restores the raw token ratios (4.89:1 dark, higher in light). */
   .dream-digest {
-    margin: 0 0.9rem 0.35rem; font-size: 0.68rem; color: var(--purple); opacity: 0.85;
+    margin: 0 0.9rem 0.35rem; font-size: 0.68rem; color: var(--purple);
   }
 
   /* Staggered reveal (CSS-only — no data attribute, no JS, so the rendered
@@ -924,6 +927,11 @@ struct StoryCardView {
     /// must validate it against the current transcript stat before trusting
     /// it (`Cache`). See [`crate::storage::dream_report::InstrumentationSource`].
     instrumentation_source: crate::storage::dream_report::InstrumentationSource,
+    /// F2 (delta review): whether the stored steer total came from the
+    /// current filter generation (version-stamped episode, post-wipe cache
+    /// row, or a live scan this run). When false the displayed count comes
+    /// from surviving persisted quotes only.
+    steer_total_trusted: bool,
     /// Set by the backfill when a transcript was located on disk but did
     /// not end up contributing measured instrumentation (oversized, budget
     /// exhausted, kill switch, or a read/parse failure) — drives the "⚠ not
@@ -1413,6 +1421,7 @@ fn build_story_card(session: &StorySession) -> StoryCardView {
         error_signatures: session.error_signatures.clone(),
         instrumentation: session.instrumentation.clone(),
         instrumentation_source: session.instrumentation_source.clone(),
+        steer_total_trusted: session.steer_total_trusted,
         unscanned: false,
         has_subagents: false,
         since_then: None,
@@ -1597,20 +1606,28 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
         .as_ref()
         .map(|i| i.steers.as_slice())
         .unwrap_or(&[]);
-    let filtered_out_count = stored_steers
+    let surviving_count = stored_steers
         .iter()
-        .filter(|s| !steer_survives(&s.text))
+        .filter(|s| steer_survives(&s.text))
         .count() as u32;
-    // The raw stored count may exceed `stored_steers.len()` (only the first
-    // `MAX_STORED_STEERS` texts are ever persisted, plan §3.3b) — subtract
-    // only what we can prove is noise among the texts we actually have,
-    // rather than collapsing the true total down to the capped list length
-    // (pinned test `steer_lines_are_capped_at_three_with_a_count_line`:
-    // steer_count=5 with 3 genuine stored quotes must still show "5", not 3).
-    let steer_count = card
-        .instrumentation
-        .as_ref()
-        .map(|i| i.steer_count.saturating_sub(filtered_out_count));
+    // Delta-review F2: whether the stored TOTAL may be displayed depends on
+    // which filter generation measured it. A trusted total (version-stamped
+    // episode, post-wipe cache row, live scan) was computed by the same
+    // chain `steer_survives` applies, so its uninspectable remainder beyond
+    // the persisted-quote cap is clean by construction and the total stands.
+    // An untrusted (legacy) total may count harness noise we cannot inspect
+    // — the previous raw-minus-provable-noise arithmetic produced "2
+    // mid-flight steers" over an empty quote list (steer_count=5, 3 stored
+    // quotes all noise). The only number evidence supports there is the
+    // surviving-quote count, so that is what renders — and when it is zero,
+    // no steer line at all.
+    let steer_count = card.instrumentation.as_ref().map(|i| {
+        if card.steer_total_trusted {
+            i.steer_count
+        } else {
+            surviving_count
+        }
+    });
     let has_steers = steer_count.is_some_and(|n| n > 0);
     if !card.todos.is_empty() || has_steers {
         let steers: Vec<SteerLineView> = stored_steers
@@ -2234,6 +2251,9 @@ fn backfill_instrumentation(storage: &Storage, projects_dir: &Path, cards: &mut 
             .flatten();
         if let Some(instrumentation) = cached {
             card.instrumentation = Some(instrumentation);
+            // F2: cache rows postdate the steer_noise_filter_v2 wipe —
+            // current filter generation, total trustworthy.
+            card.steer_total_trusted = true;
             continue;
         }
 
@@ -2260,6 +2280,8 @@ fn backfill_instrumentation(storage: &Storage, projects_dir: &Path, cards: &mut 
             )
         });
         card.instrumentation = Some(instrumentation);
+        // F2: a live scan this run uses the current filter by definition.
+        card.steer_total_trusted = true;
     }
 }
 
@@ -5107,6 +5129,13 @@ mod tests {
                     {"turn": 7, "text": "stop, show me the profile"},
                     {"turn": 11, "text": "use the october script"},
                 ],
+                // Version-stamped: measured by the current filter chain, so
+                // the total beyond the persisted-quote cap is trustworthy
+                // and "5" may render. An unstamped episode with this same
+                // payload shows the surviving-quote count instead — pinned
+                // by `legacy_untrusted_steer_total_never_renders`.
+                "instrumentation_version":
+                    crate::transcript::instrumentation::STEER_FILTER_VERSION,
             }),
         );
 
@@ -5247,6 +5276,84 @@ mod tests {
         assert!(
             !pane.contains("CSR CONTINUUM"),
             "the filtered CSR emission must never leak into the rendered pane: {pane}"
+        );
+    }
+
+    /// Delta-review F2: a legacy episode (no `instrumentation_version` stamp)
+    /// whose raw total exceeds its persisted quotes cannot have that total
+    /// repaired by subtracting provable noise — `steer_count=5` with three
+    /// stored all-noise quotes used to render "2 mid-flight steers" over an
+    /// empty quote list. An untrusted total never renders: all-noise shows no
+    /// steer line, and a mixed list shows exactly the surviving-quote count.
+    #[test]
+    fn legacy_untrusted_steer_total_never_renders() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode_with_extra(
+            &storage,
+            "legacy-noise-total",
+            "2026-03-07T01:00:00Z",
+            "pull the overnight data",
+            "done",
+            serde_json::json!({
+                "error_count": 0,
+                "top_errors": [],
+                "steer_count": 5,
+                "steers": [
+                    {"turn": 2, "text": "<task-notification><task-id>x</task-id></task-notification>"},
+                    {"turn": 4, "text": "[SYSTEM NOTIFICATION - NOT USER INPUT] scheduled event"},
+                    {"turn": 6, "text": "CSR CONTINUUM [2h ago]: stale echo"},
+                ],
+            }),
+        );
+        seed_episode_with_extra(
+            &storage,
+            "legacy-mixed-total",
+            "2026-03-07T02:00:00Z",
+            "rerender the promo",
+            "done",
+            serde_json::json!({
+                "error_count": 0,
+                "top_errors": [],
+                "steer_count": 5,
+                "steers": [
+                    {"turn": 2, "text": "no — hindi, not english"},
+                    {"turn": 4, "text": "[SYSTEM NOTIFICATION - NOT USER INPUT] scheduled event"},
+                    {"turn": 6, "text": "stop, show me the profile"},
+                ],
+            }),
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        let (_, detail_html) = split_panes(&html);
+
+        let noise_short = short_oid("legacy-noise-total");
+        let noise_start = detail_html
+            .find(&format!(r#"data-session="{noise_short}""#))
+            .unwrap();
+        let noise_end = noise_start + detail_html[noise_start..].find("</article>").unwrap();
+        let noise_pane = &detail_html[noise_start..noise_end];
+        assert!(
+            !noise_pane.contains("mid-flight steer"),
+            "an untrusted total over an all-noise quote list must render no steer line: {noise_pane}"
+        );
+
+        let mixed_short = short_oid("legacy-mixed-total");
+        let mixed_start = detail_html
+            .find(&format!(r#"data-session="{mixed_short}""#))
+            .unwrap();
+        let mixed_end = mixed_start + detail_html[mixed_start..].find("</article>").unwrap();
+        let mixed_pane = &detail_html[mixed_start..mixed_end];
+        assert!(
+            mixed_pane.contains("2 mid-flight steers"),
+            "an untrusted total renders the surviving-quote count, never the raw 5: {mixed_pane}"
+        );
+        assert_eq!(
+            mixed_pane.matches("class=\"steer-line post-it\"").count(),
+            2,
+            "exactly the two genuine quotes survive: {mixed_pane}"
         );
     }
 

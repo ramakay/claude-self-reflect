@@ -94,6 +94,12 @@ pub(crate) struct StorySession {
     /// F4: provenance of `instrumentation`, `None` (unset) whenever
     /// `instrumentation` is `None`. See [`InstrumentationSource`].
     pub instrumentation_source: InstrumentationSource,
+    /// F2 (delta review): whether the stored steer TOTAL was measured by the
+    /// current filter generation (`STEER_FILTER_VERSION`). Cache rows are
+    /// always current (the v2 migration wipe guarantees it); episode rows are
+    /// current only when version-stamped. When false, the renderer derives
+    /// the displayed steer count from surviving persisted quotes only.
+    pub steer_total_trusted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -117,6 +123,7 @@ struct SessionBuilder {
     error_signatures: Vec<String>,
     instrumentation: Option<SessionInstrumentation>,
     instrumentation_source: InstrumentationSource,
+    steer_total_trusted: bool,
 }
 
 impl SessionBuilder {
@@ -164,6 +171,7 @@ struct EpisodeJson {
     top_errors: Vec<ErrorEvent>,
     steer_count: Option<u32>,
     steers: Vec<SteerEvent>,
+    instrumentation_version: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -298,6 +306,15 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
                     // own tool-verified scan — authoritative, never
                     // re-validated or rescanned by the report-time backfill.
                     builder.instrumentation_source = InstrumentationSource::Episode;
+                    // F2 (delta review): the stored steer TOTAL is only
+                    // trustworthy when it was measured by the current filter
+                    // generation. Legacy episodes (no version stamp) may
+                    // count harness noise the render-time chain would
+                    // reject, and only the first 3 steer texts are ever
+                    // persisted — so an unstamped total cannot be repaired
+                    // by subtracting provable noise.
+                    builder.steer_total_trusted = episode.instrumentation_version
+                        == Some(crate::transcript::instrumentation::STEER_FILTER_VERSION);
                 }
             }
         }
@@ -582,6 +599,10 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
                         transcript_size: transcript_size.max(0) as u64,
                         transcript_mtime,
                     };
+                    // F2: every surviving cache row postdates the
+                    // steer_noise_filter_v2 wipe, so its total was measured
+                    // by the current filter generation.
+                    builder.steer_total_trusted = true;
                 }
             }
         }
@@ -613,6 +634,7 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
                     error_signatures: builder.error_signatures,
                     instrumentation: builder.instrumentation,
                     instrumentation_source: builder.instrumentation_source,
+                    steer_total_trusted: builder.steer_total_trusted,
                 },
             )
         })

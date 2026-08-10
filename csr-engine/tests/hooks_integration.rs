@@ -1187,6 +1187,7 @@ fn test_explore_prompt_never_fails() {
         top_errors: vec![],
         steer_count: None,
         steers: vec![],
+        instrumentation_version: None,
         anchors: vec![],
     };
 
@@ -1699,6 +1700,7 @@ fn test_episode_struct_serialization() {
         top_errors: vec![],
         steer_count: None,
         steers: vec![],
+        instrumentation_version: None,
         anchors: vec![],
     };
 

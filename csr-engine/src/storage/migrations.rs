@@ -592,6 +592,21 @@ pub fn run(conn: &Connection) -> Result<()> {
         }
     }
 
+    // Second purge, same pattern: the steer filter changed again after v1
+    // (queued-prefix normalization, F3 of the certification review), so rows
+    // cached between the two fixes may hold `[queued] [SYSTEM NOTIFICATION`
+    // noise. One wipe makes every surviving cache row a product of the
+    // current filter generation — which is what lets the renderer trust
+    // cache-sourced steer totals without a per-row version column.
+    {
+        let already_purged =
+            crate::storage::queries::get_meta(conn, "steer_noise_filter_v2")?.is_some();
+        if !already_purged {
+            conn.execute_batch("DELETE FROM session_instrumentation;")?;
+            crate::storage::queries::set_meta(conn, "steer_noise_filter_v2", "1")?;
+        }
+    }
+
     // Migration: journal_headlines gained `description` after first ship on
     // 2026-08-10; DBs created between the two shapes lack the column. Same
     // idempotent ALTER-guard pattern as the code_edges columns above.

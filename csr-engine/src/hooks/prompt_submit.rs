@@ -1526,6 +1526,7 @@ mod tests {
             top_errors: vec![],
             steer_count: None,
             steers: vec![],
+            instrumentation_version: None,
             anchors: vec![crate::extraction::anchors::FunctionAnchor {
                 file: "src/radio/RadioSheet.swift".into(),
                 node_kind: "file".into(),
