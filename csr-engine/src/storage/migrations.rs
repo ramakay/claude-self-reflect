@@ -547,6 +547,13 @@ pub fn run(conn: &Connection) -> Result<()> {
             duration_ms INTEGER NOT NULL DEFAULT 0,
             success INTEGER NOT NULL DEFAULT 1
          );
+         CREATE TABLE IF NOT EXISTS journal_headlines (
+            session_id TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
+            headline TEXT NOT NULL,
+            model TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         );
          CREATE TABLE IF NOT EXISTS ratification_scores (
             conversation_id TEXT PRIMARY KEY,
             score REAL NOT NULL,

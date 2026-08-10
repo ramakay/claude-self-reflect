@@ -192,7 +192,7 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
 /// empty MCP config with `--strict-mcp-config` so the subprocess loads ZERO MCP
 /// servers (not even csr-engine) — fastest possible `claude -p` startup and no
 /// recursive csr-engine spawn.
-fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNarrative> {
+pub(crate) fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNarrative> {
     let mcp_config_path = write_minimal_mcp_config()?;
     let mut last_err: Option<anyhow::Error> = None;
 

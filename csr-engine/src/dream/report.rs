@@ -751,6 +751,154 @@ fn render_html(data: &DreamReportData) -> Result<String> {
     Ok(rendered.replacen("</body>", &scripts, 1))
 }
 
+// --- AI-curated headlines -------------------------------------------------
+//
+// Raw first-prompts make poor card headlines ("pull the latest data."). When
+// AI narratives are enabled, one batched `claude -p` call rewrites the summary
+// line of every uncached card; results are cached in `journal_headlines` by a
+// content hash, so an unchanged corpus re-renders at zero cost. The kill
+// switch (`CSR_NO_AI_NARRATIVES=1`) suppresses the invocation but still
+// applies previously cached headlines — they are already paid for.
+
+const HEADLINE_MAX_CHARS: usize = 110;
+
+fn headline_hash(card: &StoryCardView) -> String {
+    let payload = format!("{}\u{1}{}", card.summary, card.episode_json);
+    format!("{:016x}", crate::narrative::fnv1a_64(payload.as_bytes()))
+}
+
+/// Parse the model's batch response: a JSON object mapping session-short ids
+/// to headlines, possibly wrapped in code fences or prose. Fail-open: any
+/// shape problem yields an empty map and the cards keep their raw summaries.
+fn parse_headline_batch(text: &str) -> std::collections::BTreeMap<String, String> {
+    let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) else {
+        return Default::default();
+    };
+    if end < start {
+        return Default::default();
+    }
+    serde_json::from_str::<std::collections::BTreeMap<String, String>>(&text[start..=end])
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, headline)| {
+            let cleaned = headline.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!cleaned.is_empty()).then(|| (id, truncate_chars(&cleaned, HEADLINE_MAX_CHARS)))
+        })
+        .collect()
+}
+
+fn cached_headline(storage: &Storage, session_id: &str, hash: &str) -> Option<String> {
+    storage
+        .with_connection(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT headline FROM journal_headlines
+                     WHERE session_id = ?1 AND content_hash = ?2",
+                    rusqlite::params![session_id, hash],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok())
+        })
+        .ok()
+        .flatten()
+}
+
+fn store_headline(storage: &Storage, session_id: &str, hash: &str, headline: &str, model: &str) {
+    let _ = storage.with_connection(|conn| {
+        conn.execute(
+            "INSERT INTO journal_headlines (session_id, content_hash, headline, model)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id) DO UPDATE SET
+                content_hash = excluded.content_hash,
+                headline = excluded.headline,
+                model = excluded.model,
+                created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            rusqlite::params![session_id, hash, headline, model],
+        )?;
+        Ok(())
+    });
+}
+
+fn headline_prompt(misses: &[(&StoryCardView, String)]) -> String {
+    let sessions = misses
+        .iter()
+        .map(|(card, _)| {
+            serde_json::json!({
+                "id": card.session_short,
+                "project": card.project,
+                "text": truncate_chars(&card.summary, 300),
+                "detail": truncate_chars(&card.episode_json, 600),
+            })
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "You are curating one-line headlines for a developer's private session journal. \
+         For each session below, write one specific headline (max {HEADLINE_MAX_CHARS} \
+         characters) stating what the session actually did or found — name the feature, \
+         bug, or artifact; never generic filler like 'worked on project'. Use the text \
+         and detail fields as evidence; do not invent outcomes they don't support. \
+         Return ONLY a JSON object mapping each id to its headline, no code fences, \
+         no commentary.\nSessions: {}",
+        serde_json::to_string(&sessions).unwrap_or_default()
+    )
+}
+
+/// Apply cached headlines and, unless narratives are disabled, batch-generate
+/// the missing ones. Every failure path leaves the raw summaries in place.
+fn curate_headlines(storage: &Storage, cards: &mut [StoryCardView]) {
+    curate_headlines_with(storage, cards, !crate::narrative::narratives_disabled())
+}
+
+/// `allow_invoke` is threaded as a parameter (not read from the environment
+/// here) so tests can exercise the cache paths without racing other tests on
+/// the process-global `CSR_NO_AI_NARRATIVES` variable.
+fn curate_headlines_with(storage: &Storage, cards: &mut [StoryCardView], allow_invoke: bool) {
+    let hashes: Vec<String> = cards.iter().map(headline_hash).collect();
+    let mut misses: Vec<usize> = Vec::new();
+    for (index, card) in cards.iter_mut().enumerate() {
+        match cached_headline(storage, &card.session_short, &hashes[index]) {
+            Some(headline) => card.summary = headline,
+            None => misses.push(index),
+        }
+    }
+    if misses.is_empty() || !allow_invoke {
+        return;
+    }
+
+    let batch: Vec<(&StoryCardView, String)> = misses
+        .iter()
+        .map(|&index| (&cards[index] as &StoryCardView, hashes[index].clone()))
+        .collect();
+    let prompt = headline_prompt(&batch);
+    let started = std::time::Instant::now();
+    let parsed = match crate::hooks::session_briefing::invoke_narrative_briefing(&prompt) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!(error = %err, "journal headline curation failed — keeping raw summaries");
+            return;
+        }
+    };
+    let _ = storage.record_narrative_usage(&crate::storage::NarrativeUsageRow {
+        call_site: "journal_headline".into(),
+        model: parsed.model.clone(),
+        input_tokens: parsed.input_tokens,
+        output_tokens: parsed.output_tokens,
+        cache_read_tokens: parsed.cache_read_tokens,
+        cache_creation_tokens: parsed.cache_creation_tokens,
+        duration_ms: started.elapsed().as_millis() as i64,
+        success: true,
+    });
+
+    let headlines = parse_headline_batch(&parsed.text);
+    for &index in &misses {
+        let (session_short, hash) = (cards[index].session_short.clone(), hashes[index].clone());
+        if let Some(headline) = headlines.get(&session_short) {
+            store_headline(storage, &session_short, &hash, headline, &parsed.model);
+            cards[index].summary = headline.clone();
+        }
+    }
+}
+
 /// Default output path: `~/.claude-self-reflect/reports/dream-<YYYY-MM-DD>.html`.
 fn default_report_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -777,7 +925,8 @@ fn open_in_viewer(_path: &Path) {}
 /// directory if needed. Opens it via `open` on macOS unless `no_open`.
 /// Returns the path actually written, for the CLI to report back.
 pub fn run_report(storage: &Storage, out: Option<PathBuf>, no_open: bool) -> Result<PathBuf> {
-    let data = gather_report_data(storage)?;
+    let mut data = gather_report_data(storage)?;
+    curate_headlines(storage, &mut data.cards);
     let html = render_html(&data)?;
 
     let path = out.unwrap_or_else(default_report_path);
@@ -941,6 +1090,102 @@ mod tests {
             source_kind: "backfill".into(),
             source_id: Some(at_oid.into()),
         }
+    }
+
+    #[test]
+    fn parse_headline_batch_tolerates_fences_prose_and_clamps_length() {
+        let fenced = "```json\n{\"abc12345\": \"Fixed the relevance gate in guardrails\"}\n```";
+        let map = parse_headline_batch(fenced);
+        assert_eq!(
+            map.get("abc12345").map(String::as_str),
+            Some("Fixed the relevance gate in guardrails")
+        );
+
+        let long = format!("{{\"id1\": \"{}\"}}", "x".repeat(400));
+        let clamped = parse_headline_batch(&long);
+        assert!(clamped.get("id1").unwrap().chars().count() <= HEADLINE_MAX_CHARS);
+
+        assert!(parse_headline_batch("no json here").is_empty());
+        assert!(parse_headline_batch("{\"id\": \"   \"}").is_empty());
+        let multiline = "{\"id2\": \"line one\\n   line two\"}";
+        assert_eq!(
+            parse_headline_batch(multiline)
+                .get("id2")
+                .map(String::as_str),
+            Some("line one line two")
+        );
+    }
+
+    #[test]
+    fn cached_headlines_apply_without_any_ai_invocation() {
+        // Invocation disabled: curate must never spawn claude, yet a
+        // previously cached headline (already paid for) still applies, and an
+        // uncached card keeps its raw summary.
+        let storage = Storage::open_memory().unwrap();
+        let session = StorySession {
+            session_id: "cached-headline-session".into(),
+            project: "proj".into(),
+            timestamp: "2026-08-10T00:00:00Z".into(),
+            request: Some("pull the latest data.".into()),
+            outcome: Some("done".into()),
+            ..Default::default()
+        };
+        let raw_card = story_card(&session).unwrap();
+        let hash = headline_hash(&raw_card);
+        store_headline(
+            &storage,
+            &raw_card.session_short,
+            &hash,
+            "Overnight metrics pull: MRR snapshot + spend check",
+            "test-model",
+        );
+
+        let uncached = StorySession {
+            session_id: "never-curated-session".into(),
+            project: "proj".into(),
+            timestamp: "2026-08-10T00:00:00Z".into(),
+            request: Some("do the other thing".into()),
+            outcome: Some("partial".into()),
+            ..Default::default()
+        };
+        let mut cards = vec![raw_card, story_card(&uncached).unwrap()];
+        let raw_summary = cards[1].summary.clone();
+
+        curate_headlines_with(&storage, &mut cards, false);
+
+        assert_eq!(
+            cards[0].summary,
+            "Overnight metrics pull: MRR snapshot + spend check"
+        );
+        assert_eq!(cards[1].summary, raw_summary);
+    }
+
+    #[test]
+    fn stale_cache_entry_is_ignored_when_content_hash_changes() {
+        let storage = Storage::open_memory().unwrap();
+        let session = StorySession {
+            session_id: "stale-hash-session".into(),
+            project: "proj".into(),
+            timestamp: "2026-08-10T00:00:00Z".into(),
+            request: Some("original request".into()),
+            outcome: Some("done".into()),
+            ..Default::default()
+        };
+        let card = story_card(&session).unwrap();
+        store_headline(
+            &storage,
+            &card.session_short,
+            "0000000000000000",
+            "Headline for content that no longer exists",
+            "test-model",
+        );
+        let mut cards = vec![card];
+        let raw_summary = cards[0].summary.clone();
+        curate_headlines_with(&storage, &mut cards, false);
+        assert_eq!(
+            cards[0].summary, raw_summary,
+            "a hash-mismatched cache row must not be applied"
+        );
     }
 
     #[test]
