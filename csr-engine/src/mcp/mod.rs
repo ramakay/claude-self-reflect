@@ -148,6 +148,35 @@ pub struct GetFullConversationParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct TranscriptParams {
+    /// Session id (substring match against files under the projects dir) or
+    /// an explicit path to a transcript JSONL file
+    pub session: String,
+    /// View to render: stats, prompts, tools, files, errors, slice, or grep
+    pub view: String,
+    /// Narrow the session-id search to a project directory name containing
+    /// this substring (ignored when `session` is a path)
+    pub project: Option<String>,
+    /// Role filter shared by every view: user, assistant, system, or all (default: all)
+    pub role: Option<String>,
+    /// Turn range, inclusive: "40..120" or open-ended "340.."
+    pub turns: Option<String>,
+    /// `slice` view only: show the last N turns (ignored if `turns` given)
+    pub last: Option<usize>,
+    /// `grep` view: regex to match against each turn's text
+    pub grep: Option<String>,
+    /// `tools`/`files` view: filter to this tool name only
+    pub tool: Option<String>,
+    /// Emit structured JSON instead of compact text (default: false)
+    pub json: Option<bool>,
+    /// Character budget before an honest truncation marker (default 30000; server-capped)
+    pub budget_chars: Option<usize>,
+    /// Reserved for v2 (subagent sidechain inclusion) — rejected with a
+    /// clear message in v1
+    pub sidechains: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetSessionLearningsParams {
     /// Session ID to get learnings from
     pub session_id: String,
@@ -604,6 +633,38 @@ impl CsrServer {
         let limit = p.limit.unwrap_or(50);
 
         let result = tools::get_session_learnings(&self.storage, &p.session_id, limit);
+        tool_result(result)
+    }
+
+    #[tool(
+        name = "csr_transcript",
+        description = "Structured facts from a Claude Code session transcript JSONL: stats, prompts, tool calls, touched files, errors, a turn-range/last-N slice, or a text grep — without hand-rolling a jq/Python parser over raw JSONL. Every view emits turn numbers so a follow-up slice can zoom in; large results honestly truncate with a `turns` resume hint instead of silently cutting.",
+        annotations(
+            title = "Transcript Query",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn transcript(
+        &self,
+        params: Parameters<TranscriptParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+        let result = tools::transcript(
+            &self.projects_dir,
+            &p.session,
+            &p.view,
+            p.project.as_deref(),
+            p.role.as_deref(),
+            p.turns.as_deref(),
+            p.last,
+            p.grep.as_deref(),
+            p.tool.as_deref(),
+            p.json.unwrap_or(false),
+            p.budget_chars,
+            p.sidechains.unwrap_or(false),
+        );
         tool_result(result)
     }
 

@@ -762,10 +762,11 @@ pub fn format_full_conversation(
 ) -> String {
     if let Some(path) = file_path {
         format!(
-            "<conversation_file>\n<conversation_id>{}</conversation_id>\n<file_path>{}</file_path>\n<project>{}</project>\n<message>Use the Read tool with this file path to read the complete conversation.</message>\n</conversation_file>",
+            "<conversation_file>\n<conversation_id>{}</conversation_id>\n<file_path>{}</file_path>\n<project>{}</project>\n<message>Use the Read tool with this file path to read the complete conversation. For structured facts (stats/prompts/tools/files/errors/slice/grep) without reading the raw file, use csr_transcript or `csr-engine transcript {} <view>` instead.</message>\n</conversation_file>",
             conversation_id,
             path,
             project.unwrap_or("unknown"),
+            conversation_id,
         )
     } else {
         format!(

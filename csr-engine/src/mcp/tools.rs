@@ -1717,19 +1717,22 @@ async fn get_more_results_with_vec_active(
     Ok(format::format_more_results(&page, query, offset, total))
 }
 
-/// Locate the JSONL file for a conversation.
-pub fn get_full_conversation(
+/// Locate a conversation's JSONL file by id substring match across
+/// `projects_dir` (optionally scoped to a project-name substring). Shared by
+/// `get_full_conversation` and `crate::transcript::resolve_session_path` so
+/// both surfaces agree on exactly one lookup rule.
+pub(crate) fn find_conversation_file(
     projects_dir: &Path,
     conversation_id: &str,
     project: Option<&str>,
-) -> String {
+) -> Option<(PathBuf, String)> {
     // Validate conversation_id: must be non-empty, alphanumeric + hyphens + underscores only
     if conversation_id.is_empty()
         || !conversation_id
             .chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
     {
-        return format::format_full_conversation(conversation_id, None, None);
+        return None;
     }
 
     // Search for JSONL file matching conversation_id
@@ -1772,18 +1775,105 @@ pub fn get_full_conversation(
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
-                        return format::format_full_conversation(
-                            conversation_id,
-                            Some(&path.to_string_lossy()),
-                            Some(&project_name),
-                        );
+                        return Some((path, project_name));
                     }
                 }
             }
         }
     }
 
-    format::format_full_conversation(conversation_id, None, None)
+    None
+}
+
+/// Locate the JSONL file for a conversation.
+pub fn get_full_conversation(
+    projects_dir: &Path,
+    conversation_id: &str,
+    project: Option<&str>,
+) -> String {
+    match find_conversation_file(projects_dir, conversation_id, project) {
+        Some((path, project_name)) => format::format_full_conversation(
+            conversation_id,
+            Some(&path.to_string_lossy()),
+            Some(&project_name),
+        ),
+        None => format::format_full_conversation(conversation_id, None, None),
+    }
+}
+
+/// Server-side cap on `csr_transcript`'s response, applied regardless of the
+/// caller's requested `budget_chars` — bounds a misbehaving/huge request
+/// against the MCP response size, matching the design doc's "token budget
+/// enforced server-side" (Option C rationale).
+const MCP_TRANSCRIPT_MAX_BUDGET_CHARS: usize = 60_000;
+
+/// Thin wrapper over [`crate::transcript::run`] for the `csr_transcript` MCP
+/// tool: validate the view/role/turns strings (never panics on a bad one —
+/// same fail-honest posture as the CLI, but returns the message as `Ok`
+/// content instead of exiting the process), clamp the budget, and dispatch
+/// through the exact same core the CLI uses.
+#[allow(clippy::too_many_arguments)]
+pub fn transcript(
+    projects_dir: &Path,
+    session: &str,
+    view: &str,
+    project: Option<&str>,
+    role: Option<&str>,
+    turns: Option<&str>,
+    last: Option<usize>,
+    grep: Option<&str>,
+    tool: Option<&str>,
+    json: bool,
+    budget_chars: Option<usize>,
+    sidechains: bool,
+) -> Result<String> {
+    use crate::transcript::{parse_turns_spec, RoleFilter, TranscriptRequest, ViewKind};
+
+    let Some(view_kind) = ViewKind::parse(view) else {
+        return Ok(format!(
+            "<transcript_error>\n<error>unknown view '{view}' — expected one of: stats, prompts, tools, files, errors, slice, grep</error>\n</transcript_error>"
+        ));
+    };
+    let role_filter = match role {
+        Some(r) => match RoleFilter::parse(r) {
+            Some(rf) => rf,
+            None => {
+                return Ok(format!(
+                    "<transcript_error>\n<error>unknown role '{r}' — expected one of: user, assistant, system, all</error>\n</transcript_error>"
+                ));
+            }
+        },
+        None => RoleFilter::All,
+    };
+    let parsed_turns = match turns {
+        Some(spec) => match parse_turns_spec(spec) {
+            Ok(range) => Some(range),
+            Err(e) => {
+                return Ok(format!(
+                    "<transcript_error>\n<error>{e}</error>\n</transcript_error>"
+                ));
+            }
+        },
+        None => None,
+    };
+
+    let req = TranscriptRequest {
+        session: session.to_string(),
+        view: view_kind,
+        project: project.map(str::to_string),
+        role: role_filter,
+        turns: parsed_turns,
+        last,
+        grep: grep.map(str::to_string),
+        tool: tool.map(str::to_string),
+        json,
+        budget_chars: budget_chars
+            .unwrap_or(crate::transcript::DEFAULT_BUDGET_CHARS)
+            .min(MCP_TRANSCRIPT_MAX_BUDGET_CHARS),
+        sidechains,
+    };
+
+    Ok(crate::transcript::run(projects_dir, &req))
 }
 
 /// Get learnings for a specific session.

@@ -96,6 +96,55 @@ enum Commands {
         /// File path to analyze
         path: PathBuf,
     },
+    /// Structured facts from a session transcript JSONL — stats, prompts,
+    /// tool calls, touched files, errors, a turn-range slice, or a text
+    /// grep — without hand-rolling a jq/Python parser over raw JSONL.
+    Transcript {
+        /// Session id (substring match against files under --projects-dir)
+        /// or an explicit path to a transcript JSONL file.
+        session: String,
+
+        /// View to render: stats|prompts|tools|files|errors|slice|grep
+        view: String,
+
+        /// Narrow the session-id search to a project directory name
+        /// containing this substring (ignored when `session` is a path).
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Role filter shared by every view: user|assistant|system|all
+        #[arg(long, default_value = "all")]
+        role: String,
+
+        /// Turn range, inclusive: "40..120" or open-ended "340.."
+        #[arg(long)]
+        turns: Option<String>,
+
+        /// `slice` view only: show the last N turns (ignored if --turns given)
+        #[arg(long)]
+        last: Option<usize>,
+
+        /// `grep` view: regex to match against each turn's text
+        #[arg(long)]
+        grep: Option<String>,
+
+        /// `tools`/`files` view: filter to this tool name only
+        #[arg(long)]
+        tool: Option<String>,
+
+        /// Emit structured JSON instead of compact text
+        #[arg(long)]
+        json: bool,
+
+        /// Character budget before an honest truncation marker is emitted
+        #[arg(long, default_value_t = csr_engine::transcript::DEFAULT_BUDGET_CHARS)]
+        budget_chars: usize,
+
+        /// Reserved for v2 (subagent sidechain inclusion) — rejected with a
+        /// clear message in v1, never silently ignored.
+        #[arg(long)]
+        sidechains: bool,
+    },
     /// Run ratification extraction for specific conversation IDs (one-off,
     /// bypasses the daemon queue ordering)
     Ratify {
@@ -355,6 +404,66 @@ async fn main() -> Result<()> {
     if let Some(Commands::Quality { ref path }) = args.command {
         let report = csr_engine::extraction::quality::analyze_file(path)?;
         print!("{}", report.format_text());
+        return Ok(());
+    }
+
+    if let Some(Commands::Transcript {
+        ref session,
+        ref view,
+        ref project,
+        ref role,
+        ref turns,
+        last,
+        ref grep,
+        ref tool,
+        json,
+        budget_chars,
+        sidechains,
+    }) = args.command
+    {
+        use csr_engine::transcript::{parse_turns_spec, RoleFilter, TranscriptRequest, ViewKind};
+
+        let Some(view_kind) = ViewKind::parse(view) else {
+            eprintln!(
+                "error: unknown view '{view}' — expected one of: stats, prompts, tools, files, errors, slice, grep"
+            );
+            std::process::exit(2);
+        };
+        let Some(role_filter) = RoleFilter::parse(role) else {
+            eprintln!(
+                "error: unknown --role '{role}' — expected one of: user, assistant, system, all"
+            );
+            std::process::exit(2);
+        };
+        let parsed_turns = match turns {
+            Some(spec) => match parse_turns_spec(spec) {
+                Ok(range) => Some(range),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            },
+            None => None,
+        };
+
+        let req = TranscriptRequest {
+            session: session.clone(),
+            view: view_kind,
+            project: project.clone(),
+            role: role_filter,
+            turns: parsed_turns,
+            last,
+            grep: grep.clone(),
+            tool: tool.clone(),
+            json,
+            budget_chars,
+            sidechains,
+        };
+        let out = csr_engine::transcript::run(&args.projects_dir, &req);
+        print!("{out}");
+        if !out.ends_with('\n') {
+            println!();
+        }
         return Ok(());
     }
 

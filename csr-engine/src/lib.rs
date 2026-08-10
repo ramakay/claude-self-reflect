@@ -22,3 +22,4 @@ pub mod storage;
 pub mod summarizer;
 pub mod telemetry;
 pub mod temporal;
+pub mod transcript;
