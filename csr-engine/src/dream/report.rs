@@ -58,9 +58,13 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section>
     {% for card in data.cards %}
       <details class="story-card {{ card.tier_slug }}" data-tier="{{ card.tier_slug }}">
         <summary>
-          <span class="story-summary">{{ card.summary }}</span>
-          <span class="story-meta">{{ card.project }} · {{ card.date }} · {{ card.session_short }}</span>
-          {% if card.tier_label %}<span class="tier-badge">{{ card.tier_label }}</span>{% endif %}
+          <span class="story-head">
+            <span class="story-summary">{{ card.summary }}</span>
+            {% if card.outcome_badge %}<span class="outcome-badge {{ card.outcome_slug }}">{{ card.outcome_badge }}</span>{% endif %}
+            {% if card.tier_label %}<span class="tier-badge">{{ card.tier_label }}</span>{% endif %}
+          </span>
+          {% if card.description %}<span class="story-description">{{ card.description }}</span>{% endif %}
+          <span class="story-meta"><span class="project-pill">{{ card.project }}</span><span>{{ card.date }}</span><span>{{ card.session_short }}</span></span>
         </summary>
         <div class="story-flow" aria-label="Session flow" data-stage-ids="{{ card.stage_ids }}">
           <pre class="mermaid">{{ card.mermaid | safe }}</pre>
@@ -145,12 +149,29 @@ const STORY_CSS: &str = r#"
   }
   .story-card > summary {
     list-style: none; cursor: pointer; padding: 0.9rem 1rem;
-    display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
-    align-items: center; gap: 0.75rem;
+    display: flex; flex-direction: column; gap: 0.4rem;
   }
   .story-card > summary::-webkit-details-marker { display: none; }
-  .story-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-  .story-meta { color: var(--fg-muted); font-size: 0.74rem; white-space: nowrap; }
+  .story-head { display: flex; align-items: baseline; gap: 0.55rem; flex-wrap: wrap; }
+  .story-summary { font-weight: 650; font-size: 0.95rem; line-height: 1.35; overflow-wrap: anywhere; }
+  .story-description {
+    color: var(--fg-muted); font-size: 0.82rem; line-height: 1.5;
+    overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .story-meta { display: flex; align-items: center; gap: 0.55rem; color: var(--fg-muted); font-size: 0.72rem; flex-wrap: wrap; }
+  .project-pill {
+    border: 1px solid var(--border); border-radius: 999px; padding: 0.1rem 0.5rem;
+    font-weight: 700; letter-spacing: 0.02em;
+  }
+  .outcome-badge {
+    border-radius: 999px; font-size: 0.66rem; font-weight: 800; padding: 0.15rem 0.5rem;
+    text-transform: uppercase; letter-spacing: 0.04em; border: 1px solid transparent;
+  }
+  .outcome-badge.success { color: #1a7f37; background: rgba(26, 127, 55, 0.12); }
+  .outcome-badge.partial { color: #9a6700; background: rgba(154, 103, 0, 0.12); }
+  .outcome-badge.failed { color: #cf222e; background: rgba(207, 34, 46, 0.12); }
+  .outcome-badge.noted { color: var(--fg-muted); border-color: var(--border); }
   .tier-badge {
     color: var(--fg-muted); border: 1px solid var(--border); border-radius: 999px;
     font-size: 0.66rem; font-weight: 700; padding: 0.15rem 0.45rem;
@@ -191,10 +212,6 @@ const STORY_CSS: &str = r#"
   .detail-artifact .file { display: block; margin-top: 0.2rem; }
   [hidden] { display: none !important; }
   .omission-summary { display: flex; justify-content: center; gap: 1rem; color: var(--fg-muted); font-size: 0.75rem; }
-  @media (max-width: 680px) {
-    .story-card > summary { grid-template-columns: minmax(0, 1fr) auto; }
-    .story-meta { grid-column: 1 / -1; grid-row: 2; }
-  }
 "#;
 
 const STORY_SCRIPT: &str = r#"
@@ -268,9 +285,14 @@ mermaid.initialize({startOnLoad:false});
   };
 
   const findStateNode = (svg, stageId) => {
+    // Mermaid prefixes every element id with its render id
+    // ("mermaid-<ts>-state-S_INPUT-0"), so equality/startsWith never match —
+    // verified live in headless Chrome. `includes` on the "-state-<id>-"
+    // infix matches exactly one g.statediagram-state per stage.
     const candidates = svg.querySelectorAll("[id], [data-id]");
     const match = Array.from(candidates).find(node =>
       node.id === stageId ||
+      node.id.includes(`-state-${stageId}-`) ||
       node.id.startsWith(`state-${stageId}-`) ||
       node.getAttribute("data-id") === stageId
     );
@@ -344,15 +366,41 @@ struct StoryArtifactView {
 #[derive(Debug, Clone, Serialize)]
 struct StoryCardView {
     summary: String,
+    /// 1–3 sentence always-visible elaboration under the headline. Deterministic
+    /// fallback (narrative/request excerpt); replaced by the curated version
+    /// when headline curation runs.
+    description: String,
     project: String,
     date: String,
     session_short: String,
     tier_slug: &'static str,
     tier_label: Option<&'static str>,
+    /// "success" | "partial" | "failed" | "noted" — colors the outcome badge.
+    outcome_slug: &'static str,
+    outcome_badge: Option<String>,
     stage_ids: String,
     mermaid: String,
     artifacts: Vec<StoryArtifactView>,
     episode_json: String,
+}
+
+/// Classify a free-text episode outcome into a badge. Conservative: only
+/// unambiguous wording gets a colored verdict; anything else shows as a
+/// neutral "noted" chip with the leading words.
+fn outcome_badge(outcome: Option<&str>) -> (&'static str, Option<String>) {
+    let Some(text) = outcome else {
+        return ("noted", None);
+    };
+    let lower = text.to_lowercase();
+    if lower.contains("success") || lower.contains("shipped") || lower.contains("complete") {
+        ("success", Some("success".into()))
+    } else if lower.contains("partial") {
+        ("partial", Some("partial".into()))
+    } else if lower.contains("fail") || lower.contains("blocked") {
+        ("failed", Some("failed".into()))
+    } else {
+        ("noted", Some(truncate_chars(&plain_text(text), 24)))
+    }
 }
 
 #[derive(Serialize)]
@@ -601,8 +649,22 @@ fn story_card(session: &StorySession) -> Option<StoryCardView> {
             ),
         });
 
+    // Deterministic description: the narrative (or request) beyond what the
+    // headline already says. Curation replaces this with a written version.
+    let description = {
+        let source = narrative.or(input_text).map(plain_text).unwrap_or_default();
+        let candidate = truncate_chars(&source, 260);
+        if candidate == summary {
+            String::new()
+        } else {
+            candidate
+        }
+    };
+    let (outcome_slug, outcome_badge) = outcome_badge(outcome);
+
     Some(StoryCardView {
         summary,
+        description,
         project: if session.project.is_empty() {
             "unknown".to_string()
         } else {
@@ -616,6 +678,8 @@ fn story_card(session: &StorySession) -> Option<StoryCardView> {
         session_short: short_oid(&session.session_id),
         tier_slug,
         tier_label,
+        outcome_slug,
+        outcome_badge,
         stage_ids,
         mermaid,
         artifacts,
@@ -761,6 +825,7 @@ fn render_html(data: &DreamReportData) -> Result<String> {
 // applies previously cached headlines — they are already paid for.
 
 const HEADLINE_MAX_CHARS: usize = 110;
+const DESCRIPTION_MAX_CHARS: usize = 280;
 
 fn headline_hash(card: &StoryCardView) -> String {
     let payload = format!("{}\u{1}{}", card.summary, card.episode_json);
@@ -768,34 +833,62 @@ fn headline_hash(card: &StoryCardView) -> String {
 }
 
 /// Parse the model's batch response: a JSON object mapping session-short ids
-/// to headlines, possibly wrapped in code fences or prose. Fail-open: any
+/// to `{headline, description}` objects (bare strings tolerated as
+/// headline-only), possibly wrapped in code fences or prose. Fail-open: any
 /// shape problem yields an empty map and the cards keep their raw summaries.
-fn parse_headline_batch(text: &str) -> std::collections::BTreeMap<String, String> {
+fn parse_headline_batch(text: &str) -> std::collections::BTreeMap<String, (String, String)> {
     let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) else {
         return Default::default();
     };
     if end < start {
         return Default::default();
     }
-    serde_json::from_str::<std::collections::BTreeMap<String, String>>(&text[start..=end])
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(id, headline)| {
-            let cleaned = headline.split_whitespace().collect::<Vec<_>>().join(" ");
-            (!cleaned.is_empty()).then(|| (id, truncate_chars(&cleaned, HEADLINE_MAX_CHARS)))
-        })
-        .collect()
+    let clean = |value: &str, limit: usize| -> String {
+        truncate_chars(
+            &value.split_whitespace().collect::<Vec<_>>().join(" "),
+            limit,
+        )
+    };
+    serde_json::from_str::<std::collections::BTreeMap<String, serde_json::Value>>(
+        &text[start..=end],
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|(id, value)| {
+        let (headline, description) = match value {
+            serde_json::Value::String(headline) => (headline, String::new()),
+            serde_json::Value::Object(fields) => (
+                fields
+                    .get("headline")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                fields
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            _ => return None,
+        };
+        let headline = clean(&headline, HEADLINE_MAX_CHARS);
+        (!headline.is_empty()).then(|| (id, (headline, clean(&description, DESCRIPTION_MAX_CHARS))))
+    })
+    .collect()
 }
 
-fn cached_headline(storage: &Storage, session_id: &str, hash: &str) -> Option<String> {
+/// A cached row is only a hit when it carries a description too — rows written
+/// by the description-less first shape re-curate once and are then complete.
+fn cached_headline(storage: &Storage, session_id: &str, hash: &str) -> Option<(String, String)> {
     storage
         .with_connection(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT headline FROM journal_headlines
-                     WHERE session_id = ?1 AND content_hash = ?2",
+                    "SELECT headline, description FROM journal_headlines
+                     WHERE session_id = ?1 AND content_hash = ?2
+                       AND description != ''",
                     rusqlite::params![session_id, hash],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .ok())
         })
@@ -803,17 +896,25 @@ fn cached_headline(storage: &Storage, session_id: &str, hash: &str) -> Option<St
         .flatten()
 }
 
-fn store_headline(storage: &Storage, session_id: &str, hash: &str, headline: &str, model: &str) {
+fn store_headline(
+    storage: &Storage,
+    session_id: &str,
+    hash: &str,
+    headline: &str,
+    description: &str,
+    model: &str,
+) {
     let _ = storage.with_connection(|conn| {
         conn.execute(
-            "INSERT INTO journal_headlines (session_id, content_hash, headline, model)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO journal_headlines (session_id, content_hash, headline, description, model)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(session_id) DO UPDATE SET
                 content_hash = excluded.content_hash,
                 headline = excluded.headline,
+                description = excluded.description,
                 model = excluded.model,
                 created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-            rusqlite::params![session_id, hash, headline, model],
+            rusqlite::params![session_id, hash, headline, description, model],
         )?;
         Ok(())
     });
@@ -832,13 +933,15 @@ fn headline_prompt(misses: &[(&StoryCardView, String)]) -> String {
         })
         .collect::<Vec<_>>();
     format!(
-        "You are curating one-line headlines for a developer's private session journal. \
-         For each session below, write one specific headline (max {HEADLINE_MAX_CHARS} \
-         characters) stating what the session actually did or found — name the feature, \
-         bug, or artifact; never generic filler like 'worked on project'. Use the text \
-         and detail fields as evidence; do not invent outcomes they don't support. \
-         Return ONLY a JSON object mapping each id to its headline, no code fences, \
-         no commentary.\nSessions: {}",
+        "You are curating cards for a developer's private session journal. For each \
+         session below produce: a headline (max {HEADLINE_MAX_CHARS} characters) \
+         stating what the session actually did or found — name the feature, bug, or \
+         artifact, never generic filler like 'worked on project'; and a description \
+         (1-3 sentences, max {DESCRIPTION_MAX_CHARS} characters) adding the concrete \
+         specifics — what was tried, what changed, what remains. Use only the text and \
+         detail fields as evidence; do not invent outcomes they don't support. Return \
+         ONLY a JSON object mapping each id to {{\"headline\": \"...\", \
+         \"description\": \"...\"}}, no code fences, no commentary.\nSessions: {}",
         serde_json::to_string(&sessions).unwrap_or_default()
     )
 }
@@ -857,7 +960,10 @@ fn curate_headlines_with(storage: &Storage, cards: &mut [StoryCardView], allow_i
     let mut misses: Vec<usize> = Vec::new();
     for (index, card) in cards.iter_mut().enumerate() {
         match cached_headline(storage, &card.session_short, &hashes[index]) {
-            Some(headline) => card.summary = headline,
+            Some((headline, description)) => {
+                card.summary = headline;
+                card.description = description;
+            }
             None => misses.push(index),
         }
     }
@@ -892,9 +998,19 @@ fn curate_headlines_with(storage: &Storage, cards: &mut [StoryCardView], allow_i
     let headlines = parse_headline_batch(&parsed.text);
     for &index in &misses {
         let (session_short, hash) = (cards[index].session_short.clone(), hashes[index].clone());
-        if let Some(headline) = headlines.get(&session_short) {
-            store_headline(storage, &session_short, &hash, headline, &parsed.model);
+        if let Some((headline, description)) = headlines.get(&session_short) {
+            store_headline(
+                storage,
+                &session_short,
+                &hash,
+                headline,
+                description,
+                &parsed.model,
+            );
             cards[index].summary = headline.clone();
+            if !description.is_empty() {
+                cards[index].description = description.clone();
+            }
         }
     }
 }
@@ -1094,16 +1210,32 @@ mod tests {
 
     #[test]
     fn parse_headline_batch_tolerates_fences_prose_and_clamps_length() {
-        let fenced = "```json\n{\"abc12345\": \"Fixed the relevance gate in guardrails\"}\n```";
-        let map = parse_headline_batch(fenced);
+        // New object shape: headline + description.
+        let object = "```json\n{\"abc12345\": {\"headline\": \"Fixed the relevance gate in guardrails\", \"description\": \"Traced the broken gate, rewired it, added a test.\"}}\n```";
+        let map = parse_headline_batch(object);
+        let (headline, description) = map.get("abc12345").unwrap();
+        assert_eq!(headline, "Fixed the relevance gate in guardrails");
         assert_eq!(
-            map.get("abc12345").map(String::as_str),
-            Some("Fixed the relevance gate in guardrails")
+            description,
+            "Traced the broken gate, rewired it, added a test."
         );
 
-        let long = format!("{{\"id1\": \"{}\"}}", "x".repeat(400));
+        // Legacy bare-string shape still parses as headline-only.
+        let legacy = "{\"legacy01\": \"Plain headline\"}";
+        assert_eq!(
+            parse_headline_batch(legacy).get("legacy01"),
+            Some(&("Plain headline".to_string(), String::new()))
+        );
+
+        let long = format!(
+            "{{\"id1\": {{\"headline\": \"{}\", \"description\": \"{}\"}}}}",
+            "x".repeat(400),
+            "y".repeat(600)
+        );
         let clamped = parse_headline_batch(&long);
-        assert!(clamped.get("id1").unwrap().chars().count() <= HEADLINE_MAX_CHARS);
+        let (h, d) = clamped.get("id1").unwrap();
+        assert!(h.chars().count() <= HEADLINE_MAX_CHARS);
+        assert!(d.chars().count() <= DESCRIPTION_MAX_CHARS);
 
         assert!(parse_headline_batch("no json here").is_empty());
         assert!(parse_headline_batch("{\"id\": \"   \"}").is_empty());
@@ -1111,7 +1243,7 @@ mod tests {
         assert_eq!(
             parse_headline_batch(multiline)
                 .get("id2")
-                .map(String::as_str),
+                .map(|v| v.0.as_str()),
             Some("line one line two")
         );
     }
@@ -1137,6 +1269,7 @@ mod tests {
             &raw_card.session_short,
             &hash,
             "Overnight metrics pull: MRR snapshot + spend check",
+            "Pulled Meta spend and account balances; MRR snapshot confirmed at $25k.",
             "test-model",
         );
 
@@ -1157,7 +1290,31 @@ mod tests {
             cards[0].summary,
             "Overnight metrics pull: MRR snapshot + spend check"
         );
+        assert_eq!(
+            cards[0].description,
+            "Pulled Meta spend and account balances; MRR snapshot confirmed at $25k."
+        );
         assert_eq!(cards[1].summary, raw_summary);
+    }
+
+    #[test]
+    fn outcome_badges_classify_conservatively() {
+        assert_eq!(outcome_badge(None), ("noted", None));
+        assert_eq!(
+            outcome_badge(Some("Shipped to production")),
+            ("success", Some("success".into()))
+        );
+        assert_eq!(
+            outcome_badge(Some("partial — two items left")),
+            ("partial", Some("partial".into()))
+        );
+        assert_eq!(
+            outcome_badge(Some("failed at the gate")),
+            ("failed", Some("failed".into()))
+        );
+        let (slug, badge) = outcome_badge(Some("parked for review"));
+        assert_eq!(slug, "noted");
+        assert_eq!(badge.as_deref(), Some("parked for review"));
     }
 
     #[test]
@@ -1177,6 +1334,7 @@ mod tests {
             &card.session_short,
             "0000000000000000",
             "Headline for content that no longer exists",
+            "Description for content that no longer exists.",
             "test-model",
         );
         let mut cards = vec![card];

@@ -551,6 +551,7 @@ pub fn run(conn: &Connection) -> Result<()> {
             session_id TEXT PRIMARY KEY,
             content_hash TEXT NOT NULL,
             headline TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
             model TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
          );
@@ -563,6 +564,20 @@ pub fn run(conn: &Connection) -> Result<()> {
             extracted_at INTEGER NOT NULL
          );",
     )?;
+
+    // Migration: journal_headlines gained `description` after first ship on
+    // 2026-08-10; DBs created between the two shapes lack the column. Same
+    // idempotent ALTER-guard pattern as the code_edges columns above.
+    {
+        let has_description: bool = conn
+            .prepare("SELECT description FROM journal_headlines LIMIT 0")
+            .is_ok();
+        if !has_description {
+            let _ = conn.execute_batch(
+                "ALTER TABLE journal_headlines ADD COLUMN description TEXT NOT NULL DEFAULT '';",
+            );
+        }
+    }
 
     // Migration: resolution ledger (v9.4+) — append-only verdicts per chunk_id;
     // latest row wins on read. No FK on chunk_id (may reference reflections too).
