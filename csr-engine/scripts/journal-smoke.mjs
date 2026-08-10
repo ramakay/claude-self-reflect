@@ -22,7 +22,16 @@
 // on any failure.
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+  existsSync,
+  openSync,
+  ftruncateSync,
+  closeSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -150,7 +159,41 @@ function buildFixtureSql() {
       investigated: [],
       artifacts: [],
     },
+    // Phase 2 (§7.2): one instrumented session — tool-verified error count,
+    // top errors, mid-flight steers (5 reported, only 3 stored, exercising
+    // the cap), tasks, files, and artifacts all present together so a
+    // single row exercises the full four-segment instrumentation line.
+    {
+      id: "rich7",
+      daysAgo: 0,
+      hour: 21,
+      minute: 0,
+      project: "proj-alpha",
+      request: "Wire the queue worker retry path",
+      outcome: "Shipped the queue worker",
+      todos: [["wire the retry path", "completed"]],
+      investigated: ["/repo/src/queue.rs"],
+      artifacts: ["queue_worker"],
+      instrumentation: {
+        error_count: 2,
+        top_errors: [
+          { turn: 5, tool: "Bash", preview: "npm test failed: 3 tests" },
+          { turn: 9, tool: "Read", preview: "file not found" },
+        ],
+        steer_count: 5,
+        steers: [
+          { turn: 3, text: "no, use bash not zsh" },
+          { turn: 7, text: "actually revert that" },
+          { turn: 12, text: "retry with backoff instead" },
+        ],
+      },
+    },
   ];
+  // Phase 2 (§7.2): "rich2" is deliberately left uninstrumented at the
+  // episode layer (no `instrumentation` above) AND given an oversized
+  // on-disk transcript below (see `makeOversizedTranscript`) — the
+  // report-time backfill must resolve it, decline to parse it, and mark it
+  // "not scanned" without ever fabricating an errors segment for it.
 
   const thinEntries = [
     { id: "thin1", daysAgo: 0, hour: 7, minute: 0, project: "thin-alpha", prompt: "check the logs" },
@@ -172,6 +215,10 @@ function buildFixtureSql() {
       outcome: ep.outcome,
       investigated: ep.investigated,
       todos: ep.todos.map(([c, s]) => ({ content: c, status: s })),
+      // Phase 2 (§7.2) instrumentation feeds — only present on episodes that
+      // opt in via `ep.instrumentation`; every other episode deserializes
+      // these as their honest `None`/empty defaults.
+      ...(ep.instrumentation || {}),
     });
     const tags = JSON.stringify(["session_episode", "schema_v2", `conv_${ep.id}`]);
     lines.push(
@@ -200,6 +247,26 @@ function buildFixtureSql() {
     );
   }
   return { sql: lines.join("\n") + "\n", episodes, thinEntries };
+}
+
+/** 64 MiB + 1 byte — one past `MAX_TRANSCRIPT_SCAN_BYTES` (must track
+ * `csr-engine/src/transcript/instrumentation.rs`). A sparse `ftruncateSync`
+ * makes the file report this size without writing real bytes to disk. */
+const OVERSIZED_TRANSCRIPT_BYTES = 64 * 1024 * 1024 + 1;
+
+/** Phase 2 (§7.2): create a transcript file on disk that exists but is too
+ * large for the report-time backfill to parse — the fixture case for the
+ * "⚠ not scanned" warning chip. */
+function makeOversizedTranscript(projectsDir, project, sessionId) {
+  const dir = path.join(projectsDir, project);
+  mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, `${sessionId}.jsonl`);
+  const fd = openSync(filePath, "w");
+  try {
+    ftruncateSync(fd, OVERSIZED_TRANSCRIPT_BYTES);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function runBinary(args, env) {
@@ -238,6 +305,12 @@ function seedFixtureAndRender(workDir) {
   if (seed.status !== 0) {
     throw new Error(`sqlite3 seeding failed: ${seed.stderr}`);
   }
+
+  // Phase 2 (§7.2): "rich2" (proj-beta) has no episode-level instrumentation
+  // — give it an on-disk transcript too large to scan, so the report-time
+  // backfill must resolve it, decline to parse it, and mark it "not
+  // scanned" rather than fabricate an errors segment for it.
+  makeOversizedTranscript(projectsDir, "proj-beta", "rich2");
 
   // Real render against the seeded fixture — this is the file the headless
   // checks below actually load.
@@ -696,6 +769,114 @@ async function main() {
         popoverResult.skipped ||
           (popoverResult.shownInViewport && popoverResult.hiddenAfterLeave && popoverResult.cornerInViewport),
         JSON.stringify(popoverResult),
+      );
+
+      // ---- instrumentation-segments (§7.2, Phase 2) -----------------------
+      // "rich7" carries tasks + artifacts + files + tool-verified errors —
+      // all four segments in one row. "rich1" carries no error evidence at
+      // all and must show no "error(s)" token.
+      const instrumentationSegments = await evalJS(
+        cdp,
+        `(() => {
+          const rows = Array.from(document.querySelectorAll(".index-row"));
+          const instrumented = rows.find(r => r.dataset.session === "rich7");
+          const uninstrumented = rows.find(r => r.dataset.session === "rich1");
+          return {
+            instrumentedText: instrumented ? instrumented.querySelector(".instrumentation").textContent : null,
+            uninstrumentedText: uninstrumented ? uninstrumented.querySelector(".instrumentation").textContent : null,
+          };
+        })()`,
+      );
+      const segmentsRe = /✓\d+ ○\d+ tasks · \d+ artifacts? · \d+ files? · \d+ errors?/;
+      check(
+        "instrumentation-segments",
+        Boolean(instrumentationSegments.instrumentedText) &&
+          segmentsRe.test(instrumentationSegments.instrumentedText) &&
+          instrumentationSegments.uninstrumentedText !== null &&
+          !/errors?/.test(instrumentationSegments.uninstrumentedText),
+        JSON.stringify(instrumentationSegments),
+      );
+
+      // ---- steer-lines (§7.2, Phase 2) -------------------------------------
+      // "rich7" reports steer_count=5 but only stores 3 steers — the STEER
+      // stage must show the true count line and exactly min(5, 3) = 3
+      // "↳ turn N" children.
+      const steerLines = await evalJS(
+        cdp,
+        `(() => {
+          document.querySelector('.index-row[data-session="rich7"]').click();
+          const pane = document.querySelector('.detail-pane[data-session="rich7"]');
+          const steerCard = pane ? pane.querySelector(".stage-card.steer") : null;
+          const countEl = steerCard ? steerCard.querySelector(".steer-count") : null;
+          return {
+            countText: countEl ? countEl.textContent : null,
+            lineCount: steerCard ? steerCard.querySelectorAll(".steer-line").length : 0,
+          };
+        })()`,
+      );
+      check(
+        "steer-lines",
+        Boolean(steerLines.countText) &&
+          steerLines.countText.includes("5") &&
+          steerLines.lineCount === 3,
+        JSON.stringify(steerLines),
+      );
+
+      // ---- error-popover (§7.2, Phase 2) -----------------------------------
+      // Hovering "rich7"'s errors chip must show the top-error preview,
+      // clamped fully inside the viewport (same clamp mechanism as the
+      // generic `popover` check above, targeted at the errors segment).
+      const errorPopover = await evalJS(
+        cdp,
+        `(() => {
+          const row = document.querySelector('.index-row[data-session="rich7"]');
+          const chips = row ? Array.from(row.querySelectorAll(".chip")) : [];
+          const errorChip = chips.find(c => /errors?/.test(c.textContent) && c.dataset.popover);
+          if (!errorChip) return { skipped: true };
+          const rect = errorChip.getBoundingClientRect();
+          errorChip.dispatchEvent(new PointerEvent("pointerenter", { clientX: rect.left + 2, clientY: rect.top + 2, bubbles: true }));
+          const popover = document.querySelector(".chip-popover");
+          const shown = !popover.hidden;
+          const text = popover.textContent;
+          const shownRect = popover.getBoundingClientRect();
+          const inViewport =
+            shownRect.left >= 0 &&
+            shownRect.top >= 0 &&
+            shownRect.right <= window.innerWidth &&
+            shownRect.bottom <= window.innerHeight;
+          errorChip.dispatchEvent(new PointerEvent("pointerleave", { bubbles: true }));
+          return { shown, text, inViewport };
+        })()`,
+      );
+      check(
+        "error-popover",
+        errorPopover.skipped ||
+          (errorPopover.shown && errorPopover.inViewport && /Bash|Read/.test(errorPopover.text || "")),
+        JSON.stringify(errorPopover),
+      );
+
+      // ---- warning-chip (§7.2, Phase 2) ------------------------------------
+      // "rich2" has an oversized on-disk transcript (see
+      // `makeOversizedTranscript`): the backfill resolves it, declines to
+      // parse it, and must show "⚠ not scanned". "rich1" has no transcript
+      // on disk at all and must show no chip (plan §3.4 row 1: nothing to
+      // disclose "not scanned" about).
+      const warningChip = await evalJS(
+        cdp,
+        `(() => {
+          document.querySelector('.index-row[data-session="rich2"]').click();
+          const scannedPane = document.querySelector('.detail-pane[data-session="rich2"]');
+          const hasWarnOversized = !!(scannedPane && scannedPane.querySelector(".warn-chip"));
+          document.querySelector('.index-row[data-session="rich1"]').click();
+          const otherPane = document.querySelector('.detail-pane[data-session="rich1"]');
+          const hasWarnNoTranscript = !!(otherPane && otherPane.querySelector(".warn-chip"));
+          return { hasWarnOversized, hasWarnNoTranscript };
+        })()`,
+      );
+      check(
+        "warning-chip",
+        warningChip.hasWarnOversized && !warningChip.hasWarnNoTranscript,
+        JSON.stringify(warningChip),
       );
 
       // ---- thin-expand ---------------------------------------------------

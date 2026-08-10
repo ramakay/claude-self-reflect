@@ -19,8 +19,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::storage::dream_report::{StoryArtifact, StorySession};
+use crate::storage::dream_report::{self, StoryArtifact, StorySession};
 use crate::storage::Storage;
+use crate::transcript::instrumentation::{ErrorEvent, SessionInstrumentation};
 
 /// The compiled-in Jinja template — see the module doc. Named `.html` so
 /// minijinja's default auto-escape callback treats every `{{ }}`
@@ -73,7 +74,7 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section class="mailbox" aria-label
         <button type="button" class="index-row{% if row.selected %} selected{% endif %}" data-session="{{ row.session_short }}" data-ts="{{ row.ts }}" data-project="{{ row.project }}" data-outcome="{{ row.outcome_slug }}" data-day="{{ row.day }}" role="option" aria-selected="{% if row.selected %}true{% else %}false{% endif %}">
           <span class="row-head"><span class="glyph {{ row.outcome_slug }}">{{ row.glyph }}</span><span class="project-pill">{{ row.project }}</span></span>
           <span class="sentence">{{ row.sentence }}</span>
-          <span class="instrumentation">{% for segment in row.segments %}<span class="chip"{% if segment.popover %} data-popover="{{ segment.popover }}"{% endif %}>{{ segment.text }}</span>{% if not loop.last %} · {% endif %}{% endfor %}</span>
+          <span class="instrumentation">{% for segment in row.segments %}<span class="chip{% if segment.degraded %} degraded{% endif %}"{% if segment.popover %} data-popover="{{ segment.popover }}"{% endif %}{% if segment.title %} title="{{ segment.title }}"{% endif %}>{{ segment.text }}</span>{% if not loop.last %} · {% endif %}{% endfor %}</span>
         </button>
         {% endfor %}
         {% endfor %}
@@ -98,7 +99,7 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section class="mailbox" aria-label
       <article class="detail-pane" data-session="{{ pane.session_short }}"{% if not loop.first %} hidden{% endif %}>
         <header class="detail-head">
           <h2 class="sentence">{{ pane.sentence }}</h2>
-          <p class="detail-meta"><span class="project-pill">{{ pane.project }}</span><span>{{ pane.date }}</span><span>{{ pane.session_short }}</span>{% if pane.outcome_badge %}<span class="outcome-badge {{ pane.outcome_slug }}">{{ pane.outcome_badge }}</span>{% endif %}</p>
+          <p class="detail-meta"><span class="project-pill">{{ pane.project }}</span><span>{{ pane.date }}</span><span>{{ pane.session_short }}</span>{% if pane.outcome_badge %}<span class="outcome-badge {{ pane.outcome_slug }}">{{ pane.outcome_badge }}</span>{% endif %}{% if pane.unscanned %}<span class="warn-chip" title="transcript not scanned for instrumentation">&#9888; not scanned</span>{% endif %}</p>
         </header>
         <div class="stage-rail">
           {% for stage in pane.stages %}
@@ -119,9 +120,16 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section class="mailbox" aria-label
                 <ul class="task-list">
                   {% for todo in stage.todos %}<li class="task {{ todo.slug }}"><span class="glyph">{{ todo.glyph }}</span>{{ todo.content }}</li>{% endfor %}
                 </ul>
+                {% if stage.steer_count %}
+                <p class="steer-count">{{ stage.steer_count }} mid-flight steer{% if stage.steer_count != 1 %}s{% endif %}</p>
+                {% for steer in stage.steers %}<p class="steer-line">&#8627; turn {{ steer.turn }} &ldquo;{{ steer.text }}&rdquo;</p>{% endfor %}
+                {% endif %}
               {% elif stage.kind == "outcome" %}
                 {% if stage.outcome_stats %}<p class="outcome-stats">{{ stage.outcome_stats }}</p>{% endif %}
+                {% if stage.error_line %}<p class="outcome-errors">{{ stage.error_line }}</p>{% endif %}
+                {% if stage.top_error %}<p class="top-error">&#9656; top error {{ stage.top_error }}</p>{% endif %}
                 {% if stage.outcome_text %}<p class="outcome-text">{{ stage.outcome_text }}</p>{% endif %}
+                {% if stage.still_open %}<p class="still-open">{{ stage.still_open }}</p>{% endif %}
               {% endif %}
             </div>
           </details>
@@ -299,6 +307,16 @@ const MAILBOX_CSS: &str = r#"
   .outcome-badge.partial { color: var(--amber); background: var(--amber-bg); }
   .outcome-badge.failed { color: var(--red); background: var(--red-bg); }
   .outcome-badge.noted { color: var(--fg-muted); border: 1px solid var(--border); }
+  .warn-chip {
+    color: var(--amber); border: 1px solid var(--amber); border-radius: 999px;
+    padding: 0.05rem 0.5rem; font-size: 0.68rem; font-weight: 700;
+  }
+  .chip.degraded { border-bottom: 1px dotted var(--amber); }
+  .steer-count { font-weight: 700; margin: 0.5rem 0 0.2rem; }
+  .steer-line { margin: 0 0 0.2rem; color: var(--fg-muted); overflow-wrap: anywhere; }
+  .outcome-errors { font-weight: 700; margin: 0 0 0.35rem; }
+  .top-error { color: var(--fg-muted); margin: 0 0 0.35rem; overflow-wrap: anywhere; }
+  .still-open { color: var(--fg-muted); margin: 0.35rem 0 0; overflow-wrap: anywhere; }
   .stage-rail { position: relative; padding-left: 1.9rem; margin-bottom: 1rem; }
   .stage-rail::before {
     content: ""; position: absolute; left: 0.7rem; top: 0.6rem; bottom: 0.6rem;
@@ -517,10 +535,25 @@ struct StoryTodoView {
 
 #[derive(Debug, Clone, Serialize)]
 struct SegmentView {
-    /// e.g. "✓1 ○1 tasks", "2 artifacts", "3 files".
+    /// e.g. "✓1 ○1 tasks", "2 artifacts", "3 files", "12 errors", "~3 errors".
     text: String,
     /// Short preview shown on hover; empty means the chip carries no popover.
     popover: String,
+    /// Native `title` attribute — used for the degraded-fallback disclosure
+    /// ("pattern-matched, not tool-verified") and the R8 "(parent only)"
+    /// note. `None` means no `title` attribute is rendered at all.
+    title: Option<String>,
+    /// True for the tilde-marked degraded (`error_signatures.len()`)
+    /// fallback — never a tool-verified count. Kept as an explicit flag
+    /// (rather than inferring degradation from the `~` in `text`) so the
+    /// template and any future consumer never have to string-sniff it.
+    degraded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SteerLineView {
+    turn: u32,
+    text: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -538,6 +571,19 @@ struct StageCardView {
     todos: Vec<StoryTodoView>,
     outcome_text: Option<String>,
     outcome_stats: Option<String>,
+    /// STEER stage only. `None` -> no count line at all; `Some(0)` also
+    /// renders no count line (plan §3.3b: a session with zero steers is a
+    /// real fact, but it earns no line in this phase) — `Some(n>0)` renders
+    /// "N mid-flight steers" plus up to 3 `steers` children.
+    steer_count: Option<u32>,
+    steers: Vec<SteerLineView>,
+    /// OUTCOME stage only: tool-verified/degraded error count line and the
+    /// single highest-byte-size error's "tool: preview".
+    error_line: Option<String>,
+    top_error: Option<String>,
+    /// OUTCOME stage only: `next_steps`/`blockers`, fused into one trailing
+    /// "still open" line.
+    still_open: Option<String>,
 }
 
 /// Intermediate, curation-facing representation of one rich session. This is
@@ -556,18 +602,49 @@ struct StoryCardView {
     date: String,
     timestamp: String,
     session_short: String,
+    /// Full session id — never displayed (the mailbox only ever shows
+    /// `session_short`), kept so the report-time instrumentation backfill
+    /// can resolve this card's transcript file and correlate the
+    /// `session_instrumentation` cache row.
+    session_id: String,
     outcome_slug: &'static str,
     outcome_badge: Option<String>,
     request_text: Option<String>,
     narrative: Option<String>,
     investigated: Vec<String>,
+    /// `investigated` ∪ `files_modified`, deduped — the index row's `F
+    /// files` count (plan §6 Phase 2). The DELIBERATION stage's file list
+    /// keeps showing `investigated` alone; this union only feeds the count.
+    files_touched: Vec<String>,
     todos: Vec<StoryTodoView>,
     outcome_text: Option<String>,
+    completed: Option<String>,
+    next_steps: Option<String>,
+    blockers: Option<String>,
     artifacts: Vec<StoryArtifactView>,
     /// Hash payload input only in Phase 1 — no longer rendered as a page
     /// script tag inline in the index (still embedded once per detail pane,
     /// see `DetailPaneView::episode_json`).
     episode_json: String,
+    /// The pre-existing, over/under-counting substring-matched fallback
+    /// (see `transcript::instrumentation` module doc). Eligible as the
+    /// degraded error segment only when non-empty AND `instrumentation` is
+    /// still `None` after the backfill runs.
+    error_signatures: Vec<String>,
+    /// Resolution order steps 1-2 from `StorySession` (episode/cache),
+    /// mutated in place by the report-time backfill (step 3, live scan) if
+    /// still `None` when the backfill runs.
+    instrumentation: Option<SessionInstrumentation>,
+    /// Set by the backfill when a transcript was located on disk but did
+    /// not end up contributing measured instrumentation (oversized, budget
+    /// exhausted, kill switch, or a read/parse failure) — drives the "⚠ not
+    /// scanned" detail-header chip. Never set when no transcript resolves
+    /// at all (plan §3.4: that case shows no chip, only an absent segment).
+    unscanned: bool,
+    /// Set by the backfill when the resolved transcript's directory has a
+    /// `<session>/subagents/agent-*.jsonl` sibling — the parent-only
+    /// disclosure required by plan §8 R8.
+    has_subagents: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -597,6 +674,10 @@ struct DetailPaneView {
     artifacts: Vec<StoryArtifactView>,
     artifacts_more: usize,
     episode_json: String,
+    /// Plan §3.4 / §6 Phase 2: transcript located but did not contribute
+    /// measured instrumentation (oversized, budget-exhausted, kill switch,
+    /// or a read/parse failure).
+    unscanned: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -966,6 +1047,33 @@ fn build_story_card(session: &StorySession) -> StoryCardView {
     };
     let (outcome_slug, outcome_badge) = outcome_badge(outcome);
 
+    // Index row `F files` count (plan §6 Phase 2): investigated ∪
+    // files_modified, deduped. The DELIBERATION stage keeps showing
+    // `investigated` alone — this union only feeds the count/popover.
+    let mut files_touched = session.investigated.clone();
+    for file in &session.files_modified {
+        if !file.trim().is_empty() && !files_touched.contains(file) {
+            files_touched.push(file.clone());
+        }
+    }
+
+    let completed = session
+        .completed
+        .as_deref()
+        .map(strip_scaffold)
+        .filter(|value| !value.trim().is_empty())
+        .map(|text| truncate_chars(&plain_text(text), 320));
+    let next_steps = session
+        .next_steps
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|text| truncate_chars(&plain_text(text), 200));
+    let blockers = session
+        .blockers
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|text| truncate_chars(&plain_text(text), 200));
+
     StoryCardView {
         summary,
         description,
@@ -977,15 +1085,24 @@ fn build_story_card(session: &StorySession) -> StoryCardView {
         date: iso_date(&session.timestamp),
         timestamp: session.timestamp.clone(),
         session_short: short_oid(&session.session_id),
+        session_id: session.session_id.clone(),
         outcome_slug,
         outcome_badge,
         request_text: input_text.map(|text| truncate_chars(&plain_text(text), 240)),
         narrative: narrative.map(|text| truncate_chars(&plain_text(text), 500)),
         investigated: session.investigated.clone(),
+        files_touched,
         todos,
         outcome_text: outcome.map(|text| truncate_chars(&plain_text(text), 320)),
+        completed,
+        next_steps,
+        blockers,
         artifacts,
         episode_json,
+        error_signatures: session.error_signatures.clone(),
+        instrumentation: session.instrumentation.clone(),
+        unscanned: false,
+        has_subagents: false,
     }
 }
 
@@ -1040,6 +1157,43 @@ const ARTIFACT_CAP: usize = 24;
 /// than embedding hundreds of entries no UI surface shows.
 const EPISODE_JSON_LIST_CAP: usize = 20;
 
+/// Resolved error evidence for one card, computed once the backfill has had
+/// its chance to fill `instrumentation` (plan §3.3a resolution order, final
+/// two branches). `Absent` — never a segment/line at all — for a session
+/// with neither a tool-verified pass nor any pattern-matched
+/// `error_signatures` (an episode that never carried the field defaults to
+/// the same empty `Vec` as one that genuinely found zero matches, so an
+/// empty `error_signatures` is never distinguishable from "not collected"
+/// and must never render `~0 errors`).
+enum ErrorDisplay {
+    Absent,
+    Measured { count: u32, top: Vec<ErrorEvent> },
+    Degraded { count: u32 },
+}
+
+fn error_display(card: &StoryCardView) -> ErrorDisplay {
+    if let Some(instrumentation) = &card.instrumentation {
+        return ErrorDisplay::Measured {
+            count: instrumentation.error_count,
+            top: instrumentation.top_errors.clone(),
+        };
+    }
+    if !card.error_signatures.is_empty() {
+        return ErrorDisplay::Degraded {
+            count: card.error_signatures.len() as u32,
+        };
+    }
+    ErrorDisplay::Absent
+}
+
+/// A short, single/no-space outcome phrase ("partial", "done") that reads
+/// as a bare slug rather than real prose — the OUTCOME card falls back to
+/// `completed` text as its body in this case (plan §6 Phase 2).
+fn is_bare_slug(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty() && trimmed.split_whitespace().count() <= 1 && trimmed.chars().count() <= 24
+}
+
 /// Only the stages with real evidence are drawn — a session with no todos
 /// and no steers gets a shorter rail, never a padded-out four-node one.
 fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
@@ -1058,6 +1212,11 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
             todos: Vec::new(),
             outcome_text: None,
             outcome_stats: None,
+            steer_count: None,
+            steers: Vec::new(),
+            error_line: None,
+            top_error: None,
+            still_open: None,
         });
     }
 
@@ -1081,10 +1240,31 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
             todos: Vec::new(),
             outcome_text: None,
             outcome_stats: None,
+            steer_count: None,
+            steers: Vec::new(),
+            error_line: None,
+            top_error: None,
+            still_open: None,
         });
     }
 
-    if !card.todos.is_empty() {
+    let steer_count = card.instrumentation.as_ref().map(|i| i.steer_count);
+    let has_steers = steer_count.is_some_and(|n| n > 0);
+    if !card.todos.is_empty() || has_steers {
+        let steers: Vec<SteerLineView> = card
+            .instrumentation
+            .as_ref()
+            .map(|i| {
+                i.steers
+                    .iter()
+                    .take(3)
+                    .map(|s| SteerLineView {
+                        turn: s.turn,
+                        text: s.text.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         stages.push(StageCardView {
             id: "S_STEER",
             label: "STEER",
@@ -1097,6 +1277,11 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
             todos: card.todos.clone(),
             outcome_text: None,
             outcome_stats: None,
+            steer_count,
+            steers,
+            error_line: None,
+            top_error: None,
+            still_open: None,
         });
     }
 
@@ -1105,6 +1290,32 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
             let done = card.todos.iter().filter(|todo| todo.slug == "done").count();
             format!("{done} of {} tasks done", card.todos.len())
         });
+        // Plan §6 Phase 2: when the outcome text is a bare slug ("partial",
+        // "done"), show `completed`'s real prose as the body instead.
+        let outcome_text = match &card.outcome_text {
+            Some(text) if is_bare_slug(text) => {
+                card.completed.clone().or(card.outcome_text.clone())
+            }
+            other => other.clone(),
+        };
+        let (error_line, top_error) = match error_display(card) {
+            ErrorDisplay::Absent => (None, None),
+            ErrorDisplay::Measured { count, top } => (
+                Some(pluralize(count as usize, "error")),
+                top.first()
+                    .map(|error| format!("{}: {}", error.tool, error.preview)),
+            ),
+            ErrorDisplay::Degraded { count } => (
+                Some(format!("~{}", pluralize(count as usize, "error"))),
+                None,
+            ),
+        };
+        let still_open = match (&card.next_steps, &card.blockers) {
+            (Some(next), Some(blockers)) => Some(format!("{next} — blocked by: {blockers}")),
+            (Some(next), None) => Some(next.clone()),
+            (None, Some(blockers)) => Some(format!("Blocked by: {blockers}")),
+            (None, None) => None,
+        };
         stages.push(StageCardView {
             id: "S_OUT",
             label: "OUTCOME",
@@ -1115,8 +1326,13 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
             investigated: Vec::new(),
             investigated_more: 0,
             todos: Vec::new(),
-            outcome_text: card.outcome_text.clone(),
+            outcome_text,
             outcome_stats,
+            steer_count: None,
+            steers: Vec::new(),
+            error_line,
+            top_error,
+            still_open,
         });
     }
 
@@ -1124,17 +1340,20 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
 }
 
 /// The instrumentation line's segments: `✓N ○M tasks · K artifacts · F
-/// files`. Every segment drops independently when its evidence is empty —
-/// an empty todo list never renders `✓0 ○0`, an empty artifact/file list
-/// never renders `0 artifacts`/`0 files`. Phase 1 has no error evidence yet
-/// (that lands in Phase 2 with the transcript scan), so the `errors`
-/// segment never appears here.
+/// files · E errors`. Every segment drops independently when its evidence is
+/// absent — an empty todo list never renders `✓0 ○0`, an empty
+/// artifact/file list never renders `0 artifacts`/`0 files`, and an
+/// unmeasured error count renders no `errors` segment at all
+/// (`ErrorDisplay::Absent`). A tool-verified `Some(0)` DOES render `0
+/// errors` — a real measured zero is not the same as "never measured".
 fn instrumentation_segments(
     todos: &[StoryTodoView],
     artifacts: &[StoryArtifactView],
-    investigated: &[String],
+    files_touched: &[String],
+    error: &ErrorDisplay,
+    has_subagents: bool,
 ) -> Vec<SegmentView> {
-    let mut segments = Vec::with_capacity(3);
+    let mut segments = Vec::with_capacity(4);
     if !todos.is_empty() {
         let done = todos.iter().filter(|todo| todo.slug == "done").count();
         let open = todos.len() - done;
@@ -1147,6 +1366,8 @@ fn instrumentation_segments(
         segments.push(SegmentView {
             text: format!("✓{done} ○{open} tasks"),
             popover,
+            title: None,
+            degraded: false,
         });
     }
     if !artifacts.is_empty() {
@@ -1159,19 +1380,53 @@ fn instrumentation_segments(
         segments.push(SegmentView {
             text: pluralize(artifacts.len(), "artifact"),
             popover,
+            title: None,
+            degraded: false,
         });
     }
-    if !investigated.is_empty() {
-        let popover = investigated
+    if !files_touched.is_empty() {
+        let popover = files_touched
             .iter()
             .take(CHIP_PREVIEW_CAP)
             .map(|file| basename(file))
             .collect::<Vec<_>>()
             .join(" • ");
         segments.push(SegmentView {
-            text: pluralize(investigated.len(), "file"),
+            text: pluralize(files_touched.len(), "file"),
             popover,
+            title: None,
+            degraded: false,
         });
+    }
+    match error {
+        ErrorDisplay::Absent => {}
+        ErrorDisplay::Measured { count, top } => {
+            let popover = top
+                .iter()
+                .take(CHIP_PREVIEW_CAP)
+                .map(|error| format!("{}: {}", error.tool, error.preview))
+                .collect::<Vec<_>>()
+                .join(" • ");
+            let title = has_subagents.then(|| "(parent only)".to_string());
+            segments.push(SegmentView {
+                text: pluralize(*count as usize, "error"),
+                popover,
+                title,
+                degraded: false,
+            });
+        }
+        ErrorDisplay::Degraded { count } => {
+            let mut title = "pattern-matched, not tool-verified".to_string();
+            if has_subagents {
+                title.push_str(" (parent only)");
+            }
+            segments.push(SegmentView {
+                text: format!("~{}", pluralize(*count as usize, "error")),
+                popover: String::new(),
+                title: Some(title),
+                degraded: true,
+            });
+        }
     }
     segments
 }
@@ -1183,7 +1438,13 @@ fn index_row(card: &StoryCardView, selected: bool) -> IndexRowView {
         outcome_slug: card.outcome_slug,
         project: card.project.clone(),
         sentence: card.summary.clone(),
-        segments: instrumentation_segments(&card.todos, &card.artifacts, &card.investigated),
+        segments: instrumentation_segments(
+            &card.todos,
+            &card.artifacts,
+            &card.files_touched,
+            &error_display(card),
+            card.has_subagents,
+        ),
         ts: card.timestamp.clone(),
         day: card.date.clone(),
         selected,
@@ -1203,6 +1464,7 @@ fn detail_pane(card: &StoryCardView) -> DetailPaneView {
         artifacts: card.artifacts.iter().take(ARTIFACT_CAP).cloned().collect(),
         artifacts_more,
         episode_json: card.episode_json.clone(),
+        unscanned: card.unscanned,
     }
 }
 
@@ -1220,16 +1482,145 @@ struct RawReportData {
     older_omitted: usize,
 }
 
+/// Kill switch (plan §3.3a/§6 Phase 2): when set, the report-time backfill
+/// never parses a transcript or writes a `session_instrumentation` row.
+/// Threaded as a parameter with the env read happening at this single call
+/// site, rather than read again inside the backfill loop, so tests never
+/// race the process-global variable the way parallel `cargo test` threads
+/// would if the loop itself called `std::env::var`.
+const CSR_JOURNAL_NO_SCAN: &str = "CSR_JOURNAL_NO_SCAN";
+
+fn journal_scan_enabled() -> bool {
+    std::env::var(CSR_JOURNAL_NO_SCAN).as_deref() != Ok("1")
+}
+
+/// Wall-clock budget for the whole report-time backfill loop (plan §3.3a
+/// cost table): checked between sessions, never mid-parse — a session
+/// already in flight finishes, but no new one starts once the budget is
+/// spent. Left-over sessions stay uninstrumented (honest partial), not an
+/// error.
+const BACKFILL_WALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// True when `transcript_path`'s sibling `<session_id>/subagents/` directory
+/// exists and contains at least one `agent-*.jsonl` file — the layout
+/// `import::derive_conversation_attribution` already recognizes for
+/// sidechains. Used only for the R8 "(parent only)" disclosure; sidechain
+/// transcripts themselves are never scanned (plan §8 R8/§9 Q9, out of
+/// scope).
+fn has_subagent_transcripts(transcript_path: &Path, session_id: &str) -> bool {
+    let Some(parent) = transcript_path.parent() else {
+        return false;
+    };
+    let subagents_dir = parent.join(session_id).join("subagents");
+    let Ok(entries) = std::fs::read_dir(&subagents_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("agent-") && name.ends_with(".jsonl")
+    })
+}
+
+/// Report-time instrumentation backfill (plan §3.3a resolution order, step
+/// 3 — live scan). Mutates `cards` in place: any card whose
+/// `instrumentation` is still `None` after the episode/cache resolution in
+/// `StorySession` gets one attempt at a fresh scan, bounded by the wall
+/// budget and the existing `MAX_STORY_CARDS` cap on `cards.len()` itself
+/// (the plan's "at most 50 sessions per run"). A transcript over
+/// `MAX_TRANSCRIPT_SCAN_BYTES` is never parsed; it only sets `unscanned`. A
+/// cache hit found here (a prior run's backfill result the DB-only
+/// `load_story_sessions` join could not see freshness for) does not count
+/// against the wall budget — only an actual `parse_transcript` call does.
+fn backfill_instrumentation(storage: &Storage, projects_dir: &Path, cards: &mut [StoryCardView]) {
+    let scan_enabled = journal_scan_enabled();
+    let start = std::time::Instant::now();
+    for card in cards.iter_mut() {
+        if card.instrumentation.is_some() {
+            continue;
+        }
+        let lookup = crate::transcript::resolve_session_path(
+            projects_dir,
+            &card.session_id,
+            Some(&card.project),
+        );
+        let path = match lookup {
+            crate::mcp::tools::ConversationLookup::Found(path, _) => path,
+            _ => continue, // no transcript at all -> no chip, segment stays Absent/Degraded.
+        };
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        card.has_subagents = has_subagent_transcripts(&path, &card.session_id);
+        if metadata.len() > crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES {
+            card.unscanned = true;
+            continue;
+        }
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // A cache row from a prior run may already be fresh even though the
+        // DB-only join in `load_story_sessions` could not validate it
+        // without this filesystem stat. Reusing it here costs one read, no
+        // parse, and does not count against the wall budget.
+        let cached = storage
+            .with_connection(|conn| {
+                dream_report::read_instrumentation_cache(
+                    conn,
+                    &card.session_id,
+                    metadata.len(),
+                    mtime,
+                )
+            })
+            .ok()
+            .flatten();
+        if let Some(instrumentation) = cached {
+            card.instrumentation = Some(instrumentation);
+            continue;
+        }
+
+        if !scan_enabled {
+            card.unscanned = true;
+            continue;
+        }
+        if start.elapsed() > BACKFILL_WALL_BUDGET {
+            card.unscanned = true;
+            continue; // budget spent — stop honestly, leave the rest uninstrumented.
+        }
+        let Ok(parsed) = crate::transcript::parse_transcript(&path) else {
+            card.unscanned = true;
+            continue;
+        };
+        let instrumentation = crate::transcript::instrumentation::from_parsed(&parsed);
+        let _ = storage.with_connection(|conn| {
+            dream_report::write_instrumentation_cache(
+                conn,
+                &card.session_id,
+                metadata.len(),
+                mtime,
+                &instrumentation,
+            )
+        });
+        card.instrumentation = Some(instrumentation);
+    }
+}
+
 /// Gather every piece of data through read-only storage projections.
-fn gather_report_data(storage: &Storage) -> Result<RawReportData> {
+fn gather_report_data(storage: &Storage, projects_dir: &Path) -> Result<RawReportData> {
     gather_report_data_with(
         storage,
+        projects_dir,
         crate::storage::recap_feeds::dream_consumption_mode(),
     )
 }
 
 fn gather_report_data_with(
     storage: &Storage,
+    projects_dir: &Path,
     _consumption_mode: crate::storage::recap_feeds::ConsumptionMode,
 ) -> Result<RawReportData> {
     let (obsolete, superseded, reinstated) = storage.dream_event_totals()?;
@@ -1252,6 +1643,7 @@ fn gather_report_data_with(
     }
     let older_omitted = rich_cards.len().saturating_sub(MAX_STORY_CARDS);
     rich_cards.truncate(MAX_STORY_CARDS);
+    backfill_instrumentation(storage, projects_dir, &mut rich_cards);
 
     let total = obsolete + superseded + reinstated;
     Ok(RawReportData {
@@ -1679,8 +2071,13 @@ fn open_in_viewer(_path: &Path) {}
 /// path under `~/.claude-self-reflect/reports/`), creating the parent
 /// directory if needed. Opens it via `open` on macOS unless `no_open`.
 /// Returns the path actually written, for the CLI to report back.
-pub fn run_report(storage: &Storage, out: Option<PathBuf>, no_open: bool) -> Result<PathBuf> {
-    let mut raw = gather_report_data(storage)?;
+pub fn run_report(
+    storage: &Storage,
+    projects_dir: &Path,
+    out: Option<PathBuf>,
+    no_open: bool,
+) -> Result<PathBuf> {
+    let mut raw = gather_report_data(storage, projects_dir)?;
     curate_headlines(storage, &mut raw.rich_cards);
     let data = finalize_report_data(raw);
     let html = render_html(&data)?;
@@ -1796,6 +2193,50 @@ mod tests {
             .unwrap();
     }
 
+    /// Like `seed_episode`, but merges `extra` object keys into the episode
+    /// JSON — for tests exercising the Phase 2 fields (`error_count`,
+    /// `steer_count`, `top_errors`, `steers`, `files_modified`,
+    /// `error_signatures`, `completed`, `next_steps`, `blockers`) that
+    /// `seed_episode`'s fixed shape doesn't cover.
+    fn seed_episode_with_extra(
+        storage: &Storage,
+        session_id: &str,
+        timestamp: &str,
+        request: &str,
+        outcome: &str,
+        extra: serde_json::Value,
+    ) {
+        let mut content = serde_json::json!({
+            "schema": "v2",
+            "session_id": session_id,
+            "project": "proj",
+            "timestamp": timestamp,
+            "request": request,
+            "outcome": outcome,
+            "investigated": [],
+            "todos": [],
+        });
+        if let (Some(map), Some(extra_map)) = (content.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra_map {
+                map.insert(key.clone(), value.clone());
+            }
+        }
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        format!("episode-{session_id}"),
+                        content.to_string(),
+                        format!(r#"["session_episode","schema_v2","conv_{session_id}"]"#),
+                        timestamp,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
     fn seed_registry(storage: &Storage, session_id: &str, timestamp: &str, prompt: &str) {
         storage
             .with_connection(|conn| {
@@ -1849,9 +2290,22 @@ mod tests {
     /// Full pipeline (gather -> curate with no AI invocation -> finalize ->
     /// render), the shape every test below needs. Curation always runs with
     /// `allow_invoke=false` so tests never spawn `claude` or race the
-    /// process-global `CSR_NO_AI_NARRATIVES` variable.
+    /// process-global `CSR_NO_AI_NARRATIVES` variable. Uses a fresh, empty
+    /// tempdir as `projects_dir` — the report-time backfill resolves no
+    /// transcript against it and simply no-ops, which is what every test
+    /// that doesn't care about instrumentation backfill wants. Tests that
+    /// DO care use `render_with_projects_dir` directly.
     fn render(storage: &Storage, mode: crate::storage::recap_feeds::ConsumptionMode) -> String {
-        let mut raw = gather_report_data_with(storage, mode).unwrap();
+        let empty_dir = tempfile::tempdir().unwrap();
+        render_with_projects_dir(storage, empty_dir.path(), mode)
+    }
+
+    fn render_with_projects_dir(
+        storage: &Storage,
+        projects_dir: &Path,
+        mode: crate::storage::recap_feeds::ConsumptionMode,
+    ) -> String {
+        let mut raw = gather_report_data_with(storage, projects_dir, mode).unwrap();
         curate_headlines_with(storage, &mut raw.rich_cards, false);
         let data = finalize_report_data(raw);
         render_html(&data).unwrap()
@@ -2211,7 +2665,7 @@ mod tests {
         let storage = Storage::open_memory().unwrap();
         let out_path = dir.path().join("dream-test.html");
 
-        let written = run_report(&storage, Some(out_path.clone()), true).unwrap();
+        let written = run_report(&storage, dir.path(), Some(out_path.clone()), true).unwrap();
         assert_eq!(written, out_path);
         let contents = std::fs::read_to_string(&written).unwrap();
         assert!(contents.contains("CSR Dream Journal"));
@@ -2224,7 +2678,7 @@ mod tests {
         let storage = Storage::open_memory().unwrap();
         let out_path = dir.path().join("nested").join("deeper").join("dream.html");
 
-        let written = run_report(&storage, Some(out_path.clone()), true).unwrap();
+        let written = run_report(&storage, dir.path(), Some(out_path.clone()), true).unwrap();
         assert!(written.exists());
     }
 
@@ -2675,6 +3129,239 @@ mod tests {
         assert_eq!(
             html_a, html_b,
             "rendering the same fixture twice must be byte-identical"
+        );
+    }
+
+    // ---- §7.2 pinned Phase 2 tests ---------------------------------------
+
+    /// Pinned test 15 — the single most load-bearing test in this phase.
+    #[test]
+    fn errors_segment_absent_when_unmeasured_and_zero_when_measured() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode_with_extra(
+            &storage,
+            "measured-zero-session",
+            "2026-03-01T01:00:00Z",
+            "ship the thing",
+            "done",
+            serde_json::json!({
+                "error_count": 0,
+                "top_errors": [],
+                "steer_count": 0,
+                "steers": [],
+            }),
+        );
+        seed_episode(
+            &storage,
+            "unmeasured-session",
+            "2026-03-02T01:00:00Z",
+            "note the other thing",
+            "noted",
+            &[],
+            &[],
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        let (index_html, _) = split_panes(&html);
+
+        let short_measured = short_oid("measured-zero-session");
+        let row_start = index_html
+            .find(&format!(r#"data-session="{short_measured}""#))
+            .unwrap();
+        let row_end = index_html[row_start..]
+            .find("</button>")
+            .map(|offset| row_start + offset)
+            .unwrap();
+        let row_measured = &index_html[row_start..row_end];
+        assert!(
+            row_measured.contains("0 errors"),
+            "a tool-verified zero must render, got: {row_measured}"
+        );
+
+        let short_unmeasured = short_oid("unmeasured-session");
+        let row_start = index_html
+            .find(&format!(r#"data-session="{short_unmeasured}""#))
+            .unwrap();
+        let row_end = index_html[row_start..]
+            .find("</button>")
+            .map(|offset| row_start + offset)
+            .unwrap();
+        let row_unmeasured = &index_html[row_start..row_end];
+        assert!(
+            !row_unmeasured.contains("error"),
+            "an unmeasured session must render no errors segment at all, got: {row_unmeasured}"
+        );
+    }
+
+    /// Pinned test 16.
+    #[test]
+    fn degraded_error_count_is_tilde_marked() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode_with_extra(
+            &storage,
+            "degraded-session",
+            "2026-03-03T01:00:00Z",
+            "chase the flaky test",
+            "partial",
+            serde_json::json!({
+                "error_signatures": ["Error: boom", "Error: again", "panic: whoops"],
+            }),
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        let (index_html, _) = split_panes(&html);
+        let short = short_oid("degraded-session");
+        let row_start = index_html
+            .find(&format!(r#"data-session="{short}""#))
+            .unwrap();
+        let row_end = index_html[row_start..]
+            .find("</button>")
+            .map(|offset| row_start + offset)
+            .unwrap();
+        let row = &index_html[row_start..row_end];
+        assert!(
+            row.contains("~3 errors"),
+            "the degraded fallback must be tilde-marked, never a bare count: {row}"
+        );
+        assert!(
+            !row.contains(">3 errors<"),
+            "a bare, non-tilde '3 errors' must never render for the degraded fallback: {row}"
+        );
+        assert!(
+            row.contains("pattern-matched, not tool-verified"),
+            "the degraded disclosure title must be present: {row}"
+        );
+    }
+
+    /// Pinned test 17.
+    #[test]
+    fn steer_lines_are_capped_at_three_with_a_count_line() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode_with_extra(
+            &storage,
+            "steer-session",
+            "2026-03-04T01:00:00Z",
+            "wire the feature end to end",
+            "done",
+            serde_json::json!({
+                "todos": [{"content": "wire it", "status": "completed"}],
+                "error_count": 0,
+                "top_errors": [],
+                "steer_count": 5,
+                "steers": [
+                    {"turn": 3, "text": "no, hindi not english"},
+                    {"turn": 7, "text": "stop, show me the profile"},
+                    {"turn": 11, "text": "use the october script"},
+                ],
+            }),
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        let (_, detail_html) = split_panes(&html);
+        let short = short_oid("steer-session");
+        let pane_start = detail_html
+            .find(&format!(r#"data-session="{short}""#))
+            .unwrap();
+        let pane_end = detail_html[pane_start..]
+            .find("</article>")
+            .map(|offset| pane_start + offset)
+            .unwrap();
+        let pane = &detail_html[pane_start..pane_end];
+
+        assert!(
+            pane.contains("5 mid-flight steers"),
+            "the count line must show the true total, not the capped list length: {pane}"
+        );
+        assert_eq!(
+            pane.matches("class=\"steer-line\"").count(),
+            3,
+            "at most 3 steer lines must render regardless of steer_count: {pane}"
+        );
+    }
+
+    /// Pinned test 18.
+    #[test]
+    fn unscanned_session_shows_the_warning_chip() {
+        let storage = Storage::open_memory().unwrap();
+        let projects_dir = tempfile::tempdir().unwrap();
+        let project_dir = projects_dir.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        // A transcript that exists but is oversized: never parsed, must
+        // surface the warning chip.
+        let oversized_path = project_dir.join("oversized-sess.jsonl");
+        std::fs::write(&oversized_path, "").unwrap();
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&oversized_path)
+                .unwrap();
+            f.set_len(crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES + 1)
+                .unwrap();
+        }
+        seed_episode(
+            &storage,
+            "oversized-sess",
+            "2026-03-05T01:00:00Z",
+            "process the huge transcript",
+            "noted",
+            &[],
+            &[],
+        );
+
+        // A session with no transcript on disk at all: plan §3.4 row 1 —
+        // absent segment, but no chip (there is nothing to disclose "not
+        // scanned" about).
+        seed_episode(
+            &storage,
+            "no-transcript-sess",
+            "2026-03-06T01:00:00Z",
+            "a session whose transcript moved away",
+            "noted",
+            &[],
+            &[],
+        );
+
+        let html = render_with_projects_dir(
+            &storage,
+            projects_dir.path(),
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        let (_, detail_html) = split_panes(&html);
+
+        let oversized_short = short_oid("oversized-sess");
+        let pane_start = detail_html
+            .find(&format!(r#"data-session="{oversized_short}""#))
+            .unwrap();
+        let pane_end = detail_html[pane_start..]
+            .find("</article>")
+            .map(|offset| pane_start + offset)
+            .unwrap();
+        assert!(
+            detail_html[pane_start..pane_end].contains("not scanned"),
+            "an oversized, never-parsed transcript must show the warning chip"
+        );
+
+        let missing_short = short_oid("no-transcript-sess");
+        let pane_start = detail_html
+            .find(&format!(r#"data-session="{missing_short}""#))
+            .unwrap();
+        let pane_end = detail_html[pane_start..]
+            .find("</article>")
+            .map(|offset| pane_start + offset)
+            .unwrap();
+        assert!(
+            !detail_html[pane_start..pane_end].contains("not scanned"),
+            "a session with no transcript on disk at all must show no warning chip"
         );
     }
 }

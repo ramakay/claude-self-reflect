@@ -652,7 +652,12 @@ async fn main() -> Result<()> {
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
         if report {
-            let path = csr_engine::dream::report::run_report(eng.storage(), out.clone(), no_open)?;
+            let path = csr_engine::dream::report::run_report(
+                eng.storage(),
+                eng.projects_dir(),
+                out.clone(),
+                no_open,
+            )?;
             println!("CSR dream journal written to {}", path.display());
             return Ok(());
         }

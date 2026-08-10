@@ -28,6 +28,13 @@ use serde::{Deserialize, Serialize};
 
 use super::{query, truncate_chars, ParsedTranscript, Role};
 
+/// Shared skip bound (plan §3.3a cost table): above this size an extra
+/// streaming pass over a transcript is skipped rather than paying an
+/// unbounded cost. One constant, two call sites (`hooks::stop`'s forward
+/// path and `dream::report`'s backfill path) so the bound can never drift
+/// between the two the way two independently-declared constants could.
+pub(crate) const MAX_TRANSCRIPT_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Cap on `ErrorEvent::preview` — char-boundary safe (plan §3.3a).
 const ERROR_PREVIEW_CHARS: usize = 160;
 /// Cap on `SteerEvent::text` — char-boundary safe (plan §3.3b).

@@ -506,11 +506,6 @@ pub async fn store_episode(engine: &Engine, episode: &Episode) -> Result<()> {
     Ok(())
 }
 
-/// Instrumentation scan skip bound (plan §3.3a cost table): above this size
-/// the extra streaming pass is skipped rather than paying an unbounded cost
-/// on the Stop hook's hot path.
-const MAX_INSTRUMENTATION_SCAN_BYTES: u64 = 64 * 1024 * 1024;
-
 /// Best-effort instrumentation scan over the transcript at `transcript_path`.
 /// Returns `None` on ANY failure — oversized file, the file having vanished
 /// between the caller's existence check and this scan, or a parse error —
@@ -520,7 +515,7 @@ fn scan_instrumentation(
     transcript_path: &Path,
 ) -> Option<crate::transcript::instrumentation::SessionInstrumentation> {
     let metadata = std::fs::metadata(transcript_path).ok()?;
-    if metadata.len() > MAX_INSTRUMENTATION_SCAN_BYTES {
+    if metadata.len() > crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES {
         return None;
     }
     let parsed = crate::transcript::parse_transcript(transcript_path).ok()?;
@@ -1539,10 +1534,12 @@ mod tests {
                 .write(true)
                 .open(&transcript)
                 .unwrap();
-            f.set_len(MAX_INSTRUMENTATION_SCAN_BYTES + 1).unwrap();
+            f.set_len(crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES + 1)
+                .unwrap();
         }
         assert!(
-            std::fs::metadata(&transcript).unwrap().len() > MAX_INSTRUMENTATION_SCAN_BYTES,
+            std::fs::metadata(&transcript).unwrap().len()
+                > crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES,
             "fixture must actually exceed the cap for this test to mean anything"
         );
 
