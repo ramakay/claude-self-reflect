@@ -961,8 +961,14 @@ fn curate_headlines_with(storage: &Storage, cards: &mut [StoryCardView], allow_i
     for (index, card) in cards.iter_mut().enumerate() {
         match cached_headline(storage, &card.session_short, &hashes[index]) {
             Some((headline, description)) => {
+                // A description equal to the headline is a convergence
+                // placeholder, not display content.
+                card.description = if description == headline {
+                    String::new()
+                } else {
+                    description
+                };
                 card.summary = headline;
-                card.description = description;
             }
             None => misses.push(index),
         }
@@ -971,45 +977,71 @@ fn curate_headlines_with(storage: &Storage, cards: &mut [StoryCardView], allow_i
         return;
     }
 
-    let batch: Vec<(&StoryCardView, String)> = misses
-        .iter()
-        .map(|&index| (&cards[index] as &StoryCardView, hashes[index].clone()))
-        .collect();
-    let prompt = headline_prompt(&batch);
-    let started = std::time::Instant::now();
-    let parsed = match crate::hooks::session_briefing::invoke_narrative_briefing(&prompt) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            tracing::warn!(error = %err, "journal headline curation failed — keeping raw summaries");
-            return;
-        }
-    };
-    let _ = storage.record_narrative_usage(&crate::storage::NarrativeUsageRow {
-        call_site: "journal_headline".into(),
-        model: parsed.model.clone(),
-        input_tokens: parsed.input_tokens,
-        output_tokens: parsed.output_tokens,
-        cache_read_tokens: parsed.cache_read_tokens,
-        cache_creation_tokens: parsed.cache_creation_tokens,
-        duration_ms: started.elapsed().as_millis() as i64,
-        success: true,
-    });
+    // Chunked invocation: a 50-card batch overruns the model's output cap
+    // (measured ~1.2k output tokens per card on haiku), truncating the JSON so
+    // the whole reply fails to parse and NOTHING caches — which made every
+    // render re-pay the full batch. Small chunks keep each reply well inside
+    // the cap, and a failed chunk no longer sinks the others.
+    const HEADLINE_CHUNK: usize = 10;
+    for chunk in misses.chunks(HEADLINE_CHUNK) {
+        let batch: Vec<(&StoryCardView, String)> = chunk
+            .iter()
+            .map(|&index| (&cards[index] as &StoryCardView, hashes[index].clone()))
+            .collect();
+        let prompt = headline_prompt(&batch);
+        let started = std::time::Instant::now();
+        let parsed = match crate::hooks::session_briefing::invoke_narrative_briefing(&prompt) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                tracing::warn!(error = %err, "journal headline chunk failed — keeping raw summaries");
+                continue;
+            }
+        };
+        let _ = storage.record_narrative_usage(&crate::storage::NarrativeUsageRow {
+            call_site: "journal_headline".into(),
+            model: parsed.model.clone(),
+            input_tokens: parsed.input_tokens,
+            output_tokens: parsed.output_tokens,
+            cache_read_tokens: parsed.cache_read_tokens,
+            cache_creation_tokens: parsed.cache_creation_tokens,
+            duration_ms: started.elapsed().as_millis() as i64,
+            success: true,
+        });
 
-    let headlines = parse_headline_batch(&parsed.text);
-    for &index in &misses {
-        let (session_short, hash) = (cards[index].session_short.clone(), hashes[index].clone());
-        if let Some((headline, description)) = headlines.get(&session_short) {
-            store_headline(
-                storage,
-                &session_short,
-                &hash,
-                headline,
-                description,
-                &parsed.model,
-            );
-            cards[index].summary = headline.clone();
-            if !description.is_empty() {
-                cards[index].description = description.clone();
+        let headlines = parse_headline_batch(&parsed.text);
+        if headlines.is_empty() {
+            tracing::warn!("journal headline chunk parsed to nothing — reply likely malformed");
+            continue;
+        }
+        for &index in chunk {
+            let (session_short, hash) = (cards[index].session_short.clone(), hashes[index].clone());
+            if let Some((headline, description)) = headlines.get(&session_short) {
+                // Store a non-empty description unconditionally so the row
+                // counts as a cache hit next run: the model's version when it
+                // gave one, else the card's deterministic fallback, else the
+                // headline itself. Without this, headline-only replies made
+                // the same cards re-curate forever.
+                let stored_description = if !description.is_empty() {
+                    description.clone()
+                } else if !cards[index].description.is_empty() {
+                    cards[index].description.clone()
+                } else {
+                    headline.clone()
+                };
+                store_headline(
+                    storage,
+                    &session_short,
+                    &hash,
+                    headline,
+                    &stored_description,
+                    &parsed.model,
+                );
+                cards[index].summary = headline.clone();
+                cards[index].description = if stored_description == *headline {
+                    String::new()
+                } else {
+                    stored_description
+                };
             }
         }
     }
