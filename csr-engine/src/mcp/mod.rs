@@ -653,7 +653,10 @@ impl CsrServer {
     )]
     async fn why(&self, params: Parameters<WhyParams>) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
-        let limit = p.limit.unwrap_or(10).min(50);
+        // clamp(1, 50): limit 0 would short-circuit reinstate() into an
+        // empty trace before any machinery ran — an inert 0/0/0 receipt that
+        // looks like an honest "no evidence" (DoD review blocker 3).
+        let limit = p.limit.unwrap_or(10).clamp(1, 50);
         let cfg = crate::search::reinstatement::ReinstateConfig {
             k: limit,
             ..Default::default()

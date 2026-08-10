@@ -110,16 +110,22 @@ fn provenance_gate_failed(
     receipts_valid: bool,
     gt_queries: usize,
     gt_queries_engaged: usize,
+    catastrophic_regressions: usize,
 ) -> bool {
     // Aggregate sums alone are theatre: one engaged query can mask every
     // other query running inert. Every query with reachable ground truth
-    // must engage at least one machinery route on its own.
+    // must engage at least one machinery route on its own — measured on the
+    // RENDERED output the user would see, not pre-truncation trace counters
+    // (a route accepted internally but cut before display never happened).
+    // A per-query coverage collapse (A found sessions, B found none) is a
+    // regression no aggregate win may mask.
     !ran_any
         || total_b < total_a
         || structural_graph_engagement == 0
         || episode_engagement == 0
         || !receipts_valid
         || gt_queries_engaged < gt_queries
+        || catastrophic_regressions > 0
 }
 
 /// Zero reachable ground truth while a corpus is present means the
@@ -201,6 +207,7 @@ pub async fn run_provenance(
     let mut ran_any = false;
     let mut gt_queries = 0usize;
     let mut gt_queries_engaged = 0usize;
+    let mut catastrophic_regressions = 0usize;
 
     for (qi, q) in QUERIES.iter().enumerate() {
         let gt = storage
@@ -212,6 +219,12 @@ pub async fn run_provenance(
             Ok(v) => v,
             Err(e) => {
                 lines.push_str(&format!("Q{} embed error: {e}\n", qi + 1));
+                // A GT-bearing query that never ran stays in the per-query
+                // denominator with zero engagement — an embed failure must
+                // not shrink the gate's requirements.
+                if !gt.is_empty() {
+                    gt_queries += 1;
+                }
                 continue;
             }
         };
@@ -243,25 +256,34 @@ pub async fn run_provenance(
             .find(|line| line.starts_with("receipt: "))
             .unwrap_or("receipt: missing");
 
+        // Engagement is judged on the RENDERED output — a route accepted
+        // internally but truncated before display never reached the user.
+        let (_, rendered_graph, rendered_episodes) = rendered_route_counts(&rendered);
+
         ran_any = true;
         total_a += a_cov;
         total_b += b_cov;
-        structural_graph_engagement += b_result.trace.structural_graph_accepted;
-        episode_engagement += b_result.trace.episode_accepted;
+        structural_graph_engagement += rendered_graph;
+        episode_engagement += rendered_episodes;
         receipts_valid &= receipt_valid;
         if !gt.is_empty() {
             gt_queries += 1;
-            if b_result.trace.structural_graph_accepted > 0 || b_result.trace.episode_accepted > 0 {
+            if rendered_graph > 0 || rendered_episodes > 0 {
                 gt_queries_engaged += 1;
+            }
+            if a_cov > 0 && b_cov == 0 {
+                catastrophic_regressions += 1;
             }
         }
 
         lines.push_str(&format!(
-            "Q{} A={} B={} gt={} structural_graph={} episodes={} receipt_ok={}\n{}\n",
+            "Q{} A={} B={} gt={} rendered_graph={} rendered_episodes={} (trace accepted: graph={} episodes={}) receipt_ok={}\n{}\n",
             qi + 1,
             a_cov,
             b_cov,
             gt.len(),
+            rendered_graph,
+            rendered_episodes,
             b_result.trace.structural_graph_accepted,
             b_result.trace.episode_accepted,
             receipt_valid,
@@ -299,9 +321,10 @@ pub async fn run_provenance(
         receipts_valid,
         gt_queries,
         gt_queries_engaged,
+        catastrophic_regressions,
     );
     lines.push_str(&format!(
-        "\n================ SUMMARY ================\nqueries: {} | total GT sessions reachable: {}\nGT coverage A={} B={} | structural graph engagement={} | episode engagement={} | rendered receipts valid={}\nGT-bearing queries engaged: {gt_queries_engaged}/{gt_queries} (each must engage on its own — sums alone are theatre)\n",
+        "\n================ SUMMARY ================\nqueries: {} | total GT sessions reachable: {}\nGT coverage A={} B={} | rendered graph engagement={} | rendered episode engagement={} | receipts valid={}\nGT-bearing queries engaged: {gt_queries_engaged}/{gt_queries} (each must engage on its own — sums alone are theatre)\ncatastrophic per-query regressions (A>0, B=0): {catastrophic_regressions}\n",
         QUERIES.len(),
         gt_possible,
         total_a,
@@ -372,19 +395,28 @@ mod tests {
 
     #[test]
     fn blend_only_coverage_tie_fails_the_provenance_gate() {
-        assert!(provenance_gate_failed(false, 0, 0, 0, 0, true, 0, 0));
-        assert!(provenance_gate_failed(true, 4, 4, 0, 0, true, 2, 2));
-        assert!(provenance_gate_failed(true, 4, 4, 1, 0, true, 2, 2));
-        assert!(provenance_gate_failed(true, 4, 4, 1, 1, false, 2, 2));
-        assert!(!provenance_gate_failed(true, 4, 4, 1, 1, true, 2, 2));
+        assert!(provenance_gate_failed(false, 0, 0, 0, 0, true, 0, 0, 0));
+        assert!(provenance_gate_failed(true, 4, 4, 0, 0, true, 2, 2, 0));
+        assert!(provenance_gate_failed(true, 4, 4, 1, 0, true, 2, 2, 0));
+        assert!(provenance_gate_failed(true, 4, 4, 1, 1, false, 2, 2, 0));
+        assert!(!provenance_gate_failed(true, 4, 4, 1, 1, true, 2, 2, 0));
     }
 
     #[test]
     fn one_engaged_query_cannot_mask_inert_gt_queries() {
         // Sums look healthy (graph=3, episodes=2) but only 1 of 3 GT-bearing
         // queries engaged any route — the aggregate-masking escape must fail.
-        assert!(provenance_gate_failed(true, 4, 4, 3, 2, true, 3, 1));
-        assert!(!provenance_gate_failed(true, 4, 4, 3, 2, true, 3, 3));
+        assert!(provenance_gate_failed(true, 4, 4, 3, 2, true, 3, 1, 0));
+        assert!(!provenance_gate_failed(true, 4, 4, 3, 2, true, 3, 3, 0));
+    }
+
+    #[test]
+    fn per_query_coverage_collapse_fails_even_when_aggregate_wins() {
+        // Aggregate B=17 beats A=11 (the live 2026-08-09 shape), but one
+        // query where A found sessions and B found none is a masked
+        // regression — the gate must fail on it.
+        assert!(provenance_gate_failed(true, 11, 17, 3, 7, true, 10, 10, 1));
+        assert!(!provenance_gate_failed(true, 11, 17, 3, 7, true, 10, 10, 0));
     }
 
     #[test]

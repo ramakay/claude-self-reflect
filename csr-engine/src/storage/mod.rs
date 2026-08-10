@@ -1313,7 +1313,7 @@ impl Storage {
         &self,
         chunks: &[(String, String)],
     ) -> Result<std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>>> {
-        use std::collections::{BTreeMap, HashMap, HashSet};
+        use std::collections::{HashMap, HashSet};
 
         let mut conversation_ids: Vec<String> = chunks
             .iter()
@@ -1353,34 +1353,67 @@ impl Storage {
             }
         }
 
-        let mut by_chunk = BTreeMap::new();
+        Ok(Self::rebind_verdict_hits(
+            grouped,
+            chunks,
+            &candidate_owners,
+            &persisted_by_conversation,
+        ))
+    }
+
+    /// Pure rebinding step of [`Self::witness_verdicts_for_chunks`], split
+    /// out so the drop/attach rules are directly testable. Exact chunk ids
+    /// pass through. Conversation-keyed hits (empty `chunk_id`): an
+    /// annotation is conversation-level truth ("code discussed here later
+    /// evolved") and attaches to EVERY candidate chunk of that conversation
+    /// — without this, any multi-chunk conversation silently dropped the
+    /// hit (measured live: all 545 legacy verdicts user-invisible, DoD
+    /// review blocker 1, 2026-08-09). Demote changes ranking, so it keeps
+    /// the strict rule: bind only when the conversation has exactly one
+    /// persisted chunk; ambiguous bindings abstain.
+    fn rebind_verdict_hits(
+        grouped: std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>>,
+        chunks: &[(String, String)],
+        candidate_owners: &std::collections::HashMap<&str, &str>,
+        persisted_by_conversation: &std::collections::HashMap<String, Vec<String>>,
+    ) -> std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>> {
+        let mut by_chunk = std::collections::BTreeMap::new();
         for (conversation_id, hits) in grouped {
-            for mut hit in hits {
-                let bound_chunk_id = if candidate_owners.get(hit.chunk_id.as_str())
+            for hit in hits {
+                let bound_chunk_ids: Vec<String> = if candidate_owners.get(hit.chunk_id.as_str())
                     == Some(&conversation_id.as_str())
                 {
-                    Some(hit.chunk_id.clone())
+                    vec![hit.chunk_id.clone()]
                 } else if hit.chunk_id.is_empty() {
-                    persisted_by_conversation
-                        .get(&conversation_id)
-                        .and_then(|ids| (ids.len() == 1).then(|| ids[0].clone()))
-                        .filter(|id| {
-                            candidate_owners.get(id.as_str()) == Some(&conversation_id.as_str())
-                        })
+                    match hit.channel {
+                        witness_verdicts::VerdictChannel::Annotate => chunks
+                            .iter()
+                            .filter(|(_, conv)| conv == &conversation_id)
+                            .map(|(chunk_id, _)| chunk_id.clone())
+                            .collect(),
+                        witness_verdicts::VerdictChannel::Demote => persisted_by_conversation
+                            .get(&conversation_id)
+                            .and_then(|ids| (ids.len() == 1).then(|| ids[0].clone()))
+                            .filter(|id| {
+                                candidate_owners.get(id.as_str()) == Some(&conversation_id.as_str())
+                            })
+                            .into_iter()
+                            .collect(),
+                    }
                 } else {
-                    None
+                    Vec::new()
                 };
-                let Some(bound_chunk_id) = bound_chunk_id else {
-                    continue;
-                };
-                hit.chunk_id = bound_chunk_id.clone();
-                by_chunk
-                    .entry(bound_chunk_id)
-                    .or_insert_with(Vec::new)
-                    .push(hit);
+                for bound_chunk_id in bound_chunk_ids {
+                    let mut bound_hit = hit.clone();
+                    bound_hit.chunk_id = bound_chunk_id.clone();
+                    by_chunk
+                        .entry(bound_chunk_id)
+                        .or_insert_with(Vec::new)
+                        .push(bound_hit);
+                }
             }
         }
-        Ok(by_chunk)
+        by_chunk
     }
 
     // ─── Session registry / aux coverage ───
@@ -1545,6 +1578,63 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_keyed_annotation_attaches_to_every_candidate_chunk() {
+        use chunk_binding::ChunkWitnessVerdict;
+        use std::collections::{BTreeMap, HashMap};
+
+        // Multi-chunk conversation, hit keyed at conversation level (empty
+        // chunk_id) — the exact live shape in which all 545 legacy verdicts
+        // were silently dropped (DoD review blocker 1).
+        let chunks = vec![
+            ("chunk-1".to_string(), "conv-a".to_string()),
+            ("chunk-2".to_string(), "conv-a".to_string()),
+            ("chunk-x".to_string(), "conv-other".to_string()),
+        ];
+        let candidate_owners: HashMap<&str, &str> = chunks
+            .iter()
+            .map(|(c, v)| (c.as_str(), v.as_str()))
+            .collect();
+        let persisted: HashMap<String, Vec<String>> = HashMap::from([(
+            "conv-a".to_string(),
+            vec![
+                "chunk-1".to_string(),
+                "chunk-2".to_string(),
+                "chunk-3-unretrieved".to_string(),
+            ],
+        )]);
+        let annotate_hit = ChunkWitnessVerdict {
+            chunk_id: String::new(),
+            file: "/repo/src/lib.rs".to_string(),
+            symbol: Some("foo".to_string()),
+            channel: witness_verdicts::VerdictChannel::Annotate,
+            verdict: "superseded_by",
+            receipt_oid: Some("receiptoid".to_string()),
+        };
+        let demote_hit = ChunkWitnessVerdict {
+            channel: witness_verdicts::VerdictChannel::Demote,
+            ..annotate_hit.clone()
+        };
+        let grouped: BTreeMap<String, Vec<ChunkWitnessVerdict>> =
+            BTreeMap::from([("conv-a".to_string(), vec![annotate_hit, demote_hit])]);
+
+        let by_chunk =
+            Storage::rebind_verdict_hits(grouped, &chunks, &candidate_owners, &persisted);
+
+        // Annotate: reaches BOTH candidate chunks of the conversation, with
+        // its receipt — never the other conversation's chunk.
+        for id in ["chunk-1", "chunk-2"] {
+            let hits = by_chunk
+                .get(id)
+                .unwrap_or_else(|| panic!("annotation must reach {id}"));
+            assert_eq!(hits.len(), 1, "demote must NOT rebind on multi-chunk");
+            assert_eq!(hits[0].channel, witness_verdicts::VerdictChannel::Annotate);
+            assert_eq!(hits[0].receipt_oid.as_deref(), Some("receiptoid"));
+        }
+        assert!(!by_chunk.contains_key("chunk-x"));
+        assert!(!by_chunk.contains_key("chunk-3-unretrieved"));
+    }
 
     #[test]
     fn episode_anchors_roundtrip() {
