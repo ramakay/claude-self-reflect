@@ -344,7 +344,13 @@ const MAILBOX_CSS: &str = r#"
   .steer-count { font-weight: 700; margin: 0.5rem 0 0.2rem; }
   .steer-line { margin: 0 0 0.2rem; color: var(--fg-muted); overflow-wrap: anywhere; }
   .outcome-errors { font-weight: 700; margin: 0 0 0.35rem; }
-  .top-error { color: var(--fg-muted); margin: 0 0 0.35rem; overflow-wrap: anywhere; }
+  .top-error {
+    color: var(--fg-muted); margin: 0 0 0.35rem; overflow-wrap: anywhere;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
   .still-open { color: var(--fg-muted); margin: 0.35rem 0 0; overflow-wrap: anywhere; }
   .stage-rail { position: relative; padding-left: 1.9rem; margin-bottom: 1rem; }
   .stage-rail::before {
@@ -555,9 +561,20 @@ const MAILBOX_CSS: &str = r#"
   /* Delta-review MED: at 0.85 opacity the dark-mode purple fell to ≈4.16:1
      against the index-pane glass — below the 4.5:1 floor. Full opacity
      restores the raw token ratios (4.89:1 dark, higher in light). */
+  /* The night bar. Dreams happen BETWEEN sessions, so the digest renders as
+     a thin nocturnal band under each day label — the one place the page
+     spends its boldness. The ☾ is CSS-drawn so the DOM text (and every
+     assertion against it) stays byte-identical. */
   .dream-digest {
-    margin: 0 0.9rem 0.35rem; font-size: 0.68rem; color: var(--purple);
+    margin: 0.1rem 0 0.45rem; padding: 0.28rem 0.9rem;
+    font-size: 0.72rem; color: var(--purple);
+    background: linear-gradient(90deg, var(--postit-lavender), transparent 78%);
+    border-left: 3px solid var(--purple);
   }
+  .dream-digest::before { content: "☾ "; }
+  /* The hero's verdict line is a ledger of the mind changing — numbers align
+     as figures, not prose. */
+  .meta-row { font-variant-numeric: tabular-nums; }
 
   /* Staggered reveal (CSS-only — no data attribute, no JS, so the rendered
      HTML bytes are identical run to run; the determinism test asserts the
