@@ -1,6 +1,7 @@
 pub mod ancestry;
 pub mod chunk_binding;
 pub mod codegraph;
+pub mod dream_items;
 pub mod dream_report;
 pub mod migrations;
 pub mod queries;
