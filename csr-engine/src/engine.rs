@@ -294,6 +294,14 @@ impl Engine {
             return Ok(0);
         }
 
+        // Journal v4 P4b: bind any pasted dream prompt to the dream that
+        // produced it. Runs over the FULL chunk list (not just the new tail)
+        // and before the incremental early-return, so a marker that arrives
+        // in a later pass still binds. `INSERT OR IGNORE` makes the repeat
+        // scan free. Never fatal — losing an attribution costs a metric,
+        // failing the import costs the corpus.
+        import::dream_marker::bind_markers(&self.storage, &conversation_id, &chunks);
+
         // Incremental: skip chunks we already embedded
         let prev_count = self.storage.get_imported_chunk_count(file_path)?;
         if chunks.len() <= prev_count {

@@ -913,6 +913,78 @@ pub fn load_dream_clusters(
     })
 }
 
+/// One open item as the candidate pass sees it — **before** the two-channel
+/// evidence gate decides anything about it.
+///
+/// This is the only type in this module that can describe an item the night
+/// pass reached **no** conclusion about, which is precisely what the journal's
+/// off-board Unexamined lane needs: showing such an item inside a board column
+/// would imply a verdict that does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenItem {
+    /// Identical to `DreamItem::id` / [`ClusterItem::id`] for the same item.
+    pub id: String,
+    pub project: String,
+    pub item: String,
+    /// `"todo"` or `"blocker"`.
+    pub kind: String,
+    pub origin_session: String,
+    pub origin_ts: String,
+    pub origin_date: String,
+    /// `Some` iff a NEWER episode recorded this exact text completed.
+    pub completed: Option<CompletionReceipt>,
+    /// `true` iff the two-channel gate matched ≥1 stored verdict row — i.e.
+    /// this item is represented by a cluster. `false` means the pass concluded
+    /// **nothing** about it; absence of evidence, never evidence of absence.
+    pub examined: bool,
+}
+
+/// Every open item, each tagged with whether any verdict evidence matched it.
+///
+/// Same candidate collection, dedupe and completion index
+/// [`load_dream_clusters`] uses — deliberately the same code path rather than
+/// a parallel one, so the Unexamined lane can never disagree with the board
+/// about which items exist.
+pub fn load_open_items(conn: &Connection) -> Result<Vec<OpenItem>> {
+    let episodes = load_cluster_episodes(conn)?;
+    if episodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut verdict_cache: HashMap<String, Vec<VerdictGroupRow>> = HashMap::new();
+    let mut out: Vec<OpenItem> = Vec::new();
+    for candidate in collect_candidates(&episodes) {
+        let rows = match verdict_cache.get(&candidate.project) {
+            Some(rows) => rows,
+            None => {
+                let rows = verdict_rows_for_project(conn, &candidate.project)?;
+                verdict_cache
+                    .entry(candidate.project.clone())
+                    .or_insert(rows)
+            }
+        };
+        let id = item_id(&candidate.project, &candidate.item);
+        let project = candidate.project.clone();
+        let item = candidate.item.clone();
+        let kind = candidate.kind.to_string();
+        let origin_session = candidate.origin_session.clone();
+        let origin_ts = candidate.origin_ts.clone();
+        let completed = candidate.completed.clone();
+        let examined = gate_candidate(candidate, rows).is_some();
+        out.push(OpenItem {
+            id,
+            project,
+            item,
+            kind,
+            origin_session,
+            origin_date: iso_date(&origin_ts),
+            origin_ts,
+            completed,
+            examined,
+        });
+    }
+    Ok(out)
+}
+
 fn build_cluster(key: &ClusterKey, accum: Accum, generations: &[GenerationRow]) -> DreamCluster {
     let Accum {
         grade,

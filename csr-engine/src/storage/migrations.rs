@@ -1024,15 +1024,91 @@ pub fn run(conn: &Connection) -> Result<()> {
     // sums only rows carrying that exact hash. Legacy rows stay NULL and are
     // therefore never attributed to any dream — a dream with no recorded
     // usage renders NOTHING, never a zero that would read as free.
-    let has_usage_ref_col: bool = conn
-        .prepare("SELECT ref_id FROM narrative_usage LIMIT 0")
-        .is_ok();
-    if !has_usage_ref_col {
-        let _ = conn.execute_batch(
-            "ALTER TABLE narrative_usage ADD COLUMN ref_id TEXT;
-             CREATE INDEX IF NOT EXISTS idx_narrative_usage_ref ON narrative_usage(ref_id);",
+    //
+    // Errors PROPAGATE (codex X5 finding 12). The previous form discarded the
+    // ALTER/CREATE INDEX result with `let _ =`, so a partial prerelease
+    // schema, an interrupted migration or a disk error was accepted as
+    // "migrated" while every subsequent `ref_id` insert failed — accounting
+    // could disappear without anything refusing to start.
+    migrate_narrative_usage_ref_id(conn)?;
+
+    // Journal v4 Phase 4b — dream → outcome attribution (the marker loop).
+    //
+    // Two row shapes live here, distinguished by `bound_session_id`:
+    //
+    // * **emission** (`bound_session_id IS NULL`) — a copy block carrying
+    //   this dream's marker was rendered, and of which kind. Written by the
+    //   surface that rendered it.
+    // * **binding** (`bound_session_id IS NOT NULL`) — a transcript
+    //   containing the marker was imported. THIS is the evidence: no marker,
+    //   no binding, ever. `outcome*` columns are only ever filled on a
+    //   binding row, so an unbound dream can render nothing about outcomes.
+    //
+    // The CHECK keeps an emission row from existing without its kind (the
+    // renderer always knows it), while a binding row may legitimately carry
+    // `kind IS NULL` — the marker carries a dream id and nothing else, so a
+    // binding whose emission row was never recorded genuinely does not know
+    // which prompt kind was pasted, and must say so rather than guess.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dream_attributions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dream_id TEXT NOT NULL,
+            kind TEXT,
+            emitted_at TEXT,
+            bound_session_id TEXT,
+            bound_at TEXT,
+            outcome_episode_id TEXT,
+            outcome TEXT,
+            receipts_json TEXT NOT NULL DEFAULT '[]',
+            CHECK (bound_session_id IS NOT NULL OR kind IS NOT NULL)
         );
-    }
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dream_attributions_binding
+            ON dream_attributions(dream_id, bound_session_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dream_attributions_emission
+            ON dream_attributions(dream_id, kind) WHERE bound_session_id IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_dream_attributions_dream
+            ON dream_attributions(dream_id);",
+    )?;
+
+    // Journal v4 Wave 3 — durable usage reservations.
+    //
+    // `narrative_usage` is written AFTER a model call returns. A process that
+    // dies mid-call, or a producer that discards the insert error, therefore
+    // spends real tokens that no row ever records, and the spend figure fails
+    // OPEN (reads low, or reads as "unmeasured" when it should read "spent").
+    // A reservation is written BEFORE the invocation and finalised after, so
+    // the gap between "we are about to spend" and "we know what we spent" is
+    // itself a durable row:
+    //
+    // * `state = 'reserved'` — invocation started, outcome unknown. A row
+    //   left in this state is evidence of an unaccounted call, NOT evidence
+    //   of zero spend.
+    // * `state = 'finalised'` — `usage_id` points at the `narrative_usage`
+    //   row that measured it.
+    // * `state = 'abandoned'` — the invocation provably never happened
+    //   (gate refused, budget exhausted before the call).
+    //
+    // `attempt_key` is the caller's own idempotency key, so a retried
+    // reservation reuses its row instead of double-counting.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS narrative_reservations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attempt_key TEXT NOT NULL UNIQUE,
+            ref_id TEXT,
+            call_site TEXT NOT NULL,
+            model TEXT,
+            state TEXT NOT NULL DEFAULT 'reserved'
+                CHECK (state IN ('reserved','finalised','abandoned')),
+            usage_id INTEGER,
+            reserved_at TEXT NOT NULL DEFAULT (datetime('now')),
+            settled_at TEXT,
+            note TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_narrative_reservations_state
+            ON narrative_reservations(state);
+        CREATE INDEX IF NOT EXISTS idx_narrative_reservations_ref
+            ON narrative_reservations(ref_id);",
+    )?;
 
     // Journal v4 Phase 5 — delivery ledger (`storage::dream_delivery`). One
     // row per (conclusion, channel) that was actually shown to the user, so
@@ -1063,6 +1139,97 @@ pub fn run(conn: &Connection) -> Result<()> {
         crate::storage::queries::set_meta(conn, "worktree_path_backfill_v1", "done")?;
     }
 
+    Ok(())
+}
+
+/// Does `table` have `column`? Answered from `pragma_table_info`, i.e. from
+/// the schema itself — not from whether a probe `SELECT` happened to parse.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        rusqlite::params![table, column],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Does `table` carry an index named `index_name`? Answered from
+/// `pragma_index_list`, so a column that exists without its index — the exact
+/// shape a half-applied migration leaves behind — is *detected*, not assumed
+/// complete because the column probe succeeded.
+fn has_index(conn: &Connection, table: &str, index_name: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_index_list(?1) WHERE name = ?2",
+        rusqlite::params![table, index_name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Add `narrative_usage.ref_id` and its index, checking each half
+/// independently and verifying the result.
+///
+/// Three properties the previous `let _ = execute_batch(...)` did not have:
+///
+/// 1. **Errors propagate.** A failed ALTER or CREATE INDEX aborts startup
+///    instead of leaving every later `ref_id` insert to fail silently.
+/// 2. **The two halves are checked separately.** A database that already has
+///    the column but lost the index (partial prerelease schema, interrupted
+///    migration) is *repaired*; the old code skipped the whole block the
+///    moment the column probe succeeded.
+/// 3. **The result is verified.** After the writes, both objects are read
+///    back out of the schema; if either is still missing the migration
+///    returns an error rather than reporting success.
+///
+/// Wrapped in a SAVEPOINT so a failure half-way leaves no partial state.
+/// SAVEPOINTs nest, so this is safe whether or not the caller already holds a
+/// transaction.
+fn migrate_narrative_usage_ref_id(conn: &Connection) -> Result<()> {
+    const TABLE: &str = "narrative_usage";
+    const COLUMN: &str = "ref_id";
+    const INDEX: &str = "idx_narrative_usage_ref";
+
+    let column_present = has_column(conn, TABLE, COLUMN)?;
+    let index_present = has_index(conn, TABLE, INDEX)?;
+    if column_present && index_present {
+        return Ok(());
+    }
+
+    conn.execute_batch("SAVEPOINT csr_narrative_usage_ref_id")?;
+    let applied = (|| -> Result<()> {
+        if !column_present {
+            // Deliberately NOT `IF NOT EXISTS` (SQLite has no such form for
+            // ADD COLUMN): the pragma above already established absence, and
+            // a duplicate-column error here means the schema moved under us
+            // and must surface.
+            conn.execute_batch("ALTER TABLE narrative_usage ADD COLUMN ref_id TEXT")?;
+        }
+        if !index_present {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_narrative_usage_ref ON narrative_usage(ref_id)",
+            )?;
+        }
+        Ok(())
+    })();
+    match applied {
+        Ok(()) => conn.execute_batch("RELEASE csr_narrative_usage_ref_id")?,
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO csr_narrative_usage_ref_id; RELEASE csr_narrative_usage_ref_id",
+            );
+            return Err(error);
+        }
+    }
+
+    // Verify, from the schema, that both halves actually landed. Reporting
+    // "migrated" on the strength of a statement that returned Ok is exactly
+    // the assumption this finding is about.
+    if !has_column(conn, TABLE, COLUMN)? {
+        anyhow::bail!("migration failed: narrative_usage.ref_id missing after ALTER TABLE");
+    }
+    if !has_index(conn, TABLE, INDEX)? {
+        anyhow::bail!("migration failed: idx_narrative_usage_ref missing after CREATE INDEX");
+    }
     Ok(())
 }
 
@@ -1124,6 +1291,117 @@ pub(crate) fn backfill_worktree_paths(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- narrative_usage.ref_id (codex X5 finding 12) --------------------
+
+    #[test]
+    fn ref_id_migration_creates_both_the_column_and_its_index() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        assert!(has_column(&conn, "narrative_usage", "ref_id").unwrap());
+        assert!(has_index(&conn, "narrative_usage", "idx_narrative_usage_ref").unwrap());
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(has_column(&conn, "narrative_usage", "ref_id").unwrap());
+        assert!(has_index(&conn, "narrative_usage", "idx_narrative_usage_ref").unwrap());
+    }
+
+    #[test]
+    fn a_partial_ref_id_schema_is_detected_and_repaired_not_assumed_migrated() {
+        // The exact half-applied shape the old `let _ = execute_batch(...)`
+        // accepted as complete: the column landed, the index did not. The old
+        // code's probe (`SELECT ref_id FROM narrative_usage LIMIT 0`) succeeds
+        // here, so it skipped the block and left the index missing forever.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("migrations::run");
+        conn.execute_batch("DROP INDEX idx_narrative_usage_ref")
+            .expect("drop index to simulate an interrupted migration");
+        assert!(has_column(&conn, "narrative_usage", "ref_id").unwrap());
+        assert!(!has_index(&conn, "narrative_usage", "idx_narrative_usage_ref").unwrap());
+
+        migrate_narrative_usage_ref_id(&conn).expect("repair");
+        assert!(
+            has_index(&conn, "narrative_usage", "idx_narrative_usage_ref").unwrap(),
+            "a column-without-index schema must be repaired, not treated as migrated"
+        );
+    }
+
+    #[test]
+    fn a_missing_narrative_usage_table_fails_the_migration_instead_of_being_swallowed() {
+        // Disk failure / dropped table stands in for any reason the ALTER
+        // cannot apply. The point is that it is an Err, not a silent no-op
+        // that leaves every later ref_id insert failing.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let error = migrate_narrative_usage_ref_id(&conn)
+            .expect_err("no narrative_usage table — the migration must fail loudly");
+        assert!(
+            error.to_string().contains("narrative_usage"),
+            "the error must name what failed: {error}"
+        );
+    }
+
+    #[test]
+    fn ref_id_migration_leaves_no_open_savepoint_behind() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("migrations::run");
+        assert!(
+            conn.is_autocommit(),
+            "a released savepoint must leave the connection in autocommit"
+        );
+    }
+
+    // ---- Journal v4 P4b attribution + Wave 3 reservations -----------------
+
+    #[test]
+    fn dream_attributions_table_exists_with_every_documented_column() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare(
+                "SELECT dream_id, kind, emitted_at, bound_session_id, bound_at,
+                        outcome_episode_id, outcome, receipts_json
+                 FROM dream_attributions LIMIT 0"
+            )
+            .is_ok(),
+            "dream_attributions must carry every column the design names"
+        );
+    }
+
+    #[test]
+    fn an_attribution_row_with_neither_a_kind_nor_a_binding_is_rejected() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("migrations::run");
+        let result = conn.execute(
+            "INSERT INTO dream_attributions (dream_id) VALUES ('deadbeef')",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "a row that is neither an emission (kind) nor a binding (session) claims nothing"
+        );
+    }
+
+    #[test]
+    fn narrative_reservations_table_exists_and_constrains_its_states() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        conn.execute(
+            "INSERT INTO narrative_reservations (attempt_key, call_site) VALUES ('k1', 'dream_plan')",
+            [],
+        )
+        .expect("a reservation is writable before the call");
+        let bad = conn.execute(
+            "UPDATE narrative_reservations SET state = 'probably_fine' WHERE attempt_key = 'k1'",
+            [],
+        );
+        assert!(bad.is_err(), "the state vocabulary is closed");
+        let dup = conn.execute(
+            "INSERT INTO narrative_reservations (attempt_key, call_site) VALUES ('k1', 'dream_plan')",
+            [],
+        );
+        assert!(dup.is_err(), "attempt_key is the idempotency key");
+    }
 
     #[test]
     fn saga_columns_migration_idempotent() {

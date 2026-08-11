@@ -36,6 +36,11 @@
 //!   [`AstDiff::after_total`] are the *measured* symbol counts before the
 //!   per-side cap is applied, so a renderer can never present a truncated
 //!   tree as complete.
+//! * **The size guard bounds allocation, not just parsing.** A blob's size
+//!   is taken from its git object *header* ([`inspect_blob`]) before any
+//!   object data is decompressed, so a small compressed blob that inflates
+//!   to hundreds of megabytes is refused at [`MAX_BLOB_BYTES`] without ever
+//!   being materialised. See [`BlobPlan`].
 //!
 //! # Reuse
 //!
@@ -64,6 +69,9 @@ use crate::storage::dream_items::{last_two_segments, ChurnTile};
 /// Largest blob either side may be before the engine abstains. Matches
 /// `extraction::anchors::MAX_ANCHOR_FILE_BYTES` so a file that is too big to
 /// anchor is also too big to diff.
+///
+/// Enforced against the blob's *declared* size, read from the git object
+/// header before any content is decompressed — see [`inspect_blob`].
 pub const MAX_BLOB_BYTES: usize = 512 * 1024;
 
 /// Hard cap on rendered symbols per side. Exceeding it does not silently
@@ -490,6 +498,7 @@ pub struct AstDiffRequest {
 // --- compute -----------------------------------------------------------------
 
 /// One side's blob, or the fact that the file was not there.
+#[derive(Debug)]
 enum SideRead {
     Present(String),
     Absent,
@@ -660,6 +669,20 @@ fn compute_inner(request: &AstDiffRequest) -> Result<AstDiff, Abstention> {
         after_nodes.push(node_from(raw, index, status, paired));
     }
 
+    // The honesty contract restated at the one place an `AstDiff` is built.
+    // Two empty sides are already unreachable — the `NoSymbolsExtracted`
+    // check above returns first, and the per-side cap is >= 1 so truncation
+    // cannot empty a non-empty side — but this is the invariant the whole
+    // module promises, so it is enforced where the value is constructed
+    // rather than inferred from the control flow above it.
+    if before_nodes.is_empty() && after_nodes.is_empty() {
+        return Err(Abstention::NoSymbolsExtracted {
+            path: request.path.clone(),
+            before_oid: request.before_oid.clone(),
+            after_oid: request.after_oid.clone(),
+        });
+    }
+
     Ok(AstDiff {
         path: request.path.clone(),
         language: format!("{lang:?}"),
@@ -788,6 +811,88 @@ fn resolve_oid(
         })
 }
 
+/// What the tree entry at a path declares, read from metadata alone.
+///
+/// Producing one of these decompresses **no object data**. It reads the
+/// commit, its tree, one tree entry, and that entry's object *header* via
+/// `gix`'s `find_header`, which resolves a packed object's delta chain far
+/// enough to learn the final size but never inflates the payload.
+///
+/// That ordering is the whole point of the type. Checking a size after
+/// [`codewitness::Auditor::file_content_at`] has already returned a
+/// complete `Vec<u8>` bounds *parsing and caching* but not memory: a blob
+/// that zlib-compresses to a few kilobytes and inflates to hundreds of
+/// megabytes would be fully allocated on every request before the guard
+/// ever ran. Deciding from the header means [`MAX_BLOB_BYTES`] caps the
+/// allocation itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobPlan {
+    /// The commit's tree has no entry at that path.
+    Absent,
+    /// A regular or executable file blob declaring `bytes` bytes.
+    Blob { bytes: u64 },
+}
+
+/// Read the tree entry at `relative` in `commit` and report what it
+/// declares, without materialising the object.
+///
+/// Everything that is not a readable regular-file blob abstains here with a
+/// reason: a tree, a submodule pointer, a symlink, a missing or undecodable
+/// commit, an unreadable tree, or an object database that cannot produce a
+/// header. A path simply not present in the tree is [`BlobPlan::Absent`] —
+/// a witnessed fact (created/deleted), not a failure.
+///
+/// Symlinks are rejected on the tree entry's mode rather than on the object
+/// kind. Git stores a symlink's *target path* as an ordinary blob, so
+/// object-level checks accept one and hand back the target string as if it
+/// were file content; the mode (`120000`) is the only place the distinction
+/// survives.
+fn inspect_blob(
+    auditor: &codewitness::Auditor,
+    relative: &Path,
+    display_path: &str,
+    commit: codewitness::ObjectId,
+    side: Side,
+) -> Result<BlobPlan, Abstention> {
+    let unreadable = |detail: String| Abstention::UnreadableBlob {
+        side,
+        path: display_path.to_string(),
+        detail,
+    };
+
+    let repo = auditor.repo();
+    let commit_object = repo
+        .find_commit(commit)
+        .map_err(|error| unreadable(error.to_string()))?;
+    let tree = commit_object
+        .tree()
+        .map_err(|error| unreadable(error.to_string()))?;
+    let entry = match tree
+        .lookup_entry_by_path(relative)
+        .map_err(|error| unreadable(error.to_string()))?
+    {
+        Some(entry) => entry,
+        None => return Ok(BlobPlan::Absent),
+    };
+    if !entry.mode().is_blob() {
+        return Err(unreadable(
+            "the path names a tree, submodule or symlink, not a file".to_string(),
+        ));
+    }
+    let header = repo
+        .find_header(entry.object_id())
+        .map_err(|error| unreadable(error.to_string()))?;
+    if !header.kind().is_blob() {
+        return Err(unreadable(format!(
+            "the object at that path is a {:?}, not a file blob",
+            header.kind()
+        )));
+    }
+    Ok(BlobPlan::Blob {
+        bytes: header.size(),
+    })
+}
+
 fn read_side(
     auditor: &codewitness::Auditor,
     relative: &Path,
@@ -795,10 +900,31 @@ fn read_side(
     commit: codewitness::ObjectId,
     side: Side,
 ) -> Result<SideRead, Abstention> {
-    let bytes = match auditor.file_content_at(relative, commit) {
-        Ok(bytes) => bytes,
+    let too_large = |bytes: u64| Abstention::FileTooLarge {
+        side,
+        path: display_path.to_string(),
+        // Saturating rather than wrapping: on a 32-bit target a blob that
+        // declares more than `usize::MAX` bytes is still reported as over
+        // the limit, never as a small number.
+        bytes: usize::try_from(bytes).unwrap_or(usize::MAX),
+        limit: MAX_BLOB_BYTES,
+    };
+
+    // Metadata first. Running the guard after the read would bound parsing
+    // and caching but not allocation, which is the whole exposure.
+    match inspect_blob(auditor, relative, display_path, commit, side)? {
         // The tree simply has no entry there — a real, reportable fact, not
         // a failure. Exactly one of the two sides may be Absent.
+        BlobPlan::Absent => return Ok(SideRead::Absent),
+        BlobPlan::Blob { bytes } if bytes > MAX_BLOB_BYTES as u64 => return Err(too_large(bytes)),
+        BlobPlan::Blob { .. } => {}
+    }
+
+    let bytes = match auditor.file_content_at(relative, commit) {
+        Ok(bytes) => bytes,
+        // `inspect_blob` already resolved these, so reaching one here means
+        // the object database changed underneath us (a concurrent `git gc`,
+        // a pruned pack). Report it, never fall through to an empty side.
         Err(codewitness::Error::AnchorMissing { .. }) => return Ok(SideRead::Absent),
         Err(codewitness::Error::NotABlob { .. }) => {
             return Err(Abstention::UnreadableBlob {
@@ -815,13 +941,11 @@ fn read_side(
             })
         }
     };
+    // Belt and braces: the header said it fit. If the materialised object
+    // disagrees — a corrupt header, or the odb swapped between the two
+    // reads — refuse rather than parse it.
     if bytes.len() > MAX_BLOB_BYTES {
-        return Err(Abstention::FileTooLarge {
-            side,
-            path: display_path.to_string(),
-            bytes: bytes.len(),
-            limit: MAX_BLOB_BYTES,
-        });
+        return Err(too_large(bytes.len() as u64));
     }
     match String::from_utf8(bytes) {
         Ok(text) => Ok(SideRead::Present(text)),
@@ -1659,6 +1783,191 @@ mod tests {
         }
     }
 
+    /// Total bytes of everything under `.git/objects`, i.e. the *stored*
+    /// (zlib-compressed) size of the repository's object database.
+    fn odb_bytes(repo: &Path) -> u64 {
+        fn walk(dir: &Path, total: &mut u64) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    walk(&entry.path(), total);
+                } else {
+                    *total += meta.len();
+                }
+            }
+        }
+        let mut total = 0;
+        walk(&repo.join(".git").join("objects"), &mut total);
+        total
+    }
+
+    /// Finding 7. The guard has to decide from the blob's declared size,
+    /// not from the length of a `Vec<u8>` that has already been allocated.
+    #[test]
+    fn an_oversized_blob_is_refused_from_its_header_before_it_is_materialised() {
+        let fx = Fixture::new();
+        fx.write("src/bomb.rs", "fn small() {}\n");
+        let before = fx.commit("one");
+
+        // 8 MiB — sixteen times the guard — and pathologically
+        // compressible, so git stores it in a few kilobytes. This is the
+        // review's "very large compressed git blob": a post-allocation
+        // check would have had to inflate all 8 MiB on every request just
+        // to discover the file was too big to parse.
+        const DECLARED: usize = 8 * 1024 * 1024;
+        let mut bomb = String::with_capacity(DECLARED + 32);
+        bomb.push_str("fn small() {}\n");
+        while bomb.len() < DECLARED {
+            bomb.push('A');
+        }
+        fx.write("src/bomb.rs", &bomb);
+        let after = fx.commit("bomb");
+
+        let auditor = codewitness::Auditor::open(fx.root().to_path_buf()).unwrap();
+        let after_commit = auditor.resolve_commit(&after).unwrap();
+
+        // Metadata alone knows the size, and knows it is over the cap.
+        let plan = inspect_blob(
+            &auditor,
+            Path::new("src/bomb.rs"),
+            "src/bomb.rs",
+            after_commit,
+            Side::After,
+        )
+        .expect("the header must be readable");
+        assert_eq!(
+            plan,
+            BlobPlan::Blob {
+                bytes: bomb.len() as u64
+            }
+        );
+        assert!(bomb.len() > MAX_BLOB_BYTES);
+
+        // ...and the entire object database is smaller than the cap, so the
+        // declared size provably did not come from measuring what was read:
+        // there are not 8 MiB anywhere on disk to have read.
+        let stored = odb_bytes(fx.root());
+        assert!(
+            stored < MAX_BLOB_BYTES as u64,
+            "the whole odb is {stored} bytes while the blob declares {} — \
+             the size must have come from the header, not from content",
+            bomb.len()
+        );
+
+        // The guard path refuses it, with the declared size and the limit.
+        let refused = read_side(
+            &auditor,
+            Path::new("src/bomb.rs"),
+            "src/bomb.rs",
+            after_commit,
+            Side::After,
+        )
+        .expect_err("an oversized blob must not be read");
+        match &refused {
+            Abstention::FileTooLarge {
+                side, bytes, limit, ..
+            } => {
+                assert_eq!(*side, Side::After);
+                assert_eq!(*bytes, bomb.len());
+                assert_eq!(*limit, MAX_BLOB_BYTES);
+            }
+            other => panic!("expected FileTooLarge, got {other:?}"),
+        }
+
+        // End to end: an explicit abstention, never an empty tree.
+        let outcome = compute(&fx.request("src/bomb.rs", &before, &after));
+        assert!(outcome.diff().is_none());
+        assert!(abstained(&outcome)
+            .sentence()
+            .contains("over the 524288-byte parse limit"));
+    }
+
+    /// A blob that fits is still read, and the header size it was admitted
+    /// on is the real content length — the guard is a bound, not a wall.
+    #[test]
+    fn a_blob_under_the_cap_reports_its_exact_size_and_is_read() {
+        let fx = Fixture::new();
+        let source = "fn fits() {}\n";
+        fx.write("src/fits.rs", source);
+        let one = fx.commit("one");
+
+        let auditor = codewitness::Auditor::open(fx.root().to_path_buf()).unwrap();
+        let commit = auditor.resolve_commit(&one).unwrap();
+        assert_eq!(
+            inspect_blob(
+                &auditor,
+                Path::new("src/fits.rs"),
+                "src/fits.rs",
+                commit,
+                Side::Before
+            )
+            .unwrap(),
+            BlobPlan::Blob {
+                bytes: source.len() as u64
+            }
+        );
+        assert!(matches!(
+            read_side(
+                &auditor,
+                Path::new("src/fits.rs"),
+                "src/fits.rs",
+                commit,
+                Side::Before
+            )
+            .unwrap(),
+            SideRead::Present(_)
+        ));
+    }
+
+    /// An absent path is reported as absence by metadata inspection too —
+    /// the "created / deleted" fact must not become an abstention.
+    #[test]
+    fn a_path_absent_from_the_tree_inspects_as_absent_not_as_a_failure() {
+        let fx = Fixture::new();
+        fx.write("src/here.rs", "fn here() {}\n");
+        let one = fx.commit("one");
+
+        let auditor = codewitness::Auditor::open(fx.root().to_path_buf()).unwrap();
+        let commit = auditor.resolve_commit(&one).unwrap();
+        assert_eq!(
+            inspect_blob(
+                &auditor,
+                Path::new("src/nowhere.rs"),
+                "src/nowhere.rs",
+                commit,
+                Side::Before
+            )
+            .unwrap(),
+            BlobPlan::Absent
+        );
+    }
+
+    /// Git stores a symlink's target as an ordinary blob, so an
+    /// object-level check would hand back `"real.rs"` as if it were the
+    /// file's content. The entry mode is the only place the distinction
+    /// survives, and this pins that it is the thing being checked.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_abstains_instead_of_diffing_its_target_string() {
+        let fx = Fixture::new();
+        fx.write("src/real.rs", "fn real() {}\n");
+        std::os::unix::fs::symlink("real.rs", fx.root().join("src/link.rs")).unwrap();
+        let one = fx.commit("a symlink beside a real file");
+
+        let outcome = compute(&fx.request("src/link.rs", &one, &one));
+        match abstained(&outcome) {
+            Abstention::UnreadableBlob { side, path, detail } => {
+                assert_eq!(*side, Side::Before);
+                assert_eq!(path, "src/link.rs");
+                assert!(detail.contains("symlink"), "detail was {detail:?}");
+            }
+            other => panic!("expected UnreadableBlob, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_directory_at_the_path_is_an_unreadable_blob_not_an_absence() {
         let fx = Fixture::new();
@@ -1762,6 +2071,149 @@ mod tests {
             assert!(
                 !sentence.contains("{"),
                 "{reason:?} left an unformatted placeholder: {sentence:?}"
+            );
+        }
+    }
+
+    /// The abstention contract swept end to end over **real** fixture
+    /// repositories: every failure mode the engine can actually reach must
+    /// come back `Abstained`, with a reason, and with no diff attached —
+    /// so nothing downstream can render it as "nothing changed".
+    ///
+    /// Ten of the eleven variants are produced here from live inputs.
+    /// [`Abstention::ParsePanicked`] is the exception and is stated rather
+    /// than claimed: it exists only for a tree-sitter panic, which cannot
+    /// be provoked from source text, so it is covered by
+    /// `every_abstention_variant_carries_a_reason_sentence` (its sentence)
+    /// and by construction (`extract_symbols` returns `None` only from
+    /// `catch_unwind`) — not by an executed panic.
+    #[test]
+    fn every_reachable_failure_mode_abstains_with_a_reason_and_no_diff() {
+        let fx = Fixture::new();
+        fx.write("src/a.rs", "fn a() {}\n");
+        fx.write("src/only_comments.rs", "// nothing but a comment\n");
+        fx.write("ios/P.swift", "class P {}\n");
+        fx.write("src/dir.rs/inner.rs", "fn inner() {}\n");
+        let one = fx.commit("one");
+        fx.write("src/a.rs", "fn a() { let x = 1; }\n");
+        fx.write("src/binary.rs", [0x00u8, 0xff, 0xfe, 0x80]);
+        let mut huge = String::from("fn big() {}\n");
+        while huge.len() <= MAX_BLOB_BYTES {
+            huge.push_str("// padding padding padding padding padding\n");
+        }
+        fx.write("src/huge.rs", &huge);
+        let two = fx.commit("two");
+
+        /// One case: a label, the request that provokes it, and the
+        /// predicate naming the exact variant it must produce.
+        type Case = (&'static str, AstDiffRequest, fn(&Abstention) -> bool);
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let cases: Vec<Case> = vec![
+            (
+                "repository unavailable",
+                AstDiffRequest {
+                    repo_root: elsewhere.path().to_path_buf(),
+                    path: "src/a.rs".into(),
+                    before_oid: one.clone(),
+                    after_oid: two.clone(),
+                },
+                |r| matches!(r, Abstention::RepositoryUnavailable { .. }),
+            ),
+            (
+                "path rejected",
+                fx.request("../escape.rs", &one, &two),
+                |r| matches!(r, Abstention::PathRejected { .. }),
+            ),
+            ("malformed oid", fx.request("src/a.rs", "HEAD", &two), |r| {
+                matches!(r, Abstention::MalformedOid { .. })
+            }),
+            (
+                "unknown oid",
+                fx.request("src/a.rs", &one, "0123456789abcdef0123456789abcdef01234567"),
+                |r| matches!(r, Abstention::UnknownOid { .. }),
+            ),
+            (
+                "unsupported language",
+                fx.request("ios/P.swift", &one, &two),
+                |r| matches!(r, Abstention::UnsupportedLanguage { .. }),
+            ),
+            (
+                "file too large",
+                fx.request("src/huge.rs", &one, &two),
+                |r| matches!(r, Abstention::FileTooLarge { .. }),
+            ),
+            (
+                "unreadable blob",
+                fx.request("src/dir.rs", &one, &two),
+                |r| matches!(r, Abstention::UnreadableBlob { .. }),
+            ),
+            ("not utf-8", fx.request("src/binary.rs", &one, &two), |r| {
+                matches!(r, Abstention::NotUtf8 { .. })
+            }),
+            (
+                "absent from both sides",
+                fx.request("src/never.rs", &one, &two),
+                |r| matches!(r, Abstention::AbsentFromBothSides { .. }),
+            ),
+            (
+                "no symbols extracted",
+                fx.request("src/only_comments.rs", &one, &two),
+                |r| matches!(r, Abstention::NoSymbolsExtracted { .. }),
+            ),
+        ];
+
+        for (label, request, expected) in cases {
+            let outcome = compute(&request);
+            assert!(
+                outcome.diff().is_none(),
+                "{label}: an abstention must carry no diff"
+            );
+            let reason = outcome
+                .abstention()
+                .unwrap_or_else(|| panic!("{label}: expected an abstention"));
+            assert!(expected(reason), "{label}: got {reason:?}");
+            let sentence = reason.sentence();
+            assert!(
+                sentence.starts_with("AST comparison abstained:"),
+                "{label}: {sentence:?}"
+            );
+            assert!(sentence.len() > 40, "{label}: stub sentence {sentence:?}");
+            // The cached form must round-trip to the same explicit reason.
+            let cache = AstDiffCache::new();
+            assert!(
+                cache.get_or_compute(&request).diff().is_none(),
+                "{label}: the cache must not turn an abstention into a diff"
+            );
+        }
+    }
+
+    /// The other half of the contract: whenever the engine *does* return a
+    /// diff, at least one side carries a symbol. An empty tree is never a
+    /// result, so a renderer can trust that `Diffed` means something to
+    /// draw.
+    #[test]
+    fn a_diffed_outcome_always_carries_at_least_one_symbol() {
+        let fx = Fixture::new();
+        fx.write("src/a.rs", "fn a() {}\n");
+        fx.write("src/keep.rs", "fn keep() {}\n");
+        fx.write("src/gone.rs", "fn gone() {}\n");
+        let one = fx.commit("one");
+        fx.write("src/a.rs", "fn a() { let x = 1; }\n");
+        fx.write("src/born.rs", "fn born() {}\n");
+        fx.remove("src/gone.rs");
+        let two = fx.commit("two");
+
+        for path in ["src/a.rs", "src/keep.rs", "src/gone.rs", "src/born.rs"] {
+            let outcome = compute(&fx.request(path, &one, &two));
+            let diff = diffed(&outcome);
+            assert!(
+                !(diff.before.is_empty() && diff.after.is_empty()),
+                "{path}: a diff with two empty sides would render as `nothing changed`"
+            );
+            assert!(
+                diff.before_present || diff.after_present,
+                "{path}: a diff must have existed on at least one side"
             );
         }
     }
@@ -1945,6 +2397,87 @@ mod tests {
         assert_eq!(cache.stats().entries, 0);
         assert_eq!(cache.stats().bytes, 0);
         assert_eq!(cache.stats().rejected_oversize, 1);
+    }
+
+    /// Both bounds hold simultaneously while entries churn, and the byte
+    /// counter never drifts from what is actually stored — a counter that
+    /// under-counts would let the cache grow past its budget silently.
+    #[test]
+    fn the_cache_holds_both_bounds_under_churn_and_its_byte_count_never_drifts() {
+        let fx = Fixture::new();
+        let files: Vec<String> = (0..8).map(|i| format!("src/f{i}.rs")).collect();
+        for (index, file) in files.iter().enumerate() {
+            fx.write(file, format!("fn f{index}() {{}}\n"));
+        }
+        let before = fx.commit("one");
+        for (index, file) in files.iter().enumerate() {
+            fx.write(file, format!("fn f{index}() {{ let x = {index}; }}\n"));
+        }
+        let after = fx.commit("two");
+
+        let one_entry = approx_bytes(&compute(&fx.request(&files[0], &before, &after)));
+        // Room for three entries by count, but only ~two by bytes: whichever
+        // bound bites first must bite.
+        let max_entries = 3;
+        let max_bytes = one_entry * 2 + 1;
+        let cache = AstDiffCache::with_limits(max_entries, max_bytes);
+
+        // Two passes over eight distinct keys, so entries are inserted,
+        // evicted, and re-inserted.
+        for _ in 0..2 {
+            for file in &files {
+                cache.get_or_compute(&fx.request(file, &before, &after));
+                let stats = cache.stats();
+                assert!(
+                    stats.entries <= max_entries,
+                    "entry cap breached: {stats:?} after {file}"
+                );
+                assert!(
+                    stats.bytes <= max_bytes,
+                    "byte cap breached: {stats:?} after {file}"
+                );
+                let stored: usize = {
+                    let inner = cache.lock();
+                    inner.entries.values().map(|entry| entry.bytes).sum()
+                };
+                assert_eq!(
+                    stored, stats.bytes,
+                    "the byte counter drifted from what is stored, after {file}"
+                );
+            }
+        }
+        assert!(
+            cache.stats().evictions > 0,
+            "eight keys through a two-entry budget must have evicted"
+        );
+        assert!(
+            cache.stats().entries <= 2,
+            "the byte cap is the tighter one"
+        );
+    }
+
+    /// Re-inserting the same key replaces rather than accumulates. Without
+    /// the subtraction in `insert`, a hot key would inflate `bytes` on every
+    /// recompute and evict the whole cache.
+    #[test]
+    fn reinserting_the_same_key_does_not_double_count_its_bytes() {
+        let fx = Fixture::new();
+        fx.write("src/a.rs", "fn a() {}\n");
+        let before = fx.commit("one");
+        fx.write("src/a.rs", "fn a() { let x = 1; }\n");
+        let after = fx.commit("two");
+
+        let request = fx.request("src/a.rs", &before, &after);
+        let key = CacheKey::of(&request);
+        let value = Arc::new(compute(&request));
+        let cache = AstDiffCache::new();
+        for _ in 0..5 {
+            cache.insert(key.clone(), value.clone());
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.bytes, approx_bytes(value.as_ref()));
+        assert_eq!(stats.evictions, 0);
     }
 
     #[test]

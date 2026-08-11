@@ -1,6 +1,7 @@
 pub mod ancestry;
 pub mod chunk_binding;
 pub mod codegraph;
+pub mod dream_attribution;
 pub mod dream_clusters;
 pub mod dream_delivery;
 pub mod dream_items;
@@ -8,6 +9,7 @@ pub mod dream_report;
 pub mod migrations;
 pub mod queries;
 pub mod recap_feeds;
+pub mod usage_reservation;
 pub mod witness_ledger;
 pub mod witness_verdicts;
 

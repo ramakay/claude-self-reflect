@@ -34,6 +34,23 @@
 <section class="panel" aria-labelledby="touch-h">
   <h2 id="touch-h">Touch next</h2>
   <p class="touch-next">{{ view.title }}</p>
+  {#- The two writes this surface can make (locked decision 4). Both are
+      POSTs to this same origin, both carry a per-render CSRF token bound to
+      this dream's id, and both are logged with origin `journal_ui`. There is
+      no control that moves a card RIGHTWARD on the board: promotion needs
+      evidence the system does not have. -#}
+  <div class="actions">
+    <form method="post" action="/dream/{{ view.id }}/resolve">
+      <input type="hidden" name="csrf" value="{{ view.csrf }}">
+      <button type="submit">Record resolved</button>
+    </form>
+    <form method="post" action="/dream/{{ view.id }}/dismiss">
+      <input type="hidden" name="csrf" value="{{ view.csrf }}">
+      <button type="submit">Dismiss this dream</button>
+    </form>
+  </div>
+  <p class="marker">Resolving records your assertion, not a verified check. Dismissing records
+    the item as still open — a dismissal is never stored as a resolution.</p>
 </section>
 
 <section class="panel" aria-labelledby="desc-h">
@@ -61,7 +78,7 @@
   {% endif %}
 
   {% if view.copy_block %}
-  <h3 class="sub">Copy block — paste into a new session</h3>
+  <h3 class="sub" id="copy">Copy block — paste into a new session</h3>
   <p class="marker">Assembled from stored rows only.{% if not view.copy_block.has_night_pass %}
     No night-pass thread exists for this session, and the block says so where the finding
     would have been.{% endif %}</p>

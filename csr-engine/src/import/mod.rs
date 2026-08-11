@@ -1,6 +1,7 @@
 pub mod backfill;
 pub mod codex_rollout;
 pub mod coedit_backfill;
+pub mod dream_marker;
 pub mod plans;
 pub mod registry;
 pub mod watcher;

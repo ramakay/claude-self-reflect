@@ -21,12 +21,29 @@
 //! `csr-engine status` ([`record_invalid_effort`] / [`invalid_effort_count`]),
 //! so a typo in a shell profile is visible rather than quietly halving spend.
 //!
-//! # Budget cap
+//! # Budget cap — per NIGHT, not per pass
 //!
-//! [`Budget`] is a hard cap on **model invocations per pass** — every actor
-//! call, including chain fallbacks and the verifier's re-prompt retry, spends
-//! one unit. It cannot be exceeded across retries because the cap is enforced
-//! at the single choke point every invocation passes through
+//! Locked decision 8 caps spend **per night**. A per-pass counter alone does
+//! not do that: an idle machine can tick several times before the floor
+//! boundary, and a daemon restart hands the next tick a fresh allowance, so
+//! `n` passes would each spend the full cap. The cap is therefore anchored in
+//! a durable **night ledger** ([`reserve_night`] / [`release_night`], stored
+//! under [`META_NIGHT_LEDGER`] and keyed by the local-night bucket
+//! [`night_key`]):
+//!
+//! * a pass **reserves** its allowance from tonight's remainder before it
+//!   starts ([`Budget::for_night`]) — two ticks in one night therefore share
+//!   one cap, and a restart mid-night reads the same persisted balance rather
+//!   than refilling it;
+//! * whatever the pass did not spend is **released** back on drop, so an
+//!   early-finishing pass does not burn the night's allowance;
+//! * a pass killed mid-flight releases nothing, which is the conservative
+//!   direction: the allowance stays spent rather than being handed out twice.
+//!
+//! Within a pass, [`Budget`] is still the hard invocation counter — every
+//! actor call, including chain fallbacks and the verifier's re-prompt retry,
+//! spends one unit. It cannot be exceeded across retries because the cap is
+//! enforced at the single choke point every invocation passes through
 //! ([`BudgetedActor::invoke`]), not at the call sites that decide to retry.
 //!
 //! When the budget runs out mid-pass the remaining candidates are simply not
@@ -34,21 +51,43 @@
 //! that an actor actually returned), so they are **queued for the next pass**
 //! by construction. Candidates are consumed newest-first by the existing
 //! producers' own ordering.
+//!
+//! # Accounting cannot fail open
+//!
+//! The same choke point writes a durable **usage reservation**
+//! (`storage::usage_reservation`) BEFORE the inner actor is invoked. A
+//! reservation that cannot be written refuses the invocation outright — an
+//! unrecordable call must not happen at all — and a reservation that is never
+//! settled stays `reserved`, which `status` reports as an unaccounted call
+//! rather than rounding to zero spend. `dream::threads::record_attempts`
+//! settles it against the `narrative_usage` row that measured the call, in
+//! the same transaction that writes that row.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+
+use anyhow::Result;
 
 use crate::dream::threads::{ActorAttempt, NightActor};
-use crate::storage::Storage;
+use crate::storage::{queries, usage_reservation, Storage};
 
 /// `meta` key: cumulative count of invalid `CSR_DREAM_EFFORT` values observed.
 pub const META_INVALID_EFFORT: &str = "dream_effort_invalid_count";
 
-/// Default hard cap on model invocations per pass (locked decision 8).
+/// Default hard cap on model invocations **per night** (locked decision 8).
 pub const DEFAULT_BUDGET: usize = 25;
 /// Documented override for [`DEFAULT_BUDGET`].
 pub const BUDGET_ENV: &str = "CSR_DREAM_BUDGET";
 /// Documented effort-tier selector.
 pub const EFFORT_ENV: &str = "CSR_DREAM_EFFORT";
+
+/// `meta` key: the current local night's invocation ledger, as JSON
+/// [`NightLedger`]. One row, rewritten in place; a different `night` value
+/// means the bucket has rolled and the count starts again.
+pub const META_NIGHT_LEDGER: &str = "dream_night_ledger";
+/// `meta` key: cumulative count of usage-accounting writes that failed (a
+/// reservation that could not be written, or a usage row / finalisation that
+/// could not be committed). Surfaced by `status`; never silently dropped.
+pub const META_ACCOUNTING_FAILURES: &str = "dream_usage_accounting_failures";
 
 /// The three effort tiers. `balanced` is the default and is deliberately the
 /// tier whose model equals `dream::threads`'s historical default, so enabling
@@ -212,6 +251,166 @@ pub fn budget_cap_from(raw: Option<&str>, tier: EffortTier) -> usize {
         })
 }
 
+// ─── the night ledger (locked decision 8: a cap per NIGHT) ────────────────
+
+/// Tonight's invocation ledger as stored. `reserved` is what has been handed
+/// out to passes, not what they proved they spent — a pass that dies without
+/// releasing its remainder leaves the allowance claimed, which is the
+/// conservative direction for a spend cap.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NightLedger {
+    pub night: String,
+    pub reserved: usize,
+}
+
+/// The local-night bucket a moment belongs to: the date of the most recent
+/// nightly-floor boundary at or before it. Derived from
+/// `dream_cadence::floor_boundary` rather than restated, so the ledger's night
+/// and the floor pass's night can never drift apart.
+pub fn night_key(now_local: chrono::NaiveDateTime, floor_hour: u32) -> String {
+    crate::daemon::dream_cadence::floor_boundary(now_local, floor_hour)
+        .date()
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// The night bucket for the system clock and configured floor hour.
+pub fn current_night_key() -> String {
+    night_key(
+        chrono::Utc::now()
+            .with_timezone(&chrono::Local)
+            .naive_local(),
+        crate::daemon::dream_cadence::floor_hour(),
+    )
+}
+
+/// The stored ledger, or `None` when none was ever written. A read or parse
+/// failure is an `Err`, never a `None` — a ledger that cannot be read must not
+/// be mistaken for a night with nothing spent yet.
+pub fn read_night_ledger(storage: &Storage) -> Result<Option<NightLedger>> {
+    let Some(raw) = storage.get_meta(META_NIGHT_LEDGER)? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_str::<NightLedger>(&raw)?))
+}
+
+/// How much of `night`'s allowance is already claimed. A ledger written for a
+/// *different* night reads as 0 for this one — that is the bucket rolling, not
+/// an inference from absence. A ledger that cannot be read is an `Err`.
+pub fn night_claimed(storage: &Storage, night: &str) -> Result<usize> {
+    Ok(read_night_ledger(storage)?
+        .filter(|ledger| ledger.night == night)
+        .map(|ledger| ledger.reserved)
+        .unwrap_or(0))
+}
+
+/// Invocations still available tonight under `cap`.
+pub fn night_remaining(storage: &Storage, night: &str, cap: usize) -> Result<usize> {
+    Ok(cap.saturating_sub(night_claimed(storage, night)?))
+}
+
+/// Claim up to `want` invocations from `night`'s remaining allowance under
+/// `cap`, and return how many were actually granted. This is the one place
+/// the nightly cap is enforced, and it is durable: the claim survives the
+/// pass, the daemon process and the machine.
+///
+/// The read-modify-write runs inside one `BEGIN IMMEDIATE` transaction (the
+/// idiom `witness_verdicts::insert_verdict_if_changed` uses) so two processes
+/// against the same database cannot both be granted the same last invocation.
+/// Within a process the `Storage` mutex already serializes it.
+pub fn claim_night(storage: &Storage, night: &str, cap: usize, want: usize) -> Result<usize> {
+    storage.with_connection(|conn| {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let claimed = match queries::get_meta(&tx, META_NIGHT_LEDGER)? {
+            Some(raw) => serde_json::from_str::<NightLedger>(&raw)?,
+            None => NightLedger {
+                night: night.to_string(),
+                reserved: 0,
+            },
+        };
+        let already = if claimed.night == night {
+            claimed.reserved
+        } else {
+            0
+        };
+        let granted = cap.saturating_sub(already).min(want);
+        if granted == 0 && claimed.night == night {
+            return Ok(0); // nothing to write; tonight is spent.
+        }
+        let next = NightLedger {
+            night: night.to_string(),
+            reserved: already.saturating_add(granted),
+        };
+        queries::set_meta(&tx, META_NIGHT_LEDGER, &serde_json::to_string(&next)?)?;
+        tx.commit()?;
+        Ok(granted)
+    })
+}
+
+// ─── usage-accounting failure counter ─────────────────────────────────────
+
+/// How many usage-accounting writes have failed. `None` when the counter was
+/// never written — which is "never observed", not "observed zero".
+pub fn accounting_failure_count(storage: &Storage) -> Option<i64> {
+    storage
+        .get_meta(META_ACCOUNTING_FAILURES)
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+}
+
+/// Record one accounting failure. Best-effort by necessity (the storage that
+/// just failed is the same storage this writes to), but never silent: the
+/// caller logs at error level as well.
+pub fn note_accounting_failure(storage: &Storage) {
+    let next = accounting_failure_count(storage)
+        .unwrap_or(0)
+        .saturating_add(1);
+    let _ = storage.set_meta(META_ACCOUNTING_FAILURES, &next.to_string());
+}
+
+/// Invocations that started and never had their spend measured — reservations
+/// still in `reserved` state. A non-zero count is a known unknown.
+pub fn unaccounted_invocations(storage: &Storage) -> Option<i64> {
+    storage
+        .with_connection(usage_reservation::unaccounted_count)
+        .ok()
+}
+
+// ─── reservation hand-off (choke point → usage writer) ────────────────────
+
+thread_local! {
+    /// The attempt key [`BudgetedActor::invoke`] just reserved, waiting for
+    /// the caller that collects the attempt to take it.
+    ///
+    /// A single slot rather than a queue, because the handoff is immediate:
+    /// `dream::threads::invoke_chain` takes the key on the statement right
+    /// after `actor.invoke` returns, before any other invocation can happen
+    /// (one pass runs single-threaded inside one `spawn_blocking` closure).
+    /// If a key is ever overwritten before being taken, the older reservation
+    /// is simply never settled — it stays `reserved` and is counted as an
+    /// unaccounted call, which is the honest outcome rather than a mispaired
+    /// usage row.
+    static PENDING_RESERVATION: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn push_pending_reservation(key: String) {
+    PENDING_RESERVATION.with(|slot| {
+        if let Some(stale) = slot.borrow_mut().replace(key) {
+            tracing::warn!(
+                attempt_key = %stale,
+                "dream usage reservation was never settled; it stays unaccounted"
+            );
+        }
+    });
+}
+
+/// Take the reservation key belonging to the invocation that just returned.
+pub(crate) fn take_pending_reservation() -> Option<String> {
+    PENDING_RESERVATION.with(|slot| slot.borrow_mut().take())
+}
+
 // ─── per-night token estimate (locked decision 15) ────────────────────────
 
 /// Prompt ceiling in `dream::threads` is 8 KiB; at the ~4 chars/token rule of
@@ -260,24 +459,29 @@ impl NightEstimate {
 }
 
 /// Estimate one night's dreaming spend from the **measured** candidate count,
-/// the tier, the pass budget and the cadence interval.
+/// the tier, the nightly budget and the cadence interval.
 ///
-/// Deliberately an upper bound: it assumes every allowed invocation happens
-/// and every prompt is full-size. Convergence (an unchanged corpus costs
-/// nothing on a re-run) means real spend is usually far lower — which is why
-/// this is presented as a ceiling, never as a forecast.
+/// `cap` is the NIGHTLY cap, so it bounds the whole night and not each pass:
+/// several passes in one night share it (see the night ledger above), and the
+/// estimate must say the same thing the enforcement does. Modelling
+/// `passes × cap` would promise a ceiling the implementation refuses to spend.
+///
+/// Deliberately an upper bound within that cap: it assumes every allowed
+/// invocation happens and every prompt is full-size. Convergence (an unchanged
+/// corpus costs nothing on a re-run) means real spend is usually far lower —
+/// which is why this is presented as a ceiling, never as a forecast.
 pub fn estimate_night(
     candidates: usize,
     tier: EffortTier,
     cap: usize,
     interval_secs: u64,
 ) -> NightEstimate {
-    let per_pass = candidates.min(tier.episodes_per_pass()).min(cap);
+    let per_pass = candidates.min(tier.episodes_per_pass());
     let passes = (EST_NIGHT_HOURS * 3_600)
         .checked_div(interval_secs)
         .unwrap_or(1)
         .max(1) as usize;
-    let invocations = per_pass.saturating_mul(passes);
+    let invocations = per_pass.saturating_mul(passes).min(cap);
     NightEstimate {
         candidates,
         passes,
@@ -287,30 +491,125 @@ pub fn estimate_night(
     }
 }
 
-/// A hard per-pass invocation counter. Single-threaded by construction — one
-/// pass runs inside one `spawn_blocking` closure — so a `Cell` is enough and
-/// no lock can be contended on the spend path.
-#[derive(Debug)]
-pub struct Budget {
+/// What a pass measured about its own spend, detached from the borrow the
+/// live [`Budget`] holds — what the daemon persists after the pass has ended
+/// and its budget has been dropped (and its remainder released).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BudgetSnapshot {
+    pub cap: usize,
+    pub used: usize,
+    pub queued: usize,
+}
+
+/// The night ledger a [`Budget`] spends against, plus the accounting context
+/// every invocation through it is recorded under.
+struct PassAccounting<'a> {
+    storage: &'a Storage,
+    night: String,
+    /// The NIGHTLY cap this pass debits against — not the pass's own cap.
+    nightly_cap: usize,
+    /// Per-pass unique prefix for reservation keys, so a retry after a
+    /// restart claims a NEW row rather than silently reusing (and
+    /// under-counting) the one a previous, unfinished pass left behind.
+    nonce: String,
+}
+
+/// A hard invocation counter for one pass, spending against the durable night
+/// ledger when it was built with [`Budget::for_night`]. Single-threaded by
+/// construction — one pass runs inside one `spawn_blocking` closure — so a
+/// `Cell` is enough and no lock can be contended on the spend path.
+pub struct Budget<'a> {
     cap: usize,
     used: Cell<usize>,
     /// Candidates skipped because the budget was already gone — the measured
     /// remainder queued for the next pass.
     queued: Cell<usize>,
+    /// Invocation counter feeding reservation keys (never reset).
+    seq: Cell<usize>,
+    /// Set when the night ledger refused a debit — the pass is finished
+    /// spending even though its own local counter has room. Kept separate
+    /// from `used` so the recorded usage stays a measurement.
+    closed: Cell<bool>,
+    accounting: Option<PassAccounting<'a>>,
 }
 
-impl Budget {
+impl std::fmt::Debug for Budget<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Budget")
+            .field("cap", &self.cap)
+            .field("used", &self.used.get())
+            .field("queued", &self.queued.get())
+            .field(
+                "night",
+                &self.accounting.as_ref().map(|acc| acc.night.as_str()),
+            )
+            .finish()
+    }
+}
+
+impl Budget<'static> {
+    /// A pass-local budget with no night ledger and no durable accounting —
+    /// the shape tests and one-shot manual runs use.
     pub fn new(cap: usize) -> Self {
         Self {
             cap,
             used: Cell::new(0),
             queued: Cell::new(0),
+            seq: Cell::new(0),
+            closed: Cell::new(false),
+            accounting: None,
         }
     }
 
-    /// A budget sized from the environment for `tier`.
+    /// A budget sized from the environment for `tier`, with no night ledger.
+    /// Prefer [`Budget::for_night`] anywhere the nightly cap must hold.
     pub fn for_tier(tier: EffortTier) -> Self {
         Self::new(budget_cap(tier))
+    }
+}
+
+impl<'a> Budget<'a> {
+    /// A budget that spends against **tonight's remaining allowance**, one
+    /// durable debit per invocation. Two passes in one night therefore share
+    /// one cap, and a daemon restart reads the same persisted balance instead
+    /// of being handed a fresh one. Nothing is claimed up front, so a pass
+    /// that dies mid-flight forfeits only what it actually spent.
+    ///
+    /// A ledger that cannot be read starts the pass at **zero** — an
+    /// unenforceable cap must not become an unlimited one. The pass then does
+    /// no model work at all and every candidate is counted as queued.
+    pub fn for_night(storage: &'a Storage, tier: EffortTier, night: &str) -> Self {
+        Self::for_night_with_cap(storage, night, budget_cap(tier))
+    }
+
+    /// [`Budget::for_night`] with the nightly cap passed explicitly rather
+    /// than resolved from the environment — the shape the ledger tests drive,
+    /// and the seam that keeps them off process-global state.
+    pub fn for_night_with_cap(storage: &'a Storage, night: &str, cap: usize) -> Self {
+        let remaining = match night_remaining(storage, night, cap) {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "dream night ledger unreadable; refusing to spend this pass"
+                );
+                note_accounting_failure(storage);
+                0
+            }
+        };
+        Self {
+            cap: remaining,
+            used: Cell::new(0),
+            queued: Cell::new(0),
+            seq: Cell::new(0),
+            closed: Cell::new(false),
+            accounting: Some(PassAccounting {
+                storage,
+                night: night.to_string(),
+                nightly_cap: cap,
+                nonce: uuid::Uuid::new_v4().to_string(),
+            }),
+        }
     }
 
     pub fn cap(&self) -> usize {
@@ -322,6 +621,9 @@ impl Budget {
     }
 
     pub fn remaining(&self) -> usize {
+        if self.closed.get() {
+            return 0;
+        }
         self.cap.saturating_sub(self.used.get())
     }
 
@@ -331,9 +633,38 @@ impl Budget {
 
     /// Claim one invocation. `false` means the cap is reached — the caller
     /// must NOT invoke anything.
+    ///
+    /// For a night-scoped budget the claim is **durable**: one row-level debit
+    /// against the night ledger, committed before this returns `true`. That is
+    /// what makes the cap hold across passes, retries and daemon restarts
+    /// rather than only within one pass. A ledger that refuses or fails closes
+    /// the budget out instead of spending on an unenforceable cap.
     pub fn try_spend(&self) -> bool {
         if self.remaining() == 0 {
             return false;
+        }
+        if let Some(acc) = &self.accounting {
+            match claim_night(acc.storage, &acc.night, acc.nightly_cap, 1) {
+                Ok(1) => {}
+                Ok(_) => {
+                    tracing::info!(
+                        night = %acc.night,
+                        cap = acc.nightly_cap,
+                        "tonight's dream invocation allowance is spent; queueing the remainder"
+                    );
+                    self.closed.set(true);
+                    return false;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "dream night ledger debit failed; refusing to spend on an unenforceable cap"
+                    );
+                    note_accounting_failure(acc.storage);
+                    self.closed.set(true);
+                    return false;
+                }
+            }
         }
         self.used.set(self.used.get() + 1);
         true
@@ -347,32 +678,120 @@ impl Budget {
     pub fn queued(&self) -> usize {
         self.queued.get()
     }
+
+    /// The measured cap/used/queued triple, copyable out of the pass.
+    pub fn snapshot(&self) -> BudgetSnapshot {
+        BudgetSnapshot {
+            cap: self.cap,
+            used: self.used.get(),
+            queued: self.queued.get(),
+        }
+    }
+
+    /// The night bucket this budget is spending against, if any.
+    pub fn night(&self) -> Option<&str> {
+        self.accounting.as_ref().map(|acc| acc.night.as_str())
+    }
+
+    /// Reserve one durable attempt row before an invocation. `Err` means the
+    /// call must not happen: spending without a reservation is precisely the
+    /// fail-open the reservation exists to prevent.
+    fn reserve_attempt(&self, acc: &PassAccounting<'a>, model: Option<&str>) -> Result<String> {
+        let seq = self.seq.get().saturating_add(1);
+        self.seq.set(seq);
+        let key = format!("dream:{}:{seq}", acc.nonce);
+        acc.storage.with_connection(|conn| {
+            usage_reservation::reserve(conn, &key, "dream_actor", None, model)
+        })?;
+        Ok(key)
+    }
+}
+
+impl Drop for Budget<'_> {
+    /// Nothing to return to the ledger — allowance is debited per invocation,
+    /// so a pass never holds any. What a pass CAN leave behind is a
+    /// reservation whose usage row never landed; say so rather than clearing
+    /// it, since it stays `reserved` and counts as an unaccounted call.
+    fn drop(&mut self) {
+        if self.accounting.is_some() {
+            if let Some(stale) = take_pending_reservation() {
+                tracing::warn!(
+                    attempt_key = %stale,
+                    "dream pass ended with an unsettled usage reservation; it stays unaccounted"
+                );
+            }
+        }
+    }
 }
 
 /// Wraps any [`NightActor`] so that **every** invocation — first attempt,
-/// model-chain fallback, verifier retry — is charged to one [`Budget`]. Once
-/// the cap is reached the wrapper returns [`ActorAttempt::Failed`] WITHOUT
-/// invoking the inner actor, which the producers treat as "no usable reply",
-/// so nothing is cached and the candidate is retried on the next pass.
+/// model-chain fallback, verifier retry — is charged to one [`Budget`] and
+/// carries a durable usage reservation. Once the cap is reached the wrapper
+/// returns [`ActorAttempt::Failed`] WITHOUT invoking the inner actor, which
+/// the producers treat as "no usable reply", so nothing is cached and the
+/// candidate is retried on the next pass.
+///
+/// Order of operations, which is the whole point of the type:
+/// 1. refuse outright if the cap is reached — nothing is written, nothing is
+///    spent;
+/// 2. write the reservation; if that fails, refuse WITHOUT invoking and
+///    WITHOUT charging the budget (an unrecordable call must not happen);
+/// 3. charge the budget, invoke, and hand the reservation key to the caller
+///    that will settle it against the measured `narrative_usage` row.
 pub(crate) struct BudgetedActor<'a> {
     inner: &'a dyn NightActor,
-    budget: &'a Budget,
+    budget: &'a Budget<'a>,
 }
 
 impl<'a> BudgetedActor<'a> {
-    pub(crate) fn new(inner: &'a dyn NightActor, budget: &'a Budget) -> Self {
+    pub(crate) fn new(inner: &'a dyn NightActor, budget: &'a Budget<'a>) -> Self {
         Self { inner, budget }
     }
 }
 
 impl NightActor for BudgetedActor<'_> {
     fn invoke(&self, model: Option<&str>, prompt: &str) -> ActorAttempt {
-        if !self.budget.try_spend() {
+        if self.budget.exhausted() {
             return ActorAttempt::Failed(format!(
                 "dream budget exhausted ({} of {} invocations used)",
                 self.budget.used(),
                 self.budget.cap()
             ));
+        }
+        let reservation = match &self.budget.accounting {
+            Some(acc) => match self.budget.reserve_attempt(acc, model) {
+                Ok(key) => Some(key),
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "dream usage reservation failed; refusing to invoke the actor"
+                    );
+                    note_accounting_failure(acc.storage);
+                    return ActorAttempt::Failed(
+                        "usage reservation failed; invocation refused".to_string(),
+                    );
+                }
+            },
+            None => None,
+        };
+        if !self.budget.try_spend() {
+            // Unreachable while the pass is single-threaded (the cap was
+            // checked above), but if it ever is reached the reservation
+            // describes a call that provably did not happen — say so rather
+            // than leaving it as an unknown.
+            if let (Some(key), Some(acc)) = (reservation.as_deref(), &self.budget.accounting) {
+                let _ = acc.storage.with_connection(|conn| {
+                    usage_reservation::abandon(conn, key, "budget exhausted before invoking")
+                });
+            }
+            return ActorAttempt::Failed(format!(
+                "dream budget exhausted ({} of {} invocations used)",
+                self.budget.used(),
+                self.budget.cap()
+            ));
+        }
+        if let Some(key) = reservation {
+            push_pending_reservation(key);
         }
         self.inner.invoke(model, prompt)
     }
@@ -382,6 +801,10 @@ impl NightActor for BudgetedActor<'_> {
 mod tests {
     use super::*;
     use crate::narrative::ParsedNarrative;
+
+    fn naive(text: &str) -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").unwrap()
+    }
 
     fn parsed(text: &str) -> ActorAttempt {
         ActorAttempt::Parsed(ParsedNarrative {
@@ -572,12 +995,38 @@ mod tests {
     fn estimate_scales_with_how_many_passes_a_night_holds() {
         let one = estimate_night(10, EffortTier::Balanced, 25, 8 * 3600);
         assert_eq!(one.passes, 1);
+        assert_eq!(one.invocations, 10);
         let four = estimate_night(10, EffortTier::Balanced, 25, 2 * 3600);
         assert_eq!(four.passes, 4);
-        assert_eq!(four.invocations, 40);
         // A cadence longer than the night still guarantees the floor pass.
         let long = estimate_night(10, EffortTier::Balanced, 25, 7 * 24 * 3600);
         assert_eq!(long.passes, 1);
+    }
+
+    #[test]
+    fn the_estimate_never_promises_more_than_the_nightly_cap() {
+        // Four passes × 10 reachable candidates each would be 40 invocations,
+        // but the cap is per NIGHT and the enforcement (the night ledger)
+        // stops at 25 — the estimate has to say the same thing.
+        let four = estimate_night(10, EffortTier::Balanced, 25, 2 * 3600);
+        assert_eq!(four.passes, 4);
+        assert_eq!(
+            four.invocations, 25,
+            "the estimate must not model several full-cap passes per night"
+        );
+        assert_eq!(
+            four.total_tokens(),
+            25 * (EST_INPUT_TOKENS_PER_CALL + EST_OUTPUT_TOKENS_PER_CALL)
+        );
+        // The whole night's spend is bounded by the cap whatever the cadence.
+        for interval in [600_u64, 1800, 3600, 6 * 3600] {
+            let estimate = estimate_night(500, EffortTier::Max, 25, interval);
+            assert!(
+                estimate.invocations <= 25,
+                "interval {interval}s estimated {} invocations against a cap of 25",
+                estimate.invocations
+            );
+        }
     }
 
     #[test]
@@ -600,6 +1049,261 @@ mod tests {
         assert!(
             label.contains("12 candidate episodes"),
             "the corpus basis must be shown: {label}"
+        );
+    }
+
+    // ── the night ledger: one cap per night, across passes and restarts ──
+
+    #[test]
+    fn two_ticks_in_one_night_cannot_exceed_one_nightly_cap() {
+        let storage = Storage::open_memory().unwrap();
+        let night = "2026-08-11";
+        let mut spent = 0;
+
+        // First tick: spends 3 of the night's 5.
+        {
+            let budget = Budget::for_night_with_cap(&storage, night, 5);
+            assert_eq!(budget.cap(), 5);
+            for _ in 0..3 {
+                assert!(budget.try_spend());
+                spent += 1;
+            }
+        }
+
+        // Second tick in the SAME night gets only what is left, never a
+        // fresh cap.
+        {
+            let budget = Budget::for_night_with_cap(&storage, night, 5);
+            assert_eq!(
+                budget.cap(),
+                2,
+                "a second pass must draw down the same night's allowance"
+            );
+            for _ in 0..10 {
+                if budget.try_spend() {
+                    spent += 1;
+                }
+            }
+            assert_eq!(budget.used(), 2);
+        }
+
+        // Third tick: the night is spent, whatever the pass wants.
+        let budget = Budget::for_night_with_cap(&storage, night, 5);
+        assert_eq!(budget.cap(), 0);
+        assert!(!budget.try_spend());
+        assert_eq!(
+            spent, 5,
+            "three ticks in one night must not exceed one nightly cap"
+        );
+        assert_eq!(night_claimed(&storage, night).unwrap(), 5);
+        assert_eq!(night_remaining(&storage, night, 5).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_daemon_restart_mid_night_does_not_refill_the_allowance() {
+        let storage = Storage::open_memory().unwrap();
+        let night = "2026-08-11";
+
+        // A pass spends 2 of 4 and is then killed — forgotten rather than
+        // dropped, which is what a SIGKILLed daemon looks like to the
+        // persisted ledger (no orderly shutdown ran).
+        let budget = Budget::for_night_with_cap(&storage, night, 4);
+        assert!(budget.try_spend());
+        assert!(budget.try_spend());
+        std::mem::forget(budget);
+
+        assert_eq!(
+            night_claimed(&storage, night).unwrap(),
+            2,
+            "the debits a killed pass already made stay debited"
+        );
+        let after_restart = Budget::for_night_with_cap(&storage, night, 4);
+        assert_eq!(
+            after_restart.cap(),
+            2,
+            "a restart reads the persisted balance, never a fresh cap"
+        );
+        assert!(after_restart.try_spend());
+        assert!(after_restart.try_spend());
+        assert!(
+            !after_restart.try_spend(),
+            "the night's total is still 4, not 4 per daemon lifetime"
+        );
+        assert_eq!(night_claimed(&storage, night).unwrap(), 4);
+    }
+
+    #[test]
+    fn a_second_process_cannot_be_granted_the_same_last_invocation() {
+        // Two live budgets over one database, as two `csr-engine` processes
+        // against one night would be: each debit is atomic, so the total is
+        // bounded even though both were told the same starting balance.
+        let storage = Storage::open_memory().unwrap();
+        let night = "2026-08-11";
+        let first = Budget::for_night_with_cap(&storage, night, 3);
+        let second = Budget::for_night_with_cap(&storage, night, 3);
+        assert_eq!(first.cap(), 3);
+        assert_eq!(second.cap(), 3, "both start from the same measured balance");
+
+        let mut granted = 0;
+        for _ in 0..5 {
+            if first.try_spend() {
+                granted += 1;
+            }
+            if second.try_spend() {
+                granted += 1;
+            }
+        }
+        assert_eq!(granted, 3, "the ledger, not the local counter, is the cap");
+        assert_eq!(night_claimed(&storage, night).unwrap(), 3);
+    }
+
+    #[test]
+    fn the_night_bucket_rolls_at_the_local_floor_boundary() {
+        // Before the floor hour still belongs to the previous night's bucket;
+        // at and after it, to the new one.
+        assert_eq!(night_key(naive("2026-08-11 02:59:59"), 3), "2026-08-10");
+        assert_eq!(night_key(naive("2026-08-11 03:00:00"), 3), "2026-08-11");
+        assert_eq!(night_key(naive("2026-08-11 23:30:00"), 3), "2026-08-11");
+        assert_eq!(night_key(naive("2026-08-12 01:00:00"), 3), "2026-08-11");
+        assert_eq!(
+            night_key(naive("2026-08-11 09:00:00"), 3),
+            crate::daemon::dream_cadence::floor_boundary(naive("2026-08-11 09:00:00"), 3)
+                .date()
+                .format("%Y-%m-%d")
+                .to_string(),
+            "the ledger's night and the floor pass's night must be the same boundary"
+        );
+
+        let storage = Storage::open_memory().unwrap();
+        {
+            let budget = Budget::for_night_with_cap(&storage, "2026-08-10", 3);
+            assert_eq!(budget.cap(), 3);
+            for _ in 0..3 {
+                assert!(budget.try_spend());
+            }
+            assert!(!budget.try_spend());
+        }
+        let next_night = Budget::for_night_with_cap(&storage, "2026-08-11", 3);
+        assert_eq!(
+            next_night.cap(),
+            3,
+            "the allowance is restored when the bucket rolls, not before"
+        );
+        assert!(next_night.try_spend());
+        assert_eq!(
+            night_claimed(&storage, "2026-08-10").unwrap(),
+            0,
+            "last night's ledger is not counted against tonight"
+        );
+        assert_eq!(night_claimed(&storage, "2026-08-11").unwrap(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_ledger_grants_nothing_rather_than_everything() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute("DROP TABLE meta", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let budget = Budget::for_night_with_cap(&storage, "2026-08-11", 25);
+        assert_eq!(
+            budget.cap(),
+            0,
+            "a cap that cannot be enforced must not become an unlimited one"
+        );
+        assert!(!budget.try_spend());
+    }
+
+    // ── accounting cannot fail open ──
+
+    #[test]
+    fn every_invocation_reserves_a_durable_row_before_it_happens() {
+        let storage = Storage::open_memory().unwrap();
+        let budget = Budget::for_night_with_cap(&storage, "2026-08-11", 3);
+        let seen = Cell::new(0_usize);
+        let inner = |_m: Option<&str>, _p: &str| {
+            // The reservation must already be durable while the call is in
+            // flight — that is the window the whole mechanism exists for.
+            seen.set(
+                seen.get()
+                    + storage
+                        .with_connection(usage_reservation::unaccounted_count)
+                        .unwrap() as usize,
+            );
+            parsed("[]")
+        };
+        let actor = BudgetedActor::new(&inner, &budget);
+        assert!(matches!(
+            actor.invoke(Some("sonnet-5"), "prompt"),
+            ActorAttempt::Parsed(_)
+        ));
+        assert_eq!(
+            seen.get(),
+            1,
+            "the invocation ran without a durable reservation behind it"
+        );
+        let key = take_pending_reservation().expect("the key is handed to the usage writer");
+        let row = storage
+            .with_connection(|conn| usage_reservation::load(conn, &key))
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.state, "reserved");
+        assert_eq!(row.model.as_deref(), Some("sonnet-5"));
+    }
+
+    #[test]
+    fn a_reservation_that_cannot_be_written_refuses_the_invocation() {
+        let storage = Storage::open_memory().unwrap();
+        let budget = Budget::for_night_with_cap(&storage, "2026-08-11", 5);
+        storage
+            .with_connection(|conn| {
+                conn.execute("DROP TABLE narrative_reservations", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let calls = Cell::new(0_usize);
+        let inner = |_m: Option<&str>, _p: &str| {
+            calls.set(calls.get() + 1);
+            parsed("[]")
+        };
+        let actor = BudgetedActor::new(&inner, &budget);
+        let attempt = actor.invoke(Some("sonnet-5"), "prompt");
+        match attempt {
+            ActorAttempt::Failed(msg) => assert!(
+                msg.contains("reservation"),
+                "the refusal must name its cause: {msg}"
+            ),
+            _ => panic!("an unrecordable call must not happen"),
+        }
+        assert_eq!(calls.get(), 0, "the actor was invoked without accounting");
+        assert_eq!(budget.used(), 0, "a refused call must not be charged");
+        assert_eq!(
+            accounting_failure_count(&storage),
+            Some(1),
+            "the failure must be counted for status, never swallowed"
+        );
+    }
+
+    #[test]
+    fn an_unbudgeted_actor_reserves_nothing_and_hands_over_no_key() {
+        // `Budget::new` is the no-ledger, no-accounting shape (tests, manual
+        // one-shots): it must not fabricate reservations.
+        let storage = Storage::open_memory().unwrap();
+        let budget = Budget::new(2);
+        let inner = |_m: Option<&str>, _p: &str| parsed("[]");
+        let actor = BudgetedActor::new(&inner, &budget);
+        assert!(matches!(
+            actor.invoke(None, "prompt"),
+            ActorAttempt::Parsed(_)
+        ));
+        assert_eq!(take_pending_reservation(), None);
+        assert_eq!(
+            storage
+                .with_connection(usage_reservation::unaccounted_count)
+                .unwrap(),
+            0
         );
     }
 

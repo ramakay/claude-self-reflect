@@ -6,152 +6,257 @@
 <meta name="referrer" content="no-referrer">
 <title>{% block title %}CSR Dream Journal{% endblock %}</title>
 <style>
-  /* Journal v4 server surface. Token names and values are the SAME set the
-     static `dream --report` export uses (src/dream/report_template.html.jinja)
-     so the two surfaces stay one brand: the complete light palette is defined
-     on bare :root, and only the tokens change in the two dark blocks. No
-     @font-face here — the static export inlines two woff2 files as base64
-     because it must survive being copied to another machine; a loopback
-     server has no such constraint, so the same --serif stack is declared and
-     falls back to Georgia when Playfair Display is not installed locally.
-     Nothing in this document makes a network request. */
+  /* Journal v4 server surface — P6 locked spec.
+     Four bans, enforced here and nowhere else:
+       1. No manila. No beige/tan/cream/kraft fill on any surface.
+       2. No left tab-bar navigation. An active nav item is brighter text
+          plus a small leading dot — never a bar, pill, tab or background
+          block.
+       3. No outer frame. Zones bleed to all four edges and meet at 1px
+          hairlines with square corners. Nothing floats.
+       4. Flat only. No gradients, shadows, glows, bevels, blur. Radius <= 3px.
+     The complete LIGHT palette is defined on bare :root; only the tokens
+     change in the two dark blocks, so the toggle wins in both directions.
+     No @font-face and no network request of any kind. */
   :root {
-    --sky-top: #e8e4f0;
-    --sky-bottom: #c8cae0;
-    --ink: #1a1a2e;
-    --slate: #4a4a6a;
-    --label: #606080;
-    --purple: #6b5b95;
-    --purple-bg: rgba(107, 91, 149, 0.16);
-    --glass: rgba(255, 255, 255, 0.55);
-    --glass-border: rgba(255, 255, 255, 0.3);
-    --highlight: rgba(255, 255, 255, 0.55);
-    --radius-pane: 1.25rem;
-    --radius-tile: 0.75rem;
+    /* base palette — light */
+    --sky-top: #F3F4F0;
+    --sky-bottom: #F3F4F0;
+    --ink: #20231F;
+    --slate: #646A65;
+    --label: #737A76;
+    --purple: #344A68;              /* receipt mono / link */
+    --purple-bg: rgba(52, 74, 104, 0.06);
+    --glass: #FCFCF9;               /* ledger surface */
+    --glass-border: #D9DCD5;        /* hairline */
+    --highlight: rgba(32, 35, 31, 0.05);
+    --radius-pane: 3px;
+    --radius-tile: 2px;
     --serif: 'Playfair Display', Georgia, 'Times New Roman', serif;
     --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
-    --bg: rgba(255, 255, 255, 0.35);
+    /* semantic aliases — defined ONCE, over the bases above */
+    --bg: #F3F4F0;
     --bg-card: var(--glass);
     --fg: var(--ink);
     --fg-muted: var(--slate);
     --border: var(--glass-border);
     --accent: var(--purple);
-    --red: #64484e;
-    --red-bg: rgba(181, 131, 141, 0.2);
-    --amber: #755b40;
-    --amber-bg: rgba(212, 165, 116, 0.22);
-    --green: #3f5238;
-    --green-bg: rgba(124, 148, 115, 0.2);
+    --red: #94404B;                 /* obsolete rose */
+    --red-bg: rgba(148, 64, 75, 0.06);
+    --amber: #8A5A13;               /* superseded amber */
+    --amber-bg: rgba(138, 90, 19, 0.06);
+    --green: #3F7455;               /* reinstated sage */
+    --green-bg: rgba(63, 116, 85, 0.06);
+    --neutral: #737A76;             /* unverified — never a semantic hue */
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --sky-top: #1a1a2e;
-      --sky-bottom: #26263e;
-      --ink: #e8e6f0;
-      --slate: #9a98b5;
-      --label: #9694ae;
-      --purple: #9d8cc4;
-      --purple-bg: rgba(157, 140, 196, 0.2);
-      --glass: rgba(30, 30, 46, 0.55);
-      --glass-border: rgba(255, 255, 255, 0.12);
-      --highlight: rgba(255, 255, 255, 0.14);
-      --bg: rgba(30, 30, 46, 0.35);
-      --red: #f0a9b2;
-      --red-bg: rgba(229, 128, 140, 0.22);
-      --amber: #f0c58c;
-      --amber-bg: rgba(224, 163, 85, 0.24);
-      --green: #a9dd98;
-      --green-bg: rgba(143, 194, 122, 0.22);
+      --sky-top: #151722;
+      --sky-bottom: #151722;
+      --ink: #F1EEE6;
+      --slate: #9B9EAC;
+      --label: #9B9EAC;
+      --purple: #B8C7E8;
+      --purple-bg: rgba(184, 199, 232, 0.10);
+      --glass: #1D202B;
+      --glass-border: #343846;
+      --highlight: rgba(241, 238, 230, 0.08);
+      --bg: #151722;
+      --red: #D5767C;
+      --red-bg: rgba(213, 118, 124, 0.10);
+      --amber: #E0A24E;
+      --amber-bg: rgba(224, 162, 78, 0.10);
+      --green: #73A987;
+      --green-bg: rgba(115, 169, 135, 0.10);
+      --neutral: #858A96;
     }
   }
   :root[data-theme="dark"] {
-    --sky-top: #1a1a2e;
-    --sky-bottom: #26263e;
-    --ink: #e8e6f0;
-    --slate: #9a98b5;
-    --label: #9694ae;
-    --purple: #9d8cc4;
-    --purple-bg: rgba(157, 140, 196, 0.2);
-    --glass: rgba(30, 30, 46, 0.55);
-    --glass-border: rgba(255, 255, 255, 0.12);
-    --highlight: rgba(255, 255, 255, 0.14);
-    --bg: rgba(30, 30, 46, 0.35);
-    --red: #f0a9b2;
-    --red-bg: rgba(229, 128, 140, 0.22);
-    --amber: #f0c58c;
-    --amber-bg: rgba(224, 163, 85, 0.24);
-    --green: #a9dd98;
-    --green-bg: rgba(143, 194, 122, 0.22);
+    --sky-top: #151722;
+    --sky-bottom: #151722;
+    --ink: #F1EEE6;
+    --slate: #9B9EAC;
+    --label: #9B9EAC;
+    --purple: #B8C7E8;
+    --purple-bg: rgba(184, 199, 232, 0.10);
+    --glass: #1D202B;
+    --glass-border: #343846;
+    --highlight: rgba(241, 238, 230, 0.08);
+    --bg: #151722;
+    --red: #D5767C;
+    --red-bg: rgba(213, 118, 124, 0.10);
+    --amber: #E0A24E;
+    --amber-bg: rgba(224, 162, 78, 0.10);
+    --green: #73A987;
+    --green-bg: rgba(115, 169, 135, 0.10);
+    --neutral: #858A96;
   }
 
   * { box-sizing: border-box; }
   html { -webkit-text-size-adjust: 100%; }
+  /* Ban 3: no outer frame. The page IS the surface — no margin, no rounded
+     sheet, no shadow around anything. */
   body {
     margin: 0;
-    padding: 0 1.25rem 4rem;
+    padding: 0;
     min-height: 100vh;
-    background: linear-gradient(180deg, var(--sky-top) 0%, var(--sky-bottom) 100%);
-    background-attachment: fixed;
+    background: var(--bg);
     color: var(--fg);
     font: 400 0.9375rem/1.6 -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
   }
   a { color: var(--accent); }
-  .wrap { max-width: 62rem; margin: 0 auto; }
 
   .masthead {
-    max-width: 62rem; margin: 0 auto; padding: 2rem 0 1.25rem;
     display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem 1rem;
-    border-bottom: 1px solid var(--border);
+    padding: 1.1rem 1.5rem; border-bottom: 1px solid var(--border);
   }
   .wordmark {
-    font-family: var(--serif); font-size: 1.5rem; font-weight: 700;
+    font-family: var(--serif); font-size: 1.25rem; font-weight: 700;
     color: var(--fg); text-decoration: none; letter-spacing: -0.01em;
   }
-  .wordmark span { color: var(--accent); }
+  .wordmark span { color: var(--fg-muted); }
   .masthead-meta {
     margin: 0; margin-left: auto; font-family: var(--mono);
     font-size: 0.75rem; color: var(--label);
   }
   .masthead-meta span + span::before { content: " · "; }
 
-  .card-list { list-style: none; margin: 1.5rem 0 0; padding: 0; display: grid; gap: 1rem; }
+  /* Two zones, meeting at one hairline, both bleeding to the edges. */
+  .shell { display: grid; grid-template-columns: 14rem minmax(0, 1fr); }
+  .sidebar { border-right: 1px solid var(--border); padding: 1.25rem 1.25rem 3rem; }
+  .main { padding: 1.25rem 1.5rem 4rem; min-width: 0; }
+  @media (max-width: 60rem) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    .sidebar { border-right: 0; border-bottom: 1px solid var(--border); }
+  }
+
+  .rail-title {
+    margin: 1.4rem 0 0.5rem; font-family: var(--mono); font-size: 0.6875rem;
+    font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--label);
+  }
+  .sidebar > .rail-title:first-child { margin-top: 0; }
+  /* Ban 2: the ONLY marker of the current item is brighter text plus a small
+     leading dot. No bar, no pill, no tab, no background block — anywhere. */
+  .nav { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; }
+  .nav a { color: var(--fg-muted); text-decoration: none; font-size: 0.875rem; }
+  .nav a:hover { color: var(--fg); }
+  .nav a.current { color: var(--fg); font-weight: 600; }
+  .nav a.current::before { content: "· "; color: var(--fg); }
+  .nav .count { color: var(--label); font-family: var(--mono); font-size: 0.75rem; }
+  .projects { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.25rem; }
+  .projects li {
+    font-family: var(--mono); font-size: 0.75rem; color: var(--fg-muted);
+    word-break: break-all;
+  }
+
+  /* --- board ----------------------------------------------------------- */
+  .board { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; }
+  .column { border-left: 1px solid var(--border); padding: 0 1rem 1.5rem; min-width: 0; }
+  .column:first-child { border-left: 0; padding-left: 0; }
+  @media (max-width: 60rem) {
+    .board { grid-template-columns: minmax(0, 1fr); }
+    .column { border-left: 0; border-top: 1px solid var(--border); padding: 1rem 0 1.5rem; }
+    .column:first-child { border-top: 0; padding-top: 0; }
+  }
+  .column-title {
+    margin: 0; font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg);
+  }
+  .column-count { color: var(--label); font-weight: 400; }
+  .column-gate {
+    margin: 0.35rem 0 0.9rem; font-size: 0.75rem; line-height: 1.5; color: var(--label);
+  }
+  .cards { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.75rem; }
+
+  /* Three-line index card. Everything else lives on the detail page. */
   .card {
-    background: var(--bg-card); border: 1px solid var(--border);
-    border-radius: var(--radius-tile); padding: 1rem 1.15rem;
+    position: relative;
+    display: grid; grid-template-columns: 2.25rem minmax(0, 1fr);
+    gap: 0 0.6rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--neutral);
+    border-radius: var(--radius-tile);
+    padding: 0.7rem 2rem 0.7rem 0.75rem;
   }
-  .card:hover { border-color: var(--accent); }
-  .card-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
-  .card-title {
-    margin: 0.45rem 0 0; font-family: var(--serif); font-size: 1.0625rem;
-    line-height: 1.35; font-weight: 700;
+  /* Session-grade gets NO saturated rail: a rail identical to item-grade
+     would imply the conclusion is anchored to specific items. */
+  .card.session-grade { border-left-width: 1px; border-left-color: var(--border); }
+  .card.hue-obsolete { border-left-color: var(--red); }
+  .card.hue-superseded { border-left-color: var(--amber); }
+  .card.hue-reinstated { border-left-color: var(--green); }
+  .card.hue-neutral { border-left-color: var(--neutral); }
+  /* Unverified evidence: neutral, dashed, NOT LIVE, no rank numeral. Never
+     amber/rose/sage — those assert a deterministic verdict exists. */
+  .card.not-live { border-style: dashed; border-left-color: var(--neutral); }
+  .card-rank {
+    grid-row: 1 / span 3; align-self: start;
+    font-family: var(--mono); font-size: 1.125rem; color: var(--label);
+    font-variant-numeric: tabular-nums;
   }
-  .card-title a { color: var(--fg); text-decoration: none; }
-  .card-title a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
-  .dream-lines { list-style: none; margin: 0.6rem 0 0; padding: 0; display: grid; gap: 0.25rem; }
-  .dream-lines li {
-    font-family: var(--mono); font-size: 0.8125rem; color: var(--fg-muted);
+  .card-caps {
+    font-family: var(--mono); font-size: 0.6875rem; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--label);
   }
+  .card-caps .verdict.hue-obsolete { color: var(--red); }
+  .card-caps .verdict.hue-superseded { color: var(--amber); }
+  .card-caps .verdict.hue-reinstated { color: var(--green); }
+  .card-caps .verdict.hue-neutral { color: var(--neutral); }
+  .card-caps .grade { color: var(--label); }
+  .card-caps span + span::before { content: " · "; color: var(--label); }
+  .card-conclusion {
+    margin: 0.25rem 0 0; font-family: var(--serif); font-size: 1rem; line-height: 1.35;
+    /* two lines, then ellipsis — the full sentence is on the detail page */
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .card-conclusion a { color: var(--fg); text-decoration: none; }
+  .card-conclusion a:hover { text-decoration: underline; }
   .card-meta {
-    margin: 0.7rem 0 0; font-family: var(--mono); font-size: 0.75rem; color: var(--label);
+    margin: 0.35rem 0 0; font-family: var(--mono); font-size: 0.6875rem; color: var(--label);
+  }
+  /* The card's ONLY action: one micro copy icon, top right. No worded
+     button on the index. */
+  .card-copy {
+    position: absolute; top: 0.5rem; right: 0.55rem;
+    font-family: var(--mono); font-size: 0.8125rem; line-height: 1;
+    color: var(--label); text-decoration: none;
+  }
+  .card-copy:hover { color: var(--fg); }
+
+  .lane-note, .column-empty {
+    margin: 0.35rem 0 0.9rem; font-size: 0.8125rem; line-height: 1.5; color: var(--label);
+  }
+  .section { margin: 2.25rem 0 0; padding-top: 1.1rem; border-top: 1px solid var(--border); }
+  .section h2 {
+    margin: 0 0 0.5rem; font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg);
+  }
+  .ledger { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
+  .ledger li {
+    border: 1px solid var(--border); border-radius: var(--radius-tile);
+    padding: 0.55rem 0.7rem;
+  }
+  /* Settled/archived rows drop the live rail entirely; the original verdict
+     survives only as an outlined label, and the receipt carries the proof. */
+  .outline-label {
+    display: inline-block; padding: 0 0.35rem; border: 1px solid var(--border);
+    border-radius: var(--radius-tile); font-family: var(--mono); font-size: 0.625rem;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--label);
+  }
+  .ledger-line { margin: 0.25rem 0 0; font-family: var(--mono); font-size: 0.6875rem; color: var(--label); }
+  .ledger-conclusion { margin: 0.3rem 0 0; font-size: 0.875rem; color: var(--fg-muted); }
+  .unexamined { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.4rem; }
+  .unexamined li {
+    border: 1px dashed var(--border); border-radius: var(--radius-tile);
+    padding: 0.5rem 0.7rem; font-size: 0.875rem; color: var(--fg-muted);
   }
 
-  .chip {
-    display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px;
-    font-family: var(--mono); font-size: 0.6875rem; letter-spacing: 0.02em;
-    border: 1px solid var(--border); color: var(--fg-muted); background: var(--bg);
-  }
-  .chip.item-grade { color: var(--accent); background: var(--purple-bg); border-color: transparent; }
-  .chip.session-grade { color: var(--amber); background: var(--amber-bg); border-color: transparent; }
-  .chip.project { color: var(--label); }
-
-  .pager {
-    display: flex; gap: 1rem; margin: 1.75rem 0 0;
-    font-family: var(--mono); font-size: 0.8125rem;
-  }
-
+  /* --- detail ---------------------------------------------------------- */
+  .wrap { max-width: 62rem; }
   .panel {
-    background: var(--bg-card); border: 1px solid var(--border);
-    border-radius: var(--radius-tile); padding: 1.15rem 1.25rem; margin: 1.25rem 0 0;
+    border: 1px solid var(--border); border-radius: var(--radius-tile);
+    padding: 1rem 1.1rem; margin: 1rem 0 0; background: var(--bg-card);
   }
   .panel h2 {
     margin: 0 0 0.75rem; font-family: var(--mono); font-size: 0.75rem;
@@ -167,6 +272,14 @@
   .prose { margin: 0.6rem 0 0; color: var(--fg-muted); }
   .evidence { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.35rem; }
   .evidence li { font-family: var(--mono); font-size: 0.8125rem; color: var(--fg-muted); }
+
+  .chip {
+    display: inline-block; padding: 0.1rem 0.4rem; border-radius: var(--radius-tile);
+    font-family: var(--mono); font-size: 0.6875rem; letter-spacing: 0.02em;
+    border: 1px solid var(--border); color: var(--fg-muted); background: transparent;
+  }
+  .chip.item-grade { color: var(--fg); }
+  .chip.session-grade { color: var(--label); }
 
   .sub {
     margin: 1.1rem 0 0.5rem; font-family: var(--mono); font-size: 0.6875rem;
@@ -202,9 +315,17 @@
     word-break: break-word;
   }
   .spend { margin: 0.4rem 0 0; font-family: var(--mono); font-size: 0.8125rem; color: var(--fg-muted); }
-  .card-spend {
-    margin: 0.45rem 0 0; font-family: var(--mono); font-size: 0.6875rem; color: var(--label);
+
+  /* Write forms. Loopback only, same-origin only, CSRF-token gated — the
+     server enforces all three; this is just the affordance. */
+  .actions { display: flex; flex-wrap: wrap; gap: 0.6rem; margin: 0.4rem 0 0; }
+  .actions form { margin: 0; }
+  .actions button {
+    font: inherit; font-size: 0.8125rem; padding: 0.3rem 0.7rem; cursor: pointer;
+    color: var(--fg); background: transparent;
+    border: 1px solid var(--border); border-radius: var(--radius-tile);
   }
+  .actions button:hover { border-color: var(--fg-muted); }
 
   .ast-grid {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
@@ -213,12 +334,12 @@
   .ast-tree { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; }
   .ast-tree li {
     font-family: var(--mono); font-size: 0.75rem; color: var(--fg-muted);
-    padding: 0.25rem 0.5rem; border-radius: 0.35rem;
+    padding: 0.25rem 0.5rem; border-radius: var(--radius-tile);
   }
   /* Solid = witnessed by the ledger. Dotted = deterministically resolved
      only. Neither borrows a semantic verdict hue: an AST row is geometry,
      not a verdict. */
-  .ast-tree li.witnessed { border: 1px solid var(--border); background: var(--bg); }
+  .ast-tree li.witnessed { border: 1px solid var(--border); }
   .ast-tree li.resolved { border: 1px dotted var(--border); }
   .ast-kind { color: var(--label); }
   .ast-receipt { color: var(--accent); }
@@ -233,26 +354,24 @@
   .churn li {
     position: relative; display: flex; gap: 0.6rem; align-items: baseline;
     font-family: var(--mono); font-size: 0.75rem; color: var(--fg-muted);
-    padding: 0.25rem 0.5rem; border-radius: 0.35rem; overflow: hidden;
+    padding: 0.25rem 0.5rem; border-radius: var(--radius-tile); overflow: hidden;
   }
-  .churn-bar {
-    position: absolute; inset: 0 auto 0 0; background: var(--bg); z-index: 0;
-  }
+  .churn-bar { position: absolute; inset: 0 auto 0 0; background: var(--highlight); z-index: 0; }
   .churn-file, .churn-count { position: relative; z-index: 1; }
   .churn-file { word-break: break-all; }
   .churn-count { margin-left: auto; color: var(--label); white-space: nowrap; }
 
   .empty {
-    margin: 2rem 0 0; padding: 2rem 1.25rem; text-align: center;
-    background: var(--bg-card); border: 1px dashed var(--border);
-    border-radius: var(--radius-tile);
+    margin: 1.5rem 0 0; padding: 2rem 1.25rem;
+    border: 1px dashed var(--border); border-radius: var(--radius-tile);
   }
   .empty p { margin: 0.35rem 0; color: var(--fg-muted); }
   .empty .lead { font-family: var(--serif); font-size: 1.25rem; color: var(--fg); }
 
+  .pager { display: flex; gap: 1rem; margin: 1.75rem 0 0; font-family: var(--mono); font-size: 0.8125rem; }
+
   .colophon {
-    max-width: 62rem; margin: 3rem auto 0; padding-top: 1rem;
-    border-top: 1px solid var(--border);
+    padding: 1rem 1.5rem 2rem; border-top: 1px solid var(--border);
     font-family: var(--mono); font-size: 0.6875rem; color: var(--label);
   }
   .colophon p { margin: 0.2rem 0; }
@@ -263,12 +382,19 @@
   <a class="wordmark" href="/">CSR <span>Dream Journal</span></a>
   <p class="masthead-meta">{% block masthead_meta %}{% endblock %}</p>
 </header>
-<div class="wrap">
-{% block main %}{% endblock %}
+{% block shell %}
+<div class="shell">
+  <aside class="sidebar">
+    <p class="rail-title">Journal</p>
+    <ul class="nav"><li><a class="current" href="/">Board</a></li></ul>
+  </aside>
+  <main class="main"><div class="wrap">{% block main %}{% endblock %}</div></main>
 </div>
+{% endblock %}
 <footer class="colophon">
   <p>Served on 127.0.0.1 only — this page is not reachable from any other machine, and it makes no network requests.</p>
-  <p>Read-only surface over the witness ledger. A verdict row proves a past state, never a current one.</p>
+  <p>Read-only except the resolve and dismiss forms, which write same-origin, CSRF-gated verdicts tagged <code>journal_ui</code>.</p>
+  <p>A verdict row proves a past state, never a current one.</p>
 </footer>
 </body>
 </html>

@@ -116,6 +116,13 @@ pub struct DreamCadenceStatus {
     pub last_trigger: Option<String>,
     /// Whether the nightly floor pass is currently owed.
     pub floor_due: bool,
+    /// The floor pass is owed AND the machine has not been witnessed idle,
+    /// so it is deferred rather than started underneath a live session. This
+    /// is the overdue state: the pass is still owed and runs at the next idle
+    /// window. `idle_now = false` includes "no activity has been observed at
+    /// all" — unobserved is never read as quiet, so a machine CSR cannot see
+    /// defers rather than assuming it is safe to start work.
+    pub floor_deferred_awaiting_idle: bool,
 }
 
 /// Effort tier and budget (locked decisions 8 and 14).
@@ -132,9 +139,37 @@ pub struct DreamEffortStatus {
     /// The last completed pass's measured budget usage. `None` before any
     /// pass has recorded one.
     pub last_pass: Option<DreamBudgetUsage>,
+    /// Budget left over in that last pass (`cap - used`). `None` when there
+    /// is no recorded pass to subtract from.
+    pub last_pass_remaining: Option<usize>,
     /// How many invalid `CSR_DREAM_EFFORT` values have been seen. `None`
     /// when the counter was never written (not the same as zero observed).
     pub invalid_values: Option<i64>,
+    /// Tonight's durable spend ledger (locked decision 8 — the cap is per
+    /// NIGHT). `used` is what passes have debited from `cap` tonight.
+    /// `None` when the ledger could not be read — an unreadable ledger is
+    /// not the same as a night with nothing spent.
+    pub night: Option<DreamNightBudget>,
+    /// Invocations that started and whose spend was never measured — open
+    /// usage reservations. `None` when the table could not be read; a
+    /// non-zero value is a known unknown, never rounded to zero spend.
+    pub unaccounted_invocations: Option<i64>,
+    /// How many usage-accounting writes have failed. `None` when the counter
+    /// was never written (not the same as zero observed).
+    pub accounting_failures: Option<i64>,
+}
+
+/// Tonight's invocation allowance and what is left of it.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DreamNightBudget {
+    /// The local-night bucket these numbers belong to.
+    pub night: String,
+    /// The nightly cap a pass starting now would draw from.
+    pub cap: usize,
+    /// Invocations already claimed tonight, from the durable ledger.
+    pub used: usize,
+    /// `cap - used`.
+    pub remaining: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
@@ -208,6 +243,9 @@ impl Default for DreamStatus {
                 idle_now: false,
                 last_trigger: None,
                 floor_due: true,
+                // Consistent with the two fields above it: owed, and not
+                // witnessed idle.
+                floor_deferred_awaiting_idle: true,
             },
             effort: DreamEffortStatus::default(),
             badge: DreamBadgeStatus::default(),
@@ -230,7 +268,16 @@ impl Default for DreamEffortStatus {
             model: crate::dream::threads::primary_thread_model(),
             budget_cap: crate::dream::policy::budget_cap(tier),
             last_pass: None,
+            last_pass_remaining: None,
             invalid_values: None,
+            night: Some(DreamNightBudget {
+                night: crate::dream::policy::current_night_key(),
+                cap: crate::dream::policy::budget_cap(tier),
+                used: 0,
+                remaining: crate::dream::policy::budget_cap(tier),
+            }),
+            unaccounted_invocations: None,
+            accounting_failures: None,
         }
     }
 }
@@ -632,16 +679,21 @@ fn gather_cadence(
     let idle_threshold_secs = cadence::idle_secs();
     let floor_hour = cadence::floor_hour();
     let last_activity = cadence::last_activity_at(storage);
+    let last_run_local = last_daemon_run.map(|t| t.with_timezone(&chrono::Local).naive_local());
+    let now_local = now.with_timezone(&chrono::Local).naive_local();
     DreamCadenceStatus {
         idle_threshold_secs,
         floor_hour,
         idle_now: cadence::is_idle(last_activity, now, idle_threshold_secs),
         last_activity: last_activity.map(|t| t.to_rfc3339()),
         last_trigger: storage.get_meta(cadence::META_LAST_TRIGGER).unwrap_or(None),
-        floor_due: cadence::floor_due(
-            last_daemon_run.map(|t| t.with_timezone(&chrono::Local).naive_local()),
-            now.with_timezone(&chrono::Local).naive_local(),
-            floor_hour,
+        floor_due: cadence::floor_due(last_run_local, now_local, floor_hour),
+        floor_deferred_awaiting_idle: cadence::floor_deferred_for_activity(
+            last_activity,
+            last_run_local,
+            now,
+            now_local,
+            cadence::CadenceConfig::from_env(),
         ),
     }
 }
@@ -655,12 +707,25 @@ fn gather_effort(storage: &Storage) -> DreamEffortStatus {
         .get_meta(crate::daemon::dream_cadence::META_LAST_BUDGET)
         .unwrap_or(None)
         .and_then(|raw| serde_json::from_str::<DreamBudgetUsage>(&raw).ok());
+    let night = crate::dream::policy::current_night_key();
+    let nightly_cap = crate::dream::policy::budget_cap(tier);
     DreamEffortStatus {
+        night: crate::dream::policy::night_claimed(storage, &night)
+            .ok()
+            .map(|used| DreamNightBudget {
+                cap: nightly_cap,
+                used,
+                remaining: nightly_cap.saturating_sub(used),
+                night,
+            }),
+        unaccounted_invocations: crate::dream::policy::unaccounted_invocations(storage),
+        accounting_failures: crate::dream::policy::accounting_failure_count(storage),
         tier: tier.as_str().to_string(),
         reasoning_effort: tier.reasoning_effort().to_string(),
         episodes_per_pass: tier.episodes_per_pass(),
         model: crate::dream::threads::primary_thread_model(),
         budget_cap: crate::dream::policy::budget_cap(tier),
+        last_pass_remaining: last_pass.as_ref().map(DreamBudgetUsage::remaining),
         last_pass,
         invalid_values: crate::dream::policy::invalid_effort_count(storage),
     }
@@ -1314,9 +1379,25 @@ mod tests {
                 url: report.dream.server.url.clone(),
                 port_reachable: report.dream.server.port_reachable,
             },
+            effort: DreamEffortStatus {
+                // Measured from a table that exists on a fresh DB, so it is a
+                // real zero here — unlike the `None` default, which means
+                // "never read". Asserted on its own contract below.
+                unaccounted_invocations: report.dream.effort.unaccounted_invocations,
+                ..DreamEffortStatus::default()
+            },
             ..DreamStatus::default()
         };
         assert_eq!(report.dream, expected);
+        assert_eq!(
+            report.dream.effort.unaccounted_invocations,
+            Some(0),
+            "a fresh database has no invocation in flight"
+        );
+        assert!(
+            report.dream.cadence.floor_deferred_awaiting_idle,
+            "a never-dreamed machine with no observed activity owes the floor pass and defers it"
+        );
         assert_eq!(
             report.dream.server.url.is_some(),
             !crate::journal::server_disabled(),
@@ -1389,11 +1470,18 @@ mod tests {
             .unwrap();
         crate::dream::policy::record_invalid_effort(&storage);
         let effort = gather_effort(&storage);
-        let usage = effort.last_pass.expect("a recorded budget must be read back");
+        let usage = effort
+            .last_pass
+            .expect("a recorded budget must be read back");
         assert_eq!(usage.cap, 25);
         assert_eq!(usage.used, 7);
         assert_eq!(usage.queued, 4);
         assert_eq!(usage.remaining(), 18);
+        assert_eq!(
+            effort.last_pass_remaining,
+            Some(18),
+            "remaining budget must be reported, not left to the reader"
+        );
         assert_eq!(effort.invalid_values, Some(1));
     }
 
@@ -1413,7 +1501,10 @@ mod tests {
         let fresh = gather_cadence(&storage, None);
         assert_eq!(fresh.last_activity, None);
         assert!(!fresh.idle_now, "no observed activity is not idleness");
-        assert!(fresh.floor_due, "a machine that never dreamed is owed a pass");
+        assert!(
+            fresh.floor_due,
+            "a machine that never dreamed is owed a pass"
+        );
         assert_eq!(fresh.last_trigger, None);
 
         storage
@@ -1430,8 +1521,14 @@ mod tests {
             .set_meta(crate::daemon::dream_cadence::META_LAST_TRIGGER, "idle")
             .unwrap();
         let aged = gather_cadence(&storage, None);
-        assert_eq!(aged.last_activity.as_deref(), Some("2020-01-01T00:00:00+00:00"));
-        assert!(aged.idle_now, "a five-year-old transcript is idle by any threshold");
+        assert_eq!(
+            aged.last_activity.as_deref(),
+            Some("2020-01-01T00:00:00+00:00")
+        );
+        assert!(
+            aged.idle_now,
+            "a five-year-old transcript is idle by any threshold"
+        );
         assert_eq!(aged.last_trigger.as_deref(), Some("idle"));
     }
 

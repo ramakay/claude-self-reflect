@@ -211,6 +211,11 @@ impl FileWatcher {
 
         let chunk_count = chunks.len();
 
+        // Journal v4 P4b: bind any pasted dream prompt to the dream that
+        // produced it (same contract as `engine::import_file_with_attribution`
+        // — marker present or nothing is written).
+        import::dream_marker::bind_markers(&self.storage, &conv_id, &chunks);
+
         // Batch embed and store
         for batch in chunks.chunks(BATCH_SIZE) {
             let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();

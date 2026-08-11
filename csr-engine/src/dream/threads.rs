@@ -779,6 +779,12 @@ pub(crate) struct ChainAttempt {
     output_tokens: i64,
     cache_read_tokens: i64,
     cache_creation_tokens: i64,
+    /// The durable reservation written before this invocation happened
+    /// (`policy::BudgetedActor`), taken on the statement right after the
+    /// actor returned. `None` for an attempt that was never reserved — an
+    /// unbudgeted test actor, or a call the budget refused before it could
+    /// reach the actor at all.
+    reservation: Option<String>,
 }
 
 pub(crate) struct ChainResult {
@@ -803,7 +809,11 @@ pub(crate) fn invoke_chain(
     let mut attempts = Vec::new();
     for candidate in chain {
         let label = candidate.clone().unwrap_or_else(|| "default".to_string());
-        match actor.invoke(candidate.as_deref(), prompt) {
+        let outcome = actor.invoke(candidate.as_deref(), prompt);
+        // Taken immediately, before any other invocation can happen, so the
+        // reservation belongs to exactly the attempt being recorded here.
+        let reservation = crate::dream::policy::take_pending_reservation();
+        match outcome {
             ActorAttempt::Parsed(p) => {
                 attempts.push(ChainAttempt {
                     model_label: p.model.clone(),
@@ -812,6 +822,7 @@ pub(crate) fn invoke_chain(
                     output_tokens: p.output_tokens,
                     cache_read_tokens: p.cache_read_tokens,
                     cache_creation_tokens: p.cache_creation_tokens,
+                    reservation,
                 });
                 return ChainResult {
                     text: Some(p.text),
@@ -827,6 +838,7 @@ pub(crate) fn invoke_chain(
                     output_tokens: 0,
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
+                    reservation,
                 });
                 continue;
             }
@@ -838,6 +850,7 @@ pub(crate) fn invoke_chain(
                     output_tokens: 0,
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
+                    reservation,
                 });
                 break;
             }
@@ -857,27 +870,70 @@ pub(crate) fn invoke_chain(
 ///
 /// `pub(crate)` so `journal::composer` accounts its plan spend through the
 /// same writer rather than a second one that could drift.
+///
+/// The usage row and the settlement of the attempt's durable reservation are
+/// written in **one transaction**: either the call is measured and its
+/// reservation closed, or neither happens and the reservation stays
+/// `reserved` — an invocation whose spend was never measured, which `status`
+/// reports as unaccounted. Failures are never discarded: each one is logged at
+/// error level and counted in `policy::META_ACCOUNTING_FAILURES`. Returns the
+/// number of attempts whose accounting could not be written, so callers that
+/// can act on it may (a `0` return is the normal path).
 pub(crate) fn record_attempts(
     storage: &Storage,
     attempts: &[ChainAttempt],
     call_site: &str,
     ref_id: Option<&str>,
-) {
+) -> usize {
+    let mut failures = 0_usize;
     for a in attempts {
-        let _ = storage.record_narrative_usage_for(
-            &NarrativeUsageRow {
-                call_site: call_site.to_string(),
-                model: a.model_label.clone(),
-                input_tokens: a.input_tokens,
-                output_tokens: a.output_tokens,
-                cache_read_tokens: a.cache_read_tokens,
-                cache_creation_tokens: a.cache_creation_tokens,
-                duration_ms: 0,
-                success: a.success,
-            },
-            ref_id,
-        );
+        let row = NarrativeUsageRow {
+            call_site: call_site.to_string(),
+            model: a.model_label.clone(),
+            input_tokens: a.input_tokens,
+            output_tokens: a.output_tokens,
+            cache_read_tokens: a.cache_read_tokens,
+            cache_creation_tokens: a.cache_creation_tokens,
+            duration_ms: 0,
+            success: a.success,
+        };
+        let reservation = a.reservation.clone();
+        let written = storage.with_connection(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            crate::storage::queries::record_narrative_usage_for(&tx, &row, ref_id)?;
+            let usage_id = tx.last_insert_rowid();
+            let settled = match reservation.as_deref() {
+                Some(key) => crate::storage::usage_reservation::finalise(&tx, key, usage_id)?,
+                None => true,
+            };
+            tx.commit()?;
+            Ok(settled)
+        });
+        if let Ok(false) = written {
+            // The row was measured, but its reservation was not in `reserved`
+            // state — something settled it already. Say so; do not overwrite.
+            tracing::warn!(
+                call_site,
+                attempt_key = ?reservation,
+                "dream usage reservation was already settled; the new usage row stays unlinked"
+            );
+        }
+        if let Err(error) = written {
+            failures += 1;
+            tracing::error!(
+                %error,
+                call_site,
+                model = %a.model_label,
+                reserved = reservation.is_some(),
+                "dream usage accounting failed; this invocation stays unaccounted"
+            );
+            crate::dream::policy::note_accounting_failure(storage);
+        }
     }
+    failures
 }
 
 /// Propose, then verify. `None` means the actor never produced a usable
@@ -1181,10 +1237,16 @@ fn record_run_meta(storage: &Storage, stats: &ThreadExtractionStats) {
     let _ = storage.set_meta(META_LAST_CONVERGED, if converged { "1" } else { "0" });
 }
 
-/// Run one night-pass thread-extraction cycle with a budget sized from the
-/// configured effort tier. See [`run_thread_extraction_with_budget`].
+/// Run one night-pass thread-extraction cycle with a budget claimed from
+/// **tonight's remaining allowance** (locked decision 8), so a manual run and
+/// the daemon's passes share one nightly cap rather than each getting a fresh
+/// one. See [`run_thread_extraction_with_budget`].
 pub fn run_thread_extraction(storage: &Storage) -> ThreadExtractionStats {
-    let budget = crate::dream::policy::Budget::for_tier(crate::dream::policy::effort_tier());
+    let budget = crate::dream::policy::Budget::for_night(
+        storage,
+        crate::dream::policy::effort_tier_counted(storage),
+        &crate::dream::policy::current_night_key(),
+    );
     run_thread_extraction_with_budget(storage, &budget)
 }
 
@@ -1606,6 +1668,121 @@ mod tests {
             "no reply means the episode is retried next pass, not cached as empty"
         );
         assert_eq!(calls.get(), 0);
+    }
+
+    // ---- usage accounting cannot fail open ---------------------------------
+
+    fn reply_actor(text: &'static str) -> impl Fn(Option<&str>, &str) -> ActorAttempt {
+        move |_m: Option<&str>, _p: &str| {
+            ActorAttempt::Parsed(ParsedNarrative {
+                text: text.to_string(),
+                model: "sonnet-5".into(),
+                input_tokens: 11,
+                output_tokens: 7,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            })
+        }
+    }
+
+    #[test]
+    fn each_invocation_is_reserved_before_the_call_and_settled_against_its_usage_row() {
+        use crate::dream::policy::{Budget, BudgetedActor};
+        use crate::storage::usage_reservation;
+        let _g = env_guard();
+        clear_env();
+        let storage = open();
+        let budget = Budget::for_night_with_cap(&storage, "2026-08-11", 4);
+        let inner = reply_actor("[]");
+        let actor = BudgetedActor::new(&inner, &budget);
+        let chain = vec![Some("sonnet-5".to_string())];
+        let (threads, _model) =
+            verify_reply(&actor, &chain, "RECORD: x", &[], &storage, Some("hash-a")).unwrap();
+        assert!(threads.is_empty());
+
+        assert_eq!(
+            storage
+                .with_connection(usage_reservation::unaccounted_count)
+                .unwrap(),
+            0,
+            "an invocation that returned must not stay unaccounted"
+        );
+        let (usage_rows, finalised, usage_id): (i64, i64, Option<i64>) = storage
+            .with_connection(|conn| {
+                let rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM narrative_usage WHERE call_site = 'dream_threads'
+                       AND ref_id = 'hash-a' AND input_tokens = 11",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let finalised: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM narrative_reservations WHERE state = 'finalised'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let usage_id: Option<i64> = conn.query_row(
+                    "SELECT usage_id FROM narrative_reservations WHERE state = 'finalised'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((rows, finalised, usage_id))
+            })
+            .unwrap();
+        assert_eq!(usage_rows, 1, "the call must be measured exactly once");
+        assert_eq!(finalised, 1, "its reservation must be settled");
+        let measured: i64 = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT input_tokens FROM narrative_usage WHERE id = ?1",
+                    rusqlite::params![usage_id.expect("usage id")],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            measured, 11,
+            "the reservation must point at the row that measured THIS call"
+        );
+    }
+
+    #[test]
+    fn a_usage_accounting_failure_is_counted_and_left_unaccounted_never_swallowed() {
+        use crate::dream::policy::{self, Budget, BudgetedActor};
+        use crate::storage::usage_reservation;
+        let _g = env_guard();
+        clear_env();
+        let storage = open();
+        let budget = Budget::for_night_with_cap(&storage, "2026-08-11", 4);
+        // The call happens and is reserved; the measurement then cannot be
+        // written. That must be visible, not discarded.
+        storage
+            .with_connection(|conn| {
+                conn.execute("DROP TABLE narrative_usage", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let inner = reply_actor("[]");
+        let actor = BudgetedActor::new(&inner, &budget);
+        let chain = vec![Some("sonnet-5".to_string())];
+        let _ = verify_reply(&actor, &chain, "RECORD: x", &[], &storage, Some("hash-a"));
+
+        assert_eq!(
+            policy::accounting_failure_count(&storage),
+            Some(1),
+            "a discarded accounting error is exactly the fail-open under review"
+        );
+        assert_eq!(
+            storage
+                .with_connection(usage_reservation::unaccounted_count)
+                .unwrap(),
+            1,
+            "an unmeasured call must remain a known unknown, never zero spend"
+        );
+        assert_eq!(
+            policy::unaccounted_invocations(&storage),
+            Some(1),
+            "status must be able to read the unaccounted count"
+        );
     }
 
     #[test]

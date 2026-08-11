@@ -1,42 +1,133 @@
 {% extends "layout.html" %}
 {% block title %}CSR Dream Journal{% endblock %}
 {% block masthead_meta %}
-<span>{{ view.count_label }}</span><span>{{ view.project_label }}</span>{% if view.pass_label %}<span>{{ view.pass_label }}</span>{% endif %}
+<span>{{ view.count_label }}</span>{% if view.pass_label %}<span>{{ view.pass_label }}</span>{% endif %}
 {% endblock %}
-{% block main %}
-{% if view.empty %}
-  <div class="empty">
-    <p class="lead">Nothing on record yet.</p>
-    <p>No open item has been qualified by a witnessed change. This is an empty feed, not a failure —
-       run <code>csr-engine dream</code> to write verdicts, and leave an open todo or blocker behind for them to land on.</p>
-  </div>
-{% else %}
-  <ul class="card-list">
-  {% for card in view.cards %}
-    <li class="card" id="dream-{{ card.id }}">
-      <div class="card-head">
-        <span class="chip {{ card.grade_slug }}">{{ card.grade_label }}</span>
-        <span class="chip project">{{ card.project }}</span>
-        <span class="chip">{{ card.kind }}</span>
-      </div>
-      <h2 class="card-title"><a href="{{ card.href }}">{{ card.item }}</a></h2>
-      {% if card.dream_lines %}
-      <ul class="dream-lines">
-        {% for line in card.dream_lines %}<li>☾ {{ line }}</li>{% endfor %}
+{#- The board. Three evidence-maturity columns left-to-right by DESCENDING
+    confidence, then the off-board lanes. A card moves right only when
+    evidence accumulates, and the user can never move one rightward at all —
+    promotion needs evidence the system does not have. -#}
+{% block shell %}
+<div class="shell">
+  <aside class="sidebar">
+    <p class="rail-title">Journal</p>
+    {#- Ban 2: the current item is brighter text plus a leading dot. There is
+        no bar, pill, tab shape or background block anywhere in this nav. -#}
+    <ul class="nav">
+      <li><a class="current" href="/">Board</a></li>
+      <li><a href="#unexamined">Unexamined <span class="count">{{ view.unexamined.count }}</span></a></li>
+      <li><a href="#settled">Settled <span class="count">{{ view.settled_total }}</span></a></li>
+      <li><a href="#archive">Archive <span class="count">{{ view.archive_total }}</span></a></li>
+    </ul>
+    {% if view.projects %}
+    <p class="rail-title">Projects</p>
+    <ul class="projects">
+      {#- Navigation only. Project never enters the ranking comparison. -#}
+      {% for project in view.projects %}<li>{{ project }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+  </aside>
+  <main class="main">
+  {% if view.empty %}
+    <div class="empty">
+      <p class="lead">Nothing on record yet.</p>
+      <p>No open item has been qualified by a witnessed change, and no open item is waiting
+         unexamined. This is an empty feed, not a failure — run <code>csr-engine dream</code>
+         to write verdicts, and leave an open todo or blocker behind for them to land on.</p>
+    </div>
+  {% else %}
+    <div class="board">
+      {% for column in view.columns %}
+      <section class="column" id="{{ column.slug }}" aria-labelledby="{{ column.slug }}-h">
+        <h2 class="column-title" id="{{ column.slug }}-h">{{ column.title }}
+          <span class="column-count">{{ column.count }}</span></h2>
+        <p class="column-gate">{{ column.gate }}</p>
+        {% if column.cards %}
+        <ul class="cards">
+          {% for card in column.cards %}
+          <li class="card {{ card.grade_slug }} hue-{{ card.hue }}{% if card.not_live %} not-live{% endif %}"
+              id="dream-{{ card.id }}">
+            {#- The rank numeral is a persistent gutter, and it is ABSENT on a
+                card excluded from ranking rather than being faked. -#}
+            <span class="card-rank">{% if card.ordinal %}{{ card.ordinal }}{% endif %}</span>
+            <p class="card-caps">
+              <span class="verdict hue-{{ card.hue }}">{{ card.verdict }}</span><span class="grade">{{ card.grade_label }}</span>{% if card.not_live %}<span class="grade">NOT LIVE · EVIDENCE UNVERIFIED</span>{% endif %}
+            </p>
+            <p class="card-conclusion">{% if card.href %}<a href="{{ card.href }}">{{ card.conclusion }}</a>{% else %}{{ card.conclusion }}{% endif %}</p>
+            <p class="card-meta">{{ card.meta }}</p>
+            {#- The card's only action: one micro copy icon, top right. -#}
+            {% if card.copy_href %}<a class="card-copy" href="{{ card.copy_href }}" title="copy block" aria-label="copy block for this dream">⧉</a>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+        {% if column.truncation %}<p class="lane-note">{{ column.truncation }}</p>{% endif %}
+        {% else %}
+        <p class="column-empty">{{ column.empty_note }}</p>
+        {% endif %}
+      </section>
+      {% endfor %}
+    </div>
+
+    {#- Off-board. These are open items the pass concluded NOTHING about;
+        putting them in a column would imply a conclusion that does not
+        exist. -#}
+    <section class="section" id="unexamined" aria-labelledby="unexamined-h">
+      <h2 id="unexamined-h">Unexamined <span class="column-count">{{ view.unexamined.count }}</span></h2>
+      <p class="lane-note">{{ view.unexamined_note }}</p>
+      {% if view.unexamined.rows %}
+      <ul class="unexamined">
+        {% for row in view.unexamined.rows %}
+        <li>{{ row.item }}
+          <span class="ledger-line">{{ row.kind }} · {{ row.project }} · {{ row.meta }}</span></li>
+        {% endfor %}
       </ul>
+      {% if view.unexamined.truncation %}<p class="lane-note">{{ view.unexamined.truncation }}</p>{% endif %}
+      {% else %}
+      <p class="lane-note">No open item is currently without verdict evidence.</p>
       {% endif %}
-      <p class="card-meta">{{ card.meta }}</p>
-      {#- Spend renders only when usage was recorded for this dream (locked
-          decision 13). No else-branch: an unmeasured dream shows nothing,
-          because a zero here would read as "this one was free". -#}
-      {% if card.spend %}<p class="card-spend">{{ card.spend.tokens }} · {{ card.spend.cost }}</p>{% endif %}
-    </li>
-  {% endfor %}
-  </ul>
-  <nav class="pager">
-    {% if view.prev_href %}<a href="{{ view.prev_href }}">← previous</a>{% endif %}
-    <span>showing {{ view.shown_from }}–{{ view.shown_to }} of {{ view.total }}</span>
-    {% if view.next_href %}<a href="{{ view.next_href }}">next →</a>{% endif %}
-  </nav>
-{% endif %}
+    </section>
+
+    <section class="section" id="settled" aria-labelledby="settled-h">
+      <h2 id="settled-h">Settled <span class="column-count">{{ view.settled_total }}</span></h2>
+      {% if view.settled %}
+      <ul class="ledger">
+        {% for row in view.settled %}
+        <li>
+          <span class="outline-label">{{ row.verdict }}</span>
+          <p class="ledger-conclusion">{% if row.href %}<a href="{{ row.href }}">{{ row.conclusion }}</a>{% else %}{{ row.conclusion }}{% endif %}</p>
+          {% if row.completed %}<p class="ledger-line">{{ row.completed }}</p>{% endif %}
+          <p class="ledger-line">{{ row.original_witness }}</p>
+        </li>
+        {% endfor %}
+      </ul>
+      {% if view.settled_truncation %}<p class="lane-note">{{ view.settled_truncation }}</p>{% endif %}
+      {% else %}
+      <p class="lane-note">Nothing has been recorded as later completed. Nothing is claimed about
+        whether the open work was done.</p>
+      {% endif %}
+    </section>
+
+    <section class="section" id="archive" aria-labelledby="archive-h">
+      <h2 id="archive-h">Archive <span class="column-count">{{ view.archive_total }}</span></h2>
+      {% if view.archive %}
+      <ul class="ledger">
+        {% for row in view.archive %}
+        <li>
+          <span class="outline-label">{{ row.verdict }}</span>
+          <p class="ledger-conclusion">{% if row.href %}<a href="{{ row.href }}">{{ row.conclusion }}</a>{% else %}{{ row.conclusion }}{% endif %}</p>
+          <p class="ledger-line">{{ row.original_witness }}</p>
+          {#- The pass clause drops entirely when no generation manifest covers
+              the evidence: an unnamed pass is never invented. -#}
+          {% if row.pass %}<p class="ledger-line">{{ row.pass }}</p>{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      {% if view.archive_truncation %}<p class="lane-note">{{ view.archive_truncation }}</p>{% endif %}
+      {% else %}
+      <p class="lane-note">No conclusion predates a published pass.</p>
+      {% endif %}
+    </section>
+  {% endif %}
+  </main>
+</div>
 {% endblock %}
