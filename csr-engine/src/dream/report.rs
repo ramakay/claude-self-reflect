@@ -104,11 +104,21 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section class="mailbox" aria-label
         <header class="detail-head">
           <h2 class="sentence">{{ pane.sentence }}</h2>
           {% if pane.description %}<p class="description">{{ pane.description }}</p>{% endif %}
-          <p class="detail-meta"><span class="project-pill">{{ pane.project }}</span><span>{{ pane.date }}</span><span>{{ pane.session_short }}</span>{% if pane.outcome_badge %}<span class="outcome-badge {{ pane.outcome_slug }}">{{ pane.outcome_badge }}</span>{% endif %}{% if pane.unscanned %}<span class="warn-chip" title="transcript not scanned for instrumentation">&#9888; not scanned</span>{% endif %}</p>
+          <p class="detail-meta"><span class="project-pill">{{ pane.project }}</span><span>{{ pane.date }}</span><span>{{ pane.session_short }}</span>{% if pane.outcome_badge %}<span class="outcome-badge {{ pane.outcome_slug }}" title="{{ pane.date }}">ENDED: {{ pane.outcome_badge }}</span>{% endif %}{% if pane.now_badge %}<span class="now-badge {{ pane.now_badge_slug }}" title="derived from SINCE THEN evidence, not a health check">{{ pane.now_badge }}</span>{% endif %}{% if pane.unscanned %}<span class="warn-chip" title="transcript not scanned for instrumentation">&#9888; not scanned</span>{% endif %}</p>
         </header>
+        {% if pane.touch_next %}
+        <div class="touch-next" aria-label="Touch next">
+          <p class="touch-next-head">Touch next</p>
+          <ul class="touch-next-list">
+            {% for line in pane.touch_next %}<li>{{ line }}</li>{% endfor %}
+          </ul>
+        </div>
+        {% else %}
+        <p class="touch-next-empty">nothing evidenced to touch — no open todos, blockers, or adverse verdicts</p>
+        {% endif %}
         <div class="stage-rail">
           {% for stage in pane.stages %}
-          <details class="stage-card {{ stage.kind }}" data-stage="{{ stage.id }}" open>
+          <details class="stage-card {{ stage.kind }}" data-stage="{{ stage.id }}"{% if stage.open %} open{% endif %}>
             <summary><span class="stage-glyph">{{ stage.glyph }}</span><span class="stage-label">{{ stage.label }}</span></summary>
             <div class="stage-body">
               {% if stage.kind == "ask" %}
@@ -123,7 +133,12 @@ const JOURNAL_TIMELINE_TEMPLATE: &str = r#"  <section class="mailbox" aria-label
                 {% endif %}
               {% elif stage.kind == "steer" %}
                 <ul class="task-list">
-                  {% for todo in stage.todos %}<li class="task {{ todo.slug }}"><span class="glyph">{{ todo.glyph }}</span>{{ todo.content }}</li>{% endfor %}
+                  {% for todo in stage.todos_open %}<li class="task {{ todo.slug }}"><span class="glyph">{{ todo.glyph }}</span>{{ todo.content }}</li>{% endfor %}
+                  {% if stage.todos_completed_fold %}
+                  <li class="task-fold"><details class="completed-fold"><summary>{{ stage.todos_completed | length }} completed</summary><ul class="task-list nested">{% for todo in stage.todos_completed %}<li class="task {{ todo.slug }}"><span class="glyph">{{ todo.glyph }}</span>{{ todo.content }}</li>{% endfor %}</ul></details></li>
+                  {% else %}
+                    {% for todo in stage.todos_completed %}<li class="task {{ todo.slug }}"><span class="glyph">{{ todo.glyph }}</span>{{ todo.content }}</li>{% endfor %}
+                  {% endif %}
                 </ul>
                 {% if stage.steer_count %}
                 <p class="steer-count">{{ stage.steer_count }} mid-flight steer{% if stage.steer_count != 1 %}s{% endif %}</p>
@@ -259,9 +274,23 @@ const STORY_HERO_META: &str = r#"    <p class="subtitle">What each session set o
 
 const MAILBOX_CSS: &str = r#"
   .mailbox {
-    display: grid; grid-template-columns: minmax(260px, 35%) minmax(0, 65%);
+    display: grid; grid-template-columns: 340px minmax(0, 1fr);
     gap: 0; border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
     align-items: stretch;
+  }
+  /* Finding 2 (pane visibility on selection): both panes are independently
+     scrollable and bounded to the viewport minus the hero above the
+     mailbox, so selecting a session never requires scrolling the whole page
+     to see it. 260px is a conservative estimate of the hero's rendered
+     height (wrap top padding + title row + subtitle + meta-row + hero
+     margin) — a sticky-friendly approach rather than a JS measurement, so it
+     degrades gracefully (a little extra/unused scroll room) if the hero
+     wraps to an extra line on a narrow viewport. Without JS the panes still
+     render stacked/scrollable at <=760px below — no content is ever gated
+     on script execution. */
+  .index-pane, .detail-pane-wrap {
+    max-height: calc(100vh - 260px);
+    overflow-y: auto;
   }
   .index-pane {
     border-right: 1px solid var(--border); background: var(--bg-card);
@@ -270,6 +299,8 @@ const MAILBOX_CSS: &str = r#"
   .sort-controls {
     display: flex; align-items: center; gap: 0.4rem; padding: 0.75rem 0.9rem;
     border-bottom: 1px solid var(--border); font-size: 0.75rem;
+    position: sticky; top: 0; z-index: 2; background: var(--bg-card);
+    backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
   }
   .sort-label { color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.68rem; }
   .sort-btn {
@@ -278,7 +309,12 @@ const MAILBOX_CSS: &str = r#"
     cursor: pointer;
   }
   .sort-btn.active { color: var(--accent); border-color: var(--accent); font-weight: 700; }
-  .session-rows { padding: 0.4rem 0; overflow-x: hidden; }
+  /* flex-shrink: 0 is load-bearing: `overflow-x: hidden` flips this flex
+     child's min-height:auto to 0, and inside the height-capped index column
+     it would otherwise shrink to a sliver while the thin rollup (min-height
+     intact) keeps its full height — rendering the rollup as the visible
+     "top" of the index. */
+  .session-rows { padding: 0.4rem 0; overflow-x: hidden; flex-shrink: 0; }
   .group-header {
     margin: 0.8rem 0.9rem 0.35rem; font-size: 0.68rem; font-weight: 700;
     color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.06em;
@@ -301,7 +337,7 @@ const MAILBOX_CSS: &str = r#"
   }
   .index-row .sentence {
     display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
-    overflow: hidden; overflow-wrap: anywhere; font-size: 0.86rem; line-height: 1.35; font-weight: 550;
+    overflow: hidden; overflow-wrap: anywhere; font-size: 0.875rem; line-height: 1.35; font-weight: 550;
   }
   .index-row .instrumentation {
     display: block; margin-top: 0.25rem; font-size: 0.7rem; color: var(--fg-muted);
@@ -336,11 +372,45 @@ const MAILBOX_CSS: &str = r#"
   .outcome-badge.partial { color: var(--amber); background: var(--amber-bg); }
   .outcome-badge.failed { color: var(--red); background: var(--red-bg); }
   .outcome-badge.noted { color: var(--fg-muted); border: 1px solid var(--border); }
+  /* Finding 3: NOW states what the dream has concluded SINCE the session
+     ended — evidence-gated, never a health claim. "superseded" reuses the
+     same adverse-red as a superseded outcome; "unverified" is deliberately
+     neutral (no verdict type proves current health, so it never earns the
+     positive/green treatment). */
+  .now-badge {
+    border-radius: 999px; font-size: 0.62rem; font-weight: 800; padding: 0.1rem 0.45rem;
+    text-transform: uppercase; letter-spacing: 0.04em; border: 1px solid var(--border);
+  }
+  .now-badge.superseded { color: var(--red); background: var(--red-bg); border-color: transparent; }
+  .now-badge.unverified { color: var(--fg-muted); }
   .warn-chip {
     color: var(--amber); border: 1px solid var(--amber); border-radius: 999px;
     padding: 0.05rem 0.5rem; font-size: 0.68rem; font-weight: 700;
   }
   .chip.degraded { border-bottom: 1px dotted var(--amber); }
+  /* Finding 1: the page's answer to "what should I do next?" — quiet but
+     first, directly below the detail header, before the stage rail. Muted
+     purple (--accent/--purple) marks it as the dream's own voice, same
+     register as the SINCE THEN panel's conclusion text, distinct from the
+     session's own editorial-black narrative. */
+  .touch-next { margin: 0 0 1rem; }
+  .touch-next-head {
+    font-size: 0.68rem; font-weight: 800; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--purple); margin: 0 0 0.3rem;
+  }
+  .touch-next-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.25rem; }
+  .touch-next-list li {
+    font-size: 0.875rem; color: var(--ink); line-height: 1.4; overflow-wrap: anywhere;
+    padding-left: 0.9rem; position: relative;
+  }
+  .touch-next-list li::before {
+    content: "\2192"; position: absolute; left: 0; color: var(--purple);
+  }
+  /* The honest empty state (abstention-first): quiet, small, never styled
+     as an invitation to invent advice. */
+  .touch-next-empty {
+    font-size: 0.76rem; color: var(--fg-muted); font-style: italic; margin: 0 0 1rem;
+  }
   .steer-count { font-weight: 700; margin: 0.5rem 0 0.2rem; }
   .steer-line { margin: 0 0 0.2rem; color: var(--fg-muted); overflow-wrap: anywhere; }
   .outcome-errors { font-weight: 700; margin: 0 0 0.35rem; }
@@ -372,11 +442,11 @@ const MAILBOX_CSS: &str = r#"
     align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 800;
   }
   .stage-label { font-size: 0.72rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; color: var(--fg-muted); }
-  .stage-body { padding: 0 0.85rem 0.75rem; font-size: 0.82rem; line-height: 1.5; overflow-wrap: anywhere; }
+  .stage-body { padding: 0 0.85rem 0.75rem; font-size: 0.875rem; line-height: 1.5; overflow-wrap: anywhere; }
   .stage-body .quote { font-style: italic; margin: 0; }
   .stage-body .narrative { margin: 0 0 0.5rem; }
   .file-list, .task-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; }
-  .file-list li, .task-list li { font-size: 0.8rem; overflow-wrap: anywhere; }
+  .file-list li, .task-list li { font-size: 0.875rem; overflow-wrap: anywhere; }
   .file-list li.more { color: var(--fg-muted); }
   .task { display: flex; gap: 0.45rem; }
   .task .glyph { font-weight: 800; flex: none; width: 1.1em; text-align: center; }
@@ -385,6 +455,15 @@ const MAILBOX_CSS: &str = r#"
   .task.open .glyph { color: var(--fg-muted); }
   .task.unknown .glyph { color: var(--fg-muted); }
   .task.done { color: var(--fg-muted); }
+  /* Finding 4: completed todos beyond the fold threshold nest behind a
+     closed <details> — same visual register as a task line, not a whole new
+     component. All rows stay in the DOM either way (no-JS readable). */
+  .task-fold { list-style: none; }
+  .completed-fold summary {
+    list-style: none; cursor: pointer; font-size: 0.875rem; color: var(--fg-muted);
+  }
+  .completed-fold summary::-webkit-details-marker { display: none; }
+  .completed-fold .task-list.nested { margin-top: 0.3rem; padding-left: 1.1em; }
   .outcome-stats { font-weight: 700; margin: 0 0 0.35rem; }
   .outcome-text { margin: 0; }
   .artifact-bento {
@@ -529,7 +608,7 @@ const MAILBOX_CSS: &str = r#"
   .since-then-rows { display: grid; gap: 0.5rem; }
   .since-then-row {
     border: 1px solid var(--border); border-radius: var(--radius-tile);
-    background: var(--bg-card); padding: 0.6rem 0.75rem; font-size: 0.8rem;
+    background: var(--bg-card); padding: 0.6rem 0.75rem; font-size: 0.875rem;
     line-height: 1.5; min-width: 0;
   }
   .since-then-row .symbol {
@@ -624,6 +703,17 @@ const MAILBOX_SCRIPT: &str = r#"
   const defaultSession = detailPanes.find(pane => !pane.hidden)?.dataset.session;
 
   // --- selection / pane swap -----------------------------------------
+  // Finding 2 (pane visibility on selection): the detail pane scrolls
+  // independently of the index pane (see the CSS `.detail-pane-wrap`
+  // max-height/overflow-y rule), so swapping to a different session's pane
+  // must also reset that scroll position to the top — otherwise a reader
+  // who scrolled deep into one session's stage rail would land mid-scroll
+  // on the next one. `prefers-reduced-motion: reduce` gets the instant
+  // "auto" behavior instead of a smooth scroll.
+  const detailWrap = document.querySelector(".detail-pane-wrap");
+  const prefersReducedMotion =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const selectSession = (id, updateHash) => {
     if (!id) return;
     let matched = false;
@@ -638,6 +728,13 @@ const MAILBOX_SCRIPT: &str = r#"
       row.classList.toggle("selected", isMatch);
       row.setAttribute("aria-selected", isMatch ? "true" : "false");
     });
+    if (detailWrap) {
+      if (typeof detailWrap.scrollTo === "function") {
+        detailWrap.scrollTo({ top: 0, behavior: prefersReducedMotion ? "auto" : "smooth" });
+      } else {
+        detailWrap.scrollTop = 0;
+      }
+    }
     if (updateHash !== false) location.hash = id;
   };
 
@@ -805,6 +902,13 @@ struct SinceThenRowView {
     /// ONE evidenced next move — `None` means the row ends at the
     /// conclusion with no advice (abstention-first: no evidence, no "so").
     so_clause: Option<String>,
+    /// Short receipt oid when `conclusion_slug == "superseded"`, `None`
+    /// otherwise (including a superseded verdict with no receipt at all).
+    /// Kept as its own field — rather than re-parsing it out of
+    /// `conclusion_label` — so the TOUCH NEXT strip (adversarial-review
+    /// finding 1) can quote the receipt without string-sniffing rendered
+    /// prose.
+    receipt_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -870,7 +974,21 @@ struct StageCardView {
     narrative: Option<String>,
     investigated: Vec<String>,
     investigated_more: usize,
-    todos: Vec<StoryTodoView>,
+    /// STEER stage only: open/doing todos, in original order, rendered
+    /// BEFORE any completed ones (adversarial-review finding 4).
+    todos_open: Vec<StoryTodoView>,
+    /// STEER stage only: completed todos, in original order.
+    todos_completed: Vec<StoryTodoView>,
+    /// True when `todos_completed.len() > 5` — the template wraps the
+    /// completed list in a nested closed `<details>` ("N completed") instead
+    /// of listing every one inline; all rows still land in the DOM either
+    /// way (no-JS readable).
+    todos_completed_fold: bool,
+    /// Whether this stage's `<details>` renders `open` by default
+    /// (adversarial-review finding 4): ASK and DELIBERATION start closed,
+    /// STEER and OUTCOME start open. All content is always in the DOM
+    /// regardless — this only sets the initial disclosure state.
+    open: bool,
     outcome_text: Option<String>,
     outcome_stats: Option<String>,
     /// STEER stage only. `None` -> no count line at all; `Some(0)` also
@@ -1002,6 +1120,11 @@ struct DetailPaneView {
     date: String,
     outcome_slug: &'static str,
     outcome_badge: Option<String>,
+    /// Adversarial-review finding 3: what the dream has concluded SINCE the
+    /// session ended, derived only from SINCE THEN evidence — `None` when
+    /// the session touched no symbols at all (no evidence, no claim).
+    now_badge: Option<String>,
+    now_badge_slug: Option<&'static str>,
     stages: Vec<StageCardView>,
     artifacts: Vec<StoryArtifactView>,
     artifacts_more: usize,
@@ -1013,6 +1136,10 @@ struct DetailPaneView {
     /// The SINCE THEN payback panel (journal v2 Phase 5) — see
     /// `StoryCardView::since_then`.
     since_then: Option<SinceThenPanelView>,
+    /// TOUCH NEXT strip (adversarial-review finding 1) — empty means no
+    /// evidenced next move anywhere; the template renders the explicit
+    /// abstention sentence in that case, never an empty element.
+    touch_next: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1551,6 +1678,11 @@ fn steer_survives(text: &str) -> bool {
         && !crate::transcript::instrumentation::is_noisy_steer_text(text)
 }
 
+/// STEER stage (adversarial-review finding 4): above this many completed
+/// todos, the completed list folds behind a nested closed `<details>`
+/// ("N completed") instead of listing every one inline.
+const COMPLETED_TODO_FOLD_THRESHOLD: usize = 5;
+
 /// Only the stages with real evidence are drawn — a session with no todos
 /// and no steers gets a shorter rail, never a padded-out four-node one.
 fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
@@ -1566,7 +1698,10 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
             narrative: None,
             investigated: Vec::new(),
             investigated_more: 0,
-            todos: Vec::new(),
+            todos_open: Vec::new(),
+            todos_completed: Vec::new(),
+            todos_completed_fold: false,
+            open: false,
             outcome_text: None,
             outcome_stats: None,
             steer_count: None,
@@ -1594,7 +1729,10 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
             narrative: card.narrative.clone(),
             investigated: shown,
             investigated_more: more,
-            todos: Vec::new(),
+            todos_open: Vec::new(),
+            todos_completed: Vec::new(),
+            todos_completed_fold: false,
+            open: false,
             outcome_text: None,
             outcome_stats: None,
             steer_count: None,
@@ -1656,6 +1794,20 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
                 text: s.text.clone(),
             })
             .collect();
+        // Finding 4: open (○/→) todos render before completed ones; a
+        // completed list beyond the fold threshold nests behind a closed
+        // <details> rather than listing every one inline. Order within each
+        // bucket is preserved from the episode's own todo order.
+        let mut todos_open = Vec::new();
+        let mut todos_completed = Vec::new();
+        for todo in &card.todos {
+            if todo.slug == "done" {
+                todos_completed.push(todo.clone());
+            } else {
+                todos_open.push(todo.clone());
+            }
+        }
+        let todos_completed_fold = todos_completed.len() > COMPLETED_TODO_FOLD_THRESHOLD;
         stages.push(StageCardView {
             id: "S_STEER",
             label: "STEER",
@@ -1665,7 +1817,10 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
             narrative: None,
             investigated: Vec::new(),
             investigated_more: 0,
-            todos: card.todos.clone(),
+            todos_open,
+            todos_completed,
+            todos_completed_fold,
+            open: true,
             outcome_text: None,
             outcome_stats: None,
             steer_count,
@@ -1716,7 +1871,10 @@ fn build_stage_cards(card: &StoryCardView) -> Vec<StageCardView> {
             narrative: None,
             investigated: Vec::new(),
             investigated_more: 0,
-            todos: Vec::new(),
+            todos_open: Vec::new(),
+            todos_completed: Vec::new(),
+            todos_completed_fold: false,
+            open: true,
             outcome_text,
             outcome_stats,
             steer_count: None,
@@ -1857,6 +2015,7 @@ fn index_row(card: &StoryCardView, selected: bool) -> IndexRowView {
 
 fn detail_pane(card: &StoryCardView) -> DetailPaneView {
     let artifacts_more = card.artifacts.len().saturating_sub(ARTIFACT_CAP);
+    let (now_badge, now_badge_slug) = build_now_badge(card.since_then.as_ref());
     DetailPaneView {
         session_short: card.session_short.clone(),
         sentence: card.summary.clone(),
@@ -1865,12 +2024,15 @@ fn detail_pane(card: &StoryCardView) -> DetailPaneView {
         date: card.date.clone(),
         outcome_slug: card.outcome_slug,
         outcome_badge: card.outcome_badge.clone(),
+        now_badge,
+        now_badge_slug,
         stages: build_stage_cards(card),
         artifacts: card.artifacts.iter().take(ARTIFACT_CAP).cloned().collect(),
         artifacts_more,
         episode_json: card.episode_json.clone(),
         unscanned: card.unscanned,
         since_then: card.since_then.clone(),
+        touch_next: build_touch_next(card),
     }
 }
 
@@ -2026,6 +2188,9 @@ fn build_since_then_panel(storage: &Storage, session: &StorySession) -> Option<S
                     &sym.symbol,
                     &conclusion,
                 );
+                let receipt_oid = matches!(conclusion.verdict, Some(VerdictKind::SupersededBy))
+                    .then(|| conclusion.receipt_oid.as_deref().map(short_oid))
+                    .flatten();
                 built.push(Built {
                     row: SinceThenRowView {
                         symbol: sym.symbol.clone(),
@@ -2035,6 +2200,7 @@ fn build_since_then_panel(storage: &Storage, session: &StorySession) -> Option<S
                         conclusion_slug: slug,
                         why_hint: format!("csr_why(\"{}\")", sym.symbol),
                         so_clause,
+                        receipt_oid,
                     },
                     adverse_rank: rank,
                     touched_at: sym.touched_at,
@@ -2080,6 +2246,117 @@ fn build_since_then_panel(storage: &Storage, session: &StorySession) -> Option<S
         .collect();
 
     Some(SinceThenPanelView { kpi, rows, more })
+}
+
+// --- TOUCH NEXT strip (adversarial-review finding 1) -----------------------
+//
+// The page's answer to "what should I do next?", rendered directly below the
+// detail header, before the stage rail. Abstention-first: every line traces
+// to evidence already computed for this session — an open/doing todo, the
+// episode's own `next_steps`, a `blockers` clause, or a SINCE THEN so-clause
+// for a symbol the dream concluded was superseded (the receipt IS the
+// evidence). No source anywhere -> an empty list, and the template renders
+// the honest "nothing evidenced" sentence rather than inventing advice.
+
+/// Cap on the TOUCH NEXT strip — worst/most-actionable evidence first:
+/// blockers > open todos > next_steps > superseded receipts.
+const TOUCH_NEXT_CAP: usize = 3;
+
+fn build_touch_next(card: &StoryCardView) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::with_capacity(TOUCH_NEXT_CAP);
+    // An open todo and the episode's next_steps often carry the same text
+    // (the Stop hook derives one from the other) — the strip must never say
+    // the same thing twice, so every push is deduped case-insensitively.
+    let push_unique = |lines: &mut Vec<String>, line: String| {
+        let key = line.trim().to_lowercase();
+        if !lines.iter().any(|l| l.trim().to_lowercase() == key) {
+            lines.push(line);
+        }
+    };
+
+    if let Some(blockers) = &card.blockers {
+        push_unique(&mut lines, format!("blocked: {blockers}"));
+    }
+
+    if lines.len() < TOUCH_NEXT_CAP {
+        for todo in &card.todos {
+            if lines.len() >= TOUCH_NEXT_CAP {
+                break;
+            }
+            if matches!(todo.slug, "open" | "doing") {
+                push_unique(&mut lines, todo.content.clone());
+            }
+        }
+    }
+
+    if lines.len() < TOUCH_NEXT_CAP {
+        if let Some(next) = &card.next_steps {
+            push_unique(&mut lines, next.clone());
+        }
+    }
+
+    if lines.len() < TOUCH_NEXT_CAP {
+        if let Some(since_then) = &card.since_then {
+            for row in &since_then.rows {
+                if lines.len() >= TOUCH_NEXT_CAP {
+                    break;
+                }
+                if row.conclusion_slug == "superseded" {
+                    let oid = row.receipt_oid.as_deref().unwrap_or("unknown");
+                    push_unique(
+                        &mut lines,
+                        format!("read ⌗{oid} before touching {}", row.symbol),
+                    );
+                }
+            }
+        }
+    }
+
+    lines.truncate(TOUCH_NEXT_CAP);
+    lines
+}
+
+// --- ENDED / NOW badges (adversarial-review finding 3) ----------------------
+//
+// The outcome badge ("ENDED: FAILED", etc.) states what the session itself
+// concluded, dated. The NOW badge states what the dream has concluded SINCE
+// — evidence-gated, never a health claim: there is no verdict type that
+// proves a symbol is still fine, so "NOW: fine/ok/current" never renders.
+
+/// `(badge text, CSS slug)` for the NOW badge, or `(None, None)` when the
+/// session has no attributed symbols at all (no evidence, no claim — never a
+/// fabricated "NOW: fine").
+fn build_now_badge(
+    since_then: Option<&SinceThenPanelView>,
+) -> (Option<String>, Option<&'static str>) {
+    let Some(panel) = since_then else {
+        return (None, None);
+    };
+    if panel.rows.is_empty() {
+        return (None, None);
+    }
+    let adverse = panel
+        .rows
+        .iter()
+        .filter(|row| matches!(row.conclusion_slug, "superseded" | "obsolete"))
+        .count();
+    if adverse > 0 {
+        return (
+            Some(format!("NOW: {adverse} superseded since")),
+            Some("superseded"),
+        );
+    }
+    let all_unverified = panel
+        .rows
+        .iter()
+        .all(|row| matches!(row.conclusion_slug, "witnessed_unverified" | "unverified"));
+    if all_unverified {
+        return (Some("NOW: unverified".to_string()), Some("unverified"));
+    }
+    // Mixed reinstated/witnessed evidence with no adverse verdict proves
+    // nothing about current health either way (no verdict type means "still
+    // fine") — abstention-first: no badge rather than an invented claim.
+    (None, None)
 }
 
 /// "while away: N anchors retired, M proposals open" (journal v2 Phase 5) —
@@ -5636,6 +5913,480 @@ mod tests {
         assert!(
             !row.contains(">1 error<"),
             "the stale cached count must never survive the rescan: {row}"
+        );
+    }
+
+    // ---- Codex adversarial-review findings (journal v2) -------------------
+
+    /// Finding 1: TOUCH NEXT sources in priority order (blockers > open
+    /// todos > next_steps > superseded receipts) and the 3-line cap. One
+    /// session carries all four candidate sources (blocker, one open todo,
+    /// next_steps, a superseded symbol) — the cap must render exactly the
+    /// top three and drop the fourth. A second session carries five open
+    /// todos and nothing else, proving the cap also holds within a single
+    /// tier and preserves the episode's own todo order. A third session
+    /// carries ONLY a superseded symbol, proving tier 4 fires when nothing
+    /// higher-priority exists.
+    #[test]
+    fn touch_next_strip_sources_and_priority() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode_with_extra(
+            &storage,
+            "touch-priority",
+            "2026-05-01T09:00:00Z",
+            "wire the retry path",
+            "partial",
+            serde_json::json!({
+                "todos": [{"content": "wire the retry queue", "status": "pending"}],
+                "next_steps": "polish the release notes",
+                "blockers": "clear the migration lock first",
+            }),
+        );
+        seed_attribution(
+            &storage,
+            "touch-priority",
+            "/repo/src/retry.rs",
+            "old_helper",
+            "2026-05-01T09:00:00Z",
+        );
+        let witness_id = seed_witness(
+            &storage,
+            "proj",
+            "/repo/src/retry.rs",
+            "old_helper",
+            "aoid-tn1",
+        );
+        seed_verdict_event(
+            &storage,
+            witness_id,
+            "superseded_by",
+            Some("1234567890abcdef"),
+            "2026-05-01 10:00:00",
+        );
+
+        seed_episode_with_extra(
+            &storage,
+            "touch-cap",
+            "2026-05-02T09:00:00Z",
+            "clear the backlog",
+            "done",
+            serde_json::json!({
+                "todos": [
+                    {"content": "task one", "status": "pending"},
+                    {"content": "task two", "status": "pending"},
+                    {"content": "task three", "status": "pending"},
+                    {"content": "task four", "status": "pending"},
+                    {"content": "task five", "status": "pending"},
+                ],
+            }),
+        );
+
+        seed_episode(
+            &storage,
+            "touch-superseded-only",
+            "2026-05-03T09:00:00Z",
+            "touch the legacy helper",
+            "done",
+            &[],
+            &[],
+        );
+        seed_attribution(
+            &storage,
+            "touch-superseded-only",
+            "/repo/src/legacy.rs",
+            "legacy_fn",
+            "2026-05-03T09:00:00Z",
+        );
+        let witness_id2 = seed_witness(
+            &storage,
+            "proj",
+            "/repo/src/legacy.rs",
+            "legacy_fn",
+            "aoid-tn2",
+        );
+        seed_verdict_event(
+            &storage,
+            witness_id2,
+            "superseded_by",
+            Some("abcdef9876543210"),
+            "2026-05-03 10:00:00",
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        let (_, detail_html) = split_panes(&html);
+
+        let pane_for = |session_id: &str| {
+            let short = short_oid(session_id);
+            let start = detail_html
+                .find(&format!(r#"data-session="{short}""#))
+                .unwrap();
+            let end = start + detail_html[start..].find("</article>").unwrap();
+            detail_html[start..end].to_string()
+        };
+        let strip_of = |pane: &str| -> String {
+            let start = pane
+                .find(r#"class="touch-next-list""#)
+                .expect("touch-next strip must render when evidence exists");
+            let end = start + pane[start..].find("</ul>").unwrap();
+            pane[start..end].to_string()
+        };
+
+        let priority_pane = pane_for("touch-priority");
+        let priority_strip = strip_of(&priority_pane);
+        assert_eq!(
+            priority_strip.matches("<li>").count(),
+            3,
+            "the cap must hold at 3 lines even with 4 candidate sources: {priority_strip}"
+        );
+        let blocker_pos = priority_strip
+            .find("blocked: clear the migration lock first")
+            .expect("blocker must be the first source");
+        let todo_pos = priority_strip
+            .find("wire the retry queue")
+            .expect("open todo must be the second source");
+        let next_pos = priority_strip
+            .find("polish the release notes")
+            .expect("next_steps must be the third source");
+        assert!(
+            blocker_pos < todo_pos && todo_pos < next_pos,
+            "priority order must be blockers > open todos > next_steps: {priority_strip}"
+        );
+        assert!(
+            !priority_strip.contains("old_helper"),
+            "the superseded-receipt source must not render in the TOUCH NEXT strip once the \
+             cap is already full (it may still legitimately appear in the SINCE THEN panel \
+             below): {priority_strip}"
+        );
+
+        let cap_pane = pane_for("touch-cap");
+        let cap_strip = strip_of(&cap_pane);
+        assert_eq!(
+            cap_strip.matches("<li>").count(),
+            3,
+            "5 open todos and nothing else must still cap at 3: {cap_strip}"
+        );
+        let t1 = cap_strip.find("task one").unwrap();
+        let t2 = cap_strip.find("task two").unwrap();
+        let t3 = cap_strip.find("task three").unwrap();
+        assert!(
+            t1 < t2 && t2 < t3,
+            "the surviving 3 lines must preserve the episode's own todo order: {cap_strip}"
+        );
+        assert!(
+            !cap_strip.contains("task four") && !cap_strip.contains("task five"),
+            "todos beyond the cap must not render: {cap_strip}"
+        );
+
+        let superseded_only_pane = pane_for("touch-superseded-only");
+        assert!(
+            superseded_only_pane.contains("read ⌗abcdef98 before touching legacy_fn"),
+            "with no higher-priority evidence, tier 4 (superseded receipt) fills the strip: \
+             {superseded_only_pane}"
+        );
+    }
+
+    /// Finding 1: a session with no open todos, no blockers, no next_steps,
+    /// and no superseded symbols renders the explicit abstention sentence —
+    /// never an empty `<ul>`, never invented advice.
+    #[test]
+    fn touch_next_abstains_honestly() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode(
+            &storage,
+            "touch-abstain",
+            "2026-05-04T09:00:00Z",
+            "read the logs, nothing to change",
+            "done",
+            &[],
+            &[],
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        let (_, detail_html) = split_panes(&html);
+        let short = short_oid("touch-abstain");
+        let pane_start = detail_html
+            .find(&format!(r#"data-session="{short}""#))
+            .unwrap();
+        let pane_end = pane_start + detail_html[pane_start..].find("</article>").unwrap();
+        let pane = &detail_html[pane_start..pane_end];
+
+        assert!(
+            pane.contains(
+                "class=\"touch-next-empty\">nothing evidenced to touch — no open todos, \
+                 blockers, or adverse verdicts</p>"
+            ),
+            "no evidence anywhere must render the explicit abstention sentence, not silence: {pane}"
+        );
+        assert!(
+            !pane.contains("class=\"touch-next-list\""),
+            "no evidence must never render an empty touch-next list: {pane}"
+        );
+    }
+
+    /// Finding 3: the outcome badge always carries the ENDED prefix and the
+    /// session date as its title. The NOW badge is evidence-gated: adverse
+    /// verdicts (superseded + obsolete, NOT reinstated) render "NOW: N
+    /// superseded since"; a session with no attributed symbols at all
+    /// renders no NOW badge; and there is no verdict type anywhere that
+    /// earns "NOW: ok/fine/current".
+    #[test]
+    fn ended_and_now_badges_are_evidence_gated() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode(
+            &storage,
+            "ended-adverse",
+            "2026-05-04T09:00:00Z",
+            "chase the flaky release",
+            "failed at the gate",
+            &[],
+            &[],
+        );
+        for symbol in ["sym_super", "sym_obs", "sym_reinst"] {
+            seed_attribution(
+                &storage,
+                "ended-adverse",
+                "/repo/src/lib.rs",
+                symbol,
+                "2026-05-04T09:00:00Z",
+            );
+        }
+        let w_super = seed_witness(
+            &storage,
+            "proj",
+            "/repo/src/lib.rs",
+            "sym_super",
+            "aoid-eb1",
+        );
+        seed_verdict_event(
+            &storage,
+            w_super,
+            "superseded_by",
+            Some("aaaaaaaaaaaaaaaa"),
+            "2026-05-04 10:00:00",
+        );
+        let w_obs = seed_witness(&storage, "proj", "/repo/src/lib.rs", "sym_obs", "aoid-eb2");
+        seed_verdict_event(
+            &storage,
+            w_obs,
+            "anchor_obsolete",
+            None,
+            "2026-05-04 11:00:00",
+        );
+        let w_reinst = seed_witness(
+            &storage,
+            "proj",
+            "/repo/src/lib.rs",
+            "sym_reinst",
+            "aoid-eb3",
+        );
+        seed_verdict_event(
+            &storage,
+            w_reinst,
+            "anchor_reinstated",
+            None,
+            "2026-05-04 12:00:00",
+        );
+
+        seed_episode(
+            &storage,
+            "ended-no-symbols",
+            "2026-05-05T09:00:00Z",
+            "ship the calm feature",
+            "shipped to production",
+            &[],
+            &[],
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+
+        assert!(
+            !html.contains("NOW: ok")
+                && !html.contains("NOW: fine")
+                && !html.contains("NOW: current"),
+            "no verdict type proves current health — 'NOW: ok/fine/current' must never render"
+        );
+
+        let (_, detail_html) = split_panes(&html);
+
+        let adverse_short = short_oid("ended-adverse");
+        let adverse_start = detail_html
+            .find(&format!(r#"data-session="{adverse_short}""#))
+            .unwrap();
+        let adverse_end = adverse_start + detail_html[adverse_start..].find("</article>").unwrap();
+        let adverse_pane = &detail_html[adverse_start..adverse_end];
+        assert!(
+            adverse_pane.contains(
+                r#"class="outcome-badge failed" title="2026-05-04">ENDED: failed</span>"#
+            ),
+            "the outcome badge must carry the ENDED prefix and the session date as its title: \
+             {adverse_pane}"
+        );
+        assert!(
+            adverse_pane.contains(r#"class="now-badge superseded""#)
+                && adverse_pane.contains("NOW: 2 superseded since"),
+            "two adverse verdicts (superseded + obsolete, reinstated excluded) must render \
+             'NOW: 2 superseded since': {adverse_pane}"
+        );
+
+        let clean_short = short_oid("ended-no-symbols");
+        let clean_start = detail_html
+            .find(&format!(r#"data-session="{clean_short}""#))
+            .unwrap();
+        let clean_end = clean_start + detail_html[clean_start..].find("</article>").unwrap();
+        let clean_pane = &detail_html[clean_start..clean_end];
+        assert!(
+            clean_pane.contains(
+                r#"class="outcome-badge success" title="2026-05-05">ENDED: success</span>"#
+            ),
+            "a clean success session still gets the ENDED badge: {clean_pane}"
+        );
+        assert!(
+            !clean_pane.contains("class=\"now-badge"),
+            "a session with no attributed symbols at all must render no NOW badge: {clean_pane}"
+        );
+    }
+
+    /// Finding 4: ASK and DELIBERATION stage cards render closed by default
+    /// (no `open` attribute); STEER and OUTCOME stay open.
+    #[test]
+    fn ask_and_deliberation_render_closed() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode(
+            &storage,
+            "stage-open-test",
+            "2026-05-06T09:00:00Z",
+            "investigate the queue",
+            "done",
+            &["/repo/src/queue.rs"],
+            &[("finish the migration", "pending")],
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+
+        assert!(
+            html.contains(r#"data-stage="S_INPUT">"#),
+            "ASK must render with no `open` attribute: {html}"
+        );
+        assert!(!html.contains(r#"data-stage="S_INPUT" open>"#));
+        assert!(
+            html.contains(r#"data-stage="S_DELIB">"#),
+            "DELIBERATION must render with no `open` attribute"
+        );
+        assert!(!html.contains(r#"data-stage="S_DELIB" open>"#));
+        assert!(
+            html.contains(r#"data-stage="S_STEER" open>"#),
+            "STEER must render open by default"
+        );
+        assert!(
+            html.contains(r#"data-stage="S_OUT" open>"#),
+            "OUTCOME must render open by default"
+        );
+    }
+
+    /// Finding 4: open todos always render before completed ones, in the
+    /// episode's own order; a completed list of more than 5 folds behind a
+    /// nested closed `<details>` ("N completed"), but every completed todo
+    /// still lands in the DOM. A session with exactly 5 completed todos (at
+    /// the threshold, not over it) must NOT fold.
+    #[test]
+    fn completed_todos_fold_when_more_than_five() {
+        let storage = Storage::open_memory().unwrap();
+        seed_episode(
+            &storage,
+            "fold-over-five",
+            "2026-05-07T09:00:00Z",
+            "clean up the backlog",
+            "done",
+            &[],
+            &[
+                ("open task", "pending"),
+                ("t1", "completed"),
+                ("t2", "completed"),
+                ("t3", "completed"),
+                ("t4", "completed"),
+                ("t5", "completed"),
+                ("t6", "completed"),
+            ],
+        );
+        seed_episode(
+            &storage,
+            "fold-at-five",
+            "2026-05-08T09:00:00Z",
+            "clean up a smaller backlog",
+            "done",
+            &[],
+            &[
+                ("u1", "completed"),
+                ("u2", "completed"),
+                ("u3", "completed"),
+                ("u4", "completed"),
+                ("u5", "completed"),
+            ],
+        );
+
+        let html = render(
+            &storage,
+            crate::storage::recap_feeds::ConsumptionMode::AnnotateOnly,
+        );
+        let (_, detail_html) = split_panes(&html);
+
+        let over_short = short_oid("fold-over-five");
+        let over_start = detail_html
+            .find(&format!(r#"data-session="{over_short}""#))
+            .unwrap();
+        let over_end = over_start + detail_html[over_start..].find("</article>").unwrap();
+        let over_pane = &detail_html[over_start..over_end];
+        assert!(
+            over_pane.contains("class=\"completed-fold\""),
+            "6 completed todos must fold behind a nested closed <details>: {over_pane}"
+        );
+        assert!(
+            over_pane.contains("<summary>6 completed</summary>"),
+            "the fold summary must state the true completed count: {over_pane}"
+        );
+        for label in ["t1", "t2", "t3", "t4", "t5", "t6"] {
+            assert!(
+                over_pane.contains(label),
+                "every completed todo must still land in the DOM even when folded: {over_pane}"
+            );
+        }
+        let open_pos = over_pane
+            .find("open task")
+            .expect("the open todo must render");
+        let fold_pos = over_pane
+            .find("class=\"completed-fold\"")
+            .expect("the fold must render");
+        assert!(
+            open_pos < fold_pos,
+            "open todos must render before completed ones: {over_pane}"
+        );
+
+        let at_five_short = short_oid("fold-at-five");
+        let at_five_start = detail_html
+            .find(&format!(r#"data-session="{at_five_short}""#))
+            .unwrap();
+        let at_five_end = at_five_start + detail_html[at_five_start..].find("</article>").unwrap();
+        let at_five_pane = &detail_html[at_five_start..at_five_end];
+        assert!(
+            !at_five_pane.contains("class=\"completed-fold\""),
+            "exactly 5 completed todos (at the threshold, not over it) must not fold: {at_five_pane}"
+        );
+        assert_eq!(
+            at_five_pane.matches("class=\"task done\"").count(),
+            5,
+            "all 5 completed todos must render inline: {at_five_pane}"
         );
     }
 }

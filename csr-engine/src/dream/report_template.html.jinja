@@ -32,7 +32,14 @@
     --sky-bottom: #c8cae0;
     --ink: #1a1a2e;
     --slate: #4a4a6a;
-    --label: #8a8aaa;
+    /* Finding 5 (delta-review contrast check, journal v2): the original
+       #8a8aaa measured ~2.71:1 against the light glass-over-sky worst-case
+       composite (rgb(230,231,241)) — well under the 4.5:1 normal-text
+       floor, and this token now backs body prose that grew to a 0.875rem
+       minimum. #606080 measures ~4.90:1 against the same composite (see
+       the light dark-mode-emulated contrast note below) while staying the
+       same muted-purple-adjacent grey direction as before. */
+    --label: #606080;
     --purple: #6b5b95;
     --rose: #b5838d;
     --sage: #7c9473;
@@ -150,7 +157,7 @@
     -webkit-font-smoothing: antialiased;
   }
   .wrap {
-    max-width: 880px;
+    max-width: 1160px;
     margin: 0 auto;
     padding: 2.5rem 1.5rem 4rem;
   }

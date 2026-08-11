@@ -1061,8 +1061,12 @@ async function main() {
       );
 
       // ---- no-horizontal-scroll ------------------------------------------
+      // Canvas finding 5: page max-width moved 880px -> 1160px, so the
+      // 1160-wide viewport (where the mailbox first reaches its full grid
+      // width) is checked alongside the three pre-existing viewports.
       const viewports = [
         [1440, 900],
+        [1160, 900],
         [1024, 768],
         [390, 844],
       ];
@@ -1262,6 +1266,155 @@ async function main() {
         JSON.stringify(cycle),
       );
       await cdp.send("Emulation.setEmulatedMedia", { features: [] });
+
+      // ---- touch-next (Codex adversarial-review finding 1) -----------------
+      // "rich9" has one open todo naming `compute_delay` and a superseded
+      // symbol (`retry_backoff`, receipt `deadbeefcafe0123`) with room left
+      // in the 3-line cap — both must appear in the strip. "rich2" has no
+      // todos, no blockers/next_steps, and no attributed symbols at all
+      // (see since-then-absent above) — it must render the honest
+      // abstention sentence and no `<ul>` at all.
+      const touchNext = await evalJS(
+        cdp,
+        `(() => {
+          document.querySelector('.index-row[data-session="rich9"]').click();
+          const withEvidencePane = document.querySelector('.detail-pane[data-session="rich9"]');
+          const strip = withEvidencePane ? withEvidencePane.querySelector(".touch-next-list") : null;
+          document.querySelector('.index-row[data-session="rich2"]').click();
+          const abstainPane = document.querySelector('.detail-pane[data-session="rich2"]');
+          const abstainEl = abstainPane ? abstainPane.querySelector(".touch-next-empty") : null;
+          const abstainStrip = abstainPane ? abstainPane.querySelector(".touch-next-list") : null;
+          return {
+            stripText: strip ? strip.textContent : null,
+            abstainText: abstainEl ? abstainEl.textContent : null,
+            abstainHasStrip: !!abstainStrip,
+          };
+        })()`,
+      );
+      check(
+        "touch-next",
+        Boolean(touchNext.stripText) &&
+          /compute_delay/.test(touchNext.stripText) &&
+          /deadbeef/.test(touchNext.stripText) &&
+          Boolean(touchNext.abstainText) &&
+          /nothing evidenced to touch/.test(touchNext.abstainText) &&
+          !touchNext.abstainHasStrip,
+        JSON.stringify(touchNext),
+      );
+
+      // ---- ended-now-badges (Codex adversarial-review finding 3) -----------
+      // "rich9" has one superseded symbol (`retry_backoff`) and nothing
+      // adverse besides it -> "NOW: 1 superseded since"; the ENDED badge
+      // always carries the "ENDED:" prefix and a YYYY-MM-DD title. "rich2"
+      // has no attributed symbols at all -> ENDED renders, NOW does not.
+      const endedNow = await evalJS(
+        cdp,
+        `(() => {
+          document.querySelector('.index-row[data-session="rich9"]').click();
+          const withSymbolsPane = document.querySelector('.detail-pane[data-session="rich9"]');
+          const endedBadge = withSymbolsPane ? withSymbolsPane.querySelector(".outcome-badge") : null;
+          const nowBadge = withSymbolsPane ? withSymbolsPane.querySelector(".now-badge") : null;
+          document.querySelector('.index-row[data-session="rich2"]').click();
+          const noSymbolsPane = document.querySelector('.detail-pane[data-session="rich2"]');
+          const noSymbolsEnded = noSymbolsPane ? noSymbolsPane.querySelector(".outcome-badge") : null;
+          const noSymbolsNow = noSymbolsPane ? noSymbolsPane.querySelector(".now-badge") : null;
+          return {
+            endedText: endedBadge ? endedBadge.textContent : null,
+            endedTitle: endedBadge ? endedBadge.getAttribute("title") : null,
+            nowText: nowBadge ? nowBadge.textContent : null,
+            noSymbolsEndedText: noSymbolsEnded ? noSymbolsEnded.textContent : null,
+            hasNoSymbolsNow: !!noSymbolsNow,
+          };
+        })()`,
+      );
+      check(
+        "ended-now-badges",
+        Boolean(endedNow.endedText) &&
+          endedNow.endedText.startsWith("ENDED:") &&
+          /^\d{4}-\d{2}-\d{2}$/.test(endedNow.endedTitle || "") &&
+          Boolean(endedNow.nowText) &&
+          /NOW: 1 superseded since/.test(endedNow.nowText) &&
+          Boolean(endedNow.noSymbolsEndedText) &&
+          endedNow.noSymbolsEndedText.startsWith("ENDED:") &&
+          !endedNow.hasNoSymbolsNow &&
+          !/NOW: (ok|fine|current)/.test(endedNow.nowText || ""),
+        JSON.stringify(endedNow),
+      );
+
+      // ---- collapsed-defaults (Codex adversarial-review finding 4) ---------
+      // "rich1" carries all four stages (request, 2 investigated files, a
+      // todo, and an outcome) — ASK/DELIBERATION must render closed,
+      // STEER/OUTCOME open.
+      const collapsedDefaults = await evalJS(
+        cdp,
+        `(() => {
+          document.querySelector('.index-row[data-session="rich1"]').click();
+          const pane = document.querySelector('.detail-pane[data-session="rich1"]');
+          const ask = pane ? pane.querySelector('[data-stage="S_INPUT"]') : null;
+          const delib = pane ? pane.querySelector('[data-stage="S_DELIB"]') : null;
+          const steer = pane ? pane.querySelector('[data-stage="S_STEER"]') : null;
+          const outcome = pane ? pane.querySelector('[data-stage="S_OUT"]') : null;
+          return {
+            askOpen: ask ? ask.open : null,
+            delibOpen: delib ? delib.open : null,
+            steerOpen: steer ? steer.open : null,
+            outcomeOpen: outcome ? outcome.open : null,
+          };
+        })()`,
+      );
+      check(
+        "collapsed-defaults",
+        collapsedDefaults.askOpen === false &&
+          collapsedDefaults.delibOpen === false &&
+          collapsedDefaults.steerOpen === true &&
+          collapsedDefaults.outcomeOpen === true,
+        JSON.stringify(collapsedDefaults),
+      );
+
+      // ---- pane-scroll (Codex adversarial-review finding 2) ----------------
+      // Scroll the detail pane down first (simulating a reader mid-scroll),
+      // then activate a different, lower row and confirm the pane's scroll
+      // resets to the top and the new heading lands in view. The page's own
+      // `prefers-reduced-motion` read happens once at load time (before any
+      // CDP media emulation could take effect), so this waits out the
+      // smooth-scroll animation itself instead — a generous margin over
+      // Chromium's default scroll-behavior duration (~300-500ms).
+      const paneScrollSetup = await evalJS(
+        cdp,
+        `(() => {
+          const wrap = document.querySelector(".detail-pane-wrap");
+          const rows = Array.from(document.querySelectorAll(".index-row"));
+          if (!wrap || rows.length < 2) return { skipped: true };
+          wrap.scrollTop = wrap.scrollHeight;
+          const target = rows[rows.length - 1];
+          target.click();
+          return { skipped: false };
+        })()`,
+      );
+      let paneScroll = paneScrollSetup;
+      if (!paneScrollSetup.skipped) {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        paneScroll = await evalJS(
+          cdp,
+          `(() => {
+            const wrap = document.querySelector(".detail-pane-wrap");
+            const visiblePane = document.querySelector(".detail-pane:not([hidden])");
+            const heading = visiblePane ? visiblePane.querySelector(".sentence") : null;
+            const wrapRect = wrap.getBoundingClientRect();
+            const headingRect = heading ? heading.getBoundingClientRect() : null;
+            const headingInView =
+              !!headingRect &&
+              headingRect.top >= wrapRect.top - 1 &&
+              headingRect.top <= wrapRect.bottom;
+            return { after: wrap.scrollTop, headingInView };
+          })()`,
+        );
+      }
+      check(
+        "pane-scroll",
+        paneScroll.skipped || (paneScroll.after === 0 && paneScroll.headingInView),
+        JSON.stringify(paneScroll),
+      );
 
       cdp.close();
     } finally {
