@@ -239,8 +239,10 @@ fn is_code_path_token(word: &str) -> bool {
 /// any whitespace-delimited word that is structurally snake_case, multi-hump
 /// CamelCase, or a code-extension path. Plain prose words never qualify —
 /// this is the ban on the naive substring matching the probe measured
-/// ("cand", "Phase", "GOLD" matching real symbol names).
-fn extract_code_tokens(text: &str) -> Vec<String> {
+/// ("cand", "Phase", "GOLD" matching real symbol names). `pub(crate)` so
+/// `dream::threads` (Journal v3 Phase 1.5) can reuse the same code-grade
+/// token extractor for its receipt join.
+pub(crate) fn extract_code_tokens(text: &str) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
 
     let mut rest = text;
@@ -307,8 +309,10 @@ fn claim_contains_token(claim: &str, token: &str) -> bool {
 /// Last two non-empty `/`- or `\`-separated path segments, lowercased — the
 /// channel-B / anchor-tree file-identity comparator (a session's
 /// `files_modified` entry and a witness's absolute repo path rarely share a
-/// root, but the trailing `dir/file.ext` almost always matches).
-fn last_two_segments(path: &str) -> String {
+/// root, but the trailing `dir/file.ext` almost always matches). `pub(crate)`
+/// so `dream::threads` (Journal v3 Phase 1.5) can reuse the same file-identity
+/// comparator for its receipt join instead of duplicating it.
+pub(crate) fn last_two_segments(path: &str) -> String {
     let parts: Vec<&str> = path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
     let n = parts.len();
     let slice = if n >= 2 { &parts[n - 2..] } else { &parts[..] };
@@ -330,20 +334,26 @@ fn stable_id(project: &str, item: &str) -> String {
 
 // --- verdict evidence base ---------------------------------------------------
 
+/// `pub(crate)` (fields too) so `dream::threads` (Journal v3 Phase 1.5) can
+/// reuse [`verdict_rows_for_project`] for its own receipt-tier join instead
+/// of re-deriving the same `witness_verdicts JOIN witness_ledger` query.
 #[derive(Debug, Clone)]
-struct VerdictGroupRow {
-    file: String,
-    symbol: Option<String>,
-    verdict: String,
-    receipt_oid: Option<String>,
-    witnessed_at: String,
+pub(crate) struct VerdictGroupRow {
+    pub(crate) file: String,
+    pub(crate) symbol: Option<String>,
+    pub(crate) verdict: String,
+    pub(crate) receipt_oid: Option<String>,
+    pub(crate) witnessed_at: String,
 }
 
 /// `witness_verdicts v JOIN witness_ledger l ON l.id = v.witness_id`, grouped
 /// to `(file, symbol, verdict, receipt_oid, MAX(created_at))` for one
 /// project — the shared evidence base channels A and B (and the anchor tree)
 /// match against.
-fn verdict_rows_for_project(conn: &Connection, project: &str) -> Result<Vec<VerdictGroupRow>> {
+pub(crate) fn verdict_rows_for_project(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<VerdictGroupRow>> {
     let mut stmt = conn.prepare(
         "SELECT l.file, l.symbol, v.verdict, v.receipt_oid, MAX(v.created_at) AS witnessed_at
          FROM witness_verdicts v

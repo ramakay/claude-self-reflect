@@ -86,6 +86,7 @@
 //! nothing (see that module's idempotency doc).
 
 pub mod report;
+pub mod threads;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};

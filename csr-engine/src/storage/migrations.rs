@@ -963,6 +963,33 @@ pub fn run(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_code_nodes_last_conv ON code_nodes(last_conv_id);",
     )?;
 
+    // Journal v3 Phase 1.5 — night-pass thread extraction (`dream::threads`).
+    // `UNIQUE(episode_hash, thread)` is the convergence key: a re-run over an
+    // unchanged episode (same content-hash) either hits the same row again
+    // (a real thread, `INSERT OR IGNORE` no-ops) or the sentinel row
+    // (`thread = ''`, cached when a run produced zero acceptable threads) —
+    // either way, zero further LLM spend. `receipt_tier` is a CHECK, not a
+    // free-form column, so a bad write fails loudly instead of silently
+    // widening the tier vocabulary the renderer switches on.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dream_threads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_hash TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            thread TEXT NOT NULL,
+            evidence_quote TEXT NOT NULL,
+            files_json TEXT NOT NULL,
+            receipt_tier TEXT NOT NULL CHECK (receipt_tier IN ('verdict','witnessed','unverified')),
+            receipts_json TEXT NOT NULL,
+            model TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(episode_hash, thread)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dream_threads_session ON dream_threads(session_id);
+        CREATE INDEX IF NOT EXISTS idx_dream_threads_project ON dream_threads(project);",
+    )?;
+
     // D5 one-shot backfill: rewrite worktree-local paths already stored in
     // code_evolution.file_path / code_nodes.file to canonical main-repo form.
     // Gated by `meta` so it runs exactly once per database, never on every

@@ -40,6 +40,9 @@ pub struct StatusReport {
     /// v10 "dreaming" summary (`crate::dream`) — witness_verdicts totals and
     /// current demoted-symbol count. See `gather_dream`.
     pub dream: DreamStatus,
+    /// Journal v3 Phase 1.5 "dream threads" summary (`crate::dream::threads`)
+    /// — night-pass propose-verify extraction. See `gather_dream_threads`.
+    pub dream_threads: DreamThreadStatus,
 }
 
 /// Totals by verdict kind across every `witness_verdicts` event ever
@@ -99,6 +102,49 @@ impl Default for DreamStatus {
             ancestry_cached_conversations: 0,
             last_daemon_run: None,
             next_due: None,
+        }
+    }
+}
+
+/// Per-tier counts of stored (non-sentinel) `dream_threads` rows.
+#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+pub struct DreamThreadTierCounts {
+    pub verdict: i64,
+    pub witnessed: i64,
+    pub unverified: i64,
+}
+
+/// Journal v3 Phase 1.5 status block. `enabled` mirrors the
+/// `CSR_DREAM_THREADS` opt-in gate (default off — this is a NEW spend
+/// surface layered on the zero-LLM `dream` pass). `converged` is `None`
+/// until a pass has ever completed; `Some(true)` means the last pass added
+/// zero new rows (real threads or sentinels) — a frozen corpus costing zero
+/// further spend, per `dream::threads`'s convergence-by-construction design.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DreamThreadStatus {
+    pub enabled: bool,
+    pub total: i64,
+    pub by_tier: DreamThreadTierCounts,
+    pub last_run: Option<String>,
+    pub converged: Option<bool>,
+    /// The configured target model (`CSR_DREAM_THREAD_MODEL` override or the
+    /// default) — see `dream::threads::primary_thread_model`.
+    pub model: String,
+    /// Whether a non-Claude night actor is configured via
+    /// `CSR_NIGHT_ACTOR_CMD`.
+    pub actor_cmd_configured: bool,
+}
+
+impl Default for DreamThreadStatus {
+    fn default() -> Self {
+        Self {
+            enabled: crate::dream::threads::threads_enabled(),
+            total: 0,
+            by_tier: DreamThreadTierCounts::default(),
+            last_run: None,
+            converged: None,
+            model: crate::dream::threads::primary_thread_model(),
+            actor_cmd_configured: crate::dream::threads::night_actor_cmd_configured(),
         }
     }
 }
@@ -229,6 +275,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             healthy: false,
             aux: AuxStatus::default(),
             dream: DreamStatus::default(),
+            dream_threads: DreamThreadStatus::default(),
         });
     }
 
@@ -281,6 +328,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
 
     let aux = gather_aux(&storage, projects_dir);
     let dream = gather_dream(&storage);
+    let dream_threads = gather_dream_threads(&storage);
 
     Ok(StatusReport {
         mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
@@ -303,7 +351,57 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         healthy,
         aux,
         dream,
+        dream_threads,
     })
+}
+
+/// Assemble the Journal v3 Phase 1.5 "dream threads" status block. Fail-soft
+/// to defaults — must never fail on a pre-migration schema gap (mirrors
+/// `gather_dream`).
+fn gather_dream_threads(storage: &Storage) -> DreamThreadStatus {
+    let (total, verdict, witnessed, unverified) = storage
+        .with_connection(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN receipt_tier = 'verdict' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN receipt_tier = 'witnessed' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN receipt_tier = 'unverified' THEN 1 ELSE 0 END), 0)
+                 FROM dream_threads WHERE thread != ''",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(Into::into)
+        })
+        .unwrap_or((0, 0, 0, 0));
+
+    let last_run = storage
+        .get_meta(crate::dream::threads::META_LAST_RUN_AT)
+        .unwrap_or(None);
+    let converged = storage
+        .get_meta(crate::dream::threads::META_LAST_CONVERGED)
+        .unwrap_or(None)
+        .map(|v| v == "1");
+
+    DreamThreadStatus {
+        enabled: crate::dream::threads::threads_enabled(),
+        total,
+        by_tier: DreamThreadTierCounts {
+            verdict,
+            witnessed,
+            unverified,
+        },
+        last_run,
+        converged,
+        model: crate::dream::threads::primary_thread_model(),
+        actor_cmd_configured: crate::dream::threads::night_actor_cmd_configured(),
+    }
 }
 
 /// Assemble the v10 "dreaming" status block. Fail-soft to defaults —
@@ -806,6 +904,7 @@ mod tests {
             healthy: true,
             aux: AuxStatus::default(),
             dream: DreamStatus::default(),
+            dream_threads: DreamThreadStatus::default(),
         }
     }
 

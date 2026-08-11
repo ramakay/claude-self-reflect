@@ -370,7 +370,18 @@ async fn tick(
     let cancellation = crate::dream::DreamCancellation::new(shutdown.clone());
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        crate::dream::run_dream_with_cancellation(&eng, None, false, &cancellation)
+        let dream_result =
+            crate::dream::run_dream_with_cancellation(&eng, None, false, &cancellation);
+        // Journal v3 Phase 1.5 — night-pass thread extraction. Runs on the
+        // same cadence tick as the deterministic dream cycle, best-effort
+        // and independent of its outcome: `run_thread_extraction` is
+        // fail-open internally (its own kill switches, per-episode error
+        // handling) and must never mask or block the dream cycle's result.
+        // Skipped only when this tick is itself being cancelled.
+        if !cancellation.is_cancelled() {
+            crate::dream::threads::run_thread_extraction(eng.storage());
+        }
+        dream_result
     })
     .await;
     let outcome = match result {

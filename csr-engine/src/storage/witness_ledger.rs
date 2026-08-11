@@ -259,6 +259,28 @@ pub fn count_witnesses_for_file(conn: &Connection, project: &str, file: &str) ->
     .map_err(Into::into)
 }
 
+/// All witness rows recorded for `project`, across every file — the
+/// "witnessed, no verdict" evidence base `dream::threads` (Journal v3 Phase
+/// 1.5) joins against app-side via `dream_items::last_two_segments`, the same
+/// file-identity comparator `dream_items::verdict_rows_for_project` documents
+/// (a thread's evidence files and a witness's absolute repo path rarely share
+/// a root, but the trailing `dir/file.ext` almost always matches).
+pub(crate) fn all_witnesses_for_project(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<WitnessLedgerRow>> {
+    let sql = format!(
+        "SELECT {SELECT_COLUMNS} FROM witness_ledger
+         WHERE project = ?1
+         ORDER BY id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![project], row_from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Total ledger rows across every project/file/tier — a cheap
 /// "is there anything here at all" check the daemon's dream-cadence
 /// catch-up decision uses (`daemon::dream_cadence::should_catch_up`): a
