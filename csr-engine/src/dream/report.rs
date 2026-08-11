@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::storage::dream_items::{self, DreamEvidence, DreamItem, DreamItemGrade};
 use crate::storage::dream_report::{self, StoryArtifact, StorySession};
 use crate::storage::witness_verdicts::{self, DayDigest, SinceThenConclusion, VerdictKind};
 use crate::storage::Storage;
@@ -271,6 +272,66 @@ const STORY_HERO_META: &str = r#"    <p class="subtitle">What each session set o
       {% endif %}
       <span class="totals-inline">{{ data.totals.total }} witness events · {{ data.totals.obsolete }} obsolete · {{ data.totals.superseded }} superseded · {{ data.totals.reinstated }} reinstated</span>
     </div>"#;
+
+// --- Journal v3 "Dreams Gateway" Phase 2 — home + detail view markup -------
+//
+// Spliced into the document right after `<div class="wrap">`, ahead of the
+// existing hero/mailbox markup (which becomes `#session-log-view`, wrapped
+// unchanged below in `render_html`). Home is the new default view (no
+// `hidden` attribute); detail starts hidden, one `<article>` per qualifying
+// item, first unhidden as the same fallback-selection idiom the mailbox's
+// own detail panes already use (`{% if not loop.first %} hidden{% endif %}`)
+// — relevant only if JS never runs to correct it via the hash route.
+
+const DREAMS_HOME_TEMPLATE: &str = r#"<div id="dreams-home-view" class="csr-view">
+    <div class="hero-title-row"><h1>☾ Dreams</h1></div>
+    {% if data.dream_groups %}
+    <p class="dreams-sub">Incomplete work the night pass concluded on. {{ data.dream_total_label }} · {{ data.dream_project_label }}. <a class="session-log-link" href='#/log'>session log &rarr;</a></p>
+    {% for group in data.dream_groups %}
+    <div class="dream-project-group">
+      <p class="dream-project-eyebrow">&#9660; <b>{{ group.project }}</b> — {{ group.count_label }}</p>
+      <div class="dream-cards">
+        {% for card in group.cards %}
+        <a class="dream-card" href='#/item/{{ card.id }}' data-item="{{ card.id }}">
+          <span class="dream-grade {{ card.grade_slug }}">{{ card.grade_label }}</span>
+          <div class="dream-item-text">{{ card.item }}</div>
+          {% for line in card.dream_lines %}
+          <div class="dream-line">{{ line }}</div>
+          {% endfor %}
+          <div class="dream-meta">{{ card.meta }}</div>
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+    {% else %}
+    <p class="dreams-empty">No dreams matched open work — <a class="session-log-link" href='#/log'>session log &rarr;</a></p>
+    {% endif %}
+  </div>
+  "#;
+
+const DREAM_DETAIL_TEMPLATE: &str = r#"<div id="dream-detail-view" class="csr-view" hidden>
+    {% for item in data.dream_details %}
+    <article class="dream-detail-item" data-item="{{ item.id }}"{% if not loop.first %} hidden{% endif %}>
+      <a class="dream-back" href='#/'>&larr; dreams</a>
+      <div class="dream-detail-head touch-next">
+        <p class="touch-next-head">&#9733; TOUCH NEXT</p>
+        <p class="dream-detail-title">{{ item.title }}</p>
+      </div>
+      <p class="dream-detail-project">{{ item.project }} · {{ item.grade_label }}</p>
+      <div class="dream-evidence-list" aria-label="Evidence">
+        {% for line in item.evidence_lines %}
+        <p class="dream-evidence-row">{{ line }}</p>
+        {% endfor %}
+      </div>
+      <!-- Phase 3 mounts the AST change tree (solid witnessed / dotted candidate nodes) here. -->
+      <div class="dream-ast-slot" data-slot="ast-tree" aria-hidden="true"></div>
+      <!-- Phase 3 mounts the churn heat map (measured touch density) here. -->
+      <div class="dream-heat-slot" data-slot="heat-map" aria-hidden="true"></div>
+    </article>
+    {% endfor %}
+  </div>
+  "#;
 
 const MAILBOX_CSS: &str = r#"
   .mailbox {
@@ -537,7 +598,8 @@ const MAILBOX_CSS: &str = r#"
      long-form text a card carries — the fused ask->outcome sentence. Index
      rows stay in the landing-glass chrome register (dense, scannable, sans)
      — only the detail pane's headline gets the editorial treatment. */
-  header.hero h1, .detail-pane .sentence {
+  header.hero h1, .detail-pane .sentence,
+  .hero-title-row h1, .dream-detail-title {
     font-family: var(--serif);
   }
   .detail-pane .sentence {
@@ -690,6 +752,90 @@ const MAILBOX_CSS: &str = r#"
   @media (prefers-reduced-motion: reduce) {
     .index-row { animation: none; }
   }
+
+  /* ---- Journal v3 "Dreams Gateway" Phase 2 ----
+     The three top-level views share `.csr-view`; `[hidden]` (already
+     declared above) is the only visibility mechanism — no separate
+     display rule needed here. Card/tile chrome reuses the same
+     glass-tile register as `.stage-card`/`.artifact-tile` (backdrop-filter,
+     --radius-tile, hover lift) rather than inventing a new one. */
+  .dreams-home-head, #dreams-home-view > .hero-title-row { margin-bottom: 0.4rem; }
+  .dreams-sub, .dreams-empty {
+    color: var(--fg-muted); font-size: 0.9rem; margin: 0 0 2rem;
+  }
+  .dreams-empty {
+    background: var(--bg-card); border: 1px dashed var(--border);
+    border-radius: var(--radius-tile); padding: 1.4rem 1.2rem; text-align: center;
+  }
+  .session-log-link, .dream-back {
+    color: var(--fg-muted); text-decoration: underline dotted; font-size: 0.82rem;
+  }
+  .dream-back { display: inline-block; margin-bottom: 1rem; }
+  .dream-project-group { margin-bottom: 1.8rem; }
+  .dream-project-eyebrow {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--label); margin: 0 0 0.6rem;
+  }
+  .dream-project-eyebrow b { color: var(--purple); text-transform: none; letter-spacing: 0; }
+  .dream-cards {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 0.9rem;
+  }
+  .dream-card {
+    display: block; background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--radius-tile); padding: 1rem 1.1rem; color: inherit;
+    text-decoration: none; min-width: 0;
+    backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
+    transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1), border-color 180ms ease-out;
+  }
+  .dream-card:hover { transform: translateY(-2px); border-color: var(--highlight); }
+  .dream-grade {
+    float: right; margin-left: 0.5rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.6rem; font-weight: 700; letter-spacing: 0.05em;
+    border-radius: 999px; padding: 0.1rem 0.5rem; border: 1px solid var(--border);
+    color: var(--fg-muted); white-space: nowrap;
+  }
+  /* Item-grade is the visually stronger chip (plan: "item-grade visually
+     stronger") — filled purple vs. session-grade's plain outline. */
+  .dream-grade.item-grade {
+    color: var(--purple); background: var(--purple-bg); border-color: transparent;
+    font-weight: 800;
+  }
+  .dream-item-text {
+    font-size: 1rem; line-height: 1.4; font-weight: 600; color: var(--ink);
+    margin: 0 0 0.5rem; overflow-wrap: anywhere;
+  }
+  .dream-line {
+    font-size: 0.8rem; color: var(--fg-muted); line-height: 1.5;
+    margin: 0 0 0.25rem; overflow-wrap: anywhere;
+  }
+  .dream-line::before { content: "\263E "; color: var(--purple); }
+  .dream-meta {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.7rem; color: var(--fg-muted); margin-top: 0.5rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .dream-detail-item { max-width: 720px; }
+  .dream-detail-head.touch-next {
+    border: 1px solid var(--purple); border-radius: var(--radius-tile);
+    padding: 0.9rem 1.1rem; margin: 0 0 1.2rem; background: var(--purple-bg);
+  }
+  .dream-detail-title { font-size: 1.05rem; font-weight: 700; margin: 0; overflow-wrap: anywhere; }
+  .dream-detail-project {
+    color: var(--fg-muted); font-size: 0.8rem; margin: 0 0 1.1rem;
+  }
+  .dream-evidence-list { display: grid; gap: 0.4rem; margin-bottom: 1rem; }
+  .dream-evidence-row {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--radius-tile); padding: 0.5rem 0.7rem;
+    font-size: 0.82rem; color: var(--ink); margin: 0; overflow-wrap: anywhere;
+  }
+  /* Phase 3 mount points — no visual footprint until that phase fills
+     them; an empty visible tile would read as a broken panel, not a
+     future feature. */
+  .dream-ast-slot, .dream-heat-slot { display: none; }
 "#;
 
 const MAILBOX_SCRIPT: &str = r#"
@@ -858,6 +1004,59 @@ const MAILBOX_SCRIPT: &str = r#"
       themeToggle.textContent = GLYPH[state];
       themeToggle.setAttribute("aria-label", `Theme: ${state} (click to change)`);
     });
+  }
+
+  // --- Journal v3 "Dreams Gateway" routing (Phase 2) ---------------------
+  // Three top-level views (`#dreams-home-view` default, `#dream-detail-view`,
+  // `#session-log-view` wrapping the unchanged mailbox above) toggled purely
+  // by `location.hash`. Deliberately independent of the mailbox's own
+  // hashchange listener above: the two hash namespaces never collide
+  // (mailbox ids are bare session-short strings; this namespace always
+  // starts with "/"), so both listeners can run on every hashchange with no
+  // coordination — the mailbox one simply finds no matching pane for a
+  // "/"-prefixed hash and no-ops.
+  const dreamsHomeView = document.getElementById("dreams-home-view");
+  const dreamDetailView = document.getElementById("dream-detail-view");
+  const sessionLogView = document.getElementById("session-log-view");
+  if (dreamsHomeView && dreamDetailView && sessionLogView) {
+    const dreamDetailItems = Array.from(
+      dreamDetailView.querySelectorAll(".dream-detail-item")
+    );
+
+    const showDreamView = (name) => {
+      dreamsHomeView.hidden = name !== "home";
+      dreamDetailView.hidden = name !== "detail";
+      sessionLogView.hidden = name !== "log";
+    };
+
+    const selectDreamItem = (id) => {
+      let matched = false;
+      dreamDetailItems.forEach(item => {
+        const isMatch = item.dataset.item === id;
+        item.hidden = !isMatch;
+        if (isMatch) matched = true;
+      });
+      return matched;
+    };
+
+    const routeDreams = () => {
+      const hash = location.hash;
+      if (hash.indexOf('#/item/') === 0) {
+        const id = decodeURIComponent(hash.slice('#/item/'.length));
+        if (selectDreamItem(id)) {
+          showDreamView("detail");
+          return;
+        }
+      }
+      if (hash.indexOf('#/log') === 0) {
+        showDreamView("log");
+        return;
+      }
+      showDreamView("home");
+    };
+
+    routeDreams();
+    window.addEventListener("hashchange", routeDreams);
   }
 })();
 "#;
@@ -1169,6 +1368,233 @@ struct ThinGroupView {
     rows: Vec<ThinRowView>,
 }
 
+// --- Journal v3 "Dreams Gateway" Phase 2 — home + detail view models -------
+//
+// These project `dream_items::load_dream_items` (Phase 1) into the template
+// shapes for View 1 (spare card gallery, grouped by project) and View 2
+// (per-item detail shell). Nothing here re-derives evidence — every rendered
+// clause traces back to a `DreamEvidence` row already gated by the
+// two-channel qualification in `dream_items.rs`; a `DreamItem` with no
+// evidence never reaches these builders (the query itself only returns
+// qualified items).
+
+/// One dream card on the home gallery (plan View 1).
+#[derive(Debug, Clone, Serialize)]
+struct DreamCardView {
+    id: String,
+    /// Verb-first item text, verbatim from the open todo/blocker.
+    item: String,
+    /// `"item-grade"` | `"session-grade"` — CSS hook, distinct styling per
+    /// the plan (item-grade visually stronger).
+    grade_slug: &'static str,
+    grade_label: &'static str,
+    /// Up to 2 lines: `"☾ <symbol> <verdict phrase> in <file> ⌗oid"`,
+    /// session-grade prefixed with the ground-shifted framing. Never
+    /// includes proposal evidence (no file/symbol to report against).
+    dream_lines: Vec<String>,
+    /// `"left open <date> · witnessed <date>[ · +N more]"`.
+    meta: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DreamProjectGroupView {
+    project: String,
+    /// `"1 dream"` / `"N dreams"` — the eyebrow header's count clause.
+    count_label: String,
+    cards: Vec<DreamCardView>,
+}
+
+/// View 2 shell (Phase 2 scope): TOUCH NEXT-style header + the full,
+/// receipt-bearing evidence list. Phase 3 adds the AST tree and heat map
+/// into the marked slots this view also renders.
+#[derive(Debug, Clone, Serialize)]
+struct DreamDetailView {
+    id: String,
+    title: String,
+    project: String,
+    grade_label: &'static str,
+    /// Every evidence row (verdict rows AND proposals), each rendered with
+    /// its own receipt clause — `"no receipt"` when none is stored, never a
+    /// silently dropped receipt.
+    evidence_lines: Vec<String>,
+}
+
+/// The plan's verdict-phrasing map — the only sanctioned wording for a
+/// `witness_verdicts.verdict` value or the synthetic `"proposal"` kind on a
+/// dream card. Deliberately excludes any "still live"/"re-verified" wording
+/// (F1 precedent carried into v3): a witness/verdict row proves a past
+/// state, never a current one.
+fn dream_verdict_phrase(verdict: &str) -> &'static str {
+    match verdict {
+        "superseded_by" => "superseded",
+        "anchor_obsolete" => "anchor obsolete",
+        "anchor_reinstated" => "reinstated",
+        "proposal" => "proposal",
+        _ => "noted",
+    }
+}
+
+const DREAM_SESSION_GRADE_PREFIX: &str = "ground shifted under this session — ";
+
+/// Session-grade cards get the ground-shifted framing prefix (the evidence
+/// is the origin session's touched files overlapping witnessed ground, not
+/// the item's own symbol); item-grade cards attribute directly.
+fn dream_grade_prefix(grade: DreamItemGrade) -> &'static str {
+    match grade {
+        DreamItemGrade::ItemGrade => "",
+        DreamItemGrade::SessionGrade => DREAM_SESSION_GRADE_PREFIX,
+    }
+}
+
+fn dream_grade_slug_label(grade: DreamItemGrade) -> (&'static str, &'static str) {
+    match grade {
+        DreamItemGrade::ItemGrade => ("item-grade", "item-grade"),
+        DreamItemGrade::SessionGrade => ("session-grade", "session-grade"),
+    }
+}
+
+/// One evidence row rendered as `"<prefix><subject> in <file><receipt>"` —
+/// `subject` is `"<symbol> <verdict phrase>"` when a symbol is attached, or
+/// the bare verdict phrase for a whole-file witness. The receipt clause is
+/// `" ⌗<oid8>"` when a receipt is stored, otherwise omitted entirely (never
+/// a fabricated placeholder).
+fn dream_evidence_subject_line(evidence: &DreamEvidence, prefix: &str) -> String {
+    let verdict_phrase = dream_verdict_phrase(&evidence.verdict);
+    let file = basename(&evidence.file);
+    let subject = match &evidence.symbol {
+        Some(symbol) => format!("{symbol} {verdict_phrase}"),
+        None => verdict_phrase.to_string(),
+    };
+    let receipt = match &evidence.receipt_oid {
+        Some(oid) => format!(" ⌗{}", short_oid(oid)),
+        None => String::new(),
+    };
+    format!("{prefix}{subject} in {file}{receipt}")
+}
+
+/// Up to 2 card dream-lines from the item's non-proposal evidence (already
+/// newest-witnessed-first from `dream_items::dedup_and_cap_evidence`).
+/// Proposal rows never appear here — they carry no file/symbol to attribute
+/// a change against.
+fn dream_card_lines(evidence: &[DreamEvidence], grade: DreamItemGrade) -> Vec<String> {
+    let prefix = dream_grade_prefix(grade);
+    evidence
+        .iter()
+        .filter(|e| e.verdict != "proposal")
+        .take(2)
+        .map(|e| dream_evidence_subject_line(e, prefix))
+        .collect()
+}
+
+/// `"left open <date> · witnessed <date>[ · +N more]"` — `+N more` counts
+/// the non-proposal evidence rows beyond the 2 shown as dream-lines, so the
+/// number is always traceable to stored evidence, never an estimate.
+fn dream_card_meta(item: &DreamItem) -> String {
+    let mut meta = format!("left open {}", iso_date(&item.origin_ts));
+    if let Some(latest) = item.evidence.first() {
+        meta.push_str(" · witnessed ");
+        meta.push_str(&iso_date(&latest.witnessed_at));
+    }
+    let non_proposal = item
+        .evidence
+        .iter()
+        .filter(|e| e.verdict != "proposal")
+        .count();
+    if non_proposal > 2 {
+        meta.push_str(&format!(" · +{} more", non_proposal - 2));
+    }
+    meta
+}
+
+fn build_dream_card(item: &DreamItem) -> DreamCardView {
+    let (grade_slug, grade_label) = dream_grade_slug_label(item.grade);
+    DreamCardView {
+        id: item.id.clone(),
+        item: item.item.clone(),
+        grade_slug,
+        grade_label,
+        dream_lines: dream_card_lines(&item.evidence, item.grade),
+        meta: dream_card_meta(item),
+    }
+}
+
+/// Every evidence row for the detail pane, each carrying its own witnessed
+/// date; proposal rows included (unlike the card's capped dream-lines). A
+/// non-proposal row with no stored receipt says so explicitly (`"no
+/// receipt"`) rather than silently omitting the clause — the card's compact
+/// dream-lines can afford the omission, but the detail pane's whole point is
+/// to be the honest, complete evidence list.
+fn dream_detail_evidence_lines(evidence: &[DreamEvidence], grade: DreamItemGrade) -> Vec<String> {
+    let prefix = dream_grade_prefix(grade);
+    evidence
+        .iter()
+        .map(|e| {
+            if e.verdict == "proposal" {
+                format!(
+                    "{prefix}proposal recorded · witnessed {}",
+                    iso_date(&e.witnessed_at)
+                )
+            } else {
+                let subject = dream_evidence_subject_line(e, prefix);
+                let receipt_note = if e.receipt_oid.is_none() {
+                    ", no receipt"
+                } else {
+                    ""
+                };
+                format!(
+                    "{subject}{receipt_note} · witnessed {}",
+                    iso_date(&e.witnessed_at)
+                )
+            }
+        })
+        .collect()
+}
+
+fn build_dream_detail(item: &DreamItem) -> DreamDetailView {
+    let (_, grade_label) = dream_grade_slug_label(item.grade);
+    DreamDetailView {
+        id: item.id.clone(),
+        title: item.item.clone(),
+        project: item.project.clone(),
+        grade_label,
+        evidence_lines: dream_detail_evidence_lines(&item.evidence, item.grade),
+    }
+}
+
+/// Project `load_dream_items`'s flat, globally-ranked list into the home
+/// gallery's project groups (first-seen project order — a stable function of
+/// the already-deterministic item order, so re-renders on a frozen corpus
+/// stay byte-identical) plus the flat detail-view list (same order as
+/// `items`, one `<article>` per qualifying item).
+fn build_dream_home(
+    items: &[DreamItem],
+) -> (
+    Vec<DreamProjectGroupView>,
+    usize,
+    usize,
+    Vec<DreamDetailView>,
+) {
+    let mut groups: Vec<DreamProjectGroupView> = Vec::new();
+    for item in items {
+        let card = build_dream_card(item);
+        match groups.iter_mut().find(|g| g.project == item.project) {
+            Some(group) => group.cards.push(card),
+            None => groups.push(DreamProjectGroupView {
+                project: item.project.clone(),
+                count_label: String::new(),
+                cards: vec![card],
+            }),
+        }
+    }
+    for group in &mut groups {
+        group.count_label = pluralize(group.cards.len(), "dream");
+    }
+    let project_count = groups.len();
+    let total = items.len();
+    let details = items.iter().map(build_dream_detail).collect();
+    (groups, total, project_count, details)
+}
+
 /// Classify a free-text episode outcome into a badge. Conservative: only
 /// unambiguous wording gets a colored verdict; anything else shows as a
 /// neutral "noted" chip with the leading words.
@@ -1233,6 +1659,15 @@ struct DreamReportData {
     omitted: usize,
     older_omitted: usize,
     is_empty: bool,
+    /// Journal v3 Phase 2 — dreams home gallery, grouped by project.
+    dream_groups: Vec<DreamProjectGroupView>,
+    /// `"N item"`/`"N items"` — the home sub-header's count clause.
+    dream_total_label: String,
+    /// `"N project"`/`"N projects"` — the home sub-header's group clause.
+    dream_project_label: String,
+    /// One entry per qualifying item, same order as `dream_groups`
+    /// flattens to — the detail view's stacked `<article>`s.
+    dream_details: Vec<DreamDetailView>,
 }
 
 /// First 8 hex chars of a commit oid.
@@ -2405,6 +2840,10 @@ struct RawReportData {
     /// `rich_cards`, keyed by `StoryCardView::date` — `finalize_report_data`
     /// attaches the matching digest when it opens a new `DayGroupView`.
     day_digests: std::collections::BTreeMap<String, DayDigest>,
+    /// Journal v3 Phase 2: dream-gated open items — see
+    /// `storage::dream_items::load_dream_items`. Fail-open: a storage error
+    /// here becomes an empty vec, never a report-generation failure.
+    dream_items: Vec<DreamItem>,
 }
 
 /// Kill switch (plan §3.3a/§6 Phase 2): when set, the report-time backfill
@@ -2637,6 +3076,14 @@ fn gather_report_data_with(
     }
 
     let total = obsolete + superseded + reinstated;
+
+    // Journal v3 Phase 2: fail-open per plan §2 ("error → empty vec") — a
+    // storage error on this read-only feed degrades the dreams home to its
+    // honest empty state, it never fails report generation.
+    let dream_items = storage
+        .with_connection(dream_items::load_dream_items)
+        .unwrap_or_default();
+
     Ok(RawReportData {
         has_run: last_run.is_some(),
         last_run_head_short,
@@ -2652,6 +3099,7 @@ fn gather_report_data_with(
         omitted,
         older_omitted,
         day_digests,
+        dream_items,
     })
 }
 
@@ -2719,6 +3167,9 @@ fn finalize_report_data(raw: RawReportData) -> DreamReportData {
     // into view instead of hiding them).
     let is_empty = day_groups.is_empty() && thin_groups.is_empty();
 
+    let (dream_groups, dream_total, dream_project_count, dream_details) =
+        build_dream_home(&raw.dream_items);
+
     DreamReportData {
         has_run: raw.has_run,
         last_run_head_short: raw.last_run_head_short,
@@ -2731,6 +3182,10 @@ fn finalize_report_data(raw: RawReportData) -> DreamReportData {
         omitted: raw.omitted,
         older_omitted: raw.older_omitted,
         is_empty,
+        dream_groups,
+        dream_total_label: pluralize(dream_total, "item"),
+        dream_project_label: pluralize(dream_project_count, "project"),
+        dream_details,
     }
 }
 
@@ -2788,6 +3243,25 @@ fn render_html(data: &DreamReportData) -> Result<String> {
         "</style>",
         &format!("{MAILBOX_CSS}</style>"),
         "</style> (MAILBOX_CSS insertion point)",
+    );
+    // Journal v3 Phase 2: the dreams home + detail views become the default
+    // landing content; the existing hero+mailbox markup is demoted into
+    // `#session-log-view` (hidden by default), reachable via the "session
+    // log" link and unchanged otherwise — same certified v2 surface, just a
+    // new hidden parent around it.
+    let template = replace_exactly_once(
+        &template,
+        "<div class=\"wrap\">\n\n  <header class=\"hero\">",
+        &format!(
+            "<div class=\"wrap\">\n\n  {DREAMS_HOME_TEMPLATE}\n  {DREAM_DETAIL_TEMPLATE}\n  <div id=\"session-log-view\" class=\"csr-view\" hidden>\n  <header class=\"hero\">"
+        ),
+        "<div class=\"wrap\"> (dreams-home insertion point)",
+    );
+    let template = replace_exactly_once(
+        &template,
+        "  {% endif %}\n\n  <footer>",
+        "  {% endif %}\n\n  </div>\n\n  <footer>",
+        "{% endif %} (session-log-view close point)",
     );
     if template.contains(LEGACY_HERO_META)
         || template.contains(LEGACY_EMPTY_TEMPLATE)

@@ -26,6 +26,7 @@ import {
   mkdtempSync,
   mkdirSync,
   writeFileSync,
+  readFileSync,
   rmSync,
   existsSync,
   openSync,
@@ -400,6 +401,101 @@ function seedFixtureAndRender(workDir) {
   ]);
 
   return { reportPath, episodes, thinEntries, rich9Day };
+}
+
+// --- Journal v3 "Dreams Gateway" Phase 2 fixture -------------------------
+//
+// A dedicated, small DB — kept separate from `buildFixtureSql`'s mailbox
+// fixture (which, as seeded today, qualifies zero dream items) so the new
+// gateway checks below have real evidence-backed cards to click through,
+// without perturbing a single existing mailbox assertion. Two projects, one
+// item each: "dream-alpha" is item-grade (the todo names the witnessed
+// symbol verbatim in a backtick span), "dream-beta" is session-grade (the
+// todo names nothing code-shaped, but the episode's `files_modified`
+// overlaps a witnessed file) — exercising both grade channels and both
+// card/detail render paths in one render.
+function buildDreamFixtureSql() {
+  const alphaLeftOpen = isoDaysAgo(1, 10, 0);
+  const betaLeftOpen = isoDaysAgo(2, 9, 0);
+  const witnessedAt = isoDaysAgo(0, 3, 0);
+
+  const alphaContent = JSON.stringify({
+    schema: "v2",
+    session_id: "dream-alpha-1",
+    project: "dream-alpha",
+    timestamp: alphaLeftOpen,
+    todos: [{ content: "fix `parse_widget` before ship", status: "pending" }],
+  });
+  const betaContent = JSON.stringify({
+    schema: "v2",
+    session_id: "dream-beta-1",
+    project: "dream-beta",
+    timestamp: betaLeftOpen,
+    todos: [{ content: "investigate the onboarding drop-off", status: "pending" }],
+    files_modified: ["/repo/src/beta_flow.rs"],
+  });
+
+  const lines = [
+    `INSERT INTO reflections (id, content, tags, timestamp) VALUES (${sqlString(
+      "episode-dream-alpha-1",
+    )}, ${sqlString(alphaContent)}, ${sqlString(JSON.stringify(["session_episode", "schema_v2"]))}, ${sqlString(alphaLeftOpen)});`,
+    `INSERT INTO reflections (id, content, tags, timestamp) VALUES (${sqlString(
+      "episode-dream-beta-1",
+    )}, ${sqlString(betaContent)}, ${sqlString(JSON.stringify(["session_episode", "schema_v2"]))}, ${sqlString(betaLeftOpen)});`,
+    `INSERT INTO witness_ledger
+        (project, file, symbol, span_start, span_end, stamp, tier, at_oid, source_kind, source_id)
+     VALUES
+      ('dream-alpha', '/repo/src/widget.rs', 'parse_widget', 1, 3, 'b3:dream-alpha-1', 'committed', 'oldoid-alpha', 'backfill', 'oldoid-alpha'),
+      ('dream-beta', '/repo/src/beta_flow.rs', 'handle_flow', 1, 3, 'b3:dream-beta-1', 'committed', 'oldoid-beta', 'backfill', 'oldoid-beta');`,
+    `INSERT INTO witness_verdicts
+        (witness_id, verdict, successor_witness_id, receipt_oid, observed_head_oid, created_at)
+     VALUES
+      ((SELECT id FROM witness_ledger WHERE symbol = 'parse_widget'), 'superseded_by', NULL, 'deadbeef01', 'headoid-a', ${sqlString(
+        witnessedAt,
+      )}),
+      ((SELECT id FROM witness_ledger WHERE symbol = 'handle_flow'), 'anchor_obsolete', NULL, 'cafebabe02', 'headoid-b', ${sqlString(
+        witnessedAt,
+      )});`,
+  ];
+  return { sql: lines.join("\n") + "\n" };
+}
+
+function seedDreamFixtureAndRender(workDir) {
+  const dbPath = path.join(workDir, "dream-fixture.db");
+  const projectsDir = path.join(workDir, "dream-projects");
+  const reportPath = path.join(workDir, "dream-fixture.html");
+
+  runBinary([
+    "--db-path",
+    dbPath,
+    "--projects-dir",
+    projectsDir,
+    "dream",
+    "--report",
+    "--no-open",
+    "--out",
+    path.join(workDir, "dream-bootstrap.html"),
+  ]);
+
+  const { sql } = buildDreamFixtureSql();
+  const seed = spawnSync("sqlite3", [dbPath], { input: sql, encoding: "utf8" });
+  if (seed.status !== 0) {
+    throw new Error(`sqlite3 dream-fixture seeding failed: ${seed.stderr}`);
+  }
+
+  runBinary([
+    "--db-path",
+    dbPath,
+    "--projects-dir",
+    projectsDir,
+    "dream",
+    "--report",
+    "--no-open",
+    "--out",
+    reportPath,
+  ]);
+
+  return { reportPath };
 }
 
 // --- minimal CDP client -------------------------------------------------
@@ -1414,6 +1510,216 @@ async function main() {
         "pane-scroll",
         paneScroll.skipped || (paneScroll.after === 0 && paneScroll.headingInView),
         JSON.stringify(paneScroll),
+      );
+
+      // ==== Journal v3 "Dreams Gateway" Phase 2 =========================
+      // Reuses this same page/tab (no second Chrome instance) against a
+      // dedicated dream fixture — see `buildDreamFixtureSql`'s doc comment
+      // for why it's separate from the mailbox fixture above.
+      const dreamFixture = seedDreamFixtureAndRender(workDir);
+      const dreamFileUrl = "file://" + dreamFixture.reportPath;
+      const dreamNavigated = cdp.once("Page.loadEventFired");
+      await cdp.send("Page.navigate", { url: dreamFileUrl });
+      await dreamNavigated;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+
+      // ---- (a) dreams home is the default view; every card carries a
+      // receipt ---------------------------------------------------------
+      const dreamHome = await evalJS(
+        cdp,
+        `(() => {
+          const home = document.getElementById("dreams-home-view");
+          const detail = document.getElementById("dream-detail-view");
+          const log = document.getElementById("session-log-view");
+          const cards = Array.from(document.querySelectorAll(".dream-card"));
+          return {
+            homeVisible: !!home && !home.hidden,
+            detailHidden: !!detail && !!detail.hidden,
+            logHidden: !!log && !!log.hidden,
+            cardCount: cards.length,
+            allHaveReceipt: cards.length > 0 && cards.every(c => c.textContent.includes("⌗")),
+          };
+        })()`,
+      );
+      check(
+        "dreams-home-default-with-receipts",
+        dreamHome.homeVisible &&
+          dreamHome.detailHidden &&
+          dreamHome.logHidden &&
+          dreamHome.cardCount === 2 &&
+          dreamHome.allHaveReceipt,
+        JSON.stringify(dreamHome),
+      );
+
+      // ---- (b) project grouping headers present -------------------------
+      const dreamGroups = await evalJS(
+        cdp,
+        `Array.from(document.querySelectorAll(".dream-project-eyebrow")).map(e => e.textContent.trim())`,
+      );
+      check(
+        "dreams-project-grouping",
+        dreamGroups.length === 2 &&
+          dreamGroups.some((t) => t.includes("dream-alpha")) &&
+          dreamGroups.some((t) => t.includes("dream-beta")),
+        JSON.stringify(dreamGroups),
+      );
+
+      // ---- (c) grade chips present; legacy mailbox unreachable as
+      // default ------------------------------------------------------------
+      const dreamGrades = await evalJS(
+        cdp,
+        `Array.from(document.querySelectorAll(".dream-grade")).map(c => c.className)`,
+      );
+      check(
+        "dreams-grade-chips",
+        dreamGrades.some((c) => c.includes("item-grade")) &&
+          dreamGrades.some((c) => c.includes("session-grade")),
+        JSON.stringify(dreamGrades),
+      );
+      check("dreams-mailbox-not-default", dreamHome.logHidden === true, JSON.stringify(dreamHome));
+
+      // ---- (d) clicking a card shows the detail shell; back returns
+      // home --------------------------------------------------------------
+      // Clicking an `<a href="#...">` updates `location.hash` synchronously,
+      // but the browser dispatches `hashchange` (which the routing script
+      // listens on) as a separate task — a same-tick read right after
+      // `.click()` would race that dispatch and see stale state, so the
+      // click and the assertion are two `evalJS` calls with a wait between.
+      const dreamCardId = await evalJS(
+        cdp,
+        `document.querySelector(".dream-card").dataset.item`,
+      );
+      await evalJS(cdp, `document.querySelector(".dream-card").click()`);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const dreamClick = await evalJS(
+        cdp,
+        `(() => {
+          const id = "${dreamCardId}";
+          const detail = document.getElementById("dream-detail-view");
+          const home = document.getElementById("dreams-home-view");
+          const article = document.querySelector('.dream-detail-item[data-item="' + id + '"]');
+          const back = article ? article.querySelector(".dream-back") : null;
+          return {
+            id,
+            detailVisible: !!detail && !detail.hidden,
+            homeHiddenAfterClick: !!home && !!home.hidden,
+            articleVisible: !!article && !article.hidden,
+            hasBackArrow: !!back,
+            backText: back ? back.textContent : null,
+          };
+        })()`,
+      );
+      check(
+        "dreams-card-click-detail",
+        dreamClick.detailVisible &&
+          dreamClick.homeHiddenAfterClick &&
+          dreamClick.articleVisible &&
+          dreamClick.hasBackArrow &&
+          !!dreamClick.backText &&
+          dreamClick.backText.includes("dreams"),
+        JSON.stringify(dreamClick),
+      );
+
+      await evalJS(
+        cdp,
+        `document.querySelector('.dream-detail-item[data-item="${dreamClick.id}"] .dream-back').click()`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const dreamBack = await evalJS(
+        cdp,
+        `(() => {
+          const home = document.getElementById("dreams-home-view");
+          const detail = document.getElementById("dream-detail-view");
+          return { homeVisible: !!home && !home.hidden, detailHidden: !!detail && !!detail.hidden };
+        })()`,
+      );
+      check(
+        "dreams-back-returns-home",
+        dreamBack.homeVisible && dreamBack.detailHidden,
+        JSON.stringify(dreamBack),
+      );
+
+      // ---- (e) hash deep-link lands on detail ----------------------------
+      // Navigating from the SAME document to a URL differing only by
+      // fragment is a same-document navigation — Chrome never re-fires
+      // `Page.loadEventFired` for it, since no new document loads. Routing
+      // through `about:blank` first forces a genuine cross-document
+      // navigation into the hash URL, matching what actually happens when a
+      // bookmark/deep-link opens the report fresh.
+      const blankNavigated = cdp.once("Page.loadEventFired");
+      await cdp.send("Page.navigate", { url: "about:blank" });
+      await blankNavigated;
+      const deepLinkNavigated = cdp.once("Page.loadEventFired");
+      await cdp.send("Page.navigate", { url: `${dreamFileUrl}#/item/${dreamClick.id}` });
+      await deepLinkNavigated;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const dreamDeepLink = await evalJS(
+        cdp,
+        `(() => {
+          const detail = document.getElementById("dream-detail-view");
+          const home = document.getElementById("dreams-home-view");
+          const article = document.querySelector('.dream-detail-item[data-item="${dreamClick.id}"]');
+          return {
+            detailVisible: !!detail && !detail.hidden,
+            homeHidden: !!home && !!home.hidden,
+            articleVisible: !!article && !article.hidden,
+          };
+        })()`,
+      );
+      check(
+        "dreams-hash-deep-link",
+        dreamDeepLink.detailVisible && dreamDeepLink.homeHidden && dreamDeepLink.articleVisible,
+        JSON.stringify(dreamDeepLink),
+      );
+
+      // ---- (f) empty-fixture DB renders the honest empty state, zero
+      // cards — reuses the pre-seed bootstrap render `seedFixtureAndRender`
+      // already produced (a genuinely empty, freshly-migrated DB). --------
+      const bootstrapUrl = "file://" + path.join(workDir, "bootstrap.html");
+      const bootstrapNavigated = cdp.once("Page.loadEventFired");
+      await cdp.send("Page.navigate", { url: bootstrapUrl });
+      await bootstrapNavigated;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const dreamEmpty = await evalJS(
+        cdp,
+        `(() => {
+          const empty = document.querySelector(".dreams-empty");
+          const cards = document.querySelectorAll(".dream-card");
+          return {
+            hasEmptyState: !!empty,
+            emptyText: empty ? empty.textContent.trim() : null,
+            cardCount: cards.length,
+          };
+        })()`,
+      );
+      check(
+        "dreams-empty-state",
+        dreamEmpty.hasEmptyState &&
+          dreamEmpty.cardCount === 0 &&
+          !!dreamEmpty.emptyText &&
+          dreamEmpty.emptyText.includes("No dreams matched open work"),
+        JSON.stringify(dreamEmpty),
+      );
+
+      // ---- (g) no-JS DOM completeness: raw HTML source (never executed)
+      // must carry every item's markup regardless of the `hidden`
+      // attribute JS toggles at runtime. ------------------------------------
+      const dreamSource = readFileSync(dreamFixture.reportPath, "utf8");
+      const dreamNoJs = {
+        hasHome: dreamSource.includes('id="dreams-home-view"'),
+        hasDetail: dreamSource.includes('id="dream-detail-view"'),
+        hasLog: dreamSource.includes('id="session-log-view"'),
+        articleCount: (dreamSource.match(/class="dream-detail-item"/g) || []).length,
+        evidenceRowCount: (dreamSource.match(/class="dream-evidence-row"/g) || []).length,
+      };
+      check(
+        "dreams-no-js-dom-completeness",
+        dreamNoJs.hasHome &&
+          dreamNoJs.hasDetail &&
+          dreamNoJs.hasLog &&
+          dreamNoJs.articleCount === 2 &&
+          dreamNoJs.evidenceRowCount >= 2,
+        JSON.stringify(dreamNoJs),
       );
 
       cdp.close();
