@@ -427,6 +427,19 @@ impl Daemon {
         };
         tracing::info!("release-ancestry refresh loop started (TAD v2)");
 
+        // Journal v4 dream server (locked decision 7: daemon-hosted, always
+        // on, stable loopback port, bookmarkable). It binds 127.0.0.1 only
+        // and serves read-only routes. `spawn_for_daemon` returns `None`
+        // when `CSR_NO_JOURNAL_SERVER=1`, and the task it does spawn logs
+        // and returns on any bind/serve failure rather than propagating —
+        // a busy port must never take the daemon down. It shares the same
+        // `Arc<AtomicBool>` every other loop uses, so shutdown is one flag.
+        let journal_handle =
+            crate::journal::spawn_for_daemon(self.storage.clone(), shutdown.clone());
+        if journal_handle.is_some() {
+            tracing::info!("journal server started (v10.1 journal v4)");
+        }
+
         // Wait for Ctrl+C
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down daemon gracefully");
@@ -465,6 +478,12 @@ impl Daemon {
         // immediately when shutdown arrives while it waits for the permit;
         // if publication already began, await that bounded cycle fully.
         let _ = ancestry_handle.await;
+        // The journal server stops on the same flag (its graceful-shutdown
+        // future polls it). Bounded by the shared timeout: an in-flight
+        // request only reads, so a detached one cannot corrupt anything.
+        if let Some(h) = journal_handle {
+            let _ = tokio::time::timeout(timeout, h).await;
+        }
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
 
         // Flush HNSW index to disk before exit

@@ -11,6 +11,7 @@ pub mod governor;
 pub mod hooks;
 pub mod import;
 pub mod injection;
+pub mod journal;
 pub mod ledger;
 pub mod mcp;
 pub mod narrative;

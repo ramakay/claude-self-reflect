@@ -74,8 +74,9 @@ const THREAD_PROMPT_VERSION: u32 = 1;
 /// after the live test's haiku truncated-quote failure (plan §Phase 1.5).
 const DEFAULT_THREAD_MODEL: &str = "sonnet-5";
 
-/// Default cap on candidate episodes considered per run.
-const DEFAULT_CANDIDATE_CAP: usize = 40;
+/// Absolute ceiling on candidate episodes considered per run, whatever the
+/// effort tier or the `CSR_DREAM_THREADS_CAP` override asks for.
+const MAX_CANDIDATE_CAP: usize = 40;
 
 /// Transcript-tail chunks pulled per episode, and the per-chunk char cap —
 /// matches the plan's live-tested prompt shape.
@@ -117,10 +118,20 @@ pub fn threads_disabled() -> bool {
         || !threads_enabled()
 }
 
-/// Model candidate chain: `CSR_DREAM_THREAD_MODEL` override, then
-/// [`DEFAULT_THREAD_MODEL`], then `None` (let the `claude` CLI pick its own
-/// default) — same shape as `narrative::model_candidates`, different base.
+/// Model candidate chain: `CSR_DREAM_THREAD_MODEL` override, then the
+/// effort tier's model (Journal v4 P5, locked decision 14 — the tier's
+/// "reasoning effort" is delivered as which model reasons, since `claude -p`
+/// has no separate effort flag), then `None` (let the `claude` CLI pick its
+/// own default) — same shape as `narrative::model_candidates`.
+///
+/// The default tier (`balanced`) resolves to [`DEFAULT_THREAD_MODEL`], so a
+/// user who never sets `CSR_DREAM_EFFORT` sees exactly the pre-P5 chain.
 pub fn thread_model_candidates() -> Vec<Option<String>> {
+    thread_model_candidates_for(crate::dream::policy::effort_tier())
+}
+
+/// Pure core of [`thread_model_candidates`] with the tier passed in.
+pub fn thread_model_candidates_for(tier: crate::dream::policy::EffortTier) -> Vec<Option<String>> {
     let mut chain = Vec::with_capacity(3);
     if let Ok(m) = std::env::var("CSR_DREAM_THREAD_MODEL") {
         let m = m.trim().to_string();
@@ -128,7 +139,7 @@ pub fn thread_model_candidates() -> Vec<Option<String>> {
             chain.push(Some(m));
         }
     }
-    chain.push(Some(DEFAULT_THREAD_MODEL.to_string()));
+    chain.push(Some(tier.model().to_string()));
     chain.push(None);
     chain
 }
@@ -155,11 +166,23 @@ pub fn night_actor_cmd_configured() -> bool {
 }
 
 fn candidate_cap() -> usize {
-    std::env::var("CSR_DREAM_THREADS_CAP")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
+    candidate_cap_for(
+        std::env::var("CSR_DREAM_THREADS_CAP").ok().as_deref(),
+        crate::dream::policy::effort_tier(),
+    )
+}
+
+/// Pure core of [`candidate_cap`]: the explicit `CSR_DREAM_THREADS_CAP`
+/// override when it parses as a positive integer, else the effort tier's
+/// episodes-per-pass — both clamped to [`MAX_CANDIDATE_CAP`].
+pub(crate) fn candidate_cap_for(
+    raw: Option<&str>,
+    tier: crate::dream::policy::EffortTier,
+) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(DEFAULT_CANDIDATE_CAP)
+        .unwrap_or_else(|| tier.episodes_per_pass())
+        .min(MAX_CANDIDATE_CAP)
 }
 
 // ─── types ────────────────────────────────────────────────────────────────
@@ -219,6 +242,11 @@ pub enum Receipt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DreamThread {
     pub id: i64,
+    /// The convergence hash this thread was extracted under. Doubles as the
+    /// `narrative_usage.ref_id` its spend rows carry (Journal v4 P4), so the
+    /// composer can total a dream's cost from stored rows instead of a
+    /// timestamp window.
+    pub episode_hash: String,
     pub session_id: String,
     pub project: String,
     pub thread: String,
@@ -238,6 +266,9 @@ pub struct ThreadExtractionStats {
     pub threads_stored: usize,
     pub sentinels_stored: usize,
     pub errors: usize,
+    /// Candidates never attempted because the pass budget was already spent
+    /// — a counted remainder queued for the next pass, never an estimate.
+    pub budget_queued: usize,
 }
 
 // ─── episode candidates ────────────────────────────────────────────────────
@@ -317,6 +348,19 @@ fn load_candidate_episodes(conn: &Connection, cap: usize) -> Result<Vec<EpisodeC
         });
     }
     Ok(out)
+}
+
+/// How many candidate episodes the corpus holds right now — the measured
+/// basis for `setup`'s per-night token estimate (locked decision 15). Counts
+/// the same candidates a real pass would consider, without the tier cap
+/// applied, so the estimate can show both the corpus number and the bound
+/// the tier puts on it. Fail-soft to 0 on a storage error: an estimate built
+/// from a failed query would be a guess.
+pub fn count_candidate_episodes(storage: &Storage) -> usize {
+    storage
+        .with_connection(|conn| load_candidate_episodes(conn, usize::MAX))
+        .map(|episodes| episodes.len())
+        .unwrap_or(0)
 }
 
 /// Files eligible for the prompt's FILES allowlist: the episode's own files,
@@ -728,7 +772,7 @@ fn substitute_actor_template(
 
 // ─── model-chain walk + usage accounting ───────────────────────────────────
 
-struct ChainAttempt {
+pub(crate) struct ChainAttempt {
     model_label: String,
     success: bool,
     input_tokens: i64,
@@ -737,10 +781,10 @@ struct ChainAttempt {
     cache_creation_tokens: i64,
 }
 
-struct ChainResult {
-    text: Option<String>,
-    model_used: String,
-    attempts: Vec<ChainAttempt>,
+pub(crate) struct ChainResult {
+    pub(crate) text: Option<String>,
+    pub(crate) model_used: String,
+    pub(crate) attempts: Vec<ChainAttempt>,
 }
 
 /// Walks `chain`, invoking `actor` for each candidate until one Parses
@@ -748,7 +792,14 @@ struct ChainResult {
 /// candidate (like `narrative`'s model chain); any other `Failed` stops the
 /// walk immediately — non-model failures (timeouts, spawn errors, a custom
 /// actor's terminal failure) must never burn the rest of the chain.
-fn invoke_chain(actor: &dyn NightActor, chain: &[Option<String>], prompt: &str) -> ChainResult {
+///
+/// `pub(crate)` so `journal::composer` (Journal v4 P4) drives its structured
+/// plan through this exact walk rather than standing up a second one.
+pub(crate) fn invoke_chain(
+    actor: &dyn NightActor,
+    chain: &[Option<String>],
+    prompt: &str,
+) -> ChainResult {
     let mut attempts = Vec::new();
     for candidate in chain {
         let label = candidate.clone().unwrap_or_else(|| "default".to_string());
@@ -799,18 +850,33 @@ fn invoke_chain(actor: &dyn NightActor, chain: &[Option<String>], prompt: &str) 
     }
 }
 
-fn record_attempts(storage: &Storage, attempts: &[ChainAttempt]) {
+/// Write one `narrative_usage` row per attempt, tagged with `ref_id` — the
+/// convergence hash the work was done under (Journal v4 P4, locked decision
+/// 13). `None` leaves the rows unattributed, which is what the tests that do
+/// not exercise spend attribution pass.
+///
+/// `pub(crate)` so `journal::composer` accounts its plan spend through the
+/// same writer rather than a second one that could drift.
+pub(crate) fn record_attempts(
+    storage: &Storage,
+    attempts: &[ChainAttempt],
+    call_site: &str,
+    ref_id: Option<&str>,
+) {
     for a in attempts {
-        let _ = storage.record_narrative_usage(&NarrativeUsageRow {
-            call_site: "dream_threads".into(),
-            model: a.model_label.clone(),
-            input_tokens: a.input_tokens,
-            output_tokens: a.output_tokens,
-            cache_read_tokens: a.cache_read_tokens,
-            cache_creation_tokens: a.cache_creation_tokens,
-            duration_ms: 0,
-            success: a.success,
-        });
+        let _ = storage.record_narrative_usage_for(
+            &NarrativeUsageRow {
+                call_site: call_site.to_string(),
+                model: a.model_label.clone(),
+                input_tokens: a.input_tokens,
+                output_tokens: a.output_tokens,
+                cache_read_tokens: a.cache_read_tokens,
+                cache_creation_tokens: a.cache_creation_tokens,
+                duration_ms: 0,
+                success: a.success,
+            },
+            ref_id,
+        );
     }
 }
 
@@ -827,9 +893,10 @@ pub(crate) fn verify_reply(
     prompt: &str,
     allowlist: &[String],
     storage: &Storage,
+    ref_id: Option<&str>,
 ) -> Option<(Vec<RawThread>, String)> {
     let first = invoke_chain(actor, chain, prompt);
-    record_attempts(storage, &first.attempts);
+    record_attempts(storage, &first.attempts, "dream_threads", ref_id);
     let text = first.text?;
 
     let mut threads = parse_threads(&text);
@@ -839,7 +906,7 @@ pub(crate) fn verify_reply(
     if threads.iter().any(|t| !passes_quote_gate(t, prompt)) {
         let retry_prompt = format!("{prompt}{RETRY_CORRECTION}");
         let retry = invoke_chain(actor, chain, &retry_prompt);
-        record_attempts(storage, &retry.attempts);
+        record_attempts(storage, &retry.attempts, "dream_threads", ref_id);
         if let Some(retry_text) = retry.text {
             threads = parse_threads(&retry_text);
             threads.truncate(MAX_THREADS_PER_EPISODE);
@@ -989,7 +1056,7 @@ fn store_thread(
 /// degrades to empty rather than dropping the whole row.
 pub fn load_dream_threads(conn: &Connection) -> Result<Vec<DreamThread>> {
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, project, thread, evidence_quote, files_json, receipt_tier, receipts_json, model, created_at
+        "SELECT id, episode_hash, session_id, project, thread, evidence_quote, files_json, receipt_tier, receipts_json, model, created_at
          FROM dream_threads
          WHERE thread != ''
          ORDER BY created_at DESC, id DESC",
@@ -1007,6 +1074,7 @@ pub fn load_dream_threads(conn: &Connection) -> Result<Vec<DreamThread>> {
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
                 row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1014,6 +1082,7 @@ pub fn load_dream_threads(conn: &Connection) -> Result<Vec<DreamThread>> {
     let mut out = Vec::with_capacity(rows.len());
     for (
         id,
+        episode_hash,
         session_id,
         project,
         thread,
@@ -1030,6 +1099,7 @@ pub fn load_dream_threads(conn: &Connection) -> Result<Vec<DreamThread>> {
         let receipt_tier = ReceiptTier::from_str_opt(&tier_str).unwrap_or(ReceiptTier::Unverified);
         out.push(DreamThread {
             id,
+            episode_hash,
             session_id,
             project,
             thread,
@@ -1068,7 +1138,8 @@ fn extract_for_episode(
 
     let prompt = build_prompt(ep, &tail_chunks, &allowlist);
     let chain = thread_model_candidates();
-    let Some((threads, model_used)) = verify_reply(actor, &chain, &prompt, &allowlist, storage)
+    let Some((threads, model_used)) =
+        verify_reply(actor, &chain, &prompt, &allowlist, storage, Some(&hash))
     else {
         // Actor never produced a usable reply — retry next run, cache nothing.
         return Ok(());
@@ -1110,12 +1181,29 @@ fn record_run_meta(storage: &Storage, stats: &ThreadExtractionStats) {
     let _ = storage.set_meta(META_LAST_CONVERGED, if converged { "1" } else { "0" });
 }
 
+/// Run one night-pass thread-extraction cycle with a budget sized from the
+/// configured effort tier. See [`run_thread_extraction_with_budget`].
+pub fn run_thread_extraction(storage: &Storage) -> ThreadExtractionStats {
+    let budget = crate::dream::policy::Budget::for_tier(crate::dream::policy::effort_tier());
+    run_thread_extraction_with_budget(storage, &budget)
+}
+
 /// Run one night-pass thread-extraction cycle. Fail-open at every level —
 /// per-episode errors are logged and counted, never propagated; the whole
 /// pass never panics and never returns an `Err` (matches the daemon's
 /// "never let one iteration wedge the loop" convention documented on
 /// `dream_cadence::tick`).
-pub fn run_thread_extraction(storage: &Storage) -> ThreadExtractionStats {
+///
+/// `budget` is the pass's hard invocation cap (locked decision 8). It is
+/// shared with every other producer in the same pass, so the cap is a
+/// per-pass total and not a per-producer one. Episodes are consumed
+/// newest-first (that is `load_candidate_episodes`'s own order); once the
+/// budget is gone the remainder is counted as queued and left untouched —
+/// nothing is cached for them, so the next pass retries them.
+pub fn run_thread_extraction_with_budget(
+    storage: &Storage,
+    budget: &crate::dream::policy::Budget,
+) -> ThreadExtractionStats {
     let mut stats = ThreadExtractionStats::default();
     if threads_disabled() {
         stats.skipped = true;
@@ -1132,8 +1220,14 @@ pub fn run_thread_extraction(storage: &Storage) -> ThreadExtractionStats {
     };
     stats.candidates = episodes.len();
 
-    let actor = ProcessActor;
+    let process_actor = ProcessActor;
+    let actor = crate::dream::policy::BudgetedActor::new(&process_actor, budget);
     for ep in &episodes {
+        if budget.exhausted() {
+            budget.note_queued();
+            stats.budget_queued += 1;
+            continue;
+        }
         if let Err(error) = extract_for_episode(storage, &actor, ep, &mut stats) {
             tracing::warn!(
                 %error,
@@ -1150,6 +1244,9 @@ pub fn run_thread_extraction(storage: &Storage) -> ThreadExtractionStats {
         threads_stored = stats.threads_stored,
         sentinels_stored = stats.sentinels_stored,
         errors = stats.errors,
+        budget_queued = stats.budget_queued,
+        budget_used = budget.used(),
+        budget_cap = budget.cap(),
         "dream-thread extraction pass complete"
     );
     stats
@@ -1354,7 +1451,7 @@ mod tests {
 
         let allowlist = vec!["/repo/src/a.rs".to_string()];
         let chain = vec![Some("sonnet-5".to_string())];
-        let result = verify_reply(&actor, &chain, prompt, &allowlist, &storage);
+        let result = verify_reply(&actor, &chain, prompt, &allowlist, &storage, None);
         let (threads, _model) = result.expect("actor produced a reply");
         assert_eq!(
             threads.len(),
@@ -1383,11 +1480,145 @@ mod tests {
         };
         let allowlist = vec!["/repo/src/a.rs".to_string()];
         let chain = vec![Some("sonnet-5".to_string())];
-        let (threads, _model) = verify_reply(&actor, &chain, prompt, &allowlist, &storage).unwrap();
+        let (threads, _model) =
+            verify_reply(&actor, &chain, prompt, &allowlist, &storage, None).unwrap();
         assert!(
             threads.is_empty(),
             "a quote that never becomes verbatim must be dropped: {threads:?}"
         );
+    }
+
+    // ---- effort tier + budget cap (Journal v4 P5) ---------------------------
+
+    #[test]
+    fn candidate_cap_follows_the_effort_tier_unless_explicitly_overridden() {
+        use crate::dream::policy::EffortTier;
+        assert_eq!(candidate_cap_for(None, EffortTier::Less), 8);
+        assert_eq!(candidate_cap_for(None, EffortTier::Balanced), 20);
+        assert_eq!(candidate_cap_for(None, EffortTier::Max), 40);
+        assert_eq!(
+            candidate_cap_for(Some("5"), EffortTier::Max),
+            5,
+            "an explicit cap wins over the tier"
+        );
+        assert_eq!(
+            candidate_cap_for(Some("0"), EffortTier::Less),
+            8,
+            "a zero cap falls back to the tier, not to no work at all"
+        );
+        assert_eq!(
+            candidate_cap_for(Some("9999"), EffortTier::Max),
+            MAX_CANDIDATE_CAP,
+            "nothing may exceed the absolute ceiling"
+        );
+    }
+
+    #[test]
+    fn the_model_chain_takes_the_tier_model_unless_the_env_overrides_it() {
+        use crate::dream::policy::EffortTier;
+        let _g = env_guard();
+        clear_env();
+        assert_eq!(
+            thread_model_candidates_for(EffortTier::Balanced),
+            vec![Some(DEFAULT_THREAD_MODEL.to_string()), None],
+            "the default tier must reproduce the pre-tier chain exactly"
+        );
+        assert_eq!(
+            thread_model_candidates_for(EffortTier::Less)[0],
+            Some(EffortTier::Less.model().to_string())
+        );
+        assert_eq!(
+            thread_model_candidates_for(EffortTier::Max)[0],
+            Some(EffortTier::Max.model().to_string())
+        );
+        std::env::set_var("CSR_DREAM_THREAD_MODEL", "my-model");
+        let overridden = thread_model_candidates_for(EffortTier::Max);
+        assert_eq!(
+            overridden[0],
+            Some("my-model".to_string()),
+            "an explicit model choice is never overridden by a tier"
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn the_pass_budget_holds_across_the_verifier_retry() {
+        use crate::dream::policy::{Budget, BudgetedActor};
+        let _g = env_guard();
+        clear_env();
+        let storage = open();
+        let prompt = "RECORD: alpha beta gamma. FILES: [\"/repo/src/a.rs\"]";
+        let calls = std::cell::Cell::new(0_usize);
+        // Always paraphrased, so the verifier ALWAYS wants its one retry.
+        let inner = |_model: Option<&str>, _p: &str| {
+            calls.set(calls.get() + 1);
+            ActorAttempt::Parsed(ParsedNarrative {
+                text: r#"[{"thread":"finish alpha","evidence_quote":"alpha, beta, and gamma","files":["/repo/src/a.rs"]}]"#.to_string(),
+                model: "sonnet-5".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            })
+        };
+        let budget = Budget::new(1);
+        let actor = BudgetedActor::new(&inner, &budget);
+        let allowlist = vec!["/repo/src/a.rs".to_string()];
+        let chain = vec![Some("sonnet-5".to_string())];
+        let (threads, _model) =
+            verify_reply(&actor, &chain, prompt, &allowlist, &storage, None).unwrap();
+        assert_eq!(
+            calls.get(),
+            1,
+            "the retry must be refused by the budget, not merely discouraged"
+        );
+        assert_eq!(budget.used(), 1);
+        assert!(budget.exhausted());
+        assert!(
+            threads.is_empty(),
+            "an unverifiable quote is still dropped, never softened: {threads:?}"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_budget_produces_no_reply_at_all_so_nothing_is_cached() {
+        use crate::dream::policy::{Budget, BudgetedActor};
+        let _g = env_guard();
+        clear_env();
+        let storage = open();
+        let calls = std::cell::Cell::new(0_usize);
+        let inner = |_m: Option<&str>, _p: &str| {
+            calls.set(calls.get() + 1);
+            ActorAttempt::Parsed(ParsedNarrative {
+                text: "[]".to_string(),
+                model: "sonnet-5".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            })
+        };
+        let budget = Budget::new(0);
+        let actor = BudgetedActor::new(&inner, &budget);
+        let chain = vec![Some("sonnet-5".to_string())];
+        assert!(
+            verify_reply(&actor, &chain, "RECORD: x", &[], &storage, None).is_none(),
+            "no reply means the episode is retried next pass, not cached as empty"
+        );
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn a_disabled_pass_reports_skipped_and_spends_nothing() {
+        use crate::dream::policy::Budget;
+        let _g = env_guard();
+        clear_env(); // CSR_DREAM_THREADS unset — the opt-in gate is off.
+        let storage = open();
+        let budget = Budget::new(25);
+        let stats = run_thread_extraction_with_budget(&storage, &budget);
+        assert!(stats.skipped);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(stats.budget_queued, 0);
     }
 
     // ---- file allowlist -----------------------------------------------------
@@ -1410,7 +1641,8 @@ mod tests {
         };
         let allowlist = vec!["/repo/src/a.rs".to_string()];
         let chain = vec![Some("sonnet-5".to_string())];
-        let (threads, _model) = verify_reply(&actor, &chain, prompt, &allowlist, &storage).unwrap();
+        let (threads, _model) =
+            verify_reply(&actor, &chain, prompt, &allowlist, &storage, None).unwrap();
         assert!(
             threads.is_empty(),
             "a thread naming a file outside the allowlist must be dropped: {threads:?}"

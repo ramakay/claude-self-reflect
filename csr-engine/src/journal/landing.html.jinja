@@ -1,0 +1,42 @@
+{% extends "layout.html" %}
+{% block title %}CSR Dream Journal{% endblock %}
+{% block masthead_meta %}
+<span>{{ view.count_label }}</span><span>{{ view.project_label }}</span>{% if view.pass_label %}<span>{{ view.pass_label }}</span>{% endif %}
+{% endblock %}
+{% block main %}
+{% if view.empty %}
+  <div class="empty">
+    <p class="lead">Nothing on record yet.</p>
+    <p>No open item has been qualified by a witnessed change. This is an empty feed, not a failure —
+       run <code>csr-engine dream</code> to write verdicts, and leave an open todo or blocker behind for them to land on.</p>
+  </div>
+{% else %}
+  <ul class="card-list">
+  {% for card in view.cards %}
+    <li class="card" id="dream-{{ card.id }}">
+      <div class="card-head">
+        <span class="chip {{ card.grade_slug }}">{{ card.grade_label }}</span>
+        <span class="chip project">{{ card.project }}</span>
+        <span class="chip">{{ card.kind }}</span>
+      </div>
+      <h2 class="card-title"><a href="{{ card.href }}">{{ card.item }}</a></h2>
+      {% if card.dream_lines %}
+      <ul class="dream-lines">
+        {% for line in card.dream_lines %}<li>☾ {{ line }}</li>{% endfor %}
+      </ul>
+      {% endif %}
+      <p class="card-meta">{{ card.meta }}</p>
+      {#- Spend renders only when usage was recorded for this dream (locked
+          decision 13). No else-branch: an unmeasured dream shows nothing,
+          because a zero here would read as "this one was free". -#}
+      {% if card.spend %}<p class="card-spend">{{ card.spend.tokens }} · {{ card.spend.cost }}</p>{% endif %}
+    </li>
+  {% endfor %}
+  </ul>
+  <nav class="pager">
+    {% if view.prev_href %}<a href="{{ view.prev_href }}">← previous</a>{% endif %}
+    <span>showing {{ view.shown_from }}–{{ view.shown_to }} of {{ view.total }}</span>
+    {% if view.next_href %}<a href="{{ view.next_href }}">next →</a>{% endif %}
+  </nav>
+{% endif %}
+{% endblock %}

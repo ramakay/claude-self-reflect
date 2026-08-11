@@ -1,0 +1,169 @@
+{% extends "layout.html" %}
+{% block title %}{{ view.title }} — CSR Dream Journal{% endblock %}
+{% block masthead_meta %}<span>{{ view.project }}</span><span>{{ view.grade_label }}</span>
+{% endblock %}
+{% block main %}
+{#- Render order is the codex IA memo's binding correction 3, and it is
+    asserted by `render::tests::detail_sections_render_in_the_mandated_order`:
+
+      1. evidence contract   — conclusion, grade/scope, witnessed, receipt
+      2. TOUCH NEXT          — the unresolved item
+      3. plain description   — "what changed" kept separate from "why these
+                               items surfaced"
+      4. proposal            — brief + copy block + verified plan + spend
+      5. AST before/after    — solid = witnessed w/ inline receipt,
+                               dotted = deterministically resolved only,
+                               abstention sentence in the SAME slot
+      6. churn heat          — LAST, captioned as context, never importance
+
+    The imperative never leads. Slot 4 is the plan's §Views "Proposal"
+    section; it sits after the description and before AST so both the memo's
+    order (description → AST → churn) and the plan's order (TOUCH NEXT →
+    Proposal → AST → churn) hold at once. -#}
+<section class="panel" aria-labelledby="contract-h">
+  <h2 id="contract-h">Evidence contract</h2>
+  <ul class="contract">
+    <li><b>grade</b> {{ view.grade_label }}</li>
+    <li><b>project</b> {{ view.project }}</li>
+    {% if view.witnessed %}<li><b>witnessed</b> {{ view.witnessed }}</li>{% endif %}
+    {% if view.receipt %}<li><b>receipt</b> ⌗{{ view.receipt }}</li>{% endif %}
+    <li><b>left open</b> {{ view.left_open }} · session {{ view.origin_session }}</li>
+  </ul>
+</section>
+
+<section class="panel" aria-labelledby="touch-h">
+  <h2 id="touch-h">Touch next</h2>
+  <p class="touch-next">{{ view.title }}</p>
+</section>
+
+<section class="panel" aria-labelledby="desc-h">
+  <h2 id="desc-h">What changed, and why this surfaced</h2>
+  <p class="prose">{{ view.what_changed }}</p>
+  <p class="prose">{{ view.why_surfaced }}</p>
+</section>
+
+<section class="panel" aria-labelledby="proposal-h">
+  <h2 id="proposal-h">Proposal</h2>
+
+  <h3 class="sub">Brief</h3>
+  {% if view.brief.empty %}
+  <p class="prose">Nothing is on record for this item beyond its evidence rows — no origin
+    request, no completion summary, and no night-pass thread. The brief is empty because the
+    evidence is.</p>
+  {% else %}
+  <div class="brief" tabindex="0">
+    <ul class="brief-lines">
+      {% for line in view.brief.lines %}<li><b>{{ line.label }}</b> {{ line.text }}</li>{% endfor %}
+    </ul>
+  </div>
+  {% if view.brief.truncation %}<p class="marker">{{ view.brief.truncation }} brief lines</p>{% endif %}
+  {% if view.brief.truncated_lines %}<p class="marker">{{ view.brief.truncated_lines }} line(s) shortened to fit</p>{% endif %}
+  {% endif %}
+
+  {% if view.copy_block %}
+  <h3 class="sub">Copy block — paste into a new session</h3>
+  <p class="marker">Assembled from stored rows only.{% if not view.copy_block.has_night_pass %}
+    No night-pass thread exists for this session, and the block says so where the finding
+    would have been.{% endif %}</p>
+  <pre class="copy-block">{{ view.copy_block.markdown }}</pre>
+  {% endif %}
+
+  {% if view.plan %}
+  <h3 class="sub">Structured plan <span class="chip">{{ view.plan.label }}</span></h3>
+  {% if view.plan.empty %}
+  <p class="prose">A plan pass ran for this item and the deterministic verifier kept none of
+    the drafted steps. Nothing is shown because nothing traced.</p>
+  {% else %}
+  {% if view.plan.context %}<p class="prose">{{ view.plan.context }}</p>{% endif %}
+  <ol class="plan-steps">
+    {% for step in view.plan.steps %}
+    <li>
+      <p class="step-action">{{ step.action }}</p>
+      <p class="step-receipt">traces to: {{ step.citation }}</p>
+      {% for file in step.files %}<p class="step-receipt">file: {{ file }}</p>{% endfor %}
+    </li>
+    {% endfor %}
+  </ol>
+  {% if view.plan.acceptance %}<p class="prose"><b>Acceptance check:</b> {{ view.plan.acceptance }}</p>{% endif %}
+  {% endif %}
+  {% if view.plan.dropped_note %}<p class="marker">{{ view.plan.dropped_note }}</p>{% endif %}
+  <p class="marker">drafted by {{ view.plan.model }}</p>
+  {% endif %}
+
+  {#- Spend renders ONLY when usage was recorded. There is deliberately no
+      else-branch printing zeros: a dream with no recorded usage was not
+      free, it was unmeasured. -#}
+  {% if view.spend %}
+  <h3 class="sub">Spend</h3>
+  <p class="spend"><b>{{ view.spend.tokens }}</b> · {{ view.spend.cost }}</p>
+  <p class="marker">{{ view.spend.detail }}</p>
+  {% endif %}
+</section>
+
+<section class="panel" aria-labelledby="ast-h">
+  <h2 id="ast-h">AST before / after</h2>
+  {% if view.ast.rendered %}
+  <p class="marker">{{ view.ast.path }} · ⌗{{ view.ast.before_oid }} → ⌗{{ view.ast.after_oid }} · {{ view.ast.counts }}</p>
+  {% if view.ast.truncation %}<p class="marker">{{ view.ast.truncation }}</p>{% endif %}
+  <div class="ast-grid">
+    <div>
+      <h3 class="sub">before ⌗{{ view.ast.before_oid }}</h3>
+      <ul class="ast-tree">
+        {% for node in view.ast.before %}
+        <li class="{% if node.witnessed %}witnessed{% else %}resolved{% endif %}">
+          {{ node.name }} <span class="ast-kind">{{ node.kind }} · {{ node.status }}</span>
+          {% if node.witnessed %}{% if node.receipt %}<span class="ast-receipt">⌗{{ node.receipt }}</span>{% else %}<span class="ast-receipt">witnessed, no receipt</span>{% endif %}
+          {% else %}<span class="ast-kind">resolved, not witnessed</span>{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    <div>
+      <h3 class="sub">after ⌗{{ view.ast.after_oid }}</h3>
+      <ul class="ast-tree">
+        {% for node in view.ast.after %}
+        <li class="{% if node.witnessed %}witnessed{% else %}resolved{% endif %}">
+          {{ node.name }} <span class="ast-kind">{{ node.kind }} · {{ node.status }}</span>
+          {% if node.witnessed %}{% if node.receipt %}<span class="ast-receipt">⌗{{ node.receipt }}</span>{% else %}<span class="ast-receipt">witnessed, no receipt</span>{% endif %}
+          {% else %}<span class="ast-kind">resolved, not witnessed</span>{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+  <p class="marker">Solid rows are witnessed by the ledger and carry their receipt. Dotted rows
+    were resolved deterministically by the AST engine and are not witnessed — they are
+    candidates, not evidence.</p>
+  {% else %}
+  <p class="abstained">{{ view.ast.abstention }}</p>
+  {% endif %}
+</section>
+
+<section class="panel" aria-labelledby="evidence-h">
+  <h2 id="evidence-h">Evidence ({{ view.evidence_count }})</h2>
+  <ul class="evidence">
+    {% for line in view.evidence_lines %}<li>☾ {{ line }}</li>{% endfor %}
+  </ul>
+</section>
+
+{#- Churn is LAST and neutral (locked decision 10). The caption is a Rust
+    constant so a template edit cannot quietly promote it to a ranking. -#}
+<section class="panel" aria-labelledby="churn-h">
+  <h2 id="churn-h">Churn heat</h2>
+  <p class="marker">{{ view.churn.caption }}</p>
+  {% if view.churn.measured %}
+  <ul class="churn">
+    {% for row in view.churn.rows %}
+    <li><span class="churn-bar" style="width: {{ row.width }}%"></span>
+      <span class="churn-file">{{ row.file }}</span>
+      <span class="churn-count">{{ row.touches }} touches</span></li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="prose">No churn was counted for this project in the window. This is an absence of
+    measurement, not a measurement of zero activity.</p>
+  {% endif %}
+</section>
+
+<nav class="pager"><a href="/">← all dreams</a></nav>
+{% endblock %}

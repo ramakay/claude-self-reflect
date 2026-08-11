@@ -211,6 +211,22 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         return Ok(());
     }
 
+    // Journal v4 P5 delivery channel (c): the prompt names a symbol or file a
+    // dream concluded on. Symbol-grade matching only, receipts mandatory, one
+    // line, never repeated (see `hooks::dream_match`). Runs before the
+    // anchor-overlap pointer below because a receipted conclusion outranks a
+    // "was modified recently" pointer, and both are one line.
+    if let Some(project) = resolve_project_from_cwd(&cwd.to_string_lossy()) {
+        if let Some(line) = crate::hooks::dream_match::injection_for_prompt(
+            engine.storage(),
+            &project,
+            prompt,
+            input.session_id.as_deref(),
+        ) {
+            println!("{line}");
+        }
+    }
+
     // Symbol-overlap gate: prompt names an anchored function → one-line pointer
     if let Some(project) = resolve_project_from_cwd(&cwd.to_string_lossy()) {
         if let Ok(rows) = engine.storage().get_project_anchors(&project, 200) {

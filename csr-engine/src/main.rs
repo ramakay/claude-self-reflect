@@ -193,6 +193,14 @@ enum Commands {
         #[command(subcommand)]
         action: CodegraphAction,
     },
+    /// Dream journal server (v10.1 journal v4) — a read-only, loopback-only
+    /// live surface over the witness ledger. The background daemon already
+    /// hosts this on the same port; this subcommand is the standalone host
+    /// for a machine that isn't running `csr-engine daemon`.
+    Journal {
+        #[command(subcommand)]
+        action: JournalAction,
+    },
     /// Show aggregated telemetry: hook latencies, startup stats, enrichment health
     Telemetry {
         /// Window (e.g. "24h", "7d", "30m", "all"). Default: 24h.
@@ -250,6 +258,28 @@ enum Commands {
         /// Current working directory (for project resolution)
         #[arg(long)]
         cwd: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum JournalAction {
+    /// Serve the dream journal on 127.0.0.1 until Ctrl-C.
+    ///
+    /// The bind interface is not configurable — the corpus behind this
+    /// surface is private conversation data, so the listener is loopback by
+    /// construction (`journal::loopback_addr` is the only bind-address
+    /// constructor and takes a port, nothing else). `CSR_NO_JOURNAL_SERVER=1`
+    /// disables it here and in the daemon.
+    Serve {
+        /// Loopback port. Defaults to `CSR_JOURNAL_PORT`, then the fixed
+        /// bookmarkable default. `0` asks for an ephemeral port. If the
+        /// chosen port is busy, an ephemeral one is used and printed.
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Open the served URL in the system browser (macOS `open`).
+        #[arg(long)]
+        open: bool,
     },
 }
 
@@ -683,6 +713,17 @@ async fn main() -> Result<()> {
             }
         }
         return Ok(());
+    }
+
+    if let Some(Commands::Journal {
+        action: JournalAction::Serve { port, open },
+    }) = args.command
+    {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        return csr_engine::journal::run_cli(eng.storage().clone(), port, open).await;
     }
 
     if let Some(Commands::GenerateStory {

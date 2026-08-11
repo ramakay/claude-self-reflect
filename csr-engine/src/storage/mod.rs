@@ -1,6 +1,8 @@
 pub mod ancestry;
 pub mod chunk_binding;
 pub mod codegraph;
+pub mod dream_clusters;
+pub mod dream_delivery;
 pub mod dream_items;
 pub mod dream_report;
 pub mod migrations;
@@ -633,6 +635,17 @@ impl Storage {
     pub fn record_narrative_usage(&self, row: &NarrativeUsageRow) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::record_narrative_usage(&conn, row)
+    }
+
+    /// Record usage tagged with the convergence hash that caused it — the
+    /// evidence a per-dream spend figure is summed from (Journal v4 P4).
+    pub fn record_narrative_usage_for(
+        &self,
+        row: &NarrativeUsageRow,
+        ref_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::record_narrative_usage_for(&conn, row, ref_id)
     }
 
     pub fn narrative_usage_summary(&self) -> Result<NarrativeUsageSummary> {

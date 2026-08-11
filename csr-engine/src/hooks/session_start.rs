@@ -785,13 +785,43 @@ fn format_session_start_tier0(
                 tracing::debug!(%error, "session-start recap proposal feed unavailable");
                 0
             });
+        // Journal v4 P5 delivery channel (b). The feed is read here but the
+        // delivery is recorded below, and only if the composed paragraph
+        // actually carries the clause — the composer drops clauses that do
+        // not fit its character budget, and a delivery recorded for a
+        // dropped clause would claim the user saw something they did not.
+        let top_dream = storage.recap_top_dream(project).unwrap_or_else(|error| {
+            tracing::debug!(%error, "session-start recap dream feed unavailable");
+            None
+        });
+        let dream_id = top_dream.as_ref().and(
+            storage
+                .top_undelivered_dream(
+                    project,
+                    crate::storage::dream_delivery::DeliveryChannel::Recap,
+                )
+                .unwrap_or(None)
+                .map(|headline| headline.id),
+        );
         let feeds = crate::hooks::recap::RecapFeeds {
             settled,
             still_open,
             retired_while_away,
             open_proposals,
+            top_dream,
         };
-        crate::hooks::recap::compose_recap(ep, &feeds, age)
+        let composed = crate::hooks::recap::compose_recap(ep, &feeds, age);
+        if let (Some(text), Some(id)) = (composed.as_deref(), dream_id) {
+            if text.contains(crate::hooks::recap::DREAM_CLAUSE_PREFIX) {
+                crate::storage::dream_delivery::claim_delivery(
+                    storage,
+                    &id,
+                    crate::storage::dream_delivery::DeliveryChannel::Recap,
+                    Some(&ep.session_id),
+                );
+            }
+        }
+        composed
     };
 
     format_tier0_block_with_recap(ep, anchor_verdicts, age, recap.as_deref())

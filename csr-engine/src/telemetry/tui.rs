@@ -398,6 +398,7 @@ mod tests {
             ancestry_cached_conversations: 9,
             last_daemon_run: Some("2026-08-06T10:00:00Z".into()),
             next_due: Some("2026-08-06T18:00:00Z".into()),
+            ..DreamStatus::default()
         };
 
         assert_eq!(

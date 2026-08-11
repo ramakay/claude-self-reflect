@@ -1497,11 +1497,28 @@ pub struct NarrativeUsageSummary {
 }
 
 pub fn record_narrative_usage(conn: &Connection, row: &NarrativeUsageRow) -> Result<()> {
+    record_narrative_usage_for(conn, row, None)
+}
+
+/// Record one usage row, optionally tagged with the convergence hash of the
+/// work that caused it (Journal v4 P4, locked decision 13).
+///
+/// `ref_id` is what makes a per-dream spend figure *evidence* rather than a
+/// timestamp-window guess: the producer writes the hash it is working under,
+/// and `narrative_usage_for_refs` sums only rows carrying that exact hash.
+/// Passing `None` (what every pre-existing call site does through
+/// [`record_narrative_usage`]) leaves the row unattributed forever — which
+/// is the honest outcome, since nothing recorded which dream it belonged to.
+pub fn record_narrative_usage_for(
+    conn: &Connection,
+    row: &NarrativeUsageRow,
+    ref_id: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO narrative_usage
          (call_site, model, input_tokens, output_tokens, cache_read_tokens,
-          cache_creation_tokens, duration_ms, success)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+          cache_creation_tokens, duration_ms, success, ref_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             row.call_site,
             row.model,
@@ -1511,9 +1528,106 @@ pub fn record_narrative_usage(conn: &Connection, row: &NarrativeUsageRow) -> Res
             row.cache_creation_tokens,
             row.duration_ms,
             row.success as i64,
+            ref_id,
         ],
     )?;
     Ok(())
+}
+
+/// One model's measured token totals under a set of `ref_id`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrativeUsageByModel {
+    pub model: String,
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+}
+
+/// Per-model token totals for every `narrative_usage` row tagged with one of
+/// `refs`. An empty `refs`, or refs that match no row, yields an empty vec —
+/// the caller renders nothing rather than a zero.
+///
+/// The `IN` list is built from bound parameters only; `refs` values are never
+/// interpolated into the SQL text.
+pub fn narrative_usage_for_refs(
+    conn: &Connection,
+    refs: &[String],
+) -> Result<Vec<NarrativeUsageByModel>> {
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; refs.len()].join(",");
+    let sql = format!(
+        "SELECT model, COUNT(*),
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0),
+                COALESCE(SUM(cache_creation_tokens), 0)
+         FROM narrative_usage
+         WHERE ref_id IN ({placeholders})
+         GROUP BY model
+         ORDER BY model"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params = rusqlite::params_from_iter(refs.iter());
+    let rows = stmt
+        .query_map(params, |row| {
+            Ok(NarrativeUsageByModel {
+                model: row.get(0)?,
+                calls: row.get(1)?,
+                input_tokens: row.get(2)?,
+                output_tokens: row.get(3)?,
+                cache_read_tokens: row.get(4)?,
+                cache_creation_tokens: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Per-model token totals for every `narrative_usage` row whose `call_site`
+/// is in `call_sites`. Used by `status` for dreaming's spend-to-date. An
+/// empty list, or call sites with no rows, yields an empty vec — the caller
+/// renders nothing rather than a zero it never measured.
+///
+/// The `IN` list is built from bound parameters only; values are never
+/// interpolated into the SQL text.
+pub fn narrative_usage_for_call_sites(
+    conn: &Connection,
+    call_sites: &[&str],
+) -> Result<Vec<NarrativeUsageByModel>> {
+    if call_sites.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; call_sites.len()].join(",");
+    let sql = format!(
+        "SELECT model, COUNT(*),
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0),
+                COALESCE(SUM(cache_creation_tokens), 0)
+         FROM narrative_usage
+         WHERE call_site IN ({placeholders})
+         GROUP BY model
+         ORDER BY model"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params = rusqlite::params_from_iter(call_sites.iter());
+    let rows = stmt
+        .query_map(params, |row| {
+            Ok(NarrativeUsageByModel {
+                model: row.get(0)?,
+                calls: row.get(1)?,
+                input_tokens: row.get(2)?,
+                output_tokens: row.get(3)?,
+                cache_read_tokens: row.get(4)?,
+                cache_creation_tokens: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 pub fn narrative_usage_summary(conn: &Connection) -> Result<NarrativeUsageSummary> {

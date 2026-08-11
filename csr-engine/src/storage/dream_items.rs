@@ -283,16 +283,25 @@ pub(crate) fn extract_code_tokens(text: &str) -> Vec<String> {
 /// equals `row`'s file basename, or (for a token that itself looks like a
 /// path) `row`'s file path ends with `token`. Never a substring match.
 fn token_matches_row(token: &str, row: &VerdictGroupRow) -> bool {
-    if let Some(symbol) = &row.symbol {
+    token_matches_file_symbol(token, &row.file, row.symbol.as_deref())
+}
+
+/// The same whole-token rules as [`token_matches_row`], against a bare
+/// `(file, symbol)` pair — for callers holding evidence in another shape
+/// (`hooks::dream_match` matches a `dream_delivery::DreamHeadline` this
+/// way). One definition, two callers: the ban on substring matching cannot
+/// drift between them.
+pub(crate) fn token_matches_file_symbol(token: &str, file: &str, symbol: Option<&str>) -> bool {
+    if let Some(symbol) = symbol {
         if symbol.eq_ignore_ascii_case(token) {
             return true;
         }
     }
-    let basename = row.file.rsplit('/').next().unwrap_or(&row.file);
+    let basename = file.rsplit('/').next().unwrap_or(file);
     if basename.eq_ignore_ascii_case(token) {
         return true;
     }
-    if token.contains('/') && row.file.to_lowercase().ends_with(&token.to_lowercase()) {
+    if token.contains('/') && file.to_lowercase().ends_with(&token.to_lowercase()) {
         return true;
     }
     false

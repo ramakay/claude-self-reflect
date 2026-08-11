@@ -6,8 +6,9 @@ use anyhow::Result;
 use regex::Regex;
 use rusqlite::params;
 
+use super::dream_delivery::{self, DeliveryChannel, DreamHeadline};
 use super::Storage;
-use crate::hooks::recap::{RetiredLine, SettledFact};
+use crate::hooks::recap::{DreamClause, RetiredLine, SettledFact};
 
 const LEDGER_FEED_LIMIT: i64 = 5;
 const RETIRED_FEED_LIMIT: i64 = 3;
@@ -190,6 +191,76 @@ impl Storage {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// The top **undelivered** dream for `project`, ready for the recap's
+    /// `Dreamt:` clause (Journal v4 P5, delivery channel (b)).
+    ///
+    /// Gating, in order:
+    ///
+    /// 1. `CSR_DREAM_CONSUMPTION=off` suppresses it entirely, like every
+    ///    other verdict-derived surface.
+    /// 2. A cheap existence probe short-circuits a project with no
+    ///    receipt-bearing verdict at all, so the common case costs one
+    ///    indexed count.
+    /// 3. Only conclusions carrying a receipt are candidates
+    ///    (`dream_delivery::receipted_conclusions` cannot return others).
+    /// 4. The first candidate not already delivered on the recap channel is
+    ///    returned. Nothing is returned when every candidate has been shown
+    ///    before — the clause then drops rather than repeating itself.
+    ///
+    /// This does **not** record the delivery: the composer may still drop
+    /// the clause for its character budget, and a delivery must only be
+    /// recorded for a clause that actually reached the user. The caller
+    /// records it after checking the composed text (see
+    /// `hooks::recap::DREAM_CLAUSE_PREFIX`).
+    ///
+    /// Deliberately NOT the `dream_clusters` ranking: that feed parses every
+    /// v2 episode in the corpus, which is far more than a SessionStart hook
+    /// can spend. This is the same tier-2 ordering (adverse before
+    /// restorative, newest first) applied to single receipt-bearing rows.
+    pub fn recap_top_dream(&self, project: &str) -> Result<Option<DreamClause>> {
+        self.recap_top_dream_with(project, dream_consumption_mode())
+    }
+
+    /// Core of [`Storage::recap_top_dream`] with the consumption mode passed
+    /// in — same testing idiom as [`Storage::recap_retired_since_with`].
+    pub fn recap_top_dream_with(
+        &self,
+        project: &str,
+        consumption_mode: ConsumptionMode,
+    ) -> Result<Option<DreamClause>> {
+        if consumption_mode == ConsumptionMode::Off {
+            return Ok(None);
+        }
+        Ok(self
+            .top_undelivered_dream(project, DeliveryChannel::Recap)?
+            .map(|headline| DreamClause {
+                label: headline.label().to_string(),
+                verdict: headline.verdict_phrase().to_string(),
+                receipt: shorten_receipt(&headline.receipt_oid),
+                date: headline.witnessed_date.clone(),
+            }))
+    }
+
+    /// The newest receipt-bearing conclusion for `project` that has not been
+    /// delivered on `channel`. Shared by the recap clause and the
+    /// prompt-time match.
+    pub fn top_undelivered_dream(
+        &self,
+        project: &str,
+        channel: DeliveryChannel,
+    ) -> Result<Option<DreamHeadline>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock: {error}"))?;
+        if !dream_delivery::has_receipted_conclusion(&conn, project)? {
+            return Ok(None);
+        }
+        Ok(dream_delivery::receipted_conclusions(&conn, project)?
+            .into_iter()
+            .find(|headline| !dream_delivery::already_delivered(&conn, &headline.id, channel)))
     }
 
     /// Count project proposals that have not received any promoted ledger
@@ -698,6 +769,7 @@ mod tests {
             still_open: vec![],
             retired_while_away,
             open_proposals: 0,
+            top_dream: None,
         };
 
         let got = compose_recap(&ep, &feeds, "1h ago").unwrap();

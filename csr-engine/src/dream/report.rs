@@ -1446,7 +1446,7 @@ fn dream_grade_prefix(grade: DreamItemGrade) -> &'static str {
     }
 }
 
-fn dream_grade_slug_label(grade: DreamItemGrade) -> (&'static str, &'static str) {
+pub(crate) fn dream_grade_slug_label(grade: DreamItemGrade) -> (&'static str, &'static str) {
     match grade {
         DreamItemGrade::ItemGrade => ("item-grade", "item-grade"),
         DreamItemGrade::SessionGrade => ("session-grade", "session-grade"),
@@ -1476,7 +1476,7 @@ fn dream_evidence_subject_line(evidence: &DreamEvidence, prefix: &str) -> String
 /// newest-witnessed-first from `dream_items::dedup_and_cap_evidence`).
 /// Proposal rows never appear here — they carry no file/symbol to attribute
 /// a change against.
-fn dream_card_lines(evidence: &[DreamEvidence], grade: DreamItemGrade) -> Vec<String> {
+pub(crate) fn dream_card_lines(evidence: &[DreamEvidence], grade: DreamItemGrade) -> Vec<String> {
     let prefix = dream_grade_prefix(grade);
     evidence
         .iter()
@@ -1489,7 +1489,7 @@ fn dream_card_lines(evidence: &[DreamEvidence], grade: DreamItemGrade) -> Vec<St
 /// `"left open <date> · witnessed <date>[ · +N more]"` — `+N more` counts
 /// the non-proposal evidence rows beyond the 2 shown as dream-lines, so the
 /// number is always traceable to stored evidence, never an estimate.
-fn dream_card_meta(item: &DreamItem) -> String {
+pub(crate) fn dream_card_meta(item: &DreamItem) -> String {
     let mut meta = format!("left open {}", iso_date(&item.origin_ts));
     if let Some(latest) = item.evidence.first() {
         meta.push_str(" · witnessed ");
@@ -1524,7 +1524,10 @@ fn build_dream_card(item: &DreamItem) -> DreamCardView {
 /// receipt"`) rather than silently omitting the clause — the card's compact
 /// dream-lines can afford the omission, but the detail pane's whole point is
 /// to be the honest, complete evidence list.
-fn dream_detail_evidence_lines(evidence: &[DreamEvidence], grade: DreamItemGrade) -> Vec<String> {
+pub(crate) fn dream_detail_evidence_lines(
+    evidence: &[DreamEvidence],
+    grade: DreamItemGrade,
+) -> Vec<String> {
     let prefix = dream_grade_prefix(grade);
     evidence
         .iter()
@@ -1671,7 +1674,7 @@ struct DreamReportData {
 }
 
 /// First 8 hex chars of a commit oid.
-fn short_oid(oid: &str) -> String {
+pub(crate) fn short_oid(oid: &str) -> String {
     oid.chars().take(8).collect()
 }
 
@@ -1698,7 +1701,7 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     truncated
 }
 
-fn pluralize(count: usize, noun: &str) -> String {
+pub(crate) fn pluralize(count: usize, noun: &str) -> String {
     if count == 1 {
         format!("{count} {noun}")
     } else {
@@ -1776,7 +1779,7 @@ fn json_for_html_script<T: Serialize>(value: &T) -> String {
         .replace('\u{2029}', "\\u2029")
 }
 
-fn iso_date(timestamp: &str) -> String {
+pub(crate) fn iso_date(timestamp: &str) -> String {
     timestamp.get(..10).unwrap_or(timestamp).to_string()
 }
 

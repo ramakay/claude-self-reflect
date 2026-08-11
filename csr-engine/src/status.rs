@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::import;
 use crate::storage::Storage;
@@ -65,7 +65,7 @@ pub struct DreamVerdictTotals {
 /// daemon cycle that runs and writes zero new events (re-running at an
 /// unchanged HEAD) still counts as "the daemon acted" and moves cadence
 /// forward, but would leave `last_run` frozen since no event was written.
-#[derive(Serialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Debug, PartialEq)]
 pub struct DreamStatus {
     /// Whether daemon dreaming is enabled by configuration.
     pub daemon_enabled: bool,
@@ -88,6 +88,105 @@ pub struct DreamStatus {
     /// depends on daemon process-start state a stateless status read doesn't
     /// have (see `daemon::dream_cadence::first_cycle_due_at`).
     pub next_due: Option<String>,
+    /// Journal v4 P5 cadence, spend policy and delivery state.
+    pub cadence: DreamCadenceStatus,
+    pub effort: DreamEffortStatus,
+    pub badge: DreamBadgeStatus,
+    /// Spend across every dreaming call site to date. `None` when no usage
+    /// row exists — never a zero, which would read as "dreaming is free".
+    pub spend: Option<DreamSpendStatus>,
+    pub server: DreamServerStatus,
+}
+
+/// Cadence state (locked decision 5): idle trigger plus nightly floor.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DreamCadenceStatus {
+    /// Idleness required before an idle-triggered pass may start.
+    pub idle_threshold_secs: u64,
+    /// Local hour of the guaranteed nightly floor pass.
+    pub floor_hour: u32,
+    /// Newest session/transcript write CSR has observed. `None` when neither
+    /// `import_state` nor `session_registry` holds a parseable timestamp.
+    pub last_activity: Option<String>,
+    /// Whether the machine is quiet enough for an idle pass right now.
+    /// `false` when `last_activity` is `None` — unobserved is not idle.
+    pub idle_now: bool,
+    /// Which trigger started the last COMPLETED pass — `"idle"` or
+    /// `"nightly_floor"`. `None` before any pass has completed.
+    pub last_trigger: Option<String>,
+    /// Whether the nightly floor pass is currently owed.
+    pub floor_due: bool,
+}
+
+/// Effort tier and budget (locked decisions 8 and 14).
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DreamEffortStatus {
+    pub tier: String,
+    pub reasoning_effort: String,
+    pub episodes_per_pass: usize,
+    /// Model the night actor runs at for this tier, unless
+    /// `CSR_DREAM_THREAD_MODEL` overrides it.
+    pub model: String,
+    /// Invocation cap a pass starting now would get.
+    pub budget_cap: usize,
+    /// The last completed pass's measured budget usage. `None` before any
+    /// pass has recorded one.
+    pub last_pass: Option<DreamBudgetUsage>,
+    /// How many invalid `CSR_DREAM_EFFORT` values have been seen. `None`
+    /// when the counter was never written (not the same as zero observed).
+    pub invalid_values: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
+pub struct DreamBudgetUsage {
+    pub cap: usize,
+    pub used: usize,
+    /// Candidates left for the next pass because the cap was reached.
+    pub queued: usize,
+}
+
+impl DreamBudgetUsage {
+    /// Budget still available in the last pass — a subtraction of two
+    /// measured numbers, not an estimate.
+    pub fn remaining(&self) -> usize {
+        self.cap.saturating_sub(self.used)
+    }
+}
+
+/// Statusline badge state (delivery channel (a)).
+#[derive(Serialize, Debug, PartialEq, Eq, Default)]
+pub struct DreamBadgeStatus {
+    /// Dreams measured as undelivered by the last pass, minus those
+    /// delivered since. `None` until a pass has measured a baseline — the
+    /// statusline then shows no badge at all rather than a fabricated zero.
+    pub unread: Option<i64>,
+    /// When that baseline was measured.
+    pub measured_at: Option<String>,
+}
+
+/// Spend to date across dreaming's model call sites.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct DreamSpendStatus {
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    /// List-price US$, or `None` when any contributing model has no
+    /// published price (a partial total would understate it).
+    pub cost_usd: Option<f64>,
+    pub unpriced_models: Vec<String>,
+}
+
+/// The journal server (locked decision 7) — where it is and whether anything
+/// answers there.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DreamServerStatus {
+    /// `None` when `CSR_NO_JOURNAL_SERVER` disables it.
+    pub url: Option<String>,
+    /// Whether a loopback TCP connect to the configured port succeeded just
+    /// now. This proves something is listening there — it does not prove it
+    /// is this binary's journal, so the field is named for what was
+    /// measured.
+    pub port_reachable: bool,
 }
 
 impl Default for DreamStatus {
@@ -102,6 +201,36 @@ impl Default for DreamStatus {
             ancestry_cached_conversations: 0,
             last_daemon_run: None,
             next_due: None,
+            cadence: DreamCadenceStatus {
+                idle_threshold_secs: crate::daemon::dream_cadence::DEFAULT_IDLE_MINS * 60,
+                floor_hour: crate::daemon::dream_cadence::DEFAULT_FLOOR_HOUR,
+                last_activity: None,
+                idle_now: false,
+                last_trigger: None,
+                floor_due: true,
+            },
+            effort: DreamEffortStatus::default(),
+            badge: DreamBadgeStatus::default(),
+            spend: None,
+            server: DreamServerStatus {
+                url: None,
+                port_reachable: false,
+            },
+        }
+    }
+}
+
+impl Default for DreamEffortStatus {
+    fn default() -> Self {
+        let tier = crate::dream::policy::effort_tier();
+        Self {
+            tier: tier.as_str().to_string(),
+            reasoning_effort: tier.reasoning_effort().to_string(),
+            episodes_per_pass: tier.episodes_per_pass(),
+            model: crate::dream::threads::primary_thread_model(),
+            budget_cap: crate::dream::policy::budget_cap(tier),
+            last_pass: None,
+            invalid_values: None,
         }
     }
 }
@@ -446,7 +575,8 @@ fn gather_dream_with(
     };
     let last_daemon_run_dt = crate::daemon::dream_cadence::read_last_run(storage);
     let last_daemon_run = last_daemon_run_dt.map(|t| t.to_rfc3339());
-    let daemon_enabled = !crate::daemon::dream_cadence::dreaming_disabled();
+    let daemon_enabled = !crate::daemon::dream_cadence::dreaming_disabled()
+        && !crate::daemon::dream_cadence::consent_declined(storage);
     // The TUI only renders this count for the enabled/never-run state, so keep
     // the extra COUNT query off the steady-state refresh path.
     let witnesses_ledgered = if daemon_enabled && last_daemon_run_dt.is_none() {
@@ -480,6 +610,100 @@ fn gather_dream_with(
         ancestry_cached_conversations: storage.ancestry_cache_count().unwrap_or(0),
         last_daemon_run,
         next_due,
+        cadence: gather_cadence(storage, last_daemon_run_dt),
+        effort: gather_effort(storage),
+        badge: DreamBadgeStatus {
+            unread: crate::storage::dream_delivery::badge_unread(storage),
+            measured_at: crate::storage::dream_delivery::badge_measured_at(storage),
+        },
+        spend: gather_dream_spend(storage),
+        server: gather_journal_server(),
+    }
+}
+
+/// Journal v4 P5 cadence block. Every field is either a configured value or
+/// something measured from storage; nothing is inferred from absence.
+fn gather_cadence(
+    storage: &Storage,
+    last_daemon_run: Option<chrono::DateTime<chrono::Utc>>,
+) -> DreamCadenceStatus {
+    use crate::daemon::dream_cadence as cadence;
+    let now = chrono::Utc::now();
+    let idle_threshold_secs = cadence::idle_secs();
+    let floor_hour = cadence::floor_hour();
+    let last_activity = cadence::last_activity_at(storage);
+    DreamCadenceStatus {
+        idle_threshold_secs,
+        floor_hour,
+        idle_now: cadence::is_idle(last_activity, now, idle_threshold_secs),
+        last_activity: last_activity.map(|t| t.to_rfc3339()),
+        last_trigger: storage.get_meta(cadence::META_LAST_TRIGGER).unwrap_or(None),
+        floor_due: cadence::floor_due(
+            last_daemon_run.map(|t| t.with_timezone(&chrono::Local).naive_local()),
+            now.with_timezone(&chrono::Local).naive_local(),
+            floor_hour,
+        ),
+    }
+}
+
+/// Effort tier + budget block. `last_pass` is parsed from the meta row the
+/// last completed cycle wrote; an unparseable row reads as `None` rather
+/// than as zeros.
+fn gather_effort(storage: &Storage) -> DreamEffortStatus {
+    let tier = crate::dream::policy::effort_tier();
+    let last_pass = storage
+        .get_meta(crate::daemon::dream_cadence::META_LAST_BUDGET)
+        .unwrap_or(None)
+        .and_then(|raw| serde_json::from_str::<DreamBudgetUsage>(&raw).ok());
+    DreamEffortStatus {
+        tier: tier.as_str().to_string(),
+        reasoning_effort: tier.reasoning_effort().to_string(),
+        episodes_per_pass: tier.episodes_per_pass(),
+        model: crate::dream::threads::primary_thread_model(),
+        budget_cap: crate::dream::policy::budget_cap(tier),
+        last_pass,
+        invalid_values: crate::dream::policy::invalid_effort_count(storage),
+    }
+}
+
+/// Spend to date across dreaming's model call sites (`dream_threads`,
+/// `dream_plan`). `None` when nothing was ever recorded.
+fn gather_dream_spend(storage: &Storage) -> Option<DreamSpendStatus> {
+    let rows = storage
+        .with_connection(|conn| {
+            crate::storage::queries::narrative_usage_for_call_sites(
+                conn,
+                &["dream_threads", "dream_plan"],
+            )
+        })
+        .unwrap_or_default();
+    let spend = crate::journal::composer::DreamSpend::from_rows(&rows)?;
+    Some(DreamSpendStatus {
+        calls: spend.calls,
+        input_tokens: spend.input_tokens,
+        output_tokens: spend.output_tokens,
+        cost_usd: spend.cost_usd,
+        unpriced_models: spend.unpriced_models.clone(),
+    })
+}
+
+/// Where the journal server is, and whether anything answers there right
+/// now. The probe is a bounded loopback TCP connect — it proves a listener
+/// exists, which is why the field is `port_reachable` and not `serving`.
+fn gather_journal_server() -> DreamServerStatus {
+    use std::net::TcpStream;
+    if crate::journal::server_disabled() {
+        return DreamServerStatus {
+            url: None,
+            port_reachable: false,
+        };
+    }
+    let addr = crate::journal::loopback_addr(crate::journal::configured_port());
+    let port_reachable =
+        TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(150)).is_ok();
+    DreamServerStatus {
+        url: Some(crate::journal::url_for(addr)),
+        port_reachable,
     }
 }
 
@@ -826,6 +1050,17 @@ fn format_compact(report: &StatusReport) -> String {
     {
         out.push_str(" | ☾ due");
     }
+    // Journal v4 P5 delivery channel (a): unread dreams and where to read
+    // them. `None` (no pass has ever measured a baseline) prints nothing at
+    // all — a `0` here would claim "nothing new" on evidence nobody
+    // gathered. A measured 0 is also silent: the badge exists to point at
+    // something unread.
+    if let Some(unread) = report.dream.badge.unread.filter(|&count| count > 0) {
+        match report.dream.server.url.as_deref() {
+            Some(url) => out.push_str(&format!(" | ☾ {unread} unread {url}")),
+            None => out.push_str(&format!(" | ☾ {unread} unread")),
+        }
+    }
     // v10 "dreaming" Full channel: only speak up when there's something to
     // forget — terse by design, matching the rest of this line's style.
     if report.dream.demoted_symbols > 0 {
@@ -942,6 +1177,7 @@ mod tests {
             ancestry_cached_conversations: 0,
             last_daemon_run: None,
             next_due: None,
+            ..DreamStatus::default()
         };
         let line = format_compact(&report);
         assert!(
@@ -1068,9 +1304,181 @@ mod tests {
 
         let _storage = Storage::open(&db_path).unwrap();
         let report = gather_status(&db_path, &projects_dir, false).unwrap();
-        assert_eq!(report.dream, DreamStatus::default());
+        // The journal-server block is the one environment-dependent field:
+        // whether a listener answers on the loopback port depends on whether
+        // this machine happens to be running the daemon. Carry it across and
+        // assert its contract separately, so the rest of the block is still
+        // compared exactly.
+        let expected = DreamStatus {
+            server: DreamServerStatus {
+                url: report.dream.server.url.clone(),
+                port_reachable: report.dream.server.port_reachable,
+            },
+            ..DreamStatus::default()
+        };
+        assert_eq!(report.dream, expected);
+        assert_eq!(
+            report.dream.server.url.is_some(),
+            !crate::journal::server_disabled(),
+            "a URL is offered exactly when the server is not killed"
+        );
         assert_eq!(report.dream.demoted_symbols, 0);
         assert!(report.dream.last_run.is_none());
+    }
+
+    // ── Journal v4 P5: badge, cadence, effort, spend, server ──
+
+    #[test]
+    fn compact_shows_no_badge_until_a_pass_has_measured_one() {
+        let mut report = base_report();
+        report.dream.badge.unread = None;
+        assert!(
+            !format_compact(&report).contains("unread"),
+            "an unmeasured badge must print nothing, never a zero"
+        );
+        report.dream.badge.unread = Some(0);
+        assert!(
+            !format_compact(&report).contains("unread"),
+            "a measured zero has nothing to point at"
+        );
+    }
+
+    #[test]
+    fn compact_badge_shows_the_count_and_the_journal_url() {
+        let mut report = base_report();
+        report.dream.badge.unread = Some(3);
+        report.dream.server.url = Some("http://127.0.0.1:7373/".into());
+        let line = format_compact(&report);
+        assert!(line.contains("☾ 3 unread http://127.0.0.1:7373/"), "{line}");
+    }
+
+    #[test]
+    fn compact_badge_omits_a_url_it_does_not_have() {
+        let mut report = base_report();
+        report.dream.badge.unread = Some(2);
+        report.dream.server.url = None;
+        let line = format_compact(&report);
+        assert!(line.contains("☾ 2 unread"), "{line}");
+        assert!(!line.contains("http"), "{line}");
+    }
+
+    #[test]
+    fn status_effort_block_reports_the_tier_and_its_budget() {
+        let storage = Storage::open_memory().unwrap();
+        let effort = gather_effort(&storage);
+        let tier = crate::dream::policy::effort_tier();
+        assert_eq!(effort.tier, tier.as_str());
+        assert_eq!(effort.reasoning_effort, tier.reasoning_effort());
+        assert_eq!(effort.episodes_per_pass, tier.episodes_per_pass());
+        assert_eq!(effort.budget_cap, crate::dream::policy::budget_cap(tier));
+        assert_eq!(
+            effort.last_pass, None,
+            "a pass that never ran reports no budget usage, not a zeroed one"
+        );
+        assert_eq!(effort.invalid_values, None);
+    }
+
+    #[test]
+    fn status_effort_block_reads_the_last_pass_budget_and_counts_invalid_tiers() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .set_meta(
+                crate::daemon::dream_cadence::META_LAST_BUDGET,
+                r#"{"cap":25,"used":7,"queued":4}"#,
+            )
+            .unwrap();
+        crate::dream::policy::record_invalid_effort(&storage);
+        let effort = gather_effort(&storage);
+        let usage = effort.last_pass.expect("a recorded budget must be read back");
+        assert_eq!(usage.cap, 25);
+        assert_eq!(usage.used, 7);
+        assert_eq!(usage.queued, 4);
+        assert_eq!(usage.remaining(), 18);
+        assert_eq!(effort.invalid_values, Some(1));
+    }
+
+    #[test]
+    fn status_effort_block_reports_no_budget_for_an_unparseable_record() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .set_meta(crate::daemon::dream_cadence::META_LAST_BUDGET, "not json")
+            .unwrap();
+        assert_eq!(gather_effort(&storage).last_pass, None);
+    }
+
+    #[test]
+    fn status_cadence_block_reports_measured_activity_and_the_floor() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let storage = Storage::open_memory().unwrap();
+        let fresh = gather_cadence(&storage, None);
+        assert_eq!(fresh.last_activity, None);
+        assert!(!fresh.idle_now, "no observed activity is not idleness");
+        assert!(fresh.floor_due, "a machine that never dreamed is owed a pass");
+        assert_eq!(fresh.last_trigger, None);
+
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO import_state (file_path, conversation_id, chunks_imported, file_mtime)
+                     VALUES ('/tmp/a.jsonl', 'conv-a', 1, '2020-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .set_meta(crate::daemon::dream_cadence::META_LAST_TRIGGER, "idle")
+            .unwrap();
+        let aged = gather_cadence(&storage, None);
+        assert_eq!(aged.last_activity.as_deref(), Some("2020-01-01T00:00:00+00:00"));
+        assert!(aged.idle_now, "a five-year-old transcript is idle by any threshold");
+        assert_eq!(aged.last_trigger.as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn status_spend_is_none_until_a_dreaming_call_was_recorded() {
+        let storage = Storage::open_memory().unwrap();
+        assert!(
+            gather_dream_spend(&storage).is_none(),
+            "no recorded usage must render nothing, never a zero"
+        );
+        storage
+            .record_narrative_usage_for(
+                &crate::storage::NarrativeUsageRow {
+                    call_site: "dream_threads".into(),
+                    model: "sonnet-5".into(),
+                    input_tokens: 1_000,
+                    output_tokens: 200,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    duration_ms: 0,
+                    success: true,
+                },
+                Some("hash-1"),
+            )
+            .unwrap();
+        // A non-dreaming call site must not be counted as dreaming spend.
+        storage
+            .record_narrative_usage_for(
+                &crate::storage::NarrativeUsageRow {
+                    call_site: "briefing".into(),
+                    model: "sonnet-5".into(),
+                    input_tokens: 9_999,
+                    output_tokens: 9_999,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    duration_ms: 0,
+                    success: true,
+                },
+                None,
+            )
+            .unwrap();
+        let spend = gather_dream_spend(&storage).expect("recorded usage must surface");
+        assert_eq!(spend.calls, 1);
+        assert_eq!(spend.input_tokens, 1_000);
+        assert_eq!(spend.output_tokens, 200);
+        assert!(spend.cost_usd.is_some());
+        assert!(spend.unpriced_models.is_empty());
     }
 
     #[test]

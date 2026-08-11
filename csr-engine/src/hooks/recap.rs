@@ -22,6 +22,21 @@ pub struct SettledFact {
     pub status: String,
 }
 
+/// The one dream clause the recap may carry (Journal v4 P5, delivery channel
+/// (b)). Constructed only from a stored, receipt-bearing conclusion — there
+/// is no constructor that can produce one without a receipt, which is why
+/// the clause cannot be emitted unreceipted.
+pub struct DreamClause {
+    /// Symbol or file basename the conclusion is about.
+    pub label: String,
+    /// Plain-English phrasing of the stored verdict.
+    pub verdict: String,
+    /// Commit receipt proving it. Mandatory.
+    pub receipt: String,
+    /// `YYYY-MM-DD` the verdict was witnessed.
+    pub date: String,
+}
+
 /// A previously held line invalidated while the user was away.
 pub struct RetiredLine {
     pub label: String,
@@ -39,7 +54,17 @@ pub struct RecapFeeds {
     pub still_open: Vec<SettledFact>,
     pub retired_while_away: Vec<RetiredLine>,
     pub open_proposals: usize,
+    /// The top undelivered dream for this project, or `None`. `None` drops
+    /// the `Dreamt:` clause entirely — the clause is never emitted with a
+    /// placeholder, a hedge, or a receiptless label.
+    pub top_dream: Option<DreamClause>,
 }
+
+/// The clause prefix the dream delivery uses. Exposed so the caller can
+/// verify the clause actually survived the recap's character budget before
+/// recording a delivery — recording one for a clause that got dropped would
+/// claim the user was shown something they were not.
+pub const DREAM_CLAUSE_PREFIX: &str = "Dreamt: ";
 
 /// Compose an evidence-backed recap without reading external state.
 pub fn compose_recap(
@@ -142,6 +167,25 @@ pub fn compose_recap(
         .collect();
     let next_line = next.map(|next| format!("Next: {next}."));
 
+    // Journal v4 P5 delivery channel (b): one clause naming the top dream and
+    // its receipt. Same evidence gating as every other clause — no feed, no
+    // clause; and the feed itself cannot carry a receiptless conclusion.
+    let dream_entries: Vec<String> = feeds
+        .top_dream
+        .iter()
+        .filter(|dream| !normalize_feed_text(&dream.receipt).is_empty())
+        .filter(|dream| has_substance(&normalize_feed_text(&dream.label)))
+        .map(|dream| {
+            format!(
+                "{} {} ({}, {})",
+                normalize_feed_text(&dream.label),
+                normalize_feed_text(&dream.verdict),
+                normalize_feed_text(&dream.date),
+                normalize_feed_text(&dream.receipt)
+            )
+        })
+        .collect();
+
     // Reserve one whole entry for every eligible evidence-list clause before
     // using any residual budget for extras. If the minimum set itself cannot
     // fit, drop its largest list clause rather than truncating an entry.
@@ -149,6 +193,7 @@ pub fn compose_recap(
         ListClause::new("Settled: ", "; ", settled_entries),
         ListClause::new("Now: ", " | ", now_parts),
         ListClause::new("Learnt-then-retired while away: ", "; ", retired_entries),
+        ListClause::new(DREAM_CLAUSE_PREFIX, "; ", dream_entries),
     ];
     let mut used = recap.chars().count()
         + next_line
@@ -547,6 +592,7 @@ mod tests {
                 date: "2026-08-06".into(),
             }],
             open_proposals: 2,
+            top_dream: None,
         }
     }
 
@@ -808,6 +854,7 @@ mod tests {
                 date: "2026-08-07".into(),
             }],
             open_proposals: 8,
+            top_dream: None,
         };
         let got = compose_recap(&ep, &feeds, "now").unwrap();
         assert!(got.chars().count() <= 700);
@@ -914,6 +961,7 @@ mod tests {
                 date: "2026-08-06".into(),
             }],
             open_proposals: 3,
+            top_dream: None,
         };
         let got = compose_recap(&episode(), &feeds, "28m ago").unwrap();
         assert!(got.contains("\nSettled:"));
@@ -953,6 +1001,7 @@ mod tests {
                 still_open: vec![],
                 retired_while_away: vec![],
                 open_proposals: 0,
+                top_dream: None,
             }
         }
     }
@@ -1028,6 +1077,88 @@ mod tests {
         assert!(!got.contains(",..."), "comma against ellipsis: {got:?}");
         assert!(!got.contains(": - "), "flattened bullet: {got:?}");
         assert!(!got.contains("Next:"), "next was fabricated: {got:?}");
+    }
+
+    // ---- Journal v4 P5: the dream clause (delivery channel (b)) ----------
+
+    fn dream() -> DreamClause {
+        DreamClause {
+            label: "parse_config".into(),
+            verdict: "went stale".into(),
+            receipt: "abc1234".into(),
+            date: "2026-08-11".into(),
+        }
+    }
+
+    #[test]
+    fn dream_clause_names_the_conclusion_with_its_receipt() {
+        let feeds = RecapFeeds {
+            top_dream: Some(dream()),
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        assert!(
+            got.contains("Dreamt: parse_config went stale (2026-08-11, abc1234)."),
+            "clause missing or unreceipted: {got}"
+        );
+    }
+
+    #[test]
+    fn dream_clause_drops_entirely_without_a_feed() {
+        let got = compose_recap(&episode(), &RecapFeeds::empty(), "now").unwrap();
+        assert!(
+            !got.contains(DREAM_CLAUSE_PREFIX),
+            "no evidence must mean no clause: {got}"
+        );
+    }
+
+    #[test]
+    fn dream_clause_drops_when_the_receipt_is_missing() {
+        let feeds = RecapFeeds {
+            top_dream: Some(DreamClause {
+                receipt: "   ".into(),
+                ..dream()
+            }),
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        assert!(
+            !got.contains(DREAM_CLAUSE_PREFIX),
+            "a receiptless conclusion must never be named: {got}"
+        );
+    }
+
+    #[test]
+    fn dream_clause_drops_when_the_label_carries_no_substance() {
+        let feeds = RecapFeeds {
+            top_dream: Some(DreamClause {
+                label: "\u{2026}".into(),
+                ..dream()
+            }),
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        assert!(!got.contains(DREAM_CLAUSE_PREFIX), "{got}");
+    }
+
+    #[test]
+    fn dream_clause_obeys_the_same_character_budget_as_every_other_clause() {
+        let mut ep = episode();
+        ep.request = "r".repeat(200);
+        ep.completed = "c".repeat(250);
+        let feeds = RecapFeeds {
+            settled: (0..4)
+                .map(|n| SettledFact {
+                    claim: format!("{}-{n}", "settled".repeat(30)),
+                    receipt: format!("receipt{n}"),
+                    status: "resolved".into(),
+                })
+                .collect(),
+            top_dream: Some(dream()),
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&ep, &feeds, "now").unwrap();
+        assert!(got.chars().count() <= 700);
     }
 
     // ---- T3: machine-owned recap sentinel — metamorphic wrapper tests ----

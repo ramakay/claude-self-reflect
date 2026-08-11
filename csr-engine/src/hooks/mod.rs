@@ -6,6 +6,7 @@
 //! 3. Writes text to stdout (injected into Claude's context)
 //! 4. Exits with code 0 (never blocks the session)
 
+pub mod dream_match;
 pub mod install;
 pub mod intent;
 pub mod post_tool_use;

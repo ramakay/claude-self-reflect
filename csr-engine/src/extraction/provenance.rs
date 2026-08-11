@@ -89,6 +89,23 @@ const EMISSION_FIELD_TOKENS: [&str; 8] = [
 /// this sentinel inside its own char budget.
 pub const RECAP_SENTINEL: &str = "[[CSR:RECAP]]";
 
+/// Machine-owned sentinel carried by every prompt-time dream injection
+/// (`hooks::dream_match`, Journal v4 P5 delivery channel (c)). Distinct token
+/// from [`RECAP_SENTINEL`] so the two channels stay separately attributable,
+/// but the same contract: scanned across the FULL text, normalized, before
+/// any grammar-dependent branch, so an injected dream line can never be
+/// re-imported as user content no matter how it is quoted, bulleted or
+/// re-pasted.
+///
+/// **Not** the Journal v4 P4b *attribution* marker. That marker (a short
+/// dream id appended to a copy block the user pastes into a NEW session) must
+/// be RETAINED and indexed; this one causes rejection. They must never share
+/// a token.
+pub const DREAM_SENTINEL: &str = "[[CSR:DREAM]]";
+
+/// Every machine-owned sentinel whose presence rejects the text outright.
+const MACHINE_SENTINELS: [&str; 2] = [RECAP_SENTINEL, DREAM_SENTINEL];
+
 /// Code points that render as zero-width/invisible. An adversarial re-paste
 /// can interleave these around or inside the sentinel to defeat a naive
 /// substring search; stripping them first restores contiguity regardless of
@@ -129,6 +146,17 @@ fn normalize_for_sentinel_scan(text: &str) -> String {
 /// arbitrarily long preamble and must still be caught.
 pub fn contains_recap_sentinel(text: &str) -> bool {
     normalize_for_sentinel_scan(text).contains(RECAP_SENTINEL)
+}
+
+/// True if `text` carries ANY machine-owned sentinel ([`RECAP_SENTINEL`] or
+/// [`DREAM_SENTINEL`]) — same normalization, same full-text scan. Every
+/// rejection path uses this; [`contains_recap_sentinel`] stays recap-specific
+/// so callers that mean "a recap, specifically" keep saying so.
+pub fn contains_machine_sentinel(text: &str) -> bool {
+    let normalized = normalize_for_sentinel_scan(text);
+    MACHINE_SENTINELS
+        .iter()
+        .any(|sentinel| normalized.contains(sentinel))
 }
 
 /// Claude Code transcript wrapper tags. Their contents are command plumbing or
@@ -211,9 +239,9 @@ pub fn strip_quoted(text: &str) -> String {
 /// True if `text` is CSR's own emitted output (or an echo of it): an emission
 /// header in the leading window, or ≥2 distinct emission field tokens anywhere.
 pub fn is_csr_emission(text: &str) -> bool {
-    // Machine-owned sentinel, scanned across the FULL text before any
+    // Machine-owned sentinels, scanned across the FULL text before any
     // window-limited or grammar-based heuristic below runs.
-    if contains_recap_sentinel(text) {
+    if contains_machine_sentinel(text) {
         return true;
     }
 
@@ -265,7 +293,7 @@ pub fn extractable(text: &str) -> Option<String> {
     // genuine content. Historical header/field-token branches still apply
     // after strip_quoted on cleaned prose — quoted echoes alone must not
     // reject genuine unquoted content co-occurring with them.
-    if contains_recap_sentinel(&unplumbed) {
+    if contains_machine_sentinel(&unplumbed) {
         return None;
     }
     let prose = strip_quoted(&unplumbed);

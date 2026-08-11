@@ -990,6 +990,70 @@ pub fn run(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_dream_threads_project ON dream_threads(project);",
     )?;
 
+    // Journal v4 Phase 4 — verified structured plans (`journal::composer`).
+    // `plan_hash` is the convergence key, computed exactly like
+    // `dream::threads::episode_hash`: a re-run over unchanged evidence either
+    // finds the stored plan or the sentinel row (`context = ''` with
+    // `steps_json = '[]'`, written when verification kept nothing), so a
+    // frozen corpus costs zero further spend. `dropped` is the measured
+    // count of steps the deterministic verifier removed — it is rendered as
+    // a number, never inferred from the difference between two vectors.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dream_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_hash TEXT NOT NULL UNIQUE,
+            item_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            context TEXT NOT NULL,
+            steps_json TEXT NOT NULL,
+            files_json TEXT NOT NULL,
+            acceptance TEXT,
+            dropped INTEGER NOT NULL DEFAULT 0,
+            model TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_dream_plans_item ON dream_plans(item_id);",
+    )?;
+
+    // Journal v4 Phase 4 — per-dream spend attribution (locked decision 13).
+    // `narrative_usage` had no key tying a row to the dream that caused it,
+    // so a per-dream figure could only ever have been inferred from a
+    // timestamp window. `ref_id` makes it evidence instead: the producer
+    // writes the convergence hash it was working under, and the composer
+    // sums only rows carrying that exact hash. Legacy rows stay NULL and are
+    // therefore never attributed to any dream — a dream with no recorded
+    // usage renders NOTHING, never a zero that would read as free.
+    let has_usage_ref_col: bool = conn
+        .prepare("SELECT ref_id FROM narrative_usage LIMIT 0")
+        .is_ok();
+    if !has_usage_ref_col {
+        let _ = conn.execute_batch(
+            "ALTER TABLE narrative_usage ADD COLUMN ref_id TEXT;
+             CREATE INDEX IF NOT EXISTS idx_narrative_usage_ref ON narrative_usage(ref_id);",
+        );
+    }
+
+    // Journal v4 Phase 5 — delivery ledger (`storage::dream_delivery`). One
+    // row per (conclusion, channel) that was actually shown to the user, so
+    // the SessionStart recap clause and the prompt-time match never repeat
+    // themselves. The UNIQUE index is what makes "claim it or do not inject"
+    // a single atomic step rather than a check-then-write race. A row proves
+    // the user was shown something; its absence proves nothing.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dream_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dream_id TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            session_id TEXT,
+            delivered_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dream_deliveries_unique
+            ON dream_deliveries(dream_id, channel);
+        CREATE INDEX IF NOT EXISTS idx_dream_deliveries_at
+            ON dream_deliveries(delivered_at);",
+    )?;
+
     // D5 one-shot backfill: rewrite worktree-local paths already stored in
     // code_evolution.file_path / code_nodes.file to canonical main-repo form.
     // Gated by `meta` so it runs exactly once per database, never on every

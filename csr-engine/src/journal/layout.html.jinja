@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{% block title %}CSR Dream Journal{% endblock %}</title>
+<style>
+  /* Journal v4 server surface. Token names and values are the SAME set the
+     static `dream --report` export uses (src/dream/report_template.html.jinja)
+     so the two surfaces stay one brand: the complete light palette is defined
+     on bare :root, and only the tokens change in the two dark blocks. No
+     @font-face here — the static export inlines two woff2 files as base64
+     because it must survive being copied to another machine; a loopback
+     server has no such constraint, so the same --serif stack is declared and
+     falls back to Georgia when Playfair Display is not installed locally.
+     Nothing in this document makes a network request. */
+  :root {
+    --sky-top: #e8e4f0;
+    --sky-bottom: #c8cae0;
+    --ink: #1a1a2e;
+    --slate: #4a4a6a;
+    --label: #606080;
+    --purple: #6b5b95;
+    --purple-bg: rgba(107, 91, 149, 0.16);
+    --glass: rgba(255, 255, 255, 0.55);
+    --glass-border: rgba(255, 255, 255, 0.3);
+    --highlight: rgba(255, 255, 255, 0.55);
+    --radius-pane: 1.25rem;
+    --radius-tile: 0.75rem;
+    --serif: 'Playfair Display', Georgia, 'Times New Roman', serif;
+    --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+    --bg: rgba(255, 255, 255, 0.35);
+    --bg-card: var(--glass);
+    --fg: var(--ink);
+    --fg-muted: var(--slate);
+    --border: var(--glass-border);
+    --accent: var(--purple);
+    --red: #64484e;
+    --red-bg: rgba(181, 131, 141, 0.2);
+    --amber: #755b40;
+    --amber-bg: rgba(212, 165, 116, 0.22);
+    --green: #3f5238;
+    --green-bg: rgba(124, 148, 115, 0.2);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --sky-top: #1a1a2e;
+      --sky-bottom: #26263e;
+      --ink: #e8e6f0;
+      --slate: #9a98b5;
+      --label: #9694ae;
+      --purple: #9d8cc4;
+      --purple-bg: rgba(157, 140, 196, 0.2);
+      --glass: rgba(30, 30, 46, 0.55);
+      --glass-border: rgba(255, 255, 255, 0.12);
+      --highlight: rgba(255, 255, 255, 0.14);
+      --bg: rgba(30, 30, 46, 0.35);
+      --red: #f0a9b2;
+      --red-bg: rgba(229, 128, 140, 0.22);
+      --amber: #f0c58c;
+      --amber-bg: rgba(224, 163, 85, 0.24);
+      --green: #a9dd98;
+      --green-bg: rgba(143, 194, 122, 0.22);
+    }
+  }
+  :root[data-theme="dark"] {
+    --sky-top: #1a1a2e;
+    --sky-bottom: #26263e;
+    --ink: #e8e6f0;
+    --slate: #9a98b5;
+    --label: #9694ae;
+    --purple: #9d8cc4;
+    --purple-bg: rgba(157, 140, 196, 0.2);
+    --glass: rgba(30, 30, 46, 0.55);
+    --glass-border: rgba(255, 255, 255, 0.12);
+    --highlight: rgba(255, 255, 255, 0.14);
+    --bg: rgba(30, 30, 46, 0.35);
+    --red: #f0a9b2;
+    --red-bg: rgba(229, 128, 140, 0.22);
+    --amber: #f0c58c;
+    --amber-bg: rgba(224, 163, 85, 0.24);
+    --green: #a9dd98;
+    --green-bg: rgba(143, 194, 122, 0.22);
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    padding: 0 1.25rem 4rem;
+    min-height: 100vh;
+    background: linear-gradient(180deg, var(--sky-top) 0%, var(--sky-bottom) 100%);
+    background-attachment: fixed;
+    color: var(--fg);
+    font: 400 0.9375rem/1.6 -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  }
+  a { color: var(--accent); }
+  .wrap { max-width: 62rem; margin: 0 auto; }
+
+  .masthead {
+    max-width: 62rem; margin: 0 auto; padding: 2rem 0 1.25rem;
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .wordmark {
+    font-family: var(--serif); font-size: 1.5rem; font-weight: 700;
+    color: var(--fg); text-decoration: none; letter-spacing: -0.01em;
+  }
+  .wordmark span { color: var(--accent); }
+  .masthead-meta {
+    margin: 0; margin-left: auto; font-family: var(--mono);
+    font-size: 0.75rem; color: var(--label);
+  }
+  .masthead-meta span + span::before { content: " · "; }
+
+  .card-list { list-style: none; margin: 1.5rem 0 0; padding: 0; display: grid; gap: 1rem; }
+  .card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--radius-tile); padding: 1rem 1.15rem;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+  .card-title {
+    margin: 0.45rem 0 0; font-family: var(--serif); font-size: 1.0625rem;
+    line-height: 1.35; font-weight: 700;
+  }
+  .card-title a { color: var(--fg); text-decoration: none; }
+  .card-title a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+  .dream-lines { list-style: none; margin: 0.6rem 0 0; padding: 0; display: grid; gap: 0.25rem; }
+  .dream-lines li {
+    font-family: var(--mono); font-size: 0.8125rem; color: var(--fg-muted);
+  }
+  .card-meta {
+    margin: 0.7rem 0 0; font-family: var(--mono); font-size: 0.75rem; color: var(--label);
+  }
+
+  .chip {
+    display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px;
+    font-family: var(--mono); font-size: 0.6875rem; letter-spacing: 0.02em;
+    border: 1px solid var(--border); color: var(--fg-muted); background: var(--bg);
+  }
+  .chip.item-grade { color: var(--accent); background: var(--purple-bg); border-color: transparent; }
+  .chip.session-grade { color: var(--amber); background: var(--amber-bg); border-color: transparent; }
+  .chip.project { color: var(--label); }
+
+  .pager {
+    display: flex; gap: 1rem; margin: 1.75rem 0 0;
+    font-family: var(--mono); font-size: 0.8125rem;
+  }
+
+  .panel {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--radius-tile); padding: 1.15rem 1.25rem; margin: 1.25rem 0 0;
+  }
+  .panel h2 {
+    margin: 0 0 0.75rem; font-family: var(--mono); font-size: 0.75rem;
+    font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--label);
+  }
+  .contract { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.4rem; }
+  .contract li { font-family: var(--mono); font-size: 0.8125rem; color: var(--fg-muted); }
+  .contract b { color: var(--fg); font-weight: 600; }
+  .touch-next {
+    font-family: var(--serif); font-size: 1.25rem; line-height: 1.35;
+    font-weight: 700; margin: 0;
+  }
+  .prose { margin: 0.6rem 0 0; color: var(--fg-muted); }
+  .evidence { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.35rem; }
+  .evidence li { font-family: var(--mono); font-size: 0.8125rem; color: var(--fg-muted); }
+
+  .sub {
+    margin: 1.1rem 0 0.5rem; font-family: var(--mono); font-size: 0.6875rem;
+    font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--label);
+  }
+  .panel > .sub:first-of-type { margin-top: 0; }
+  .marker {
+    margin: 0.4rem 0 0; font-family: var(--mono); font-size: 0.6875rem; color: var(--label);
+  }
+
+  /* The brief gets its own scroll context so a long one never pushes the
+     rest of the page out of reach; the truncation marker below it reports
+     the measured total either way. */
+  .brief { max-height: 16rem; overflow-y: auto; overscroll-behavior: contain; }
+  .brief-lines { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.45rem; }
+  .brief-lines li { font-size: 0.875rem; color: var(--fg-muted); }
+  .brief-lines b {
+    display: block; font-family: var(--mono); font-size: 0.6875rem;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--label); font-weight: 600;
+  }
+
+  .copy-block {
+    margin: 0.5rem 0 0; padding: 0.9rem 1rem; max-height: 26rem; overflow: auto;
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-tile);
+    font-family: var(--mono); font-size: 0.75rem; line-height: 1.55;
+    color: var(--fg-muted); white-space: pre-wrap; word-break: break-word;
+  }
+
+  .plan-steps { margin: 0.6rem 0 0; padding-left: 1.2rem; display: grid; gap: 0.75rem; }
+  .step-action { margin: 0; color: var(--fg); }
+  .step-receipt {
+    margin: 0.2rem 0 0; font-family: var(--mono); font-size: 0.6875rem; color: var(--label);
+    word-break: break-word;
+  }
+  .spend { margin: 0.4rem 0 0; font-family: var(--mono); font-size: 0.8125rem; color: var(--fg-muted); }
+  .card-spend {
+    margin: 0.45rem 0 0; font-family: var(--mono); font-size: 0.6875rem; color: var(--label);
+  }
+
+  .ast-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+    gap: 1rem; margin-top: 0.6rem;
+  }
+  .ast-tree { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; }
+  .ast-tree li {
+    font-family: var(--mono); font-size: 0.75rem; color: var(--fg-muted);
+    padding: 0.25rem 0.5rem; border-radius: 0.35rem;
+  }
+  /* Solid = witnessed by the ledger. Dotted = deterministically resolved
+     only. Neither borrows a semantic verdict hue: an AST row is geometry,
+     not a verdict. */
+  .ast-tree li.witnessed { border: 1px solid var(--border); background: var(--bg); }
+  .ast-tree li.resolved { border: 1px dotted var(--border); }
+  .ast-kind { color: var(--label); }
+  .ast-receipt { color: var(--accent); }
+  .abstained {
+    margin: 0; padding: 1rem; border: 1px dotted var(--border);
+    border-radius: var(--radius-tile); color: var(--fg-muted);
+  }
+
+  /* Churn is neutral grey only — no warm bars, which would borrow adverse
+     semantics and read as justifying priority. */
+  .churn { list-style: none; margin: 0.6rem 0 0; padding: 0; display: grid; gap: 0.35rem; }
+  .churn li {
+    position: relative; display: flex; gap: 0.6rem; align-items: baseline;
+    font-family: var(--mono); font-size: 0.75rem; color: var(--fg-muted);
+    padding: 0.25rem 0.5rem; border-radius: 0.35rem; overflow: hidden;
+  }
+  .churn-bar {
+    position: absolute; inset: 0 auto 0 0; background: var(--bg); z-index: 0;
+  }
+  .churn-file, .churn-count { position: relative; z-index: 1; }
+  .churn-file { word-break: break-all; }
+  .churn-count { margin-left: auto; color: var(--label); white-space: nowrap; }
+
+  .empty {
+    margin: 2rem 0 0; padding: 2rem 1.25rem; text-align: center;
+    background: var(--bg-card); border: 1px dashed var(--border);
+    border-radius: var(--radius-tile);
+  }
+  .empty p { margin: 0.35rem 0; color: var(--fg-muted); }
+  .empty .lead { font-family: var(--serif); font-size: 1.25rem; color: var(--fg); }
+
+  .colophon {
+    max-width: 62rem; margin: 3rem auto 0; padding-top: 1rem;
+    border-top: 1px solid var(--border);
+    font-family: var(--mono); font-size: 0.6875rem; color: var(--label);
+  }
+  .colophon p { margin: 0.2rem 0; }
+</style>
+</head>
+<body>
+<header class="masthead">
+  <a class="wordmark" href="/">CSR <span>Dream Journal</span></a>
+  <p class="masthead-meta">{% block masthead_meta %}{% endblock %}</p>
+</header>
+<div class="wrap">
+{% block main %}{% endblock %}
+</div>
+<footer class="colophon">
+  <p>Served on 127.0.0.1 only — this page is not reachable from any other machine, and it makes no network requests.</p>
+  <p>Read-only surface over the witness ledger. A verdict row proves a past state, never a current one.</p>
+</footer>
+</body>
+</html>

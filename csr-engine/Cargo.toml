@@ -41,10 +41,27 @@ ignore = "0.4"
 toml = "0.9"
 codewitness = { path = "../codewitness" }
 minijinja = "2.22"
+# Journal v4 dream server (loopback only). `default-features = false` keeps
+# http2, ws, multipart, form and macros OUT of the binary: the server binds
+# 127.0.0.1 and serves HTML/JSON over HTTP/1.1 to a local browser, nothing
+# else. hyper/hyper-util/tower/tower-http/rustls are already compiled via
+# reqwest, so this adds only axum, axum-core, httpdate, matchit and
+# serde_path_to_error.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+    "tracing",
+] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
+# Route-level journal tests drive the axum Router through `ServiceExt::oneshot`
+# so no socket is ever bound in the test suite. tower 0.5 is already in the
+# dependency graph via reqwest/tower-http.
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "spike_bench"

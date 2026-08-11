@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 700 700" width="700" height="700" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <!-- Moonlight wash: warm, from the upper left, dying quickly. -->
+    <linearGradient gradientTransform="rotate(-38, 0.5, 0.5)" x1="0%" y1="0%" x2="100%" y2="100%" id="dream-moonlight">
+      <stop stop-color="hsla(48, 34%, 62%, 0.16)" offset="0%"></stop>
+      <stop stop-color="hsla(48, 30%, 55%, 0.05)" offset="34%"></stop>
+      <stop stop-color="rgba(255,255,255,0)" offset="72%"></stop>
+    </linearGradient>
+    <!-- Undergrowth: cool green depth rising from the lower right. -->
+    <linearGradient gradientTransform="rotate(64, 0.5, 0.5)" x1="50%" y1="100%" x2="50%" y2="0%" id="dream-undergrowth">
+      <stop stop-color="hsla(128, 26%, 12%, 0.55)" offset="0%"></stop>
+      <stop stop-color="rgba(255,255,255,0)" offset="78%"></stop>
+    </linearGradient>
+
+    <!--
+      Grain. Deliberately gentler than the gggrain reference:
+      finer cells (baseFrequency 0.92 vs 0.55), three octaves so the noise
+      reads as tooth rather than static, a near-linear transfer (slope 1.15
+      vs 3) and a shallow alpha ramp (7/-4.4 vs 21/-13). Rendered at low
+      opacity under soft-light rather than overlay so it never posterises
+      the flat surfaces it sits on.
+    -->
+    <filter id="dream-grain" x="-10%" y="-10%" width="120%" height="120%"
+            filterUnits="objectBoundingBox" primitiveUnits="userSpaceOnUse"
+            color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.92" numOctaves="3"
+                    seed="4127" stitchTiles="stitch" result="turbulence"></feTurbulence>
+      <feColorMatrix type="saturate" values="0" in="turbulence" result="desaturated"></feColorMatrix>
+      <feComponentTransfer in="desaturated" result="transferred">
+        <feFuncR type="linear" slope="1.15" intercept="-0.06"></feFuncR>
+        <feFuncG type="linear" slope="1.15" intercept="-0.06"></feFuncG>
+        <feFuncB type="linear" slope="1.15" intercept="-0.06"></feFuncB>
+      </feComponentTransfer>
+      <feColorMatrix in="transferred" type="matrix"
+                     values="1 0 0 0 0
+                             0 1 0 0 0
+                             0 0 1 0 0
+                             0 0 0 7 -4.4"></feColorMatrix>
+    </filter>
+  </defs>
+
+  <g>
+    <rect width="100%" height="100%" fill="#0F140E"></rect>
+    <rect width="100%" height="100%" fill="url(#dream-undergrowth)"></rect>
+    <rect width="100%" height="100%" fill="url(#dream-moonlight)"></rect>
+    <rect width="100%" height="100%" fill="transparent" filter="url(#dream-grain)"
+          opacity="0.15" style="mix-blend-mode: soft-light"></rect>
+  </g>
+</svg>
