@@ -27,18 +27,18 @@
 //! not do that: an idle machine can tick several times before the floor
 //! boundary, and a daemon restart hands the next tick a fresh allowance, so
 //! `n` passes would each spend the full cap. The cap is therefore anchored in
-//! a durable **night ledger** ([`reserve_night`] / [`release_night`], stored
-//! under [`META_NIGHT_LEDGER`] and keyed by the local-night bucket
+//! a durable **night ledger** ([`claim_night`], stored under
+//! [`META_NIGHT_LEDGER`] and keyed by the local-night bucket
 //! [`night_key`]):
 //!
-//! * a pass **reserves** its allowance from tonight's remainder before it
-//!   starts ([`Budget::for_night`]) — two ticks in one night therefore share
-//!   one cap, and a restart mid-night reads the same persisted balance rather
-//!   than refilling it;
-//! * whatever the pass did not spend is **released** back on drop, so an
-//!   early-finishing pass does not burn the night's allowance;
-//! * a pass killed mid-flight releases nothing, which is the conservative
-//!   direction: the allowance stays spent rather than being handed out twice.
+//! * each invocation **claims** one unit from tonight's remainder immediately
+//!   before it runs — two ticks in one night therefore share one cap, and a
+//!   restart mid-night reads the same persisted balance rather than refilling
+//!   it;
+//! * unused allowance is never claimed, so an early-finishing pass does not
+//!   burn the night's remaining budget;
+//! * a pass killed after a claim does not refund it, which is the conservative
+//!   direction: allowance is never handed out twice.
 //!
 //! Within a pass, [`Budget`] is still the hard invocation counter — every
 //! actor call, including chain fallbacks and the verifier's re-prompt retry,
@@ -274,12 +274,20 @@ pub fn night_key(now_local: chrono::NaiveDateTime, floor_hour: u32) -> String {
         .to_string()
 }
 
+/// [`night_key`] for an offset-bearing local timestamp. Keeping the UTC
+/// offset attached until this boundary makes daylight-saving transitions
+/// explicit in tests while the bucket itself remains a local calendar date.
+pub fn night_key_at<Tz: chrono::TimeZone>(
+    now_local: chrono::DateTime<Tz>,
+    floor_hour: u32,
+) -> String {
+    night_key(now_local.naive_local(), floor_hour)
+}
+
 /// The night bucket for the system clock and configured floor hour.
 pub fn current_night_key() -> String {
-    night_key(
-        chrono::Utc::now()
-            .with_timezone(&chrono::Local)
-            .naive_local(),
+    night_key_at(
+        chrono::Utc::now().with_timezone(&chrono::Local),
         crate::daemon::dream_cadence::floor_hour(),
     )
 }
@@ -1196,6 +1204,47 @@ mod tests {
             "last night's ledger is not counted against tonight"
         );
         assert_eq!(night_claimed(&storage, "2026-08-11").unwrap(), 1);
+    }
+
+    #[test]
+    fn the_night_bucket_rolls_once_across_spring_and_fall_dst_transitions() {
+        fn local_at(
+            wall_clock: &str,
+            offset_seconds: i32,
+        ) -> chrono::DateTime<chrono::FixedOffset> {
+            let zone = chrono::FixedOffset::east_opt(offset_seconds).unwrap();
+            chrono::TimeZone::from_local_datetime(&zone, &naive(wall_clock))
+                .single()
+                .unwrap()
+        }
+
+        // America/Los_Angeles springs from 01:59:59 PST to 03:00:00 PDT.
+        // The missing 02:00 hour neither creates nor skips a local-night
+        // bucket: the configured 03:00 floor rolls exactly once.
+        assert_eq!(
+            night_key_at(local_at("2026-03-08 01:59:59", -8 * 3600), 3),
+            "2026-03-07"
+        );
+        assert_eq!(
+            night_key_at(local_at("2026-03-08 03:00:00", -7 * 3600), 3),
+            "2026-03-08"
+        );
+
+        // The fall-back hour occurs twice, once in PDT and once in PST. Both
+        // representations are still before the same 03:00 local boundary;
+        // changing UTC offset must not refill the nightly allowance.
+        assert_eq!(
+            night_key_at(local_at("2026-11-01 01:30:00", -7 * 3600), 3),
+            "2026-10-31"
+        );
+        assert_eq!(
+            night_key_at(local_at("2026-11-01 01:30:00", -8 * 3600), 3),
+            "2026-10-31"
+        );
+        assert_eq!(
+            night_key_at(local_at("2026-11-01 03:00:00", -8 * 3600), 3),
+            "2026-11-01"
+        );
     }
 
     #[test]

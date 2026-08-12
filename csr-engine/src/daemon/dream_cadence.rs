@@ -362,15 +362,15 @@ pub fn choose_trigger(
     config: CadenceConfig,
 ) -> CadenceDecision {
     let idle = is_idle(last_activity, now, config.idle_secs);
-    if is_due(last_run, now, config.interval_secs) && idle {
-        return CadenceDecision::Run(Trigger::Idle);
-    }
     if floor_due(last_run_local, now_local, config.floor_hour) {
         return if idle {
             CadenceDecision::Run(Trigger::NightlyFloor)
         } else {
             CadenceDecision::FloorOwedDeferred
         };
+    }
+    if is_due(last_run, now, config.interval_secs) && idle {
+        return CadenceDecision::Run(Trigger::Idle);
     }
     CadenceDecision::Wait
 }
@@ -614,19 +614,12 @@ fn record_completed_cycle(
     trigger: Trigger,
     budget: &crate::dream::policy::BudgetSnapshot,
 ) -> Result<()> {
-    storage.set_meta(META_LAST_RUN_AT, &completed_at.to_rfc3339())?;
-    if let Err(error) = storage.set_meta(META_LAST_TRIGGER, trigger.as_str()) {
-        tracing::warn!(%error, "dream cycle trigger persistence failed (non-fatal)");
-    }
     let budget_summary = serde_json::json!({
         "cap": budget.cap,
         "used": budget.used,
         "queued": budget.queued,
     })
     .to_string();
-    if let Err(error) = storage.set_meta(META_LAST_BUDGET, &budget_summary) {
-        tracing::warn!(%error, "dream cycle budget persistence failed (non-fatal)");
-    }
     let summary = serde_json::json!({
         "anchors_considered": stats.anchors_considered,
         "witnesses_considered": stats.witnesses_considered,
@@ -637,10 +630,16 @@ fn record_completed_cycle(
         "events_deduped": stats.events_deduped,
     })
     .to_string();
-    if let Err(error) = storage.set_meta(META_LAST_STATS, &summary) {
-        tracing::warn!(%error, "dream cycle stats persistence failed (non-fatal)");
-    }
-    Ok(())
+    storage.with_connection(|conn| {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        crate::storage::queries::set_meta(&tx, META_LAST_RUN_AT, &completed_at.to_rfc3339())?;
+        crate::storage::queries::set_meta(&tx, META_LAST_TRIGGER, trigger.as_str())?;
+        crate::storage::queries::set_meta(&tx, META_LAST_BUDGET, &budget_summary)?;
+        crate::storage::queries::set_meta(&tx, META_LAST_STATS, &summary)?;
+        tx.commit()?;
+        Ok(())
+    })
 }
 
 /// One cadence-checked tick: dream if due, respecting the kill switch, the
@@ -1026,6 +1025,51 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_completion_metadata_does_not_publish_a_badge_baseline() {
+        use crate::storage::dream_delivery::badge_measured_at;
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_dream_stats
+                     BEFORE INSERT ON meta
+                     WHEN NEW.key = 'dream_daemon_last_stats'
+                     BEGIN
+                       SELECT RAISE(FAIL, 'completion metadata refused');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let persisted = record_completed_cycle(
+            &storage,
+            &crate::dream::DreamStats::default(),
+            ts(0),
+            Trigger::NightlyFloor,
+            &crate::dream::policy::Budget::new(1).snapshot(),
+        );
+        if persisted.is_ok() {
+            refresh_badge_after(&storage, TickOutcome::Success);
+        }
+
+        assert!(
+            persisted.is_err(),
+            "a partially persisted completion must not be declared complete"
+        );
+        assert_eq!(
+            read_last_run(&storage),
+            None,
+            "completion metadata must commit atomically"
+        );
+        assert_eq!(
+            badge_measured_at(&storage),
+            None,
+            "a pass whose completion metadata rolled back measured no badge baseline"
+        );
+    }
+
+    #[test]
     fn a_failed_pass_leaves_the_badge_baseline_untouched() {
         use crate::storage::dream_delivery::{badge_measured_at, badge_unread};
         let storage = Storage::open_memory().unwrap();
@@ -1193,6 +1237,24 @@ mod tests {
             trigger,
             CadenceDecision::Run(Trigger::NightlyFloor),
             "an owed floor pass must run at the first witnessed idle window"
+        );
+    }
+
+    #[test]
+    fn an_owed_floor_pass_keeps_its_identity_when_the_idle_interval_is_also_due() {
+        let now = ts(0);
+        let decision = choose_trigger(
+            Some(now - Duration::hours(2)), // witnessed idle
+            Some(now - Duration::hours(9)), // ordinary 8h cadence also due
+            now,
+            naive("2026-08-11 09:00:00"),
+            Some(naive("2026-08-11 02:00:00")), // nightly floor still owed
+            cfg(8 * 3600, 1800),
+        );
+        assert_eq!(
+            decision,
+            CadenceDecision::Run(Trigger::NightlyFloor),
+            "the deferred nightly debt must run at the next idle window, not be relabelled as an ordinary cadence tick"
         );
     }
 

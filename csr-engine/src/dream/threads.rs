@@ -912,25 +912,33 @@ pub(crate) fn record_attempts(
             tx.commit()?;
             Ok(settled)
         });
-        if let Ok(false) = written {
-            // The row was measured, but its reservation was not in `reserved`
-            // state — something settled it already. Say so; do not overwrite.
-            tracing::warn!(
-                call_site,
-                attempt_key = ?reservation,
-                "dream usage reservation was already settled; the new usage row stays unlinked"
-            );
-        }
-        if let Err(error) = written {
-            failures += 1;
-            tracing::error!(
-                %error,
-                call_site,
-                model = %a.model_label,
-                reserved = reservation.is_some(),
-                "dream usage accounting failed; this invocation stays unaccounted"
-            );
-            crate::dream::policy::note_accounting_failure(storage);
+        match written {
+            Ok(true) => {}
+            Ok(false) => {
+                // The usage row landed, but its reservation was missing or no
+                // longer `reserved`. That is still a finalisation failure: the
+                // measured row cannot prove which pre-invocation reservation
+                // it settles, so status must surface it rather than a warning
+                // being the only trace.
+                failures += 1;
+                tracing::error!(
+                    call_site,
+                    attempt_key = ?reservation,
+                    "dream usage reservation finalisation matched no reserved attempt; the usage row stays unlinked"
+                );
+                crate::dream::policy::note_accounting_failure(storage);
+            }
+            Err(error) => {
+                failures += 1;
+                tracing::error!(
+                    %error,
+                    call_site,
+                    model = %a.model_label,
+                    reserved = reservation.is_some(),
+                    "dream usage accounting failed; this invocation stays unaccounted"
+                );
+                crate::dream::policy::note_accounting_failure(storage);
+            }
         }
     }
     failures
@@ -1782,6 +1790,38 @@ mod tests {
             policy::unaccounted_invocations(&storage),
             Some(1),
             "status must be able to read the unaccounted count"
+        );
+    }
+
+    #[test]
+    fn a_missing_reservation_during_finalisation_is_visible_in_status() {
+        use crate::dream::policy;
+        let storage = open();
+        let attempts = [ChainAttempt {
+            model_label: "sonnet-5".into(),
+            success: true,
+            input_tokens: 11,
+            output_tokens: 7,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            reservation: Some("reservation-that-does-not-exist".into()),
+        }];
+
+        let failures = record_attempts(
+            &storage,
+            &attempts,
+            "dream_threads",
+            Some("hash-missing-reservation"),
+        );
+
+        assert_eq!(
+            failures, 1,
+            "updating zero reservation rows is a finalisation failure"
+        );
+        assert_eq!(
+            policy::accounting_failure_count(&storage),
+            Some(1),
+            "status must surface a finalisation that matched no reserved attempt"
         );
     }
 

@@ -549,6 +549,73 @@ pub(crate) fn ensure_journal_audit(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// Item ids whose latest journal action is a resolve. The audit table is
+/// created lazily by the write path, so a never-mutated database returns an
+/// empty set without making a GET route create schema.
+fn resolved_journal_item_ids(conn: &rusqlite::Connection) -> Result<BTreeSet<String>> {
+    let audit_exists: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_schema
+             WHERE type = 'table' AND name = 'journal_audit'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !audit_exists {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT audit.item_id
+         FROM journal_audit audit
+         JOIN (
+             SELECT item_id, MAX(id) AS latest_id
+             FROM journal_audit
+             GROUP BY item_id
+         ) latest ON latest.latest_id = audit.id
+         WHERE audit.action = 'resolve'",
+    )?;
+    let resolved: rusqlite::Result<BTreeSet<String>> =
+        stmt.query_map([], |row| row.get::<_, String>(0))?.collect();
+    Ok(resolved?)
+}
+
+fn suppress_resolved_journal_items(board: &mut BoardFeed, resolved: &BTreeSet<String>) {
+    if resolved.is_empty() {
+        return;
+    }
+
+    fn suppress_bucket(
+        clusters: &mut Vec<DreamCluster>,
+        total: &mut usize,
+        resolved: &BTreeSet<String>,
+    ) {
+        let before = clusters.len();
+        clusters.retain(|cluster| !cluster.items.iter().any(|item| resolved.contains(&item.id)));
+        *total = total.saturating_sub(before.saturating_sub(clusters.len()));
+    }
+
+    suppress_bucket(
+        &mut board.clusters.active,
+        &mut board.clusters.total_active,
+        resolved,
+    );
+    suppress_bucket(
+        &mut board.clusters.settled,
+        &mut board.clusters.total_settled,
+        resolved,
+    );
+    suppress_bucket(
+        &mut board.clusters.archive,
+        &mut board.clusters.total_archive,
+        resolved,
+    );
+    board.open_items.retain(|item| !resolved.contains(&item.id));
+    board
+        .verified_plan_items
+        .retain(|item_id| !resolved.contains(item_id));
+}
+
 impl DreamFeed for StorageDreamFeed {
     fn load(&self) -> Result<Vec<DreamItem>> {
         self.storage.with_connection(dream_items::load_dream_items)
@@ -568,11 +635,14 @@ impl DreamFeed for StorageDreamFeed {
             let verified_plan_items = stmt
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<BTreeSet<String>>>()?;
-            Ok(BoardFeed {
+            let mut board = BoardFeed {
                 clusters,
                 open_items,
                 verified_plan_items,
-            })
+            };
+            let resolved = resolved_journal_item_ids(conn)?;
+            suppress_resolved_journal_items(&mut board, &resolved);
+            Ok(board)
         })
     }
 
@@ -2514,6 +2584,85 @@ mod tests {
         assert_eq!(action, "dismiss");
         assert_eq!(origin, JOURNAL_ORIGIN);
         assert_eq!(chunks, 1);
+    }
+
+    #[test]
+    fn a_resolved_journal_item_leaves_the_reloaded_board() {
+        let storage = Arc::new(Storage::open_memory().expect("memory storage"));
+        storage
+            .with_connection(|conn| {
+                let episode = serde_json::json!({
+                    "schema": "v2",
+                    "session_id": "sess-resolve",
+                    "project": "proj",
+                    "timestamp": "2026-08-01T00:00:00Z",
+                    "todos": [{
+                        "content": "retire `outdated_symbol` claim",
+                        "status": "pending"
+                    }],
+                    "files_modified": ["/fixture/outdated.rs"]
+                })
+                .to_string();
+                conn.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp)
+                     VALUES ('episode-resolve', ?1, '[]', '2026-08-01T00:00:00Z')",
+                    [episode],
+                )?;
+                conn.execute(
+                    "INSERT INTO chunks
+                        (id, conversation_id, project_name, timestamp, content, message_count)
+                     VALUES ('chunk-resolve', 'sess-resolve', 'proj',
+                             '2026-08-01T00:00:00Z', 'fixture chunk', 1)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO witness_ledger
+                        (project, file, symbol, span_start, span_end, stamp, tier,
+                         at_oid, source_kind, source_id)
+                     VALUES ('proj', '/fixture/outdated.rs', 'outdated_symbol', 1, 3,
+                             'stamp-resolve', 'committed', 'at-resolve', 'backfill',
+                             'at-resolve')",
+                    [],
+                )?;
+                let witness_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO witness_verdicts
+                        (witness_id, verdict, receipt_oid, observed_head_oid, created_at)
+                     VALUES (?1, 'anchor_obsolete', 'receipt-resolve', 'head-resolve',
+                             '2026-08-02T00:00:00Z')",
+                    [witness_id],
+                )?;
+                Ok(())
+            })
+            .expect("seed live board fixture");
+
+        let feed = StorageDreamFeed::new(storage);
+        let item = feed
+            .load()
+            .expect("load target")
+            .into_iter()
+            .next()
+            .expect("target item");
+        assert_eq!(
+            feed.load_board()
+                .expect("board before")
+                .clusters
+                .active
+                .len(),
+            1
+        );
+
+        feed.record_verdict(&item, JournalAction::Resolve)
+            .expect("resolve target");
+
+        assert!(
+            feed.load_board()
+                .expect("board after")
+                .clusters
+                .active
+                .is_empty(),
+            "a successful journal resolve must remove its card on reload"
+        );
     }
 
     #[test]
