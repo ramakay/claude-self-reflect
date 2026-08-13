@@ -49,8 +49,18 @@ impl Storage {
         let conn = Connection::open(path)?;
         // foreign_keys=ON is explicit, not build-flag-dependent (Codex MEDIUM):
         // makes the declared chunk_provenance FK enforced deterministically.
+        //
+        // recursive_triggers=ON is what keeps `chunks_fts` honest under REPLACE.
+        // The index is external-content and maintained by AFTER INSERT/UPDATE/DELETE
+        // triggers on `chunks`; SQLite fires the DELETE trigger for the row that
+        // REPLACE conflict-resolution removes ONLY when this pragma is on. With it
+        // off, an `INSERT OR REPLACE INTO chunks` strands the old document in the
+        // index at a rowid nothing owns — the exact defect that grew this index to
+        // 10.4M orphan rows, and one that `integrity-check` does not report. The
+        // production write path is an upsert and no longer does that; this pragma is
+        // the guard against the next writer that reaches for REPLACE.
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;",
         )?;
         migrations::run(&conn)?;
         Ok(Self {
@@ -61,7 +71,7 @@ impl Storage {
     /// Open an in-memory database (for tests).
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;")?;
         migrations::run(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -1594,6 +1604,75 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A raw `INSERT OR REPLACE INTO chunks` must not strand the replaced row's
+    /// document in the FTS index.
+    ///
+    /// REPLACE deletes the conflicting row and inserts a fresh one, which takes a
+    /// NEW implicit rowid (`chunks.id` is TEXT, so the rowid is unconstrained).
+    /// `chunks_fts` is addressed by that rowid. Without `recursive_triggers=ON`
+    /// SQLite skips the AFTER DELETE trigger for the row REPLACE removed, so the
+    /// old document survives at a rowid no chunk owns — invisible to
+    /// `integrity-check`, and 98.5% of the reference database's index by row count.
+    #[test]
+    fn insert_or_replace_on_chunks_leaves_no_orphan_fts_document() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                for content in ["orphanedtoken payload", "survivingtoken payload"] {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO chunks
+                             (id, conversation_id, project_name, timestamp, content, message_count)
+                         VALUES ('c1', 'conv', 'proj', '2026-08-12T00:00:00Z', ?1, 1)",
+                        rusqlite::params![content],
+                    )?;
+                }
+                let documents: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM chunks_fts_docsize", [], |r| r.get(0))?;
+                assert_eq!(documents, 1, "REPLACE must not append an orphan document");
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            storage
+                .fts5_search("orphanedtoken", 10, None)
+                .unwrap()
+                .is_empty(),
+            "the replaced text must leave the index"
+        );
+        assert_eq!(
+            storage.fts5_search("survivingtoken", 10, None).unwrap()[0].id,
+            "c1"
+        );
+
+        // Negative control, so the assertions above cannot pass vacuously: the same
+        // writes on a connection that did NOT enable the pragma strand the orphan.
+        // If SQLite ever fires delete triggers for REPLACE unconditionally, this
+        // fails and the pragma becomes redundant rather than silently load-bearing.
+        let unguarded = Connection::open_in_memory().unwrap();
+        unguarded
+            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=OFF;")
+            .unwrap();
+        migrations::run(&unguarded).unwrap();
+        for content in ["orphanedtoken payload", "survivingtoken payload"] {
+            unguarded
+                .execute(
+                    "INSERT OR REPLACE INTO chunks
+                         (id, conversation_id, project_name, timestamp, content, message_count)
+                     VALUES ('c1', 'conv', 'proj', '2026-08-12T00:00:00Z', ?1, 1)",
+                    rusqlite::params![content],
+                )
+                .unwrap();
+        }
+        let orphaned: i64 = unguarded
+            .query_row("SELECT COUNT(*) FROM chunks_fts_docsize", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            orphaned, 2,
+            "control: without the pragma REPLACE orphans a document"
+        );
+    }
 
     #[test]
     fn conversation_keyed_annotation_attaches_to_every_candidate_chunk() {
