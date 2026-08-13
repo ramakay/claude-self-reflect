@@ -663,7 +663,15 @@ fn git_log_introducing_commit(
         return None;
     }
     let range_arg = format!("-L{start},{end}:{relpath}");
-    let output = Command::new("git")
+    // Strip ambient GIT_* (see `extraction::repo_root::git_toplevel`): an
+    // inherited GIT_DIR overrides `-C` and would answer for the wrong repo.
+    let mut cmd = Command::new("git");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(&k);
+        }
+    }
+    let output = cmd
         .arg("-C")
         .arg(repo_root)
         .arg("log")
@@ -1171,7 +1179,18 @@ mod tests {
         // is returned.
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
-        let git = |args: &[&str]| Command::new("git").arg("-C").arg(repo).args(args).status();
+        // Scrubbed GIT_*: under a git hook an inherited GIT_DIR/GIT_INDEX_FILE
+        // overrides `-C`, and this helper's `git add` then stages into the REAL
+        // repository instead of the fixture.
+        let git = |args: &[&str]| {
+            let mut cmd = Command::new("git");
+            for (k, _) in std::env::vars_os() {
+                if k.to_string_lossy().starts_with("GIT_") {
+                    cmd.env_remove(&k);
+                }
+            }
+            cmd.arg("-C").arg(repo).args(args).status()
+        };
         if git(&["init", "-q"]).map(|s| !s.success()).unwrap_or(true) {
             return; // git unavailable — fail-soft skip, matches repo_root.rs precedent
         }
@@ -1183,13 +1202,17 @@ mod tests {
         git(&["add", "lib.rs"]).unwrap();
         git(&["commit", "-q", "-m", "introduce foo"]).unwrap();
         let oldest_hash = String::from_utf8(
-            Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .unwrap()
-                .stdout,
+            {
+                let mut cmd = Command::new("git");
+                for (k, _) in std::env::vars_os() {
+                    if k.to_string_lossy().starts_with("GIT_") {
+                        cmd.env_remove(&k);
+                    }
+                }
+                cmd.arg("-C").arg(repo).args(["rev-parse", "HEAD"]).output()
+            }
+            .unwrap()
+            .stdout,
         )
         .unwrap()
         .trim()

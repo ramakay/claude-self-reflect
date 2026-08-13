@@ -165,8 +165,18 @@ pub fn insert_chunk_with_source(
     source: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary, seq, is_sidechain, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary, seq, is_sidechain, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(id) DO UPDATE SET
+             conversation_id = excluded.conversation_id,
+             project_name = excluded.project_name,
+             timestamp = excluded.timestamp,
+             content = excluded.content,
+             message_count = excluded.message_count,
+             summary = excluded.summary,
+             seq = excluded.seq,
+             is_sidechain = excluded.is_sidechain,
+             source = excluded.source",
         params![
             chunk.id,
             chunk.conversation_id,
@@ -182,16 +192,9 @@ pub fn insert_chunk_with_source(
     )?;
 
     conn.execute(
-        "INSERT OR REPLACE INTO chunk_embeddings (chunk_id, embedding) VALUES (?1, ?2)",
+        "INSERT INTO chunk_embeddings (chunk_id, embedding) VALUES (?1, ?2)
+         ON CONFLICT(chunk_id) DO UPDATE SET embedding = excluded.embedding",
         params![chunk.id, vec_to_bytes(embedding)],
-    )?;
-
-    // Insert into FTS index
-    conn.execute(
-        "INSERT OR REPLACE INTO chunks_fts (rowid, content) VALUES (
-            (SELECT rowid FROM chunks WHERE id = ?1), ?2
-        )",
-        params![chunk.id, chunk.content],
     )?;
 
     Ok(())
@@ -223,12 +226,6 @@ pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) 
     drop(stmt);
 
     for id in &ids {
-        // chunks_fts has no FK on chunks.id (it's rowid-addressed), so its row must be
-        // dropped before the owning chunks row disappears and the rowid lookup goes stale.
-        conn.execute(
-            "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
-            params![id],
-        )?;
         conn.execute(
             "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
             params![id],
@@ -2440,6 +2437,123 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrations::run(&conn).unwrap();
         conn
+    }
+
+    fn test_chunk(id: &str, content: &str) -> ConversationChunk {
+        ConversationChunk {
+            id: id.into(),
+            conversation_id: "conv-fts".into(),
+            project_name: "project-fts".into(),
+            timestamp: "2026-08-12T00:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        }
+    }
+
+    #[test]
+    fn chunk_reimport_preserves_rowids_and_replaces_one_fts_document() {
+        // Break caught: using INSERT OR REPLACE for either TEXT-keyed table
+        // deletes and reinserts its row, changing the implicit rowid. For
+        // chunks that also leaves the old rowid indexed in FTS.
+        let conn = mem();
+        insert_chunk(&conn, &test_chunk("stable", "legacytoken"), &[0.1; 4]).unwrap();
+        let chunk_rowid_before: i64 = conn
+            .query_row("SELECT rowid FROM chunks WHERE id = 'stable'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let embedding_rowid_before: i64 = conn
+            .query_row(
+                "SELECT rowid FROM chunk_embeddings WHERE chunk_id = 'stable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        insert_chunk(&conn, &test_chunk("stable", "replacementtoken"), &[0.2; 4]).unwrap();
+
+        let chunk_rowid_after: i64 = conn
+            .query_row("SELECT rowid FROM chunks WHERE id = 'stable'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let embedding_rowid_after: i64 = conn
+            .query_row(
+                "SELECT rowid FROM chunk_embeddings WHERE chunk_id = 'stable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_rowid_after, chunk_rowid_before);
+        assert_eq!(embedding_rowid_after, embedding_rowid_before);
+        assert!(fts5_search(&conn, "legacytoken", 10, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fts5_search(&conn, "replacementtoken", 10, None).unwrap()[0].id,
+            "stable"
+        );
+        let indexed_documents: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts_docsize", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            indexed_documents, 1,
+            "reimport must not append an orphan FTS row"
+        );
+
+        delete_chunks_for_conversation(&conn, "conv-fts").unwrap();
+        assert!(fts5_search(&conn, "replacementtoken", 10, None)
+            .unwrap()
+            .is_empty());
+        let indexed_documents: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts_docsize", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            indexed_documents, 0,
+            "deleting the chunk must delete its FTS row"
+        );
+    }
+
+    #[test]
+    fn external_fts_tracks_direct_chunk_updates_and_deletes() {
+        // Break caught: external-content FTS has no automatic synchronization.
+        // A writer that bypasses insert_chunk must still be covered.
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO chunks
+                 (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES ('direct', 'conv-direct', 'project-fts',
+                     '2026-08-12T00:00:00Z', 'beforetoken', 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            fts5_search(&conn, "beforetoken", 10, None).unwrap()[0].id,
+            "direct"
+        );
+
+        conn.execute(
+            "UPDATE chunks SET content = 'aftertoken' WHERE id = 'direct'",
+            [],
+        )
+        .unwrap();
+        assert!(fts5_search(&conn, "beforetoken", 10, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fts5_search(&conn, "aftertoken", 10, None).unwrap()[0].id,
+            "direct"
+        );
+
+        conn.execute("DELETE FROM chunks WHERE id = 'direct'", [])
+            .unwrap();
+        assert!(fts5_search(&conn, "aftertoken", 10, None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

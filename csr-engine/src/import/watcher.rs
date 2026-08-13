@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 use crate::embeddings::EmbeddingEngine;
 use crate::import;
+use crate::import::ConversationChunk;
 use crate::search::SearchEngine;
 use crate::storage::Storage;
 
@@ -181,9 +182,42 @@ impl FileWatcher {
 
         let chunk_count = chunks.len();
 
-        // Batch embed and store
+        // Batch embed and store — but only what actually changed.
+        //
+        // This is the live path, and it has no tail arithmetic: `is_file_imported`
+        // returns false on any mtime change, and Claude Code appends to the session
+        // JSONL after every message, so `parse_jsonl_file_with_stats` above re-derives
+        // EVERY chunk of the file every ~5s (DEBOUNCE_SECS) for the whole life of a
+        // session. Re-deriving is cheap; re-embedding and rewriting all N chunks is
+        // not, and it grows with the session. Only chunks that differ from the row
+        // already stored need work — appends change the final partial chunk and add
+        // new ones, leaving every earlier chunk byte-identical.
+        //
+        // Compared fields are the ones that decide what search returns: `content`
+        // (the indexed text), plus `project_name`/`is_sidechain`, which scope it.
+        // `summary`/`seq`/`timestamp` are deterministic re-derivations of the same
+        // prefix bytes, so they cannot drift without `content` drifting too.
+        let mut reindexed = 0usize;
+        let mut unchanged = 0usize;
         for batch in chunks.chunks(BATCH_SIZE) {
-            let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
+            let ids: Vec<String> = batch.iter().map(|c| c.id.clone()).collect();
+            let stored: HashMap<String, ConversationChunk> = self
+                .storage
+                .get_chunks_by_ids(&ids)?
+                .into_iter()
+                .map(|chunk| (chunk.id.clone(), chunk))
+                .collect();
+            let pending: Vec<&ConversationChunk> = batch
+                .iter()
+                .filter(|chunk| needs_reindex(chunk, stored.get(&chunk.id)))
+                .collect();
+            unchanged += batch.len() - pending.len();
+            reindexed += pending.len();
+            if pending.is_empty() {
+                continue;
+            }
+
+            let texts: Vec<String> = pending.iter().map(|c| c.content.clone()).collect();
             let emb = self.embeddings.clone();
             let embeddings = tokio::task::spawn_blocking(move || {
                 let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
@@ -192,7 +226,7 @@ impl FileWatcher {
             .await??;
 
             let mut idx = self.search.write().await;
-            for (chunk, embedding) in batch.iter().zip(embeddings) {
+            for (chunk, embedding) in pending.iter().zip(embeddings) {
                 self.storage.insert_chunk(chunk, &embedding)?;
                 idx.insert_chunk(chunk.id.clone(), embedding);
             }
@@ -232,10 +266,88 @@ impl FileWatcher {
         tracing::info!(
             file = %file_path.display(),
             chunks = chunk_count,
+            reindexed,
+            unchanged,
             project = %project_name,
             "auto-imported conversation"
         );
 
         Ok(())
+    }
+}
+
+/// Does this freshly parsed chunk need to be embedded and written again?
+///
+/// `stored` is the row already in `chunks` under the same deterministic id
+/// (`uuid_v5(conversation_id, seq)`), or `None` when this chunk is new.
+///
+/// Answering "no" is what stops the live watcher from re-embedding and
+/// rewriting an entire session every debounce window. It is safe because the
+/// storage write is an upsert keyed on that same id: re-running it with
+/// identical values produces a byte-identical row, an identical embedding, and
+/// an identical FTS document.
+fn needs_reindex(parsed: &ConversationChunk, stored: Option<&ConversationChunk>) -> bool {
+    match stored {
+        None => true,
+        Some(stored) => {
+            stored.content != parsed.content
+                || stored.project_name != parsed.project_name
+                || stored.is_sidechain != parsed.is_sidechain
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provenance::Speaker;
+
+    fn chunk(id: &str, content: &str) -> ConversationChunk {
+        ConversationChunk {
+            id: id.to_string(),
+            conversation_id: "conv".to_string(),
+            project_name: "proj".to_string(),
+            timestamp: "2026-08-12T00:00:00Z".to_string(),
+            content: content.to_string(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        }
+    }
+
+    #[test]
+    fn unseen_chunk_is_indexed() {
+        assert!(needs_reindex(&chunk("a", "hello"), None));
+    }
+
+    #[test]
+    fn byte_identical_chunk_is_skipped() {
+        // The whole point: an append to the transcript re-derives every earlier
+        // chunk unchanged, and those must cost neither an embedding nor a write.
+        let parsed = chunk("a", "hello");
+        let stored = chunk("a", "hello");
+        assert!(!needs_reindex(&parsed, Some(&stored)));
+    }
+
+    #[test]
+    fn grown_final_chunk_is_reindexed() {
+        // The last chunk of a live session is partial and gains text on append.
+        let stored = chunk("a", "hello");
+        let parsed = chunk("a", "hello there");
+        assert!(needs_reindex(&parsed, Some(&stored)));
+    }
+
+    #[test]
+    fn rescoped_chunk_is_reindexed() {
+        let stored = chunk("a", "hello");
+        let mut parsed = chunk("a", "hello");
+        parsed.project_name = "other".to_string();
+        assert!(needs_reindex(&parsed, Some(&stored)));
+
+        let mut parsed = chunk("a", "hello");
+        parsed.is_sidechain = true;
+        assert!(needs_reindex(&parsed, Some(&stored)));
     }
 }

@@ -1,5 +1,258 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+
+const CHUNKS_FTS_COMPACTION_KEY: &str = "chunks_fts_external_content_v1";
+const CHUNKS_FTS_PENDING_VACUUM: &str = "pending_vacuum";
+const CHUNKS_FTS_PENDING_REBUILD: &str = "pending_rebuild";
+const CHUNKS_FTS_COMPLETE: &str = "complete";
+
+const CREATE_EXTERNAL_CHUNKS_FTS: &str = "
+    CREATE VIRTUAL TABLE chunks_fts USING fts5(
+        content,
+        content='chunks',
+        content_rowid='rowid',
+        tokenize='porter unicode61'
+    );
+";
+
+const CREATE_CHUNKS_FTS_TRIGGERS: &str = "
+    CREATE TRIGGER chunks_fts_ai AFTER INSERT ON chunks BEGIN
+        INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+    CREATE TRIGGER chunks_fts_ad AFTER DELETE ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+    END;
+    CREATE TRIGGER chunks_fts_au AFTER UPDATE ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+        INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+";
+
+const DROP_CHUNKS_FTS_TRIGGERS: &str = "
+    DROP TRIGGER IF EXISTS chunks_fts_ai;
+    DROP TRIGGER IF EXISTS chunks_fts_ad;
+    DROP TRIGGER IF EXISTS chunks_fts_au;
+";
+
+fn fts_migration_state(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        [CHUNKS_FTS_COMPACTION_KEY],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn set_fts_migration_state(conn: &Connection, state: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [CHUNKS_FTS_COMPACTION_KEY, state],
+    )?;
+    Ok(())
+}
+
+fn chunks_fts_schema(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn is_external_chunks_fts(schema: &str) -> bool {
+    let compact: String = schema
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    compact.contains("content='chunks'") && compact.contains("content_rowid='rowid'")
+}
+
+fn chunks_fts_trigger_count(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'trigger'
+           AND name IN ('chunks_fts_ai', 'chunks_fts_ad', 'chunks_fts_au')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn verify_chunks_fts(conn: &Connection) -> Result<()> {
+    let schema = chunks_fts_schema(conn)?
+        .ok_or_else(|| anyhow::anyhow!("chunks_fts migration left no FTS table"))?;
+    if !is_external_chunks_fts(&schema) {
+        anyhow::bail!("chunks_fts migration did not install external-content schema");
+    }
+    if chunks_fts_trigger_count(conn)? != 3 {
+        anyhow::bail!("chunks_fts migration did not install all three synchronization triggers");
+    }
+    conn.execute(
+        "INSERT INTO chunks_fts(chunks_fts, rank) VALUES('integrity-check', 1)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Replace the legacy internal-content index atomically. The legacy table,
+/// all orphan documents and its duplicate content store disappear together;
+/// a failure before RELEASE rolls the whole schema change back.
+fn migrate_chunks_fts(conn: &Connection) -> Result<()> {
+    let existing_schema = chunks_fts_schema(conn)?;
+    let already_external = existing_schema
+        .as_deref()
+        .is_some_and(is_external_chunks_fts);
+    let triggers_complete = chunks_fts_trigger_count(conn)? == 3;
+    if already_external && triggers_complete {
+        return Ok(());
+    }
+
+    conn.execute_batch("SAVEPOINT csr_chunks_fts_external_content")?;
+    let applied = (|| -> Result<()> {
+        conn.execute_batch(DROP_CHUNKS_FTS_TRIGGERS)?;
+        if !already_external {
+            if existing_schema.is_some() {
+                conn.execute_batch("DROP TABLE chunks_fts")?;
+            }
+            conn.execute_batch(CREATE_EXTERNAL_CHUNKS_FTS)?;
+        }
+        conn.execute_batch(CREATE_CHUNKS_FTS_TRIGGERS)?;
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')", [])?;
+        verify_chunks_fts(conn)?;
+        set_fts_migration_state(
+            conn,
+            if existing_schema.is_some() && !already_external {
+                CHUNKS_FTS_PENDING_VACUUM
+            } else {
+                CHUNKS_FTS_COMPLETE
+            },
+        )?;
+        Ok(())
+    })();
+    match applied {
+        Ok(()) => conn.execute_batch("RELEASE csr_chunks_fts_external_content")?,
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO csr_chunks_fts_external_content;
+                 RELEASE csr_chunks_fts_external_content",
+            );
+            return Err(error);
+        }
+    }
+
+    verify_chunks_fts(conn)
+}
+
+fn main_database_path(conn: &Connection) -> Result<Option<std::path::PathBuf>> {
+    let path: String = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((!path.is_empty()).then(|| std::path::PathBuf::from(path)))
+}
+
+/// Free bytes VACUUM needs before it is worth starting.
+///
+/// VACUUM writes a compacted copy and then transfers it back, so what it needs
+/// is space for the *result*, not for a second copy of the file on disk. Sizing
+/// the check off the current file length would demand ~21 GB from the database
+/// this migration exists to shrink — whose owner has just watched an index eat
+/// their disk — and defer the reclaim forever on exactly the machines that need
+/// it. The result is bounded by the pages still in use (VACUUM packs them
+/// tighter, never looser), which at this point in the state machine is a small
+/// fraction of the file: the legacy index's pages are already on the freelist.
+///
+/// The margin covers the rewritten b-tree structure and the journal.
+fn vacuum_free_space_required(conn: &Connection) -> Result<u64> {
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    Ok(vacuum_free_space_required_from(
+        page_size.max(0) as u64,
+        page_count.max(0) as u64,
+        free_pages.max(0) as u64,
+    ))
+}
+
+fn vacuum_free_space_required_from(page_size: u64, page_count: u64, free_pages: u64) -> u64 {
+    let in_use_bytes = page_count.saturating_sub(free_pages) * page_size;
+    // 25% headroom plus a 64 MiB floor, so tiny databases still get a sane check.
+    in_use_bytes
+        .saturating_mul(5)
+        .saturating_div(4)
+        .saturating_add(64 * 1024 * 1024)
+}
+
+/// Physically reclaim the pages released by the legacy FTS table. VACUUM may
+/// renumber implicit rowids, so the durable state machine always rebuilds and
+/// verifies the external index after VACUUM and before startup may serve reads.
+fn finish_chunks_fts_compaction(conn: &Connection) -> Result<()> {
+    let Some(mut state) = fts_migration_state(conn)? else {
+        return Ok(());
+    };
+    if state == CHUNKS_FTS_COMPLETE || !conn.is_autocommit() {
+        return Ok(());
+    }
+
+    if state == CHUNKS_FTS_PENDING_VACUUM {
+        if let Some(path) = main_database_path(conn)? {
+            let database_bytes = std::fs::metadata(&path)?.len();
+            let available_bytes = fs2::available_space(path.parent().unwrap_or(&path))?;
+            let required_bytes = vacuum_free_space_required(conn)?;
+            if available_bytes < required_bytes {
+                tracing::warn!(
+                    database_bytes,
+                    available_bytes,
+                    required_bytes,
+                    "deferring chunks_fts compaction: insufficient free disk space"
+                );
+                return Ok(());
+            }
+        }
+
+        if let Err(error) = conn.execute_batch("VACUUM") {
+            // The external index created in the preceding transaction remains
+            // correct. Keep the pending marker and serve search; a later open
+            // retries physical compaction.
+            tracing::warn!(%error, "deferring chunks_fts compaction after VACUUM failure");
+            return Ok(());
+        }
+        // VACUUM itself is atomic, but it may renumber chunks.rowid. Persist a
+        // repair marker before attempting the FTS rebuild so a killed process
+        // can never serve the potentially stale index on the next open.
+        set_fts_migration_state(conn, CHUNKS_FTS_PENDING_REBUILD)?;
+        state = CHUNKS_FTS_PENDING_REBUILD.to_string();
+    }
+
+    if state == CHUNKS_FTS_PENDING_REBUILD {
+        conn.execute_batch("SAVEPOINT csr_chunks_fts_post_vacuum_rebuild")?;
+        let rebuilt = (|| -> Result<()> {
+            conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')", [])?;
+            verify_chunks_fts(conn)?;
+            set_fts_migration_state(conn, CHUNKS_FTS_COMPLETE)?;
+            Ok(())
+        })();
+        match rebuilt {
+            Ok(()) => conn.execute_batch("RELEASE csr_chunks_fts_post_vacuum_rebuild")?,
+            Err(error) => {
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO csr_chunks_fts_post_vacuum_rebuild;
+                     RELEASE csr_chunks_fts_post_vacuum_rebuild",
+                );
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Run all database migrations.
 pub fn run(conn: &Connection) -> Result<()> {
@@ -470,17 +723,13 @@ pub fn run(conn: &Connection) -> Result<()> {
         );
     }
 
-    // FTS5 for hybrid search — CREATE VIRTUAL TABLE doesn't support IF NOT EXISTS
-    // so we check manually
-    let has_fts: bool = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='chunks_fts'")?
-        .exists([])?;
-
-    if !has_fts {
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE chunks_fts USING fts5(content, tokenize='porter unicode61');",
-        )?;
-    }
+    // The FTS migration records its durable compaction state in meta. Create
+    // this small table before the larger metadata block below so the schema
+    // replacement and its pending marker can commit atomically.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+    )?;
+    migrate_chunks_fts(conn)?;
 
     // Engine metadata KV — caches expensive computed state (e.g. integrity_check
     // results, which cost ~10s on multi-GB DBs and must not run per status call).
@@ -683,12 +932,236 @@ pub fn run(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_edge_scope_chains_file ON edge_scope_chains(project, file);",
     )?;
 
+    finish_chunks_fts_compaction(conn)?;
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    const DROP_CURRENT_FTS: &str = "
+        DROP TRIGGER IF EXISTS chunks_fts_ai;
+        DROP TRIGGER IF EXISTS chunks_fts_ad;
+        DROP TRIGGER IF EXISTS chunks_fts_au;
+        DROP TABLE chunks_fts;
+    ";
+
+    fn fts_schema(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn matching_live_ids(conn: &Connection, query: &str) -> BTreeSet<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id FROM chunks c
+                 JOIN chunks_fts fts ON fts.rowid = c.rowid
+                 WHERE chunks_fts MATCH ?1",
+            )
+            .unwrap();
+        stmt.query_map([query], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn vacuum_space_check_is_sized_off_live_pages_not_file_length() {
+        // Break caught: requiring 2x the file length defers the reclaim forever on
+        // the databases that need it most. Numbers are the measured state of the
+        // reference corpus at the moment VACUUM is reached: 11,665,166,336 bytes
+        // of file, of which 2,658,352 of 2,847,941 pages are already free, and a
+        // finished VACUUM produced 747,130,880 bytes.
+        let required = vacuum_free_space_required_from(4096, 2_847_941, 2_658_352);
+        assert!(
+            required >= 747_130_880,
+            "must cover the compacted result, asked {required}"
+        );
+        assert!(
+            required < 1_500_000_000,
+            "must not ask for the whole pre-VACUUM file, asked {required}"
+        );
+
+        // A database with nothing to reclaim still gets a real check.
+        let dense = vacuum_free_space_required_from(4096, 2_847_941, 0);
+        assert!(dense > 11_000_000_000);
+
+        // And an empty one never asks for zero.
+        assert_eq!(
+            vacuum_free_space_required_from(4096, 0, 0),
+            64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn fresh_databases_use_external_content_fts_with_all_sync_triggers() {
+        // Break caught: an internal-content FTS table creates chunks_fts_content
+        // and stores a second full copy of every chunk body.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let sql = fts_schema(&conn).to_ascii_lowercase();
+        assert!(sql.contains("content='chunks'"), "schema was: {sql}");
+        assert!(sql.contains("content_rowid='rowid'"), "schema was: {sql}");
+        let content_shadow: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'chunks_fts_content'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content_shadow, 0);
+        let trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name IN ('chunks_fts_ai', 'chunks_fts_ad', 'chunks_fts_au')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger_count, 3);
+    }
+
+    #[test]
+    fn legacy_fts_upgrade_purges_orphans_and_preserves_live_result_sets() {
+        // Break caught: merely changing future writes leaves historical orphan
+        // documents in the FTS corpus. Rebuild must derive the new index solely
+        // from live chunks, without changing which live ids match.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(DROP_CURRENT_FTS).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE chunks_fts
+                 USING fts5(content, tokenize='porter unicode61');
+             INSERT INTO chunks
+                 (rowid, id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES
+                 (10, 'live-a', 'conv-a', 'p', '2026-08-12T00:00:00Z', 'alpha beta', 1),
+                 (20, 'live-b', 'conv-b', 'p', '2026-08-12T00:00:00Z', 'beta gamma', 1);
+             INSERT INTO chunks_fts(rowid, content) VALUES
+                 (10, 'alpha beta'),
+                 (20, 'beta gamma'),
+                 (99, 'alpha orphanonly'),
+                 (100, 'beta stale duplicate');",
+        )
+        .unwrap();
+        let queries = ["alpha", "beta", "gamma", "orphanonly"];
+        let before: Vec<_> = queries
+            .iter()
+            .map(|query| matching_live_ids(&conn, query))
+            .collect();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM chunks_fts_docsize", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+
+        run(&conn).unwrap();
+
+        let after: Vec<_> = queries
+            .iter()
+            .map(|query| matching_live_ids(&conn, query))
+            .collect();
+        assert_eq!(
+            after, before,
+            "migration must preserve every live result set"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM chunks_fts_docsize", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2,
+            "rebuild must index exactly the two live chunks"
+        );
+        assert!(fts_schema(&conn)
+            .to_ascii_lowercase()
+            .contains("content='chunks'"));
+        assert_eq!(
+            fts_migration_state(&conn).unwrap().as_deref(),
+            Some(CHUNKS_FTS_COMPLETE),
+            "startup must not serve before post-VACUUM FTS verification completes"
+        );
+    }
+
+    #[test]
+    fn failed_legacy_fts_upgrade_rolls_back_to_the_searchable_old_index() {
+        // Break caught: a non-transactional DROP/CREATE migration can strand a
+        // killed or failed upgrade with neither a usable old nor new index.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(DROP_CURRENT_FTS).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE chunks RENAME COLUMN content TO body;
+             CREATE VIRTUAL TABLE chunks_fts
+                 USING fts5(content, tokenize='porter unicode61');
+             INSERT INTO chunks
+                 (rowid, id, conversation_id, project_name, timestamp, body, message_count)
+             VALUES (10, 'survivor', 'conv', 'p', '2026-08-12T00:00:00Z', 'stillsearchable', 1);
+             INSERT INTO chunks_fts(rowid, content) VALUES (10, 'stillsearchable');",
+        )
+        .unwrap();
+
+        run(&conn)
+            .expect_err("missing external content column must fail after the transactional DROP");
+
+        let schema = fts_schema(&conn).to_ascii_lowercase();
+        assert!(
+            !schema.contains("content='chunks'"),
+            "legacy schema must roll back: {schema}"
+        );
+        assert_eq!(
+            matching_live_ids(&conn, "stillsearchable"),
+            BTreeSet::from(["survivor".to_string()])
+        );
+    }
+
+    #[test]
+    fn interrupted_post_vacuum_rebuild_is_repaired_before_reopen_returns() {
+        // Break caught: after VACUUM, an implicit chunks.rowid may have moved.
+        // A durable pending-rebuild marker must force reconstruction before a
+        // restarted process can use the index.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO chunks
+                 (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES ('restart', 'conv', 'p', '2026-08-12T00:00:00Z', 'restarttoken', 1)",
+            [],
+        )
+        .unwrap();
+        let rowid: i64 = conn
+            .query_row("SELECT rowid FROM chunks WHERE id = 'restart'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO chunks_fts(chunks_fts, rowid, content)
+             VALUES ('delete', ?1, 'restarttoken')",
+            [rowid],
+        )
+        .unwrap();
+        assert!(matching_live_ids(&conn, "restarttoken").is_empty());
+        set_fts_migration_state(&conn, CHUNKS_FTS_PENDING_REBUILD).unwrap();
+
+        run(&conn).expect("reopen must finish the interrupted rebuild");
+
+        assert_eq!(
+            matching_live_ids(&conn, "restarttoken"),
+            BTreeSet::from(["restart".to_string()])
+        );
+        assert_eq!(
+            fts_migration_state(&conn).unwrap().as_deref(),
+            Some(CHUNKS_FTS_COMPLETE)
+        );
+    }
 
     #[test]
     fn saga_columns_migration_idempotent() {
