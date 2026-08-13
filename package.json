@@ -1,6 +1,6 @@
 {
   "name": "claude-self-reflect",
-  "version": "9.5.0",
+  "version": "9.5.1",
   "description": "Give Claude perfect memory of all your conversations. Single binary, zero dependencies.",
   "keywords": [
     "claude",
