@@ -93,6 +93,19 @@ const MAX_THREADS_PER_EPISODE: usize = 4;
 /// `CSR_NIGHT_ACTOR_CMD` custom-command path).
 const ACTOR_TIMEOUT_SECS: u64 = 120;
 
+/// Replaces Claude Code's default system prompt. The user prompt already
+/// carries the extraction rules; this exists only to drop ~14k of session
+/// scaffolding. Measured 2026-08-15: 52,024 → 12,082 tokens/call with the
+/// rest of the strip flags below.
+const THREAD_SYSTEM_PROMPT: &str = "Output only raw JSON. No prose.";
+
+/// Built-in Claude Code tools denied on the dream actor. `verify_reply`
+/// requires every `evidence_quote` to already be a substring of the prompt
+/// that was sent, so a quote found by reading a file cannot pass the gate.
+/// List is the one measured to 12,082 tokens on 2026-08-15 — append new
+/// builtins here if a later CLI reintroduces schema cost.
+const DISALLOWED_BUILTINS: &str = "Bash,Read,Edit,Write,Glob,Grep,Task,WebFetch,WebSearch,NotebookEdit,TodoWrite,BashOutput,KillShell,SlashCommand,ExitPlanMode,TaskCreate,TaskUpdate,Skill";
+
 /// `meta` key: RFC3339 timestamp of the last completed thread-extraction
 /// pass (set even when it processed zero candidates — that is still "ran").
 pub(crate) const META_LAST_RUN_AT: &str = "dream_threads_last_run_at";
@@ -608,6 +621,37 @@ fn write_minimal_mcp_config() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Argv after `claude` for one dream-thread call. Extracted so the
+/// session-strip contract is unit-testable without spawning the CLI.
+/// The prompt is always the argument to `-p`, never a trailing positional:
+/// `--mcp-config` is variadic and would consume the episode text otherwise.
+fn claude_p_argv(
+    model: Option<&str>,
+    prompt: &str,
+    mcp_config_path: &std::path::Path,
+) -> Vec<String> {
+    let mut args = vec!["-p".to_string(), prompt.to_string()];
+    if let Some(m) = model {
+        args.push("--model".into());
+        args.push(m.into());
+    }
+    args.push("--output-format".into());
+    args.push("json".into());
+    args.push("--strict-mcp-config".into());
+    args.push("--mcp-config".into());
+    args.push(mcp_config_path.to_string_lossy().into_owned());
+    args.push("--system-prompt".into());
+    args.push(THREAD_SYSTEM_PROMPT.into());
+    // No-op today when --system-prompt is set (CLI docs); kept so a later
+    // CLI that honors both still strips per-machine sections.
+    args.push("--exclude-dynamic-system-prompt-sections".into());
+    args.push("--setting-sources".into());
+    args.push(String::new());
+    args.push("--disallowedTools".into());
+    args.push(DISALLOWED_BUILTINS.into());
+    args
+}
+
 /// Single `claude -p` attempt for one model candidate. Manual poll-timeout
 /// loop, same idiom as `hooks::session_briefing::invoke_narrative_briefing`
 /// (sync `std::process::Command`, no tokio needed — this runs inside the
@@ -618,15 +662,7 @@ fn invoke_claude_p(model: Option<&str>, prompt: &str) -> ActorAttempt {
         Err(e) => return ActorAttempt::Failed(format!("mcp config: {e}")),
     };
     let mut cmd = std::process::Command::new("claude");
-    cmd.arg("-p").arg(prompt);
-    if let Some(m) = model {
-        cmd.arg("--model").arg(m);
-    }
-    cmd.arg("--output-format")
-        .arg("json")
-        .arg("--strict-mcp-config")
-        .arg("--mcp-config")
-        .arg(&mcp_config_path)
+    cmd.args(claude_p_argv(model, prompt, &mcp_config_path))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -2171,6 +2207,85 @@ mod tests {
             "prompt must be capped: {} bytes",
             prompt.len()
         );
+    }
+
+    // ---- session-strip argv (string-building only, never executes) -----------
+
+    #[test]
+    fn claude_p_argv_strips_session_scaffolding() {
+        let args = claude_p_argv(
+            Some("sonnet-5"),
+            "EXTRACT",
+            std::path::Path::new("/tmp/dream-mcp.json"),
+        );
+
+        // Prompt is a -p argument, not a trailing positional — --mcp-config
+        // is variadic and would swallow the episode text otherwise.
+        let dash_p = args.iter().position(|a| a == "-p").expect("-p");
+        assert_eq!(args[dash_p + 1], "EXTRACT");
+        let mcp = args.iter().position(|a| a == "--mcp-config").expect("mcp");
+        assert!(dash_p < mcp, "prompt must precede --mcp-config");
+        assert_eq!(args[mcp + 1], "/tmp/dream-mcp.json");
+        let model = args.iter().position(|a| a == "--model").expect("model");
+        assert_eq!(args[model + 1], "sonnet-5");
+
+        let sys = args
+            .iter()
+            .position(|a| a == "--system-prompt")
+            .expect("system-prompt");
+        assert_eq!(args[sys + 1], "Output only raw JSON. No prose.");
+
+        assert!(
+            args.iter()
+                .any(|a| a == "--exclude-dynamic-system-prompt-sections"),
+            "keep the measured flag even though the CLI ignores it with --system-prompt"
+        );
+
+        let sources = args
+            .iter()
+            .position(|a| a == "--setting-sources")
+            .expect("setting-sources");
+        assert_eq!(
+            args[sources + 1],
+            "",
+            "empty sources is what drops CLAUDE.md"
+        );
+
+        let deny = args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .expect("disallowedTools");
+        for tool in [
+            "Bash",
+            "Read",
+            "Edit",
+            "Write",
+            "Glob",
+            "Grep",
+            "Task",
+            "WebFetch",
+            "WebSearch",
+            "NotebookEdit",
+            "TodoWrite",
+            "BashOutput",
+            "KillShell",
+            "SlashCommand",
+            "ExitPlanMode",
+            "TaskCreate",
+            "TaskUpdate",
+            "Skill",
+        ] {
+            assert!(
+                args[deny + 1].split(',').any(|t| t == tool),
+                "disallowedTools must include {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_p_argv_omits_model_flag_when_unset() {
+        let args = claude_p_argv(None, "p", std::path::Path::new("/tmp/m.json"));
+        assert!(!args.iter().any(|a| a == "--model"));
     }
 
     // ---- actor template substitution (string-building only, never executes) --
