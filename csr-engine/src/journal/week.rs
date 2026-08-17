@@ -7,7 +7,7 @@
 //!
 //! GET `/` never invokes a model. `claude -p` ranking is a later writer.
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
 use super::composer::{self, StoredPlan};
 use crate::storage::dream_clusters::OpenItem;
@@ -33,11 +33,20 @@ pub(crate) struct Candidate {
     has_plan: bool,
 }
 
-/// `(iso_year, iso_week)` for a stored timestamp, or `None` if unparseable.
-pub fn week_key(raw: &str) -> Option<(i32, u32)> {
-    let dt = parse_ts(raw)?;
-    let week = dt.iso_week();
-    Some((week.year(), week.week()))
+/// True when `raw` falls inside the rolling week ending at `now`.
+///
+/// A rolling window, not the ISO calendar week: the calendar week empties
+/// the home at the UTC week rollover (observed live: Sunday evening local
+/// = Monday UTC dropped every open item), and an unfinished item does not
+/// stop being this week's business at midnight. Unparseable → out (the
+/// window is evidence-gated, never guessed). A small forward tolerance
+/// absorbs clock skew without admitting future-dated rows.
+pub fn within_week(raw: &str, now: DateTime<Utc>) -> bool {
+    let Some(ts) = parse_ts(raw) else {
+        return false;
+    };
+    let age = now.signed_duration_since(ts);
+    age <= Duration::days(7) && age >= Duration::hours(-1)
 }
 
 fn parse_ts(raw: &str) -> Option<DateTime<Utc>> {
@@ -57,16 +66,10 @@ fn parse_ts(raw: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-/// Rank and cap candidates that already belong to `now`'s ISO week.
+/// Rank and cap candidates from the rolling week ending at `now`.
 pub(crate) fn select_week_dreams(mut cands: Vec<Candidate>, now: DateTime<Utc>) -> Vec<WeekDream> {
-    let now_week = {
-        let w = now.iso_week();
-        (w.year(), w.week())
-    };
     cands.retain(|c| {
-        c.item.completed.is_none()
-            && week_key(&c.item.origin_ts) == Some(now_week)
-            && !c.how.is_empty()
+        c.item.completed.is_none() && within_week(&c.item.origin_ts, now) && !c.how.is_empty()
     });
     cands.sort_by(|a, b| {
         b.has_plan
@@ -162,12 +165,29 @@ mod tests {
         }
     }
 
+    fn at(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .expect("test timestamp")
+            .with_timezone(&Utc)
+    }
+
     #[test]
-    fn week_key_reads_iso_week() {
-        assert_eq!(week_key("2026-08-12T12:00:00Z"), Some((2026, 33)));
-        assert_eq!(week_key("2026-08-16T23:00:00Z"), Some((2026, 33)));
-        assert_eq!(week_key("2026-08-09T23:00:00Z"), Some((2026, 32)));
-        assert_eq!(week_key(""), None);
+    fn within_week_is_a_rolling_window_not_a_calendar_week() {
+        let now = at("2026-08-16T18:00:00Z");
+        assert!(within_week("2026-08-12T12:00:00Z", now));
+        assert!(within_week("2026-08-09T19:00:00Z", now));
+        assert!(!within_week("2026-08-09T10:00:00Z", now), "8d ago is out");
+        assert!(!within_week("2026-08-20T00:00:00Z", now), "future is out");
+        assert!(!within_week("", now));
+    }
+
+    #[test]
+    fn the_utc_week_rollover_does_not_empty_the_home() {
+        // Observed live 2026-08-16: Sunday evening local is Monday 03:31 UTC.
+        // ISO-week matching dropped every open item at that boundary.
+        let now = at("2026-08-17T03:31:00Z");
+        assert!(within_week("2026-08-15T21:46:13Z", now));
+        assert!(within_week("2026-08-13T23:05:57.942739+00:00", now));
     }
 
     #[test]
