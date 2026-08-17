@@ -156,8 +156,10 @@ fn compose_how_line(step: &composer::PlanStep) -> Option<String> {
     }
     let citation = step.citation.trim();
     if !citation.is_empty() {
+        // Same 8-char short-oid convention as the board's receipt lines.
+        let short = citation.get(..8).unwrap_or(citation);
         line.push_str(" ⌗");
-        line.push_str(citation);
+        line.push_str(short);
     }
     Some(line)
 }
@@ -421,6 +423,19 @@ mod tests {
         assert_eq!(
             compose_how_line(&step),
             Some("review week.rs ⌗abc123".into())
+        );
+    }
+
+    #[test]
+    fn compose_how_line_shortens_a_full_oid_to_the_board_convention() {
+        let step = composer::PlanStep {
+            action: "review file".into(),
+            files: vec![],
+            citation: "49f9d88d19acbdbc1c8f82e0b5eb1049d57e64ef".into(),
+        };
+        assert_eq!(
+            compose_how_line(&step),
+            Some("review file ⌗49f9d88d".into())
         );
     }
 
