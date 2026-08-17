@@ -5,7 +5,10 @@ pub mod reinstatement;
 pub mod rerank;
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::Path;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use fs2::FileExt;
@@ -49,7 +52,9 @@ const MAX_LAYER: usize = 16;
 // exact cosine over ≤256 384-dim vectors is well under a millisecond anyway.
 const EXACT_SCAN_THRESHOLD: usize = 256;
 
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
+const LEGACY_MANIFEST_VERSION: u32 = 1;
+static INDEX_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Metadata for validating a cached HNSW index.
 /// The `_expected` counts are DB row counts passed in from storage,
@@ -63,6 +68,18 @@ struct IndexManifest {
     chunk_embeddings_expected: usize,
     reflection_embeddings_expected: usize,
     active_reflection_count: usize,
+    #[serde(default = "default_chunk_basename")]
+    chunk_basename: String,
+    #[serde(default = "default_reflection_basename")]
+    reflection_basename: String,
+}
+
+fn default_chunk_basename() -> String {
+    "chunks".to_string()
+}
+
+fn default_reflection_basename() -> String {
+    "reflections".to_string()
 }
 
 impl SearchEngine {
@@ -403,25 +420,21 @@ impl SearchEngine {
             .lock_exclusive()
             .map_err(|e| anyhow::anyhow!("failed to acquire index lock for dump: {}", e))?;
 
-        // Dump HNSW graph + data files (skip empty indices — file_dump fails on empty).
-        // hnsw_rs may return a numbered basename (e.g. "chunks-7905") when mmap is active
-        // (after load_from_disk). We promote it to the canonical name so load_from_disk
-        // always finds "chunks.hnsw.data" / "reflections.hnsw.data".
-        if !self.chunk_id_map.is_empty() {
-            let basename = self
-                .chunk_index
-                .file_dump(dir, "chunks")
-                .map_err(|e| anyhow::anyhow!("chunk index dump failed: {}", e))?;
-            promote_to_canonical(dir, &basename, "chunks")?;
-        }
+        // Dump every non-empty index to a new generation. Neither fresh nor mmap-backed
+        // indexes may overwrite files referenced by the currently committed manifest.
+        let chunk_basename = if !self.chunk_id_map.is_empty() {
+            dump_hnsw_generation(&self.chunk_index, dir, "chunks")
+                .map_err(|e| anyhow::anyhow!("chunk index dump failed: {}", e))?
+        } else {
+            default_chunk_basename()
+        };
 
-        if !self.reflection_id_map.is_empty() {
-            let basename = self
-                .reflection_index
-                .file_dump(dir, "reflections")
-                .map_err(|e| anyhow::anyhow!("reflection index dump failed: {}", e))?;
-            promote_to_canonical(dir, &basename, "reflections")?;
-        }
+        let reflection_basename = if !self.reflection_id_map.is_empty() {
+            dump_hnsw_generation(&self.reflection_index, dir, "reflections")
+                .map_err(|e| anyhow::anyhow!("reflection index dump failed: {}", e))?
+        } else {
+            default_reflection_basename()
+        };
 
         // Write manifest atomically (tmp + rename)
         let manifest = IndexManifest {
@@ -432,17 +445,13 @@ impl SearchEngine {
             chunk_embeddings_expected: db_chunk_count,
             reflection_embeddings_expected: db_reflection_count,
             active_reflection_count: self.active_reflection_count,
+            chunk_basename,
+            reflection_basename,
         };
 
-        let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        let tmp_path = dir.join("manifest.json.tmp");
-        let final_path = dir.join("manifest.json");
-        std::fs::write(&tmp_path, &manifest_json)?;
-        std::fs::rename(&tmp_path, &final_path)?;
+        write_manifest_atomically(dir, &manifest)?;
 
-        // Clean stale numbered HNSW files from previous dumps.
-        // hnsw_rs creates numbered files (e.g. chunks-7905.hnsw.data) when mmap is active
-        // on the old files (after load_from_disk). These are orphaned after each new dump.
+        // Clean numbered generations not referenced by the newly committed manifest.
         cleanup_stale_index_files(dir);
 
         // Lock is released when lock_file is dropped
@@ -458,9 +467,10 @@ impl SearchEngine {
     /// - Chunk/reflection counts match current DB state (staleness detection)
     /// - All required files exist and load successfully
     ///
-    /// **WARNING**: This function uses `Box::leak` for `HnswIo` objects to satisfy
-    /// the `'static` lifetime requirement. Each call leaks ~200 bytes. Only call
-    /// this once per process (at startup).
+    /// **WARNING**: On full success the `HnswIo` objects are leaked to satisfy
+    /// the `'static` lifetime requirement (their mmaps must outlive the returned
+    /// indices). Failed or partially failed loads reclaim them instead. Only
+    /// call this once per process (at startup).
     pub fn load_from_disk(
         dir: &Path,
         expected_chunks: usize,
@@ -481,9 +491,9 @@ impl SearchEngine {
         let manifest_data = std::fs::read_to_string(&manifest_path).ok()?;
         let manifest: IndexManifest = serde_json::from_str(&manifest_data).ok()?;
 
-        if manifest.version != MANIFEST_VERSION {
+        if manifest.version != MANIFEST_VERSION && manifest.version != LEGACY_MANIFEST_VERSION {
             tracing::info!(
-                expected = MANIFEST_VERSION,
+                expected = "1 or 2",
                 found = manifest.version,
                 "index cache version mismatch"
             );
@@ -526,16 +536,15 @@ impl SearchEngine {
             );
         }
 
-        // Load chunk index.
-        // Box::leak gives the HnswIo a 'static lifetime required by load_hnsw.
-        // Leaked memory is ~200 bytes total — negligible for process-lifetime objects.
-        // Empty indices aren't dumped to disk, so create fresh ones if count is 0.
-        let chunk_hnsw = if manifest.chunk_embeddings_expected > 0 {
-            let chunk_io = Box::leak(Box::new(HnswIo::new(dir, "chunks")));
-            match chunk_io.load_hnsw::<f32, DistCosine>() {
+        // Hnsw borrows its HnswIo mmap. Keep each allocation owned while loading so
+        // failures can reclaim it; leak both only after both loads have succeeded.
+        let mut chunk_io = (manifest.chunk_embeddings_expected > 0)
+            .then(|| PendingHnswIo::new(dir, &manifest.chunk_basename));
+        let chunk_hnsw = if let Some(io) = chunk_io.as_mut() {
+            match io.load() {
                 Ok(hnsw) => hnsw,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load chunk HNSW from cache");
+                Err(failure) => {
+                    log_hnsw_load_failure("chunk", &failure);
                     return None;
                 }
             }
@@ -549,12 +558,13 @@ impl SearchEngine {
             )
         };
 
-        let refl_hnsw = if manifest.reflection_embeddings_expected > 0 {
-            let refl_io = Box::leak(Box::new(HnswIo::new(dir, "reflections")));
-            match refl_io.load_hnsw::<f32, DistCosine>() {
+        let mut refl_io = (manifest.reflection_embeddings_expected > 0)
+            .then(|| PendingHnswIo::new(dir, &manifest.reflection_basename));
+        let refl_hnsw = if let Some(io) = refl_io.as_mut() {
+            match io.load() {
                 Ok(hnsw) => hnsw,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load reflection HNSW from cache");
+                Err(failure) => {
+                    log_hnsw_load_failure("reflection", &failure);
                     return None;
                 }
             }
@@ -567,6 +577,15 @@ impl SearchEngine {
                 DistCosine {},
             )
         };
+
+        // These allocations own mmaps referenced by the returned Hnsw values and
+        // therefore intentionally live for the process lifetime after full success.
+        if let Some(io) = chunk_io.take() {
+            io.leak();
+        }
+        if let Some(io) = refl_io.take() {
+            io.leak();
+        }
 
         // Rebuild ID sets from the loaded maps
         let chunk_id_set: HashSet<String> = manifest
@@ -598,38 +617,150 @@ impl SearchEngine {
     }
 }
 
-/// If `file_dump` returned a numbered basename (e.g. "chunks-7905"), rename its files
-/// to the canonical name (e.g. "chunks.hnsw.data") so `load_from_disk` can find them.
-/// This happens when the Hnsw was loaded via `load_hnsw` (mmap active → `overwrite=false`).
-fn promote_to_canonical(dir: &Path, returned_basename: &str, canonical: &str) -> Result<()> {
-    if returned_basename == canonical {
-        return Ok(()); // Already canonical, nothing to do
-    }
-    for ext in &[".hnsw.data", ".hnsw.graph"] {
-        let src = dir.join(format!("{}{}", returned_basename, ext));
-        let dst = dir.join(format!("{}{}", canonical, ext));
-        if src.exists() {
-            std::fs::rename(&src, &dst).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to promote {} to {}: {}",
-                    src.display(),
-                    dst.display(),
-                    e
-                )
-            })?;
+fn next_generation_basename(dir: &Path, prefix: &str) -> String {
+    loop {
+        let generation = INDEX_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let basename = format!("{prefix}-{}-{generation}", std::process::id());
+        let data_path = dir.join(format!("{basename}.hnsw.data"));
+        let graph_path = dir.join(format!("{basename}.hnsw.graph"));
+        if !data_path.exists() && !graph_path.exists() {
+            return basename;
         }
+    }
+}
+
+fn dump_hnsw_generation(
+    index: &Hnsw<'static, f32, DistCosine>,
+    dir: &Path,
+    prefix: &str,
+) -> Result<String> {
+    let requested_basename = next_generation_basename(dir, prefix);
+    let actual_basename = index.file_dump(dir, &requested_basename)?;
+    sync_index_pair(dir, &actual_basename)?;
+    Ok(actual_basename)
+}
+
+fn sync_index_pair(dir: &Path, basename: &str) -> Result<()> {
+    for extension in [".hnsw.data", ".hnsw.graph"] {
+        std::fs::File::open(dir.join(format!("{basename}{extension}")))?.sync_all()?;
     }
     Ok(())
 }
 
+fn write_manifest_atomically(dir: &Path, manifest: &IndexManifest) -> Result<()> {
+    let manifest_json = serde_json::to_vec_pretty(manifest)?;
+    let tmp_path = dir.join("manifest.json.tmp");
+    let final_path = dir.join("manifest.json");
+    let mut tmp_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    tmp_file.write_all(&manifest_json)?;
+    tmp_file.sync_all()?;
+    drop(tmp_file);
+    std::fs::rename(&tmp_path, &final_path)?;
+    if let Err(error) = std::fs::File::open(dir).and_then(|directory| directory.sync_all()) {
+        tracing::warn!(%error, path = %dir.display(), "failed to fsync index directory");
+    }
+    Ok(())
+}
+
+struct PendingHnswIo {
+    io: NonNull<HnswIo>,
+}
+
+impl PendingHnswIo {
+    fn new(dir: &Path, basename: &str) -> Self {
+        let io = Box::new(HnswIo::new(dir, basename));
+        Self {
+            io: NonNull::new(Box::into_raw(io)).expect("Box::into_raw never returns null"),
+        }
+    }
+
+    fn load(&mut self) -> std::result::Result<Hnsw<'static, f32, DistCosine>, HnswLoadFailure> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: `self` uniquely owns this allocation until `leak`; the pointer
+            // remains stable, and a failed/unwound call cannot return a borrowing Hnsw.
+            unsafe { self.io.as_mut().load_hnsw::<f32, DistCosine>() }
+        }))
+        .map_err(HnswLoadFailure::Panic)?
+        .map_err(HnswLoadFailure::Error)
+    }
+
+    fn leak(self) {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: the allocation is still uniquely owned here. Both Hnsw loads have
+        // succeeded, so converting it to a process-lifetime leak preserves their mmaps.
+        unsafe {
+            Box::leak(Box::from_raw(this.io.as_ptr()));
+        }
+    }
+}
+
+impl Drop for PendingHnswIo {
+    fn drop(&mut self) {
+        // SAFETY: no Hnsw escaped when a load returned Err or unwound. At a partial
+        // failure, Rust drops any previously loaded Hnsw before its PendingHnswIo.
+        unsafe {
+            drop(Box::from_raw(self.io.as_ptr()));
+        }
+    }
+}
+
+enum HnswLoadFailure {
+    Error(anyhow::Error),
+    Panic(Box<dyn std::any::Any + Send>),
+}
+
+fn log_hnsw_load_failure(kind: &str, failure: &HnswLoadFailure) {
+    match failure {
+        HnswLoadFailure::Error(error) => {
+            tracing::warn!(%error, index = kind, "failed to load HNSW from cache");
+        }
+        HnswLoadFailure::Panic(payload) => {
+            tracing::warn!(
+                panic = panic_payload_message(payload.as_ref()),
+                index = kind,
+                "panic while loading HNSW from cache"
+            );
+        }
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
+    }
+}
+
 /// Remove stale numbered HNSW files from the index directory.
 /// hnsw_rs creates numbered files (e.g. `chunks-7905.hnsw.data`) when mmap is active.
-/// After `dump_to_disk` promotes them to canonical names, the numbered copies are gone.
-/// This function catches any stragglers from crashes, concurrent processes, or old sessions.
+/// The generation referenced by the current manifest is retained; other numbered
+/// generations are stragglers from crashes, concurrent processes, or old sessions.
 ///
 /// Called after every `dump_to_disk` and at engine startup.
 /// Must be called while holding `index.lock` (dump_to_disk) or at startup before serving.
 pub fn cleanup_stale_index_files(dir: &Path) {
+    let Some(manifest) = std::fs::read_to_string(dir.join("manifest.json"))
+        .ok()
+        .and_then(|data| serde_json::from_str::<IndexManifest>(&data).ok())
+    else {
+        return;
+    };
+    let keep: HashSet<String> = [
+        format!("{}.hnsw.data", manifest.chunk_basename),
+        format!("{}.hnsw.graph", manifest.chunk_basename),
+        format!("{}.hnsw.data", manifest.reflection_basename),
+        format!("{}.hnsw.graph", manifest.reflection_basename),
+    ]
+    .into_iter()
+    .collect();
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -640,6 +771,7 @@ pub fn cleanup_stale_index_files(dir: &Path) {
         // Keep: chunks.hnsw.data, reflections.hnsw.graph, manifest.json, index.lock
         if (name.starts_with("chunks-") || name.starts_with("reflections-"))
             && (name.ends_with(".hnsw.data") || name.ends_with(".hnsw.graph"))
+            && !keep.contains(&name)
         {
             let _ = std::fs::remove_file(entry.path());
             removed += 1;
@@ -731,79 +863,227 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_removes_numbered_keeps_base() {
+    fn load_from_disk_returns_none_when_hnsw_pair_is_mismatched() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("c0".into(), vec![0.5; 384]);
+        engine.dump_to_disk(dir, 1, 0).unwrap();
+
+        let manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        // Retain the real graph but make its paired data file claim a different
+        // dimension. hnsw_rs asserts that the graph and data dimensions agree.
+        let mut data = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(format!("{}.hnsw.data", manifest.chunk_basename)))
+            .unwrap();
+        data.seek(SeekFrom::Start(std::mem::size_of::<u32>() as u64))
+            .unwrap();
+        data.write_all(&999usize.to_ne_bytes()).unwrap();
+        drop(data);
+
+        assert!(SearchEngine::load_from_disk(dir, 1, 0).is_none());
+    }
+
+    #[test]
+    fn load_accepts_v1_manifest_with_canonical_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("c0".into(), vec![0.5; 384]);
+        engine.dump_to_disk(dir, 1, 0).unwrap();
+
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let object = manifest.as_object_mut().unwrap();
+        let chunk_basename = object["chunk_basename"].as_str().unwrap().to_string();
+        for extension in [".hnsw.data", ".hnsw.graph"] {
+            std::fs::copy(
+                dir.join(format!("{chunk_basename}{extension}")),
+                dir.join(format!("chunks{extension}")),
+            )
+            .unwrap();
+        }
+        object.insert("version".into(), serde_json::json!(1));
+        object.remove("chunk_basename");
+        object.remove("reflection_basename");
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert!(SearchEngine::load_from_disk(dir, 1, 0).is_some());
+    }
+
+    #[test]
+    fn consecutive_dumps_without_reload_use_distinct_generations() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("c0".into(), vec![0.5; 384]);
+        engine.dump_to_disk(dir, 1, 0).unwrap();
+
+        let first_manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let first_manifest_bytes = std::fs::read(dir.join("manifest.json")).unwrap();
+        let first_data_path = dir.join(format!("{}.hnsw.data", first_manifest.chunk_basename));
+        let first_graph_path = dir.join(format!("{}.hnsw.graph", first_manifest.chunk_basename));
+        let first_data = std::fs::read(&first_data_path).unwrap();
+        let first_graph = std::fs::read(&first_graph_path).unwrap();
+
+        // Stage the second same-process HNSW dump without publishing its manifest.
+        let staged_basename = dump_hnsw_generation(&engine.chunk_index, dir, "chunks").unwrap();
+        assert_ne!(first_manifest.chunk_basename, staged_basename);
+        assert_eq!(
+            std::fs::read(dir.join("manifest.json")).unwrap(),
+            first_manifest_bytes
+        );
+        assert_eq!(std::fs::read(&first_data_path).unwrap(), first_data);
+        assert_eq!(std::fs::read(&first_graph_path).unwrap(), first_graph);
+        assert!(dir.join(format!("{staged_basename}.hnsw.data")).exists());
+        assert!(dir.join(format!("{staged_basename}.hnsw.graph")).exists());
+
+        engine.dump_to_disk(dir, 1, 0).unwrap();
+
+        let second_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let second_basename = second_manifest["chunk_basename"].as_str().unwrap();
+        assert_ne!(first_manifest.chunk_basename, second_basename);
+        assert!(second_basename.starts_with("chunks-"));
+        assert!(dir.join(format!("{second_basename}.hnsw.data")).exists());
+        assert!(dir.join(format!("{second_basename}.hnsw.graph")).exists());
+    }
+
+    #[test]
+    fn dumps_write_current_manifest_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("c0".into(), vec![0.5; 384]);
+        engine.dump_to_disk(tmp.path(), 1, 0).unwrap();
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["version"], 2);
+    }
+
+    #[test]
+    fn manifest_commit_replaces_file_and_removes_temp() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("manifest.json"), "old").unwrap();
+        let manifest = IndexManifest {
+            version: MANIFEST_VERSION,
+            created_at: "2026-08-17T00:00:00Z".into(),
+            chunk_id_map: Vec::new(),
+            reflection_id_map: Vec::new(),
+            chunk_embeddings_expected: 0,
+            reflection_embeddings_expected: 0,
+            active_reflection_count: 0,
+            chunk_basename: default_chunk_basename(),
+            reflection_basename: default_reflection_basename(),
+        };
+
+        write_manifest_atomically(dir, &manifest).unwrap();
+
+        let committed: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(committed.version, MANIFEST_VERSION);
+        assert!(!dir.join("manifest.json.tmp").exists());
+    }
+
+    #[test]
+    fn reflection_panic_after_chunk_load_does_not_poison_later_load() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("c0".into(), vec![0.5; 384]);
+        engine.insert_reflection("r0".into(), vec![0.25; 384]);
+        engine.dump_to_disk(dir, 1, 1).unwrap();
+
+        let manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let reflection_data_path = dir.join(format!("{}.hnsw.data", manifest.reflection_basename));
+        let valid_reflection_data = std::fs::read(&reflection_data_path).unwrap();
+        let mut data = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&reflection_data_path)
+            .unwrap();
+        data.seek(SeekFrom::Start(std::mem::size_of::<u32>() as u64))
+            .unwrap();
+        data.write_all(&999usize.to_ne_bytes()).unwrap();
+        drop(data);
+
+        assert!(SearchEngine::load_from_disk(dir, 1, 1).is_none());
+        std::fs::write(&reflection_data_path, valid_reflection_data).unwrap();
+        assert!(SearchEngine::load_from_disk(dir, 1, 1).is_some());
+    }
+
+    #[test]
+    fn cleanup_keeps_manifest_generation_and_removes_other_numbered_files() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
 
-        // Create stale numbered files
+        // Create stale and current numbered generations.
         std::fs::write(dir.join("chunks-100.hnsw.data"), "old").unwrap();
         std::fs::write(dir.join("chunks-100.hnsw.graph"), "old").unwrap();
-        std::fs::write(dir.join("chunks-200.hnsw.data"), "old").unwrap();
-        std::fs::write(dir.join("reflections-50.hnsw.data"), "old").unwrap();
-        std::fs::write(dir.join("reflections-50.hnsw.graph"), "old").unwrap();
+        std::fs::write(dir.join("chunks-200.hnsw.data"), "current").unwrap();
+        std::fs::write(dir.join("chunks-200.hnsw.graph"), "current").unwrap();
+        std::fs::write(dir.join("reflections-25.hnsw.data"), "old").unwrap();
+        std::fs::write(dir.join("reflections-25.hnsw.graph"), "old").unwrap();
+        std::fs::write(dir.join("reflections-50.hnsw.data"), "current").unwrap();
+        std::fs::write(dir.join("reflections-50.hnsw.graph"), "current").unwrap();
 
-        // Create base files that should be kept
+        // Canonical files are from an older cache generation, but cleanup only
+        // removes stale numbered generations.
         std::fs::write(dir.join("chunks.hnsw.data"), "current").unwrap();
         std::fs::write(dir.join("chunks.hnsw.graph"), "current").unwrap();
         std::fs::write(dir.join("reflections.hnsw.data"), "current").unwrap();
         std::fs::write(dir.join("reflections.hnsw.graph"), "current").unwrap();
-        std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": MANIFEST_VERSION,
+                "created_at": "2026-08-17T00:00:00Z",
+                "chunk_id_map": [],
+                "reflection_id_map": [],
+                "chunk_embeddings_expected": 0,
+                "reflection_embeddings_expected": 0,
+                "active_reflection_count": 0,
+                "chunk_basename": "chunks-200",
+                "reflection_basename": "reflections-50"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         std::fs::write(dir.join("index.lock"), "").unwrap();
 
         cleanup_stale_index_files(dir);
 
-        // Numbered files should be gone
+        // Stale numbered generations should be gone.
         assert!(!dir.join("chunks-100.hnsw.data").exists());
-        assert!(!dir.join("chunks-200.hnsw.data").exists());
-        assert!(!dir.join("reflections-50.hnsw.data").exists());
+        assert!(!dir.join("chunks-100.hnsw.graph").exists());
+        assert!(!dir.join("reflections-25.hnsw.data").exists());
+        assert!(!dir.join("reflections-25.hnsw.graph").exists());
 
-        // Base files should remain
+        // The manifest's complete graph/data pairs must remain.
+        assert!(dir.join("chunks-200.hnsw.data").exists());
+        assert!(dir.join("chunks-200.hnsw.graph").exists());
+        assert!(dir.join("reflections-50.hnsw.data").exists());
+        assert!(dir.join("reflections-50.hnsw.graph").exists());
+
+        // Canonical files and non-index metadata should remain.
         assert!(dir.join("chunks.hnsw.data").exists());
         assert!(dir.join("chunks.hnsw.graph").exists());
         assert!(dir.join("reflections.hnsw.data").exists());
         assert!(dir.join("manifest.json").exists());
         assert!(dir.join("index.lock").exists());
-    }
-
-    #[test]
-    fn test_promote_renames_numbered_to_canonical() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        // Simulate hnsw_rs creating numbered files
-        std::fs::write(dir.join("chunks-4567.hnsw.data"), "new_data").unwrap();
-        std::fs::write(dir.join("chunks-4567.hnsw.graph"), "new_graph").unwrap();
-        // Old canonical files exist
-        std::fs::write(dir.join("chunks.hnsw.data"), "old_data").unwrap();
-        std::fs::write(dir.join("chunks.hnsw.graph"), "old_graph").unwrap();
-
-        let _ = promote_to_canonical(dir, "chunks-4567", "chunks");
-
-        // Canonical files should have the new content
-        assert_eq!(
-            std::fs::read_to_string(dir.join("chunks.hnsw.data")).unwrap(),
-            "new_data"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.join("chunks.hnsw.graph")).unwrap(),
-            "new_graph"
-        );
-        // Numbered files should be gone (renamed)
-        assert!(!dir.join("chunks-4567.hnsw.data").exists());
-        assert!(!dir.join("chunks-4567.hnsw.graph").exists());
-    }
-
-    #[test]
-    fn test_promote_noop_when_already_canonical() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let dir = tmp.path();
-        std::fs::write(dir.join("chunks.hnsw.data"), "data").unwrap();
-
-        let _ = promote_to_canonical(dir, "chunks", "chunks"); // should not panic or corrupt
-        assert_eq!(
-            std::fs::read_to_string(dir.join("chunks.hnsw.data")).unwrap(),
-            "data"
-        );
     }
 
     #[test]
