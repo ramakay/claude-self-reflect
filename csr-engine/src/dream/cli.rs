@@ -100,15 +100,32 @@ pub fn handle(
     project_filter: Option<&str>,
     json: bool,
     no_llm: bool,
+    as_of: Option<&str>,
 ) -> Result<()> {
     let storage = Storage::open(db_path)?;
-    let now = Utc::now();
+    let now = match as_of {
+        Some(raw) => parse_as_of(raw)?,
+        None => Utc::now(),
+    };
     let (verdict, cards) = build_run(&storage, project_filter, no_llm, now)?;
     if json {
         emit_json(&verdict, &cards, project_filter)
     } else {
         emit_text(&verdict, &cards)
     }
+}
+
+/// `--as-of` accepts RFC3339 or a bare UTC date (anchored at end of day, so
+/// "2026-08-10" means "the week as seen from the end of Aug 10").
+fn parse_as_of(raw: &str) -> Result<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        let end_of_day = d.and_hms_opt(23, 59, 59).expect("valid fixed time");
+        return Ok(DateTime::from_naive_utc_and_offset(end_of_day, Utc));
+    }
+    anyhow::bail!("--as-of must be RFC3339 or YYYY-MM-DD, got {raw:?}")
 }
 
 /// Everything `csr-engine dreams` decides, given an already-open `storage`:

@@ -166,6 +166,10 @@ enum Commands {
         /// deterministic unfinished category runs
         #[arg(long = "no-llm")]
         no_llm: bool,
+        /// Anchor "now" at a past instant (RFC3339 or YYYY-MM-DD, UTC) so the
+        /// rolling 7-day evidence window covers an earlier week — replay/eval
+        #[arg(long = "as-of")]
+        as_of: Option<String>,
     },
     /// Run evaluation tests
     Eval {
@@ -450,9 +454,16 @@ async fn main() -> Result<()> {
         ref project,
         json,
         no_llm,
+        ref as_of,
     }) = args.command
     {
-        return csr_engine::dream::cli::handle(&args.db_path, project.as_deref(), json, no_llm);
+        return csr_engine::dream::cli::handle(
+            &args.db_path,
+            project.as_deref(),
+            json,
+            no_llm,
+            as_of.as_deref(),
+        );
     }
 
     if let Some(Commands::Quality { ref path }) = args.command {
