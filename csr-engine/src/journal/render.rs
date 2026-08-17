@@ -47,26 +47,27 @@ pub struct WeekDreamView {
     pub kind_label: String,
 }
 
-/// The week-dreams home. Empty is abstention, not a missing log.
+/// The week-dreams home. The curator's #1 speaks as THE next move; the
+/// rest are demoted to runners-up. Empty is abstention, not a missing log.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct DreamsHomeView {
-    pub dreams: Vec<WeekDreamView>,
+    pub next_move: Option<WeekDreamView>,
+    pub runners_up: Vec<WeekDreamView>,
 }
 
 impl DreamsHomeView {
     pub fn from_week(dreams: Vec<crate::journal::week::WeekDream>) -> Self {
+        let mut views = dreams.into_iter().map(|d| WeekDreamView {
+            title: d.title,
+            hypothesis: d.hypothesis,
+            how: d.how,
+            project: d.project,
+            href: format!("/dream/{}", d.item_id),
+            kind_label: d.kind_label.to_string(),
+        });
         Self {
-            dreams: dreams
-                .into_iter()
-                .map(|d| WeekDreamView {
-                    title: d.title,
-                    hypothesis: d.hypothesis,
-                    how: d.how,
-                    project: d.project,
-                    href: format!("/dream/{}", d.item_id),
-                    kind_label: d.kind_label.to_string(),
-                })
-                .collect(),
+            next_move: views.next(),
+            runners_up: views.collect(),
         }
     }
 }
@@ -248,6 +249,7 @@ mod tests {
         board_feed_of, build_board, build_detail, sample_cluster, sample_item, test_now, BoardFeed,
         DetailContext, ResolveReceipt,
     };
+    use crate::journal::week::WeekDream;
     use crate::storage::dream_items::{DreamItem, DreamItemGrade};
 
     fn adverse(id: &str) -> crate::storage::dream_clusters::DreamCluster {
@@ -767,5 +769,54 @@ mod tests {
         assert!(html.contains("That write was refused"));
         assert!(html.contains("Nothing was written."));
         assert!(!html.contains("Verdict recorded"));
+    }
+
+    fn week_dream(id: &str, title: &str, hyp: &str, kind: &'static str) -> WeekDream {
+        WeekDream {
+            title: title.to_string(),
+            hypothesis: Some(hyp.to_string()),
+            how: vec!["step one".to_string()],
+            project: "csr".to_string(),
+            item_id: id.to_string(),
+            kind_label: kind,
+        }
+    }
+
+    #[test]
+    fn the_home_speaks_one_next_move_and_demotes_the_rest() {
+        let dreams = vec![
+            week_dream(
+                "id1",
+                "fix the curator smear",
+                "one session owns two cards",
+                "natural direction",
+            ),
+            week_dream("id2", "runner item", "runner hypothesis", "unfinished"),
+        ];
+        let html = dreams_home(&DreamsHomeView::from_week(dreams)).expect("render");
+        assert!(html.contains("next move (dreamed)"));
+        assert!(html.contains("fix the curator smear"));
+        assert!(html.contains("one session owns two cards"));
+        assert!(html.contains("step one"));
+        // The runner-up is demoted to a linked title: its hypothesis and how
+        // never render. The home is a verdict, not a menu of equals.
+        assert!(html.contains("runner item"));
+        assert!(!html.contains("runner hypothesis"));
+        let pick = html.find("fix the curator smear").expect("pick present");
+        let runner = html.find("runner item").expect("runner present");
+        assert!(pick < runner, "the next move must lead the page");
+    }
+
+    #[test]
+    fn a_lone_week_dream_renders_no_runners_up_section() {
+        let dreams = vec![week_dream(
+            "id1",
+            "only move",
+            "why it matters",
+            "unfinished",
+        )];
+        let html = dreams_home(&DreamsHomeView::from_week(dreams)).expect("render");
+        assert!(html.contains("next move (dreamed)"));
+        assert!(!html.contains("Also live this week"));
     }
 }

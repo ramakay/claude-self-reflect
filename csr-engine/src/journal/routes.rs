@@ -587,7 +587,7 @@ mod tests {
     async fn the_home_route_is_the_week_dreams_page_not_the_log() {
         let (status, _, body) = get_path(state_with(3), "/").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("No week-dream is on this page yet"));
+        assert!(body.contains("No next move is dreamed yet"));
         assert!(body.contains("abstention"));
         assert!(body.contains("href=\"/board\""));
         assert!(
