@@ -361,6 +361,15 @@
   .churn-file { word-break: break-all; }
   .churn-count { margin-left: auto; color: var(--label); white-space: nowrap; }
 
+  .week-dreams { list-style: none; margin: 0; padding: 1.5rem 0; display: grid; gap: 1.75rem; }
+  .week-dream h2 { margin: 0.2rem 0 0.5rem; font-family: var(--serif); font-size: 1.5rem; font-weight: 500; }
+  .week-kicker {
+    margin: 0; font-family: var(--mono); font-size: 0.6875rem;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--label);
+  }
+  .week-hypothesis { margin: 0 0 0.6rem; color: var(--fg); }
+  .week-how { margin: 0; padding-left: 1.2rem; color: var(--fg-muted); display: grid; gap: 0.25rem; }
+
   .empty {
     margin: 1.5rem 0 0; padding: 2rem 1.25rem;
     border: 1px dashed var(--border); border-radius: var(--radius-tile);
@@ -386,7 +395,7 @@
 <div class="shell">
   <aside class="sidebar">
     <p class="rail-title">Journal</p>
-    <ul class="nav"><li><a class="current" href="/">Board</a></li></ul>
+    <ul class="nav"><li><a class="current" href="/">Dreams</a></li><li><a href="/board">Board</a></li></ul>
   </aside>
   <main class="main"><div class="wrap">{% block main %}{% endblock %}</div></main>
 </div>

@@ -38,6 +38,7 @@ pub mod composer;
 pub mod render;
 pub mod routes;
 pub mod state;
+pub mod week;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};

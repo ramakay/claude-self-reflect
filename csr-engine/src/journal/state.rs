@@ -349,6 +349,15 @@ pub trait DreamFeed: Send + Sync + 'static {
         None
     }
 
+    /// This week's curated dreams. Default is a successful empty read —
+    /// fixtures that store no week-dreams. Production overrides.
+    fn load_week_dreams(
+        &self,
+        _now: DateTime<Utc>,
+    ) -> Result<Vec<crate::journal::week::WeekDream>> {
+        Ok(Vec::new())
+    }
+
     /// Everything the detail page composes from stored rows.
     ///
     /// Returns `Result` (codex X4 finding 9): a failed read must reach the
@@ -648,6 +657,11 @@ impl DreamFeed for StorageDreamFeed {
 
     fn last_pass(&self) -> Option<(String, String)> {
         self.storage.last_dream_run().ok().flatten()
+    }
+
+    fn load_week_dreams(&self, now: DateTime<Utc>) -> Result<Vec<crate::journal::week::WeekDream>> {
+        self.storage
+            .with_connection(|conn| crate::journal::week::load_week_dreams(conn, now))
     }
 
     fn detail_context(&self, item: &DreamItem) -> Result<DetailContext> {

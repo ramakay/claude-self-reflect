@@ -26,13 +26,50 @@ use super::state::{BoardView, DetailView, ResolveReceipt};
 
 const LAYOUT: &str = include_str!("layout.html.jinja");
 const LANDING: &str = include_str!("landing.html.jinja");
+const DREAMS: &str = include_str!("dreams.html.jinja");
 const DETAIL: &str = include_str!("detail.html.jinja");
 const NOTICE: &str = include_str!("notice.html.jinja");
 
 const LAYOUT_NAME: &str = "layout.html";
 const LANDING_NAME: &str = "landing.html";
+const DREAMS_NAME: &str = "dreams.html";
 const DETAIL_NAME: &str = "detail.html";
 const NOTICE_NAME: &str = "notice.html";
+
+/// One week-dream as rendered. Hypothesis is optional (clause drops).
+#[derive(Debug, Clone, Serialize)]
+pub struct WeekDreamView {
+    pub title: String,
+    pub hypothesis: Option<String>,
+    pub how: Vec<String>,
+    pub project: String,
+    pub href: String,
+    pub kind_label: String,
+}
+
+/// The week-dreams home. Empty is abstention, not a missing log.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DreamsHomeView {
+    pub dreams: Vec<WeekDreamView>,
+}
+
+impl DreamsHomeView {
+    pub fn from_week(dreams: Vec<crate::journal::week::WeekDream>) -> Self {
+        Self {
+            dreams: dreams
+                .into_iter()
+                .map(|d| WeekDreamView {
+                    title: d.title,
+                    hypothesis: d.hypothesis,
+                    how: d.how,
+                    project: d.project,
+                    href: format!("/dream/{}", d.item_id),
+                    kind_label: d.kind_label.to_string(),
+                })
+                .collect(),
+        }
+    }
+}
 
 /// A 404 / 500 / kill-switch page. Kept in the same visual register as the
 /// real pages so an error never looks like a broken deploy.
@@ -163,6 +200,7 @@ fn build_env() -> std::result::Result<Environment<'static>, String> {
     for (name, source) in [
         (LAYOUT_NAME, LAYOUT),
         (LANDING_NAME, LANDING),
+        (DREAMS_NAME, DREAMS),
         (DETAIL_NAME, DETAIL),
         (NOTICE_NAME, NOTICE),
     ] {
@@ -189,6 +227,10 @@ fn render<T: Serialize>(template: &str, view: &T) -> Result<String> {
 
 pub fn board(view: &BoardView) -> Result<String> {
     render(LANDING_NAME, view)
+}
+
+pub fn dreams_home(view: &DreamsHomeView) -> Result<String> {
+    render(DREAMS_NAME, view)
 }
 
 pub fn detail(view: &DetailView) -> Result<String> {
@@ -371,7 +413,7 @@ mod tests {
                 "the current nav item must not be marked with {banned}"
             );
         }
-        assert!(html.contains(r#"<a class="current" href="/">Board</a>"#));
+        assert!(html.contains(r#"<a class="current" href="/board">Board</a>"#));
     }
 
     /// Ban 1, 3 and 4: no manila fill, no rounded floating frame, nothing

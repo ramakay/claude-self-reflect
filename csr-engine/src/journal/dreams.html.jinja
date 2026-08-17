@@ -1,0 +1,45 @@
+{% extends "layout.html" %}
+{% block title %}Dreams — CSR Dream Journal{% endblock %}
+{% block masthead_meta %}<span>week-dreams</span>{% endblock %}
+{#- Home is the curated week-dream list. The evidence log lives at /board
+    and is not inlined here — an empty home is abstention, not a missing log. -#}
+{% block shell %}
+<div class="shell">
+  <aside class="sidebar">
+    <p class="rail-title">Journal</p>
+    <ul class="nav">
+      <li><a class="current" href="/">Dreams</a></li>
+      <li><a href="/board">Board</a></li>
+    </ul>
+  </aside>
+  <main class="main">
+    {% if view.dreams %}
+    <div class="wrap">
+      <h1>This week</h1>
+      <ul class="week-dreams">
+        {% for dream in view.dreams %}
+        <li class="week-dream">
+          <p class="week-kicker">{{ dream.kind_label }} · {{ dream.project }}</p>
+          <h2><a href="{{ dream.href }}">{{ dream.title }}</a></h2>
+          {% if dream.hypothesis %}<p class="week-hypothesis">{{ dream.hypothesis }}</p>{% endif %}
+          {% if dream.how %}
+          <ol class="week-how">
+            {% for step in dream.how %}<li>{{ step }}</li>{% endfor %}
+          </ol>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% else %}
+    <div class="empty">
+      <p class="lead">No week-dream is on this page yet.</p>
+      <p>That is abstention, not an empty week. A card appears here only when a
+         second deliberation over the week has a gated <em>how</em>. The
+         hypothesis on that card is one free sentence; the how is not free.</p>
+      <p>The session log and evidence board stay at <a href="/board">/board</a>.</p>
+    </div>
+    {% endif %}
+  </main>
+</div>
+{% endblock %}

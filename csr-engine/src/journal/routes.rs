@@ -78,7 +78,8 @@ impl PageQuery {
 /// [`super::router_if_enabled`] instead.
 pub fn router(app_state: JournalState) -> Router {
     Router::new()
-        .route("/", get(board))
+        .route("/", get(dreams_home))
+        .route("/board", get(board))
         // axum 0.8 spells path parameters `{id}`, not `:id` (0.7 syntax).
         // The served URL is `/dream/<id>` either way.
         .route("/dream/{id}", get(detail))
@@ -180,6 +181,24 @@ async fn load_board(app_state: &JournalState) -> Result<LoadedBoard, String> {
         Err(error) => Err(format!("feed task failed: {error}")),
         Ok((Err(error), _)) => Err(error.to_string()),
         Ok((Ok(board), last_pass)) => Ok((board, last_pass)),
+    }
+}
+
+async fn dreams_home(State(app_state): State<JournalState>) -> Response {
+    let now = Utc::now();
+    let loaded = tokio::task::spawn_blocking(move || app_state.feed().load_week_dreams(now)).await;
+    match loaded {
+        Ok(Ok(dreams)) => render_or_500(render::dreams_home(&render::DreamsHomeView::from_week(
+            dreams,
+        ))),
+        Ok(Err(error)) => notice(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            NoticeView::feed_error(&error.to_string()),
+        ),
+        Err(error) => notice(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            NoticeView::feed_error(&format!("week-dream task failed: {error}")),
+        ),
     }
 }
 
@@ -565,8 +584,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_home_route_is_the_week_dreams_page_not_the_log() {
+        let (status, _, body) = get_path(state_with(3), "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("No week-dream is on this page yet"));
+        assert!(body.contains("abstention"));
+        assert!(body.contains("href=\"/board\""));
+        assert!(
+            !body.contains("id=\"observations\""),
+            "the log board must not be the home"
+        );
+        assert!(
+            !body.to_lowercase().contains("all clear"),
+            "zero week-dreams must never read as an all-clear"
+        );
+        assert!(!body.contains("<script"), "home must work with JS off");
+    }
+
+    #[tokio::test]
     async fn the_landing_route_renders_the_cluster_board_not_a_legacy_item_list() {
-        let (status, headers, body) = get_path(state_with(3), "/").await;
+        let (status, headers, body) = get_path(state_with(3), "/board").await;
         assert_eq!(status, StatusCode::OK);
         // All three evidence-maturity columns, with their gates stated.
         assert!(body.contains("Proposals"));
@@ -663,7 +700,7 @@ mod tests {
         // And the rendered page agrees. Cards are laid out per column, so the
         // tier order is asserted WITHIN the column the three session-grade
         // conclusions share; the item-grade one sits in Outdated claims.
-        let (_, _, html) = get_path(app_state, "/").await;
+        let (_, _, html) = get_path(app_state, "/board").await;
         let observations = &html[html
             .find(r#"id="observations""#)
             .expect("observations column")
@@ -707,7 +744,7 @@ mod tests {
         }];
         let app_state =
             JournalState::new(Arc::new(StaticDreamFeed::new(Vec::new()).with_board(feed)));
-        let (_, _, body) = get_path(app_state, "/").await;
+        let (_, _, body) = get_path(app_state, "/board").await;
 
         let lane = body
             .find("id=\"unexamined\"")
@@ -724,7 +761,7 @@ mod tests {
         let app_state = JournalState::new(Arc::new(
             StaticDreamFeed::new(Vec::new()).with_board(BoardFeed::default()),
         ));
-        let (status, _, body) = get_path(app_state, "/").await;
+        let (status, _, body) = get_path(app_state, "/board").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("Nothing on record yet."));
         assert!(body.contains("This is an empty feed, not a failure"));
@@ -997,7 +1034,7 @@ mod tests {
             StaticDreamFeed::new(items(1)).with_board(board_feed(vec![cluster])),
         ));
 
-        let (_, _, body) = get_path(app_state.clone(), "/").await;
+        let (_, _, body) = get_path(app_state.clone(), "/board").await;
         let card = first_href_after(&body, "class=\"card-conclusion\"");
         assert_eq!(card, "/dream/id00");
         let (status, _, detail_body) = get_path(app_state.clone(), &card).await;
@@ -1013,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_feed_reports_the_reason_instead_of_an_empty_page() {
         let app_state = JournalState::new(Arc::new(BrokenFeed));
-        let (status, _, body) = get_path(app_state.clone(), "/").await;
+        let (status, _, body) = get_path(app_state.clone(), "/board").await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body.contains("database is locked"));
         assert!(
