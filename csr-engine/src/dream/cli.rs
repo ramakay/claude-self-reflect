@@ -530,8 +530,14 @@ fn lookup_open_dream_id(
             .optional()
             .map_err(anyhow::Error::from)
         })
-        .ok()
-        .flatten()
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                project,
+                subject_key,
+                "dream_id reuse lookup failed; minting a fresh id (duplicate open row likely): {e}"
+            );
+            None
+        })
 }
 
 pub(crate) fn record_dream_row(
