@@ -16,9 +16,24 @@
 //!    total) — this module reuses that ranking verbatim rather than
 //!    re-deriving it, so a project's unfinished slot can only ever be filled
 //!    by an item that already cleared the home page's own bar.
-//! 2. **strategy**: LLM-authored, stage B. [`author_strategy_dream`] is the
-//!    seam stage B fills in; it always returns `None` here, so `--no-llm` is
-//!    effectively always on until then.
+//! 2. **strategy**: LLM-authored via `claude -p`, one call per project --
+//!    fully implemented in [`crate::dream::strategy`]. Gated behind a
+//!    deterministic evidence bar (>= 3 distinct origin sessions this week)
+//!    before any spend is considered, and cached by content hash so a
+//!    re-run of an unchanged corpus costs nothing. `--no-llm` (or either
+//!    AI kill switch) skips this category entirely -- see
+//!    [`crate::dream::strategy::category_disabled`].
+//!
+//! # Category competition
+//!
+//! A project gets at most one dream. When both categories produce a
+//! candidate for the same project, strategy wins the slot whenever it
+//! produced ANY dream -- a cache hit counts as "passed authoring" exactly
+//! like a fresh call, since both mean the corpus currently supports a
+//! strategy judgment. Only when strategy has nothing for a project (gate
+//! failed, kill-switched, or the model abstained/malformed) does the
+//! unfinished card fill that project's slot. Decided in [`handle`], where
+//! `strategy_by_project` is checked before `unfinished_by_project`.
 //!
 //! # The global cross-project slot
 //!
@@ -64,6 +79,17 @@ const REVISION_HASH_VERSION: &str = "dreams-cli-v1";
 
 // ─── entry point ────────────────────────────────────────────────────────
 
+/// One project's chosen dream, whichever category won its slot — the shape
+/// [`emit_text`]/[`emit_json`] render, already fully decided (rendered,
+/// recorded) by the time [`handle`] builds it.
+struct FinalCard {
+    project: String,
+    category: &'static str,
+    dream_id: String,
+    subject_key: Option<String>,
+    text: String,
+}
+
 /// Run `csr-engine dreams`. Storage-only — no `Engine::new()`, no
 /// embeddings, no HNSW index, following the `status` subcommand's pattern.
 pub fn handle(
@@ -75,20 +101,21 @@ pub fn handle(
     let storage = Storage::open(db_path)?;
     let now = Utc::now();
 
-    let (week_dreams, open_items) = storage.with_connection(|conn| {
+    let (week_dreams, open_items, dream_threads) = storage.with_connection(|conn| {
         let wd = week::load_week_dreams(conn, now)?;
         let oi = dream_clusters::load_open_items(conn)?;
-        Ok((wd, oi))
+        let dt = crate::dream::threads::load_dream_threads(conn)?;
+        Ok((wd, oi, dt))
     })?;
 
     let global_candidates = build_global_candidates(&open_items, now);
     let verdict = global_headline(&global_candidates);
 
-    // One card per project: first occurrence in the already-ranked feed
-    // wins ("zero-or-one dream per project" applied to an input that is
-    // itself already ranked highest-first).
+    // unfinished-and-valuable candidates, one per project: first occurrence
+    // in the already-ranked feed wins ("zero-or-one dream per project"
+    // applied to an input that is itself already ranked highest-first).
     let mut seen_projects: HashSet<String> = HashSet::new();
-    let mut cards: Vec<&WeekDream> = Vec::new();
+    let mut unfinished_by_project: BTreeMap<String, &WeekDream> = BTreeMap::new();
     for wd in &week_dreams {
         if let Some(p) = project_filter {
             if wd.project != p {
@@ -96,78 +123,132 @@ pub fn handle(
             }
         }
         if seen_projects.insert(wd.project.clone()) {
-            cards.push(wd);
+            unfinished_by_project.insert(wd.project.clone(), wd);
         }
     }
 
-    // Stage B seam: the strategy category is not built yet, so `no_llm` has
-    // nothing to gate today. Threaded through so the flag's plumbing (CLI ->
-    // handle -> seam) doesn't need to change shape when stage B lands.
-    let strategy_evidence = StrategyEvidence {
-        no_llm,
-        week_dreams: week_dreams.clone(),
-    };
-    let _strategy = author_strategy_dream(&strategy_evidence);
+    // strategy candidates: gathered from every project with WEEK EVIDENCE at
+    // all (raw open items + raw threads, same "don't limit to the capped
+    // home feed" reasoning `build_global_candidates` already uses) rather
+    // than only the ≤3 projects that made the unfinished home page — a
+    // project can win a strategy slot even when it never had a shot at an
+    // unfinished one.
+    let mut strategy_by_project: BTreeMap<String, crate::dream::strategy::RenderedStrategy> =
+        BTreeMap::new();
+    if !crate::dream::strategy::category_disabled(no_llm) {
+        let mut candidate_projects: BTreeSet<String> = BTreeSet::new();
+        for item in &open_items {
+            if item.completed.is_none() && week::within_week(&item.origin_ts, now) {
+                candidate_projects.insert(item.project.clone());
+            }
+        }
+        for t in &dream_threads {
+            if !t.thread.is_empty() && week::within_week(&t.created_at, now) {
+                candidate_projects.insert(t.project.clone());
+            }
+        }
+        if let Some(p) = project_filter {
+            candidate_projects.retain(|proj| proj == p);
+        }
+
+        let budget = crate::dream::policy::Budget::for_night(
+            &storage,
+            crate::dream::policy::effort_tier_counted(&storage),
+            &crate::dream::policy::current_night_key(),
+        );
+        let process_actor = crate::dream::threads::ProcessActor;
+        let actor = crate::dream::policy::BudgetedActor::new(&process_actor, &budget);
+
+        for project in &candidate_projects {
+            let evidence = storage.with_connection(|conn| {
+                crate::dream::strategy::build_project_evidence(
+                    conn,
+                    project,
+                    &open_items,
+                    &dream_threads,
+                    now,
+                )
+            })?;
+            if let Some(rendered) = crate::dream::strategy::author_for_project(
+                &storage, &actor, &budget, &evidence, now,
+            ) {
+                strategy_by_project.insert(project.clone(), rendered);
+            }
+        }
+    }
+
+    // Category competition (see the module doc): strategy wins a project's
+    // slot whenever it produced ANY dream — presence in `strategy_by_project`
+    // already means "passed authoring" (cache hit or fresh call both count,
+    // `author_for_project` only ever inserts a `Some` for one of those two
+    // outcomes). Only when strategy has nothing for a project does the
+    // unfinished card fill that slot.
+    let mut project_order: BTreeSet<String> = unfinished_by_project.keys().cloned().collect();
+    project_order.extend(strategy_by_project.keys().cloned());
+
+    let mut cards: Vec<FinalCard> = Vec::new();
+    for project in &project_order {
+        if let Some(rendered) = strategy_by_project.remove(project) {
+            cards.push(FinalCard {
+                project: project.clone(),
+                category: "strategy",
+                dream_id: rendered.dream_id,
+                subject_key: None,
+                text: rendered.text,
+            });
+        } else if let Some(wd) = unfinished_by_project.get(project) {
+            let rendered = render_unfinished_card(wd, now);
+            record_dream_row(
+                &storage,
+                &rendered.dream_id,
+                &wd.project,
+                "unfinished",
+                Some(&wd.item_id),
+                &rendered.revision_hash,
+                &rendered.text,
+            )?;
+            cards.push(FinalCard {
+                project: project.clone(),
+                category: "unfinished",
+                dream_id: rendered.dream_id,
+                subject_key: Some(wd.item_id.clone()),
+                text: rendered.text,
+            });
+        }
+    }
 
     if json {
-        emit_json(&storage, &verdict, &cards, project_filter, now)
+        emit_json(&verdict, &cards, project_filter)
     } else {
-        emit_text(&storage, &verdict, &cards, now)
+        emit_text(&verdict, &cards)
     }
 }
 
-fn emit_text(
-    storage: &Storage,
-    verdict: &GlobalVerdict,
-    cards: &[&WeekDream],
-    now: DateTime<Utc>,
-) -> Result<()> {
+fn emit_text(verdict: &GlobalVerdict, cards: &[FinalCard]) -> Result<()> {
     println!("{}", render_global_line(verdict));
     println!();
-    for wd in cards {
-        let rendered = render_unfinished_card(wd, now);
-        record_dream_row(
-            storage,
-            &rendered.dream_id,
-            &wd.project,
-            "unfinished",
-            Some(&wd.item_id),
-            &rendered.revision_hash,
-            &rendered.text,
-        )?;
-        println!("{}", rendered.text);
+    for card in cards {
+        println!("{}", card.text);
     }
     Ok(())
 }
 
 fn emit_json(
-    storage: &Storage,
     verdict: &GlobalVerdict,
-    cards: &[&WeekDream],
+    cards: &[FinalCard],
     project_filter: Option<&str>,
-    now: DateTime<Utc>,
 ) -> Result<()> {
     let global = GlobalJson::from(verdict);
-    let mut projects = Vec::with_capacity(cards.len());
-    for wd in cards {
-        let rendered = render_unfinished_card(wd, now);
-        record_dream_row(
-            storage,
-            &rendered.dream_id,
-            &wd.project,
-            "unfinished",
-            Some(&wd.item_id),
-            &rendered.revision_hash,
-            &rendered.text,
-        )?;
-        projects.push(ProjectJson {
-            project: wd.project.clone(),
-            category: Some("unfinished".to_string()),
-            dream_id: Some(rendered.dream_id),
-            subject_key: Some(wd.item_id.clone()),
-            text: Some(rendered.text),
-        });
-    }
+    let mut projects: Vec<ProjectJson> = cards
+        .iter()
+        .map(|card| ProjectJson {
+            project: card.project.clone(),
+            category: Some(card.category.to_string()),
+            dream_id: Some(card.dream_id.clone()),
+            subject_key: card.subject_key.clone(),
+            text: Some(card.text.clone()),
+        })
+        .collect();
     // A filtered project with no qualifying evidence gets an explicit
     // "no dream" entry — the one place abstention is visible in JSON mode.
     if let Some(p) = project_filter {
@@ -321,7 +402,7 @@ fn unfinished_revision_hash(dream: &WeekDream) -> String {
 /// seconds apart don't collide; a caller that wants a stable id across runs
 /// should not expect one — identity here is "this run's row", not "this
 /// item", by design (see the module doc's cache-reuse contract).
-fn compute_dream_id(
+pub(crate) fn compute_dream_id(
     project: &str,
     category: &str,
     subject_key: &str,
@@ -378,7 +459,7 @@ fn render_unfinished_card(dream: &WeekDream, now: DateTime<Utc>) -> RenderedCard
     }
 }
 
-fn record_dream_row(
+pub(crate) fn record_dream_row(
     storage: &Storage,
     dream_id: &str,
     project: &str,
@@ -525,38 +606,6 @@ fn render_global_line(verdict: &GlobalVerdict) -> String {
             "No defensible cross-project verdict this week.".to_string()
         }
     }
-}
-
-// ─── strategy seam (stage B) ────────────────────────────────────────────
-
-/// Structured evidence a strategy-authoring pass would need. Every field is
-/// receipt-bearing corpus data; nothing here is LLM output.
-struct StrategyEvidence {
-    no_llm: bool,
-    #[allow(dead_code)] // read once stage B lands
-    week_dreams: Vec<WeekDream>,
-}
-
-/// One LLM-authored strategy dream, ready to persist.
-#[allow(dead_code)] // constructed once stage B lands
-struct StrategyDream {
-    prose: String,
-}
-
-/// Stage B seam. Always returns `None` in this slice — no `claude -p` call
-/// happens here, so `--no-llm` is effectively always on regardless of its
-/// value. When filled in, this must: gate on ≥3 distinct origin sessions of
-/// week evidence per project before spending anything; go through
-/// `dream::threads`'s `BudgetedActor`/`invoke_chain` (never call
-/// `ProcessActor` bare, so spend counts against the shared nightly budget);
-/// honor `CSR_NO_AI_NARRATIVES=1` and `CSR_NO_DREAMING=1`; parse defensively
-/// and treat a literal `ABSTAIN` (or anything malformed) as `None`, never a
-/// partial card.
-fn author_strategy_dream(evidence: &StrategyEvidence) -> Option<StrategyDream> {
-    if evidence.no_llm {
-        return None;
-    }
-    None
 }
 
 // ─── JSON output ─────────────────────────────────────────────────────────
@@ -976,14 +1025,5 @@ mod tests {
         assert_eq!(category, "unfinished");
         assert_eq!(revision_hash, "revhash");
         assert_eq!(prose, "card text");
-    }
-
-    #[test]
-    fn strategy_seam_always_abstains_in_this_slice() {
-        let evidence = StrategyEvidence {
-            no_llm: false,
-            week_dreams: vec![],
-        };
-        assert!(author_strategy_dream(&evidence).is_none());
     }
 }

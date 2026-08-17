@@ -1007,6 +1007,7 @@ dependencies = [
  "ast-grep-language",
  "async-trait",
  "axum",
+ "blake3",
  "chrono",
  "clap",
  "codewitness",

@@ -88,6 +88,7 @@
 pub mod cli;
 pub mod policy;
 pub mod report;
+pub(crate) mod strategy;
 pub mod threads;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

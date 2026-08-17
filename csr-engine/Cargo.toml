@@ -26,6 +26,7 @@ regex = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 async-trait = "0.1"
 sha2 = "0.11"
+blake3 = "1"
 fs2 = "0.4"
 ast-grep-core = { version = "0.42", features = ["tree-sitter"] }
 ast-grep-language = { version = "0.42", default-features = false, features = [
