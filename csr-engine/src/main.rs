@@ -152,6 +152,21 @@ enum Commands {
         #[arg(required = true)]
         conversation_ids: Vec<String>,
     },
+    /// Headless dream generation over this week's evidence: zero-or-one
+    /// dream per project, printed to stdout. No journal HTML/routes, no
+    /// browser surface.
+    Dreams {
+        /// Limit to one project (matches the stored project name exactly)
+        #[arg(long)]
+        project: Option<String>,
+        /// Emit structured JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+        /// Skip the strategy (LLM-authored) category entirely — currently
+        /// always effectively on, since that category isn't built yet
+        #[arg(long = "no-llm")]
+        no_llm: bool,
+    },
     /// Run evaluation tests
     Eval {
         /// Run full evaluation (20 tests) instead of quick (5 tests)
@@ -429,6 +444,15 @@ async fn main() -> Result<()> {
             }
         }
         return Ok(());
+    }
+
+    if let Some(Commands::Dreams {
+        ref project,
+        json,
+        no_llm,
+    }) = args.command
+    {
+        return csr_engine::dream::cli::handle(&args.db_path, project.as_deref(), json, no_llm);
     }
 
     if let Some(Commands::Quality { ref path }) = args.command {

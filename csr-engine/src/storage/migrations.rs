@@ -1388,6 +1388,31 @@ pub fn run(conn: &Connection) -> Result<()> {
         crate::storage::queries::set_meta(conn, "worktree_path_backfill_v1", "done")?;
     }
 
+    // `csr-engine dreams` (headless CLI) — spend-control cache, NOT an
+    // identity hash. `dream_id` is opaque (blake3 of
+    // project|category|subject_key|created_at, truncated); the row it names
+    // is looked up for reuse by (project, category, revision_hash) — a hit
+    // means the underlying receipt set hasn't changed since the prose was
+    // authored, so the caller reuses `prose` verbatim and spends nothing.
+    // `subject_key` is NULL for the `strategy` category (no deterministic
+    // subject exists there — one-shot, no escalation). `status` defaults to
+    // 'open' for a future verdict-recording tool to update.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dreams_v1 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dream_id TEXT NOT NULL UNIQUE,
+            project TEXT NOT NULL,
+            category TEXT NOT NULL CHECK (category IN ('unfinished','strategy')),
+            subject_key TEXT,
+            revision_hash TEXT NOT NULL,
+            prose TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            status TEXT NOT NULL DEFAULT 'open'
+        );
+        CREATE INDEX IF NOT EXISTS idx_dreams_v1_lookup
+            ON dreams_v1(project, category, revision_hash);",
+    )?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())

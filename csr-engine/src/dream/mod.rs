@@ -85,6 +85,7 @@
 //! `dream` at an unchanged HEAD with an unchanged conclusion writes
 //! nothing (see that module's idempotency doc).
 
+pub mod cli;
 pub mod policy;
 pub mod report;
 pub mod threads;
