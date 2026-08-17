@@ -38,6 +38,14 @@ pub const MAX_WEEK_DREAMS: usize = 3;
 pub struct WeekDream {
     pub title: String,
     pub hypothesis: Option<String>,
+    /// The session that produced `hypothesis`, when one matched — always the
+    /// item's own `origin_session` by construction (`threads_for_session`
+    /// scopes candidate threads to that session before scoring), but carried
+    /// explicitly rather than implicitly so a receipt for "the night pass
+    /// said this" points at the artifact that actually said it, not at the
+    /// unrelated open-item id. `None` alongside `hypothesis: None` — no
+    /// thread matched, nothing to receipt.
+    pub hypothesis_session: Option<String>,
     pub how: Vec<String>,
     pub project: String,
     pub item_id: String,
@@ -117,6 +125,11 @@ pub(crate) fn select_week_dreams(mut cands: Vec<Candidate>, now: DateTime<Utc>) 
         }
         out.push(WeekDream {
             title: c.item.item,
+            // Every matched hypothesis came from `threads_for_session(&item.origin_session)`
+            // (see `load_week_dreams`), so the thread's own session_id IS
+            // `item.origin_session` — carried here so a caller receipts the
+            // hypothesis fact against the artifact that produced it.
+            hypothesis_session: c.hypothesis.as_ref().map(|_| c.item.origin_session.clone()),
             hypothesis: c.hypothesis,
             how: c.how,
             project: c.item.project,
@@ -396,6 +409,12 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert!(got[0].how.is_empty());
         assert_eq!(got[0].kind_label, "unfinished");
+        assert_eq!(
+            got[0].hypothesis_session.as_deref(),
+            Some("sess-hyp"),
+            "the hypothesis's receipt must be the session that produced it \
+             (item(\"hyp\", ..) -> origin_session \"sess-hyp\"), not the item id"
+        );
     }
 
     #[test]
@@ -411,6 +430,26 @@ mod tests {
         };
         let got = select_week_dreams(vec![neither], now);
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn a_candidate_with_no_hypothesis_carries_no_hypothesis_session_either() {
+        let now = DateTime::parse_from_rfc3339("2026-08-16T18:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let how_only = Candidate {
+            item: item("howonly", "todo", "2026-08-15T10:00:00Z", "how only"),
+            how: vec!["step one".to_string()],
+            hypothesis: None,
+            has_plan: true,
+        };
+        let got = select_week_dreams(vec![how_only], now);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].hypothesis.is_none());
+        assert!(
+            got[0].hypothesis_session.is_none(),
+            "no matched thread means nothing to receipt a hypothesis against"
+        );
     }
 
     #[test]

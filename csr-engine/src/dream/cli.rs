@@ -61,7 +61,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -92,6 +92,9 @@ struct FinalCard {
 
 /// Run `csr-engine dreams`. Storage-only — no `Engine::new()`, no
 /// embeddings, no HNSW index, following the `status` subcommand's pattern.
+/// Thin: open storage, delegate to [`build_run`] for every decision, print.
+/// The split exists so `build_run` — category competition included — is
+/// unit-testable against an in-memory `Storage` without going through stdout.
 pub fn handle(
     db_path: &Path,
     project_filter: Option<&str>,
@@ -100,7 +103,23 @@ pub fn handle(
 ) -> Result<()> {
     let storage = Storage::open(db_path)?;
     let now = Utc::now();
+    let (verdict, cards) = build_run(&storage, project_filter, no_llm, now)?;
+    if json {
+        emit_json(&verdict, &cards, project_filter)
+    } else {
+        emit_text(&verdict, &cards)
+    }
+}
 
+/// Everything `csr-engine dreams` decides, given an already-open `storage`:
+/// the global cross-project verdict and every project's chosen card, category
+/// competition already resolved. No printing — [`handle`] does that.
+fn build_run(
+    storage: &Storage,
+    project_filter: Option<&str>,
+    no_llm: bool,
+    now: DateTime<Utc>,
+) -> Result<(GlobalVerdict, Vec<FinalCard>)> {
     let (week_dreams, open_items, dream_threads) = storage.with_connection(|conn| {
         let wd = week::load_week_dreams(conn, now)?;
         let oi = dream_clusters::load_open_items(conn)?;
@@ -152,8 +171,8 @@ pub fn handle(
         }
 
         let budget = crate::dream::policy::Budget::for_night(
-            &storage,
-            crate::dream::policy::effort_tier_counted(&storage),
+            storage,
+            crate::dream::policy::effort_tier_counted(storage),
             &crate::dream::policy::current_night_key(),
         );
         let process_actor = crate::dream::threads::ProcessActor;
@@ -169,9 +188,9 @@ pub fn handle(
                     now,
                 )
             })?;
-            if let Some(rendered) = crate::dream::strategy::author_for_project(
-                &storage, &actor, &budget, &evidence, now,
-            ) {
+            if let Some(rendered) =
+                crate::dream::strategy::author_for_project(storage, &actor, &budget, &evidence, now)
+            {
                 strategy_by_project.insert(project.clone(), rendered);
             }
         }
@@ -197,31 +216,51 @@ pub fn handle(
                 text: rendered.text,
             });
         } else if let Some(wd) = unfinished_by_project.get(project) {
-            let rendered = render_unfinished_card(wd, now);
-            record_dream_row(
-                &storage,
-                &rendered.dream_id,
+            let revision_hash = unfinished_revision_hash(wd);
+            // Idempotency: an unchanged subject+revision reuses its row's
+            // dream_id rather than minting a fresh one every run (see the
+            // module doc and `lookup_open_dream_id`'s own doc) — only a
+            // genuinely new revision (or a first sighting) gets a new id and
+            // a new row.
+            let existing = lookup_open_dream_id(
+                storage,
                 &wd.project,
                 "unfinished",
-                Some(&wd.item_id),
-                &rendered.revision_hash,
-                &rendered.text,
-            )?;
+                &wd.item_id,
+                &revision_hash,
+            );
+            let is_new_revision = existing.is_none();
+            let dream_id = existing
+                .unwrap_or_else(|| compute_dream_id(&wd.project, "unfinished", &wd.item_id, now));
+            let rendered = render_unfinished_card(wd, &dream_id);
+            if is_new_revision {
+                // Fail-soft, matching the strategy path: the card is fully
+                // rendered already, so a failed INSERT costs a dream_id for
+                // future verdict tooling, never the card itself or the rest
+                // of this run's output.
+                if let Err(error) = record_dream_row(
+                    storage,
+                    &dream_id,
+                    &wd.project,
+                    "unfinished",
+                    Some(&wd.item_id),
+                    &revision_hash,
+                    &rendered,
+                ) {
+                    tracing::warn!(%error, project = %wd.project, item_id = %wd.item_id, "failed to persist unfinished dream row");
+                }
+            }
             cards.push(FinalCard {
                 project: project.clone(),
                 category: "unfinished",
-                dream_id: rendered.dream_id,
+                dream_id,
                 subject_key: Some(wd.item_id.clone()),
-                text: rendered.text,
+                text: rendered,
             });
         }
     }
 
-    if json {
-        emit_json(&verdict, &cards, project_filter)
-    } else {
-        emit_text(&verdict, &cards)
-    }
+    Ok((verdict, cards))
 }
 
 fn emit_text(verdict: &GlobalVerdict, cards: &[FinalCard]) -> Result<()> {
@@ -269,13 +308,6 @@ fn emit_json(
 
 // ─── unfinished-and-valuable card rendering ────────────────────────────
 
-/// One rendered card, plus the identifiers a caller needs to persist it.
-struct RenderedCard {
-    text: String,
-    dream_id: String,
-    revision_hash: String,
-}
-
 /// `true` iff the item's stored plan actually contributed how-lines —
 /// mirrors [`WeekDream::kind_label`]'s own two-value vocabulary rather than
 /// re-deriving it from `how.is_empty()` (a hypothesis-only item also has an
@@ -286,7 +318,9 @@ fn has_plan(dream: &WeekDream) -> bool {
 
 /// Observed bullets. Every line carries a receipt: the item id when nothing
 /// more specific is available, the how-line's own commit oid when it has
-/// one. `select_week_dreams` guarantees at least a title plus (how OR
+/// one, and — for the hypothesis line specifically — the session that
+/// actually produced it (`hypothesis_session`), never the unrelated item id.
+/// `select_week_dreams` guarantees at least a title plus (how OR
 /// hypothesis), so this is never empty.
 fn observed_lines(dream: &WeekDream) -> Vec<String> {
     let mut lines = vec![format!(
@@ -295,7 +329,15 @@ fn observed_lines(dream: &WeekDream) -> Vec<String> {
         dream.title.trim()
     )];
     if let Some(hypothesis) = &dream.hypothesis {
-        lines.push(format!("night pass: \"{hypothesis}\" ⌗{}", dream.item_id));
+        // `hypothesis_session` is set whenever `hypothesis` is (see
+        // `WeekDream`'s doc) — the item id fallback only guards a future
+        // change to that invariant from panicking here.
+        let session_receipt = dream
+            .hypothesis_session
+            .as_deref()
+            .map(crate::dream::report::short_oid)
+            .unwrap_or_else(|| dream.item_id.clone());
+        lines.push(format!("night pass: \"{hypothesis}\" ⌗{session_receipt}"));
     }
     for how in &dream.how {
         if how.contains('⌗') {
@@ -351,10 +393,11 @@ fn verify_first_line(dream: &WeekDream) -> Option<String> {
     }
 }
 
-/// One verification-first directive. Never a free-form execution command —
-/// it always routes through confirming state, then names the stored next
-/// step (or asks for one when none exists), then names the tool that
-/// records the verdict.
+/// One verification-first directive, WITHOUT its header — the caller
+/// ([`render_unfinished_card`]) prepends [`dream_attribution::DREAM_CARD_PROPOSAL_HEADER`].
+/// Never a free-form execution command — it always routes through confirming
+/// state, then names the stored next step (or asks for one when none
+/// exists), then names the tool that records the verdict.
 fn proposal_line(dream: &WeekDream) -> String {
     let next = dream
         .how
@@ -362,7 +405,7 @@ fn proposal_line(dream: &WeekDream) -> String {
         .map(|h| format!("proceed with: {h}"))
         .unwrap_or_else(|| "decide the next concrete step".to_string());
     format!(
-        "Proposal — requires verdict: verify \"{}\" (project `{}`, item ⌗{}) is still open, \
+        "verify \"{}\" (project `{}`, item ⌗{}) is still open, \
          then {next} — record the outcome via csr_resolve.",
         dream.title.trim(),
         dream.project,
@@ -424,10 +467,12 @@ pub(crate) fn compute_dream_id(
         .collect()
 }
 
-fn render_unfinished_card(dream: &WeekDream, now: DateTime<Utc>) -> RenderedCard {
-    let dream_id = compute_dream_id(&dream.project, "unfinished", &dream.item_id, now);
-    let revision_hash = unfinished_revision_hash(dream);
-
+/// Render one unfinished-and-valuable card for `dream_id` — an id the caller
+/// already resolved (reused from an existing open row at an unchanged
+/// revision, or freshly minted for a new one; see [`lookup_open_dream_id`]
+/// and the module doc's idempotency contract). This function is pure
+/// rendering: it never computes or persists an id itself.
+fn render_unfinished_card(dream: &WeekDream, dream_id: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "PROJECT {} — unfinished-and-valuable\n",
@@ -439,24 +484,54 @@ fn render_unfinished_card(dream: &WeekDream, now: DateTime<Utc>) -> RenderedCard
         out.push_str(&line);
         out.push('\n');
     }
-    out.push_str(&format!(
-        "Dream's take — not a fact: {}\n",
-        dreams_take(dream)
-    ));
+    out.push_str(dream_attribution::DREAM_CARD_TAKE_HEADER);
+    out.push(' ');
+    out.push_str(&dreams_take(dream));
+    out.push('\n');
     if let Some(verify) = verify_first_line(dream) {
         out.push_str(&verify);
         out.push('\n');
     }
+    out.push_str(dream_attribution::DREAM_CARD_PROPOSAL_HEADER);
+    out.push(' ');
     out.push_str(&proposal_line(dream));
     out.push('\n');
-    out.push_str(&dream_attribution::marker_line(&dream_id));
+    out.push_str(&dream_attribution::marker_line(dream_id));
     out.push('\n');
+    out
+}
 
-    RenderedCard {
-        text: out,
-        dream_id,
-        revision_hash,
-    }
+/// Existing OPEN `dreams_v1` row's dream_id at
+/// `(project, category, subject_key, revision_hash)`, if one exists —
+/// idempotency for a category (like `unfinished`) whose logical identity
+/// includes a `subject_key`, mirroring [`crate::dream::strategy`]'s
+/// `lookup_cached` cache-hit contract but keyed additionally by that subject
+/// and used only to reuse the id, never to reuse rendered prose (an
+/// unfinished card is deterministic and always recomputed — see the module
+/// doc). `None` on any error too (fail-open to "mint a fresh id" — a lookup
+/// failure must never be the reason a project loses its dream this run).
+fn lookup_open_dream_id(
+    storage: &Storage,
+    project: &str,
+    category: &str,
+    subject_key: &str,
+    revision_hash: &str,
+) -> Option<String> {
+    storage
+        .with_connection(|conn| {
+            conn.query_row(
+                "SELECT dream_id FROM dreams_v1 \
+                 WHERE project = ?1 AND category = ?2 AND subject_key = ?3 \
+                 AND revision_hash = ?4 AND status = 'open' \
+                 ORDER BY id DESC LIMIT 1",
+                params![project, category, subject_key, revision_hash],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(anyhow::Error::from)
+        })
+        .ok()
+        .flatten()
 }
 
 pub(crate) fn record_dream_row(
@@ -562,16 +637,20 @@ fn build_global_candidates(open_items: &[OpenItem], now: DateTime<Utc>) -> Vec<G
 }
 
 /// Discrete gate: a candidate qualifies only at ≥2 independent
-/// session/day receipts AND ≥1 stakes receipt. Among qualifiers, a UNIQUE
-/// highest-receipt-count winner publishes; a tie at the top (or zero
-/// qualifiers) abstains — "no defensible verdict" is the correct answer far
-/// more often than a headline is, by construction.
+/// session/day receipts, ≥1 stakes receipt, AND ≥2 distinct projects — this
+/// is the CROSS-project slot, and [`render_global_line`] renders "across
+/// {projects}"; a theme reported twice within a single project is real
+/// corroboration but not cross-project scope, and must not publish under a
+/// claim it doesn't back. Among qualifiers, a UNIQUE highest-receipt-count
+/// winner publishes; a tie at the top (or zero qualifiers) abstains — "no
+/// defensible verdict" is the correct answer far more often than a headline
+/// is, by construction.
 fn global_headline(candidates: &[GlobalCandidate]) -> GlobalVerdict {
     let mut qualifying: Vec<(&GlobalCandidate, usize)> = candidates
         .iter()
         .filter_map(|c| {
             let n = c.distinct_receipt_count();
-            (n >= 2 && c.has_stakes()).then_some((c, n))
+            (n >= 2 && c.has_stakes() && c.projects.len() >= 2).then_some((c, n))
         })
         .collect();
     qualifying.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
@@ -674,6 +753,7 @@ mod tests {
         WeekDream {
             title: title.to_string(),
             hypothesis: hypothesis.map(str::to_string),
+            hypothesis_session: hypothesis.map(|_| "sess-hyp01".to_string()),
             how: how.into_iter().map(str::to_string).collect(),
             project: project.to_string(),
             item_id: item_id.to_string(),
@@ -729,24 +809,20 @@ mod tests {
             vec!["review week.rs ⌗abc12345"],
             "natural direction",
         );
-        let rendered = render_unfinished_card(&dream, now());
+        let dream_id = compute_dream_id(&dream.project, "unfinished", &dream.item_id, now());
+        let text = render_unfinished_card(&dream, &dream_id);
 
-        assert!(rendered
-            .text
-            .starts_with("PROJECT csr — unfinished-and-valuable\n"));
-        assert!(rendered.text.contains("Observed:\n"));
-        assert!(rendered.text.contains("Dream's take — not a fact:"));
-        assert!(rendered.text.contains("Proposal — requires verdict:"));
-        assert!(rendered
-            .text
-            .contains(&dream_attribution::marker_line(&rendered.dream_id)));
+        assert!(text.starts_with("PROJECT csr — unfinished-and-valuable\n"));
+        assert!(text.contains("Observed:\n"));
+        assert!(text.contains("Dream's take — not a fact:"));
+        assert!(text.contains("Proposal — requires verdict:"));
+        assert!(text.contains(&dream_attribution::marker_line(&dream_id)));
         // has_plan == true (kind_label == "natural direction") -> no Verify
         // first homework line.
-        assert!(!rendered.text.contains("Verify first:"));
+        assert!(!text.contains("Verify first:"));
 
         // Every "Observed:" bullet line carries a receipt (⌗ marker).
-        let observed_block = rendered
-            .text
+        let observed_block = text
             .split("Observed:\n")
             .nth(1)
             .unwrap()
@@ -771,8 +847,9 @@ mod tests {
             vec![],
             "unfinished",
         );
-        let rendered = render_unfinished_card(&dream, now());
-        assert!(rendered.text.contains("Verify first:"));
+        let dream_id = compute_dream_id(&dream.project, "unfinished", &dream.item_id, now());
+        let text = render_unfinished_card(&dream, &dream_id);
+        assert!(text.contains("Verify first:"));
     }
 
     #[test]
@@ -792,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn dream_id_differs_across_runs_and_revision_hash_is_stable_for_identical_content() {
+    fn compute_dream_id_differs_across_runs_and_unfinished_revision_hash_is_content_only() {
         let dream = wd(
             "csr",
             "item1",
@@ -802,15 +879,77 @@ mod tests {
             "natural direction",
         );
         let later = now() + chrono::Duration::seconds(5);
-        let r1 = render_unfinished_card(&dream, now());
-        let r2 = render_unfinished_card(&dream, later);
+        let id1 = compute_dream_id(&dream.project, "unfinished", &dream.item_id, now());
+        let id2 = compute_dream_id(&dream.project, "unfinished", &dream.item_id, later);
         assert_ne!(
-            r1.dream_id, r2.dream_id,
-            "dream_id folds in `now`, must differ across runs"
+            id1, id2,
+            "compute_dream_id folds in `now`, must differ across calls"
         );
         assert_eq!(
-            r1.revision_hash, r2.revision_hash,
+            unfinished_revision_hash(&dream),
+            unfinished_revision_hash(&dream),
             "revision_hash is content-only, must be stable across runs"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_subject_and_revision_reuses_its_dream_id_across_runs() {
+        // The major-finding regression: re-running against the identical
+        // corpus must not churn a fresh dream_id (and a fresh row) every
+        // time — that breaks any verdict tooling that targeted yesterday's
+        // printed id.
+        let storage = Storage::open_memory().unwrap();
+        let dream = wd(
+            "csr",
+            "item-stable",
+            "fix the release gate",
+            Some("hyp"),
+            vec!["step ⌗oid1"],
+            "natural direction",
+        );
+        let revision_hash = unfinished_revision_hash(&dream);
+
+        assert!(
+            lookup_open_dream_id(&storage, "csr", "unfinished", "item-stable", &revision_hash)
+                .is_none(),
+            "nothing recorded yet"
+        );
+        let first_id = compute_dream_id(&dream.project, "unfinished", &dream.item_id, now());
+        record_dream_row(
+            &storage,
+            &first_id,
+            "csr",
+            "unfinished",
+            Some("item-stable"),
+            &revision_hash,
+            "card text",
+        )
+        .unwrap();
+
+        // A later run, same subject, same revision (content unchanged) —
+        // must find and reuse the same dream_id rather than minting a new
+        // one, even though `now` has moved on.
+        let later = now() + chrono::Duration::days(1);
+        let reused =
+            lookup_open_dream_id(&storage, "csr", "unfinished", "item-stable", &revision_hash);
+        assert_eq!(reused.as_deref(), Some(first_id.as_str()));
+        assert_ne!(
+            reused.unwrap(),
+            compute_dream_id(&dream.project, "unfinished", &dream.item_id, later),
+            "sanity: a freshly minted id at a later `now` would have differed \
+             had the lookup not short-circuited to the existing row"
+        );
+
+        // A genuinely changed revision (different evidence) does NOT reuse
+        // the old id — it's a new logical fact, not the same one recomputed.
+        let mut changed = dream.clone();
+        changed.how = vec!["a different step ⌗oid2".to_string()];
+        let changed_hash = unfinished_revision_hash(&changed);
+        assert_ne!(changed_hash, revision_hash);
+        assert!(
+            lookup_open_dream_id(&storage, "csr", "unfinished", "item-stable", &changed_hash)
+                .is_none(),
+            "a changed revision must not resolve to the old row"
         );
     }
 
@@ -905,6 +1044,26 @@ mod tests {
         );
         assert_eq!(
             global_headline(&[no_stakes]),
+            GlobalVerdict::NoDefensibleVerdict
+        );
+    }
+
+    #[test]
+    fn global_gate_abstains_on_a_single_project_even_with_two_stakes_receipts() {
+        // The minor-finding regression: two independent, stakes-bearing
+        // receipts within ONE project must not publish under a headline
+        // whose own rendering claims "across <projects>" — that claim needs
+        // more than one project behind it.
+        let single_project = candidate(
+            "recurring theme",
+            &["csr"],
+            &[
+                ("sess-a", "2026-08-10", true),
+                ("sess-b", "2026-08-11", true),
+            ],
+        );
+        assert_eq!(
+            global_headline(&[single_project]),
             GlobalVerdict::NoDefensibleVerdict
         );
     }
@@ -1025,5 +1184,146 @@ mod tests {
         assert_eq!(category, "unfinished");
         assert_eq!(revision_hash, "revhash");
         assert_eq!(prose, "card text");
+    }
+
+    // --- build_run: category competition (minor finding, zero coverage) ---
+
+    fn seed_v2_episode(conn: &rusqlite::Connection, id: &str, session: &str, ts: &str, todo: &str) {
+        let content = format!(
+            r#"{{"schema":"v2","session_id":"{session}","project":"csr","timestamp":"{ts}","todos":[{{"content":"{todo}","status":"pending"}}],"files_modified":[]}}"#
+        );
+        conn.execute(
+            "INSERT INTO reflections (id, content, tags, timestamp) VALUES (?1, ?2, '[]', ?3)",
+            params![id, content, ts],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_cached_strategy_dream_takes_the_slot_over_a_qualifying_unfinished_one() {
+        let storage = Storage::open_memory().unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-16T18:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Three open items in one project, three distinct sessions — clears
+        // strategy's MIN_DISTINCT_SESSIONS gate. Only the first gets a
+        // stored plan, so it's also the one candidate that clears
+        // `select_week_dreams`'s own gate and becomes the unfinished
+        // candidate for this project's slot.
+        storage
+            .with_connection(|conn| {
+                seed_v2_episode(
+                    conn,
+                    "ep-a",
+                    "sess-a",
+                    "2026-08-15T10:00:00Z",
+                    "fix the release gate",
+                );
+                seed_v2_episode(
+                    conn,
+                    "ep-b",
+                    "sess-b",
+                    "2026-08-15T11:00:00Z",
+                    "second item",
+                );
+                seed_v2_episode(conn, "ep-c", "sess-c", "2026-08-15T12:00:00Z", "third item");
+                Ok(())
+            })
+            .unwrap();
+
+        let item_id = storage
+            .with_connection(|conn| {
+                let items = dream_clusters::load_open_items(conn)?;
+                Ok(items
+                    .into_iter()
+                    .find(|i| i.item == "fix the release gate")
+                    .expect("seeded item")
+                    .id)
+            })
+            .unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO dream_plans \
+                     (plan_hash, item_id, project, session_id, context, steps_json, \
+                      files_json, acceptance, dropped, model) \
+                     VALUES ('hash1', ?1, 'csr', 'sess-a', 'ctx', \
+                     '[{\"action\":\"review the gate\",\"files\":[],\"citation\":\"abc12345\"}]', \
+                     '[]', 'ok', 0, 'sonnet-5')",
+                    params![item_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Confirm the unfinished candidate genuinely exists before adding
+        // strategy to the mix — otherwise this test would prove nothing
+        // about competition.
+        let week_dreams_before = storage
+            .with_connection(|conn| week::load_week_dreams(conn, now))
+            .unwrap();
+        assert_eq!(
+            week_dreams_before.len(),
+            1,
+            "the unfinished candidate must exist"
+        );
+        assert_eq!(week_dreams_before[0].project, "csr");
+
+        // Seed a strategy cache hit at the revision_hash `build_run` will
+        // actually compute for this corpus, so the strategy branch inside
+        // `author_for_project` hits cache (zero LLM spend, no shell-out).
+        let (open_items, dream_threads) = storage
+            .with_connection(|conn| {
+                let oi = dream_clusters::load_open_items(conn)?;
+                let dt = crate::dream::threads::load_dream_threads(conn)?;
+                Ok((oi, dt))
+            })
+            .unwrap();
+        let evidence = storage
+            .with_connection(|conn| {
+                crate::dream::strategy::build_project_evidence(
+                    conn,
+                    "csr",
+                    &open_items,
+                    &dream_threads,
+                    now,
+                )
+            })
+            .unwrap();
+        let rev_hash = crate::dream::strategy::revision_hash(&evidence);
+        record_dream_row(
+            &storage,
+            "cachedstrategyid",
+            "csr",
+            "strategy",
+            None,
+            &rev_hash,
+            "PROJECT csr — strategy\ncached prose\n",
+        )
+        .unwrap();
+
+        let (_, cards) = build_run(&storage, None, false, now).unwrap();
+        assert_eq!(cards.len(), 1, "one project, one slot");
+        assert_eq!(cards[0].project, "csr");
+        assert_eq!(
+            cards[0].category, "strategy",
+            "strategy must win the slot whenever it produced any dream"
+        );
+        assert_eq!(cards[0].dream_id, "cachedstrategyid");
+        assert!(cards[0].text.contains("cached prose"));
+    }
+
+    #[test]
+    fn a_project_filter_naming_a_project_with_no_evidence_yields_zero_cards() {
+        // Feeds emit_json's one abstention branch: a `--project` filter that
+        // matches nothing must not error and must not synthesize a card —
+        // the caller (emit_json) is what renders the explicit "no dream"
+        // JSON entry from an empty card list.
+        let storage = Storage::open_memory().unwrap();
+        let now = Utc::now();
+        let (verdict, cards) = build_run(&storage, Some("no-such-project"), true, now).unwrap();
+        assert!(cards.is_empty());
+        assert_eq!(verdict, GlobalVerdict::NoDefensibleVerdict);
     }
 }

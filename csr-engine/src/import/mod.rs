@@ -681,12 +681,8 @@ fn sanitize_content(
     sanitizer: &mut CsrMessageSanitizer,
 ) {
     if let Some(text) = content.as_str() {
-        if scrub_wrappers {
-            *content = serde_json::Value::String(scrub_csr_system_reminders(
-                text,
-                &mut sanitizer.stats.csr_hook_wrappers_scrubbed,
-            ));
-        }
+        *content =
+            serde_json::Value::String(sanitize_text_for_search(text, scrub_wrappers, sanitizer));
         return;
     }
 
@@ -719,12 +715,13 @@ fn sanitize_content(
                     continue;
                 }
             }
-            Some("text") if scrub_wrappers => {
+            Some("text") => {
                 if let Some(text) = item.get_mut("text") {
                     if let Some(raw) = text.as_str() {
-                        *text = serde_json::Value::String(scrub_csr_system_reminders(
+                        *text = serde_json::Value::String(sanitize_text_for_search(
                             raw,
-                            &mut sanitizer.stats.csr_hook_wrappers_scrubbed,
+                            scrub_wrappers,
+                            sanitizer,
                         ));
                     }
                 }
@@ -734,6 +731,26 @@ fn sanitize_content(
         kept.push(item);
     }
     *items = kept;
+}
+
+/// One text span's search-sanitization: strip any pasted dreams-CLI card's
+/// model-authored judgment spans (cheap no-op absent a marker — see
+/// `dream_attribution::strip_card_judgment`), then, for user/human messages
+/// only, scrub exact CSR hook-wrapper blocks. Applied uniformly to plain
+/// string content and to `type: "text"` content-array items alike, so a
+/// pasted dreams-CLI card is caught regardless of which shape Claude Code
+/// stored it in.
+fn sanitize_text_for_search(
+    text: &str,
+    scrub_wrappers: bool,
+    sanitizer: &mut CsrMessageSanitizer,
+) -> String {
+    let stripped = crate::storage::dream_attribution::strip_card_judgment(text);
+    if scrub_wrappers {
+        scrub_csr_system_reminders(&stripped, &mut sanitizer.stats.csr_hook_wrappers_scrubbed)
+    } else {
+        stripped
+    }
 }
 
 fn scrub_csr_system_reminders(text: &str, count: &mut usize) -> String {

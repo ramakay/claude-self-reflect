@@ -212,6 +212,11 @@ mod tests {
 
     #[test]
     fn test_narratives_disabled_env() {
+        // `CSR_NO_AI_NARRATIVES` is also read by `dream::strategy::category_disabled`,
+        // whose own tests mutate it under this same shared crate-level guard —
+        // without it, `cargo test`'s cross-module thread parallelism can stomp
+        // one test's `set_var`/`remove_var` with another's mid-assertion.
+        let _g = crate::daemon::dream_cadence::env_test_guard();
         std::env::remove_var("CSR_NO_AI_NARRATIVES");
         assert!(!narratives_disabled());
         std::env::set_var("CSR_NO_AI_NARRATIVES", "1");

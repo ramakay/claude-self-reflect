@@ -162,8 +162,8 @@ enum Commands {
         /// Emit structured JSON instead of plain text
         #[arg(long)]
         json: bool,
-        /// Skip the strategy (LLM-authored) category entirely — currently
-        /// always effectively on, since that category isn't built yet
+        /// Skip the strategy (LLM-authored) category entirely; only the
+        /// deterministic unfinished category runs
         #[arg(long = "no-llm")]
         no_llm: bool,
     },

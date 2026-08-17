@@ -341,9 +341,14 @@ fn build_prompt(evidence: &ProjectEvidence) -> String {
 // ─── defensive parse ────────────────────────────────────────────────────
 
 const HDR_OBSERVED: &str = "Observed:";
-const HDR_TAKE: &str = "Dream's take — not a fact:";
+// `HDR_TAKE`/`HDR_PROPOSAL` are the exact strings the import-side card
+// suppressor keys on (`storage::dream_attribution::strip_card_judgment`) —
+// reusing its constants here rather than duplicating the literals keeps the
+// emitter and the stripper from silently drifting apart.
+use crate::storage::dream_attribution::{
+    DREAM_CARD_PROPOSAL_HEADER as HDR_PROPOSAL, DREAM_CARD_TAKE_HEADER as HDR_TAKE,
+};
 const HDR_VERIFY: &str = "Verify first:";
-const HDR_PROPOSAL: &str = "Proposal — requires verdict:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedStrategyCard {
@@ -353,13 +358,56 @@ struct ParsedStrategyCard {
     proposal: String,
 }
 
+/// Every `⌗`-prefixed token in `text`: the run of characters immediately
+/// after each `⌗` up to the first whitespace, `)`, or `,`. Pure scan, no
+/// validation — the caller decides which tokens are legitimate.
+fn receipt_tokens_in(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('⌗') {
+        let tail = &rest[at + '⌗'.len_utf8()..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == ')' || c == ',')
+            .unwrap_or(tail.len());
+        tokens.push(&tail[..end]);
+        rest = &tail[end..];
+    }
+    tokens
+}
+
+/// Every receipt token [`build_prompt`] actually put in front of the model:
+/// open-item ids and their session oids, how-line citation oids, thread
+/// session oids, and thread receipt oids. An `Observed` bullet citing
+/// anything outside this set did not come from the evidence bundle — see
+/// [`parse_strategy_reply`].
+fn valid_receipt_tokens(evidence: &ProjectEvidence) -> BTreeSet<&str> {
+    let mut tokens = BTreeSet::new();
+    for oi in &evidence.open_items {
+        tokens.insert(oi.item_id.as_str());
+        tokens.insert(short_oid(&oi.origin_session));
+        for how in &oi.how_lines {
+            tokens.extend(receipt_tokens_in(how));
+        }
+    }
+    for t in &evidence.threads {
+        tokens.insert(short_oid(&t.session_id));
+        for r in &t.receipts {
+            tokens.extend(receipt_tokens_in(r));
+        }
+    }
+    tokens
+}
+
 /// Parse a reply into the four required sections, or `None` for anything
 /// that isn't a clean, fully-formed card — a literal `ABSTAIN`, a missing
-/// section, sections out of order, an empty required section, or an
-/// `Observed` bullet with no `⌗` receipt. There is no partial-credit path:
-/// malformed output and an explicit `ABSTAIN` are indistinguishable to the
-/// caller, both meaning "no strategy dream this run".
-fn parse_strategy_reply(raw: &str) -> Option<ParsedStrategyCard> {
+/// section, sections out of order, an empty required section, an `Observed`
+/// bullet with no `⌗` receipt, or an `Observed` bullet whose `⌗` token is
+/// not one [`build_prompt`] actually showed the model (a fabricated or
+/// training-prior receipt). There is no partial-credit path: malformed
+/// output, a fabricated receipt, and an explicit `ABSTAIN` are all
+/// indistinguishable to the caller — every one means "no strategy dream this
+/// run".
+fn parse_strategy_reply(raw: &str, evidence: &ProjectEvidence) -> Option<ParsedStrategyCard> {
     let text = raw.trim();
     if text == "ABSTAIN" {
         return None;
@@ -378,6 +426,7 @@ fn parse_strategy_reply(raw: &str) -> Option<ParsedStrategyCard> {
         }
     }
 
+    let valid_tokens = valid_receipt_tokens(evidence);
     let observed_block = &text[observed_pos + HDR_OBSERVED.len()..take_pos];
     let observed: Vec<String> = observed_block
         .lines()
@@ -385,7 +434,11 @@ fn parse_strategy_reply(raw: &str) -> Option<ParsedStrategyCard> {
         .filter(|l| !l.is_empty())
         .map(|l| l.trim_start_matches('-').trim().to_string())
         .collect();
-    if observed.is_empty() || !observed.iter().all(|l| l.contains('⌗')) {
+    let observed_receipts_valid = |line: &str| {
+        let tokens = receipt_tokens_in(line);
+        !tokens.is_empty() && tokens.iter().all(|t| valid_tokens.contains(t))
+    };
+    if observed.is_empty() || !observed.iter().all(|l| observed_receipts_valid(l)) {
         return None;
     }
 
@@ -431,16 +484,20 @@ fn render_strategy_card(project: &str, parsed: &ParsedStrategyCard, dream_id: &s
         out.push_str(line);
         out.push('\n');
     }
-    out.push_str(&format!("Dream's take — not a fact: {}\n", parsed.take));
+    out.push_str(HDR_TAKE);
+    out.push(' ');
+    out.push_str(&parsed.take);
+    out.push('\n');
     if let Some(verify) = &parsed.verify {
-        out.push_str("Verify first: ");
+        out.push_str(HDR_VERIFY);
+        out.push(' ');
         out.push_str(verify);
         out.push('\n');
     }
-    out.push_str(&format!(
-        "Proposal — requires verdict: {}\n",
-        parsed.proposal
-    ));
+    out.push_str(HDR_PROPOSAL);
+    out.push(' ');
+    out.push_str(&parsed.proposal);
+    out.push('\n');
     out.push_str(&crate::storage::dream_attribution::marker_line(dream_id));
     out.push('\n');
     out
@@ -551,10 +608,10 @@ pub(crate) fn author_for_project(
     }
 
     let text = result.text?;
-    let parsed = parse_strategy_reply(&text).or_else(|| {
+    let parsed = parse_strategy_reply(&text, evidence).or_else(|| {
         tracing::debug!(
             project = %evidence.project,
-            "strategy dream reply was ABSTAIN or did not parse; abstaining"
+            "strategy dream reply was ABSTAIN, did not parse, or cited a fabricated receipt; abstaining"
         );
         None
     })?;
@@ -600,12 +657,15 @@ mod tests {
     use crate::dream::threads::{ActorAttempt, ReceiptTier};
 
     /// Serializes tests that touch the process-global kill-switch env vars
-    /// this module reads via `category_disabled` — same idiom as
-    /// `dream::threads`'s own `ENV_LOCK`.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    /// this module reads via `category_disabled`. Reuses the ONE shared
+    /// crate-level guard (`daemon::dream_cadence::env_test_guard`) rather
+    /// than a module-local mutex — `cargo test` runs unit tests concurrently
+    /// across module boundaries, and `CSR_NO_DREAMING` specifically is also
+    /// read by `dream_cadence`'s own tests; two independent locks over the
+    /// same process-global var don't serialize against each other, only
+    /// against themselves (the exact bug this reuse fixes — see the review
+    /// finding that landed this comment).
+    use crate::daemon::dream_cadence::env_test_guard as env_guard;
     fn clear_kill_switch_env() {
         std::env::remove_var("CSR_NO_AI_NARRATIVES");
         std::env::remove_var("CSR_NO_DREAMING");
@@ -624,6 +684,27 @@ mod tests {
                     origin_session: s.to_string(),
                     origin_date: "2026-08-10".to_string(),
                     how_lines: vec![format!("do thing {i} ⌗oid{i:04}abcd")],
+                })
+                .collect(),
+            threads: vec![],
+        }
+    }
+
+    /// Minimal evidence whose only purpose is to make exactly `tokens` valid
+    /// `⌗`-receipts (via `valid_receipt_tokens`) — for `parse_strategy_reply`
+    /// tests that don't need a realistic bundle, only a known valid set.
+    fn evidence_with_receipt_tokens(project: &str, tokens: &[&str]) -> ProjectEvidence {
+        ProjectEvidence {
+            project: project.to_string(),
+            open_items: tokens
+                .iter()
+                .map(|t| EvidenceOpenItem {
+                    item_id: t.to_string(),
+                    title: format!("title {t}"),
+                    kind: "todo".to_string(),
+                    origin_session: "sess-unused".to_string(),
+                    origin_date: "2026-08-10".to_string(),
+                    how_lines: vec![],
                 })
                 .collect(),
             threads: vec![],
@@ -742,30 +823,48 @@ mod tests {
 
     #[test]
     fn parse_rejects_a_literal_abstain() {
-        assert!(parse_strategy_reply("ABSTAIN").is_none());
-        assert!(parse_strategy_reply("  ABSTAIN  ").is_none());
+        let ev = evidence_with_receipt_tokens("csr", &["abcd1234"]);
+        assert!(parse_strategy_reply("ABSTAIN", &ev).is_none());
+        assert!(parse_strategy_reply("  ABSTAIN  ", &ev).is_none());
     }
 
     #[test]
     fn parse_rejects_malformed_output_missing_a_required_section() {
         // No "Proposal —" section at all.
         let text = "Observed:\n  - fact one ⌗abcd1234\nDream's take — not a fact: judgment\n";
-        assert!(parse_strategy_reply(text).is_none());
+        let ev = evidence_with_receipt_tokens("csr", &["abcd1234"]);
+        assert!(parse_strategy_reply(text, &ev).is_none());
     }
 
     #[test]
     fn parse_rejects_an_observed_line_with_no_receipt() {
         let text = "Observed:\n  - fact with no receipt\nDream's take — not a fact: j\nProposal — requires verdict: do x";
-        assert!(parse_strategy_reply(text).is_none());
+        let ev = evidence_with_receipt_tokens("csr", &["abcd1234"]);
+        assert!(parse_strategy_reply(text, &ev).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_an_observed_line_with_a_fabricated_receipt() {
+        // "⌗deadbeef" is well-formed (has a ⌗ token) but was never shown to
+        // the model — the evidence bundle only ever put "abcd1234" in front
+        // of it. A real reply copying evidence verbatim could never produce
+        // this; a fabricated or training-prior receipt must abstain, not
+        // render a card with a fact the corpus never produced.
+        let text = "Observed:\n  - fact one ⌗deadbeef\n\
+             Dream's take — not a fact: judgment.\n\
+             Proposal — requires verdict: do the thing.";
+        let ev = evidence_with_receipt_tokens("csr", &["abcd1234"]);
+        assert!(parse_strategy_reply(text, &ev).is_none());
     }
 
     #[test]
     fn parse_accepts_a_well_formed_reply_with_and_without_verify() {
+        let ev = evidence_with_receipt_tokens("csr", &["abcd1234", "efgh5678"]);
         let with_verify = "Observed:\n  - fact one ⌗abcd1234\n  - fact two ⌗efgh5678\n\
              Dream's take — not a fact: this is the judgment paragraph.\n\
              Verify first: confirm the deploy actually happened.\n\
              Proposal — requires verdict: check the release notes first.";
-        let parsed = parse_strategy_reply(with_verify).unwrap();
+        let parsed = parse_strategy_reply(with_verify, &ev).unwrap();
         assert_eq!(parsed.observed.len(), 2);
         assert_eq!(
             parsed.verify.as_deref(),
@@ -776,7 +875,7 @@ mod tests {
         let without_verify = "Observed:\n  - fact one ⌗abcd1234\n\
              Dream's take — not a fact: judgment.\n\
              Proposal — requires verdict: do the thing.";
-        let parsed2 = parse_strategy_reply(without_verify).unwrap();
+        let parsed2 = parse_strategy_reply(without_verify, &ev).unwrap();
         assert!(parsed2.verify.is_none());
     }
 
@@ -788,7 +887,7 @@ mod tests {
         let ev = evidence("csr", &["sess-a", "sess-b", "sess-c"]);
         let inner = |_m: Option<&str>, _p: &str| {
             ActorAttempt::Parsed(crate::narrative::ParsedNarrative {
-                text: "Observed:\n  - fact one ⌗oid00000abcd\n\
+                text: "Observed:\n  - fact one ⌗item0\n\
                        Dream's take — not a fact: this needs attention.\n\
                        Proposal — requires verdict: verify the item is still open."
                     .to_string(),

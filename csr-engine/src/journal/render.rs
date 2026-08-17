@@ -775,6 +775,7 @@ mod tests {
         WeekDream {
             title: title.to_string(),
             hypothesis: Some(hyp.to_string()),
+            hypothesis_session: Some("sess-week-dream".to_string()),
             how: vec!["step one".to_string()],
             project: "csr".to_string(),
             item_id: id.to_string(),

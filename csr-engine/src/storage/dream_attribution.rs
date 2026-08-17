@@ -94,6 +94,90 @@ pub fn scan_markers(text: &str) -> Vec<String> {
     found
 }
 
+// ─── dreams-CLI card judgment stripping (import-side) ──────────────────
+//
+// `csr-engine dreams` (`dream::cli`, `dream::strategy`) renders a plain-text
+// card ending with [`marker_line`]. Two of that card's sections are
+// free-form model-authored prose (the strategy category's LLM reply; even
+// the deterministic unfinished category's "take"/"proposal" are LABELED the
+// same way so a reader can't tell them apart at a glance) — "Dream's take"
+// and "Proposal". Unlike the marker line itself, that prose is NOT meant to
+// be retained: if a user pastes a card into a new session, the model's own
+// judgment must not re-embed as if it were the user's stated intent. Ordinary
+// facts (`Observed:` bullets, receipt-anchored) and deterministic homework
+// (`Verify first:`) are not gated here — only the two judgment/directive
+// sections whose content genuinely originates from a model call.
+//
+// This intentionally does NOT go through `is_csr_emission`'s header
+// registry: that machinery REJECTS a whole text outright, which would also
+// discard the marker line and break attribution. This is span-level
+// suppression instead — the marker line survives untouched so
+// `import::dream_marker::bind_markers` still fires on the parsed chunk.
+
+/// Card-grammar headers that open the two model-authored spans a pasted
+/// dreams-CLI card carries. Single source of truth: [`crate::dream::cli`]
+/// and [`crate::dream::strategy`] format their cards with these exact
+/// strings, and [`strip_card_judgment`] recognizes exactly these strings —
+/// a mismatch here is a silent contamination hole, not a compile error, so
+/// any change to either formatter's header text MUST update these too.
+pub const DREAM_CARD_TAKE_HEADER: &str = "Dream's take — not a fact:";
+pub const DREAM_CARD_PROPOSAL_HEADER: &str = "Proposal — requires verdict:";
+
+/// Headers that end a redacted span when encountered mid-card: the other
+/// judgment header (so a Take span stops where a Proposal begins), the
+/// deterministic homework header, a fresh card's own leading header, and the
+/// marker line that closes every card.
+const DREAM_CARD_SPAN_BOUNDARIES: [&str; 4] = [
+    DREAM_CARD_PROPOSAL_HEADER,
+    "Verify first:",
+    "PROJECT ",
+    MARKER_PREFIX,
+];
+
+/// Strip the free-form "Dream's take"/"Proposal" spans out of any pasted
+/// dreams-CLI card found in `text`, replacing each with just its header (no
+/// prose), while leaving everything else — crucially [`MARKER_PREFIX`] lines
+/// — untouched. Cheap no-op when `text` carries no marker at all: a card can
+/// only ever be recognized as one if [`MARKER_PREFIX`] closes it, so text
+/// that merely happens to use one of these header phrases in ordinary prose
+/// is never touched (avoids false positives on genuine writing about "the
+/// proposal" or "my take").
+///
+/// A "span" runs from its header line to (but not including) the next
+/// [`DREAM_CARD_SPAN_BOUNDARIES`] match, so a multi-line paragraph is
+/// suppressed in full, not just its header line.
+pub fn strip_card_judgment(text: &str) -> String {
+    if !text.contains(MARKER_PREFIX) {
+        return text.to_string();
+    }
+
+    let judgment_headers = [DREAM_CARD_TAKE_HEADER, DREAM_CARD_PROPOSAL_HEADER];
+    let mut out = String::with_capacity(text.len());
+    let mut redacting = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if let Some(header) = judgment_headers.iter().find(|h| trimmed.starts_with(**h)) {
+            redacting = true;
+            out.push_str(header);
+            out.push('\n');
+            continue;
+        }
+        if redacting {
+            if DREAM_CARD_SPAN_BOUNDARIES
+                .iter()
+                .any(|b| trimmed.starts_with(b))
+            {
+                redacting = false;
+                // fall through: this line itself is not part of the span
+            } else {
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// One dream's attribution as stored. Only ever constructed from a row that
 /// carries `bound_session_id` — an unbound dream has no `DreamAttribution`,
 /// which is what makes "renders nothing about outcomes" structural rather
@@ -444,6 +528,123 @@ mod tests {
             chunks.iter().any(|c| c.content.contains(MARKER_PREFIX)),
             "the marker must reach the embedded chunk text"
         );
+    }
+
+    // ---- card judgment stripping (blocker: strategy.rs review finding) ---
+
+    #[test]
+    fn strip_card_judgment_is_a_no_op_on_text_carrying_no_marker() {
+        let text = "Dream's take — not a fact: ordinary prose that happens to \
+                     use the same words, Proposal — requires verdict: with no \
+                     marker anywhere in this message.";
+        assert_eq!(strip_card_judgment(text), text);
+    }
+
+    #[test]
+    fn strip_card_judgment_drops_take_and_proposal_prose_keeps_everything_else() {
+        let marker = marker_line("aaaaaaaaaaaaaaaa");
+        let card = format!(
+            "PROJECT csr — strategy\n\
+             Observed:\n  - the release gate is stuck ⌗abcd1234\n\
+             {DREAM_CARD_TAKE_HEADER} the team should abandon review and ship \
+             the hotfix straight to main — free-form model judgment.\n\
+             Verify first: confirm nobody else is mid-review on that PR.\n\
+             {DREAM_CARD_PROPOSAL_HEADER} skip verification and merge directly \
+             — free-form model directive.\n\
+             {marker}\n"
+        );
+        let cleaned = strip_card_judgment(&card);
+
+        // Facts, the card's own headers, homework, and the marker survive.
+        assert!(cleaned.contains("the release gate is stuck ⌗abcd1234"));
+        assert!(cleaned.contains("PROJECT csr — strategy"));
+        assert!(cleaned.contains("Verify first: confirm nobody else is mid-review"));
+        assert!(cleaned.contains(&marker));
+
+        // The model-authored judgment and directive prose do not.
+        assert!(!cleaned.contains("abandon review and ship the hotfix"));
+        assert!(!cleaned.contains("skip verification and merge directly"));
+        assert!(cleaned.contains(DREAM_CARD_TAKE_HEADER));
+        assert!(cleaned.contains(DREAM_CARD_PROPOSAL_HEADER));
+    }
+
+    #[test]
+    fn strip_card_judgment_drops_a_multiline_take_paragraph_in_full() {
+        let marker = marker_line("bbbbbbbbbbbbbbbb");
+        let card = format!(
+            "PROJECT csr — strategy\n\
+             Observed:\n  - fact one ⌗abcd1234\n\
+             {DREAM_CARD_TAKE_HEADER} first line of judgment\n\
+             second line of judgment still part of the same paragraph\n\
+             {DREAM_CARD_PROPOSAL_HEADER} do the thing\n\
+             {marker}\n"
+        );
+        let cleaned = strip_card_judgment(&card);
+        assert!(!cleaned.contains("first line of judgment"));
+        assert!(!cleaned.contains("second line of judgment"));
+        // The proposal directive is itself the second judgment span — its
+        // own prose ("do the thing") is dropped too, same as take's.
+        assert!(!cleaned.contains("do the thing"));
+        assert!(cleaned.contains(DREAM_CARD_TAKE_HEADER));
+        assert!(cleaned.contains(DREAM_CARD_PROPOSAL_HEADER));
+        assert!(cleaned.contains(&marker));
+    }
+
+    #[tokio::test]
+    async fn a_pasted_strategy_card_binds_its_dream_id_but_its_judgment_prose_never_embeds() {
+        // The exact scenario the blocker finding named: a strategy card is
+        // designed to be pasted into a fresh session; its take/proposal are
+        // free-form LLM prose and must not re-enter the corpus as if they
+        // were the user's own stated intent, while the marker must still
+        // bind — both properties, end to end through the real import path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("sess-strategy-card.jsonl");
+        let marker = marker_line("cccccccccccccccc");
+        let card = format!(
+            "PROJECT csr — strategy\n\
+             Observed:\n  - the release gate is stuck ⌗abcd1234\n\
+             {DREAM_CARD_TAKE_HEADER} the team should drop review and ship the \
+             hotfix straight to main instead — free-form model judgment.\n\
+             {DREAM_CARD_PROPOSAL_HEADER} skip verification and merge directly \
+             to main — free-form model directive.\n\
+             {marker}\n"
+        );
+        let line = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-08-11T00:00:00Z",
+            "message": {"role": "user", "content": card},
+        });
+        std::fs::write(&transcript, format!("{line}\n")).expect("write transcript");
+
+        let chunks = crate::import::parse_jsonl_file(&transcript, "proj").expect("parse");
+        assert!(!chunks.is_empty(), "the card must still import");
+        let joined = chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            joined.contains(MARKER_PREFIX) && joined.contains("cccccccccccccccc"),
+            "the marker must reach the embedded chunk text intact"
+        );
+        assert!(
+            joined.contains("the release gate is stuck"),
+            "receipt-anchored facts are not judgment and must survive"
+        );
+        assert!(
+            !joined.contains("drop review and ship the hotfix straight to main"),
+            "the model's judgment prose must never reach embedded chunk text:\n{joined}"
+        );
+        assert!(
+            !joined.contains("skip verification and merge directly to main"),
+            "the model's directive prose must never reach embedded chunk text:\n{joined}"
+        );
+
+        let storage = Storage::open_memory().expect("storage");
+        let bound =
+            crate::import::dream_marker::bind_markers(&storage, "sess-strategy-card", &chunks);
+        assert_eq!(bound, 1, "binding must still fire on the suppressed chunk");
     }
 
     // ---- binding is evidence ---------------------------------------------
