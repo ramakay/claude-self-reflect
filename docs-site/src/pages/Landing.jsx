@@ -1274,12 +1274,12 @@ export default function Landing() {
 
       <div className="hero-watermark" aria-hidden="true">
         <h1 className="hero-watermark__title">You or your agent don't have to remember any of this</h1>
-        <p className="hero-watermark__subtext">because Claude Code does.</p>
+        <p className="hero-watermark__subtext">because Claude Self-Reflect does.</p>
       </div>
 
       <main className="landing-main">
         <p className="type-dateline landing-dateline" style={{ opacity: datelineVisible ? 1 : 0 }}>
-          Claude Self-Reflect / v8.2 / Rust Engine / Local Memory Archive
+          Claude Self-Reflect / v9.5.2 / Rust Engine / Local Memory Archive
         </p>
 
         <section className="bento-grid" aria-label="Claude Self-Reflect overview">
