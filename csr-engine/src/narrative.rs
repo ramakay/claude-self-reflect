@@ -37,6 +37,32 @@ pub fn model_candidates() -> Vec<Option<String>> {
     chain
 }
 
+/// Path to an EMPTY MCP config, for use with `--strict-mcp-config` so a
+/// `claude -p` subprocess loads ZERO MCP servers.
+///
+/// Every headless `claude -p` invocation inherits the user's full MCP
+/// configuration and serialises every tool schema into the request. That is not
+/// a small overhead: on a machine with a typical plugin/connector set it is
+/// ~180k tokens of tool definitions before the prompt is even considered, which
+/// overruns the model's context window and fails the request with HTTP 400
+/// `prompt_too_long` — deterministically, before any inference happens, and
+/// therefore on every retry.
+///
+/// Every CSR subprocess call site embeds what the model needs directly in the
+/// prompt, so all of them need ZERO tools. Passing this alongside
+/// `--strict-mcp-config` also avoids spawning a recursive csr-engine MCP server
+/// and gives the fastest possible `claude -p` startup.
+pub fn minimal_mcp_config() -> anyhow::Result<std::path::PathBuf> {
+    let config = serde_json::json!({ "mcpServers": {} });
+    let dir = dirs::home_dir()
+        .map(|h| h.join(".claude-self-reflect"))
+        .ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join("briefing-mcp.json");
+    std::fs::write(&path, serde_json::to_string(&config)?)?;
+    Ok(path)
+}
+
 #[derive(Debug)]
 pub struct ParsedNarrative {
     pub text: String,
@@ -296,5 +322,14 @@ mod tests {
             AttemptOutcome::Failed(msg) => assert!(msg.contains("real error")),
             other => panic!("expected Failed, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_minimal_mcp_config_is_empty() {
+        let path = minimal_mcp_config().unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let servers = v["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 0, "claude -p call sites need zero MCP servers");
     }
 }

@@ -97,6 +97,12 @@ fn build_prompt(ctx: &StoryContext) -> String {
 async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNarrative> {
     use tokio::io::AsyncWriteExt;
 
+    // The transcript is embedded in `prompt`, so the analyst needs NO tools. Without
+    // an explicit empty MCP config this subprocess inherits the user's full MCP set
+    // and blows the context window on tool schemas alone (HTTP 400 prompt_too_long),
+    // failing every call before inference. See narrative::minimal_mcp_config.
+    let mcp_config_path = crate::narrative::minimal_mcp_config().ok();
+
     for candidate in crate::narrative::model_candidates() {
         let attempt = tokio::time::timeout(HAIKU_TIMEOUT, async {
             let mut cmd = tokio::process::Command::new("claude");
@@ -107,8 +113,14 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
             if let Some(model) = &candidate {
                 cmd.args(["--model", model]);
             }
+            cmd.args(["-p", "-", "--output-format", "json"]);
+            // Must come LAST: --mcp-config is variadic in the claude CLI and would
+            // consume any positional arg that followed it.
+            if let Some(path) = &mcp_config_path {
+                cmd.args(["--strict-mcp-config", "--mcp-config"]);
+                cmd.arg(path);
+            }
             let mut child = match cmd
-                .args(["-p", "-", "--output-format", "json"])
                 .stdout(Stdio::piped())
                 // Piped intentionally — required for model-not-found detection on the failure path; do not revert to null().
                 .stderr(Stdio::piped())
