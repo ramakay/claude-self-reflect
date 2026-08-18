@@ -5,6 +5,24 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.5.3] - 2026-08-18
+
+### Fixed
+
+- **Background AI pipelines no longer fail on every call with `prompt_too_long`.**
+  Only `hooks::session_briefing` passed `--strict-mcp-config` to its headless
+  `claude -p` subprocess; `daemon::ratification` and `summarizer` inherited the
+  user's full MCP configuration and serialised every tool schema into the
+  request. On a machine with a normal plugin set that is ~180k tokens of tool
+  definitions before the prompt is considered, so the request overran the
+  context window and failed with HTTP 400 before any inference — identically on
+  every retry. Reported and fixed by @Devin345458, who measured a daemon frozen
+  at 68% ratification coverage for ~20 hours, retrying ~105 calls/hour at a 0%
+  success rate; with the fix, coverage reached 773/773 and the backlog drained.
+  The empty-config helper now lives in `narrative::minimal_mcp_config`, writes
+  atomically (all three call sites can run concurrently), and logs when it is
+  unavailable instead of degrading silently.
+
 ## [9.5.2] - 2026-08-17
 
 ### Fixed
