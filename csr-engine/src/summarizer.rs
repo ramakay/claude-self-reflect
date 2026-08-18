@@ -101,7 +101,14 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
     // an explicit empty MCP config this subprocess inherits the user's full MCP set
     // and blows the context window on tool schemas alone (HTTP 400 prompt_too_long),
     // failing every call before inference. See narrative::minimal_mcp_config.
-    let mcp_config_path = crate::narrative::minimal_mcp_config().ok();
+    let mcp_config_path = crate::narrative::minimal_mcp_config()
+        .inspect_err(|e| {
+            tracing::warn!(
+                "minimal MCP config unavailable; this call inherits the user's MCP set \
+                 and may fail with prompt_too_long: {e}"
+            )
+        })
+        .ok();
 
     for candidate in crate::narrative::model_candidates() {
         let attempt = tokio::time::timeout(HAIKU_TIMEOUT, async {
