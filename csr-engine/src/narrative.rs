@@ -37,6 +37,52 @@ pub fn model_candidates() -> Vec<Option<String>> {
     chain
 }
 
+/// Path to an EMPTY MCP config, for use with `--strict-mcp-config` so a
+/// `claude -p` subprocess loads ZERO MCP servers.
+///
+/// Every headless `claude -p` invocation inherits the user's full MCP
+/// configuration and serialises every tool schema into the request. That is not
+/// a small overhead: on a machine with a typical plugin/connector set it is
+/// ~180k tokens of tool definitions before the prompt is even considered, which
+/// overruns the model's context window and fails the request with HTTP 400
+/// `prompt_too_long` — deterministically, before any inference happens, and
+/// therefore on every retry.
+///
+/// Every CSR subprocess call site embeds what the model needs directly in the
+/// prompt, so all of them need ZERO tools. Passing this alongside
+/// `--strict-mcp-config` also avoids spawning a recursive csr-engine MCP server
+/// and gives the fastest possible `claude -p` startup.
+pub fn minimal_mcp_config() -> anyhow::Result<std::path::PathBuf> {
+    let config = serde_json::json!({ "mcpServers": {} });
+    let dir = dirs::home_dir()
+        .map(|h| h.join(".claude-self-reflect"))
+        .ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join("briefing-mcp.json");
+
+    // Atomic write. All three call sites can run concurrently, so a plain
+    // truncating write would let one caller observe a 0-byte config while
+    // another rewrites it — failing that subprocess before inference, which is
+    // the exact class of silent failure this config exists to prevent.
+    //
+    // The temp name carries a counter as well as the pid: the daemon drives
+    // ratification and story generation from a single process, so a shared pid
+    // is precisely the case that needs distinguishing. (Sibling call sites in
+    // this repo use a fixed `.tmp` name; they have one writer each.)
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let tmp_path = dir.join(format!("briefing-mcp.json.{pid}.{seq}.tmp"));
+    std::fs::write(&tmp_path, serde_json::to_string(&config)?)?;
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(path)
+}
+
+/// Distinguishes temp files written concurrently by `minimal_mcp_config`.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug)]
 pub struct ParsedNarrative {
     pub text: String,
@@ -296,5 +342,18 @@ mod tests {
             AttemptOutcome::Failed(msg) => assert!(msg.contains("real error")),
             other => panic!("expected Failed, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_minimal_mcp_config_is_empty() {
+        let path = minimal_mcp_config().unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let servers = v["mcpServers"].as_object().unwrap();
+        assert_eq!(
+            servers.len(),
+            0,
+            "claude -p call sites need zero MCP servers"
+        );
     }
 }

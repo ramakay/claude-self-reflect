@@ -193,7 +193,7 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
 /// servers (not even csr-engine) — fastest possible `claude -p` startup and no
 /// recursive csr-engine spawn.
 fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNarrative> {
-    let mcp_config_path = write_minimal_mcp_config()?;
+    let mcp_config_path = crate::narrative::minimal_mcp_config()?;
     let mut last_err: Option<anyhow::Error> = None;
 
     for candidate in crate::narrative::model_candidates() {
@@ -288,21 +288,6 @@ fn store_briefing(engine: &Engine, project: &str, briefing: &str) -> Result<()> 
         .insert_reflection(&id, briefing, &tags, &embedding)?;
 
     Ok(())
-}
-
-/// Write an EMPTY MCP config, used with `--strict-mcp-config` so the briefing
-/// subprocess loads ZERO MCP servers. Episodes are injected into the prompt, so
-/// Haiku needs no tools — this avoids loading any MCP server (including a recursive
-/// csr-engine) and gives the fastest possible `claude -p` startup.
-fn write_minimal_mcp_config() -> Result<std::path::PathBuf> {
-    let config = serde_json::json!({ "mcpServers": {} });
-    let dir = dirs::home_dir()
-        .map(|h| h.join(".claude-self-reflect"))
-        .ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    std::fs::create_dir_all(&dir).ok();
-    let path = dir.join("briefing-mcp.json");
-    std::fs::write(&path, serde_json::to_string(&config)?)?;
-    Ok(path)
 }
 
 /// Prompt-ready episode window plus stable (time-independent) precursors for
@@ -484,19 +469,6 @@ mod tests {
     fn test_briefing_timeout_reasonable() {
         // claude -p has ~30s startup; allow generous async budget up to 3 min
         assert!((60..=180).contains(&BRIEFING_TIMEOUT_SECS));
-    }
-
-    #[test]
-    fn test_minimal_mcp_config_is_empty() {
-        let path = write_minimal_mcp_config().unwrap();
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let servers = v["mcpServers"].as_object().unwrap();
-        assert_eq!(
-            servers.len(),
-            0,
-            "briefing needs no tools — config must load zero MCP servers"
-        );
     }
 
     #[test]
