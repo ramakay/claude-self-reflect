@@ -350,6 +350,10 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&raw).unwrap();
         let servers = v["mcpServers"].as_object().unwrap();
-        assert_eq!(servers.len(), 0, "claude -p call sites need zero MCP servers");
+        assert_eq!(
+            servers.len(),
+            0,
+            "claude -p call sites need zero MCP servers"
+        );
     }
 }
