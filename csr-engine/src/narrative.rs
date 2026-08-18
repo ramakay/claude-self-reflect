@@ -59,9 +59,29 @@ pub fn minimal_mcp_config() -> anyhow::Result<std::path::PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("no home dir"))?;
     std::fs::create_dir_all(&dir).ok();
     let path = dir.join("briefing-mcp.json");
-    std::fs::write(&path, serde_json::to_string(&config)?)?;
+
+    // Atomic write. All three call sites can run concurrently, so a plain
+    // truncating write would let one caller observe a 0-byte config while
+    // another rewrites it — failing that subprocess before inference, which is
+    // the exact class of silent failure this config exists to prevent.
+    //
+    // The temp name carries a counter as well as the pid: the daemon drives
+    // ratification and story generation from a single process, so a shared pid
+    // is precisely the case that needs distinguishing. (Sibling call sites in
+    // this repo use a fixed `.tmp` name; they have one writer each.)
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let tmp_path = dir.join(format!("briefing-mcp.json.{pid}.{seq}.tmp"));
+    std::fs::write(&tmp_path, serde_json::to_string(&config)?)?;
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
     Ok(path)
 }
+
+/// Distinguishes temp files written concurrently by `minimal_mcp_config`.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct ParsedNarrative {
