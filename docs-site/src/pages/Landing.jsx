@@ -814,6 +814,22 @@ function KnowledgeGraphCard() {
   )
 }
 
+function PullQuoteCard() {
+  return (
+    <BentoCard className="card--quote" delay={520}>
+      <CardKicker number="—" label="FROM A LIVE SESSION" />
+      <blockquote className="pull-quote">
+        <span className="pull-quote__mark" aria-hidden="true">&ldquo;</span>
+        <p className="pull-quote__text">Retrieval beat curation today.</p>
+        <footer className="pull-quote__footer">
+          <cite className="pull-quote__attribution">— Claude, comparing its own curated MEMORY.md against CSR in a live session</cite>
+        </footer>
+      </blockquote>
+      <p className="pull-quote__support type-caption">A hand-curated memory note answered with stale information; CSR's search over past conversations surfaced the current thread in about 20ms.</p>
+    </BentoCard>
+  )
+}
+
 function WhatsNewCard() {
   return (
     <BentoCard className="card--whatsnew" delay={560} id="whats-new">
@@ -1294,6 +1310,7 @@ export default function Landing() {
           <WhatsNewCard />
           <MultiSourceCard />
           <PaperCard />
+          <PullQuoteCard />
           <div className="bento-section-header">
             <span />
             <h2>How others do it</h2>
