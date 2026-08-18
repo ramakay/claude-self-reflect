@@ -5,6 +5,28 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.5.2] - 2026-08-17
+
+### Fixed
+
+- **HNSW index load no longer aborts every hook on a torn cache.** `hnsw_rs`'s
+  `load_hnsw` panics (it does not return `Err`) when the `.hnsw.graph` /
+  `.hnsw.data` pair on disk comes from two different dump generations — a
+  window the old promote-to-canonical double rename could leave behind after a
+  crash. Two layers: both load sites are wrapped in `catch_unwind` and fall
+  back to the documented full-rebuild path, and promotion itself is now
+  crash-atomic — the index manifest records the dumped basenames and its
+  existing tmp-write + rename is the single commit point, so a mismatched
+  canonical pair can no longer be manufactured. Regression test loads a
+  deliberately mismatched pair and asserts `None` instead of a panic.
+
+## [9.5.1] - 2026-08-12
+
+### Fixed
+
+- **FTS index no longer grows without bound** (backport of the 65x
+  `chunks_fts` bloat fix to the 9.5 line).
+
 ## [9.5.0] - 2026-08-03
 
 ### Codegraph truth pass: evidence-tiered resolution, two-channel attribution, honest abstention

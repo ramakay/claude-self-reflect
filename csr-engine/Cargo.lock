@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "csr-engine"
-version = "9.5.1"
+version = "9.5.2"
 dependencies = [
  "anyhow",
  "ast-grep-core",
