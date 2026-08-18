@@ -816,7 +816,7 @@ function KnowledgeGraphCard() {
 
 function PullQuoteCard() {
   return (
-    <BentoCard className="card--quote" delay={520}>
+    <BentoCard className="card--quote" delay={20}>
       <CardKicker number="—" label="FROM A LIVE SESSION" />
       <blockquote className="pull-quote">
         <span className="pull-quote__mark" aria-hidden="true">&ldquo;</span>
@@ -826,6 +826,15 @@ function PullQuoteCard() {
         </footer>
       </blockquote>
       <p className="pull-quote__support type-caption">A hand-curated memory note answered with stale information; CSR's search over past conversations surfaced the current thread in about 20ms.</p>
+      <div className="pull-quote__receipts">
+        <p className="pull-quote__receipts-label">One session's ledger, misses included — not a benchmark</p>
+        <ul className="pull-quote__receipts-list">
+          <li><span className="pull-quote__receipts-metric">0.728 / ~20ms</span>a pre-compaction turn, retrieved after the session had compacted twice</li>
+          <li><span className="pull-quote__receipts-metric">0.78</span>a minutes-old message, retrieved after compaction</li>
+          <li><span className="pull-quote__receipts-metric">stale</span>MEMORY.md's hand-curated note; retrieval held the current thread</li>
+          <li><span className="pull-quote__receipts-metric">2 / 5</span>queries that session came back weak — flagged uncalibrated by the tool itself</li>
+        </ul>
+      </div>
     </BentoCard>
   )
 }
@@ -1284,6 +1293,7 @@ export default function Landing() {
 
         <section className="bento-grid" aria-label="Claude Self-Reflect overview">
           <ForgettingCard />
+          <PullQuoteCard />
           <BentoCard className="card--demo" delay={40}>
             <CardKicker number="—" label="SEE IT IN ACTION" />
             <h2 className="type-hl-md">The Demo</h2>
@@ -1310,7 +1320,6 @@ export default function Landing() {
           <WhatsNewCard />
           <MultiSourceCard />
           <PaperCard />
-          <PullQuoteCard />
           <div className="bento-section-header">
             <span />
             <h2>How others do it</h2>
