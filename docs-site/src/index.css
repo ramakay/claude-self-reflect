@@ -2705,6 +2705,11 @@ body {
     grid-column: 1 / -1;
   }
 
+  /* base grid-row: 3 must not pin this ahead of auto-placed cards here */
+  .card--pipeline {
+    grid-row: auto;
+  }
+
   .card--active,
   .card--search,
   .card--import,
