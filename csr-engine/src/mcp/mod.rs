@@ -821,6 +821,21 @@ fn tool_result(result: anyhow::Result<String>) -> Result<CallToolResult, rmcp::E
 }
 
 impl ServerHandler for CsrServer {
+    // rmcp 3.1's default advertises every version it knows, including
+    // 2026-07-28 — a revision whose tools/list response requires cache
+    // metadata (ttlMs/cacheScope) the crate never emits. Claude Code
+    // >= 2.1.234 requests 2026-07-28, gets the echo, then rejects the
+    // metadata-less tools/list. Cap negotiation at the last revision
+    // rmcp actually serves.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(&[
+            ProtocolVersion::V_2024_11_05,
+            ProtocolVersion::V_2025_03_26,
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2025_11_25,
+        ])
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
