@@ -702,20 +702,26 @@ fn tool_result(result: anyhow::Result<String>) -> Result<CallToolResult, rmcp::E
     }
 }
 
+/// Protocol revisions this server may agree to during `initialize`.
+///
+/// rmcp 3.1's default advertises every version it knows, including
+/// 2026-07-28 — a revision whose tools/list response requires cache
+/// metadata (ttlMs/cacheScope) the crate never emits. Claude Code
+/// 2.1.234 and newer requests 2026-07-28, gets the echo, then rejects the
+/// metadata-less tools/list, leaving the server connected but tool-less.
+/// Cap negotiation at the last revision rmcp actually serves. Before
+/// adding a newer revision here, prove the linked rmcp emits its
+/// required response shape (grep the crate for ttlMs/cacheScope).
+const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2024_11_05,
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+];
+
 impl ServerHandler for CsrServer {
-    // rmcp 3.1's default advertises every version it knows, including
-    // 2026-07-28 — a revision whose tools/list response requires cache
-    // metadata (ttlMs/cacheScope) the crate never emits. Claude Code
-    // >= 2.1.234 requests 2026-07-28, gets the echo, then rejects the
-    // metadata-less tools/list. Cap negotiation at the last revision
-    // rmcp actually serves.
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
-        std::borrow::Cow::Borrowed(&[
-            ProtocolVersion::V_2024_11_05,
-            ProtocolVersion::V_2025_03_26,
-            ProtocolVersion::V_2025_06_18,
-            ProtocolVersion::V_2025_11_25,
-        ])
+        std::borrow::Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
     fn get_info(&self) -> ServerInfo {
@@ -856,5 +862,27 @@ impl ServerHandler for CsrServer {
                 None,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── protocol negotiation guard: never agree to a revision rmcp
+    // cannot serve (2026-07-28 tools/list requires ttlMs/cacheScope
+    // metadata rmcp 3.1 never emits; Claude Code >= 2.1.234 rejects
+    // the mismatch and the server ends up connected but tool-less) ───
+
+    #[test]
+    fn negotiation_never_agrees_to_protocol_2026_07_28() {
+        assert!(
+            !SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2026_07_28),
+            "2026-07-28 must stay off the supported list until the linked rmcp \
+             emits that revision's tools/list cache metadata (ttlMs/cacheScope)"
+        );
+        // The cap must still include the newest revision rmcp does serve,
+        // so we don't silently downgrade below it.
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2025_11_25));
     }
 }
