@@ -1719,6 +1719,116 @@ fn episode_v2_full_cycle_with_anchors() {
     );
 }
 
+/// Regression: memory-registry file bodies are metadata-only.
+///
+/// `scan_memory_dirs` must upsert rows into `memory_registry` and never write
+/// file bodies into `chunks`, `chunks_fts`, or the vector/HNSW index. This
+/// locks the cross-table isolation invariant found in code review — unit tests
+/// cover frontmatter/upsert lifecycle, but not that chunks/FTS stay untouched.
+#[test]
+fn test_memory_registry_bodies_never_reach_chunks_or_fts() {
+    const MARKER: &str = "MEMORY_BODY_SENTINEL_9f3a";
+
+    let dir = tempfile::tempdir().unwrap();
+    let mem_dir = dir.path().join("demo-project").join("memory");
+    std::fs::create_dir_all(&mem_dir).unwrap();
+
+    let reference_body = format!(
+        r#"---
+name: reference-marker-isolation
+description: "Memory registry body isolation probe"
+metadata:
+  node_type: memory
+  type: reference
+  originSessionId: 00000000-0000-4000-8000-000000000001
+  modified: 2026-08-19T15:05:51.330Z
+---
+Body paragraph carrying the unique marker {MARKER} so we can prove it never
+lands in chunks or chunks_fts.
+"#
+    );
+    std::fs::write(mem_dir.join("reference_marker.md"), reference_body).unwrap();
+    std::fs::write(mem_dir.join("MEMORY.md"), "# index\n").unwrap();
+
+    let storage = Storage::open_memory().unwrap();
+    let stats =
+        csr_engine::import::memory_registry::scan_memory_dirs(&storage, dir.path()).unwrap();
+    assert_eq!(
+        stats.files_seen, 1,
+        "only the real memory file should count; MEMORY.md is skipped"
+    );
+    assert_eq!(
+        stats.upserted, 1,
+        "exactly one memory_registry upsert expected"
+    );
+
+    let (
+        registry_count,
+        memory_md_count,
+        chunks_count,
+        fts_count,
+        marker_in_chunks,
+        fts_match_count,
+    ) = storage
+        .with_transaction(|tx| {
+            let registry_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE project = ?1",
+                ["demo-project"],
+                |r| r.get(0),
+            )?;
+            let memory_md_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE file_path LIKE '%MEMORY.md'",
+                [],
+                |r| r.get(0),
+            )?;
+            let chunks_count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+            let fts_count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))?;
+            let marker_in_chunks: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM chunks WHERE content LIKE ?1",
+                [format!("%{MARKER}%")],
+                |r| r.get(0),
+            )?;
+            let fts_match_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+                [format!("\"{MARKER}\"")],
+                |r| r.get(0),
+            )?;
+            Ok((
+                registry_count,
+                memory_md_count,
+                chunks_count,
+                fts_count,
+                marker_in_chunks,
+                fts_match_count,
+            ))
+        })
+        .unwrap();
+
+    assert_eq!(
+        registry_count, 1,
+        "exactly one memory_registry row for demo-project"
+    );
+    assert_eq!(
+        memory_md_count, 0,
+        "MEMORY.md must not produce a memory_registry row"
+    );
+    assert_eq!(
+        chunks_count, 0,
+        "scan_memory_dirs must not insert any chunks rows"
+    );
+    assert_eq!(fts_count, 0, "scan_memory_dirs must leave chunks_fts empty");
+    assert_eq!(
+        marker_in_chunks, 0,
+        "marker must not appear in any chunks.content value"
+    );
+    assert_eq!(
+        fts_match_count, 0,
+        "FTS5 MATCH for body marker must return zero rows"
+    );
+}
+
 // ─── v9.4 code property graph: LIVE round-trip (gate) ───
 
 mod codegraph_roundtrip {
