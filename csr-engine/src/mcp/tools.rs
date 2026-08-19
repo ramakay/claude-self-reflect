@@ -1434,12 +1434,79 @@ pub async fn why(
         let _ = storage.log_retrieval_event(&item.chunk_id, "chunk", "mcp_search", "mcp");
     }
 
-    Ok(format_why(
+    let mut rendered = format_why(
         query,
         &ranking.items,
         &ranking.hoisted_chunk_ids,
         &reinstatement.trace,
-    ))
+    );
+
+    append_memory_provenance_hop(storage, &ranking.items, &mut rendered)?;
+
+    Ok(rendered)
+}
+
+/// Read-only additive join: for each conversation the evidence resolved to,
+/// look up memory_registry rows whose origin_session_id matches that
+/// conversation id, and append up to 3 "distilled into memory" lines
+/// (newest first) to `out`. Zero matches => `out` is untouched (no bytes
+/// added) so pre-existing csr_why output is byte-identical when no memory
+/// references this conversation. Never affects ranking or evidence
+/// selection — this runs strictly after `format_why` has already rendered
+/// the ordered items.
+fn append_memory_provenance_hop(
+    storage: &Arc<Storage>,
+    items: &[crate::search::reinstatement::EvidenceItem],
+    out: &mut String,
+) -> Result<()> {
+    // Unique conversation ids, first-seen order (order doesn't matter for
+    // correctness since we re-sort by freshness below, but keep it
+    // deterministic and avoid duplicate queries for the same conversation).
+    let mut seen_conv = HashSet::new();
+    let mut hits: Vec<crate::storage::queries::MemoryRegistryRow> = Vec::new();
+    for item in items {
+        if !seen_conv.insert(item.conversation_id.clone()) {
+            continue;
+        }
+        let rows = storage.with_connection(|conn| {
+            crate::storage::queries::get_memory_registry_by_origin_session(
+                conn,
+                &item.conversation_id,
+            )
+        })?;
+        hits.extend(rows);
+    }
+
+    if hits.is_empty() {
+        return Ok(());
+    }
+
+    hits.sort_by_key(|row| {
+        let key = row
+            .modified_ts
+            .as_deref()
+            .and_then(crate::temporal::parse_timestamp)
+            .map(|dt| dt.timestamp())
+            .unwrap_or(row.file_mtime);
+        std::cmp::Reverse(key)
+    });
+    hits.truncate(3);
+
+    for row in &hits {
+        let mem_type = row.mem_type.as_deref().unwrap_or("unknown");
+        let description = sanitize_memory_description(row.description.as_deref().unwrap_or(""));
+        out.push_str(&format!(
+            "distilled into memory: {} ({}, {}) — {}\n",
+            row.slug, mem_type, row.project, description
+        ));
+    }
+
+    Ok(())
+}
+
+fn sanitize_memory_description(s: &str) -> String {
+    let flattened = s.replace(['\n', '\r'], " ");
+    crate::format::truncate_chars(&flattened, 200).to_string()
 }
 
 /// Format evidence items as: header, grouped-by-conversation body (in the
@@ -6086,6 +6153,159 @@ mod tests {
             "resolution and acceptance must be separate stages:\n{rendered}"
         );
         assert!(rendered.contains("below-threshold=1"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn why_rendered_receipt_appends_distilled_into_memory_line_on_origin_session_match() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let query = "why memory provenance hop surfaces distilled memory";
+        let query_vec = embeddings.embed_single(query).unwrap();
+        let conversation_id = "why-mem-conv";
+        let chunk = crate::import::ConversationChunk {
+            id: "why-mem-chunk".into(),
+            conversation_id: conversation_id.into(),
+            project_name: "claude-self-reflect".into(),
+            timestamp: "2026-08-19T00:00:00Z".into(),
+            content: "memory provenance hop surfaces distilled memory".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let mut engine = SearchEngine::new(query_vec.len());
+        storage.insert_chunk(&chunk, &query_vec).unwrap();
+        engine.insert_chunk(chunk.id.clone(), query_vec.clone());
+
+        storage
+            .with_transaction(|tx| {
+                crate::storage::queries::upsert_memory_registry_batch(
+                    tx,
+                    &[crate::storage::queries::MemoryRegistryRow {
+                        file_path: "/mem/why-hop-memory.md".into(),
+                        project: "proj-why-mem".into(),
+                        slug: "why-hop-memory".into(),
+                        description: Some("a description with\na newline and stuff".into()),
+                        mem_type: Some("reference".into()),
+                        origin_session_id: Some(conversation_id.into()),
+                        modified_ts: Some("2026-08-19T00:00:00Z".into()),
+                        file_mtime: 1_700_000_000,
+                        content_hash: "hash-why-hop".into(),
+                        links_json: "[]".into(),
+                        last_seen_scan: 1,
+                    }],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let rendered = why(
+            &storage,
+            &embeddings,
+            &Arc::new(RwLock::new(engine)),
+            query,
+            Some("claude-self-reflect"),
+            &crate::search::reinstatement::ReinstateConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let expected = "distilled into memory: why-hop-memory (reference, proj-why-mem) — a description with a newline and stuff";
+        assert!(
+            rendered.contains(expected),
+            "matching origin_session_id must append a sanitized memory line:\n{rendered}"
+        );
+        assert!(
+            rendered.find("distilled into memory").unwrap() > rendered.find("WHY:").unwrap(),
+            "memory line must appear after the WHY header:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn why_rendered_receipt_omits_memory_line_when_no_origin_session_matches() {
+        let storage_empty = Arc::new(Storage::open_memory().unwrap());
+        let storage_unrelated = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let query = "why memory provenance hop stays silent without a match";
+        let query_vec = embeddings.embed_single(query).unwrap();
+        let conversation_id = "why-mem-nomatch-conv";
+        let chunk = crate::import::ConversationChunk {
+            id: "why-mem-nomatch-chunk".into(),
+            conversation_id: conversation_id.into(),
+            project_name: "claude-self-reflect".into(),
+            timestamp: "2026-08-19T00:00:00Z".into(),
+            content: "memory provenance hop stays silent without a match".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+
+        let mut engine_empty = SearchEngine::new(query_vec.len());
+        storage_empty.insert_chunk(&chunk, &query_vec).unwrap();
+        engine_empty.insert_chunk(chunk.id.clone(), query_vec.clone());
+
+        let mut engine_unrelated = SearchEngine::new(query_vec.len());
+        storage_unrelated.insert_chunk(&chunk, &query_vec).unwrap();
+        engine_unrelated.insert_chunk(chunk.id.clone(), query_vec.clone());
+        storage_unrelated
+            .with_transaction(|tx| {
+                crate::storage::queries::upsert_memory_registry_batch(
+                    tx,
+                    &[crate::storage::queries::MemoryRegistryRow {
+                        file_path: "/mem/unrelated.md".into(),
+                        project: "proj-why-mem".into(),
+                        slug: "unrelated-memory".into(),
+                        description: Some("should not appear".into()),
+                        mem_type: Some("reference".into()),
+                        origin_session_id: Some("unrelated-session-id".into()),
+                        modified_ts: Some("2026-08-19T00:00:00Z".into()),
+                        file_mtime: 1_700_000_000,
+                        content_hash: "hash-unrelated".into(),
+                        links_json: "[]".into(),
+                        last_seen_scan: 1,
+                    }],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let cfg = crate::search::reinstatement::ReinstateConfig::default();
+        let rendered_empty = why(
+            &storage_empty,
+            &embeddings,
+            &Arc::new(RwLock::new(engine_empty)),
+            query,
+            Some("claude-self-reflect"),
+            &cfg,
+        )
+        .await
+        .unwrap();
+        let rendered_unrelated = why(
+            &storage_unrelated,
+            &embeddings,
+            &Arc::new(RwLock::new(engine_unrelated)),
+            query,
+            Some("claude-self-reflect"),
+            &cfg,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !rendered_empty.contains("distilled into memory"),
+            "zero memory_registry rows must leave csr_why output without a memory line:\n{rendered_empty}"
+        );
+        assert!(
+            !rendered_unrelated.contains("distilled into memory"),
+            "non-matching origin_session_id must leave csr_why output without a memory line:\n{rendered_unrelated}"
+        );
+        assert_eq!(
+            rendered_empty, rendered_unrelated,
+            "non-matching registry rows must keep output byte-identical to the empty-registry case"
+        );
     }
 
     /// The chain that a pairwise near-tie comparator gets wrong. Scores 0.90 /
