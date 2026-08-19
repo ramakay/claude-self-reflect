@@ -1,6 +1,6 @@
 //! Daemon module — background processing for progressive enrichment.
 //!
-//! Runs six background tasks:
+//! Runs seven background tasks:
 //! 1. File watcher (existing) — auto-import new JSONL files
 //! 2. Extraction loop (Layer 2) — V3 extraction on imported conversations
 //! 3. Narrator loop (Layer 3) — AI batch narrative generation (if API key set)
@@ -8,6 +8,7 @@
 //! 5. Dream loop (v10) — periodic `dream_cadence::dream_loop` cycle over the
 //!    witness ledger (see that module for cadence/persistence/cost-discipline)
 //! 6. Release-ancestry loop — precomputes deterministic TAD v2 episode labels
+//! 7. Memory registry loop — periodic metadata-only scan of native memory files (`~/.claude/projects/*/memory/*.md`) into `memory_registry`; never embeds or injects memory content
 
 pub mod consolidation;
 pub mod dream_cadence;
@@ -28,6 +29,14 @@ use crate::extraction;
 use crate::import;
 use crate::search::SearchEngine;
 use crate::storage::Storage;
+
+/// `CSR_NO_MEMORY_REGISTRY` kill switch — same "1"/"true" (case-insensitive) idiom
+/// as `crate::daemon::dream_cadence::dreaming_disabled`.
+pub fn memory_registry_disabled() -> bool {
+    std::env::var("CSR_NO_MEMORY_REGISTRY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 /// Configuration for the daemon loops.
 pub struct DaemonConfig {
@@ -329,6 +338,55 @@ impl Daemon {
         };
         tracing::info!("plans loop started (~/.claude/plans → source='plan' chunks)");
 
+        // Memory registry loop: every 30 minutes, scan <projects_root>/*/memory/*.md
+        // and upsert metadata-only rows into memory_registry. Never embeds or
+        // injects memory file bodies — scan_memory_dirs already enforces that.
+        let memory_registry_handle = {
+            let storage = self.storage.clone();
+            let projects_root = self.projects_dir.clone();
+            let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
+            tokio::spawn(async move {
+                if memory_registry_disabled() {
+                    tracing::info!("memory registry loop disabled via CSR_NO_MEMORY_REGISTRY");
+                    return;
+                }
+                loop {
+                    for _ in 0..180 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    let s = storage.clone();
+                    let projects_root = projects_root.clone();
+                    let permit = match heavy_work.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        match crate::import::memory_registry::scan_memory_dirs(&s, &projects_root) {
+                            Ok(stats) => tracing::debug!(
+                                files_seen = stats.files_seen,
+                                upserted = stats.upserted,
+                                deleted = stats.deleted,
+                                schema_misses = stats.schema_misses,
+                                "memory registry scanned"
+                            ),
+                            Err(e) => tracing::warn!("memory registry scan failed: {e}"),
+                        }
+                    })
+                    .await;
+                }
+            })
+        };
+        if !memory_registry_disabled() {
+            tracing::info!(
+                "memory registry loop started (<projects_root>/*/memory/*.md → memory_registry)"
+            );
+        }
+
         // Optional Codex rollout loop. It runs once immediately and then every
         // 30 minutes. Missing ~/.codex/sessions is deliberately silent, and the
         // directory is re-checked each cycle so a later installation is detected.
@@ -464,6 +522,9 @@ impl Daemon {
         let _ = plans_handle.await;
         // Same index-mutation contract as plans: never detach an in-flight import.
         let _ = codex_rollout_handle.await;
+        // Memory registry only upserts its own SQLite table transactionally —
+        // no HNSW mutation — so a timeout here cannot corrupt the search index.
+        let _ = tokio::time::timeout(timeout, memory_registry_handle).await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
         // The dream loop's tick awaits its `spawn_blocking` cycle directly
         // (see `dream_cadence::tick`) and checks the shutdown flag between
@@ -1256,6 +1317,24 @@ pub fn prompt_hash(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_registry_kill_switch_env() {
+        // Unique to this module — no cross-module env races — so no shared
+        // mutex. Keep all cases in one test so cargo's default parallel
+        // runners cannot interleave set_var/remove_var on this var.
+        std::env::remove_var("CSR_NO_MEMORY_REGISTRY");
+        assert!(!memory_registry_disabled());
+        std::env::set_var("CSR_NO_MEMORY_REGISTRY", "1");
+        assert!(memory_registry_disabled());
+        std::env::set_var("CSR_NO_MEMORY_REGISTRY", "true");
+        assert!(memory_registry_disabled());
+        std::env::set_var("CSR_NO_MEMORY_REGISTRY", "TRUE");
+        assert!(memory_registry_disabled());
+        std::env::set_var("CSR_NO_MEMORY_REGISTRY", "0");
+        assert!(!memory_registry_disabled());
+        std::env::remove_var("CSR_NO_MEMORY_REGISTRY");
+    }
 
     #[test]
     fn test_prompt_hash_deterministic() {
