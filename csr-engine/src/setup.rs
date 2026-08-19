@@ -73,6 +73,31 @@ pub async fn handle(
         }
     }
 
+    // Memory registry spine: one initial scan so setup doesn't leave the table empty
+    // until the daemon's first 30-min tick. Kill switch matches the daemon loop.
+    if !crate::daemon::memory_registry_disabled() {
+        let storage = eng.storage().clone();
+        let projects_root = projects_dir.to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            crate::import::memory_registry::scan_memory_dirs(&storage, &projects_root)
+        })
+        .await
+        {
+            Ok(Ok(stats)) => {
+                eprintln!(
+                    "  Memory registry: {} files scanned, {} upserted, {} schema misses",
+                    stats.files_seen, stats.upserted, stats.schema_misses
+                );
+            }
+            Ok(Err(e)) => {
+                eprintln!("  Warning: memory registry scan failed: {e}");
+            }
+            Err(e) => {
+                eprintln!("  Warning: memory registry scan failed: {e}");
+            }
+        }
+    }
+
     // Step 5: Run enrichment
     eprintln!("[5/7] Running heuristic enrichment...");
     let (backfilled, enriched) = eng.backfill_and_enrich().await?;
