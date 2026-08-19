@@ -17,6 +17,9 @@ use crate::storage::queries::{self, MemoryRegistryRow};
 use crate::storage::Storage;
 
 const META_SCAN_GENERATION: &str = "memory_registry_scan_generation";
+/// RFC3339 timestamp of the most recently completed scan. Read by
+/// `status::gather_memory_registry` to surface `memory_registry.last_scan_ts`.
+pub const META_LAST_SCAN_TS: &str = "memory_registry_last_scan_ts";
 /// Soft read cap — files larger than this are metadata-only schema-misses.
 const READ_CAP_BYTES: u64 = 262_144;
 
@@ -154,6 +157,7 @@ pub fn scan_memory_dirs(storage: &Storage, projects_root: &Path) -> Result<Memor
             META_SCAN_GENERATION,
             &current_scan_generation.to_string(),
         )?;
+        queries::set_meta(tx, META_LAST_SCAN_TS, &chrono::Utc::now().to_rfc3339())?;
         Ok(deleted)
     })?;
 

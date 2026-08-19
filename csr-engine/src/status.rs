@@ -37,6 +37,9 @@ pub struct StatusReport {
     pub mcp_binary_stale: bool,
     /// Aux corpus coverage (session_registry vs chunks) — never injected into search.
     pub aux: AuxStatus,
+    /// Native memory-file spine (`~/.claude/projects/*/memory/*.md`) — metadata
+    /// only; bodies are never embedded or injected. See `gather_memory_registry`.
+    pub memory_registry: MemoryRegistryStatus,
     /// v10 "dreaming" summary (`crate::dream`) — witness_verdicts totals and
     /// current demoted-symbol count. See `gather_dream`.
     pub dream: DreamStatus,
@@ -361,6 +364,18 @@ pub struct AuxStatus {
     pub sources: SourceCounts,
 }
 
+/// Native harness file-based memory spine (`~/.claude/projects/*/memory/*.md`) —
+/// metadata only, bodies are never embedded or injected. See
+/// `crate::import::memory_registry::scan_memory_dirs`.
+#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+pub struct MemoryRegistryStatus {
+    pub files: i64,
+    pub projects: i64,
+    pub with_origin_session: i64,
+    pub last_scan_ts: Option<String>,
+    pub schema_misses: i64,
+}
+
 #[derive(Serialize, Default)]
 pub struct EnrichmentBreakdown {
     pub heuristic_completed: usize,
@@ -450,6 +465,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             db_path: db_path.to_string_lossy().to_string(),
             healthy: false,
             aux: AuxStatus::default(),
+            memory_registry: MemoryRegistryStatus::default(),
             dream: DreamStatus::default(),
             dream_threads: DreamThreadStatus::default(),
         });
@@ -505,6 +521,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let aux = gather_aux(&storage, projects_dir);
     let dream = gather_dream(&storage);
     let dream_threads = gather_dream_threads(&storage);
+    let memory_registry = gather_memory_registry(&storage);
 
     Ok(StatusReport {
         mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
@@ -526,9 +543,56 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         db_path: db_path.to_string_lossy().to_string(),
         healthy,
         aux,
+        memory_registry,
         dream,
         dream_threads,
     })
+}
+
+/// Assemble the memory-registry status block. Fail-soft to defaults — must
+/// never fail on a pre-migration schema gap (mirrors `gather_dream_threads`).
+/// `schema_misses` reads the same `aux_schema_miss:memory_frontmatter` counter
+/// that `crate::import::memory_registry::scan_memory_dirs` bumps via
+/// `Storage::bump_aux_counter_by` — see that convention via `grep aux_schema_miss`.
+fn gather_memory_registry(storage: &Storage) -> MemoryRegistryStatus {
+    let (files, projects, with_origin_session) = storage
+        .with_connection(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT project),
+                        COALESCE(SUM(CASE WHEN origin_session_id IS NOT NULL THEN 1 ELSE 0 END), 0)
+                 FROM memory_registry",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(Into::into)
+        })
+        .unwrap_or((0, 0, 0));
+
+    let last_scan_ts = storage
+        .get_meta(crate::import::memory_registry::META_LAST_SCAN_TS)
+        .unwrap_or(None);
+
+    let schema_misses = storage
+        .get_aux_counters()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(source, _)| source == "memory_frontmatter")
+        .map(|(_, count)| count)
+        .unwrap_or(0);
+
+    MemoryRegistryStatus {
+        files,
+        projects,
+        with_origin_session,
+        last_scan_ts,
+        schema_misses,
+    }
 }
 
 /// Assemble the Journal v3 Phase 1.5 "dream threads" status block. Fail-soft
@@ -1203,6 +1267,7 @@ mod tests {
             db_path: "/tmp/test.db".to_string(),
             healthy: true,
             aux: AuxStatus::default(),
+            memory_registry: MemoryRegistryStatus::default(),
             dream: DreamStatus::default(),
             dream_threads: DreamThreadStatus::default(),
         }
@@ -1777,5 +1842,85 @@ mod tests {
         assert_eq!(dream.by_verdict.superseded, 0);
         assert_eq!(dream.by_verdict.reinstated, 0);
         assert_eq!(dream.demoted_symbols, 0);
+    }
+
+    #[test]
+    fn test_memory_registry_default_is_empty() {
+        let storage = Storage::open_memory().unwrap();
+        let status = gather_memory_registry(&storage);
+        assert_eq!(status.files, 0);
+        assert_eq!(status.projects, 0);
+        assert_eq!(status.with_origin_session, 0);
+        assert!(status.last_scan_ts.is_none());
+        assert_eq!(status.schema_misses, 0);
+
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let report = gather_status(
+            Path::new("/tmp/nonexistent-csr-memory-registry-test.db"),
+            Path::new("/tmp/nonexistent-projects"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.memory_registry, MemoryRegistryStatus::default());
+    }
+
+    #[test]
+    fn test_memory_registry_counts_from_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path().join("proj1").join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(
+            mem.join("reference_x.md"),
+            r#"---
+name: reference-email-sending-domain-dns
+description: "Email sending domain email.anukriti.ai — DNS legs"
+metadata:
+  node_type: memory
+  type: reference
+  originSessionId: 723f8a5e-341b-4e41-b2eb-dffd02ef440e
+  modified: 2026-08-19T15:05:51.330Z
+---
+Body text with a [[some-slug]] wikilink and more prose.
+"#,
+        )
+        .unwrap();
+
+        let storage = Storage::open_memory().unwrap();
+        let stats = crate::import::memory_registry::scan_memory_dirs(&storage, dir.path()).unwrap();
+        assert_eq!(stats.files_seen, 1);
+        assert_eq!(stats.schema_misses, 0);
+
+        let status = gather_memory_registry(&storage);
+        assert_eq!(status.files, 1);
+        assert_eq!(status.projects, 1);
+        assert_eq!(status.with_origin_session, 1);
+        assert!(
+            status
+                .last_scan_ts
+                .as_ref()
+                .is_some_and(|ts| !ts.is_empty()),
+            "last_scan_ts should be a non-empty RFC3339 string after scan"
+        );
+        assert_eq!(status.schema_misses, 0);
+    }
+
+    #[test]
+    fn test_memory_registry_schema_miss_reflected_in_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path().join("proj1").join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(
+            mem.join("plain_note.md"),
+            "Just plain text, no fences at all.\n",
+        )
+        .unwrap();
+
+        let storage = Storage::open_memory().unwrap();
+        let stats = crate::import::memory_registry::scan_memory_dirs(&storage, dir.path()).unwrap();
+        assert_eq!(stats.schema_misses, 1);
+
+        let status = gather_memory_registry(&storage);
+        assert_eq!(status.schema_misses, 1);
+        assert_eq!(status.files, 1);
     }
 }
