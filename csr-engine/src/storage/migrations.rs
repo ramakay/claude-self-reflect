@@ -1413,6 +1413,28 @@ pub fn run(conn: &Connection) -> Result<()> {
             ON dreams_v1(project, category, revision_hash);",
     )?;
 
+    // Memory registry (harness file-based memory spine — never embedded, never
+    // injected). One row per on-disk memory .md file; scanned by a later-stage
+    // importer. content_hash + file_mtime drive change detection; last_seen_scan
+    // enables project-scoped stale deletion without touching unscanned projects.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_registry (
+            file_path        TEXT PRIMARY KEY,
+            project           TEXT NOT NULL,
+            slug              TEXT NOT NULL,
+            description       TEXT,
+            mem_type          TEXT,
+            origin_session_id TEXT,
+            modified_ts       TEXT,
+            file_mtime        INTEGER NOT NULL,
+            content_hash      TEXT NOT NULL,
+            links_json        TEXT NOT NULL DEFAULT '[]',
+            last_seen_scan    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_registry_origin ON memory_registry(origin_session_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_registry_project ON memory_registry(project);",
+    )?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())

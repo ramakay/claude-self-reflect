@@ -2939,6 +2939,130 @@ pub fn known_session_ids(
     Ok(out)
 }
 
+// ─── Memory registry (harness file-based memory — never embedded / never injected) ───
+
+/// One memory_registry row to upsert. `file_path` is the stable primary key
+/// (absolute path to the .md file). All other fields are simply overwritten
+/// on conflict — unlike session_registry there is no earliest/latest merge
+/// logic, because a given file_path only ever describes one file: the most
+/// recent scan's read of it is authoritative.
+#[derive(Debug, Clone)]
+pub struct MemoryRegistryRow {
+    pub file_path: String,
+    pub project: String,
+    pub slug: String,
+    pub description: Option<String>,
+    pub mem_type: Option<String>,
+    pub origin_session_id: Option<String>,
+    pub modified_ts: Option<String>,
+    pub file_mtime: i64,
+    pub content_hash: String,
+    pub links_json: String,
+    pub last_seen_scan: i64,
+}
+
+/// Upsert memory_registry rows within an existing transaction. On conflict
+/// every field is overwritten from the incoming row — the latest scan is
+/// authoritative for a given file_path.
+///
+/// Does NOT open a new transaction — caller already holds one (see
+/// `Storage::with_transaction` for atomic upsert+stale-delete).
+pub fn upsert_memory_registry_batch(
+    conn: &Connection,
+    rows: &[MemoryRegistryRow],
+) -> Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare(
+        "INSERT INTO memory_registry (
+            file_path, project, slug, description, mem_type,
+            origin_session_id, modified_ts, file_mtime, content_hash,
+            links_json, last_seen_scan
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(file_path) DO UPDATE SET
+           project = excluded.project,
+           slug = excluded.slug,
+           description = excluded.description,
+           mem_type = excluded.mem_type,
+           origin_session_id = excluded.origin_session_id,
+           modified_ts = excluded.modified_ts,
+           file_mtime = excluded.file_mtime,
+           content_hash = excluded.content_hash,
+           links_json = excluded.links_json,
+           last_seen_scan = excluded.last_seen_scan",
+    )?;
+    for row in rows {
+        stmt.execute(params![
+            row.file_path,
+            row.project,
+            row.slug,
+            row.description,
+            row.mem_type,
+            row.origin_session_id,
+            row.modified_ts,
+            row.file_mtime,
+            row.content_hash,
+            row.links_json,
+            row.last_seen_scan,
+        ])?;
+    }
+    Ok(rows.len())
+}
+
+/// Delete memory_registry rows for `project` whose `last_seen_scan` is older
+/// than `current_scan_generation`. Scoped to ONE project per call by design —
+/// a project whose directory was unreadable during a scan pass must simply
+/// never have this function called for it that pass, so its rows are never
+/// touched (unreadable != deleted). This is how "never delete for unscanned
+/// projects" is enforced at the call-site level, not inside this function.
+pub fn delete_memory_registry_stale(
+    conn: &Connection,
+    project: &str,
+    current_scan_generation: i64,
+) -> Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM memory_registry WHERE project = ?1 AND last_seen_scan < ?2",
+        params![project, current_scan_generation],
+    )?;
+    Ok(deleted)
+}
+
+/// All memory_registry rows whose `origin_session_id` matches `session_id`.
+/// Lookup `csr_why` will use in a later stage.
+pub fn get_memory_registry_by_origin_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<MemoryRegistryRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT file_path, project, slug, description, mem_type,
+                origin_session_id, modified_ts, file_mtime, content_hash,
+                links_json, last_seen_scan
+         FROM memory_registry WHERE origin_session_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![session_id], |row| {
+        Ok(MemoryRegistryRow {
+            file_path: row.get(0)?,
+            project: row.get(1)?,
+            slug: row.get(2)?,
+            description: row.get(3)?,
+            mem_type: row.get(4)?,
+            origin_session_id: row.get(5)?,
+            modified_ts: row.get(6)?,
+            file_mtime: row.get(7)?,
+            content_hash: row.get(8)?,
+            links_json: row.get(9)?,
+            last_seen_scan: row.get(10)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3365,5 +3489,158 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, vec!["sess_b"]);
+    }
+
+    fn sample_memory_row(
+        file_path: &str,
+        project: &str,
+        slug: &str,
+        origin_session_id: Option<&str>,
+        last_seen_scan: i64,
+    ) -> MemoryRegistryRow {
+        MemoryRegistryRow {
+            file_path: file_path.into(),
+            project: project.into(),
+            slug: slug.into(),
+            description: Some(format!("desc-{slug}")),
+            mem_type: Some("user".into()),
+            origin_session_id: origin_session_id.map(str::to_string),
+            modified_ts: Some("2026-08-19T00:00:00Z".into()),
+            file_mtime: 1_700_000_000,
+            content_hash: format!("hash-{slug}"),
+            links_json: "[]".into(),
+            last_seen_scan,
+        }
+    }
+
+    #[test]
+    fn memory_registry_upsert_and_lookup_by_origin_session() {
+        let conn = mem();
+        upsert_memory_registry_batch(
+            &conn,
+            &[
+                sample_memory_row("/mem/a.md", "proj", "a", Some("sess-1"), 1),
+                sample_memory_row("/mem/b.md", "proj", "b", None, 1),
+            ],
+        )
+        .unwrap();
+
+        let hit = get_memory_registry_by_origin_session(&conn, "sess-1").unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].file_path, "/mem/a.md");
+        assert_eq!(hit[0].origin_session_id.as_deref(), Some("sess-1"));
+
+        let miss = get_memory_registry_by_origin_session(&conn, "sess-missing").unwrap();
+        assert!(miss.is_empty());
+    }
+
+    #[test]
+    fn memory_registry_upsert_on_conflict_overwrites_all_fields() {
+        let conn = mem();
+        upsert_memory_registry_batch(
+            &conn,
+            &[sample_memory_row(
+                "/mem/a.md",
+                "proj",
+                "first",
+                Some("s1"),
+                1,
+            )],
+        )
+        .unwrap();
+
+        let mut second = sample_memory_row("/mem/a.md", "proj", "second", Some("s2"), 9);
+        second.description = Some("updated-desc".into());
+        second.content_hash = "hash-updated".into();
+        upsert_memory_registry_batch(&conn, &[second.clone()]).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE file_path = '/mem/a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let rows = get_memory_registry_by_origin_session(&conn, "s2").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slug, "second");
+        assert_eq!(rows[0].description.as_deref(), Some("updated-desc"));
+        assert_eq!(rows[0].content_hash, "hash-updated");
+        assert_eq!(rows[0].last_seen_scan, 9);
+        assert!(get_memory_registry_by_origin_session(&conn, "s1")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn memory_registry_delete_stale_removes_only_lower_generation_same_project() {
+        let conn = mem();
+        upsert_memory_registry_batch(
+            &conn,
+            &[
+                sample_memory_row("/mem/gone.md", "proj-a", "gone", None, 1),
+                sample_memory_row("/mem/keep1.md", "proj-a", "keep1", None, 2),
+                sample_memory_row("/mem/keep2.md", "proj-a", "keep2", None, 2),
+            ],
+        )
+        .unwrap();
+
+        let deleted = delete_memory_registry_stale(&conn, "proj-a", 2).unwrap();
+        assert_eq!(deleted, 1);
+
+        let gone: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE file_path = '/mem/gone.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0);
+
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE project = 'proj-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 2);
+    }
+
+    #[test]
+    fn memory_registry_delete_stale_never_touches_other_projects() {
+        let conn = mem();
+        upsert_memory_registry_batch(
+            &conn,
+            &[
+                sample_memory_row("/mem/a.md", "proj-a", "a", None, 1),
+                sample_memory_row("/mem/b.md", "proj-b", "b", None, 1),
+            ],
+        )
+        .unwrap();
+
+        // Only proj-a was scanned this pass; proj-b was unreadable → never call
+        // delete_memory_registry_stale for it.
+        let deleted = delete_memory_registry_stale(&conn, "proj-a", 5).unwrap();
+        assert_eq!(deleted, 1);
+
+        let a: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE project = 'proj-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let b: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE project = 'proj-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
     }
 }
