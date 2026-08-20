@@ -45,6 +45,9 @@ minijinja = "2.22"
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
+# Client-side rmcp for the in-process MCP handshake test (Cargo unifies this with
+# the server feature set the main dependency enables).
+rmcp = { version = "3.1", features = ["client", "transport-async-rw"] }
 
 [[bench]]
 name = "spike_bench"
