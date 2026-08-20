@@ -422,6 +422,11 @@ impl SearchEngine {
 
         // Dump every non-empty index to a new generation. Neither fresh nor mmap-backed
         // indexes may overwrite files referenced by the currently committed manifest.
+        //
+        // The `!id_map.is_empty()` guard here is the authoritative "a generation exists"
+        // signal — `load_from_disk` MUST gate its load on the same persisted id map, not
+        // on the DB counts recorded below, or it can load a stale generation this dump
+        // never wrote. Keep the two in lockstep.
         let chunk_basename = if !self.chunk_id_map.is_empty() {
             dump_hnsw_generation(&self.chunk_index, dir, "chunks")
                 .map_err(|e| anyhow::anyhow!("chunk index dump failed: {}", e))?
@@ -538,7 +543,18 @@ impl SearchEngine {
 
         // Hnsw borrows its HnswIo mmap. Keep each allocation owned while loading so
         // failures can reclaim it; leak both only after both loads have succeeded.
-        let mut chunk_io = (manifest.chunk_embeddings_expected > 0)
+        //
+        // Gate the load on the SAME emptiness signal `dump_to_disk` used to decide
+        // whether it wrote a generation: the persisted id map, NOT the DB row count.
+        // `dump_to_disk` writes a generation pair iff `!chunk_id_map.is_empty()`, and
+        // serializes that exact map here. `chunk_embeddings_expected` is a DB count
+        // captured independently; under concurrent ingestion a dump can record a
+        // positive count while its in-memory id map was still empty, so no generation
+        // was written. Gating on the DB count would then load whatever legacy canonical
+        // `chunks.hnsw.*` files a prior generation left behind and map fresh ids onto
+        // those stale vectors. Gating on the id map treats that manifest as empty and
+        // rebuilds from the DB instead.
+        let mut chunk_io = (!manifest.chunk_id_map.is_empty())
             .then(|| PendingHnswIo::new(dir, &manifest.chunk_basename));
         let chunk_hnsw = if let Some(io) = chunk_io.as_mut() {
             match io.load() {
@@ -558,7 +574,9 @@ impl SearchEngine {
             )
         };
 
-        let mut refl_io = (manifest.reflection_embeddings_expected > 0)
+        // Same reasoning as the chunk index above: gate on the persisted id map, which
+        // is what `dump_to_disk` keyed the generation write on, not the DB count.
+        let mut refl_io = (!manifest.reflection_id_map.is_empty())
             .then(|| PendingHnswIo::new(dir, &manifest.reflection_basename));
         let refl_hnsw = if let Some(io) = refl_io.as_mut() {
             match io.load() {
@@ -886,6 +904,62 @@ mod tests {
         drop(data);
 
         assert!(SearchEngine::load_from_disk(dir, 1, 0).is_none());
+    }
+
+    #[test]
+    fn positive_count_without_a_generation_does_not_map_ids_onto_stale_files() {
+        // Regression: dump keys "a generation exists" on `!id_map.is_empty()`, but the
+        // manifest independently records a DB row count. Under concurrent ingestion a
+        // dump can commit a positive count while its in-memory id map was still empty,
+        // so no generation pair was written — only whatever legacy canonical
+        // `chunks.hnsw.*` files a prior generation left behind remain on disk. The
+        // loader must NOT resurrect those stale vectors and map fresh ids onto them; it
+        // must treat the index as empty and let the DB backfill rebuild it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Produce real, loadable canonical chunk files from a throwaway generation, so
+        // the buggy DB-count gate WOULD have loaded three stale vectors here.
+        let mut seeded = SearchEngine::new(10);
+        seeded.insert_chunk("stale0".into(), vec![0.1; 384]);
+        seeded.insert_chunk("stale1".into(), vec![0.2; 384]);
+        seeded.insert_chunk("stale2".into(), vec![0.3; 384]);
+        seeded.dump_to_disk(dir, 3, 0).unwrap();
+        let seeded_manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        for extension in [".hnsw.data", ".hnsw.graph"] {
+            std::fs::copy(
+                dir.join(format!("{}{extension}", seeded_manifest.chunk_basename)),
+                dir.join(format!("chunks{extension}")),
+            )
+            .unwrap();
+        }
+
+        // Rewrite the manifest to the bug shape: positive DB count, empty id map (no
+        // generation written for THIS manifest), basename pointing at the stale canonical
+        // files.
+        let manifest = IndexManifest {
+            version: MANIFEST_VERSION,
+            created_at: "2026-08-19T00:00:00Z".into(),
+            chunk_id_map: Vec::new(),
+            reflection_id_map: Vec::new(),
+            chunk_embeddings_expected: 3,
+            reflection_embeddings_expected: 0,
+            active_reflection_count: 0,
+            chunk_basename: default_chunk_basename(),
+            reflection_basename: default_reflection_basename(),
+        };
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = SearchEngine::load_from_disk(dir, 3, 0)
+            .expect("empty-map manifest loads as an empty index, not None");
+        // The stale canonical vectors must not have been mapped in.
+        assert!(loaded.chunk_id_map.is_empty());
+        assert_eq!(loaded.chunk_index.get_nb_point(), 0);
     }
 
     #[test]
