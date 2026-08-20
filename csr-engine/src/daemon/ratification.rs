@@ -130,6 +130,19 @@ fn ratification_model_candidates() -> Vec<Option<String>> {
 }
 
 async fn call_claude_for_acts(prompt: &str) -> Option<crate::narrative::ParsedNarrative> {
+    // The digest is embedded in `prompt`, so the extractor needs NO tools. Without
+    // an explicit empty MCP config this subprocess inherits the user's full MCP set
+    // and blows the context window on tool schemas alone (HTTP 400 prompt_too_long),
+    // failing every call before inference. See narrative::minimal_mcp_config.
+    let mcp_config_path = crate::narrative::minimal_mcp_config()
+        .inspect_err(|e| {
+            tracing::warn!(
+                "minimal MCP config unavailable; this call inherits the user's MCP set \
+                 and may fail with prompt_too_long: {e}"
+            )
+        })
+        .ok();
+
     for candidate in ratification_model_candidates() {
         let attempt = tokio::time::timeout(RATIFICATION_TIMEOUT, async {
             let mut cmd = tokio::process::Command::new("claude");
@@ -140,8 +153,14 @@ async fn call_claude_for_acts(prompt: &str) -> Option<crate::narrative::ParsedNa
             if let Some(model) = &candidate {
                 cmd.args(["--model", model]);
             }
+            cmd.args(["-p", "-", "--output-format", "json"]);
+            // Must come LAST: --mcp-config is variadic in the claude CLI and would
+            // consume any positional arg that followed it.
+            if let Some(path) = &mcp_config_path {
+                cmd.args(["--strict-mcp-config", "--mcp-config"]);
+                cmd.arg(path);
+            }
             let mut child = match cmd
-                .args(["-p", "-", "--output-format", "json"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .stdin(Stdio::piped())

@@ -814,6 +814,31 @@ function KnowledgeGraphCard() {
   )
 }
 
+function PullQuoteCard() {
+  return (
+    <BentoCard className="card--quote" delay={20}>
+      <CardKicker number="—" label="FROM A LIVE SESSION" />
+      <blockquote className="pull-quote">
+        <span className="pull-quote__mark" aria-hidden="true">&ldquo;</span>
+        <p className="pull-quote__text">Retrieval beat curation today.</p>
+        <footer className="pull-quote__footer">
+          <cite className="pull-quote__attribution">— Claude, comparing its own curated MEMORY.md against CSR in a live session</cite>
+        </footer>
+      </blockquote>
+      <p className="pull-quote__support type-caption">A hand-curated memory note answered with stale information; CSR's search over past conversations surfaced the current thread in about 20ms.</p>
+      <div className="pull-quote__receipts">
+        <p className="pull-quote__receipts-label">One session's ledger, misses included — not a benchmark</p>
+        <ul className="pull-quote__receipts-list">
+          <li><span className="pull-quote__receipts-metric">0.728 / ~20ms</span>a pre-compaction turn, retrieved after the session had compacted twice</li>
+          <li><span className="pull-quote__receipts-metric">0.78</span>a minutes-old message, retrieved after compaction</li>
+          <li><span className="pull-quote__receipts-metric">stale</span>MEMORY.md's hand-curated note; retrieval held the current thread</li>
+          <li><span className="pull-quote__receipts-metric">2 / 5</span>queries that session came back weak — flagged uncalibrated by the tool itself</li>
+        </ul>
+      </div>
+    </BentoCard>
+  )
+}
+
 function WhatsNewCard() {
   return (
     <BentoCard className="card--whatsnew" delay={560} id="whats-new">
@@ -1258,16 +1283,17 @@ export default function Landing() {
 
       <div className="hero-watermark" aria-hidden="true">
         <h1 className="hero-watermark__title">You or your agent don't have to remember any of this</h1>
-        <p className="hero-watermark__subtext">because Claude Code does.</p>
+        <p className="hero-watermark__subtext">because Claude Self-Reflect does.</p>
       </div>
 
       <main className="landing-main">
         <p className="type-dateline landing-dateline" style={{ opacity: datelineVisible ? 1 : 0 }}>
-          Claude Self-Reflect / v8.2 / Rust Engine / Local Memory Archive
+          Claude Self-Reflect / v9.5.2 / Rust Engine / Local Memory Archive
         </p>
 
         <section className="bento-grid" aria-label="Claude Self-Reflect overview">
           <ForgettingCard />
+          <PullQuoteCard />
           <BentoCard className="card--demo" delay={40}>
             <CardKicker number="—" label="SEE IT IN ACTION" />
             <h2 className="type-hl-md">The Demo</h2>
