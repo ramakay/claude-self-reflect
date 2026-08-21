@@ -5,6 +5,28 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.5.4] - 2026-08-20
+
+### Fixed
+
+- **HNSW cache no longer maps fresh ids onto stale vectors after a
+  no-generation dump.** Dump and load disagreed on the "is this index empty"
+  signal: `dump_to_disk` writes a generation pair (and records its basename)
+  only when the in-memory id map is non-empty, but `load_from_disk` decided
+  whether to load from `chunk_embeddings_expected` — a DB row count captured
+  independently. Under concurrent ingestion a dump can commit a positive count
+  while its id map is still empty, writing no generation; the loader then saw
+  the positive count, opened the manifest basename, and loaded whatever legacy
+  canonical `chunks.hnsw.*` files a prior generation left on disk — mapping
+  fresh ids onto stale vectors. The load now gates on the persisted id map (the
+  same signal dump keys the generation write on) for both the chunk and
+  reflection indexes, so a manifest with no generation loads empty and is
+  rebuilt from the DB. v1 manifests always carried a non-empty id map, so their
+  canonical-file loads are unaffected. Regression test: a manifest that claims a
+  positive count with an empty id map and only stale canonical files on disk
+  loads an empty index (`get_nb_point() == 0`), never the stale vectors.
+  (#296, 623f8de)
+
 ## [9.5.3] - 2026-08-18
 
 ### Fixed
