@@ -7,11 +7,13 @@
 //! 4. Exits with code 0 (never blocks the session)
 
 pub mod dream_match;
+pub mod exposure;
 pub mod install;
 pub mod intent;
 pub mod post_tool_use;
 pub mod precompact;
 pub mod prompt_submit;
+pub mod reaction;
 pub mod recap;
 pub mod session_briefing;
 pub mod session_end;

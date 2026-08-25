@@ -35,6 +35,11 @@ impl InjectionContext {
         formatter::format_with_budget(self, max_tokens)
     }
 
+    /// Format and return an exact receipt for items that survived the budget.
+    pub fn format_with_receipt(&self, max_tokens: usize) -> formatter::FormattedInjection {
+        formatter::format_with_budget_receipt(self, max_tokens)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.anti_patterns.is_empty()
             && self.error_matches.is_empty()

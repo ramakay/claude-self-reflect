@@ -26,6 +26,7 @@ use crate::injection::formatter;
 use crate::injection::predictor::{self, RawResult};
 use crate::injection::{InjectionContext, InjectionItem};
 use crate::search::cross_project::resolve_project_from_cwd;
+use crate::storage::trained_rerank::ExposureItem;
 use crate::temporal;
 
 /// Token budget for prompt-submit injection (larger than Stop hook's 300).
@@ -89,6 +90,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                 &age,
                 "the user asked to continue; the episode below is the work being resumed.",
             );
+            record_episode_exposure(input, engine, cwd, prompt, None, "continue", &ep, None);
         }
         return Ok(());
     }
@@ -118,6 +120,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             _ => return Ok(()), // Can't embed → nothing to inject
         }
     };
+    let mut classified_intent = "other";
 
     // correlate_episode is expensive (semantic search over reflections); the
     // Explore arm and Route B want the same result for the same prompt, so the
@@ -139,26 +142,49 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         if let Some((intent, _score)) = probes.classify(&query_vec) {
             match intent {
                 crate::hooks::intent::Intent::Continue => {
+                    classified_intent = "continue";
                     if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
                         emit_pickup(
                             &ep,
                             &age,
                             "the user asked to continue; the episode below is the work being resumed.",
                         );
+                        record_episode_exposure(
+                            input,
+                            engine,
+                            cwd,
+                            prompt,
+                            Some(&query_vec),
+                            classified_intent,
+                            &ep,
+                            None,
+                        );
                         return Ok(());
                     }
                 }
                 crate::hooks::intent::Intent::StateRecall => {
+                    classified_intent = "state_recall";
                     if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
                         emit_pickup(
                             &ep,
                             &age,
                             "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity).",
                         );
+                        record_episode_exposure(
+                            input,
+                            engine,
+                            cwd,
+                            prompt,
+                            Some(&query_vec),
+                            classified_intent,
+                            &ep,
+                            None,
+                        );
                         return Ok(());
                     }
                 }
                 crate::hooks::intent::Intent::Explore => {
+                    classified_intent = "explore";
                     // Exploration prompt: the user is asking WHERE code lives. The
                     // topic-matched episode (not the latest one) knows which files past
                     // work touched — hand those over instead of letting the agent
@@ -195,6 +221,16 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                     if let Some((ep, age, _score)) = &corr {
                         if let Some(map) = format_code_map(ep, age) {
                             println!("{}", map);
+                            record_episode_exposure(
+                                input,
+                                engine,
+                                cwd,
+                                prompt,
+                                Some(&query_vec),
+                                classified_intent,
+                                ep,
+                                None,
+                            );
                             return Ok(());
                         }
                     }
@@ -217,13 +253,36 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // anchor-overlap pointer below because a receipted conclusion outranks a
     // "was modified recently" pointer, and both are one line.
     if let Some(project) = resolve_project_from_cwd(&cwd.to_string_lossy()) {
-        if let Some(line) = crate::hooks::dream_match::injection_for_prompt(
+        if let Some((dream_id, line)) = crate::hooks::dream_match::injection_with_id_for_prompt(
             engine.storage(),
             &project,
             prompt,
             input.session_id.as_deref(),
         ) {
             println!("{line}");
+            super::exposure::record_impression(
+                engine.storage(),
+                input.session_id.as_deref(),
+                &project,
+                "prompt_submit",
+                Some(prompt),
+                Some(&query_vec),
+                classified_intent,
+                vec![ExposureItem {
+                    rank: 0,
+                    memory_id: dream_id,
+                    conversation_id: None,
+                    source_type: "dream".into(),
+                    baseline_score: None,
+                    cosine: None,
+                    recency: None,
+                    graph_proximity: None,
+                    author: None,
+                    is_scaffold: false,
+                    is_mechanic: false,
+                    supersedes: false,
+                }],
+            );
         }
     }
 
@@ -236,6 +295,29 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                 println!(
                     "CSR: `{}` was modified in a recent session — episode: csr_reflect_on_past(\"conv_{}\")",
                     name, sid
+                );
+                super::exposure::record_impression(
+                    engine.storage(),
+                    input.session_id.as_deref(),
+                    &project,
+                    "prompt_submit",
+                    Some(prompt),
+                    Some(&query_vec),
+                    classified_intent,
+                    vec![ExposureItem {
+                        rank: 0,
+                        memory_id: sid.clone(),
+                        conversation_id: Some(sid),
+                        source_type: "code_anchor".into(),
+                        baseline_score: None,
+                        cosine: None,
+                        recency: None,
+                        graph_proximity: Some(1.0),
+                        author: None,
+                        is_scaffold: false,
+                        is_mechanic: false,
+                        supersedes: false,
+                    }],
                 );
             }
         }
@@ -255,8 +337,31 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // 1. Search for anti-patterns (highest priority)
     // Anti-patterns use a modified query ("failed approach don't retry: ...") so keep separate embedding.
     // TODO: scope anti-patterns by project once outcome reflections carry project tags (Codex H-1)
-    let anti_patterns =
-        anti_pattern::find_anti_patterns(storage, embeddings, search, prompt, 0.5, 2).await;
+    let anti_matches =
+        anti_pattern::find_anti_pattern_matches(storage, embeddings, search, prompt, 0.5, 2).await;
+    let anti_exposures: Vec<Option<ExposureItem>> = anti_matches
+        .iter()
+        .map(|matched| {
+            Some(ExposureItem {
+                rank: -1,
+                memory_id: matched.memory_id.clone(),
+                conversation_id: None,
+                source_type: "anti_pattern".into(),
+                baseline_score: Some(f64::from(matched.item.score)),
+                cosine: Some(f64::from(matched.item.score)),
+                recency: None,
+                graph_proximity: None,
+                author: None,
+                is_scaffold: false,
+                is_mechanic: false,
+                supersedes: false,
+            })
+        })
+        .collect();
+    let anti_patterns = anti_matches
+        .into_iter()
+        .map(|matched| matched.item)
+        .collect();
 
     // Route B pickup: episode correlation. A content prompt may be re-asking
     // an already-solved problem or retelling past context from lossy human
@@ -277,8 +382,10 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             .await
         }
     };
+    let mut preface_exposures = Vec::new();
     if let Some((ep, age, score)) = correlated {
         print!("{}", format_semantic_pickup(&ep, &age, score));
+        preface_exposures.push(episode_exposure_item(&ep, Some(f64::from(score))));
     }
 
     // 2. Search chunks (past conversations) — scoped to current project
@@ -359,6 +466,14 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         }
     }
 
+    if let Some(trained) = crate::search::trained_rerank::rerank_prompt_with_latest(
+        storage,
+        &scored,
+        classified_intent,
+    ) {
+        scored = trained;
+    }
+
     // 5. Session-aware review context (v9: code evolution + consolidated facts)
     let mut review_items: Vec<InjectionItem> = Vec::new();
 
@@ -384,12 +499,27 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // 5c. Code graph slice (v9.4) — capped relevant_context item within the
     // existing PROMPT_TOKEN_BUDGET (Codex #5: no separate budget). Surfaces the
     // 1-hop neighborhood of files/symbols named in the prompt, with provenance.
-    for slice in build_graph_slices(storage, prompt, &current_files, &current_project) {
+    let mut review_exposures = vec![None; review_items.len()];
+    for slice in build_graph_slices_with_ids(storage, prompt, &current_files, &current_project) {
         review_items.push(InjectionItem {
-            content: slice,
+            content: slice.content,
             score: 0.88,
             source: "code_graph".into(),
         });
+        review_exposures.push(Some(ExposureItem {
+            rank: -1,
+            memory_id: slice.memory_id,
+            conversation_id: None,
+            source_type: "code_graph".into(),
+            baseline_score: Some(0.88),
+            cosine: None,
+            recency: None,
+            graph_proximity: Some(1.0),
+            author: None,
+            is_scaffold: false,
+            is_mechanic: false,
+            supersedes: false,
+        }));
     }
 
     // 6. Build InjectionContext
@@ -401,8 +531,9 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
 
     // Content-based dedup: skip items whose first 200 chars overlap with already-seen items
     let mut seen_prefixes: HashSet<String> = HashSet::new();
-    // Track which memory IDs were actually injected (for TAD logging accuracy)
-    let mut injected_memory_ids: Vec<(String, String)> = Vec::new(); // (id, source)
+    // Parallel metadata is kept separate from formatter content. Its indexes
+    // are reconciled against the formatter receipt after budget truncation.
+    let mut winning_exposures: Vec<Option<ExposureItem>> = Vec::new();
 
     // Distribute scored results into context categories.
     // Skip anti_patterns here — they're already loaded from find_anti_patterns() above.
@@ -424,11 +555,6 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             continue;
         }
 
-        // Track this item as actually injected
-        if let Some(ref id) = result.memory_id {
-            injected_memory_ids.push((id.clone(), result.source.clone()));
-        }
-
         let item = InjectionItem {
             content: result.content.clone(),
             score: result.final_score,
@@ -436,30 +562,57 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         };
 
         ctx.winning_strategies.push(item);
+        winning_exposures.push(scored_exposure_item(result));
     }
 
     if ctx.is_empty() {
+        record_prompt_exposure(
+            input,
+            engine,
+            cwd,
+            prompt,
+            &query_vec,
+            classified_intent,
+            preface_exposures,
+        );
         return Ok(());
     }
 
-    let formatted = ctx.format(PROMPT_TOKEN_BUDGET);
-    if !formatted.is_empty() {
+    let formatted = ctx.format_with_receipt(PROMPT_TOKEN_BUDGET);
+    if !formatted.text.is_empty() {
         // stdout injection: Claude Code prepends this to the system prompt.
         // Uses print! (not println!) to avoid double-newline — formatter output ends with \n.
-        print!("{}", formatted);
+        print!("{}", formatted.text);
     }
+
+    let rendered_exposures = super::exposure::rendered_exposure_items(
+        &formatted,
+        &anti_exposures,
+        &review_exposures,
+        &winning_exposures,
+    );
 
     // TAD: Log retrieval events only for actually-injected items (not filtered-out ones)
     if let Some(ref session_id) = input.session_id {
-        for (memory_id, source) in &injected_memory_ids {
+        for item in &rendered_exposures {
             let _ = engine.storage().log_retrieval_event(
-                memory_id,
-                source,
+                &item.memory_id,
+                &item.source_type,
                 "prompt_submit",
                 session_id,
             );
         }
     }
+    preface_exposures.extend(rendered_exposures);
+    record_prompt_exposure(
+        input,
+        engine,
+        cwd,
+        prompt,
+        &query_vec,
+        classified_intent,
+        preface_exposures,
+    );
 
     // Structured log to stderr (not visible to Claude, only to debug logs)
     let anti_count = ctx.anti_patterns.len();
@@ -477,11 +630,112 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         prompt,
         total,
         anti_count,
-        formatted.len(),
+        formatted.text.len(),
         &scored,
     );
 
     Ok(())
+}
+
+fn episode_exposure_item(
+    episode: &crate::hooks::stop::Episode,
+    score: Option<f64>,
+) -> ExposureItem {
+    ExposureItem {
+        rank: -1,
+        memory_id: episode.session_id.clone(),
+        conversation_id: Some(episode.session_id.clone()),
+        source_type: "episode".into(),
+        baseline_score: score,
+        cosine: score,
+        recency: None,
+        graph_proximity: None,
+        author: None,
+        is_scaffold: false,
+        is_mechanic: false,
+        supersedes: false,
+    }
+}
+
+fn scored_exposure_item(result: &predictor::ScoredResult) -> Option<ExposureItem> {
+    let memory_id = result.memory_id.clone()?;
+    let recency = result.signals.iter().find_map(|signal| match signal {
+        predictor::Signal::RecencyBoost(value) => Some(f64::from(*value)),
+        _ => None,
+    });
+    Some(ExposureItem {
+        rank: -1,
+        memory_id,
+        conversation_id: result.conversation_id.clone(),
+        source_type: result.source.clone(),
+        baseline_score: Some(f64::from(result.final_score)),
+        cosine: Some(f64::from(result.raw_score)),
+        recency,
+        graph_proximity: None,
+        author: result
+            .author
+            .map(|author| match author {
+                crate::provenance::Speaker::User => "user",
+                crate::provenance::Speaker::Assistant => "assistant",
+                crate::provenance::Speaker::ToolResult => "tool_result",
+            })
+            .map(str::to_string),
+        is_scaffold: crate::search::rerank::is_scaffold_text(&result.content),
+        is_mechanic: crate::search::rerank::is_mechanic_text(&result.content),
+        supersedes: false,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_prompt_exposure(
+    input: &HookInput,
+    engine: &Engine,
+    cwd: &Path,
+    prompt: &str,
+    query_vec: &[f32],
+    intent: &str,
+    mut items: Vec<ExposureItem>,
+) {
+    let mut seen = HashSet::new();
+    items.retain(|item| seen.insert((item.memory_id.clone(), item.source_type.clone())));
+    for (rank, item) in items.iter_mut().enumerate() {
+        item.rank = rank as i64;
+    }
+    let project = resolve_project_from_cwd(&cwd.to_string_lossy()).unwrap_or_default();
+    super::exposure::record_impression(
+        engine.storage(),
+        input.session_id.as_deref(),
+        &project,
+        "prompt_submit",
+        Some(prompt),
+        Some(query_vec),
+        intent,
+        items,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_episode_exposure(
+    input: &HookInput,
+    engine: &Engine,
+    cwd: &Path,
+    prompt: &str,
+    query_vec: Option<&[f32]>,
+    intent: &str,
+    episode: &crate::hooks::stop::Episode,
+    score: Option<f64>,
+) {
+    let project = resolve_project_from_cwd(&cwd.to_string_lossy()).unwrap_or_default();
+    super::exposure::record_impression(
+        engine.storage(),
+        input.session_id.as_deref(),
+        &project,
+        "prompt_submit",
+        Some(prompt),
+        query_vec,
+        intent,
+        vec![episode_exposure_item(episode, score)],
+    );
 }
 
 fn ancestry_releases_for_prompt(
@@ -789,7 +1043,9 @@ async fn search_chunks_with_vec(
     let now = chrono::Utc::now();
     let mut raw_results = Vec::new();
     for result in &results {
-        if let Ok(chunks) = storage.get_chunks_by_ids(std::slice::from_ref(&result.id)) {
+        if let Ok(chunks) =
+            storage.get_chunks_by_ids_with_provenance(std::slice::from_ref(&result.id))
+        {
             if let Some(chunk) = chunks.into_iter().next() {
                 // Project scope filter: skip chunks from other projects
                 if !project.is_empty() && chunk.project_name != project {
@@ -816,6 +1072,7 @@ async fn search_chunks_with_vec(
                     tags: vec![],
                     conversation_id: Some(chunk.conversation_id),
                     memory_id: Some(result.id.clone()),
+                    author: Some(chunk.author),
                 });
             }
         }
@@ -879,6 +1136,7 @@ async fn search_reflections_with_vec(
                 tags,
                 conversation_id: None,
                 memory_id: Some(result.id.clone()),
+                author: Some(crate::provenance::Speaker::ToolResult),
             });
         }
     }
@@ -1025,6 +1283,23 @@ pub(crate) fn build_graph_slices(
     current_files: &[String],
     project: &str,
 ) -> Vec<String> {
+    build_graph_slices_with_ids(storage, prompt, current_files, project)
+        .into_iter()
+        .map(|slice| slice.content)
+        .collect()
+}
+
+struct TrackedGraphSlice {
+    memory_id: String,
+    content: String,
+}
+
+fn build_graph_slices_with_ids(
+    storage: &crate::storage::Storage,
+    prompt: &str,
+    current_files: &[String],
+    project: &str,
+) -> Vec<TrackedGraphSlice> {
     let mut slices = Vec::new();
 
     // File-anchored slice: symbols + callers of files named in the prompt.
@@ -1050,7 +1325,10 @@ pub(crate) fn build_graph_slices(
                 if !callers.is_empty() {
                     line.push_str(&format!(" · callers: {}", callers.join(", ")));
                 }
-                slices.push(formatter::truncate_item(&line, 280));
+                slices.push(TrackedGraphSlice {
+                    memory_id: ledger.symbols[0].id.clone(),
+                    content: formatter::truncate_item(&line, 280),
+                });
             }
         }
     }
@@ -1112,7 +1390,10 @@ pub(crate) fn build_graph_slices(
                 unverified_names.join(", ")
             )
         };
-        slices.push(formatter::truncate_item(&line, 280));
+        slices.push(TrackedGraphSlice {
+            memory_id: node.id,
+            content: formatter::truncate_item(&line, 280),
+        });
         break; // one symbol slice is enough for the budget
     }
 

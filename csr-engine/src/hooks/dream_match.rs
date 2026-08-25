@@ -72,6 +72,17 @@ pub fn injection_for_prompt(
     prompt: &str,
     session_id: Option<&str>,
 ) -> Option<String> {
+    injection_with_id_for_prompt(storage, project, prompt, session_id).map(|(_, line)| line)
+}
+
+/// Same delivery claim as [`injection_for_prompt`], retaining the stable
+/// dream ID so exposure telemetry can record exactly what was shown.
+pub fn injection_with_id_for_prompt(
+    storage: &Storage,
+    project: &str,
+    prompt: &str,
+    session_id: Option<&str>,
+) -> Option<(String, String)> {
     if injection_disabled() || dream_consumption_mode() == ConsumptionMode::Off {
         return None;
     }
@@ -108,7 +119,7 @@ pub fn injection_for_prompt(
             DeliveryChannel::Prompt,
             session_id,
         ) {
-            return Some(format_line(headline, token));
+            return Some((headline.id.clone(), format_line(headline, token)));
         }
     }
     None

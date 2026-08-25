@@ -9,6 +9,7 @@ pub mod dream_report;
 pub mod migrations;
 pub mod queries;
 pub mod recap_feeds;
+pub mod trained_rerank;
 pub mod usage_reservation;
 pub mod witness_ledger;
 pub mod witness_verdicts;

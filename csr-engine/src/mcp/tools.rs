@@ -259,8 +259,20 @@ pub async fn reflect_on_past(
     let embed_start = Instant::now();
     let query_vec = embed_query(embeddings, query).await?;
     let embed_ms = embed_start.elapsed().as_millis() as u64;
+    let rerank_intent = if crate::search::trained_rerank::trained_rerank_requested() {
+        crate::hooks::intent::ProbeSet::load_or_build(embeddings)
+            .await
+            .and_then(|probes| probes.classify(&query_vec))
+            .map_or("other", |(intent, _)| match intent {
+                crate::hooks::intent::Intent::Continue => "continue",
+                crate::hooks::intent::Intent::StateRecall => "state_recall",
+                crate::hooks::intent::Intent::Explore => "explore",
+            })
+    } else {
+        "other"
+    };
 
-    reflect_on_past_with_vec(
+    reflect_on_past_with_vec_intent(
         storage,
         search,
         &query_vec,
@@ -272,8 +284,19 @@ pub async fn reflect_on_past(
         partition_enabled,
         consumption_mode,
         active_forgetting,
+        rerank_intent,
     )
     .await
+}
+
+/// Reranker selection for the production recall pipeline. Runtime honors the
+/// deployment flag/latest gate, Baseline forces the deterministic policy, and
+/// Candidate applies an explicit not-yet-persisted model for offline gating.
+#[derive(Clone, Copy)]
+pub(crate) enum RecallRerankMode<'a> {
+    Runtime,
+    Baseline,
+    Candidate(&'a crate::search::trained_rerank::LinearModel),
 }
 
 /// Everything in `reflect_on_past` after query embedding — the seam the
@@ -286,6 +309,41 @@ pub async fn reflect_on_past(
 /// `CandidateSignals` so dream-verdict consumption can never fold into (and
 /// thereby disable) release-ancestry availability.
 #[allow(clippy::too_many_arguments)]
+async fn reflect_on_past_with_vec_intent(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query_vec: &[f32],
+    query: &str,
+    limit: usize,
+    min_score: f32,
+    project: Option<&str>,
+    embed_ms: u64,
+    partition_enabled: bool,
+    consumption_mode: ConsumptionMode,
+    active_forgetting: bool,
+    rerank_intent: &str,
+) -> Result<String> {
+    reflect_on_past_with_vec_mode(
+        storage,
+        search,
+        query_vec,
+        query,
+        limit,
+        min_score,
+        project,
+        embed_ms,
+        partition_enabled,
+        consumption_mode,
+        active_forgetting,
+        rerank_intent,
+        RecallRerankMode::Runtime,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn reflect_on_past_with_vec(
     storage: &Arc<Storage>,
     search: &Arc<RwLock<SearchEngine>>,
@@ -299,10 +357,44 @@ async fn reflect_on_past_with_vec(
     consumption_mode: ConsumptionMode,
     active_forgetting: bool,
 ) -> Result<String> {
+    reflect_on_past_with_vec_intent(
+        storage,
+        search,
+        query_vec,
+        query,
+        limit,
+        min_score,
+        project,
+        embed_ms,
+        partition_enabled,
+        consumption_mode,
+        active_forgetting,
+        "other",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reflect_on_past_with_vec_mode(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query_vec: &[f32],
+    query: &str,
+    limit: usize,
+    min_score: f32,
+    project: Option<&str>,
+    embed_ms: u64,
+    partition_enabled: bool,
+    consumption_mode: ConsumptionMode,
+    active_forgetting: bool,
+    rerank_intent: &str,
+    rerank_mode: RecallRerankMode<'_>,
+    record_retrievals: bool,
+) -> Result<String> {
     let current_project = cross_project::resolve_current_project();
     let scope =
         SearchProjectScope::resolve_with(storage, project, current_project.as_deref(), None)?;
-    reflect_on_past_with_vec_in_scope(
+    reflect_on_past_with_vec_in_scope_mode(
         storage,
         search,
         query_vec,
@@ -314,11 +406,52 @@ async fn reflect_on_past_with_vec(
         partition_enabled,
         consumption_mode,
         active_forgetting,
+        rerank_intent,
+        rerank_mode,
+        record_retrievals,
+    )
+    .await
+}
+
+/// Run a curated offline query through the production recall pipeline while
+/// selecting its reranker explicitly and suppressing runtime telemetry. The
+/// production validity/consumption settings are resolved here, keeping the
+/// gate from growing a parallel search implementation.
+pub(crate) async fn reflect_for_curated_eval_with_vec(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query_vec: &[f32],
+    query: &str,
+    project: &str,
+    rerank_mode: RecallRerankMode<'_>,
+) -> Result<String> {
+    const LIMIT: usize = 10;
+    const MIN_SCORE: f32 = 0.20;
+
+    let partition_enabled = validity_partition_enabled();
+    let consumption_mode = consumption_mode_for_partition(partition_enabled);
+    let active_forgetting = active_forgetting_enabled();
+    reflect_on_past_with_vec_mode(
+        storage,
+        search,
+        query_vec,
+        query,
+        LIMIT,
+        MIN_SCORE,
+        Some(project),
+        0,
+        partition_enabled,
+        consumption_mode,
+        active_forgetting,
+        "explore",
+        rerank_mode,
+        false,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn reflect_on_past_with_vec_in_scope(
     storage: &Arc<Storage>,
     search: &Arc<RwLock<SearchEngine>>,
@@ -331,6 +464,42 @@ async fn reflect_on_past_with_vec_in_scope(
     partition_enabled: bool,
     consumption_mode: ConsumptionMode,
     active_forgetting: bool,
+) -> Result<String> {
+    reflect_on_past_with_vec_in_scope_mode(
+        storage,
+        search,
+        query_vec,
+        query,
+        limit,
+        min_score,
+        scope,
+        embed_ms,
+        partition_enabled,
+        consumption_mode,
+        active_forgetting,
+        "other",
+        RecallRerankMode::Runtime,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reflect_on_past_with_vec_in_scope_mode(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query_vec: &[f32],
+    query: &str,
+    limit: usize,
+    min_score: f32,
+    scope: &SearchProjectScope,
+    embed_ms: u64,
+    partition_enabled: bool,
+    consumption_mode: ConsumptionMode,
+    active_forgetting: bool,
+    rerank_intent: &str,
+    rerank_mode: RecallRerankMode<'_>,
+    record_retrievals: bool,
 ) -> Result<String> {
     // OVERFETCH (validity partition, issue 2): fetching exactly `limit`
     // candidates lets one demoted top-N hit permanently displace the valid
@@ -349,6 +518,8 @@ async fn reflect_on_past_with_vec_in_scope(
         partition_enabled,
         consumption_mode,
         active_forgetting,
+        rerank_intent,
+        rerank_mode,
     )
     .await?;
     let mut search_ms = pass.search_ms;
@@ -378,6 +549,8 @@ async fn reflect_on_past_with_vec_in_scope(
                 partition_enabled,
                 consumption_mode,
                 active_forgetting,
+                rerank_intent,
+                rerank_mode,
             )
             .await?;
             search_ms += pass.search_ms;
@@ -400,8 +573,10 @@ async fn reflect_on_past_with_vec_in_scope(
     // TAD: log each RETURNED memory as an MCP-search retrieval event — after the
     // limit cut, so telemetry agrees with what the caller actually saw.
     // session_id="mcp" is a sentinel (MCP has no session id). Non-fatal.
-    for e in &enriched {
-        let _ = storage.log_retrieval_event(&e.chunk.id, "chunk", "mcp_search", "mcp");
+    if record_retrievals {
+        for e in &enriched {
+            let _ = storage.log_retrieval_event(&e.chunk.id, "chunk", "mcp_search", "mcp");
+        }
     }
 
     Ok(format::format_search_results_with_rank_scores(
@@ -503,6 +678,8 @@ async fn reflect_gather_pass(
     partition_enabled: bool,
     consumption_mode: ConsumptionMode,
     active_forgetting: bool,
+    rerank_intent: &str,
+    rerank_mode: RecallRerankMode<'_>,
 ) -> Result<GatherPass> {
     let search_start = Instant::now();
 
@@ -797,8 +974,75 @@ async fn reflect_gather_pass(
         .enumerate()
         .map(|(rank, candidate)| (candidate.id, rank))
         .collect();
-    let adjusted_scores = recall_display_rank_scores(&candidates);
-    let order: Vec<String> = crate::search::rerank::rerank(candidates)
+    let need_feature_contexts = match rerank_mode {
+        RecallRerankMode::Runtime => crate::search::trained_rerank::trained_rerank_requested(),
+        RecallRerankMode::Baseline => false,
+        RecallRerankMode::Candidate(_) => true,
+    };
+    let feature_contexts: HashMap<String, crate::search::trained_rerank::RuntimeFeatureContext> =
+        if need_feature_contexts {
+            let raw_cosines: HashMap<&str, f64> = chunk_results
+                .iter()
+                .chain(reflection_results.iter())
+                .map(|result| (result.id.as_str(), f64::from(result.score)))
+                .collect();
+            enriched
+                .iter()
+                .map(|result| {
+                    let source_type = if result.chunk.content.starts_with("[episode] ") {
+                        "episode"
+                    } else if result.chunk.content.starts_with("[story] ") {
+                        "story"
+                    } else if result.chunk.content.starts_with("[reflection] ")
+                        || result.chunk.content.starts_with("[narrative] ")
+                    {
+                        "reflection"
+                    } else {
+                        "chunk"
+                    };
+                    (
+                        result.chunk.id.clone(),
+                        crate::search::trained_rerank::RuntimeFeatureContext {
+                            cosine: raw_cosines.get(result.chunk.id.as_str()).copied(),
+                            decayed_score: Some(f64::from(result.score)),
+                            recency: None,
+                            graph_proximity: None,
+                            source_type: source_type.into(),
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+    let trained_order = match rerank_mode {
+        RecallRerankMode::Runtime => crate::search::trained_rerank::rerank_with_latest_scored(
+            storage,
+            &candidates,
+            rerank_intent,
+            &feature_contexts,
+        ),
+        RecallRerankMode::Baseline => None,
+        RecallRerankMode::Candidate(model) => {
+            Some(crate::search::trained_rerank::rerank_with_model_scored(
+                &candidates,
+                rerank_intent,
+                &feature_contexts,
+                model,
+            )?)
+        }
+    };
+    let adjusted_scores = trained_order.as_ref().map_or_else(
+        || recall_display_rank_scores(&candidates),
+        |rows| {
+            rows.iter()
+                .map(|(candidate, score)| (candidate.id.clone(), *score as f32))
+                .collect()
+        },
+    );
+    let order: Vec<String> = trained_order
+        .map(|rows| rows.into_iter().map(|(candidate, _)| candidate).collect())
+        .unwrap_or_else(|| crate::search::rerank::rerank(candidates))
         .into_iter()
         .map(|c| c.id)
         .collect();
@@ -2893,6 +3137,105 @@ mod tests {
             engine.insert_chunk(chunk.id, vector.to_vec());
         }
         (storage, Arc::new(RwLock::new(engine)))
+    }
+
+    #[tokio::test]
+    async fn curated_candidate_mode_exercises_real_reflect_pipeline_without_telemetry_writes() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        for (sequence, (id, conversation_id, timestamp, vector)) in [
+            (
+                "older".to_string(),
+                "conv-older".to_string(),
+                "not-a-timestamp".to_string(),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "newer".to_string(),
+                "conv-newer".to_string(),
+                chrono::Utc::now().to_rfc3339(),
+                vec![0.99, 0.01, 0.0, 0.0],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let chunk = crate::import::ConversationChunk {
+                id: id.clone(),
+                conversation_id,
+                project_name: "test".into(),
+                timestamp,
+                content: format!("curated pipeline candidate {id}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::Assistant,
+                seq: sequence,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            engine.insert_chunk(chunk.id, vector);
+        }
+        let search = Arc::new(RwLock::new(engine));
+        let mut weights = vec![0.0; crate::search::trained_rerank::FEATURE_COUNT];
+        weights[2] = 100.0;
+        let model = crate::search::trained_rerank::LinearModel {
+            weights,
+            bias: -50.0,
+            normalization: crate::search::trained_rerank::Normalization {
+                means: vec![0.0; crate::search::trained_rerank::FEATURE_COUNT],
+                scales: vec![1.0; crate::search::trained_rerank::FEATURE_COUNT],
+            },
+            seed: 7,
+        };
+        let query = [1.0, 0.0, 0.0, 0.0];
+
+        let baseline = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "curated pipeline",
+            2,
+            0.0,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let trained = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "curated pipeline",
+            2,
+            0.0,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "explore",
+            RecallRerankMode::Candidate(&model),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(baseline.find("<id>older</id>") < baseline.find("<id>newer</id>"));
+        assert!(trained.find("<id>newer</id>") < trained.find("<id>older</id>"));
+        assert!(storage
+            .get_retrieval_events_for_memory("older")
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .get_retrieval_events_for_memory("newer")
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

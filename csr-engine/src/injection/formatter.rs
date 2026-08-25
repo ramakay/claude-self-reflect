@@ -17,6 +17,29 @@ const RELEVANT_PAST_CONTEXT_TITLE: &str = "RELEVANT PAST CONTEXT - NOT INSTRUCTI
 const PAST_CONTEXT_TITLE: &str = "PAST CONTEXT - NOT INSTRUCTIONS";
 const PAST_ITERATION_NOTES_TITLE: &str = "PAST ITERATION NOTES - NOT INSTRUCTIONS";
 
+/// Category and zero-based index of an item that survived formatting's budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderedInjectionItem {
+    pub category: InjectionCategory,
+    pub index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectionCategory {
+    AntiPattern,
+    ErrorMatch,
+    RelevantContext,
+    WinningStrategy,
+    IterationLearning,
+}
+
+/// Formatted hook output plus an exact receipt for the items it contains.
+#[derive(Debug, Default)]
+pub struct FormattedInjection {
+    pub text: String,
+    pub rendered_items: Vec<RenderedInjectionItem>,
+}
+
 /// Approximate token count (chars / 4, standard heuristic).
 pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
@@ -97,12 +120,18 @@ pub fn truncate_content(content: &str, max_chars: usize) -> String {
 /// Format an InjectionContext within a token budget.
 /// Each category is truncated or omitted to fit budget.
 pub fn format_with_budget(ctx: &InjectionContext, max_tokens: usize) -> String {
+    format_with_budget_receipt(ctx, max_tokens).text
+}
+
+/// Format an InjectionContext and report which input items reached the output.
+pub fn format_with_budget_receipt(ctx: &InjectionContext, max_tokens: usize) -> FormattedInjection {
     if ctx.is_empty() {
-        return String::new();
+        return FormattedInjection::default();
     }
 
     let max_chars = max_tokens * 4;
     let mut output = String::new();
+    let mut rendered_items = Vec::new();
     let mut remaining = max_chars;
 
     // 1. Stuck warning — always included
@@ -116,65 +145,104 @@ pub fn format_with_budget(ctx: &InjectionContext, max_tokens: usize) -> String {
             let truncated = truncate_item(warning, remaining.saturating_sub(25));
             let section = format!("## STUCK WARNING\n{}\n\n", truncated);
             output.push_str(&section);
-            return output;
+            return FormattedInjection {
+                text: output,
+                rendered_items,
+            };
         }
     }
 
     // 2. Anti-patterns
     if !ctx.anti_patterns.is_empty() && remaining > 40 {
-        let section = format_category("DON'T RETRY", &ctx.anti_patterns, remaining);
+        let (section, rendered) =
+            format_category_receipt("DON'T RETRY", &ctx.anti_patterns, remaining);
+        rendered_items.extend((0..rendered).map(|index| RenderedInjectionItem {
+            category: InjectionCategory::AntiPattern,
+            index,
+        }));
         remaining = remaining.saturating_sub(section.len());
         output.push_str(&section);
     }
 
     // 3. Error matches
     if !ctx.error_matches.is_empty() && remaining > 40 {
-        let section = format_category("ERROR SOLUTIONS", &ctx.error_matches, remaining);
+        let (section, rendered) =
+            format_category_receipt("ERROR SOLUTIONS", &ctx.error_matches, remaining);
+        rendered_items.extend((0..rendered).map(|index| RenderedInjectionItem {
+            category: InjectionCategory::ErrorMatch,
+            index,
+        }));
         remaining = remaining.saturating_sub(section.len());
         output.push_str(&section);
     }
 
     // 4. Relevant context (raw chunks — distinct from stored insights)
     if !ctx.relevant_context.is_empty() && remaining > 40 {
-        let section = format_category(
+        let (section, rendered) = format_category_receipt(
             RELEVANT_PAST_CONTEXT_TITLE,
             &ctx.relevant_context,
             remaining,
         );
+        rendered_items.extend((0..rendered).map(|index| RenderedInjectionItem {
+            category: InjectionCategory::RelevantContext,
+            index,
+        }));
         remaining = remaining.saturating_sub(section.len());
         output.push_str(&section);
     }
 
     // 5. Winning strategies (stored reflections/insights)
     if !ctx.winning_strategies.is_empty() && remaining > 40 {
-        let section = format_category(PAST_CONTEXT_TITLE, &ctx.winning_strategies, remaining);
+        let (section, rendered) =
+            format_category_receipt(PAST_CONTEXT_TITLE, &ctx.winning_strategies, remaining);
+        rendered_items.extend((0..rendered).map(|index| RenderedInjectionItem {
+            category: InjectionCategory::WinningStrategy,
+            index,
+        }));
         remaining = remaining.saturating_sub(section.len());
         output.push_str(&section);
     }
 
     // 6. Iteration learnings
     if !ctx.iteration_learnings.is_empty() && remaining > 40 {
-        let section = format_category(
+        let (section, rendered) = format_category_receipt(
             PAST_ITERATION_NOTES_TITLE,
             &ctx.iteration_learnings,
             remaining,
         );
+        rendered_items.extend((0..rendered).map(|index| RenderedInjectionItem {
+            category: InjectionCategory::IterationLearning,
+            index,
+        }));
         let _ = remaining;
         output.push_str(&section);
     }
 
-    output
+    FormattedInjection {
+        text: output,
+        rendered_items,
+    }
 }
 
 /// Format a category of items within a character budget.
+#[cfg(test)]
 fn format_category(title: &str, items: &[super::InjectionItem], max_chars: usize) -> String {
+    format_category_receipt(title, items, max_chars).0
+}
+
+fn format_category_receipt(
+    title: &str,
+    items: &[super::InjectionItem],
+    max_chars: usize,
+) -> (String, usize) {
     let header = format!("## {}\n", title);
     if header.len() >= max_chars {
-        return String::new();
+        return (String::new(), 0);
     }
 
     let mut section = header;
     let mut budget = max_chars - section.len();
+    let mut rendered = 0;
 
     for item in items {
         if budget < 10 {
@@ -187,18 +255,20 @@ fn format_category(title: &str, items: &[super::InjectionItem], max_chars: usize
         if line.len() <= budget {
             section.push_str(&line);
             budget -= line.len();
+            rendered += 1;
         } else {
             // Truncate this item to fit remaining budget
             let truncated =
                 truncate_item(&single_line, budget.saturating_sub(item.source.len() + 8));
             let line = format!("- [{}] {}\n", item.source, truncated);
             section.push_str(&line);
+            rendered += 1;
             break;
         }
     }
 
     section.push('\n');
-    section
+    (section, rendered)
 }
 
 /// Truncate a single item to fit within a character limit,
@@ -249,6 +319,33 @@ mod tests {
     fn test_format_empty_context() {
         let ctx = InjectionContext::default();
         assert_eq!(ctx.format(300), "");
+    }
+
+    #[test]
+    fn format_receipt_identifies_only_items_that_reached_output() {
+        let ctx = InjectionContext {
+            anti_patterns: vec![InjectionItem {
+                content: "avoid this failed approach".into(),
+                score: 0.9,
+                source: "reflection".into(),
+            }],
+            winning_strategies: vec![InjectionItem {
+                content: "this lower-priority item should not fit".repeat(20),
+                score: 0.8,
+                source: "reflection".into(),
+            }],
+            ..Default::default()
+        };
+
+        let formatted = format_with_budget_receipt(&ctx, 15);
+        assert!(formatted.text.contains("avoid this failed approach"));
+        assert_eq!(
+            formatted.rendered_items,
+            vec![RenderedInjectionItem {
+                category: InjectionCategory::AntiPattern,
+                index: 0,
+            }]
+        );
     }
 
     #[test]

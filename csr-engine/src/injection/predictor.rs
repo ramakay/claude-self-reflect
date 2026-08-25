@@ -18,6 +18,12 @@ pub struct ScoredResult {
     pub signals: Vec<Signal>,
     /// Stable storage ID for outcome tracking (carried from RawResult).
     pub memory_id: Option<String>,
+    /// Source conversation for exposure logging and leakage-safe grouping.
+    pub conversation_id: Option<String>,
+    /// Original result timestamp, retained for exposure-time recency features.
+    pub timestamp: Option<String>,
+    /// Authorship resolved from chunk provenance when available.
+    pub author: Option<crate::provenance::Speaker>,
 }
 
 /// What contributed to a result's score.
@@ -51,6 +57,8 @@ pub struct RawResult {
     pub conversation_id: Option<String>,
     /// Stable storage ID (chunk_id or reflection_id) for outcome tracking.
     pub memory_id: Option<String>,
+    /// Authorship resolved from chunk provenance when available.
+    pub author: Option<crate::provenance::Speaker>,
 }
 
 /// Score and rank results for injection.
@@ -155,6 +163,9 @@ fn score_result(
     phase: super::weights::HookPhase,
     ancestry_releases_behind: Option<u32>,
 ) -> ScoredResult {
+    let conversation_id = result.conversation_id.clone();
+    let timestamp = result.timestamp.clone();
+    let author = result.author;
     let mut signals = Vec::new();
 
     // 1. Semantic match (raw HNSW score, already 0.0-1.0)
@@ -195,6 +206,9 @@ fn score_result(
         source: result.source,
         signals,
         memory_id: result.memory_id,
+        conversation_id,
+        timestamp,
+        author,
     }
 }
 
@@ -341,6 +355,7 @@ mod tests {
         let results = vec![
             RawResult {
                 content: "high match".into(),
+                author: None,
                 score: 0.9,
                 source: "chunk".into(),
                 timestamp: None,
@@ -352,6 +367,7 @@ mod tests {
             },
             RawResult {
                 content: "low match".into(),
+                author: None,
                 score: 0.5,
                 source: "chunk".into(),
                 timestamp: None,
@@ -384,6 +400,7 @@ mod tests {
 
         let live_timestamp = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
         let raw = |content: &str, conversation_id: &str, chunk_id: &str| RawResult {
+            author: None,
             content: content.into(),
             score: 0.8,
             source: "chunk".into(),
@@ -423,6 +440,7 @@ mod tests {
         let timestamp = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
         let raw = || RawResult {
             content: "<command-message>quoted workflow</command-message>".into(),
+            author: None,
             score: 0.8,
             source: "chunk".into(),
             timestamp: Some(timestamp.clone()),
@@ -475,6 +493,7 @@ mod tests {
         let timestamp = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
         let raw = || RawResult {
             content: "organic conversation".into(),
+            author: None,
             score: 0.8,
             source: "chunk".into(),
             timestamp: Some(timestamp.clone()),
@@ -533,6 +552,7 @@ mod tests {
         let results = vec![
             RawResult {
                 content: "recent".into(),
+                author: None,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: Some(now),
@@ -544,6 +564,7 @@ mod tests {
             },
             RawResult {
                 content: "old".into(),
+                author: None,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: Some(old),
@@ -568,6 +589,7 @@ mod tests {
         let results = vec![
             RawResult {
                 content: "with file overlap".into(),
+                author: None,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: None,
@@ -579,6 +601,7 @@ mod tests {
             },
             RawResult {
                 content: "no overlap".into(),
+                author: None,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: None,
@@ -601,6 +624,7 @@ mod tests {
         let results = vec![
             RawResult {
                 content: "matching error".into(),
+                author: None,
                 score: 0.7,
                 source: "reflection".into(),
                 timestamp: None,
@@ -612,6 +636,7 @@ mod tests {
             },
             RawResult {
                 content: "no error match".into(),
+                author: None,
                 score: 0.7,
                 source: "reflection".into(),
                 timestamp: None,
@@ -682,6 +707,7 @@ mod tests {
         let results = vec![
             RawResult {
                 content: "from continued session".into(),
+                author: None,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: None,
@@ -693,6 +719,7 @@ mod tests {
             },
             RawResult {
                 content: "from older session".into(),
+                author: None,
                 score: 0.75,
                 source: "chunk".into(),
                 timestamp: None,
@@ -747,6 +774,7 @@ mod tests {
     fn test_continuity_boost_no_match() {
         let results = vec![RawResult {
             content: "unrelated session".into(),
+            author: None,
             score: 0.7,
             source: "chunk".into(),
             timestamp: None,

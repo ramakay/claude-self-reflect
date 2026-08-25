@@ -172,6 +172,38 @@ pub fn rerank_with(mut cands: Vec<RankCandidate>, policy: RankPolicy) -> Vec<Ran
     cands
 }
 
+/// Deterministic recall scores, including the list-level primacy boost, aligned
+/// with the input candidate order. The trained residual adapter uses these as
+/// its immutable baseline.
+pub(crate) fn recall_scores(cands: &[RankCandidate]) -> Vec<f32> {
+    let origin = primacy_conv(cands);
+    cands
+        .iter()
+        .map(|candidate| {
+            let mut score = adjusted_score(candidate);
+            if let (Some(origin), Some(provenance)) =
+                (origin.as_deref(), candidate.provenance.as_ref())
+            {
+                if provenance.source_conv_id == origin && provenance.author == Speaker::User {
+                    score += W_PRIMACY;
+                }
+            }
+            score
+        })
+        .collect()
+}
+
+pub(crate) fn is_poison_candidate(candidate: &RankCandidate) -> bool {
+    is_poison_content(
+        candidate.provenance.as_ref().map(|value| value.author),
+        &candidate.content,
+    )
+}
+
+pub(crate) fn is_poison_content(author: Option<Speaker>, content: &str) -> bool {
+    author == Some(Speaker::ToolResult) && is_authority_claim(content)
+}
+
 /// Tool-mechanic markers: `[Edit: ...]`, `[Bash: ...]`, etc. These index *what
 /// was done mechanically*, not *what was meant*.
 const MECHANIC_MARKERS: &[&str] = &[
@@ -187,7 +219,7 @@ const MECHANIC_MARKERS: &[&str] = &[
 /// A chunk is mechanic if it *leads* with a tool marker OR is mechanic-dominated
 /// (several markers anywhere). The importer concatenates prose before tool
 /// context, so a prefix-only check misses mixed chunks (Codex MEDIUM).
-fn is_mechanic_text(content: &str) -> bool {
+pub(crate) fn is_mechanic_text(content: &str) -> bool {
     let t = content.trim_start();
     if MECHANIC_MARKERS.iter().any(|p| t.starts_with(p)) {
         return true;

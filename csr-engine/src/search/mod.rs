@@ -3,6 +3,7 @@ pub mod cross_project;
 pub mod decay;
 pub mod reinstatement;
 pub mod rerank;
+pub mod trained_rerank;
 
 use std::collections::HashSet;
 use std::path::Path;

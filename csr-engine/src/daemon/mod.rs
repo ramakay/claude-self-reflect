@@ -13,6 +13,7 @@
 pub mod consolidation;
 pub mod dream_cadence;
 pub mod ratification;
+pub mod trained_rerank;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -485,6 +486,22 @@ impl Daemon {
         };
         tracing::info!("release-ancestry refresh loop started (TAD v2)");
 
+        // Trained re-ranker: deterministic nightly label harvest, fit, and
+        // chronological gate. It shares the single heavy-work permit and does
+        // not invoke the narrative/LLM path.
+        let trained_rerank_handle = {
+            let storage = self.storage.clone();
+            let embeddings = self.embeddings.clone();
+            let search = self.search.clone();
+            let heavy_work = heavy_work.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                trained_rerank::nightly_loop(storage, embeddings, search, heavy_work, shutdown)
+                    .await;
+            })
+        };
+        tracing::info!("trained re-ranker nightly loop started");
+
         // Journal v4 dream server (locked decision 7: daemon-hosted, always
         // on, stable loopback port, bookmarkable). It binds 127.0.0.1 only
         // and serves read-only routes. `spawn_for_daemon` returns `None`
@@ -539,6 +556,10 @@ impl Daemon {
         // immediately when shutdown arrives while it waits for the permit;
         // if publication already began, await that bounded cycle fully.
         let _ = ancestry_handle.await;
+        // A cycle holds the shared heavy-work permit and appends its model row
+        // transactionally. Await it so shutdown cannot detach a half-harvested
+        // training attempt.
+        let _ = trained_rerank_handle.await;
         // The journal server stops on the same flag (its graceful-shutdown
         // future polls it). Bounded by the shared timeout: an in-flight
         // request only reads, so a detached one cannot corrupt anything.

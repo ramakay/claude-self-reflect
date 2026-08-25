@@ -46,6 +46,41 @@ pub struct StatusReport {
     /// Journal v3 Phase 1.5 "dream threads" summary (`crate::dream::threads`)
     /// — night-pass propose-verify extraction. See `gather_dream_threads`.
     pub dream_threads: DreamThreadStatus,
+    /// Latest chronological trained re-ranker gate and runtime activation.
+    pub trained_rerank: TrainedRerankStatus,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Default)]
+pub struct TrainedRerankStatus {
+    pub requested: bool,
+    pub active: bool,
+    pub feature_schema: i64,
+    pub model_id: Option<String>,
+    pub active_model_id: Option<String>,
+    pub gate_status: String,
+    pub gate_reason: String,
+    pub baseline_ndcg5: Option<f64>,
+    pub trained_ndcg5: Option<f64>,
+    pub baseline_mrr: Option<f64>,
+    pub trained_mrr: Option<f64>,
+    pub curated_baseline_score: Option<f64>,
+    pub curated_trained_score: Option<f64>,
+    pub curated_case_count: i64,
+    pub curated_veto_epsilon: f64,
+    pub train_impressions: i64,
+    pub train_rows: i64,
+    pub eval_impressions: i64,
+    pub eval_rows: i64,
+    pub eval_clusters: i64,
+    pub cluster_wins: i64,
+    pub cluster_losses: i64,
+    pub cluster_ties: i64,
+    pub cluster_receipts: Vec<crate::storage::trained_rerank::GateClusterReceipt>,
+    pub cutoff_ts: Option<String>,
+    pub train_window: Option<[String; 2]>,
+    pub eval_window: Option<[String; 2]>,
+    pub trained_at: Option<String>,
+    pub model_age_days: Option<f64>,
 }
 
 /// Totals by verdict kind across every `witness_verdicts` event ever
@@ -468,6 +503,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             memory_registry: MemoryRegistryStatus::default(),
             dream: DreamStatus::default(),
             dream_threads: DreamThreadStatus::default(),
+            trained_rerank: empty_trained_rerank_status(),
         });
     }
 
@@ -522,6 +558,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let dream = gather_dream(&storage);
     let dream_threads = gather_dream_threads(&storage);
     let memory_registry = gather_memory_registry(&storage);
+    let trained_rerank = gather_trained_rerank(&storage);
 
     Ok(StatusReport {
         mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
@@ -546,7 +583,91 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         memory_registry,
         dream,
         dream_threads,
+        trained_rerank,
     })
+}
+
+fn empty_trained_rerank_status() -> TrainedRerankStatus {
+    TrainedRerankStatus {
+        requested: crate::search::trained_rerank::trained_rerank_requested(),
+        feature_schema: crate::search::trained_rerank::FEATURE_SCHEMA,
+        gate_status: "never_run".into(),
+        gate_reason: "no persisted training attempt".into(),
+        curated_veto_epsilon: crate::storage::trained_rerank::CURATED_VETO_EPSILON,
+        ..Default::default()
+    }
+}
+
+fn model_age_days_at(trained_at: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+    let trained_at = crate::temporal::parse_timestamp(trained_at)?;
+    Some((now - trained_at).num_seconds().max(0) as f64 / 86_400.0)
+}
+
+fn gather_trained_rerank(storage: &Storage) -> TrainedRerankStatus {
+    let mut status = empty_trained_rerank_status();
+    let attempt = match storage.latest_rerank_model_attempt() {
+        Ok(Some(attempt)) => attempt,
+        Ok(None) => return status,
+        Err(error) => {
+            status.gate_status = "error".into();
+            status.gate_reason = format!("gate read failed: {error}");
+            return status;
+        }
+    };
+    status.model_id = Some(attempt.model_id.clone());
+    status.gate_status = attempt.gate_status.clone();
+    status.gate_reason = attempt.gate_reason.clone();
+    status.baseline_ndcg5 = attempt.baseline_ndcg5;
+    status.trained_ndcg5 = attempt.trained_ndcg5;
+    status.baseline_mrr = attempt.baseline_mrr;
+    status.trained_mrr = attempt.trained_mrr;
+    status.curated_baseline_score = attempt.curated_baseline_score;
+    status.curated_trained_score = attempt.curated_trained_score;
+    status.curated_case_count = attempt.curated_case_count;
+    status.curated_veto_epsilon = attempt.curated_veto_epsilon;
+    status.train_impressions = attempt.train_impressions;
+    status.train_rows = attempt.train_rows;
+    status.eval_impressions = attempt.eval_impressions;
+    status.eval_rows = attempt.eval_rows;
+    status.eval_clusters = attempt.eval_clusters;
+    status.cluster_wins = attempt.cluster_wins;
+    status.cluster_losses = attempt.cluster_losses;
+    status.cluster_ties = attempt.cluster_ties;
+    match storage.rerank_gate_clusters(&attempt.model_id) {
+        Ok(receipts) => status.cluster_receipts = receipts,
+        Err(error) => {
+            status.active = false;
+            status.gate_status = "error".into();
+            status.gate_reason = format!("cluster receipt read failed: {error}");
+            return status;
+        }
+    }
+    status.cutoff_ts = attempt.cutoff_ts.clone();
+    status.train_window = attempt
+        .train_start_ts
+        .clone()
+        .zip(attempt.train_end_ts.clone())
+        .map(|(start, end)| [start, end]);
+    status.eval_window = attempt
+        .eval_start_ts
+        .clone()
+        .zip(attempt.eval_end_ts.clone())
+        .map(|(start, end)| [start, end]);
+    status.trained_at = Some(attempt.trained_at.clone());
+    match crate::search::trained_rerank::latest_compatible_model(storage) {
+        Ok(Some((active_attempt, _))) => {
+            status.model_age_days =
+                model_age_days_at(&active_attempt.trained_at, chrono::Utc::now());
+            status.active_model_id = Some(active_attempt.model_id);
+            status.active = status.requested;
+        }
+        Ok(None) => {}
+        Err(error) if attempt.gate_status == "passed" => {
+            status.gate_reason = format!("{}; model load failed: {error}", status.gate_reason);
+        }
+        Err(_) => {}
+    }
+    status
 }
 
 /// Assemble the memory-registry status block. Fail-soft to defaults — must
@@ -1270,6 +1391,7 @@ mod tests {
             memory_registry: MemoryRegistryStatus::default(),
             dream: DreamStatus::default(),
             dream_threads: DreamThreadStatus::default(),
+            trained_rerank: empty_trained_rerank_status(),
         }
     }
 
@@ -1277,6 +1399,71 @@ mod tests {
     fn test_compact_format() {
         // Just verify it doesn't panic
         print_compact(&base_report());
+    }
+
+    #[test]
+    fn status_json_contains_trained_rerank_gate_receipts() {
+        let mut report = base_report();
+        report.trained_rerank.gate_status = "failed".into();
+        report.trained_rerank.cluster_wins = 4;
+        report.trained_rerank.cluster_losses = 5;
+        report.trained_rerank.cluster_ties = 2;
+        report.trained_rerank.curated_baseline_score = Some(0.60);
+        report.trained_rerank.curated_trained_score = Some(0.61);
+        report.trained_rerank.curated_case_count = 8;
+        report.trained_rerank.curated_veto_epsilon = 1e-9;
+        report.trained_rerank.cluster_receipts =
+            vec![crate::storage::trained_rerank::GateClusterReceipt {
+                model_id: "model".into(),
+                cluster_id: "cluster".into(),
+                impression_count: 3,
+                distinct_session_count: 2,
+                candidate_count: 5,
+                baseline_ndcg5: 0.4,
+                trained_ndcg5: 0.5,
+                outcome: "win".into(),
+            }];
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["trained_rerank"]["gate_status"], "failed");
+        assert_eq!(value["trained_rerank"]["cluster_wins"], 4);
+        assert_eq!(value["trained_rerank"]["cluster_losses"], 5);
+        assert_eq!(value["trained_rerank"]["cluster_ties"], 2);
+        assert_eq!(value["trained_rerank"]["curated_baseline_score"], 0.60);
+        assert_eq!(value["trained_rerank"]["curated_trained_score"], 0.61);
+        assert_eq!(value["trained_rerank"]["curated_case_count"], 8);
+        assert_eq!(value["trained_rerank"]["curated_veto_epsilon"], 1e-9);
+        assert!(value["trained_rerank"].get("model_age_days").is_some());
+        assert_eq!(
+            value["trained_rerank"]["cluster_receipts"][0]["candidate_count"],
+            5
+        );
+        assert_eq!(
+            value["trained_rerank"]["cluster_receipts"][0]["distinct_session_count"],
+            2
+        );
+    }
+
+    #[test]
+    fn trained_rerank_model_age_is_derived_from_the_active_model_timestamp() {
+        let now = crate::temporal::parse_timestamp("2026-08-24T12:00:00Z").unwrap();
+
+        assert_eq!(model_age_days_at("2026-08-22T00:00:00Z", now), Some(2.5));
+    }
+
+    #[test]
+    fn trained_rerank_status_reports_database_read_errors() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch("DROP TABLE rerank_models")?;
+                Ok(())
+            })
+            .unwrap();
+
+        let status = gather_trained_rerank(&storage);
+
+        assert_eq!(status.gate_status, "error");
+        assert!(status.gate_reason.contains("gate read failed"));
     }
 
     #[test]

@@ -232,6 +232,18 @@ enum Commands {
         #[arg(long)]
         tui: bool,
     },
+    /// Dump a deterministic, stratified sample of persisted reaction labels.
+    AuditRerankLabels {
+        /// Maximum audited rows for each non-abstained reaction class.
+        #[arg(long, default_value_t = 20)]
+        per_class: usize,
+        /// Maximum abstain-adjacent near misses to include.
+        #[arg(long, default_value_t = 20)]
+        near_misses: usize,
+        /// Emit the audit rows and counts as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run one v10 "dreaming" cycle: HEAD stamp-spans, then the
     /// deterministic successor join over the witness ledger, emitting
     /// `witness_verdicts` events (anchor_obsolete / superseded_by /
@@ -402,6 +414,66 @@ async fn main() -> Result<()> {
 
     if let Some(Commands::Telemetry { since, json, tui }) = args.command {
         return csr_engine::telemetry::handle(&args.db_path, &args.projects_dir, since, json, tui);
+    }
+
+    if let Some(Commands::AuditRerankLabels {
+        per_class,
+        near_misses,
+        json,
+    }) = args.command
+    {
+        let storage = csr_engine::storage::Storage::open(&args.db_path)?;
+        let Some(classifier_hash) = storage.latest_reaction_classifier_hash()? else {
+            if json {
+                println!("{{\"classifier_hash\":null,\"counts\":null,\"labels\":[]}}");
+            } else {
+                println!("No harvested reaction labels are available.");
+            }
+            return Ok(());
+        };
+        let counts = storage.rerank_reaction_label_counts(&classifier_hash)?;
+        let labels =
+            storage.audit_rerank_reaction_labels(&classifier_hash, per_class, near_misses)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "classifier_hash": classifier_hash,
+                    "counts": counts,
+                    "labels": labels,
+                }))?
+            );
+        } else {
+            println!("classifier_hash: {classifier_hash}");
+            println!(
+                "counts: acceptance={} correction={} reask={} redirect={} abstain={} near_miss={}",
+                counts.acceptance,
+                counts.correction,
+                counts.reask,
+                counts.redirect,
+                counts.abstain,
+                counts.near_miss
+            );
+            for label in labels {
+                println!(
+                    "\n[{}] session={} assistant_turn={} next_user_turn={} proposed={} confidence={:.4} runner_up={:.4} margin={:.4} pickup_similarity={} near_miss={}\n{}",
+                    label.reaction,
+                    label.session_id,
+                    label.assistant_turn,
+                    label.next_user_turn,
+                    label.proposed_reaction.as_deref().unwrap_or("none"),
+                    label.confidence,
+                    label.runner_up_score,
+                    label.margin,
+                    label
+                        .pickup_similarity
+                        .map_or_else(|| "none".to_string(), |value| format!("{value:.4}")),
+                    label.near_miss,
+                    label.next_user_text
+                );
+            }
+        }
+        return Ok(());
     }
 
     if let Some(Commands::Daemon {

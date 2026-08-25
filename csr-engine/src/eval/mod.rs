@@ -1,13 +1,14 @@
 //! Evaluation framework for csr-engine.
 //!
-//! Quick mode: 5 core tests (<30s)
-//! Full mode: 20 tests (~2 min)
+//! Quick mode: 5 core tests plus the persisted trained-reranker gate (<30s)
+//! Full mode: 20 tests plus the persisted trained-reranker gate (~2 min)
 //! Continuity mode: the North Star gate — CSR must recall its own vision with
 //! provenance, beating a grep baseline (`csr-engine eval --continuity`).
 
 pub mod codegraph;
 pub mod continuity;
 pub mod provenance;
+pub mod trained_rerank;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -90,7 +91,7 @@ impl EvalReport {
     }
 }
 
-/// Run quick evaluation (5 tests).
+/// Run quick evaluation (5 core tests plus the trained-reranker gate).
 pub async fn run_quick(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
@@ -105,6 +106,7 @@ pub async fn run_quick(
     results.push(test_performance(embeddings, search).await);
     results.push(test_cache_status(index_dir));
     results.push(test_tool_count());
+    results.push(trained_rerank::latest_gate_result(storage));
 
     EvalReport {
         results,
@@ -112,7 +114,7 @@ pub async fn run_quick(
     }
 }
 
-/// Run full evaluation (20 tests).
+/// Run full evaluation (20 core tests plus the trained-reranker gate).
 pub async fn run_full(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
@@ -122,12 +124,13 @@ pub async fn run_full(
     let start = Instant::now();
     let mut results = Vec::new();
 
-    // Quick tests (5)
+    // Quick tests (5 core + trained-reranker gate)
     results.push(test_db_connectivity(storage));
     results.push(test_search_accuracy(storage, embeddings, search).await);
     results.push(test_performance(embeddings, search).await);
     results.push(test_cache_status(index_dir));
     results.push(test_tool_count());
+    results.push(trained_rerank::latest_gate_result(storage));
 
     // Semantic search tests (5)
     results.push(

@@ -1435,6 +1435,169 @@ pub fn run(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_memory_registry_project ON memory_registry(project);",
     )?;
 
+    // Trained re-ranker: exact hook impressions, auditable reaction labels,
+    // append-only model attempts, and per-cluster gate receipts. The runtime
+    // remains deterministic unless the latest model row carries a passing gate.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS rerank_exposure_impressions (
+            impression_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            surface TEXT NOT NULL,
+            query_hash TEXT,
+            query_embedding BLOB,
+            intent TEXT NOT NULL,
+            shown_at TEXT NOT NULL,
+            feature_schema INTEGER NOT NULL,
+            item_count INTEGER NOT NULL,
+            legacy INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_rerank_impressions_session_time
+            ON rerank_exposure_impressions(session_id, shown_at);
+        CREATE INDEX IF NOT EXISTS idx_rerank_impressions_time
+            ON rerank_exposure_impressions(shown_at);
+
+        CREATE TABLE IF NOT EXISTS rerank_exposure_items (
+            impression_id TEXT NOT NULL REFERENCES rerank_exposure_impressions(impression_id)
+                ON DELETE CASCADE,
+            rank INTEGER NOT NULL,
+            memory_id TEXT NOT NULL,
+            conversation_id TEXT,
+            source_type TEXT NOT NULL,
+            baseline_score REAL,
+            cosine REAL,
+            recency REAL,
+            graph_proximity REAL,
+            author TEXT,
+            is_scaffold INTEGER NOT NULL DEFAULT 0,
+            is_mechanic INTEGER NOT NULL DEFAULT 0,
+            supersedes INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (impression_id, rank),
+            UNIQUE (impression_id, memory_id, source_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_rerank_exposure_items_memory
+            ON rerank_exposure_items(memory_id);
+
+        CREATE TABLE IF NOT EXISTS rerank_reaction_labels (
+            session_id TEXT NOT NULL,
+            assistant_turn INTEGER NOT NULL,
+            next_user_turn INTEGER NOT NULL,
+            assistant_ts TEXT,
+            next_user_ts TEXT,
+            reaction TEXT NOT NULL CHECK (reaction IN
+                ('acceptance','correction','reask','redirect','abstain')),
+            proposed_reaction TEXT,
+            confidence REAL NOT NULL,
+            runner_up_score REAL NOT NULL,
+            margin REAL NOT NULL,
+            pickup_similarity REAL,
+            next_user_text TEXT NOT NULL,
+            near_miss INTEGER NOT NULL DEFAULT 0,
+            classifier_hash TEXT NOT NULL,
+            transcript_mtime INTEGER NOT NULL,
+            harvested_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, assistant_turn, classifier_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_rerank_reactions_session_time
+            ON rerank_reaction_labels(session_id, assistant_ts);
+        CREATE INDEX IF NOT EXISTS idx_rerank_reactions_audit
+            ON rerank_reaction_labels(classifier_hash, reaction, near_miss);
+
+        CREATE TABLE IF NOT EXISTS rerank_harvest_state (
+            session_id TEXT NOT NULL,
+            classifier_hash TEXT NOT NULL,
+            transcript_mtime INTEGER NOT NULL,
+            label_count INTEGER NOT NULL,
+            contaminated INTEGER NOT NULL DEFAULT 0,
+            harvested_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, classifier_hash)
+        );
+
+        CREATE TABLE IF NOT EXISTS rerank_models (
+            model_id TEXT PRIMARY KEY,
+            feature_schema INTEGER NOT NULL,
+            classifier_hash TEXT NOT NULL,
+            seed INTEGER NOT NULL,
+            cutoff_ts TEXT,
+            train_start_ts TEXT,
+            train_end_ts TEXT,
+            eval_start_ts TEXT,
+            eval_end_ts TEXT,
+            train_impressions INTEGER NOT NULL,
+            train_rows INTEGER NOT NULL,
+            eval_impressions INTEGER NOT NULL,
+            eval_rows INTEGER NOT NULL,
+            eval_clusters INTEGER NOT NULL,
+            cluster_wins INTEGER NOT NULL,
+            cluster_losses INTEGER NOT NULL,
+            cluster_ties INTEGER NOT NULL,
+            excluded_contaminated INTEGER NOT NULL,
+            abstained_reactions INTEGER NOT NULL,
+            acceptance_labels INTEGER NOT NULL,
+            correction_labels INTEGER NOT NULL,
+            reask_labels INTEGER NOT NULL,
+            redirect_labels INTEGER NOT NULL,
+            near_miss_labels INTEGER NOT NULL,
+            baseline_ndcg5 REAL,
+            trained_ndcg5 REAL,
+            baseline_mrr REAL,
+            trained_mrr REAL,
+            curated_baseline_score REAL,
+            curated_trained_score REAL,
+            curated_case_count INTEGER NOT NULL DEFAULT 0,
+            curated_veto_epsilon REAL NOT NULL,
+            gate_status TEXT NOT NULL CHECK (gate_status IN
+                ('passed','failed','insufficient_data','error')),
+            gate_reason TEXT NOT NULL,
+            weights_json TEXT,
+            normalization_json TEXT,
+            trained_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rerank_models_latest
+            ON rerank_models(trained_at DESC, model_id DESC);
+
+        CREATE TABLE IF NOT EXISTS rerank_gate_clusters (
+            model_id TEXT NOT NULL REFERENCES rerank_models(model_id),
+            cluster_id TEXT NOT NULL,
+            impression_count INTEGER NOT NULL,
+            distinct_session_count INTEGER NOT NULL,
+            candidate_count INTEGER NOT NULL,
+            baseline_ndcg5 REAL NOT NULL,
+            trained_ndcg5 REAL NOT NULL,
+            outcome TEXT NOT NULL CHECK (outcome IN ('win','loss','tie')),
+            PRIMARY KEY (model_id, cluster_id)
+        );",
+    )?;
+
+    // Curated-eval veto receipt. These columns were added after the first
+    // trained-reranker implementation was reviewable, so prerelease databases
+    // may already carry rerank_models without them.
+    if !has_column(conn, "rerank_models", "curated_baseline_score")? {
+        conn.execute_batch("ALTER TABLE rerank_models ADD COLUMN curated_baseline_score REAL;")?;
+    }
+    if !has_column(conn, "rerank_models", "curated_trained_score")? {
+        conn.execute_batch("ALTER TABLE rerank_models ADD COLUMN curated_trained_score REAL;")?;
+    }
+    if !has_column(conn, "rerank_models", "curated_veto_epsilon")? {
+        conn.execute_batch("ALTER TABLE rerank_models ADD COLUMN curated_veto_epsilon REAL;")?;
+    }
+    if !has_column(conn, "rerank_models", "curated_case_count")? {
+        conn.execute_batch(
+            "ALTER TABLE rerank_models ADD COLUMN curated_case_count INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !has_column(conn, "rerank_gate_clusters", "distinct_session_count")? {
+        conn.execute_batch(
+            "ALTER TABLE rerank_gate_clusters
+             ADD COLUMN distinct_session_count INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    conn.execute(
+        "UPDATE rerank_models SET curated_veto_epsilon = ?1
+         WHERE curated_veto_epsilon IS NULL",
+        [super::trained_rerank::CURATED_VETO_EPSILON],
+    )?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())
