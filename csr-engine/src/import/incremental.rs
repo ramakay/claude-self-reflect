@@ -26,7 +26,7 @@ use anyhow::Result;
 use tokio::sync::RwLock;
 
 use crate::embeddings::EmbeddingEngine;
-use crate::import::{self, ConversationAttribution};
+use crate::import::{self, ConversationAttribution, ParseCursor, PARSE_CURSOR_VERSION};
 use crate::search::SearchEngine;
 use crate::storage::Storage;
 
@@ -100,9 +100,24 @@ pub(crate) async fn import_file_incremental(
         .to_string_lossy()
         .to_string();
 
-    let parsed = import::parse_jsonl_file_with_stats(file_path, &attribution.project_name)?;
+    // Resume from the stored byte cursor when it still describes this file.
+    let stored_cursor = ctx
+        .storage
+        .get_parse_cursor(file_path)?
+        .and_then(|json| serde_json::from_str::<ParseCursor>(&json).ok())
+        .filter(|c| c.v == PARSE_CURSOR_VERSION && cursor_still_valid(c, file_path));
+
+    let parsed = import::parse_jsonl_file_from_cursor(
+        file_path,
+        &attribution.project_name,
+        stored_cursor.as_ref(),
+    )?;
     let suppression = parsed.suppression;
+    let next_cursor = parsed.next_cursor;
     let chunks = parsed.chunks;
+    // With a cursor the parse starts mid-file, so chunks[0] is chunk number
+    // `first_index`, not chunk zero.
+    let first_index = stored_cursor.as_ref().map(|c| c.chunk_index).unwrap_or(0);
 
     // Agent transcripts and empty conversations parse to nothing. Record the skip so
     // the file is not re-parsed on every pass and import_percent counts it.
@@ -112,7 +127,7 @@ pub(crate) async fn import_file_incremental(
         return Ok(ImportOutcome::default());
     }
 
-    let n = chunks.len();
+    let n = first_index + chunks.len();
     let prev_count = ctx.storage.get_imported_chunk_count(file_path)?;
 
     // ── Decide where to resume ────────────────────────────────────────────────
@@ -122,11 +137,20 @@ pub(crate) async fn import_file_incremental(
     // skipped). Wiping is destructive, so it needs corroboration: compare the
     // head chunk's content. A rewrite changes it; a short read does not.
     let mut full_reimport = false;
-    let rebuild_from = if n < prev_count {
-        let head_changed = ctx
-            .storage
-            .get_chunk_content(&chunks[0].id)?
-            .is_none_or(|stored| stored != chunks[0].content);
+    let rebuild_from = if stored_cursor.is_some() {
+        // Everything the cursor handed back begins at the seam by construction,
+        // and the cursor was only trusted after its head fingerprint matched.
+        first_index
+    } else {
+        // Full parse, so the head is in hand. Verify the prefix really is intact
+        // before trusting it: a rewrite changes chunk zero even when the chunk
+        // count does not move, and resuming at the seam would strand the old
+        // content in place. This also covers a cursor rejected as stale.
+        let head_changed = prev_count > 0
+            && ctx
+                .storage
+                .get_chunk_content(&chunks[0].id)?
+                .is_none_or(|stored| stored != chunks[0].content);
 
         if head_changed {
             tracing::warn!(
@@ -148,8 +172,9 @@ pub(crate) async fn import_file_incremental(
             }
             full_reimport = true;
             0
-        } else {
-            // Head intact: keep the valid prefix, drop only the orphan tail.
+        } else if n < prev_count {
+            // Head intact but fewer chunks: keep the valid prefix, drop the
+            // orphan tail rather than wiping a conversation needlessly.
             tracing::warn!(
                 conv = %conversation_id,
                 previous = prev_count,
@@ -167,20 +192,24 @@ pub(crate) async fn import_file_incremental(
                 }
             }
             n.saturating_sub(1)
+        } else {
+            // The seam. `prev_count` counts chunks WRITTEN, and the last of those
+            // was a partial buffer flushed at EOF — on this pass it may have
+            // grown, so it must be rebuilt. Slicing from `prev_count` instead
+            // drops its new messages into no chunk at all.
+            prev_count.saturating_sub(1)
         }
-    } else {
-        // The seam. `prev_count` counts chunks WRITTEN, and the last of those was
-        // a partial buffer flushed at EOF — on this pass it may have grown, so it
-        // must be rebuilt. Slicing from `prev_count` instead drops its new
-        // messages into no chunk at all.
-        prev_count.saturating_sub(1)
     };
 
     // ── Plan: what actually needs work ───────────────────────────────────────
     let mut plans: Vec<ChunkPlan> = Vec::new();
     {
         let idx = ctx.search.read().await;
-        for (i, chunk) in chunks.iter().enumerate().skip(rebuild_from) {
+        for (local, chunk) in chunks.iter().enumerate() {
+            let i = first_index + local;
+            if i < rebuild_from {
+                continue;
+            }
             let is_trailing = i + 1 == n;
             let index_it = !is_trailing || seal == SealPolicy::SealAll;
             let indexed = idx.has_chunk(&chunk.id);
@@ -198,7 +227,7 @@ pub(crate) async fn import_file_incremental(
             }
 
             plans.push(ChunkPlan {
-                index: i,
+                index: local,
                 write: !content_same,
                 index_it: index_it && (!indexed || !content_same),
                 remove_first: indexed,
@@ -264,8 +293,15 @@ pub(crate) async fn import_file_incremental(
         }
     }
 
-    ctx.storage
-        .mark_file_imported_with_suppression(file_path, n, suppression)?;
+    let cursor_json = next_cursor
+        .as_ref()
+        .and_then(|c| serde_json::to_string(c).ok());
+    ctx.storage.mark_file_imported_with_cursor(
+        file_path,
+        n,
+        suppression,
+        cursor_json.as_deref(),
+    )?;
 
     Ok(ImportOutcome {
         indexed_chunks,
@@ -275,6 +311,22 @@ pub(crate) async fn import_file_incremental(
         full_reimport,
         unchanged: false,
     })
+}
+
+/// Whether a stored cursor still describes the file on disk.
+///
+/// A shorter file means truncation. A changed head means the file was rewritten,
+/// which a length check alone misses when the rewrite happens to be as long or
+/// longer. Either way the offset is meaningless and the caller falls back to a
+/// full parse.
+fn cursor_still_valid(cursor: &ParseCursor, path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() < cursor.file_len || meta.len() < cursor.byte_offset {
+        return false;
+    }
+    import::head_fingerprint(path) == cursor.head_fingerprint
 }
 
 /// Layer 1 heuristic enrichment, shared by both callers.
@@ -378,7 +430,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, text)| {
                     serde_json::json!({
-                        "type": if i % 2 == 0 { "user" } else { "assistant" },
+                        "type": if i.is_multiple_of(2) { "user" } else { "assistant" },
                         "timestamp": format!("2026-02-22T10:00:{:02}Z", i),
                         "message": {"content": [{"type": "text", "text": text}]}
                     })
@@ -692,5 +744,96 @@ mod tests {
                 "an idle pass must not enrich"
             );
         });
+    }
+
+    /// A rewritten file of the same length must not be resumed from a stale offset.
+    #[test]
+    fn truncate_and_regrow_invalidates_cursor() {
+        rt().block_on(async {
+            let h = Harness::new("regrow");
+            h.write(&msgs(7));
+            h.import(SealPolicy::SealAll).await;
+            let before = h.all_stored();
+            assert!(before.join("\n").contains("MSG006"));
+
+            // Same message count, entirely different content.
+            let replaced: Vec<String> = (0..7)
+                .map(|i| format!("NEW{i:03}-{}", "q".repeat(390)))
+                .collect();
+            h.write(&replaced);
+            h.import(SealPolicy::SealAll).await;
+
+            let after = h.all_stored().join("\n");
+            assert!(
+                after.contains("NEW000") && after.contains("NEW006"),
+                "the rewrite must be fully reimported"
+            );
+            assert!(
+                !after.contains("MSG"),
+                "a stale cursor must not leave old content behind"
+            );
+        });
+    }
+
+    /// A NULL cursor is the downgrade path and the pre-migration path: it must
+    /// simply fall back to a full parse with the seam rebuild.
+    #[test]
+    fn null_cursor_falls_back_to_full_parse() {
+        rt().block_on(async {
+            let h = Harness::new("null-cursor");
+            h.write(&msgs(5));
+            h.import(SealPolicy::SealAll).await;
+
+            // Simulate an older binary having written the row without a cursor.
+            h.storage
+                .clear_parse_cursor_for_test(&h.path)
+                .expect("clear cursor");
+            assert!(h.storage.get_parse_cursor(&h.path).unwrap().is_none());
+
+            h.write(&msgs(7));
+            h.import(SealPolicy::SealAll).await;
+
+            let all = h.all_stored().join("\n");
+            for i in 0..7 {
+                assert!(all.contains(&format!("MSG{i:03}")), "MSG{i:03} missing");
+            }
+        });
+    }
+
+    /// The migration must be additive on a database that predates the column.
+    #[test]
+    fn cursor_column_migration_is_additive() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("legacy.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            // The pre-cursor shape of the table, with a row already in it.
+            conn.execute_batch(
+                "CREATE TABLE import_state (
+                     file_path TEXT PRIMARY KEY,
+                     conversation_id TEXT,
+                     chunks_imported INTEGER,
+                     imported_at TEXT DEFAULT (datetime('now')),
+                     file_mtime TEXT,
+                     csr_tool_blocks_suppressed INTEGER NOT NULL DEFAULT 0,
+                     csr_hook_wrappers_scrubbed INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO import_state (file_path, chunks_imported) VALUES ('/legacy.jsonl', 12);",
+            )
+            .unwrap();
+        }
+
+        let storage = Storage::open(&db).expect("migrations must run on a legacy database");
+        let cursor = storage
+            .get_parse_cursor(Path::new("/legacy.jsonl"))
+            .expect("the column must exist after migration");
+        assert!(cursor.is_none(), "legacy rows start with no cursor");
+        assert_eq!(
+            storage
+                .get_imported_chunk_count(Path::new("/legacy.jsonl"))
+                .unwrap(),
+            12,
+            "the existing row must survive the ALTER"
+        );
     }
 }

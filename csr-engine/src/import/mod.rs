@@ -8,13 +8,58 @@ pub mod watcher;
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
 use regex::Regex;
 use uuid::Uuid;
+
+/// Where to resume parsing a transcript, plus the file-head state a resumed
+/// parse cannot rederive because it never reads the head.
+///
+/// `byte_offset` is NOT end-of-file. It is the start of the first message line of
+/// the trailing chunk, paired with that chunk's index. Because the chunker is a
+/// no-lookahead fold, restarting there with an empty buffer reproduces exactly
+/// what a full parse yields from that chunk onward.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ParseCursor {
+    pub v: u32,
+    pub byte_offset: u64,
+    pub chunk_index: usize,
+    pub file_len: u64,
+    /// Hash of the first 4 KiB. Catches a rewrite that happens to leave the file
+    /// the same length or longer, which a length check alone would miss.
+    pub head_fingerprint: u64,
+    pub summary: Option<String>,
+    pub first_user_message: Option<String>,
+    pub first_timestamp: Option<String>,
+    /// CSR tool_use ids suppressed before the cursor but not yet answered by their
+    /// tool_result. Without these a seam between a tool_use and its result leaks a
+    /// CSR tool_result into the index.
+    pub open_suppressed_tool_use_ids: Vec<String>,
+    /// Suppression totals for bytes strictly BEFORE `byte_offset`, so the
+    /// re-parsed seam region is counted exactly once.
+    pub suppressed_tool_blocks_at_cursor: usize,
+    pub scrubbed_hook_wrappers_at_cursor: usize,
+}
+
+pub(crate) const PARSE_CURSOR_VERSION: u32 = 1;
+
+/// Size of the head sample used for `head_fingerprint`.
+const HEAD_FINGERPRINT_BYTES: usize = 4096;
+
+pub(crate) fn head_fingerprint(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut buf = vec![0u8; HEAD_FINGERPRINT_BYTES];
+    let read = fs::File::open(path)
+        .and_then(|mut f| f.read(&mut buf))
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    buf[..read].hash(&mut hasher);
+    hasher.finish()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConversationAttribution {
@@ -65,6 +110,9 @@ pub struct ConversationChunk {
 pub(crate) struct ParsedConversation {
     pub chunks: Vec<ConversationChunk>,
     pub suppression: CsrSuppressionStats,
+    /// Where the next incremental parse should resume. `None` means the caller
+    /// must do a full parse next time.
+    pub next_cursor: Option<ParseCursor>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +325,19 @@ pub(crate) fn parse_jsonl_file_with_stats(
     path: &Path,
     project_name: &str,
 ) -> Result<ParsedConversation> {
+    parse_jsonl_file_from_cursor(path, project_name, None)
+}
+
+/// Parse a transcript, optionally resuming from a stored byte cursor.
+///
+/// With `None` this reads the whole file. With a cursor it seeks to the trailing
+/// chunk's first line and reproduces everything from that chunk onward, which is
+/// identical to what a full parse would produce there.
+pub(crate) fn parse_jsonl_file_from_cursor(
+    path: &Path,
+    project_name: &str,
+    cursor: Option<&ParseCursor>,
+) -> Result<ParsedConversation> {
     let conversation_id = path
         .file_stem()
         .unwrap_or_default()
@@ -284,21 +345,50 @@ pub(crate) fn parse_jsonl_file_with_stats(
         .to_string();
 
     let file = fs::File::open(path).context("opening JSONL file")?;
-    let reader = BufReader::new(file);
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut reader = BufReader::new(file);
+
+    let start_offset = cursor.map(|c| c.byte_offset).unwrap_or(0);
+    let index_base = cursor.map(|c| c.chunk_index).unwrap_or(0);
+    if start_offset > 0 {
+        reader
+            .seek(SeekFrom::Start(start_offset))
+            .context("seeking to parse cursor")?;
+    }
+
     let mut messages: Vec<String> = Vec::new();
+    let mut message_offsets: Vec<u64> = Vec::new();
+    // Sanitizer state as it stood BEFORE each retained message. A cursor always
+    // lands on a message boundary, so this is what a resumed parse must restore.
+    let mut message_stats: Vec<CsrSuppressionStats> = Vec::new();
+    let mut message_open_ids: Vec<Vec<String>> = Vec::new();
     let mut authors: Vec<crate::provenance::Speaker> = Vec::new();
     let mut sidechains: Vec<bool> = Vec::new();
-    let mut first_timestamp: Option<String> = None;
+    let mut first_timestamp: Option<String> = cursor.and_then(|c| c.first_timestamp.clone());
     let mut last_timestamp: Option<String> = None;
-    let mut summary: Option<String> = None;
-    let mut first_user_message: Option<String> = None;
+    let mut summary: Option<String> = cursor.and_then(|c| c.summary.clone());
+    let mut first_user_message: Option<String> = cursor.and_then(|c| c.first_user_message.clone());
     let mut csr_sanitizer = CsrMessageSanitizer::default();
+    if let Some(c) = cursor {
+        // Tool calls still awaiting their result at the cursor, so a tool_result
+        // landing after the seam is still recognised as CSR's own.
+        csr_sanitizer.suppressed_tool_use_ids =
+            c.open_suppressed_tool_use_ids.iter().cloned().collect();
+    }
 
-    for line_result in reader.lines() {
-        let line = match line_result {
-            Ok(l) => l,
-            Err(_) => continue,
+    let mut offset = start_offset;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let line_start = offset;
+        // Deliberately not `continue` on error: with read_line a persistent decode
+        // failure would never advance the offset and would spin forever.
+        let read = match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
         };
+        offset += read as u64;
         if line.trim().is_empty() {
             continue;
         }
@@ -330,6 +420,12 @@ pub(crate) fn parse_jsonl_file_with_stats(
             continue;
         }
 
+        let stats_before_line = csr_sanitizer.stats;
+        let open_ids_before_line: Vec<String> = csr_sanitizer
+            .suppressed_tool_use_ids
+            .iter()
+            .cloned()
+            .collect();
         sanitize_message_for_search(&mut parsed, &mut csr_sanitizer);
 
         // Capture first and last timestamps
@@ -373,6 +469,9 @@ pub(crate) fn parse_jsonl_file_with_stats(
             .unwrap_or(false);
         if !combined_text.is_empty() {
             messages.push(combined_text);
+            message_offsets.push(line_start);
+            message_stats.push(stats_before_line);
+            message_open_ids.push(open_ids_before_line);
             authors.push(classify_message_author(&parsed));
             sidechains.push(is_sidechain_msg);
         }
@@ -382,6 +481,7 @@ pub(crate) fn parse_jsonl_file_with_stats(
         return Ok(ParsedConversation {
             chunks: Vec::new(),
             suppression: csr_sanitizer.stats,
+            next_cursor: None,
         });
     }
 
@@ -396,6 +496,7 @@ pub(crate) fn parse_jsonl_file_with_stats(
             return Ok(ParsedConversation {
                 chunks: Vec::new(),
                 suppression: csr_sanitizer.stats,
+                next_cursor: None,
             });
         }
     }
@@ -403,8 +504,13 @@ pub(crate) fn parse_jsonl_file_with_stats(
     // Use last_timestamp for ordering (shows "last active" not "started at")
     // Fall back to first_timestamp if somehow no last, then to now()
     let timestamp = last_timestamp
-        .or(first_timestamp)
+        .or_else(|| first_timestamp.clone())
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+    // Kept for the cursor: a resumed parse never reads the head, so it cannot
+    // rederive either of these.
+    let summary_for_cursor = summary.clone();
+    let first_user_for_cursor = first_user_message.clone();
 
     // Priority: JSONL summary > first user message > None
     let chunk_summary = summary.or(first_user_message);
@@ -414,18 +520,31 @@ pub(crate) fn parse_jsonl_file_with_stats(
     // ~900 chars only embeds its head — the rest is unsearchable. Sizing each chunk
     // under that window means the whole conversation actually lands in vector space.
     let mut chunks: Vec<ConversationChunk> = Vec::new();
+    // Byte offset of the message that opened each chunk, parallel to `chunks`.
+    let mut chunk_starts: Vec<u64> = Vec::new();
+    // Offset of the message currently at the head of `buf`.
+    let mut buf_start: u64 = 0;
     let mut buf = String::new();
     let mut buf_authors: Vec<crate::provenance::Speaker> = Vec::new();
     let mut buf_sidechains: Vec<bool> = Vec::new();
     let mut buf_msgs = 0usize;
 
-    for ((msg, author), sidechain) in messages.iter().zip(authors.iter()).zip(sidechains.iter()) {
+    for (i, ((msg, author), sidechain)) in messages
+        .iter()
+        .zip(authors.iter())
+        .zip(sidechains.iter())
+        .enumerate()
+    {
+        let msg_offset = message_offsets[i];
         // A single message larger than the budget is hard-split into multiple chunks
         // so its tail (e.g. the end of a long report) is embedded too.
         if msg.len() > CHUNK_CHAR_BUDGET {
             if !buf.is_empty() {
                 push_chunk(
                     &mut chunks,
+                    &mut chunk_starts,
+                    index_base,
+                    buf_start,
                     &conversation_id,
                     project_name,
                     &timestamp,
@@ -448,6 +567,9 @@ pub(crate) fn parse_jsonl_file_with_stats(
                 }
                 push_chunk(
                     &mut chunks,
+                    &mut chunk_starts,
+                    index_base,
+                    msg_offset,
                     &conversation_id,
                     project_name,
                     &timestamp,
@@ -466,6 +588,9 @@ pub(crate) fn parse_jsonl_file_with_stats(
         if !buf.is_empty() && buf.len() + msg.len() + 2 > CHUNK_CHAR_BUDGET {
             push_chunk(
                 &mut chunks,
+                &mut chunk_starts,
+                index_base,
+                buf_start,
                 &conversation_id,
                 project_name,
                 &timestamp,
@@ -479,7 +604,9 @@ pub(crate) fn parse_jsonl_file_with_stats(
             buf_sidechains.clear();
             buf_msgs = 0;
         }
-        if !buf.is_empty() {
+        if buf.is_empty() {
+            buf_start = msg_offset;
+        } else {
             buf.push_str("\n\n");
         }
         buf.push_str(msg);
@@ -490,6 +617,9 @@ pub(crate) fn parse_jsonl_file_with_stats(
     if !buf.is_empty() {
         push_chunk(
             &mut chunks,
+            &mut chunk_starts,
+            index_base,
+            buf_start,
             &conversation_id,
             project_name,
             &timestamp,
@@ -501,9 +631,55 @@ pub(crate) fn parse_jsonl_file_with_stats(
         );
     }
 
+    // Suppression counts are reported absolutely: the prefix the cursor already
+    // accounted for, plus what this pass saw. The seam region is re-parsed every
+    // time, so it must be counted from the cursor's prefix, never added twice.
+    let (prefix_tool, prefix_wrappers) = cursor
+        .map(|c| {
+            (
+                c.suppressed_tool_blocks_at_cursor,
+                c.scrubbed_hook_wrappers_at_cursor,
+            )
+        })
+        .unwrap_or((0, 0));
+    let absolute = CsrSuppressionStats {
+        csr_tool_blocks_suppressed: prefix_tool + csr_sanitizer.stats.csr_tool_blocks_suppressed,
+        csr_hook_wrappers_scrubbed: prefix_wrappers
+            + csr_sanitizer.stats.csr_hook_wrappers_scrubbed,
+    };
+
+    // Resume from the trailing chunk. A hard-split message emits several chunks
+    // that all begin at the same offset, so resume at the FIRST of that group --
+    // resuming mid-group would re-split the message and renumber its pieces.
+    let next_cursor = chunk_starts.last().map(|&resume_offset| {
+        let local = chunk_starts
+            .iter()
+            .position(|&o| o == resume_offset)
+            .unwrap_or(chunk_starts.len() - 1);
+        let mark = message_offsets
+            .iter()
+            .position(|&o| o == resume_offset)
+            .map(|m| (message_stats[m], message_open_ids[m].clone()))
+            .unwrap_or_default();
+        ParseCursor {
+            v: PARSE_CURSOR_VERSION,
+            byte_offset: resume_offset,
+            chunk_index: index_base + local,
+            file_len,
+            head_fingerprint: head_fingerprint(path),
+            summary: summary_for_cursor,
+            first_user_message: first_user_for_cursor,
+            first_timestamp,
+            open_suppressed_tool_use_ids: mark.1,
+            suppressed_tool_blocks_at_cursor: prefix_tool + mark.0.csr_tool_blocks_suppressed,
+            scrubbed_hook_wrappers_at_cursor: prefix_wrappers + mark.0.csr_hook_wrappers_scrubbed,
+        }
+    });
+
     Ok(ParsedConversation {
         chunks,
-        suppression: csr_sanitizer.stats,
+        suppression: absolute,
+        next_cursor,
     })
 }
 
@@ -519,6 +695,9 @@ const MAX_TOOL_RESULT_CHARS: usize = 4000;
 #[allow(clippy::too_many_arguments)]
 fn push_chunk(
     chunks: &mut Vec<ConversationChunk>,
+    starts: &mut Vec<u64>,
+    index_base: usize,
+    start_offset: u64,
     conversation_id: &str,
     project_name: &str,
     timestamp: &str,
@@ -528,7 +707,8 @@ fn push_chunk(
     author: crate::provenance::Speaker,
     is_sidechain: bool,
 ) {
-    let i = chunks.len();
+    let i = index_base + chunks.len();
+    starts.push(start_offset);
     chunks.push(ConversationChunk {
         id: generate_chunk_id(conversation_id, i),
         conversation_id: conversation_id.to_string(),
@@ -696,10 +876,17 @@ fn sanitize_content(
                 }
             }
             Some("tool_result") => {
-                let is_csr_result = item
+                let tool_use_id = item
                     .get("tool_use_id")
                     .and_then(|value| value.as_str())
-                    .is_some_and(|id| sanitizer.suppressed_tool_use_ids.contains(id));
+                    .map(str::to_string);
+                // Consume the id rather than just testing it. A tool_result is only
+                // ever matched by its own tool_use, so this is a no-op for a full
+                // parse -- but it keeps the live set down to the handful of calls
+                // still awaiting a result, which is what makes it cheap to carry
+                // across a resumed parse.
+                let is_csr_result =
+                    tool_use_id.is_some_and(|id| sanitizer.suppressed_tool_use_ids.remove(&id));
                 if is_csr_result {
                     sanitizer.stats.csr_tool_blocks_suppressed += 1;
                     continue;
@@ -1512,5 +1699,264 @@ mod tests {
         let text = extract_message_text(&msg);
         assert!(!text.contains("sk-abc123"));
         assert!(text.contains("[private]"));
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    fn write_lines(path: &Path, lines: &[serde_json::Value]) {
+        std::fs::write(
+            path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
+    fn msg(i: usize, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": if i.is_multiple_of(2) { "user" } else { "assistant" },
+            "timestamp": format!("2026-02-22T10:00:{:02}Z", i),
+            "message": {"content": [{"type": "text", "text": text}]}
+        })
+    }
+
+    fn bulk(n: usize) -> Vec<serde_json::Value> {
+        (0..n)
+            .map(|i| msg(i, &format!("MSG{i:03}-{}", "x".repeat(390))))
+            .collect()
+    }
+
+    /// The core property: resuming from a cursor must reproduce exactly what a
+    /// full parse of the same file yields from that chunk onward.
+    #[test]
+    fn cursor_resume_matches_full_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resume.jsonl");
+
+        write_lines(&path, &bulk(5));
+        let first = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        let cursor = first
+            .next_cursor
+            .clone()
+            .expect("a cursor must be produced");
+
+        write_lines(&path, &bulk(11));
+        let full = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        let resumed = parse_jsonl_file_from_cursor(&path, "test", Some(&cursor)).unwrap();
+
+        let expected = &full.chunks[cursor.chunk_index..];
+        assert_eq!(
+            resumed.chunks.len(),
+            expected.len(),
+            "resumed parse must cover the same chunks"
+        );
+        for (r, e) in resumed.chunks.iter().zip(expected) {
+            assert_eq!(r.id, e.id, "chunk ids must line up across a resume");
+            assert_eq!(r.content, e.content, "content must be byte-identical");
+            assert_eq!(r.seq, e.seq);
+        }
+    }
+
+    /// A hard-split message emits several chunks at one offset; resuming must land
+    /// on the first of that group or the pieces get renumbered.
+    #[test]
+    fn cursor_resume_matches_full_parse_with_hard_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resume-split.jsonl");
+
+        let mut lines = bulk(3);
+        lines.push(msg(3, &format!("BIG-{}", "y".repeat(2600))));
+        write_lines(&path, &lines);
+        let first = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        let cursor = first.next_cursor.clone().unwrap();
+
+        lines.extend(bulk(3));
+        write_lines(&path, &lines);
+        let full = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        let resumed = parse_jsonl_file_from_cursor(&path, "test", Some(&cursor)).unwrap();
+
+        let expected = &full.chunks[cursor.chunk_index..];
+        assert_eq!(resumed.chunks.len(), expected.len());
+        for (r, e) in resumed.chunks.iter().zip(expected) {
+            assert_eq!(r.id, e.id);
+            assert_eq!(r.content, e.content);
+        }
+    }
+
+    /// A resumed parse never reads the head, so the summary must ride the cursor.
+    #[test]
+    fn cursor_carries_summary_across_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("summary.jsonl");
+
+        let mut lines = vec![serde_json::json!({"type":"summary","summary":"THE SUMMARY"})];
+        lines.extend(bulk(5));
+        write_lines(&path, &lines);
+        let first = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        let cursor = first.next_cursor.clone().unwrap();
+        assert_eq!(cursor.summary.as_deref(), Some("THE SUMMARY"));
+
+        lines.extend(bulk(3));
+        write_lines(&path, &lines);
+        let resumed = parse_jsonl_file_from_cursor(&path, "test", Some(&cursor)).unwrap();
+        assert!(
+            resumed
+                .chunks
+                .iter()
+                .all(|c| c.summary.as_deref() == Some("THE SUMMARY")),
+            "resumed chunks must keep the summary their siblings have"
+        );
+    }
+
+    /// With no summary line the first user message is the fallback, and it also
+    /// lives only in the head.
+    #[test]
+    fn cursor_carries_first_user_message_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fum.jsonl");
+
+        let mut lines = vec![msg(0, "OPENING REQUEST that is long enough to keep")];
+        lines.extend(bulk(5));
+        write_lines(&path, &lines);
+        let first = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        let cursor = first.next_cursor.clone().unwrap();
+        assert!(cursor
+            .first_user_message
+            .as_deref()
+            .is_some_and(|m| m.starts_with("OPENING REQUEST")));
+
+        lines.extend(bulk(3));
+        write_lines(&path, &lines);
+        let resumed = parse_jsonl_file_from_cursor(&path, "test", Some(&cursor)).unwrap();
+        assert!(resumed.chunks.iter().all(|c| c
+            .summary
+            .as_deref()
+            .is_some_and(|s| s.starts_with("OPENING REQUEST"))));
+    }
+
+    /// The sanitizer's open tool_use ids are genuine cross-line state. A seam
+    /// falling between a CSR tool_use and its tool_result must not leak the result.
+    #[test]
+    fn suppressed_tool_result_across_cursor_seam_is_still_suppressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seam-suppress.jsonl");
+
+        // The CSR tool_use must sit well BEFORE the cursor, with enough filler
+        // after it that the trailing chunk starts later in the file. Otherwise a
+        // resumed parse re-reads the tool_use and the carried ids are never needed.
+        let mut lines = bulk(4);
+        lines.push(serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-02-22T10:00:20Z",
+            "message": {"content": [
+                {"type":"tool_use","id":"csr-seam-1","name":"mcp__claude-self-reflect__reflect_on_past","input":{}},
+                {"type":"text","text":format!("CARRIER-{}", "w".repeat(380))}
+            ]}
+        }));
+        lines.extend((5..9).map(|i| msg(i, &format!("TAIL{i:03}-{}", "t".repeat(390)))));
+        write_lines(&path, &lines);
+        let first = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        let cursor = first.next_cursor.clone().unwrap();
+
+        // Sanity: the seam must actually fall after the tool_use, or this test
+        // proves nothing.
+        let tool_use_offset = {
+            let raw = std::fs::read_to_string(&path).unwrap();
+            raw.find("csr-seam-1").unwrap() as u64
+        };
+        assert!(
+            cursor.byte_offset > tool_use_offset,
+            "fixture is wrong: the cursor must sit after the tool_use line"
+        );
+        assert!(
+            cursor
+                .open_suppressed_tool_use_ids
+                .contains(&"csr-seam-1".to_string()),
+            "the unanswered tool_use id must ride the cursor"
+        );
+
+        lines.push(serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-02-22T10:00:30Z",
+            "message": {"content": [
+                {"type":"tool_result","tool_use_id":"csr-seam-1","content":"LEAKED CSR RESULT"}
+            ]}
+        }));
+        write_lines(&path, &lines);
+
+        let resumed = parse_jsonl_file_from_cursor(&path, "test", Some(&cursor)).unwrap();
+        let text = resumed
+            .chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains("LEAKED CSR RESULT"),
+            "a tool_result whose tool_use sits before the cursor must still be suppressed"
+        );
+    }
+
+    /// Suppression totals are absolute, so N incremental passes must agree with one
+    /// full parse rather than double-counting the re-parsed seam.
+    #[test]
+    fn suppression_counters_exact_across_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counters.jsonl");
+
+        let csr_call = |i: usize| {
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": format!("2026-02-22T10:01:{:02}Z", i),
+                "message": {"content": [
+                    {"type":"tool_use","id":format!("csr-{i}"),"name":"mcp__claude-self-reflect__store_reflection","input":{}},
+                    {"type":"text","text":format!("KEPT{i}-{}", "z".repeat(390))}
+                ]}
+            })
+        };
+
+        let mut lines = bulk(3);
+        lines.push(csr_call(1));
+        write_lines(&path, &lines);
+        let p1 = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        let c1 = p1.next_cursor.clone().unwrap();
+
+        lines.extend(bulk(2));
+        lines.push(csr_call(2));
+        write_lines(&path, &lines);
+        let p2 = parse_jsonl_file_from_cursor(&path, "test", Some(&c1)).unwrap();
+
+        let full = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        assert_eq!(
+            p2.suppression.csr_tool_blocks_suppressed, full.suppression.csr_tool_blocks_suppressed,
+            "incremental suppression totals must match a single full parse"
+        );
+    }
+
+    /// A cursor produced for one file must not be trusted for different content of
+    /// the same or greater length.
+    #[test]
+    fn head_fingerprint_detects_rewrite_at_same_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewrite.jsonl");
+
+        write_lines(&path, &bulk(5));
+        let before = head_fingerprint(&path);
+
+        let replaced: Vec<serde_json::Value> = (0..5)
+            .map(|i| msg(i, &format!("NEW{i:03}-{}", "q".repeat(390))))
+            .collect();
+        write_lines(&path, &replaced);
+        assert_ne!(
+            before,
+            head_fingerprint(&path),
+            "a rewritten head must change the fingerprint even at the same length"
+        );
     }
 }

@@ -733,6 +733,35 @@ impl Storage {
         queries::mark_file_imported_with_suppression(&mut conn, path, chunks, suppression)
     }
 
+    pub(crate) fn mark_file_imported_with_cursor(
+        &self,
+        path: &Path,
+        chunks: usize,
+        suppression: crate::import::CsrSuppressionStats,
+        cursor: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_file_imported_with_cursor(&mut conn, path, chunks, suppression, cursor)
+    }
+
+    /// Byte cursor to resume parsing this transcript from, if one is stored.
+    pub fn get_parse_cursor(&self, path: &Path) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_parse_cursor(&conn, path)
+    }
+
+    /// Drop a stored resume cursor, forcing the next import to parse in full.
+    /// Used by tests to reproduce a pre-migration or downgraded row.
+    #[cfg(test)]
+    pub(crate) fn clear_parse_cursor_for_test(&self, path: &Path) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.execute(
+            "UPDATE import_state SET parse_cursor = NULL WHERE file_path = ?1",
+            rusqlite::params![path.to_string_lossy().to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Read an import_state mtime keyed by a synthetic (non-filesystem) `file_path`,
     /// for aux-source adapters. See `queries::get_import_state_mtime`.
     pub fn get_import_state_mtime(&self, file_path: &str) -> Result<Option<String>> {

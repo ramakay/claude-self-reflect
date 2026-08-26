@@ -44,7 +44,8 @@ pub fn run(conn: &Connection) -> Result<()> {
             imported_at TEXT DEFAULT (datetime('now')),
             file_mtime TEXT,
             csr_tool_blocks_suppressed INTEGER NOT NULL DEFAULT 0,
-            csr_hook_wrappers_scrubbed INTEGER NOT NULL DEFAULT 0
+            csr_hook_wrappers_scrubbed INTEGER NOT NULL DEFAULT 0,
+            parse_cursor TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_import_conversation_id
@@ -478,6 +479,18 @@ pub fn run(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE import_state ADD COLUMN csr_hook_wrappers_scrubbed INTEGER;",
         )?;
+    }
+
+    // Byte offset to resume parsing a transcript from, so an append re-parses the
+    // trailing chunk instead of the whole file. Nullable with no default, so the
+    // ALTER is metadata-only even on a multi-gigabyte database. A NULL cursor
+    // simply falls back to a full parse, which is also what an older binary
+    // leaves behind -- that makes a downgrade fail-safe rather than corrupting.
+    let has_parse_cursor_col = conn
+        .prepare("SELECT parse_cursor FROM import_state LIMIT 0")
+        .is_ok();
+    if !has_parse_cursor_col {
+        conn.execute_batch("ALTER TABLE import_state ADD COLUMN parse_cursor TEXT;")?;
     }
 
     // Migration: add summary column to chunks table if missing (for timeline display)
