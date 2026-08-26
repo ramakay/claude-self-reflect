@@ -628,6 +628,12 @@ impl Storage {
         queries::delete_chunks_for_conversation(&conn, conversation_id)
     }
 
+    /// Delete specific chunks by id. See `queries::delete_chunks_by_ids`.
+    pub fn delete_chunks_by_ids(&self, ids: &[String]) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::delete_chunks_by_ids(&conn, ids)
+    }
+
     pub fn record_narrative_usage(&self, row: &NarrativeUsageRow) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::record_narrative_usage(&conn, row)
@@ -725,6 +731,47 @@ impl Storage {
     ) -> Result<()> {
         let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::mark_file_imported_with_suppression(&mut conn, path, chunks, suppression)
+    }
+
+    pub(crate) fn mark_file_imported_with_cursor(
+        &self,
+        path: &Path,
+        chunks: usize,
+        suppression: crate::import::CsrSuppressionStats,
+        cursor: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_file_imported_with_cursor(&mut conn, path, chunks, suppression, cursor)
+    }
+
+    /// Byte cursor to resume parsing this transcript from, if one is stored.
+    pub fn get_parse_cursor(&self, path: &Path) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_parse_cursor(&conn, path)
+    }
+
+    /// A chunk's SQLite rowid. INSERT OR REPLACE assigns a fresh one, so tests use
+    /// this to tell an untouched row from a rewritten one.
+    #[cfg(test)]
+    pub(crate) fn chunk_rowid_for_test(&self, id: &str) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(conn.query_row(
+            "SELECT rowid FROM chunks WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Drop a stored resume cursor, forcing the next import to parse in full.
+    /// Used by tests to reproduce a pre-migration or downgraded row.
+    #[cfg(test)]
+    pub(crate) fn clear_parse_cursor_for_test(&self, path: &Path) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.execute(
+            "UPDATE import_state SET parse_cursor = NULL WHERE file_path = ?1",
+            rusqlite::params![path.to_string_lossy().to_string()],
+        )?;
+        Ok(())
     }
 
     /// Read an import_state mtime keyed by a synthetic (non-filesystem) `file_path`,

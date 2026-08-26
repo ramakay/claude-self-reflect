@@ -247,9 +247,10 @@ impl Engine {
     }
 
     /// Import a single JSONL file: parse, embed, store chunks, enrich.
-    /// Supports incremental import — when a transcript grows mid-session,
-    /// only new chunks are embedded (chunks beyond prev_count are new).
-    /// Returns the number of NEW chunks imported (0 if nothing new).
+    /// Incremental — when a transcript grows mid-session only the chunks whose
+    /// content actually changed are re-embedded, which includes the trailing
+    /// chunk from the previous pass because it was flushed partial.
+    /// Returns the number of chunks written (0 if nothing changed).
     pub async fn import_file(&self, file_path: &Path, project_name: &str) -> Result<usize> {
         let attribution = import::ConversationAttribution {
             project_name: project_name.to_string(),
@@ -277,106 +278,29 @@ impl Engine {
                 parent,
             )?;
         }
-        // Check if file is unchanged (mtime match = fully imported, nothing new)
-        if self.storage.is_file_imported(file_path)? {
+
+        let ctx = import::incremental::ImportContext {
+            storage: &self.storage,
+            embeddings: &self.embeddings,
+            search: &self.search,
+        };
+        // Driven by the Stop hook and by bulk import, where the transcript is
+        // final — so the trailing chunk is sealed and indexed in the same pass.
+        let outcome = import::incremental::import_file_incremental(
+            &ctx,
+            file_path,
+            attribution,
+            import::incremental::SealPolicy::SealAll,
+        )
+        .await?;
+
+        if outcome.unchanged {
             return Ok(0);
         }
 
-        let parsed = import::parse_jsonl_file_with_stats(file_path, &attribution.project_name)?;
-        let suppression = parsed.suppression;
-        let chunks = parsed.chunks;
-        if chunks.is_empty() {
-            // Record the skip (agent transcripts, empty conversations) so the
-            // watcher doesn't re-parse the file every pass and import_percent
-            // counts it as processed instead of silently under-reporting.
-            self.storage
-                .mark_file_imported_with_suppression(file_path, 0, suppression)?;
-            return Ok(0);
-        }
+        import::incremental::maybe_enrich(&ctx, &outcome, file_path, attribution).await;
 
-        // Incremental: skip chunks we already embedded
-        let prev_count = self.storage.get_imported_chunk_count(file_path)?;
-        if chunks.len() <= prev_count {
-            // File parsed to same/fewer chunks — just update mtime
-            self.storage.mark_file_imported_with_suppression(
-                file_path,
-                chunks.len(),
-                suppression,
-            )?;
-            return Ok(0);
-        }
-
-        let new_chunks = &chunks[prev_count..];
-        const BATCH_SIZE: usize = 10;
-
-        for batch in new_chunks.chunks(BATCH_SIZE) {
-            let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
-            let emb = self.embeddings.clone();
-            let embeddings = tokio::task::spawn_blocking(move || {
-                let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-                emb.embed(&refs)
-            })
-            .await??;
-
-            let mut idx = self.search.write().await;
-            for (chunk, embedding) in batch.iter().zip(embeddings) {
-                self.storage
-                    .insert_chunk_with_source(chunk, &embedding, attribution.source)?;
-                // Persist provenance: who authored this chunk + its source conv.
-                // Supersession detection is deferred (None) — recall still gains
-                // from author-authority weighting. Non-fatal on error.
-                if let Err(e) = self.storage.insert_chunk_provenance(
-                    &chunk.id,
-                    &crate::provenance::ChunkProvenance {
-                        author: chunk.author,
-                        source_conv_id: attribution
-                            .parent_conversation_id
-                            .clone()
-                            .unwrap_or_else(|| chunk.conversation_id.clone()),
-                        supersedes: None,
-                    },
-                ) {
-                    eprintln!("CSR: chunk provenance persist error (non-fatal): {e}");
-                }
-                idx.insert_chunk(chunk.id.clone(), embedding);
-            }
-        }
-
-        self.storage
-            .mark_file_imported_with_suppression(file_path, chunks.len(), suppression)?;
-
-        // Layer 1: Heuristic enrichment only on first import (not incremental updates)
-        if prev_count == 0 {
-            let conv_id = file_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            if !self
-                .storage
-                .is_conversation_enriched(&conv_id, "heuristic")
-                .unwrap_or(false)
-            {
-                if let Err(e) = crate::extraction::heuristic::enrich_conversation(
-                    file_path,
-                    &conv_id,
-                    &attribution.project_name,
-                    &self.storage,
-                    &self.embeddings,
-                    &self.search,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        conv = %conv_id,
-                        error = %e,
-                        "heuristic enrichment failed (non-fatal)"
-                    );
-                }
-            }
-        }
-
-        Ok(new_chunks.len())
+        Ok(outcome.written_chunks)
     }
 
     /// Backfill missing import_state rows and run heuristic enrichment for all unenriched conversations.
