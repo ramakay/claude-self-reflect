@@ -1097,6 +1097,19 @@ pub fn is_file_imported(conn: &Connection, path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Read the stored resume cursor for a transcript, if any.
+pub fn get_parse_cursor(conn: &Connection, path: &Path) -> Result<Option<String>> {
+    let path_str = path.to_string_lossy().to_string();
+    conn.query_row(
+        "SELECT parse_cursor FROM import_state WHERE file_path = ?1",
+        params![path_str],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(Option::flatten)
+    .map_err(Into::into)
+}
+
 /// Get file modification time as a string for comparison.
 fn file_mtime_str(path: &Path) -> String {
     path.metadata()
@@ -1125,7 +1138,8 @@ pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Resu
          ON CONFLICT(file_path) DO UPDATE SET
              conversation_id = excluded.conversation_id,
              chunks_imported = excluded.chunks_imported,
-             file_mtime = excluded.file_mtime",
+             file_mtime = excluded.file_mtime,
+             parse_cursor = NULL",
         params![path_str, conv_id, chunks as i64, mtime],
     )?;
     Ok(())
@@ -1134,11 +1148,26 @@ pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Resu
 /// Atomically persist import state and apply only newly observed per-file CSR
 /// suppression totals. The import-state row is written before counter deltas;
 /// any failure rolls both back.
+/// Record an import, leaving no resume cursor. Callers that do not understand
+/// cursors must clear rather than preserve one: a stale offset is worse than a
+/// full reparse.
 pub(crate) fn mark_file_imported_with_suppression(
     conn: &mut Connection,
     path: &Path,
     chunks: usize,
     suppression: CsrSuppressionStats,
+) -> Result<()> {
+    mark_file_imported_with_cursor(conn, path, chunks, suppression, None)
+}
+
+/// Record an import together with the byte cursor to resume from next time.
+/// `cursor` of `None` writes SQL NULL, which forces a full parse.
+pub(crate) fn mark_file_imported_with_cursor(
+    conn: &mut Connection,
+    path: &Path,
+    chunks: usize,
+    suppression: CsrSuppressionStats,
+    cursor: Option<&str>,
 ) -> Result<()> {
     let tx = conn.transaction()?;
     let path_str = path.to_string_lossy().to_string();
@@ -1168,18 +1197,33 @@ pub(crate) fn mark_file_imported_with_suppression(
         .unwrap_or_default();
     let mtime = file_mtime_str(path);
 
+    // Deliberately not INSERT OR REPLACE: that deletes the row and reinserts it,
+    // so every column absent from the VALUES list silently becomes NULL. An
+    // upsert names exactly what it changes and leaves anything added later alone.
     tx.execute(
-        "INSERT OR REPLACE INTO import_state
+        "INSERT INTO import_state
          (file_path, conversation_id, chunks_imported, file_mtime,
-          csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+          csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed, parse_cursor)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(file_path) DO UPDATE SET
+             conversation_id = excluded.conversation_id,
+             chunks_imported = excluded.chunks_imported,
+             file_mtime = excluded.file_mtime,
+             csr_tool_blocks_suppressed = excluded.csr_tool_blocks_suppressed,
+             csr_hook_wrappers_scrubbed = excluded.csr_hook_wrappers_scrubbed,
+             parse_cursor = excluded.parse_cursor,
+             -- INSERT OR REPLACE reset this via the column DEFAULT. An upsert
+             -- leaves it alone, which would silently turn a last-import
+             -- timestamp into a first-import one.
+             imported_at = datetime('now')",
         params![
             path_str,
             conv_id,
             chunks as i64,
             mtime,
             persisted_tool,
-            persisted_wrappers
+            persisted_wrappers,
+            cursor
         ],
     )?;
 
