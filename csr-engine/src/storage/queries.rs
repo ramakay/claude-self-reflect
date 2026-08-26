@@ -1281,8 +1281,17 @@ pub fn upsert_import_state_explicit(
     chunks: usize,
     mtime: &str,
 ) -> Result<()> {
+    // Upsert, not INSERT OR REPLACE: the latter deletes the row and reinserts it,
+    // zeroing the suppression counters and dropping any parse cursor simply
+    // because this statement does not name them.
     conn.execute(
-        "INSERT OR REPLACE INTO import_state (file_path, conversation_id, chunks_imported, file_mtime) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO import_state (file_path, conversation_id, chunks_imported, file_mtime)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(file_path) DO UPDATE SET
+             conversation_id = excluded.conversation_id,
+             chunks_imported = excluded.chunks_imported,
+             file_mtime = excluded.file_mtime,
+             imported_at = datetime('now')",
         params![file_path, conversation_id, chunks as i64, mtime],
     )?;
     Ok(())
