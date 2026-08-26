@@ -627,26 +627,49 @@ pub(crate) fn import_changed_rollouts(engine: &Engine, root: &Path) -> Result<Ro
             stats.vanished += 1;
             continue;
         };
-        let old_ids = storage.get_chunk_ids_for_conversation(&metadata.conversation_id)?;
-        storage.delete_chunks_for_conversation(&metadata.conversation_id)?;
-        if !old_ids.is_empty() {
-            let mut index = engine.search().blocking_write();
-            for id in old_ids {
-                index.remove_chunk(&id);
-            }
-        }
+        let key = file.path.to_string_lossy().to_string();
+        let prev_count = storage.get_imported_chunk_count(&file.path)?;
+
+        // Rollouts used to be deleted and rebuilt in full on any change, so a
+        // session that grew by one message re-embedded its entire history.
+        //
+        // Unlike a Claude transcript, a rollout chunk is frozen the moment it is
+        // written: `visit_rollout_message_chunks` splits each message on its own
+        // with no carry-over buffer, so there is no trailing partial chunk that
+        // grows. That makes a content comparison sufficient — and a primary-key
+        // lookup is nothing next to an embedding.
+        let mut reused = 0usize;
         let outcome = stream_rollout_chunk_batches(
             &file.path,
             &metadata,
             ROLLOUT_EMBED_BATCH_SIZE,
             |chunks| {
-                let texts = chunks
+                let mut todo: Vec<(&ConversationChunk, bool)> = Vec::new();
+                {
+                    let index = engine.search().blocking_read();
+                    for chunk in chunks {
+                        let unchanged = storage
+                            .get_chunk_content(&chunk.id)?
+                            .is_some_and(|stored| stored == chunk.content);
+                        let indexed = index.has_chunk(&chunk.id);
+                        if unchanged && indexed {
+                            reused += 1;
+                            continue;
+                        }
+                        todo.push((chunk, indexed));
+                    }
+                }
+                if todo.is_empty() {
+                    return Ok(());
+                }
+
+                let texts = todo
                     .iter()
-                    .map(|chunk| chunk.content.as_str())
+                    .map(|(chunk, _)| chunk.content.as_str())
                     .collect::<Vec<_>>();
                 let embeddings = engine.embeddings().embed(&texts)?;
                 let mut index = engine.search().blocking_write();
-                for (chunk, embedding) in chunks.iter().zip(embeddings) {
+                for ((chunk, indexed), embedding) in todo.into_iter().zip(embeddings) {
                     storage.insert_chunk_with_source(chunk, &embedding, "codex_rollout")?;
                     storage.insert_chunk_provenance(
                         &chunk.id,
@@ -656,16 +679,40 @@ pub(crate) fn import_changed_rollouts(engine: &Engine, root: &Path) -> Result<Ro
                             supersedes: None,
                         },
                     )?;
+                    // insert_chunk is a no-op for a known id, so a changed chunk
+                    // keeps its stale vector unless it is blanked first.
+                    if indexed {
+                        index.remove_chunk(&chunk.id);
+                    }
                     index.insert_chunk(chunk.id.clone(), embedding);
                 }
                 Ok(())
             },
         )?;
+
+        // A rollout that shrank leaves orphan tail chunks still matching content
+        // that no longer exists. The wholesale delete used to cover this.
+        if outcome.chunks < prev_count {
+            let orphans = (outcome.chunks..prev_count)
+                .map(|seq| super::generate_chunk_id(&metadata.conversation_id, seq))
+                .collect::<Vec<_>>();
+            tracing::warn!(
+                conv = %metadata.conversation_id,
+                previous = prev_count,
+                current = outcome.chunks,
+                "codex rollout shrank — dropping orphan tail chunks"
+            );
+            storage.delete_chunks_by_ids(&orphans)?;
+            let mut index = engine.search().blocking_write();
+            for id in &orphans {
+                index.remove_chunk(id);
+            }
+        }
+
         storage.bump_aux_counter_by("codex_rollout", outcome.schema_misses)?;
         stats.schema_misses += outcome.schema_misses;
         stats.csr_tool_blocks_suppressed += outcome.suppression.csr_tool_blocks_suppressed;
         stats.csr_hook_wrappers_scrubbed += outcome.suppression.csr_hook_wrappers_scrubbed;
-        let key = file.path.to_string_lossy();
         storage.upsert_import_state_explicit(
             &key,
             &metadata.conversation_id,
@@ -674,6 +721,13 @@ pub(crate) fn import_changed_rollouts(engine: &Engine, root: &Path) -> Result<Ro
         )?;
         stats.files_imported += 1;
         stats.chunks_imported += outcome.chunks;
+        tracing::debug!(
+            conv = %metadata.conversation_id,
+            total = outcome.chunks,
+            embedded = outcome.chunks.saturating_sub(reused),
+            reused,
+            "codex rollout imported"
+        );
     }
     Ok(stats)
 }
@@ -682,6 +736,152 @@ pub(crate) fn import_changed_rollouts(engine: &Engine, root: &Path) -> Result<Ro
 mod tests {
     use super::*;
     use std::path::Path;
+
+    use std::sync::Arc;
+
+    /// Build a rollout whose messages are long enough to produce several chunks each.
+    fn write_rollout(path: &Path, id: &str, messages: usize) {
+        let mut lines = vec![serde_json::json!({
+            "timestamp": "2026-08-06T12:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "timestamp": "2026-08-06T12:00:00Z",
+                "cwd": "/workspace/synthetic-project",
+                "source": "synthetic"
+            }
+        })];
+        for i in 0..messages {
+            lines.push(serde_json::json!({
+                "timestamp": format!("2026-08-06T12:00:{:02}Z", i + 1),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": format!("msg-{i}"),
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "content": [{"type": "input_text", "text": format!("ROLLOUT{i:03}-{}", "x".repeat(1900))}]
+                }
+            }));
+        }
+        std::fs::write(
+            path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    /// A rollout that grows must re-embed only its new chunks. The old code
+    /// deleted the conversation and rebuilt it in full on every change, so a
+    /// session that gained one message re-embedded its whole history.
+    #[test]
+    fn growing_rollout_reuses_existing_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let rollout = root.join("rollout-2026-08-06T12-00-00-grow.jsonl");
+
+        let engine = crate::engine::Engine::from_parts(
+            Arc::new(crate::storage::Storage::open_memory().unwrap()),
+            Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
+                256,
+            ))),
+            dir.path().to_path_buf(),
+        );
+
+        write_rollout(&rollout, "grow-fixture", 4);
+        let first = import_changed_rollouts(&engine, &root).unwrap();
+        assert!(
+            first.chunks_imported > 4,
+            "fixture must yield several chunks"
+        );
+
+        let snapshot = |engine: &crate::engine::Engine| -> Vec<(String, i64)> {
+            engine
+                .storage()
+                .get_chunk_ids_for_conversation("codex:grow-fixture")
+                .unwrap()
+                .into_iter()
+                .map(|id| {
+                    let rowid = engine.storage().chunk_rowid_for_test(&id).unwrap();
+                    (id, rowid)
+                })
+                .collect()
+        };
+        let before: std::collections::HashMap<_, _> = snapshot(&engine).into_iter().collect();
+        assert_eq!(before.len(), first.chunks_imported);
+
+        write_rollout(&rollout, "grow-fixture", 6);
+        let second = import_changed_rollouts(&engine, &root).unwrap();
+        assert!(second.chunks_imported > first.chunks_imported);
+
+        // INSERT OR REPLACE assigns a fresh rowid, so an untouched chunk keeps its
+        // original one. Every pre-existing chunk must be untouched.
+        let after: std::collections::HashMap<_, _> = snapshot(&engine).into_iter().collect();
+        let rewritten = before
+            .iter()
+            .filter(|(id, rowid)| after.get(*id).is_some_and(|now| now != *rowid))
+            .count();
+        assert_eq!(
+            rewritten, 0,
+            "a grown rollout must not rewrite chunks it already had"
+        );
+
+        // And the new content must actually be there.
+        let text = after
+            .keys()
+            .filter_map(|id| engine.storage().get_chunk_content(id).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("ROLLOUT005"), "new messages must be imported");
+    }
+
+    /// A rollout that shrinks must drop the orphan tail the wholesale delete used
+    /// to remove.
+    #[test]
+    fn shrinking_rollout_drops_orphan_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let rollout = root.join("rollout-2026-08-06T12-00-00-shrink.jsonl");
+
+        let engine = crate::engine::Engine::from_parts(
+            Arc::new(crate::storage::Storage::open_memory().unwrap()),
+            Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
+                256,
+            ))),
+            dir.path().to_path_buf(),
+        );
+
+        write_rollout(&rollout, "shrink-fixture", 6);
+        let big = import_changed_rollouts(&engine, &root).unwrap();
+
+        write_rollout(&rollout, "shrink-fixture", 2);
+        let small = import_changed_rollouts(&engine, &root).unwrap();
+        assert!(small.chunks_imported < big.chunks_imported);
+
+        let stored = engine
+            .storage()
+            .get_chunk_ids_for_conversation("codex:shrink-fixture")
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            small.chunks_imported,
+            "no orphan tail chunks may survive a shrink"
+        );
+        let text = stored
+            .iter()
+            .filter_map(|id| engine.storage().get_chunk_content(id).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("ROLLOUT005"), "dropped content must be gone");
+    }
 
     #[test]
     fn modern_fixture_parses_messages_cwd_and_scrubs_csr_calls() {

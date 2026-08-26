@@ -750,6 +750,18 @@ impl Storage {
         queries::get_parse_cursor(&conn, path)
     }
 
+    /// A chunk's SQLite rowid. INSERT OR REPLACE assigns a fresh one, so tests use
+    /// this to tell an untouched row from a rewritten one.
+    #[cfg(test)]
+    pub(crate) fn chunk_rowid_for_test(&self, id: &str) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(conn.query_row(
+            "SELECT rowid FROM chunks WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Drop a stored resume cursor, forcing the next import to parse in full.
     /// Used by tests to reproduce a pre-migration or downgraded row.
     #[cfg(test)]
