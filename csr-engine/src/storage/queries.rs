@@ -291,6 +291,30 @@ pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) 
     Ok(())
 }
 
+/// Delete specific chunks by id, with the same table ordering as
+/// [`delete_chunks_for_conversation`]. Used when a transcript shrinks with an
+/// intact head: the valid prefix is kept and only the orphan tail is dropped.
+pub fn delete_chunks_by_ids(conn: &Connection, ids: &[String]) -> Result<()> {
+    for id in ids {
+        // chunks_fts is rowid-addressed with no FK, so it must go before the
+        // owning chunks row disappears and the rowid lookup goes stale.
+        conn.execute(
+            "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
+            params![id],
+        )?;
+        conn.execute(
+            "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
+            params![id],
+        )?;
+        conn.execute(
+            "DELETE FROM chunk_provenance WHERE chunk_id = ?1",
+            params![id],
+        )?;
+        conn.execute("DELETE FROM chunks WHERE id = ?1", params![id])?;
+    }
+    Ok(())
+}
+
 pub fn load_all_chunk_vectors(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> {
     let mut stmt = conn.prepare("SELECT chunk_id, embedding FROM chunk_embeddings")?;
     let rows = stmt.query_map([], |row| {

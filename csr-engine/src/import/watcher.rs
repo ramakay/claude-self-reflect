@@ -14,9 +14,6 @@ use crate::storage::Storage;
 /// Debounce interval for collecting file changes before processing.
 const DEBOUNCE_SECS: u64 = 5;
 
-/// Batch size for embedding during auto-import.
-const BATCH_SIZE: usize = 10;
-
 /// Watches the Claude projects directory for new JSONL files and auto-imports them.
 pub struct FileWatcher {
     projects_dir: PathBuf,
@@ -159,8 +156,10 @@ impl FileWatcher {
         Ok(())
     }
 
-    /// Import a single JSONL file: parse → embed → store → index.
-    async fn import_file(&self, file_path: &Path) -> Result<()> {
+    /// Import a single JSONL file. Parse, embed, store and index all live in
+    /// [`import::incremental`], shared with `Engine::import_file` so the two
+    /// copies of this routine cannot drift apart again.
+    pub(crate) async fn import_file(&self, file_path: &Path) -> Result<()> {
         // Security: resolve symlinks and verify the file is within our projects directory
         let canonical = file_path
             .canonicalize()
@@ -193,85 +192,34 @@ impl FileWatcher {
             )?;
         }
 
-        // Skip if already imported
-        if self.storage.is_file_imported(file_path)? {
+        let ctx = import::incremental::ImportContext {
+            storage: &self.storage,
+            embeddings: &self.embeddings,
+            search: &self.search,
+        };
+        // A watched transcript belongs to a live session, so its trailing chunk is
+        // still growing. Its content reaches SQLite and FTS immediately, but it
+        // stays out of HNSW until it stops changing — indexing it early would
+        // freeze a vector representing only its first fragment.
+        let outcome = import::incremental::import_file_incremental(
+            &ctx,
+            file_path,
+            &attribution,
+            import::incremental::SealPolicy::DeferTrailing,
+        )
+        .await?;
+
+        if outcome.unchanged {
             return Ok(());
         }
 
-        let parsed = import::parse_jsonl_file_with_stats(file_path, &attribution.project_name)?;
-        let suppression = parsed.suppression;
-        let chunks = parsed.chunks;
-        if chunks.is_empty() {
-            // Record the skip so this file isn't re-parsed every watcher pass
-            // and import_percent counts it as processed.
-            self.storage
-                .mark_file_imported_with_suppression(file_path, 0, suppression)?;
-            return Ok(());
-        }
-
-        let chunk_count = chunks.len();
-
-        // Batch embed and store
-        for batch in chunks.chunks(BATCH_SIZE) {
-            let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
-            let emb = self.embeddings.clone();
-            let embeddings = tokio::task::spawn_blocking(move || {
-                let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-                emb.embed(&refs)
-            })
-            .await??;
-
-            let mut idx = self.search.write().await;
-            for (chunk, embedding) in batch.iter().zip(embeddings) {
-                self.storage
-                    .insert_chunk_with_source(chunk, &embedding, attribution.source)?;
-                if let Err(error) = self.storage.insert_chunk_provenance(
-                    &chunk.id,
-                    &crate::provenance::ChunkProvenance {
-                        author: chunk.author,
-                        source_conv_id: attribution
-                            .parent_conversation_id
-                            .clone()
-                            .unwrap_or_else(|| chunk.conversation_id.clone()),
-                        supersedes: None,
-                    },
-                ) {
-                    tracing::warn!(error = %error, chunk = %chunk.id, "chunk provenance persist failed");
-                }
-                idx.insert_chunk(chunk.id.clone(), embedding);
-            }
-        }
-
-        self.storage
-            .mark_file_imported_with_suppression(file_path, chunk_count, suppression)?;
-
-        // Layer 1: Heuristic enrichment (inline, instant, free)
-        if !self
-            .storage
-            .is_conversation_enriched(&conv_id, "heuristic")
-            .unwrap_or(false)
-        {
-            if let Err(e) = crate::extraction::heuristic::enrich_conversation(
-                file_path,
-                &conv_id,
-                &attribution.project_name,
-                &self.storage,
-                &self.embeddings,
-                &self.search,
-            )
-            .await
-            {
-                tracing::warn!(
-                    conv = %conv_id,
-                    error = %e,
-                    "heuristic enrichment failed (non-fatal)"
-                );
-            }
-        }
+        import::incremental::maybe_enrich(&ctx, &outcome, file_path, &attribution).await;
 
         tracing::info!(
             file = %file_path.display(),
-            chunks = chunk_count,
+            chunks = outcome.total_chunks,
+            written = outcome.written_chunks,
+            indexed = outcome.indexed_chunks,
             project = %attribution.project_name,
             source = attribution.source,
             "auto-imported conversation"

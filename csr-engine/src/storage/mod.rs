@@ -628,6 +628,12 @@ impl Storage {
         queries::delete_chunks_for_conversation(&conn, conversation_id)
     }
 
+    /// Delete specific chunks by id. See `queries::delete_chunks_by_ids`.
+    pub fn delete_chunks_by_ids(&self, ids: &[String]) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::delete_chunks_by_ids(&conn, ids)
+    }
+
     pub fn record_narrative_usage(&self, row: &NarrativeUsageRow) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::record_narrative_usage(&conn, row)

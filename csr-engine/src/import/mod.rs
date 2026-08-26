@@ -1,6 +1,7 @@
 pub mod backfill;
 pub mod codex_rollout;
 pub mod coedit_backfill;
+pub(crate) mod incremental;
 pub mod plans;
 pub mod registry;
 pub mod watcher;
@@ -953,7 +954,7 @@ fn is_csr_server_name(identity: &str) -> bool {
 }
 
 /// Generate a deterministic chunk ID using UUIDv5.
-fn generate_chunk_id(conversation_id: &str, chunk_index: usize) -> String {
+pub(crate) fn generate_chunk_id(conversation_id: &str, chunk_index: usize) -> String {
     let input = format!("{}-chunk-{}", conversation_id, chunk_index);
     Uuid::new_v5(&CSR_NAMESPACE, input.as_bytes()).to_string()
 }
