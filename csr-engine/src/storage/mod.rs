@@ -2,6 +2,7 @@ pub mod ancestry;
 pub mod chunk_binding;
 pub mod codegraph;
 pub mod dream_attribution;
+pub mod dream_backfill;
 pub mod dream_clusters;
 pub mod dream_delivery;
 pub mod dream_items;

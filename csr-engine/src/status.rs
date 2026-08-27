@@ -48,6 +48,53 @@ pub struct StatusReport {
     pub dream_threads: DreamThreadStatus,
     /// Latest chronological trained re-ranker gate and runtime activation.
     pub trained_rerank: TrainedRerankStatus,
+    /// Dream backfill pipeline (`.plans/dream-backfill-design.md`) — stage
+    /// cursors, adjudication spend/discard rate, and drain queue depth.
+    /// See `gather_backfill`.
+    pub backfill: BackfillStatus,
+}
+
+/// One `backfill_state` checkpoint row (design §3 "Crash safety /
+/// idempotency"). Only the `adjudicate` stage writes one today — Stages
+/// 0-3 are cheap, idempotent full-rescans with nothing to checkpoint.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct BackfillStageCursor {
+    pub stage: String,
+    pub project: String,
+    /// Opaque, stage-owned JSON payload (`backfill_state.cursor`).
+    pub cursor: Option<String>,
+    pub updated_at: String,
+}
+
+/// Dream backfill status block (design §4 / §8 D11: "Status: `backfill`
+/// block in `csr-engine status` (stage cursors, calls spent, discard rate,
+/// backlog count, dreams queued, canary flag)").
+#[derive(Serialize, Debug, Default, PartialEq)]
+pub struct BackfillStatus {
+    pub stage_cursors: Vec<BackfillStageCursor>,
+    /// Adjudication (`claude -p`) calls spent to date across every backfill
+    /// run, from `narrative_usage` (`call_site = 'dream_backfill_adjudicate'`).
+    pub calls_spent: i64,
+    /// `backfill_discards` rows / (discards + ever-witnessed relations).
+    /// `None` until at least one candidate has ever been adjudicated — a
+    /// rate computed from a zero denominator would read as a real 0%,
+    /// which is not the same as "no adjudication has happened yet".
+    pub discard_rate: Option<f64>,
+    /// Candidates still awaiting adjudication (`dream_relations` rows with
+    /// `status = 'queued' AND tier = 'unverified'`) — the resumable backlog
+    /// [`crate::dream::backfill::adjudicate::queue_depth`] reports.
+    pub backlog: usize,
+    /// Verified relations ready to drain right now (`status = 'queued' AND
+    /// tier = 'witnessed'`) — cheap SQL only; unlike `dream backfill
+    /// --report`, this deliberately does NOT also re-run the Queue U scan
+    /// (`unfinished::scan_unfinished`) on every `status` call, since that
+    /// scan's cosine/tau-fit work is too heavy for a call meant to stay
+    /// fast without an `EmbeddingEngine` — see this module's own doc.
+    pub dreams_queued: usize,
+    /// D5's canary: the last adjudication run's UNRELATED rate landed
+    /// outside the healthy 10-40% band. `false` when no run has ever
+    /// recorded a verdict.
+    pub adjudicator_suspect: bool,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Default)]
@@ -504,6 +551,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             dream: DreamStatus::default(),
             dream_threads: DreamThreadStatus::default(),
             trained_rerank: empty_trained_rerank_status(),
+            backfill: BackfillStatus::default(),
         });
     }
 
@@ -559,6 +607,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let dream_threads = gather_dream_threads(&storage);
     let memory_registry = gather_memory_registry(&storage);
     let trained_rerank = gather_trained_rerank(&storage);
+    let backfill = gather_backfill(&storage);
 
     Ok(StatusReport {
         mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
@@ -584,6 +633,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         dream,
         dream_threads,
         trained_rerank,
+        backfill,
     })
 }
 
@@ -762,6 +812,90 @@ fn gather_dream_threads(storage: &Storage) -> DreamThreadStatus {
         converged,
         model: crate::dream::threads::primary_thread_model(),
         actor_cmd_configured: crate::dream::threads::night_actor_cmd_configured(),
+    }
+}
+
+/// Assemble the dream backfill status block (design §4 / §8 D11). Fail-soft
+/// to defaults — must never fail on a pre-migration schema gap (mirrors
+/// `gather_dream_threads`).
+fn gather_backfill(storage: &Storage) -> BackfillStatus {
+    let stage_cursors = storage
+        .with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT stage, project, cursor, updated_at FROM backfill_state ORDER BY stage, project",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(BackfillStageCursor {
+                    stage: r.get(0)?,
+                    project: r.get(1)?,
+                    cursor: r.get(2)?,
+                    updated_at: r.get(3)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap_or_default();
+
+    let calls_spent = storage
+        .with_connection(|conn| {
+            crate::storage::queries::narrative_usage_for_call_sites(
+                conn,
+                &[crate::dream::backfill::adjudicate::ADJUDICATE_CALL_SITE],
+            )
+        })
+        .unwrap_or_default()
+        .iter()
+        .map(|m| m.calls)
+        .sum();
+
+    let (discards, witnessed) = storage
+        .with_connection(|conn| {
+            let discards: i64 =
+                conn.query_row("SELECT COUNT(*) FROM backfill_discards", [], |r| r.get(0))?;
+            let witnessed: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM dream_relations WHERE tier = 'witnessed'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((discards, witnessed))
+        })
+        .unwrap_or((0, 0));
+    let discard_rate = if discards + witnessed == 0 {
+        None
+    } else {
+        Some(discards as f64 / (discards + witnessed) as f64)
+    };
+
+    let backlog = storage
+        .with_connection(crate::dream::backfill::adjudicate::queue_depth)
+        .unwrap_or(0);
+
+    let dreams_queued: i64 = storage
+        .with_connection(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM dream_relations WHERE status = 'queued' AND tier = 'witnessed'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .unwrap_or(0);
+
+    let adjudicator_suspect = storage
+        .with_connection(crate::dream::backfill::adjudicate::read_backfill_state)
+        .unwrap_or(None)
+        .and_then(|cursor| serde_json::from_str::<serde_json::Value>(&cursor).ok())
+        .and_then(|v| v.get("adjudicator_suspect").and_then(|b| b.as_bool()))
+        .unwrap_or(false);
+
+    BackfillStatus {
+        stage_cursors,
+        calls_spent,
+        discard_rate,
+        backlog,
+        dreams_queued: dreams_queued.max(0) as usize,
+        adjudicator_suspect,
     }
 }
 
@@ -1392,6 +1526,7 @@ mod tests {
             dream: DreamStatus::default(),
             dream_threads: DreamThreadStatus::default(),
             trained_rerank: empty_trained_rerank_status(),
+            backfill: BackfillStatus::default(),
         }
     }
 
@@ -1856,6 +1991,117 @@ mod tests {
         assert_eq!(report.dream.ancestry_cached_conversations, 1);
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["dream"]["ancestry_cached_conversations"], 1);
+    }
+
+    #[test]
+    fn status_backfill_block_defaults_to_empty_on_fresh_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        Storage::open(&db_path).unwrap();
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert_eq!(report.backfill, BackfillStatus::default());
+        assert!(report.backfill.stage_cursors.is_empty());
+        assert_eq!(report.backfill.calls_spent, 0);
+        assert_eq!(report.backfill.discard_rate, None);
+        assert_eq!(report.backfill.backlog, 0);
+        assert_eq!(report.backfill.dreams_queued, 0);
+        assert!(!report.backfill.adjudicator_suspect);
+    }
+
+    #[test]
+    fn status_backfill_block_surfaces_stage_cursor_spend_discard_rate_and_canary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                // A checkpoint from a completed adjudicate run, canary tripped.
+                conn.execute(
+                    "INSERT INTO backfill_state (stage, project, cursor)
+                     VALUES ('adjudicate', '', '{\"adjudicator_suspect\": true}')",
+                    [],
+                )?;
+                // Two decided candidates: one witnessed, one discarded ->
+                // discard_rate = 1 / (1 + 1) = 0.5.
+                conn.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp)
+                     VALUES ('ea', '{\"schema\":\"v2\",\"session_id\":\"ea\",\"project\":\"p\",
+                              \"timestamp\":\"2020-01-01T00:00:00Z\",\"request\":\"r\",
+                              \"completed\":\"c\",\"outcome\":\"completed\",\"todos\":[],
+                              \"files_modified\":[],\"anchors\":[]}', '[]', '2020-01-01T00:00:00Z')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp)
+                     VALUES ('eb', '{\"schema\":\"v2\",\"session_id\":\"eb\",\"project\":\"p\",
+                              \"timestamp\":\"2020-02-01T00:00:00Z\",\"request\":\"r\",
+                              \"completed\":\"c\",\"outcome\":\"completed\",\"todos\":[],
+                              \"files_modified\":[],\"anchors\":[]}', '[]', '2020-02-01T00:00:00Z')",
+                    [],
+                )?;
+                crate::storage::dream_backfill::materialize_episode_index(conn)?;
+                conn.execute(
+                    "INSERT INTO dream_relations
+                        (project, ep_a, ep_b, relation, generator, topic_key, tier, status)
+                     VALUES ('p', 'ea', 'eb', 'replaced_by', 'ledger', 'symbol:witnessed_one',
+                             'witnessed', 'queued')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO dream_relations
+                        (project, ep_a, ep_b, relation, generator, topic_key, tier, status)
+                     VALUES ('p', 'ea', 'eb', 'extended_by', 'ledger', 'symbol:awaiting_one',
+                             'unverified', 'queued')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO backfill_discards (pair_key, reason, raw_json)
+                     VALUES ('p:ea:eb', 'fabricated_quote_a', '{}')",
+                    [],
+                )?;
+                crate::storage::queries::record_narrative_usage(
+                    conn,
+                    &crate::storage::queries::NarrativeUsageRow {
+                        call_site: crate::dream::backfill::adjudicate::ADJUDICATE_CALL_SITE
+                            .to_string(),
+                        model: "haiku".to_string(),
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                        duration_ms: 100,
+                        success: true,
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert_eq!(report.backfill.stage_cursors.len(), 1);
+        assert_eq!(report.backfill.stage_cursors[0].stage, "adjudicate");
+        assert_eq!(report.backfill.calls_spent, 1);
+        assert_eq!(report.backfill.discard_rate, Some(0.5));
+        assert_eq!(
+            report.backfill.backlog, 1,
+            "the still-unverified queued row is the backlog"
+        );
+        assert_eq!(
+            report.backfill.dreams_queued, 1,
+            "the witnessed+queued row is ready to drain"
+        );
+        assert!(report.backfill.adjudicator_suspect);
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["backfill"]["calls_spent"], 1);
+        assert_eq!(json["backfill"]["adjudicator_suspect"], true);
     }
 
     #[test]

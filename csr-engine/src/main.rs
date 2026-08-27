@@ -250,6 +250,14 @@ enum Commands {
     /// anchor_reinstated). Idempotent: re-running at an unchanged HEAD with
     /// unchanged conclusions writes nothing new.
     Dream {
+        /// Dream BACKFILL pipeline (`.plans/dream-backfill-design.md`):
+        /// `backfill` mines historical episodes for forgotten-but-consequential
+        /// supersessions; `drain` composes the ranked queue into `dreams_v1`.
+        /// When omitted, the flags below run the ORIGINAL v10 witness-ledger
+        /// dream cycle unchanged.
+        #[command(subcommand)]
+        action: Option<DreamAction>,
+
         /// Compute and print the summary without writing verdict events.
         /// The prerequisite HEAD stamp-spans pass still runs FOR REAL
         /// (append-only witness_ledger evidence, harmless and idempotent) —
@@ -289,6 +297,63 @@ enum Commands {
         /// Current working directory (for project resolution)
         #[arg(long)]
         cwd: String,
+    },
+}
+
+/// `csr-engine dream backfill` / `csr-engine dream drain`
+/// (`.plans/dream-backfill-design.md` §4). A nested subcommand of `Dream`
+/// rather than new flags directly on it: `backfill`'s own `--dry-run`/
+/// `--report` mean something entirely different from the witness-ledger
+/// `dream` command's flags of the same name, and clap subcommand namespaces
+/// keep the two from colliding.
+#[derive(Subcommand, Debug)]
+enum DreamAction {
+    /// Deterministic supersession mining over historical episodes, with a
+    /// single budgeted LLM adjudication stage. See
+    /// `dream::backfill::cli::handle_backfill`'s doc for `--stage`'s exact
+    /// semantics.
+    Backfill {
+        /// Restrict to one project (matches the stored project name exactly).
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Hard cap on adjudication (`claude -p`) calls this run may spend.
+        #[arg(long, default_value_t = csr_engine::dream::backfill::adjudicate::DEFAULT_BUDGET_CALLS)]
+        budget_calls: usize,
+
+        /// Stages 0-3 only (materialize, unfinished scan, pair generation +
+        /// rank/gate): prints candidate counts and the top queue heads.
+        /// Zero LLM spend; this is the eyeball checkpoint the acceptance
+        /// protocol runs before `--budget-calls` ever spends anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Bypass the nightly drain and render the FULL post-verification
+        /// ranked queue (verified relations + queue-U), unrestricted by the
+        /// per-night cap.
+        #[arg(long)]
+        report: bool,
+
+        /// Run through this pipeline stage only and stop (0-3; omit for a
+        /// full run through adjudication). A resumability/debug aid.
+        #[arg(long)]
+        stage: Option<u8>,
+
+        /// Print the SQL-stage funnel (episodes -> funeral symbols ->
+        /// anchor overlap -> negative verdicts -> reinstated) per family
+        /// and exit. Read-only corpus counts — no git, no LLM, ignores
+        /// `--dry-run`/`--report`/`--stage`.
+        #[arg(long)]
+        funnel: bool,
+    },
+
+    /// Drain the ranked backfill queue (verified relations + queue-U) into
+    /// `dreams_v1`, capped at `--n` and enforcing one open dream per
+    /// (project, topic) within 30 days.
+    Drain {
+        /// How many dreams to compose this run (design default: 3/night).
+        #[arg(long, default_value_t = csr_engine::dream::backfill::compose::DEFAULT_DRAIN_N)]
+        n: usize,
     },
 }
 
@@ -777,6 +842,7 @@ async fn main() -> Result<()> {
     }
 
     if let Some(Commands::Dream {
+        ref action,
         dry_run,
         ref repo,
         report,
@@ -784,6 +850,30 @@ async fn main() -> Result<()> {
         no_open,
     }) = args.command
     {
+        if let Some(action) = action {
+            return match action {
+                DreamAction::Backfill {
+                    project,
+                    budget_calls,
+                    dry_run: backfill_dry_run,
+                    report: backfill_report,
+                    stage,
+                    funnel,
+                } => csr_engine::dream::backfill::cli::handle_backfill(
+                    &args.db_path,
+                    project.as_deref(),
+                    *budget_calls,
+                    *backfill_dry_run,
+                    *backfill_report,
+                    *stage,
+                    *funnel,
+                ),
+                DreamAction::Drain { n } => {
+                    csr_engine::dream::backfill::cli::handle_drain(&args.db_path, *n)
+                }
+            };
+        }
+
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }

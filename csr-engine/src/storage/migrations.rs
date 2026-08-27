@@ -1402,7 +1402,7 @@ pub fn run(conn: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             dream_id TEXT NOT NULL UNIQUE,
             project TEXT NOT NULL,
-            category TEXT NOT NULL CHECK (category IN ('unfinished','strategy')),
+            category TEXT NOT NULL CHECK (category IN ('unfinished','strategy','supersession')),
             subject_key TEXT,
             revision_hash TEXT NOT NULL,
             prose TEXT NOT NULL,
@@ -1412,6 +1412,45 @@ pub fn run(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_dreams_v1_lookup
             ON dreams_v1(project, category, revision_hash);",
     )?;
+
+    // Dream backfill Stage 6 (`.plans/dream-backfill-design.md` §3 Stage 6):
+    // the composer needs a THIRD `dreams_v1` category, 'supersession', added
+    // to a table that may already hold real rows from `csr-engine dreams`.
+    // SQLite cannot ALTER a CHECK constraint in place, and `CREATE TABLE IF
+    // NOT EXISTS` above is a no-op on a pre-existing table — so a DB created
+    // before this migration would silently keep the OLD 2-value constraint
+    // forever, rejecting every `supersession` insert. Rebuild ONLY when the
+    // on-disk constraint doesn't already allow it (shape-probed via
+    // `sqlite_master.sql`, same idiom `chunks_fts_schema`/`has_column` use
+    // elsewhere in this file) — never unconditionally, since this table can
+    // hold real dream rows a user has already read/verdicted and an
+    // unconditional drop+recreate would destroy them.
+    if !dreams_v1_allows_supersession(conn)? {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE dreams_v1 RENAME TO dreams_v1_pre_supersession;
+             CREATE TABLE dreams_v1 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dream_id TEXT NOT NULL UNIQUE,
+                project TEXT NOT NULL,
+                category TEXT NOT NULL CHECK (category IN ('unfinished','strategy','supersession')),
+                subject_key TEXT,
+                revision_hash TEXT NOT NULL,
+                prose TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                status TEXT NOT NULL DEFAULT 'open'
+             );
+             INSERT INTO dreams_v1 (id, dream_id, project, category, subject_key, revision_hash,
+                                    prose, created_at, status)
+                SELECT id, dream_id, project, category, subject_key, revision_hash,
+                       prose, created_at, status
+                FROM dreams_v1_pre_supersession;
+             DROP TABLE dreams_v1_pre_supersession;
+             CREATE INDEX IF NOT EXISTS idx_dreams_v1_lookup
+                ON dreams_v1(project, category, revision_hash);
+             COMMIT;",
+        )?;
+    }
 
     // Memory registry (harness file-based memory spine — never embedded, never
     // injected). One row per on-disk memory .md file; scanned by a later-stage
@@ -1598,9 +1637,163 @@ pub fn run(conn: &Connection) -> Result<()> {
         [super::trained_rerank::CURATED_VETO_EPSILON],
     )?;
 
+    // Dream backfill (`.plans/dream-backfill-design.md`, Stage 0 + the D3/D4
+    // round-2 deltas in its §8, which bind over §3-6 wherever they conflict)
+    // — deterministic episode materialization + relation staging for the
+    // (future) supersession-detection pipeline. `episode_index` is a
+    // REFRESHABLE projection over `reflections` rows carrying schema-v2
+    // episode JSON — never the writer of record for episode content
+    // (`hooks::stop::store_episode` remains that); it exists so later
+    // pipeline stages scan one flat table instead of re-parsing every
+    // reflection's JSON on every pass. `storage::dream_backfill::
+    // materialize_episode_index` fully replaces every row's base columns on
+    // each run (`INSERT OR REPLACE` keyed by `episode_id`), so aliveness
+    // (below) is always recomputed alongside a base refresh, never preserved
+    // stale against a base row that has moved on.
+    //
+    // D3 (round-2 finding F3): the aliveness columns replace the design's
+    // originally drafted `live_file_ratio REAL`. `present_at_head` /
+    // `days_since_last_touch` are NULL — never `false` / `0` — when the
+    // episode's project has no git-resolvable repo locally, or when none of
+    // its touched files resolve to one: absence of evidence is not
+    // deadness, and a NULL here must be excluded and the aliveness term
+    // renormalized by the reader (see `storage::dream_backfill::
+    // fill_aliveness`'s doc comment), never treated as a zero.
+    //
+    // `dream_relations` / `backfill_state` / `backfill_discards` are created
+    // here so every later build stage (pair generators, adjudicate, verify,
+    // compose — design §3 Stages 2-6) has its landing tables from the
+    // start; this migration and `storage::dream_backfill` only create and
+    // document the three, and write to none of them.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS episode_index (
+            episode_id             TEXT PRIMARY KEY,     -- reflections.id
+            session_id             TEXT NOT NULL,
+            project                TEXT NOT NULL,
+            ts                     TEXT NOT NULL,
+            outcome                TEXT NOT NULL,
+            request                TEXT NOT NULL DEFAULT '',
+            completed              TEXT NOT NULL DEFAULT '',
+            next_steps             TEXT,
+            blockers               TEXT,
+            todo_count             INTEGER NOT NULL DEFAULT 0,
+            files_json             TEXT NOT NULL DEFAULT '[]',
+            anchors_json           TEXT NOT NULL DEFAULT '[]',
+            prev_episode_id        TEXT,
+            present_at_head        INTEGER,
+            days_since_last_touch  INTEGER,
+            refreshed_at           TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_episode_index_project_ts ON episode_index(project, ts);
+        CREATE INDEX IF NOT EXISTS idx_episode_index_session ON episode_index(session_id);
+        CREATE INDEX IF NOT EXISTS idx_episode_index_prev ON episode_index(prev_episode_id);
+
+        -- Stage 6 verified relations. `UNIQUE(project, ep_a, ep_b, relation)`
+        -- is the design's own idempotency key (§3 Stage 6); `topic_key` is
+        -- D7's stable diversity key (project,symbol) for ledger/relapse,
+        -- hash of the shared-anchor-symbol set for era). `generator`/`tier`
+        -- vocabularies follow D2 (G-relapse added) and D5 (LLM tier can
+        -- never exceed the generator's evidence ceiling) respectively.
+        CREATE TABLE IF NOT EXISTS dream_relations (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            project          TEXT NOT NULL,
+            ep_a             TEXT NOT NULL,   -- episode_index.episode_id, superseded side
+            ep_b             TEXT NOT NULL,   -- episode_index.episode_id, superseding side
+            relation         TEXT NOT NULL CHECK (relation IN ('replaced_by','extended_by')),
+            generator        TEXT NOT NULL CHECK (generator IN ('ledger','era','relapse')),
+            topic_key        TEXT NOT NULL,
+            tier             TEXT NOT NULL CHECK (tier IN ('verdict','witnessed','unverified')),
+            quote_a          TEXT NOT NULL DEFAULT '',
+            quote_b          TEXT NOT NULL DEFAULT '',
+            load_bearing_oid TEXT,
+            aux_oid          TEXT,
+            oid_provenance   TEXT NOT NULL DEFAULT 'git_derived'
+                CHECK (oid_provenance IN ('git_derived','created_at_fallback')),
+            gate_score       REAL,
+            now_hook         TEXT,
+            status           TEXT NOT NULL DEFAULT 'queued'
+                CHECK (status IN ('queued','drained','archived')),
+            dream_id         TEXT,
+            created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project, ep_a, ep_b, relation)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dream_relations_queue
+            ON dream_relations(project, status, gate_score DESC);
+        CREATE INDEX IF NOT EXISTS idx_dream_relations_topic
+            ON dream_relations(project, topic_key);
+
+        -- Crash-safety checkpoint (design §3 'Crash safety / idempotency').
+        -- `project = ''` means an all-projects run; `cursor` is an opaque
+        -- resume marker private to whichever stage owns it.
+        CREATE TABLE IF NOT EXISTS backfill_state (
+            stage      TEXT NOT NULL,
+            project    TEXT NOT NULL DEFAULT '',
+            cursor     TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (stage, project)
+        );
+
+        -- Stage 5 verify-failure audit log (design §3 Stage 5 / §6). Every
+        -- discarded LLM candidate lands here with its reason and raw output,
+        -- so the discard rate is a measurable run-quality metric rather than
+        -- a number nothing backs.
+        CREATE TABLE IF NOT EXISTS backfill_discards (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair_key   TEXT NOT NULL,
+            reason     TEXT NOT NULL,
+            raw_json   TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_backfill_discards_pair ON backfill_discards(pair_key);
+        CREATE INDEX IF NOT EXISTS idx_backfill_discards_reason ON backfill_discards(reason);
+
+        -- Stage 1 unfinished-scan negative-receipt audit trail (design §3
+        -- Stage 1 + §8 D10): one row per currently-'never picked up' seed,
+        -- `INSERT OR REPLACE` keyed by `seed_episode_id` so a re-scan always
+        -- reflects the latest pass — `dream::backfill::unfinished::
+        -- scan_unfinished` also deletes any row here for a seed that no
+        -- longer qualifies as 'never picked up' on the current corpus (chain-
+        -- picked, score-picked, obsolescence-converted, or dropped out of the
+        -- seed set entirely), so this table never accumulates stale claims.
+        -- `confusion_matrix_json` is the GLOBAL tau-fit's own confusion
+        -- matrix at the time of the run, denormalized onto every row so the
+        -- receipt is fully self-contained (D10: 'publish confusion matrix in
+        -- the negative receipt JSON').
+        CREATE TABLE IF NOT EXISTS backfill_unfinished_receipts (
+            seed_episode_id       TEXT PRIMARY KEY,  -- episode_index.episode_id
+            project               TEXT NOT NULL,
+            corpus_scanned        INTEGER NOT NULL,
+            max_score             REAL NOT NULL,
+            argmax_episode        TEXT,
+            confusion_matrix_json TEXT NOT NULL,
+            created_at            TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_backfill_unfinished_receipts_project
+            ON backfill_unfinished_receipts(project);",
+    )?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())
+}
+
+/// Does the on-disk `dreams_v1` CHECK constraint already allow the
+/// `supersession` category? Answered from `sqlite_master.sql` itself (the
+/// literal `CREATE TABLE` text SQLite stores), not from a probe insert —
+/// same shape-probe idiom `chunks_fts_schema` uses for `chunks_fts`. A
+/// missing table (fresh DB, not yet created) reads as "already allows it":
+/// the `CREATE TABLE IF NOT EXISTS` immediately above this call already
+/// wrote the 3-value constraint on a fresh DB, so there is nothing to
+/// rebuild.
+fn dreams_v1_allows_supersession(conn: &Connection) -> Result<bool> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'dreams_v1'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(sql.is_none_or(|s| s.contains("supersession")))
 }
 
 /// Does `table` have `column`? Answered from `pragma_table_info`, i.e. from
@@ -2693,5 +2886,100 @@ mod tests {
             node_path_1, node_path_2,
             "path must be stable across repeated backfill passes"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // dreams_v1 'supersession' category widen (dream backfill Stage 6)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fresh_db_allows_supersession_category_immediately() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        conn.execute(
+            "INSERT INTO dreams_v1 (dream_id, project, category, revision_hash, prose)
+             VALUES ('id1', 'p', 'supersession', 'rev1', 'card text')",
+            [],
+        )
+        .expect("a fresh DB's dreams_v1 must accept 'supersession' without a rebuild");
+    }
+
+    #[test]
+    fn preexisting_two_value_check_is_rebuilt_without_losing_rows() {
+        // Simulate a DB created before this migration: dreams_v1 with the
+        // OLD 2-value CHECK, carrying a real row a user may have already
+        // read/verdicted.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dreams_v1 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dream_id TEXT NOT NULL UNIQUE,
+                project TEXT NOT NULL,
+                category TEXT NOT NULL CHECK (category IN ('unfinished','strategy')),
+                subject_key TEXT,
+                revision_hash TEXT NOT NULL,
+                prose TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                status TEXT NOT NULL DEFAULT 'open'
+             );
+             CREATE INDEX IF NOT EXISTS idx_dreams_v1_lookup
+                 ON dreams_v1(project, category, revision_hash);
+             INSERT INTO dreams_v1 (dream_id, project, category, subject_key, revision_hash,
+                                    prose, status)
+             VALUES ('old-id', 'p', 'unfinished', 'item-1', 'rev0', 'legacy card', 'open');",
+        )
+        .unwrap();
+
+        run(&conn).expect("migrations::run over a pre-existing old-schema dreams_v1");
+
+        // The legacy row survived the rebuild, untouched.
+        let (project, category, subject_key, prose, status): (
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT project, category, subject_key, prose, status FROM dreams_v1 WHERE dream_id = 'old-id'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("legacy row must survive the rebuild");
+        assert_eq!(project, "p");
+        assert_eq!(category, "unfinished");
+        assert_eq!(subject_key.as_deref(), Some("item-1"));
+        assert_eq!(prose, "legacy card");
+        assert_eq!(status, "open");
+
+        // And the new category is now accepted.
+        conn.execute(
+            "INSERT INTO dreams_v1 (dream_id, project, category, revision_hash, prose)
+             VALUES ('new-id', 'p', 'supersession', 'rev1', 'new card')",
+            [],
+        )
+        .expect("'supersession' must be accepted after the rebuild");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dreams_v1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "no rows lost or duplicated by the rebuild");
+    }
+
+    #[test]
+    fn dreams_v1_rebuild_is_idempotent_on_rerun() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        conn.execute(
+            "INSERT INTO dreams_v1 (dream_id, project, category, revision_hash, prose)
+             VALUES ('id1', 'p', 'supersession', 'rev1', 'card text')",
+            [],
+        )
+        .unwrap();
+        run(&conn).expect("second migrations::run must not re-rebuild an already-current table");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dreams_v1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "row must survive a rerun that is already a no-op");
     }
 }

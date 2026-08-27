@@ -1,0 +1,1128 @@
+//! Dream backfill — Stage 6 compose + drain (`.plans/dream-backfill-design.md`
+//! §3 "Stage 6 — compose + drain", with the D1/D7/D11 round-2 deltas from §8
+//! folded in, since that section overrides §3-6 wherever they conflict).
+//!
+//! Two independent, already-computed feeds land here:
+//!
+//! 1. **Verified relations** ([`super::verify::verify_and_apply`]'s output):
+//!    `dream_relations` rows a clean adjudication+verification pass promoted
+//!    to `tier = 'witnessed'`. These are the ONLY relation rows this module
+//!    treats as a claim worth composing — a row still `tier = 'unverified'`
+//!    is either awaiting adjudication (`--dry-run`'s territory, not this
+//!    module's) or was never a claim at all.
+//! 2. **Queue U** ([`super::unfinished::scan_unfinished`]'s `queue` field):
+//!    never-picked-up seeds that already cleared
+//!    [`super::unfinished::queue_eligible`] (an open todo or blockers AND a
+//!    live file) — the deterministic zero-LLM "unfinished" half of the
+//!    drain.
+//!
+//! [`build_ranked_queue`] merges both into one [`RankedEntry`] list, ranked
+//! now-hook-bearing-first-then-score (D11's interleave rule for `--report`).
+//! [`drain`] is what a nightly cadence (or a manual `dream drain`) calls to
+//! turn the top of that queue into `dreams_v1` rows, capped at N/night and
+//! enforcing D7's "one open dream per (project, topic_key) per 30 days" plus
+//! pairwise topic-distinctness within the batch itself. `--report`
+//! ([`render_full_report`]) bypasses the drain cap entirely and renders the
+//! FULL queue — this is what the design's §0 acceptance protocol ("3
+//! mind-blowing dreams") reads.
+//!
+//! # Card voice (D11: "states receipt-backed facts plainly")
+//!
+//! [`render_supersession_card`] and [`render_unfinished_backfill_card`] are
+//! pure field interpolation — every line is `format!` over a stored column,
+//! never a generated sentence. Uncertainty is expressed ONLY through the
+//! `[tier]` badge in the card header; no hedge word ("may have", "possibly",
+//! "likely") ever appears anywhere in either template, checked directly by
+//! this module's snapshot tests. This is deliberately narrower than
+//! `dream::cli`'s `unfinished`/`strategy` cards, which DO carry a labeled
+//! "Dream's take" interpretive paragraph — a `supersession` claim is a
+//! machine-verified relation with quotes and (usually) a commit receipt
+//! behind it, so there is nothing left to interpret; stating it plainly is
+//! more honest than dressing it up.
+//!
+//! # Judgment calls (undocumented by the design)
+//!
+//! - Queue U carries no `topic_key` of its own (a queue entry is one
+//!   episode, not a pair) — this module namespaces one as
+//!   `"episode:<episode_id>"`, mirroring `pairs::PairCandidate::topic_key`'s
+//!   own `symbol:`/`era:` prefixing convention so the two id spaces never
+//!   collide by coincidence.
+//! - Queue U's card is written under `dreams_v1.category = 'unfinished'` —
+//!   the SAME category `dream::cli`'s home-page feed already uses (that
+//!   category's CHECK value predates this stage), not a new one. Only
+//!   `supersession` is genuinely new (the task's own instruction). The two
+//!   feeds share a category because both tell the identical "you left this
+//!   open" story, just sourced from different scans (this week vs. the full
+//!   historical corpus) — a reader has no reason to see them as different
+//!   kinds of dream.
+//! - "drainable" (used for the now-hook-bearing/interleave split) is read
+//!   off `dream_relations.status`, not the stored `now_hook` column
+//!   directly: `status = 'queued'` is exactly the population
+//!   [`super::adjudicate::load_queue`] draws from, so a `witnessed` row is
+//!   `queued` if and only if it was now-hook-eligible when generated AND has
+//!   not yet been drained. An `archived` row — never now-hook-eligible at
+//!   rank time, or later ruled UNRELATED/discarded by adjudication — is
+//!   exactly D1's "pure-historical supersession → archived in report, never
+//!   a dream slot", and Queue U entries are always drainable by construction
+//!   (`queue_eligible` already required a live consequence).
+//! - The report's "would drain next" preview size ([`REPORT_PREVIEW_N`]) is
+//!   not specified by the design beyond "top ~20" (§8 D11, describing the
+//!   related `--dry-run` checkpoint) — reused here for the same order of
+//!   magnitude, on the same "an operator eyeballs this before spending
+//!   anything" spirit.
+//!
+//! Zero LLM calls anywhere in this module.
+
+use std::collections::HashSet;
+use std::fmt::Write as _;
+
+use anyhow::Result;
+use chrono::{DateTime, Duration, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
+
+use crate::dream::cli::{compute_dream_id, record_dream_row};
+use crate::dream::report::short_oid;
+use crate::storage::dream_attribution::{marker_line, DREAM_CARD_PROPOSAL_HEADER};
+use crate::storage::Storage;
+
+use super::adjudicate::{load_episode, EpisodeFacts};
+use super::unfinished::scan_unfinished_at;
+
+/// D7: at most one OPEN dream per (project, topic_key) within this window.
+const TOPIC_DEDUP_WINDOW_DAYS: i64 = 30;
+
+/// Default nightly drain size (design §3 Stage 6 / §4: "drained N/night
+/// (default 3)").
+pub const DEFAULT_DRAIN_N: usize = 3;
+
+/// `--report`'s "would drain next" preview size — see the module doc's
+/// judgment-call note.
+pub const REPORT_PREVIEW_N: usize = 20;
+
+/// New `dreams_v1.category` this stage adds (migration widen in
+/// `storage::migrations::run`).
+const CATEGORY_SUPERSESSION: &str = "supersession";
+/// Reused, unmodified, from `dream::cli`'s pre-existing home-page feed — see
+/// the module doc.
+const CATEGORY_UNFINISHED: &str = "unfinished";
+
+fn short_id(s: &str) -> String {
+    s.chars().take(8).collect()
+}
+
+// ---------------------------------------------------------------------
+// Ranked queue (verified relations + queue-U)
+// ---------------------------------------------------------------------
+
+/// What kind of candidate a [`RankedEntry`] carries — enough to render its
+/// card and, on drain, to mark its source row accordingly.
+#[derive(Debug, Clone)]
+pub enum EntryKind {
+    Supersession {
+        relation_id: i64,
+        ep_a: String,
+        ep_b: String,
+        /// `'replaced_by'` | `'extended_by'` — read as a raw string rather
+        /// than reconstructed into `pairs::Relation`; nothing here needs the
+        /// enum, only its already-verified DB value.
+        relation: String,
+        /// `'ledger'` | `'era'` | `'relapse'`.
+        generator: String,
+        quote_a: String,
+        quote_b: String,
+        load_bearing_oid: Option<String>,
+    },
+    Unfinished {
+        episode_id: String,
+    },
+}
+
+/// One entry in the combined post-verification ranked queue — a verified
+/// relation or a Queue-U seed, already scored and ready to render.
+#[derive(Debug, Clone)]
+pub struct RankedEntry {
+    pub project: String,
+    /// D7 stable dedup/diversity key: `dream_relations.topic_key` for a
+    /// supersession entry, `"episode:<id>"` for a Queue U entry (see the
+    /// module doc).
+    pub topic_key: String,
+    pub score: f64,
+    /// Whether this entry currently carries a live consequence and is
+    /// eligible to actually become a dream (see the module doc's "drainable"
+    /// judgment call). `false` only for a finally-archived relation row —
+    /// D1's "pure-historical supersession".
+    pub drainable: bool,
+    pub generator: String,
+    /// `Some("witnessed")` for a verified relation; `None` for Queue U,
+    /// which carries no adjudication tier at all (it is a directly-read
+    /// fact from `episode_index`, never an LLM-judged claim).
+    pub tier: Option<String>,
+    pub days_since_last_touch: Option<i64>,
+    /// Short display form of the underlying receipt (a commit oid), when
+    /// there is one.
+    pub receipt: Option<String>,
+    pub kind: EntryKind,
+}
+
+fn load_relation_entries(conn: &Connection) -> Result<Vec<RankedEntry>> {
+    // `status != 'drained'` excludes relations already composed into a
+    // dream on a previous run; `NOT (status = 'queued' AND tier =
+    // 'unverified')` excludes the pre-adjudication backlog (`--dry-run`'s
+    // territory) — every row this query returns has either been verified
+    // (`tier = 'witnessed'`, always `status = 'queued'` since
+    // `adjudicate::load_queue` never touches an already-`archived` row) or
+    // finally archived (no-now-hook at rank time, or an adjudicated
+    // UNRELATED/discard outcome).
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.project, r.ep_a, r.ep_b, r.relation, r.generator, r.topic_key,
+                r.tier, r.quote_a, r.quote_b, r.load_bearing_oid, r.gate_score, r.status,
+                eb.days_since_last_touch
+         FROM dream_relations r
+         LEFT JOIN episode_index eb ON eb.episode_id = r.ep_b
+         WHERE r.status != 'drained' AND NOT (r.status = 'queued' AND r.tier = 'unverified')",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let status: String = row.get(12)?;
+        let generator: String = row.get(5)?;
+        let tier: String = row.get(7)?;
+        let load_bearing_oid: Option<String> = row.get(10)?;
+        Ok(RankedEntry {
+            project: row.get(1)?,
+            topic_key: row.get(6)?,
+            score: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
+            drainable: status == "queued",
+            generator: generator.clone(),
+            tier: Some(tier.clone()),
+            days_since_last_touch: row.get(13)?,
+            receipt: load_bearing_oid.clone(),
+            kind: EntryKind::Supersession {
+                relation_id: row.get(0)?,
+                ep_a: row.get(2)?,
+                ep_b: row.get(3)?,
+                relation: row.get(4)?,
+                generator,
+                quote_a: row.get(8)?,
+                quote_b: row.get(9)?,
+                load_bearing_oid,
+            },
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn load_unfinished_entries(conn: &Connection, now: DateTime<Utc>) -> Result<Vec<RankedEntry>> {
+    let report = scan_unfinished_at(conn, now)?;
+    if report.disabled {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(report.queue.len());
+    for seed in &report.queue {
+        let days: Option<i64> = conn
+            .query_row(
+                "SELECT days_since_last_touch FROM episode_index WHERE episode_id = ?1",
+                params![seed.episode_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        out.push(RankedEntry {
+            project: seed.project.clone(),
+            topic_key: format!("episode:{}", seed.episode_id),
+            score: seed.priority,
+            drainable: true, // queue_eligible already required a live consequence
+            generator: "unfinished".to_string(),
+            tier: None,
+            days_since_last_touch: days,
+            receipt: None,
+            kind: EntryKind::Unfinished {
+                episode_id: seed.episode_id.clone(),
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// Build the full post-verification ranked queue: verified relations +
+/// Queue U, sorted drainable-bearing first, then descending score, with a
+/// deterministic tiebreak on `topic_key` (never on insertion order, which
+/// `HashSet`-backed Queue U priority computation does not guarantee).
+///
+/// P5: `now` is threaded through to [`load_unfinished_entries`]'s
+/// `scan_unfinished_at` call — Queue U's own priority depends on the D1
+/// age>90d bonus, so the ranked queue this produces is itself
+/// clock-dependent; callers that also compute their own `now` (e.g.
+/// [`drain`]'s 30-day topic-reuse check) should reuse the SAME value here
+/// rather than letting the two drift apart within one run.
+pub fn build_ranked_queue(conn: &Connection, now: DateTime<Utc>) -> Result<Vec<RankedEntry>> {
+    let mut entries = load_relation_entries(conn)?;
+    entries.extend(load_unfinished_entries(conn, now)?);
+    entries.sort_by(|a, b| {
+        b.drainable
+            .cmp(&a.drainable)
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.topic_key.cmp(&b.topic_key))
+    });
+    Ok(entries)
+}
+
+/// Walk `entries` in rank order, picking up to `n` DRAINABLE ones with
+/// pairwise-distinct `topic_key`s (D7/D11: "report top-N enforces pairwise
+/// topic-distinctness"). A duplicate-topic entry is skipped, never
+/// substituted for by a later same-topic candidate.
+pub fn select_topic_distinct(entries: &[RankedEntry], n: usize) -> Vec<&RankedEntry> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out = Vec::new();
+    for e in entries {
+        if out.len() >= n {
+            break;
+        }
+        if !e.drainable {
+            continue;
+        }
+        if seen.insert(e.topic_key.as_str()) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// `--report` rendering (D11: bypasses the drain, renders the FULL queue)
+// ---------------------------------------------------------------------
+
+fn entry_subject(e: &RankedEntry) -> String {
+    match &e.kind {
+        EntryKind::Supersession {
+            ep_a,
+            ep_b,
+            relation,
+            ..
+        } => format!("{} -> {} ({relation})", short_id(ep_a), short_id(ep_b)),
+        EntryKind::Unfinished { episode_id } => format!("episode {}", short_id(episode_id)),
+    }
+}
+
+fn render_entry_line(e: &RankedEntry) -> String {
+    let tier_badge = e.tier.as_deref().unwrap_or("observed");
+    let days = e
+        .days_since_last_touch
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let receipt = e
+        .receipt
+        .as_deref()
+        .map(short_oid)
+        .unwrap_or_else(|| "-".to_string());
+    let hook_flag = if e.drainable { "now" } else { "archived" };
+    format!(
+        "[{hook_flag}] [{tier_badge}] score={:.3} project={} topic_key={} generator={} \
+         days_since_touch={days} receipt={receipt} {}",
+        e.score,
+        e.project,
+        e.topic_key,
+        e.generator,
+        entry_subject(e),
+    )
+}
+
+/// Full ranked-queue rendering for `dream backfill --report` (design §3
+/// Stage 6 / §8 D11): a "would drain next" preview (topic-distinct, capped
+/// at `preview_n`) followed by every entry in rank order, including
+/// archived (never-a-dream-slot) ones — the FULL queue, unrestricted by the
+/// per-night drain cap.
+pub fn render_full_report(entries: &[RankedEntry], preview_n: usize) -> String {
+    let mut out = String::new();
+    let preview = select_topic_distinct(entries, preview_n);
+    let _ = writeln!(
+        out,
+        "Would drain next (top {}, topic-distinct):",
+        preview.len()
+    );
+    if preview.is_empty() {
+        let _ = writeln!(out, "  (none — nothing drainable yet)");
+    }
+    for (i, e) in preview.iter().enumerate() {
+        let _ = writeln!(out, "{:>2}. {}", i + 1, render_entry_line(e));
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Full ranked queue ({} entries):", entries.len());
+    if entries.is_empty() {
+        let _ = writeln!(out, "  (empty)");
+    }
+    for (i, e) in entries.iter().enumerate() {
+        let _ = writeln!(out, "{:>3}. {}", i + 1, render_entry_line(e));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// Card templates — pure field interpolation, no generated sentences (see
+// the module doc's "card voice" section).
+// ---------------------------------------------------------------------
+
+fn relation_verb(relation: &str) -> &'static str {
+    match relation {
+        "replaced_by" => "Replaced by",
+        "extended_by" => "Extended by",
+        // Defensive default for a future CHECK-constraint value this
+        // stage doesn't know about yet — never a panic on a stored row.
+        _ => "Related to",
+    }
+}
+
+fn receipt_line(load_bearing_oid: Option<&str>, generator: &str) -> String {
+    match load_bearing_oid {
+        Some(oid) => format!("commit {} (generator: {generator})", short_oid(oid)),
+        None => format!("no commit oid on record (generator: {generator})"),
+    }
+}
+
+/// Render one `supersession` card: what was believed, what replaced it, both
+/// quotes, the commit receipt, and a "requires verdict" proposal — design §3
+/// Stage 6's own required contents, verbatim. Every line is field
+/// interpolation; see the module doc.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_supersession_card(
+    project: &str,
+    ep_a: &str,
+    ep_b: &str,
+    relation: &str,
+    generator: &str,
+    tier: &str,
+    quote_a: &str,
+    quote_b: &str,
+    load_bearing_oid: Option<&str>,
+    days_since_last_touch: Option<i64>,
+    dream_id: &str,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "PROJECT {project} — supersession [{tier}]");
+    out.push_str("Observed:\n");
+    let _ = writeln!(
+        out,
+        "  - what was believed: \"{quote_a}\" — episode ⌗{}",
+        short_id(ep_a)
+    );
+    let _ = writeln!(
+        out,
+        "  - what replaced it ({}): \"{quote_b}\" — episode ⌗{}",
+        relation_verb(relation),
+        short_id(ep_b)
+    );
+    let _ = writeln!(
+        out,
+        "  - receipt: {}",
+        receipt_line(load_bearing_oid, generator)
+    );
+    if let Some(days) = days_since_last_touch {
+        let _ = writeln!(out, "  - last touched {days} day(s) ago");
+    }
+    out.push_str(DREAM_CARD_PROPOSAL_HEADER);
+    out.push_str(" confirm via csr_resolve whether this supersession still holds.\n");
+    out.push_str(&marker_line(dream_id));
+    out.push('\n');
+    out
+}
+
+/// Render one backfill `unfinished` card (Queue U) from `episode_index`
+/// facts — plain field interpolation, same voice as the supersession card.
+pub(super) fn render_unfinished_backfill_card(
+    project: &str,
+    facts: &EpisodeFacts,
+    priority: f64,
+    dream_id: &str,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "PROJECT {project} — unfinished (backfill)");
+    out.push_str("Observed:\n");
+    let _ = writeln!(
+        out,
+        "  - open since episode ⌗{} — \"{}\"",
+        short_id(&facts.episode_id),
+        facts.request.trim()
+    );
+    let _ = writeln!(out, "  - completed so far: \"{}\"", facts.completed.trim());
+    if let Some(n) = &facts.next_steps {
+        let _ = writeln!(out, "  - next steps: \"{}\"", n.trim());
+    }
+    if let Some(b) = &facts.blockers {
+        let _ = writeln!(out, "  - blockers: \"{}\"", b.trim());
+    }
+    let _ = writeln!(out, "  - backfill priority: {priority:.3}");
+    out.push_str(DREAM_CARD_PROPOSAL_HEADER);
+    out.push_str(" confirm this is still open, then act — record the outcome via csr_resolve.\n");
+    out.push_str(&marker_line(dream_id));
+    out.push('\n');
+    out
+}
+
+fn content_hash(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for p in parts {
+        hasher.update(p.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher
+        .finalize()
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------
+// Drain
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DrainStats {
+    /// `true` under `CSR_NO_DREAMING` — nothing was read or written.
+    pub disabled: bool,
+    pub candidates: usize,
+    pub drained: usize,
+    /// Skipped because a same-`(project, topic_key)` dream is already open
+    /// within the last 30 days (D7).
+    pub skipped_recent_topic: usize,
+}
+
+/// `created_at` in `dreams_v1` is `datetime('now')` — SQLite's own
+/// `YYYY-MM-DD HH:MM:SS` (UTC, space-separated, no offset), NOT RFC3339.
+/// The cutoff must be formatted identically or the lexical `>=` comparison
+/// below silently compares apples to oranges.
+fn sqlite_datetime(dt: DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn recent_open_dream_exists(
+    conn: &Connection,
+    project: &str,
+    topic_key: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let cutoff = sqlite_datetime(now - Duration::days(TOPIC_DEDUP_WINDOW_DAYS));
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM dreams_v1
+            WHERE project = ?1 AND subject_key = ?2 AND status = 'open' AND created_at >= ?3
+         )",
+        params![project, topic_key, cutoff],
+        |r| r.get(0),
+    )?;
+    Ok(exists)
+}
+
+/// Compose and persist one entry's `dreams_v1` row, and mark its source
+/// accordingly (a supersession relation's `status` moves to `'drained'`;
+/// Queue U has no separate source row to mark — its own dedup is entirely
+/// the `dreams_v1` 30-day-per-topic check above, same idiom
+/// `dream::cli::lookup_open_dream_id` already uses for the home-page
+/// `unfinished` category). Fail-soft on a write error, matching
+/// `dream::cli::build_run`'s own convention: a failed insert costs this
+/// entry's slot for tonight, never the rest of the drain batch.
+fn drain_one(storage: &Storage, entry: &RankedEntry, now: DateTime<Utc>) -> Result<bool> {
+    match &entry.kind {
+        EntryKind::Supersession {
+            relation_id,
+            ep_a,
+            ep_b,
+            relation,
+            generator,
+            quote_a,
+            quote_b,
+            load_bearing_oid,
+        } => {
+            let tier = entry.tier.as_deref().unwrap_or("witnessed");
+            let dream_id =
+                compute_dream_id(&entry.project, CATEGORY_SUPERSESSION, &entry.topic_key, now);
+            let prose = render_supersession_card(
+                &entry.project,
+                ep_a,
+                ep_b,
+                relation,
+                generator,
+                tier,
+                quote_a,
+                quote_b,
+                load_bearing_oid.as_deref(),
+                entry.days_since_last_touch,
+                &dream_id,
+            );
+            let revision_hash = content_hash(&[ep_a, ep_b, relation, quote_a, quote_b]);
+            if let Err(error) = record_dream_row(
+                storage,
+                &dream_id,
+                &entry.project,
+                CATEGORY_SUPERSESSION,
+                Some(&entry.topic_key),
+                &revision_hash,
+                &prose,
+            ) {
+                tracing::warn!(%error, project = %entry.project, relation_id, "dream backfill: failed to persist supersession dream row");
+                return Ok(false);
+            }
+            storage.with_connection(|conn| {
+                conn.execute(
+                    "UPDATE dream_relations SET status = 'drained', dream_id = ?1 WHERE id = ?2",
+                    params![dream_id, relation_id],
+                )?;
+                Ok(())
+            })?;
+            Ok(true)
+        }
+        EntryKind::Unfinished { episode_id } => {
+            let Some(facts) = storage.with_connection(|conn| load_episode(conn, episode_id))?
+            else {
+                // The seed's episode_index row vanished between scan and
+                // drain (should not happen in practice — nothing refreshes
+                // episode_index mid-drain — but never a panic).
+                return Ok(false);
+            };
+            let dream_id =
+                compute_dream_id(&entry.project, CATEGORY_UNFINISHED, &entry.topic_key, now);
+            let prose =
+                render_unfinished_backfill_card(&entry.project, &facts, entry.score, &dream_id);
+            let revision_hash = content_hash(&[
+                episode_id,
+                &facts.request,
+                &facts.completed,
+                facts.next_steps.as_deref().unwrap_or(""),
+                facts.blockers.as_deref().unwrap_or(""),
+            ]);
+            if let Err(error) = record_dream_row(
+                storage,
+                &dream_id,
+                &entry.project,
+                CATEGORY_UNFINISHED,
+                Some(episode_id),
+                &revision_hash,
+                &prose,
+            ) {
+                tracing::warn!(%error, project = %entry.project, episode_id, "dream backfill: failed to persist unfinished dream row");
+                return Ok(false);
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// Drain up to `n` entries off the ranked queue into `dreams_v1` (design §3
+/// Stage 6 / §4: "drained N/night (default 3)"). Enforces, in order:
+///
+/// 1. Only `drainable` entries are ever considered (D1's now-hook gate —
+///    archived/pure-historical relations never fill a dream slot).
+/// 2. Pairwise topic-distinctness WITHIN this batch (D7/D11) — a
+///    duplicate-topic entry later in rank order is skipped, not
+///    substituted for.
+/// 3. D7's "one open dream per (project, topic_key) per 30 days" — a topic
+///    with an already-open recent dream is skipped for this run entirely,
+///    counted separately from the batch cap.
+///
+/// Respects `CSR_NO_DREAMING`.
+pub fn drain(storage: &Storage, n: usize) -> Result<DrainStats> {
+    if crate::daemon::dream_cadence::dreaming_disabled() {
+        return Ok(DrainStats {
+            disabled: true,
+            ..Default::default()
+        });
+    }
+
+    let now = Utc::now();
+    let entries = storage.with_connection(|conn| build_ranked_queue(conn, now))?;
+    let mut stats = DrainStats {
+        candidates: entries.len(),
+        ..Default::default()
+    };
+
+    let mut seen_topics: HashSet<String> = HashSet::new();
+    for entry in entries.iter().filter(|e| e.drainable) {
+        if stats.drained >= n {
+            break;
+        }
+        if !seen_topics.insert(entry.topic_key.clone()) {
+            continue;
+        }
+        let recent = storage.with_connection(|conn| {
+            recent_open_dream_exists(conn, &entry.project, &entry.topic_key, now)
+        })?;
+        if recent {
+            stats.skipped_recent_topic += 1;
+            continue;
+        }
+        if drain_one(storage, entry, now)? {
+            stats.drained += 1;
+        }
+    }
+    Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dream::backfill::adjudicate::{
+        run_adjudication_with, AdjudicateAttempt, EpisodeFacts as AdjEpisodeFacts,
+    };
+    use crate::narrative::ParsedNarrative;
+
+    fn open() -> Storage {
+        Storage::open_memory().unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_episode(
+        conn: &Connection,
+        id: &str,
+        session: &str,
+        project: &str,
+        ts: &str,
+        request: &str,
+        completed: &str,
+        todo: Option<&str>,
+    ) {
+        let todos = match todo {
+            Some(t) => format!(r#"[{{"content":"{t}","status":"pending"}}]"#),
+            None => "[]".to_string(),
+        };
+        conn.execute(
+            "INSERT INTO reflections (id, content, tags, timestamp) VALUES (?1, ?2, '[]', ?3)",
+            params![
+                id,
+                format!(
+                    r#"{{"schema":"v2","session_id":"{session}","project":"{project}",
+                        "timestamp":"{ts}","request":"{request}","completed":"{completed}",
+                        "outcome":"completed","todos":{todos},"files_modified":[],"anchors":[]}}"#
+                ),
+                ts
+            ],
+        )
+        .unwrap();
+        crate::storage::dream_backfill::materialize_episode_index(conn).unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Card snapshot tests (D11 voice contract)
+    // -----------------------------------------------------------------
+
+    const HEDGE_WORDS: &[&str] = &["may have", "possibly", "likely", "probably", "perhaps"];
+
+    fn assert_no_hedge_words(text: &str) {
+        let lower = text.to_lowercase();
+        for word in HEDGE_WORDS {
+            assert!(
+                !lower.contains(word),
+                "receipt-backed card must never hedge, found {word:?} in:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn supersession_card_every_sentence_maps_to_an_input_field() {
+        let card = render_supersession_card(
+            "csr",
+            "ep-old-1234",
+            "ep-new-5678",
+            "replaced_by",
+            "ledger",
+            "witnessed",
+            "we believed X was the right approach",
+            "we now do Y instead",
+            Some("abcdef1234567890"),
+            Some(12),
+            "deadbeefcafef00d",
+        );
+        assert!(card.starts_with("PROJECT csr — supersession [witnessed]\n"));
+        assert!(card.contains("we believed X was the right approach"));
+        assert!(card.contains("ep-old-1"));
+        assert!(card.contains("we now do Y instead"));
+        assert!(card.contains("ep-new-5"));
+        assert!(card.contains("Replaced by"));
+        assert!(card.contains("abcdef12")); // short_oid
+        assert!(card.contains("generator: ledger"));
+        assert!(card.contains("last touched 12 day(s) ago"));
+        assert!(card.contains(DREAM_CARD_PROPOSAL_HEADER));
+        assert!(card.contains(&marker_line("deadbeefcafef00d")));
+        assert_no_hedge_words(&card);
+    }
+
+    #[test]
+    fn supersession_card_extended_by_uses_the_extended_verb_and_no_oid_line_when_absent() {
+        let card = render_supersession_card(
+            "csr",
+            "a",
+            "b",
+            "extended_by",
+            "era",
+            "witnessed",
+            "qa",
+            "qb",
+            None,
+            None,
+            "id1",
+        );
+        assert!(card.contains("Extended by"));
+        assert!(card.contains("no commit oid on record"));
+        assert!(!card.contains("last touched"));
+        assert_no_hedge_words(&card);
+    }
+
+    #[test]
+    fn unfinished_backfill_card_carries_every_field_with_no_hedging() {
+        let facts = AdjEpisodeFacts {
+            episode_id: "ep-1".to_string(),
+            session_id: "s1".to_string(),
+            ts: "2020-01-01T00:00:00Z".to_string(),
+            request: "fix the flaky test".to_string(),
+            completed: "diagnosed the race".to_string(),
+            next_steps: Some("add a retry guard".to_string()),
+            blockers: Some("CI is red".to_string()),
+            files: vec![],
+        };
+        let card = render_unfinished_backfill_card("csr", &facts, 0.742, "id2");
+        assert!(card.contains("fix the flaky test"));
+        assert!(card.contains("diagnosed the race"));
+        assert!(card.contains("add a retry guard"));
+        assert!(card.contains("CI is red"));
+        assert!(card.contains("0.742"));
+        assert!(card.contains(DREAM_CARD_PROPOSAL_HEADER));
+        assert_no_hedge_words(&card);
+    }
+
+    // -----------------------------------------------------------------
+    // Ranked queue ordering
+    // -----------------------------------------------------------------
+
+    fn mk_entry(topic_key: &str, score: f64, drainable: bool) -> RankedEntry {
+        RankedEntry {
+            project: "p".to_string(),
+            topic_key: topic_key.to_string(),
+            score,
+            drainable,
+            generator: "ledger".to_string(),
+            tier: Some("witnessed".to_string()),
+            days_since_last_touch: None,
+            receipt: None,
+            kind: EntryKind::Unfinished {
+                episode_id: "e".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn drainable_entries_sort_before_archived_regardless_of_score() {
+        let mut entries = [
+            mk_entry("t1", 0.99, false), // high score but archived
+            mk_entry("t2", 0.10, true),  // low score but drainable
+        ];
+        entries.sort_by(|a, b| {
+            b.drainable
+                .cmp(&a.drainable)
+                .then_with(|| b.score.partial_cmp(&a.score).unwrap())
+        });
+        assert!(entries[0].drainable);
+        assert_eq!(entries[0].topic_key, "t2");
+    }
+
+    #[test]
+    fn select_topic_distinct_skips_duplicate_topics_and_never_backfills() {
+        let entries = vec![
+            mk_entry("t1", 0.9, true),
+            mk_entry("t1", 0.8, true), // same topic, lower score — skipped
+            mk_entry("t2", 0.7, true),
+            mk_entry("t3", 0.6, false), // not drainable — excluded entirely
+        ];
+        let picked = select_topic_distinct(&entries, 5);
+        let topics: Vec<&str> = picked.iter().map(|e| e.topic_key.as_str()).collect();
+        assert_eq!(topics, vec!["t1", "t2"]);
+    }
+
+    #[test]
+    fn select_topic_distinct_respects_the_cap() {
+        let entries = vec![
+            mk_entry("t1", 0.9, true),
+            mk_entry("t2", 0.8, true),
+            mk_entry("t3", 0.7, true),
+        ];
+        let picked = select_topic_distinct(&entries, 2);
+        assert_eq!(picked.len(), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // Integration: synthetic corpus + mocked adjudicator producing 2
+    // verified relations => dry-run counts, report ordering, drain cap,
+    // topic dedup.
+    // -----------------------------------------------------------------
+
+    fn mock_adjudicator_extracts_quotes_from_the_prompt(
+    ) -> impl Fn(Option<&str>, &str) -> AdjudicateAttempt {
+        |_model, prompt: &str| {
+            // Pull the first "Request: ..." line out of each episode block —
+            // a real substring of the prompt (and therefore of the episode
+            // record text `quote_verified` checks against), so this mock
+            // exercises the REAL quote-verification path rather than
+            // sidestepping it.
+            let extract = |label: &str| -> String {
+                prompt
+                    .split(label)
+                    .nth(1)
+                    .and_then(|rest| rest.split("Request: ").nth(1))
+                    .and_then(|rest| rest.lines().next())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            };
+            let quote_a = extract("=== EPISODE A");
+            let quote_b = extract("=== EPISODE B");
+            let body = serde_json::json!({
+                "quote_a_attests_a": true,
+                "quote_b_attests_b": true,
+                "incompatible": true,
+                "extended": false,
+                "quote_a": quote_a,
+                "quote_b": quote_b,
+                "oids": [],
+            })
+            .to_string();
+            AdjudicateAttempt::Parsed(ParsedNarrative {
+                text: body,
+                model: "mock".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            })
+        }
+    }
+
+    /// Directly seeds one adjudication-ready `dream_relations` row plus its
+    /// two backing episodes — same shortcut `adjudicate.rs`'s own
+    /// `seed_pair` test helper uses, so this test exercises Stage 5's new
+    /// code (adjudicate -> verify -> compose -> drain) against realistic
+    /// verified data without re-deriving pair-generation, which stages 2-3
+    /// already cover exhaustively.
+    fn seed_relation(
+        conn: &Connection,
+        n: usize,
+        request_a: &str,
+        request_b: &str,
+        gate_score: f64,
+    ) {
+        let ep_a = format!("ep-{n}-a");
+        let ep_b = format!("ep-{n}-b");
+        insert_episode(
+            conn,
+            &ep_a,
+            &ep_a,
+            "p",
+            "2020-01-01T00:00:00Z",
+            request_a,
+            "c",
+            Some("t"),
+        );
+        insert_episode(
+            conn,
+            &ep_b,
+            &ep_b,
+            "p",
+            "2020-02-01T00:00:00Z",
+            request_b,
+            "c",
+            None,
+        );
+        conn.execute(
+            "INSERT INTO dream_relations
+                (project, ep_a, ep_b, relation, generator, topic_key, tier, gate_score,
+                 now_hook, status, load_bearing_oid, oid_provenance)
+             VALUES ('p', ?1, ?2, 'replaced_by', 'era', ?3, 'unverified', ?4,
+                     'open_todo', 'queued', NULL, 'created_at_fallback')",
+            params![ep_a, ep_b, format!("symbol:sym{n}"), gate_score],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn end_to_end_two_verified_relations_report_and_drain() {
+        // Guards against a concurrently-running `CSR_NO_DREAMING`/
+        // `CSR_NO_AI_NARRATIVES`-toggling test elsewhere in the crate
+        // racing this test's `run_adjudication_with`/`scan_unfinished`
+        // calls via the shared process-global env var — see
+        // `env_test_guard`'s own doc.
+        let _g = crate::daemon::dream_cadence::env_test_guard();
+        let storage = open();
+        storage
+            .with_connection(|conn| {
+                seed_relation(
+                    conn,
+                    1,
+                    "use the old cache layer",
+                    "use the new cache layer",
+                    0.90,
+                );
+                seed_relation(
+                    conn,
+                    2,
+                    "use synchronous IO for uploads",
+                    "use async IO for uploads",
+                    0.60,
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        // Before adjudication: nothing verified yet, `--dry-run`-equivalent
+        // count (queue depth) is 2.
+        let queue_before = storage
+            .with_connection(super::super::adjudicate::queue_depth)
+            .unwrap();
+        assert_eq!(queue_before, 2, "dry-run/backlog count before adjudication");
+
+        // Mocked adjudicator: both candidates come back REPLACED_BY with
+        // quotes lifted straight from the real prompt text.
+        let actor = mock_adjudicator_extracts_quotes_from_the_prompt();
+        let stats = run_adjudication_with(&actor, &storage, 10).unwrap();
+        assert_eq!(stats.attempted, 2);
+        assert_eq!(stats.related, 2);
+        assert_eq!(
+            stats.verify_passed, 2,
+            "both quotes must verify against the real episode text"
+        );
+        assert_eq!(stats.verify_failed, 0);
+
+        // Both rows are now witnessed and queued (not yet drained).
+        let witnessed: i64 = storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM dream_relations WHERE tier = 'witnessed' AND status = 'queued'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(witnessed, 2);
+
+        // --report: full ranked queue, higher gate_score first (both
+        // drainable, so score alone decides order).
+        let entries = storage
+            .with_connection(|conn| build_ranked_queue(conn, Utc::now()))
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.drainable));
+        assert!(
+            entries[0].score >= entries[1].score,
+            "report must rank by descending score among equally-drainable entries"
+        );
+        assert_eq!(entries[0].topic_key, "symbol:sym1");
+        let report_text = render_full_report(&entries, REPORT_PREVIEW_N);
+        assert!(report_text.contains("symbol:sym1"));
+        assert!(report_text.contains("symbol:sym2"));
+        assert!(report_text.contains("[now]"));
+
+        // Drain cap: n=1 drains only the top-scoring topic.
+        let drain_stats = drain(&storage, 1).unwrap();
+        assert_eq!(drain_stats.candidates, 2);
+        assert_eq!(drain_stats.drained, 1);
+        let dream_count: i64 = storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM dreams_v1 WHERE category = 'supersession'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(dream_count, 1);
+        let drained_relation_status: String = storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT status FROM dream_relations WHERE topic_key = 'symbol:sym1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(drained_relation_status, "drained");
+
+        // The remaining entry (sym2) is untouched and still drainable next run.
+        let remaining = storage
+            .with_connection(|conn| build_ranked_queue(conn, Utc::now()))
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].topic_key, "symbol:sym2");
+
+        // Draining again with a larger n picks up exactly the remainder —
+        // and does NOT re-drain sym1 (it left the queue entirely).
+        let drain_stats2 = drain(&storage, 5).unwrap();
+        assert_eq!(drain_stats2.drained, 1);
+        assert_eq!(drain_stats2.candidates, 1);
+    }
+
+    #[test]
+    fn drain_enforces_the_thirty_day_per_topic_reuse_gate() {
+        // See `end_to_end_two_verified_relations_report_and_drain`'s guard comment.
+        let _g = crate::daemon::dream_cadence::env_test_guard();
+        let storage = open();
+        storage
+            .with_connection(|conn| {
+                seed_relation(conn, 1, "approach one", "approach two", 0.90);
+                Ok(())
+            })
+            .unwrap();
+        let actor = mock_adjudicator_extracts_quotes_from_the_prompt();
+        run_adjudication_with(&actor, &storage, 10).unwrap();
+
+        let first = drain(&storage, 5).unwrap();
+        assert_eq!(first.drained, 1);
+
+        // Re-verify a fresh candidate on the SAME topic_key within the
+        // 30-day window (simulating a re-generated candidate for the same
+        // symbol) — it must be skipped, not drained a second time.
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp)
+                     VALUES ('ep-1-c', ?1, '[]', '2020-03-01T00:00:00Z')",
+                    params![format!(
+                        r#"{{"schema":"v2","session_id":"ep-1-c","project":"p",
+                            "timestamp":"2020-03-01T00:00:00Z","request":"approach three",
+                            "completed":"c","outcome":"completed","todos":[],
+                            "files_modified":[],"anchors":[]}}"#
+                    )],
+                )?;
+                crate::storage::dream_backfill::materialize_episode_index(conn)?;
+                conn.execute(
+                    "INSERT INTO dream_relations
+                        (project, ep_a, ep_b, relation, generator, topic_key, tier, gate_score,
+                         now_hook, status, load_bearing_oid, oid_provenance)
+                     VALUES ('p', 'ep-1-b', 'ep-1-c', 'replaced_by', 'ledger', 'symbol:sym1',
+                             'witnessed', 0.95, 'open_todo', 'queued', NULL, 'created_at_fallback')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let second = drain(&storage, 5).unwrap();
+        assert_eq!(second.candidates, 1);
+        assert_eq!(second.drained, 0);
+        assert_eq!(second.skipped_recent_topic, 1);
+    }
+
+    #[test]
+    fn disabled_drain_touches_nothing() {
+        let _g = crate::daemon::dream_cadence::env_test_guard();
+        std::env::set_var("CSR_NO_DREAMING", "1");
+        let storage = open();
+        let stats = drain(&storage, 5);
+        std::env::remove_var("CSR_NO_DREAMING");
+        let stats = stats.unwrap();
+        assert!(stats.disabled);
+        assert_eq!(stats.drained, 0);
+    }
+}

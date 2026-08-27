@@ -85,6 +85,7 @@
 //! `dream` at an unchanged HEAD with an unchanged conclusion writes
 //! nothing (see that module's idempotency doc).
 
+pub mod backfill;
 pub mod cli;
 pub mod policy;
 pub mod report;
@@ -101,7 +102,7 @@ use rusqlite::Connection;
 
 use crate::engine::Engine;
 use crate::extraction::repo_root::repo_root_for_file;
-use crate::import::backfill::{self, open_repo_head, StampSpansStats};
+use crate::import::backfill::{self as witness_backfill, open_repo_head, StampSpansStats};
 use crate::storage::codegraph::stored_repo_root_for_file;
 use crate::storage::witness_ledger::{self, WitnessLedgerRow};
 use crate::storage::witness_verdicts::{self, VerdictKind, WitnessVerdictRow};
@@ -251,10 +252,10 @@ fn run_dream_inner(
         return Ok(DreamRunResult::Cancelled(DreamStats::default()));
     }
     let stamp_spans = match cancellation {
-        Some(cancel) => {
-            backfill::backfill_stamp_spans_cancellable(engine, false, &|| cancel.is_cancelled())?
-        }
-        None => backfill::backfill_stamp_spans(engine, false)?,
+        Some(cancel) => witness_backfill::backfill_stamp_spans_cancellable(engine, false, &|| {
+            cancel.is_cancelled()
+        })?,
+        None => witness_backfill::backfill_stamp_spans(engine, false)?,
     };
     let mut stats = DreamStats {
         stamp_spans,

@@ -1224,6 +1224,12 @@ mod tests {
 
     #[test]
     fn a_cached_strategy_dream_takes_the_slot_over_a_qualifying_unfinished_one() {
+        // Guards against a concurrently-running `CSR_NO_AI_NARRATIVES`/
+        // `CSR_NO_DREAMING`-toggling test elsewhere in the crate (e.g.
+        // `dream::backfill::adjudicate`/`compose`'s disabled-run tests)
+        // flipping `strategy::category_disabled` mid-test via the shared
+        // process-global env var — see `env_test_guard`'s own doc.
+        let _g = crate::daemon::dream_cadence::env_test_guard();
         let storage = Storage::open_memory().unwrap();
         let now = DateTime::parse_from_rfc3339("2026-08-16T18:00:00Z")
             .unwrap()
