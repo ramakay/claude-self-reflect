@@ -73,20 +73,22 @@
 //!
 //! Zero LLM calls anywhere in this module.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
+use std::path::Path;
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-use crate::dream::cli::{compute_dream_id, record_dream_row};
+use crate::dream::cli::compute_dream_id;
 use crate::dream::report::short_oid;
 use crate::storage::dream_attribution::{marker_line, DREAM_CARD_PROPOSAL_HEADER};
 use crate::storage::Storage;
 
 use super::adjudicate::{load_episode, EpisodeFacts};
+use super::subagent_citation::{build_dream_citation_evidence, DreamCitationEvidence};
 use super::unfinished::scan_unfinished_at;
 
 /// D7: at most one OPEN dream per (project, topic_key) within this window.
@@ -517,6 +519,168 @@ fn recent_open_dream_exists(
     Ok(exists)
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct CitationAnchor {
+    #[serde(default)]
+    file: String,
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug)]
+struct CitationEpisode {
+    session_id: String,
+    anchors: Vec<CitationAnchor>,
+}
+
+fn load_citation_episode(conn: &Connection, episode_id: &str) -> Result<Option<CitationEpisode>> {
+    conn.query_row(
+        "SELECT session_id, anchors_json FROM episode_index WHERE episode_id = ?1",
+        params![episode_id],
+        |row| {
+            let anchors_json: String = row.get(1)?;
+            Ok(CitationEpisode {
+                session_id: row.get(0)?,
+                anchors: serde_json::from_str(&anchors_json).unwrap_or_default(),
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Resolve the exact dash-encoded Claude project directory from the parent
+/// transcript path already recorded by import. A missing/mismatched path is
+/// fail-closed: this parent contributes no citations, and no path is guessed.
+fn project_dir_for_parent(
+    conn: &Connection,
+    parent_session_id: &str,
+    projects_root: &Path,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT file_path FROM import_state
+         WHERE conversation_id = ?1 AND file_path IS NOT NULL AND file_path != ''
+         ORDER BY imported_at DESC, file_path ASC",
+    )?;
+    let paths = stmt.query_map(params![parent_session_id], |row| row.get::<_, String>(0))?;
+    let expected_filename = format!("{parent_session_id}.jsonl");
+    let mut project_dirs = BTreeSet::new();
+    for path in paths {
+        let path = path?;
+        let Ok(relative) = Path::new(&path).strip_prefix(projects_root) else {
+            continue;
+        };
+        let mut components = relative.components();
+        let Some(std::path::Component::Normal(project_dir)) = components.next() else {
+            continue;
+        };
+        let Some(std::path::Component::Normal(filename)) = components.next() else {
+            continue;
+        };
+        if components.next().is_some() || filename != std::ffi::OsStr::new(&expected_filename) {
+            continue;
+        }
+        let Some(project_dir) = project_dir.to_str().filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        project_dirs.insert(project_dir.to_string());
+    }
+    if project_dirs.len() == 1 {
+        Ok(project_dirs.into_iter().next())
+    } else {
+        Ok(None)
+    }
+}
+
+fn citation_subject(episodes: &[CitationEpisode], topic_key: &str) -> Option<(String, String)> {
+    let symbol = topic_key
+        .strip_prefix("symbol:")
+        .filter(|symbol| !symbol.is_empty())?
+        .to_string();
+    let files: BTreeSet<String> = episodes
+        .iter()
+        .flat_map(|episode| &episode.anchors)
+        .filter(|anchor| anchor.name == symbol && !anchor.file.is_empty())
+        .map(|anchor| super::family::canon_file(&anchor.file))
+        .collect();
+    if files.len() == 1 {
+        Some((symbol, files.into_iter().next()?))
+    } else {
+        None
+    }
+}
+
+fn stored_dream_provenance(
+    conn: &Connection,
+    episode_ids: &[&str],
+    topic_key: &str,
+    projects_root: Option<&Path>,
+) -> Result<String> {
+    let mut episodes = Vec::new();
+    for episode_id in episode_ids {
+        if let Some(episode) = load_citation_episode(conn, episode_id)? {
+            episodes.push(episode);
+        }
+    }
+    let parent_sessions: Vec<String> = episodes
+        .iter()
+        .map(|episode| episode.session_id.clone())
+        .filter(|session| !session.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let subject = citation_subject(&episodes, topic_key);
+    let mut citations = Vec::new();
+    if let (Some(projects_root), Some((symbol, file))) = (projects_root, subject.as_ref()) {
+        for parent_session in &parent_sessions {
+            let Some(project_dir) = project_dir_for_parent(conn, parent_session, projects_root)?
+            else {
+                continue;
+            };
+            let evidence = build_dream_citation_evidence(
+                std::slice::from_ref(parent_session),
+                &project_dir,
+                symbol,
+                file,
+                projects_root,
+            );
+            citations.extend(evidence.citations);
+        }
+    }
+    let evidence = DreamCitationEvidence::audited(parent_sessions, citations);
+    serde_json::to_string(&evidence).map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_backfill_dream_row(
+    storage: &Storage,
+    dream_id: &str,
+    project: &str,
+    category: &str,
+    subject_key: Option<&str>,
+    revision_hash: &str,
+    prose: &str,
+    evidence_provenance: &str,
+) -> Result<()> {
+    storage.with_connection(|conn| {
+        conn.execute(
+            "INSERT INTO dreams_v1
+                (dream_id, project, category, subject_key, revision_hash, prose, evidence_provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                dream_id,
+                project,
+                category,
+                subject_key,
+                revision_hash,
+                prose,
+                evidence_provenance
+            ],
+        )?;
+        Ok(())
+    })
+}
+
 /// Compose and persist one entry's `dreams_v1` row, and mark its source
 /// accordingly (a supersession relation's `status` moves to `'drained'`;
 /// Queue U has no separate source row to mark — its own dedup is entirely
@@ -525,7 +689,12 @@ fn recent_open_dream_exists(
 /// `unfinished` category). Fail-soft on a write error, matching
 /// `dream::cli::build_run`'s own convention: a failed insert costs this
 /// entry's slot for tonight, never the rest of the drain batch.
-fn drain_one(storage: &Storage, entry: &RankedEntry, now: DateTime<Utc>) -> Result<bool> {
+fn drain_one(
+    storage: &Storage,
+    entry: &RankedEntry,
+    now: DateTime<Utc>,
+    projects_root: Option<&Path>,
+) -> Result<bool> {
     match &entry.kind {
         EntryKind::Supersession {
             relation_id,
@@ -554,7 +723,15 @@ fn drain_one(storage: &Storage, entry: &RankedEntry, now: DateTime<Utc>) -> Resu
                 &dream_id,
             );
             let revision_hash = content_hash(&[ep_a, ep_b, relation, quote_a, quote_b]);
-            if let Err(error) = record_dream_row(
+            let evidence_provenance = storage.with_connection(|conn| {
+                stored_dream_provenance(
+                    conn,
+                    &[ep_a.as_str(), ep_b.as_str()],
+                    &entry.topic_key,
+                    projects_root,
+                )
+            })?;
+            if let Err(error) = record_backfill_dream_row(
                 storage,
                 &dream_id,
                 &entry.project,
@@ -562,6 +739,7 @@ fn drain_one(storage: &Storage, entry: &RankedEntry, now: DateTime<Utc>) -> Resu
                 Some(&entry.topic_key),
                 &revision_hash,
                 &prose,
+                &evidence_provenance,
             ) {
                 tracing::warn!(%error, project = %entry.project, relation_id, "dream backfill: failed to persist supersession dream row");
                 return Ok(false);
@@ -594,7 +772,15 @@ fn drain_one(storage: &Storage, entry: &RankedEntry, now: DateTime<Utc>) -> Resu
                 facts.next_steps.as_deref().unwrap_or(""),
                 facts.blockers.as_deref().unwrap_or(""),
             ]);
-            if let Err(error) = record_dream_row(
+            let evidence_provenance = storage.with_connection(|conn| {
+                stored_dream_provenance(
+                    conn,
+                    &[episode_id.as_str()],
+                    &entry.topic_key,
+                    projects_root,
+                )
+            })?;
+            if let Err(error) = record_backfill_dream_row(
                 storage,
                 &dream_id,
                 &entry.project,
@@ -602,6 +788,7 @@ fn drain_one(storage: &Storage, entry: &RankedEntry, now: DateTime<Utc>) -> Resu
                 Some(episode_id),
                 &revision_hash,
                 &prose,
+                &evidence_provenance,
             ) {
                 tracing::warn!(%error, project = %entry.project, episode_id, "dream backfill: failed to persist unfinished dream row");
                 return Ok(false);
@@ -633,6 +820,9 @@ pub fn drain(storage: &Storage, n: usize) -> Result<DrainStats> {
     }
 
     let now = Utc::now();
+    let projects_root = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".claude/projects"));
     let entries = storage.with_connection(|conn| build_ranked_queue(conn, now))?;
     let mut stats = DrainStats {
         candidates: entries.len(),
@@ -654,7 +844,7 @@ pub fn drain(storage: &Storage, n: usize) -> Result<DrainStats> {
             stats.skipped_recent_topic += 1;
             continue;
         }
-        if drain_one(storage, entry, now)? {
+        if drain_one(storage, entry, now, projects_root.as_deref())? {
             stats.drained += 1;
         }
     }
@@ -663,6 +853,8 @@ pub fn drain(storage: &Storage, n: usize) -> Result<DrainStats> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::dream::backfill::adjudicate::{
         run_adjudication_with, AdjudicateAttempt, EpisodeFacts as AdjEpisodeFacts,
@@ -790,6 +982,111 @@ mod tests {
         assert!(card.contains("0.742"));
         assert!(card.contains(DREAM_CARD_PROPOSAL_HEADER));
         assert_no_hedge_words(&card);
+    }
+
+    #[test]
+    fn citation_subject_fails_closed_when_a_symbol_maps_to_multiple_files() {
+        let episodes = [CitationEpisode {
+            session_id: "session".to_string(),
+            anchors: vec![
+                CitationAnchor {
+                    file: "/repo/a.rs".to_string(),
+                    name: "shared".to_string(),
+                },
+                CitationAnchor {
+                    file: "/repo/b.rs".to_string(),
+                    name: "shared".to_string(),
+                },
+            ],
+        }];
+
+        assert!(citation_subject(&episodes, "symbol:shared").is_none());
+    }
+
+    #[test]
+    fn citation_subject_uses_the_relation_generators_canonical_file_identity() {
+        let episodes = [CitationEpisode {
+            session_id: "session".to_string(),
+            anchors: vec![
+                CitationAnchor {
+                    file: "/repo/.claude/worktrees/w1/src/Home.tsx".to_string(),
+                    name: "Home".to_string(),
+                },
+                CitationAnchor {
+                    file: "/repo/src/Home.tsx".to_string(),
+                    name: "Home".to_string(),
+                },
+            ],
+        }];
+
+        assert_eq!(
+            citation_subject(&episodes, "symbol:Home"),
+            Some(("Home".to_string(), "/repo/src/Home.tsx".to_string()))
+        );
+    }
+
+    #[test]
+    fn citation_subject_does_not_guess_for_non_symbol_dreams() {
+        let episodes = [CitationEpisode {
+            session_id: "session".to_string(),
+            anchors: vec![CitationAnchor {
+                file: "/repo/a.rs".to_string(),
+                name: "arbitrary".to_string(),
+            }],
+        }];
+
+        assert!(citation_subject(&episodes, "episode:ep-1").is_none());
+        assert!(citation_subject(&episodes, "era:deadbeef").is_none());
+    }
+
+    #[test]
+    fn project_dir_resolution_rejects_ambiguous_session_paths() {
+        let storage = open();
+        let temp = tempfile::tempdir().unwrap();
+        let projects_root = temp.path().join("claude-root");
+        storage
+            .with_connection(|conn| {
+                for project_dir in ["-repo-a", "-repo-b"] {
+                    let path = projects_root.join(project_dir).join("same-session.jsonl");
+                    conn.execute(
+                        "INSERT INTO import_state (file_path, conversation_id, chunks_imported)
+                         VALUES (?1, 'same-session', 0)",
+                        params![path.to_string_lossy()],
+                    )?;
+                }
+                assert!(project_dir_for_parent(conn, "same-session", &projects_root)?.is_none());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn project_dir_resolution_ignores_paths_outside_the_injected_root() {
+        let storage = open();
+        let temp = tempfile::tempdir().unwrap();
+        let projects_root = temp.path().join("claude-root");
+        storage
+            .with_connection(|conn| {
+                let outside = temp
+                    .path()
+                    .join("other-root")
+                    .join("-wrong")
+                    .join("session.jsonl");
+                let inside = projects_root.join("-right").join("session.jsonl");
+                for path in [outside, inside] {
+                    conn.execute(
+                        "INSERT INTO import_state (file_path, conversation_id, chunks_imported)
+                         VALUES (?1, 'session', 0)",
+                        params![path.to_string_lossy()],
+                    )?;
+                }
+                assert_eq!(
+                    project_dir_for_parent(conn, "session", &projects_root)?.as_deref(),
+                    Some("-right")
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     // -----------------------------------------------------------------
@@ -945,6 +1242,138 @@ mod tests {
     }
 
     #[test]
+    fn persisted_supersession_carries_audited_subagent_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_root = temp.path().join("projects");
+        let project_dir = "-Users-rama-projects-repo";
+        let subagents = projects_root
+            .join(project_dir)
+            .join("parent-a")
+            .join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let transcript = subagents.join("agent-cited.jsonl");
+        let transcript_bytes = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "tool-edit",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": "/repo/HomeScreen.tsx",
+                            "old_string": "before",
+                            "new_string": "prefix HomeScreen suffix"
+                        }
+                    }]
+                }
+            })
+        );
+        let expected_offset = transcript_bytes.rfind("HomeScreen").unwrap();
+        fs::write(&transcript, transcript_bytes).unwrap();
+
+        let storage = open();
+        storage
+            .with_connection(|conn| {
+                insert_episode(
+                    conn,
+                    "ep-a",
+                    "parent-a",
+                    "p",
+                    "2020-01-01T00:00:00Z",
+                    "old approach",
+                    "old completion",
+                    None,
+                );
+                insert_episode(
+                    conn,
+                    "ep-b",
+                    "parent-b",
+                    "p",
+                    "2020-02-01T00:00:00Z",
+                    "new approach",
+                    "new completion",
+                    None,
+                );
+                let anchors = serde_json::json!([{
+                    "file": "/repo/HomeScreen.tsx",
+                    "node_kind": "function",
+                    "name": "HomeScreen",
+                    "body_hash": "hash"
+                }])
+                .to_string();
+                conn.execute(
+                    "UPDATE episode_index SET anchors_json = ?1 WHERE episode_id IN ('ep-a', 'ep-b')",
+                    params![anchors],
+                )?;
+                for parent in ["parent-a", "parent-b"] {
+                    let parent_path = projects_root
+                        .join(project_dir)
+                        .join(format!("{parent}.jsonl"));
+                    conn.execute(
+                        "INSERT INTO import_state (file_path, conversation_id, chunks_imported)
+                         VALUES (?1, ?2, 0)",
+                        params![parent_path.to_string_lossy(), parent],
+                    )?;
+                }
+                conn.execute(
+                    "INSERT INTO dream_relations
+                        (project, ep_a, ep_b, relation, generator, topic_key, tier, gate_score,
+                         now_hook, status, load_bearing_oid, oid_provenance, quote_a, quote_b)
+                     VALUES ('p', 'ep-a', 'ep-b', 'replaced_by', 'ledger', 'symbol:HomeScreen',
+                             'witnessed', 0.9, 'open_todo', 'queued', NULL,
+                             'created_at_fallback', 'old approach', 'new approach')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let entry = storage
+            .with_connection(|conn| {
+                let mut entries = build_ranked_queue(conn, Utc::now())?;
+                Ok(entries.remove(0))
+            })
+            .unwrap();
+
+        assert!(drain_one(&storage, &entry, Utc::now(), Some(&projects_root),).unwrap());
+
+        let stored: String = storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT evidence_provenance FROM dreams_v1 WHERE category = 'supersession'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        let provenance: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(
+            provenance["parent_sessions"],
+            serde_json::json!(["parent-a", "parent-b"])
+        );
+        assert_eq!(
+            provenance["subagent_sessions"],
+            serde_json::json!(["cited"])
+        );
+        assert_eq!(provenance["bar_clause_met"], true);
+        assert_eq!(provenance["attribution"], "transcript_path");
+        assert_eq!(provenance["citations"][0]["session_id"], "cited");
+        assert_eq!(provenance["citations"][0]["byte_offset"], expected_offset);
+        assert_eq!(provenance["citations"][0]["needle"], "HomeScreen");
+        assert_eq!(provenance["citations"][0]["tool_name"], "Edit");
+        assert_eq!(
+            provenance["citations"][0]["transcript_path"],
+            transcript.to_string_lossy().as_ref()
+        );
+        let offset = provenance["citations"][0]["byte_offset"].as_u64().unwrap() as usize;
+        let bytes = fs::read(transcript).unwrap();
+        assert!(bytes[offset..].starts_with(b"HomeScreen"));
+    }
+
+    #[test]
     fn end_to_end_two_verified_relations_report_and_drain() {
         // Guards against a concurrently-running `CSR_NO_DREAMING`/
         // `CSR_NO_AI_NARRATIVES`-toggling test elsewhere in the crate
@@ -1037,6 +1466,23 @@ mod tests {
             })
             .unwrap();
         assert_eq!(dream_count, 1);
+        let uncited_provenance: String = storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT evidence_provenance FROM dreams_v1 WHERE category = 'supersession'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        let uncited_provenance: serde_json::Value =
+            serde_json::from_str(&uncited_provenance).unwrap();
+        assert_eq!(uncited_provenance["bar_clause_met"], false);
+        assert_eq!(
+            uncited_provenance["subagent_sessions"],
+            serde_json::json!([])
+        );
         let drained_relation_status: String = storage
             .with_connection(|conn| {
                 conn.query_row(

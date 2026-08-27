@@ -31,6 +31,7 @@ mod golden;
 pub mod intent_channel;
 pub mod pairs;
 pub mod rank;
+pub mod subagent_citation;
 pub mod subagent_iface;
 pub mod unfinished;
 pub mod verify;

@@ -1406,6 +1406,7 @@ pub fn run(conn: &Connection) -> Result<()> {
             subject_key TEXT,
             revision_hash TEXT NOT NULL,
             prose TEXT NOT NULL,
+            evidence_provenance TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             status TEXT NOT NULL DEFAULT 'open'
         );
@@ -1426,7 +1427,12 @@ pub fn run(conn: &Connection) -> Result<()> {
     // hold real dream rows a user has already read/verdicted and an
     // unconditional drop+recreate would destroy them.
     if !dreams_v1_allows_supersession(conn)? {
-        conn.execute_batch(
+        let provenance_copy = if has_column(conn, "dreams_v1", "evidence_provenance")? {
+            "evidence_provenance"
+        } else {
+            "NULL"
+        };
+        conn.execute_batch(&format!(
             "BEGIN IMMEDIATE;
              ALTER TABLE dreams_v1 RENAME TO dreams_v1_pre_supersession;
              CREATE TABLE dreams_v1 (
@@ -1437,19 +1443,27 @@ pub fn run(conn: &Connection) -> Result<()> {
                 subject_key TEXT,
                 revision_hash TEXT NOT NULL,
                 prose TEXT NOT NULL,
+                evidence_provenance TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 status TEXT NOT NULL DEFAULT 'open'
              );
              INSERT INTO dreams_v1 (id, dream_id, project, category, subject_key, revision_hash,
-                                    prose, created_at, status)
+                                    prose, evidence_provenance, created_at, status)
                 SELECT id, dream_id, project, category, subject_key, revision_hash,
-                       prose, created_at, status
+                       prose, {provenance_copy}, created_at, status
                 FROM dreams_v1_pre_supersession;
              DROP TABLE dreams_v1_pre_supersession;
              CREATE INDEX IF NOT EXISTS idx_dreams_v1_lookup
                 ON dreams_v1(project, category, revision_hash);
-             COMMIT;",
-        )?;
+             COMMIT;"
+        ))?;
+    }
+
+    // Build 1 subagent citations: additive and nullable by design. Existing
+    // dreams remain valid historical rows; only newly composed backfill
+    // dreams carry the deterministic transcript receipts.
+    if !has_column(conn, "dreams_v1", "evidence_provenance")? {
+        conn.execute_batch("ALTER TABLE dreams_v1 ADD COLUMN evidence_provenance TEXT")?;
     }
 
     // Memory registry (harness file-based memory spine — never embedded, never
@@ -2905,6 +2919,39 @@ mod tests {
     }
 
     #[test]
+    fn provenance_column_is_added_nullable_without_losing_current_schema_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dreams_v1 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dream_id TEXT NOT NULL UNIQUE,
+                project TEXT NOT NULL,
+                category TEXT NOT NULL CHECK (category IN ('unfinished','strategy','supersession')),
+                subject_key TEXT,
+                revision_hash TEXT NOT NULL,
+                prose TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                status TEXT NOT NULL DEFAULT 'open'
+             );
+             INSERT INTO dreams_v1 (dream_id, project, category, revision_hash, prose)
+             VALUES ('legacy-current', 'p', 'supersession', 'rev0', 'legacy card');",
+        )
+        .unwrap();
+
+        run(&conn).expect("additive provenance migration");
+
+        let (prose, provenance): (String, Option<String>) = conn
+            .query_row(
+                "SELECT prose, evidence_provenance FROM dreams_v1 WHERE dream_id = 'legacy-current'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy row and nullable provenance column must remain readable");
+        assert_eq!(prose, "legacy card");
+        assert!(provenance.is_none());
+    }
+
+    #[test]
     fn preexisting_two_value_check_is_rebuilt_without_losing_rows() {
         // Simulate a DB created before this migration: dreams_v1 with the
         // OLD 2-value CHECK, carrying a real row a user may have already
@@ -2964,6 +3011,40 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM dreams_v1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 2, "no rows lost or duplicated by the rebuild");
+    }
+
+    #[test]
+    fn two_value_check_rebuild_preserves_prerelease_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dreams_v1 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dream_id TEXT NOT NULL UNIQUE,
+                project TEXT NOT NULL,
+                category TEXT NOT NULL CHECK (category IN ('unfinished','strategy')),
+                subject_key TEXT,
+                revision_hash TEXT NOT NULL,
+                prose TEXT NOT NULL,
+                evidence_provenance TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                status TEXT NOT NULL DEFAULT 'open'
+             );
+             INSERT INTO dreams_v1
+                (dream_id, project, category, revision_hash, prose, evidence_provenance)
+             VALUES ('old-id', 'p', 'unfinished', 'rev0', 'legacy card', '{\"receipt\":true}');",
+        )
+        .unwrap();
+
+        run(&conn).expect("rebuild prerelease table");
+
+        let provenance: String = conn
+            .query_row(
+                "SELECT evidence_provenance FROM dreams_v1 WHERE dream_id = 'old-id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("non-NULL prerelease provenance must survive");
+        assert_eq!(provenance, r#"{"receipt":true}"#);
     }
 
     #[test]
