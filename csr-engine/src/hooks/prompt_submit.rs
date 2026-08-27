@@ -60,10 +60,18 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     // Incremental: mtime check makes this a no-op when nothing changed (~0ms).
     // When new content exists: ~30-50ms for 1-2 chunks (well under perceptible lag).
     // Content becomes searchable by the next prompt submit.
+    // Injection is done; from here nothing may touch stdout. Indexing inserts
+    // HNSW points, and hnsw_rs prints to stdout on insert, which would land in
+    // the model's context as fake retrieved memory. See super::suppress_stdout.
+    super::suppress_stdout();
     super::import_current_transcript(input, engine, cwd).await;
 
     Ok(()) // Always succeed
 }
+
+/// Upper bound on `code_nodes_by_name` probes per prompt in `build_graph_slices`.
+/// Without it, cost scales with prompt word count.
+const MAX_SYMBOL_PROBES: usize = 12;
 
 /// Maximum age (in minutes) to apply continuity boost.
 const CONTINUITY_THRESHOLD_MINUTES: i64 = 2880;
@@ -239,8 +247,15 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // 1. Search for anti-patterns (highest priority)
     // Anti-patterns use a modified query ("failed approach don't retry: ...") so keep separate embedding.
     // TODO: scope anti-patterns by project once outcome reflections carry project tags (Codex H-1)
-    let anti_patterns =
-        anti_pattern::find_anti_patterns(storage, embeddings, search, prompt, 0.5, 2).await;
+    // Opt-out: this stage costs a second full embedding pass (the query is
+    // rewritten to "failed approach don't retry: ..."), which the upstream
+    // comment above keeps deliberately separate from the main query vector.
+    // Set CSR_NO_ANTI_PATTERNS=1 to trade that recall for latency.
+    let anti_patterns = if std::env::var("CSR_NO_ANTI_PATTERNS").as_deref() == Ok("1") {
+        Vec::new()
+    } else {
+        anti_pattern::find_anti_patterns(storage, embeddings, search, prompt, 0.5, 2).await
+    };
 
     // Route B pickup: episode correlation. A content prompt may be re-asking
     // an already-solved problem or retelling past context from lossy human
@@ -363,7 +378,15 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // 5c. Code graph slice (v9.4) — capped relevant_context item within the
     // existing PROMPT_TOKEN_BUDGET (Codex #5: no separate budget). Surfaces the
     // 1-hop neighborhood of files/symbols named in the prompt, with provenance.
-    for slice in build_graph_slices(storage, prompt, &current_files, &current_project) {
+    // Opt-out: graph slices issue one SQLite query per qualifying prompt token
+    // (now bounded by MAX_SYMBOL_PROBES) plus a file-ledger read. Set
+    // CSR_NO_GRAPH_SLICES=1 to skip the stage entirely.
+    let graph_slices = if std::env::var("CSR_NO_GRAPH_SLICES").as_deref() == Ok("1") {
+        Vec::new()
+    } else {
+        build_graph_slices(storage, prompt, &current_files, &current_project)
+    };
+    for slice in graph_slices {
         review_items.push(InjectionItem {
             content: slice,
             score: 0.88,
@@ -767,9 +790,22 @@ async fn search_chunks_with_vec(
 
     let now = chrono::Utc::now();
     let mut raw_results = Vec::new();
+
+    // Batch the row fetch. `get_chunks_by_ids` already takes a slice, but was
+    // being called once per hit via `from_ref`, making this N+1 over the HNSW
+    // result set. Fetch once and index by id, preserving the original result
+    // order (and therefore score order) when rebuilding.
+    let chunk_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+    let mut chunk_by_id: std::collections::HashMap<String, _> = storage
+        .get_chunks_by_ids(&chunk_ids)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
+        .collect();
+
     for result in &results {
-        if let Ok(chunks) = storage.get_chunks_by_ids(std::slice::from_ref(&result.id)) {
-            if let Some(chunk) = chunks.into_iter().next() {
+        {
+            if let Some(chunk) = chunk_by_id.remove(&result.id) {
                 // Project scope filter: skip chunks from other projects
                 if !project.is_empty() && chunk.project_name != project {
                     continue;
@@ -1035,7 +1071,16 @@ pub(crate) fn build_graph_slices(
     }
 
     // Symbol-anchored slice: callees of a symbol named in the prompt.
+    //
+    // Each qualifying token costs one `code_nodes_by_name` query, and the loop
+    // only breaks once a token actually yields a slice. A long prompt whose
+    // words match no graph node therefore issues one SQLite query per word with
+    // no upper bound. Cap the probes so worst-case cost is fixed.
+    let mut symbol_probes = 0usize;
     for word in prompt.split_whitespace() {
+        if symbol_probes >= MAX_SYMBOL_PROBES {
+            break;
+        }
         let token: String = word
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '_')
@@ -1043,6 +1088,7 @@ pub(crate) fn build_graph_slices(
         if token.len() < 6 {
             continue;
         }
+        symbol_probes += 1;
         // Ask for 2 so an ambiguous name (multiple definitions sharing the
         // same name) is detectable instead of silently picking one.
         let nodes = match storage.code_nodes_by_name(&token, project, 2) {
