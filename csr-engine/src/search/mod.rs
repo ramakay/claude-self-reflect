@@ -423,6 +423,11 @@ impl SearchEngine {
             promote_to_canonical(dir, &basename, "reflections")?;
         }
 
+        // Both promotions are done, so nothing is half-renamed. Clear unconditionally:
+        // a marker left by an earlier crashed run would otherwise survive a dump whose
+        // own promotions both no-opped, and force a rebuild on every load from then on.
+        let _ = std::fs::remove_file(dir.join(PROMOTE_MARKER));
+
         // Write manifest atomically (tmp + rename)
         let manifest = IndexManifest {
             version: MANIFEST_VERSION,
@@ -475,6 +480,15 @@ impl SearchEngine {
             .open(&lock_path)
             .ok()
             .and_then(|f| f.lock_shared().ok().map(|_| f));
+
+        // A promotion that did not finish leaves the canonical .hnsw.graph and .hnsw.data
+        // from different generations. hnsw_rs asserts on that mismatch instead of
+        // returning an error, which aborts the process, so refuse the cache here and let
+        // the caller rebuild.
+        if promotion_interrupted(dir) {
+            tracing::warn!("index promotion did not complete; discarding cache and rebuilding");
+            return None;
+        }
 
         // Read and validate manifest
         let manifest_path = dir.join("manifest.json");
@@ -598,6 +612,20 @@ impl SearchEngine {
     }
 }
 
+/// Written while `promote_to_canonical` is renaming, removed once it finishes.
+///
+/// A promotion moves two files and cannot be made atomic. If the process dies between
+/// them the canonical pair straddles two generations — one file new, the other old —
+/// and `hnsw_rs` handles that with a debug assertion rather than an error, so the whole
+/// process aborts on the next load instead of falling back to a rebuild. This marker
+/// makes the half-finished state detectable, so the index can be rebuilt instead.
+pub(crate) const PROMOTE_MARKER: &str = ".promote-in-flight";
+
+/// True when a previous promotion did not run to completion.
+pub(crate) fn promotion_interrupted(dir: &Path) -> bool {
+    dir.join(PROMOTE_MARKER).exists()
+}
+
 /// If `file_dump` returned a numbered basename (e.g. "chunks-7905"), rename its files
 /// to the canonical name (e.g. "chunks.hnsw.data") so `load_from_disk` can find them.
 /// This happens when the Hnsw was loaded via `load_hnsw` (mmap active → `overwrite=false`).
@@ -605,7 +633,11 @@ fn promote_to_canonical(dir: &Path, returned_basename: &str, canonical: &str) ->
     if returned_basename == canonical {
         return Ok(()); // Already canonical, nothing to do
     }
-    for ext in &[".hnsw.data", ".hnsw.graph"] {
+    // Record the in-flight basename before touching anything. The numbered files are the
+    // only complete copy of this generation until both renames land, so a reader that
+    // finds this marker must rebuild rather than trust the canonical pair.
+    std::fs::write(dir.join(PROMOTE_MARKER), returned_basename)?;
+    for ext in &[".hnsw.graph", ".hnsw.data"] {
         let src = dir.join(format!("{}{}", returned_basename, ext));
         let dst = dir.join(format!("{}{}", canonical, ext));
         if src.exists() {
@@ -619,6 +651,8 @@ fn promote_to_canonical(dir: &Path, returned_basename: &str, canonical: &str) ->
             })?;
         }
     }
+    // Both files carry the canonical name now, so the pair is coherent again.
+    let _ = std::fs::remove_file(dir.join(PROMOTE_MARKER));
     Ok(())
 }
 
@@ -630,6 +664,13 @@ fn promote_to_canonical(dir: &Path, returned_basename: &str, canonical: &str) ->
 /// Called after every `dump_to_disk` and at engine startup.
 /// Must be called while holding `index.lock` (dump_to_disk) or at startup before serving.
 pub fn cleanup_stale_index_files(dir: &Path) {
+    // Mid-promotion the numbered files are the only intact copy of the new generation,
+    // and the canonical pair is mismatched. Deleting them here would throw away the one
+    // thing a recovery could use.
+    if promotion_interrupted(dir) {
+        tracing::warn!("promotion in flight; skipping stale-file cleanup");
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -791,6 +832,56 @@ mod tests {
         // Numbered files should be gone (renamed)
         assert!(!dir.join("chunks-4567.hnsw.data").exists());
         assert!(!dir.join("chunks-4567.hnsw.graph").exists());
+    }
+
+    #[test]
+    fn test_promote_clears_marker_on_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("chunks-77.hnsw.data"), "new_data").unwrap();
+        std::fs::write(dir.join("chunks-77.hnsw.graph"), "new_graph").unwrap();
+
+        promote_to_canonical(dir, "chunks-77", "chunks").unwrap();
+
+        assert!(
+            !promotion_interrupted(dir),
+            "marker must be gone once both renames land"
+        );
+    }
+
+    #[test]
+    fn test_interrupted_promotion_is_detected() {
+        // Reproduces the crash of 2026-08-26: a process died between the two renames,
+        // leaving chunks.hnsw.graph from generation N and chunks.hnsw.data from N+1.
+        // hnsw_rs asserts on the origin_id mismatch and aborts, so the mismatch has to
+        // be caught before the files are opened.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("chunks.hnsw.graph"), "new_graph").unwrap();
+        std::fs::write(dir.join("chunks.hnsw.data"), "old_data").unwrap();
+        std::fs::write(dir.join(PROMOTE_MARKER), "chunks-77").unwrap();
+
+        assert!(promotion_interrupted(dir));
+        assert!(
+            SearchEngine::load_from_disk(dir, 0, 0).is_none(),
+            "a half-promoted index must be refused, not loaded"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_spares_numbered_files_mid_promotion() {
+        // The numbered files are the only intact copy of the new generation until both
+        // renames land, so cleanup must leave them alone while the marker is present.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("chunks-77.hnsw.data"), "new_data").unwrap();
+        std::fs::write(dir.join("chunks-77.hnsw.graph"), "new_graph").unwrap();
+        std::fs::write(dir.join(PROMOTE_MARKER), "chunks-77").unwrap();
+
+        cleanup_stale_index_files(dir);
+
+        assert!(dir.join("chunks-77.hnsw.data").exists());
+        assert!(dir.join("chunks-77.hnsw.graph").exists());
     }
 
     #[test]
