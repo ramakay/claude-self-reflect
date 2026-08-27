@@ -110,10 +110,11 @@ pub fn canon_file(file: &str) -> String {
 /// which is exactly the property the hyphen-prefix heuristic lacked.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct RepoIdentity {
-    /// Canonicalized `git rev-parse --show-toplevel` of the first recorded
-    /// file that resolves to a repo on this machine. `None` when nothing
-    /// recorded for this key resolves anywhere (checkout no longer
-    /// present) — the [`group_keys`] equality-only fallback then applies.
+    /// Canonicalized `git rev-parse --show-toplevel` selected by modal
+    /// frequency across the recorded files that resolve to repos on this
+    /// machine. `None` when nothing recorded for this key resolves anywhere
+    /// (checkout no longer present) — the [`group_keys`] equality-only
+    /// fallback then applies.
     pub(super) toplevel: Option<String>,
     /// Secondary edge: that toplevel's normalized `origin` remote URL, so a
     /// linked worktree (own toplevel, same origin) still merges with its
@@ -217,9 +218,10 @@ fn normalize_origin(url: &str) -> String {
 }
 
 /// Resolve one project key's repo identity from its OWN recorded files
-/// (never its name): the first candidate that resolves to a real git
-/// toplevel wins, and that toplevel's origin/common-dir (if any) become the
-/// secondary edges. [`RepoIdentity::default`] (all `None`) when nothing
+/// (never its name): tally every candidate that resolves to a real git
+/// toplevel, select the most frequent canonicalized toplevel (breaking ties
+/// by lexicographically smallest path), and derive all secondary edges from
+/// that same repo. [`RepoIdentity::default`] (all `None`) when nothing
 /// resolves.
 ///
 /// F4 fix (Codex review pass 1, finding #5): a RELATIVE candidate path is
@@ -238,21 +240,35 @@ fn normalize_origin(url: &str) -> String {
 /// project key falls through to [`group_keys`]'s name-equality fallback
 /// instead, same as an unresolvable one.
 pub(super) fn resolve_repo_identity(candidate_files: &[String]) -> RepoIdentity {
+    let mut repo_counts: BTreeMap<String, usize> = BTreeMap::new();
     for file in candidate_files {
         if file.is_empty() || !std::path::Path::new(file).is_absolute() {
             continue;
         }
         if let Some(toplevel) = repo_root_for_file(file) {
-            let origin = git_origin_url(&toplevel);
-            let common_dir = git_common_dir(&toplevel);
-            return RepoIdentity {
-                toplevel: Some(toplevel),
-                origin,
-                common_dir,
-            };
+            let toplevel = std::fs::canonicalize(&toplevel)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&toplevel))
+                .to_string_lossy()
+                .to_string();
+            *repo_counts.entry(toplevel).or_default() += 1;
         }
     }
-    RepoIdentity::default()
+    let Some((toplevel, _)) =
+        repo_counts
+            .into_iter()
+            .max_by(|(path_a, count_a), (path_b, count_b)| {
+                count_a.cmp(count_b).then_with(|| path_b.cmp(path_a))
+            })
+    else {
+        return RepoIdentity::default();
+    };
+    let origin = git_origin_url(&toplevel);
+    let common_dir = git_common_dir(&toplevel);
+    RepoIdentity {
+        toplevel: Some(toplevel),
+        origin,
+        common_dir,
+    }
 }
 
 /// Up to `limit` file paths recorded for `project`: `witness_ledger` first
@@ -268,10 +284,9 @@ pub(super) fn resolve_repo_identity(candidate_files: &[String]) -> RepoIdentity 
 /// machine (stale paths, `limit` too small to reach a resolvable one) never
 /// even tried the anchor-derived candidates that might have resolved fine —
 /// [`resolve_repo_identity`] never got the chance. Appending unconditionally
-/// costs one extra (already-indexed) query per key and changes nothing for
-/// the common case (ledger candidates resolve first and win, since
-/// [`resolve_repo_identity`] takes the FIRST resolving candidate); it only
-/// adds coverage for the case that was silently dropped before.
+/// costs one extra (already-indexed) query per key and adds coverage for the
+/// case that was silently dropped before. Both sources contribute to the
+/// modal repo tally in [`resolve_repo_identity`].
 ///
 /// `pub(super)` (A-e, pass 2): [`super::intent_channel`] reuses this to
 /// resolve a family's own repo-identity toplevel when attributing a raw
@@ -478,13 +493,16 @@ pub(super) fn group_keys(entries: Vec<(String, RepoIdentity)>) -> Vec<Family> {
     families
 }
 
-/// The family whose member set (or name) contains `project`,
-/// case-insensitively — the CLI's `--project <p>` resolution.
+/// The family whose member set contains `project`, case-insensitively — the
+/// CLI's `--project <p>` resolution. A family-name match is only a fallback
+/// when no member match exists, so a display-name collision cannot shadow
+/// the family that actually owns the raw project key.
 pub fn family_containing<'a>(families: &'a [Family], project: &str) -> Option<&'a Family> {
     let lp = project.to_lowercase();
     families
         .iter()
-        .find(|f| f.name == lp || f.members.iter().any(|m| m.to_lowercase() == lp))
+        .find(|f| f.members.iter().any(|m| m.to_lowercase() == lp))
+        .or_else(|| families.iter().find(|f| f.name.to_lowercase() == lp))
 }
 
 #[cfg(test)]
@@ -720,6 +738,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn modal_repo_identity_groups_a_key_with_its_majority_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let majority_repo = tmp.path().join("majority_repo");
+        let minority_repo = tmp.path().join("minority_repo");
+        if !init_repo(&majority_repo) || !init_repo(&minority_repo) {
+            return; // git unavailable -- fail-soft skip
+        }
+
+        let majority_a = majority_repo.join("a.rs");
+        let majority_b = majority_repo.join("b.rs");
+        let minority = minority_repo.join("minority.rs");
+        std::fs::write(&majority_a, "fn a() {}\n").unwrap();
+        std::fs::write(&majority_b, "fn b() {}\n").unwrap();
+        std::fs::write(&minority, "fn minority() {}\n").unwrap();
+        assert!(commit_all(&majority_repo));
+        assert!(commit_all(&minority_repo));
+
+        let mixed_identity = resolve_repo_identity(&[
+            minority.to_string_lossy().to_string(),
+            majority_a.to_string_lossy().to_string(),
+            majority_b.to_string_lossy().to_string(),
+        ]);
+        let majority_identity = resolve_repo_identity(&[majority_a.to_string_lossy().to_string()]);
+        let minority_identity = resolve_repo_identity(&[minority.to_string_lossy().to_string()]);
+        let families = group_keys(vec![
+            ("mixed-key".into(), mixed_identity),
+            ("majority-key".into(), majority_identity),
+            ("minority-key".into(), minority_identity),
+        ]);
+
+        let mixed_family = families
+            .iter()
+            .find(|family| family.members.iter().any(|member| member == "mixed-key"))
+            .expect("mixed key resolves to a family");
+        assert!(mixed_family
+            .members
+            .iter()
+            .any(|member| member == "majority-key"));
+        assert!(!mixed_family
+            .members
+            .iter()
+            .any(|member| member == "minority-key"));
+    }
+
+    #[test]
+    fn repo_identity_ties_choose_the_lexicographically_smallest_toplevel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_repo = tmp.path().join("a_repo");
+        let second_repo = tmp.path().join("z_repo");
+        if !init_repo(&first_repo) || !init_repo(&second_repo) {
+            return; // git unavailable -- fail-soft skip
+        }
+
+        let first_file = first_repo.join("first.rs");
+        let second_file = second_repo.join("second.rs");
+        std::fs::write(&first_file, "fn first() {}\n").unwrap();
+        std::fs::write(&second_file, "fn second() {}\n").unwrap();
+        assert!(commit_all(&first_repo));
+        assert!(commit_all(&second_repo));
+
+        let identity = resolve_repo_identity(&[
+            second_file.to_string_lossy().to_string(),
+            first_file.to_string_lossy().to_string(),
+        ]);
+        let expected = std::fs::canonicalize(&first_repo).unwrap_or(first_repo);
+        assert_eq!(identity.toplevel.as_deref(), expected.to_str());
+    }
+
     // -----------------------------------------------------------------
     // F4: candidate_files_for_project must fall back to anchors even when
     // the ledger returned rows, as long as none of them resolved.
@@ -789,6 +876,25 @@ mod tests {
             Some("acme-campaigns")
         );
         assert!(family_containing(&families, "other").is_none());
+    }
+
+    #[test]
+    fn family_containing_prefers_membership_over_a_colliding_family_name() {
+        let families = vec![
+            Family {
+                name: "anukriti".into(),
+                members: vec!["ghost-key".into()],
+            },
+            Family {
+                name: "real-anukriti-repo".into(),
+                members: vec!["anukriti".into()],
+            },
+        ];
+
+        assert_eq!(
+            family_containing(&families, "ANUKRITI").map(|family| family.name.as_str()),
+            Some("real-anukriti-repo")
+        );
     }
 
     // -----------------------------------------------------------------
