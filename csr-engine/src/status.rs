@@ -4,12 +4,16 @@
 //! `csr-engine status --compact`  — One-line for statusline
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::import;
 use crate::storage::Storage;
+
+#[path = "dream_state.rs"]
+pub(crate) mod dream_state;
 
 /// Status data gathered from SQLite and disk.
 #[derive(Serialize)]
@@ -52,6 +56,12 @@ pub struct StatusReport {
     /// cursors, adjudication spend/discard rate, and drain queue depth.
     /// See `gather_backfill`.
     pub backfill: BackfillStatus,
+    pub dreaming: Option<DreamingView>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct DreamingView {
+    pub elapsed_secs: u64,
 }
 
 /// One `backfill_state` checkpoint row (design §3 "Crash safety /
@@ -519,6 +529,10 @@ pub fn gather_status_public(db_path: &Path, projects_dir: &Path) -> Result<Statu
 
 /// Gather status data from SQLite and disk.
 fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<StatusReport> {
+    let now = chrono::Utc::now();
+    let dreaming = dream_state::read_active_marker(now).map(|marker| DreamingView {
+        elapsed_secs: (now - marker.started_at).num_seconds().max(0) as u64,
+    });
     // Count total JSONL files on disk
     let total_jsonl = count_jsonl_files(projects_dir);
 
@@ -552,6 +566,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             dream_threads: DreamThreadStatus::default(),
             trained_rerank: empty_trained_rerank_status(),
             backfill: BackfillStatus::default(),
+            dreaming,
         });
     }
 
@@ -634,6 +649,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         dream_threads,
         trained_rerank,
         backfill,
+        dreaming,
     })
 }
 
@@ -1395,13 +1411,17 @@ fn format_age(timestamp: &str) -> String {
 
 /// Print compact one-line status for statusline integration.
 fn print_compact(report: &StatusReport) {
-    print!("{}", format_compact(report));
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    print!("{}", format_compact(report, now_ms));
 }
 
 /// Pure formatter for the compact one-line statusline — separated from
 /// `print_compact` so tests can assert on the string directly (same split
 /// `format_narrative_segment` uses).
-fn format_compact(report: &StatusReport) -> String {
+fn format_compact(report: &StatusReport, now_ms: u128) -> String {
     // Format: [████████░░ 82%] [✓ 909c 54r] [3 projects]
     let bar_filled = (report.import_percent / 10.0).round() as usize;
     let bar_empty = 10_usize.saturating_sub(bar_filled);
@@ -1430,7 +1450,7 @@ fn format_compact(report: &StatusReport) -> String {
             .next_due
             .as_deref()
             .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
-            .is_some_and(|due| due < chrono::Utc::now())
+            .is_some_and(|due| due.timestamp_millis() < now_ms.min(i64::MAX as u128) as i64)
     {
         out.push_str(" | ☾ due");
     }
@@ -1450,6 +1470,15 @@ fn format_compact(report: &StatusReport) -> String {
     if report.dream.demoted_symbols > 0 {
         out.push_str(&format!(" | ☾ {} forgotten", report.dream.demoted_symbols));
     }
+    if let Some(dreaming) = &report.dreaming {
+        const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let frame = ((now_ms / 100) % 10) as usize;
+        out.push_str(&format!(
+            " | ☾ dreaming {} {}",
+            SPINNER[frame],
+            format_dreaming_elapsed(dreaming.elapsed_secs)
+        ));
+    }
     // A newer binary is installed but the live MCP server predates it. Say so
     // on the statusline the user already watches, rather than leaving them to
     // discover it from stale behaviour.
@@ -1457,6 +1486,14 @@ fn format_compact(report: &StatusReport) -> String {
         out.push_str(" | ⟳ reconnect mcp");
     }
     out
+}
+
+fn format_dreaming_elapsed(elapsed_secs: u64) -> String {
+    if elapsed_secs < 60 {
+        format!("{elapsed_secs}s")
+    } else {
+        format!("{}m{:02}s", elapsed_secs / 60, elapsed_secs % 60)
+    }
 }
 
 #[cfg(test)]
@@ -1527,6 +1564,7 @@ mod tests {
             dream_threads: DreamThreadStatus::default(),
             trained_rerank: empty_trained_rerank_status(),
             backfill: BackfillStatus::default(),
+            dreaming: None,
         }
     }
 
@@ -1605,11 +1643,27 @@ mod tests {
     fn test_compact_omits_dream_suffix_when_nothing_forgotten() {
         let report = base_report();
         assert_eq!(report.dream.demoted_symbols, 0);
-        let line = format_compact(&report);
+        let line = format_compact(&report, 0);
         assert!(
             !line.contains('☾'),
             "no demoted symbols means no dream suffix: {line:?}"
         );
+        assert!(!line.contains("dreaming"));
+    }
+
+    #[test]
+    fn compact_dreaming_segment_advances_spinner_with_time() {
+        let mut report = base_report();
+        report.dreaming = Some(DreamingView { elapsed_secs: 4 });
+
+        assert!(format_compact(&report, 0).contains("☾ dreaming ⠋ 4s"));
+        assert!(format_compact(&report, 300).contains("☾ dreaming ⠸ 4s"));
+    }
+
+    #[test]
+    fn dreaming_elapsed_is_humanized() {
+        assert_eq!(format_dreaming_elapsed(4), "4s");
+        assert_eq!(format_dreaming_elapsed(63), "1m03s");
     }
 
     #[test]
@@ -1631,7 +1685,7 @@ mod tests {
             next_due: None,
             ..DreamStatus::default()
         };
-        let line = format_compact(&report);
+        let line = format_compact(&report, 0);
         assert!(
             line.contains("☾ 3 forgotten"),
             "must surface the demoted count: {line:?}"
@@ -1646,7 +1700,7 @@ mod tests {
     fn test_compact_shows_dreams_segment_without_demotion() {
         let mut report = base_report();
         report.dream.events_total = 545;
-        let line = format_compact(&report);
+        let line = format_compact(&report, 0);
         assert!(
             line.contains("☾ 545 dreams"),
             "annotate-only verdicts must be visible: {line:?}"
@@ -1662,7 +1716,7 @@ mod tests {
         let mut report = base_report();
         report.dream.daemon_enabled = true;
         report.dream.next_due = Some("2020-01-01T00:00:00+00:00".into());
-        let line = format_compact(&report);
+        let line = format_compact(&report, 1_800_000_000_000);
         assert!(
             line.contains("☾ due"),
             "overdue daemon with zero events must say due: {line:?}"
@@ -1670,7 +1724,7 @@ mod tests {
 
         // Future due date -> silent.
         report.dream.next_due = Some("2099-01-01T00:00:00+00:00".into());
-        let line = format_compact(&report);
+        let line = format_compact(&report, 1_800_000_000_000);
         assert!(
             !line.contains('☾'),
             "not yet due must stay silent: {line:?}"
@@ -1682,7 +1736,7 @@ mod tests {
         let mut report = base_report();
         report.dream.events_total = 2;
         report.mcp_binary_stale = true;
-        let line = format_compact(&report);
+        let line = format_compact(&report, 0);
         let dreams = line.find("☾ 2 dreams").expect("dreams segment present");
         let stale = line.find("⟳ reconnect mcp").expect("stale marker present");
         assert!(
@@ -1801,12 +1855,12 @@ mod tests {
         let mut report = base_report();
         report.dream.badge.unread = None;
         assert!(
-            !format_compact(&report).contains("unread"),
+            !format_compact(&report, 0).contains("unread"),
             "an unmeasured badge must print nothing, never a zero"
         );
         report.dream.badge.unread = Some(0);
         assert!(
-            !format_compact(&report).contains("unread"),
+            !format_compact(&report, 0).contains("unread"),
             "a measured zero has nothing to point at"
         );
     }
@@ -1816,7 +1870,7 @@ mod tests {
         let mut report = base_report();
         report.dream.badge.unread = Some(3);
         report.dream.server.url = Some("http://127.0.0.1:7373/".into());
-        let line = format_compact(&report);
+        let line = format_compact(&report, 0);
         assert!(line.contains("☾ 3 unread http://127.0.0.1:7373/"), "{line}");
     }
 
@@ -1825,7 +1879,7 @@ mod tests {
         let mut report = base_report();
         report.dream.badge.unread = Some(2);
         report.dream.server.url = None;
-        let line = format_compact(&report);
+        let line = format_compact(&report, 0);
         assert!(line.contains("☾ 2 unread"), "{line}");
         assert!(!line.contains("http"), "{line}");
     }

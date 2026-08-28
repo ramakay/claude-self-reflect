@@ -585,6 +585,7 @@ pub async fn decide(
     if dream_running.swap(true, Ordering::SeqCst) {
         return Err(SkipReason::AlreadyRunning);
     }
+    crate::status::dream_state::write_marker("forgetting");
     Ok(permit)
 }
 
@@ -770,6 +771,7 @@ async fn tick(
     {
         tracing::warn!(%error, "dream badge baseline refresh failed (non-fatal)");
     }
+    crate::status::dream_state::clear_marker();
     dream_running.store(false, Ordering::SeqCst);
     outcome
 }
