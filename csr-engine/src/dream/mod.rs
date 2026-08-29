@@ -242,6 +242,94 @@ pub fn run_dream_with_cancellation(
     run_dream_inner(engine, repo_filter, dry_run, Some(cancellation))
 }
 
+/// Run a dream cycle while advertising the live "dreaming" statusline marker
+/// (`crate::status::dream_state`) for the cycle's duration. `label` names the
+/// trigger written into the marker (e.g. `"compact"`).
+///
+/// Returns `Ok(None)` WITHOUT dreaming when a fresh marker is already active —
+/// the marker file is the cross-process single-flight signal, so a
+/// compact-triggered dream never piles on top of a daemon pass already in
+/// flight. The marker is cleared on completion and on error alike; an outright
+/// crash falls back to the 15-minute staleness floor in
+/// `dream_state::read_active_marker`.
+pub fn run_dream_marked(
+    engine: &Engine,
+    repo_filter: Option<&str>,
+    dry_run: bool,
+    label: &str,
+) -> Result<Option<DreamStats>> {
+    if crate::status::dream_state::read_active_marker(chrono::Utc::now()).is_some() {
+        return Ok(None);
+    }
+    crate::status::dream_state::write_marker(label);
+    let result = run_dream(engine, repo_filter, dry_run);
+    crate::status::dream_state::clear_marker();
+    result.map(Some)
+}
+
+/// Whether a compaction should trigger a background dream cycle. Off when
+/// dreaming is disabled wholesale (`CSR_NO_DREAMING`) or when the
+/// compact-specific opt-out (`CSR_NO_DREAM_ON_COMPACT`) is set.
+pub fn compact_dream_enabled() -> bool {
+    compact_dream_enabled_from(
+        crate::daemon::dream_cadence::dreaming_disabled(),
+        std::env::var("CSR_NO_DREAM_ON_COMPACT").as_deref() == Ok("1"),
+    )
+}
+
+fn compact_dream_enabled_from(dreaming_disabled: bool, compact_opt_out: bool) -> bool {
+    !dreaming_disabled && !compact_opt_out
+}
+
+/// Spawn a detached `csr-engine dream --mark compact` process so a compaction
+/// triggers exactly one dream cycle over the freshly-imported transcript,
+/// independent of the idle-gated daemon cadence (a compaction is an explicit
+/// trigger, so it deliberately bypasses the "defer under a live session"
+/// rule). Fire-and-forget: it never blocks compaction, discards stdio, and
+/// self-skips via the marker guard in [`run_dream_marked`] if a dream is
+/// already running.
+pub fn spawn_detached_compact_dream() {
+    if !compact_dream_enabled() {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            tracing::debug!(%error, "compact dream: cannot resolve own exe; skipping");
+            return;
+        }
+    };
+    match std::process::Command::new(exe)
+        .args(["dream", "--mark", "compact"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => tracing::debug!("compact dream: spawned detached cycle"),
+        Err(error) => tracing::debug!(%error, "compact dream: spawn failed (non-fatal)"),
+    }
+}
+
+#[cfg(test)]
+mod compact_gate_tests {
+    use super::compact_dream_enabled_from;
+
+    #[test]
+    fn compact_dream_gate_truth_table() {
+        assert!(compact_dream_enabled_from(false, false), "on by default");
+        assert!(
+            !compact_dream_enabled_from(true, false),
+            "CSR_NO_DREAMING disables it"
+        );
+        assert!(
+            !compact_dream_enabled_from(false, true),
+            "CSR_NO_DREAM_ON_COMPACT disables it"
+        );
+        assert!(!compact_dream_enabled_from(true, true));
+    }
+}
+
 fn run_dream_inner(
     engine: &Engine,
     repo_filter: Option<&str>,

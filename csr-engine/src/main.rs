@@ -287,6 +287,13 @@ enum Commands {
         /// only) after writing the file.
         #[arg(long)]
         no_open: bool,
+
+        /// Advertise the live "dreaming" statusline marker for this cycle,
+        /// labelled with this trigger name (e.g. `compact`), and self-skip if
+        /// a dream is already in flight. Set by the PreCompact hook so a
+        /// compaction lights the statusline; harmless to pass by hand.
+        #[arg(long)]
+        mark: Option<String>,
     },
     /// Generate a Haiku-curated session story (fire-and-forget from SessionEnd)
     GenerateStory {
@@ -848,6 +855,7 @@ async fn main() -> Result<()> {
         report,
         ref out,
         no_open,
+        ref mark,
     }) = args.command
     {
         if let Some(action) = action {
@@ -888,7 +896,20 @@ async fn main() -> Result<()> {
             println!("CSR dream journal written to {}", path.display());
             return Ok(());
         }
-        let stats = csr_engine::dream::run_dream(&eng, repo.as_deref(), dry_run)?;
+        let stats = if let Some(label) = mark {
+            match csr_engine::dream::run_dream_marked(&eng, repo.as_deref(), dry_run, label)? {
+                Some(stats) => stats,
+                None => {
+                    println!(
+                        "CSR dream: another dream is in flight (marker active); \
+                         skipping {label}-triggered cycle"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            csr_engine::dream::run_dream(&eng, repo.as_deref(), dry_run)?
+        };
         // v10.1: CSR_DREAM_CONSUMPTION default OFF. The cycle still runs and
         // the witness ledger still updates for real either way — this
         // switch is about consumption/exposure, not about whether dreaming

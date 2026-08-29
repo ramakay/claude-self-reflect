@@ -25,5 +25,14 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
         crate::summarizer::spawn_detached_story_generation(tp, &cwd_str);
     }
 
+    // v10: a compaction is a natural consolidation boundary. Trigger exactly
+    // one dream cycle over the just-imported transcript, detached and
+    // fire-and-forget, so it never blocks compaction. It advertises the live
+    // "dreaming" statusline marker for its duration and self-skips if a dream
+    // is already running (marker guard in `dream::run_dream_marked`).
+    // Independent of the idle-gated daemon cadence — a compaction is an
+    // explicit trigger. Opt out with CSR_NO_DREAM_ON_COMPACT / CSR_NO_DREAMING.
+    crate::dream::spawn_detached_compact_dream();
+
     Ok(())
 }
