@@ -108,7 +108,10 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
                 cmd.args(["--model", model]);
             }
             let mut child = match cmd
-                .args(["-p", "-", "--output-format", "json"])
+                // `--tools ""`: a print-mode child otherwise inherits every
+                // built-in tool (Bash, Edit, Write, Agent) under the user's
+                // permission mode; this call is a pure text summary.
+                .args(["-p", "-", "--output-format", "json", "--tools", ""])
                 .stdout(Stdio::piped())
                 // Piped intentionally — required for model-not-found detection on the failure path; do not revert to null().
                 .stderr(Stdio::piped())

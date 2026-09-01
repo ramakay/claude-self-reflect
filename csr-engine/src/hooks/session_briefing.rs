@@ -191,7 +191,10 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
 /// The episodes are embedded in `prompt`, so Haiku needs NO tools. We pass an
 /// empty MCP config with `--strict-mcp-config` so the subprocess loads ZERO MCP
 /// servers (not even csr-engine) — fastest possible `claude -p` startup and no
-/// recursive csr-engine spawn.
+/// recursive csr-engine spawn — and `--tools ""` so the built-in set (Bash, Edit,
+/// Write, Agent, ...) is empty too. Without that flag a print-mode child inherits
+/// every built-in tool under the user's permission mode; one such narrator ran
+/// `git commit` in the live worktree on 2026-09-01.
 pub(crate) fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNarrative> {
     let mcp_config_path = write_minimal_mcp_config()?;
     let mut last_err: Option<anyhow::Error> = None;
@@ -211,10 +214,15 @@ pub(crate) fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative
             .arg("--strict-mcp-config")
             .arg("--mcp-config")
             .arg(&mcp_config_path)
+            // Disable every built-in tool: the empty MCP config alone leaves Bash,
+            // Edit, Write and Agent available. Must come after the variadic
+            // --mcp-config so the flag terminates that list.
+            .arg("--tools")
+            .arg("")
             // No --dangerously-skip-permissions: episodes are session-derived text and
-            // the empty MCP config means zero tools, so this is a pure text summary.
-            // Skipping permissions would only widen the blast radius if an episode
-            // contained adversarial content. Print mode won't prompt interactively.
+            // with zero tools this is a pure text summary. Skipping permissions would
+            // only widen the blast radius if an episode contained adversarial content.
+            // Print mode won't prompt interactively.
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())

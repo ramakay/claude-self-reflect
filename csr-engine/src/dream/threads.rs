@@ -649,6 +649,12 @@ fn claude_p_argv(
     args.push(String::new());
     args.push("--disallowedTools".into());
     args.push(DISALLOWED_BUILTINS.into());
+    // Belt and braces: `--tools ""` empties the built-in set outright, so a
+    // tool missing from DISALLOWED_BUILTINS (new CLI releases add them) can
+    // never reach the extractor. Verified 2026-09-01: init `tools` = [] and a
+    // model-attempted Bash call is inert text.
+    args.push("--tools".into());
+    args.push(String::new());
     args
 }
 
@@ -2280,6 +2286,22 @@ mod tests {
                 "disallowedTools must include {tool}"
             );
         }
+    }
+
+    #[test]
+    fn claude_p_argv_empties_the_builtin_tool_set() {
+        let args = claude_p_argv(None, "p", std::path::Path::new("/tmp/m.json"));
+        let tools = args.iter().position(|a| a == "--tools").expect("--tools");
+        assert_eq!(
+            args[tools + 1],
+            "",
+            "--tools must be followed by the empty list"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(""),
+            "--tools \"\" is variadic and must be the final argument so nothing is swallowed"
+        );
     }
 
     #[test]

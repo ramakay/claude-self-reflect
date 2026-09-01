@@ -141,7 +141,10 @@ async fn call_claude_for_acts(prompt: &str) -> Option<crate::narrative::ParsedNa
                 cmd.args(["--model", model]);
             }
             let mut child = match cmd
-                .args(["-p", "-", "--output-format", "json"])
+                // `--tools ""`: a print-mode child otherwise inherits every
+                // built-in tool (Bash, Edit, Write, Agent) under the user's
+                // permission mode; this call is a pure text extraction.
+                .args(["-p", "-", "--output-format", "json", "--tools", ""])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .stdin(Stdio::piped())

@@ -537,6 +537,10 @@ fn invoke_claude_p(model: Option<&str>, prompt: &str) -> AdjudicateAttempt {
         .arg(&mcp_config_path)
         .arg("--system-prompt")
         .arg(ADJUDICATE_SYSTEM_PROMPT)
+        // `--tools ""`: a print-mode child otherwise inherits every built-in
+        // tool (Bash, Edit, Write, Agent) under the user's permission mode.
+        .arg("--tools")
+        .arg("")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
