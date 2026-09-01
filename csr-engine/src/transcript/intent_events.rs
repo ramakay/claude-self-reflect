@@ -489,6 +489,8 @@ struct TranscriptLine<'a> {
     uuid: Option<&'a str>,
     #[serde(rename = "isMeta")]
     is_meta: Option<bool>,
+    #[serde(rename = "isCompactSummary")]
+    is_compact_summary: Option<bool>,
     #[serde(borrow)]
     message: Option<TranscriptMessage<'a>>,
 }
@@ -519,7 +521,7 @@ struct RawTextSpan {
 struct SourceText {
     turn: u32,
     role: Role,
-    is_meta: bool,
+    is_injected: bool,
     timestamp: Option<String>,
     decoded: String,
     spans: Vec<RawTextSpan>,
@@ -639,10 +641,15 @@ fn source_texts(path: &Path) -> Result<SourceTexts> {
                 }
             })
             .collect();
+        let is_injected = record.is_meta == Some(true)
+            || record.is_compact_summary == Some(true)
+            || (role == Role::User
+                && joined
+                    .starts_with("This session is being continued from a previous conversation"));
         sources.push(SourceText {
             turn,
             role,
-            is_meta: record.is_meta == Some(true),
+            is_injected,
             timestamp: record.timestamp.map(str::to_string),
             decoded: joined,
             spans,
@@ -733,10 +740,15 @@ fn source_texts_tail(raw: &str, starting_turn: u32) -> SourceTexts {
                 }
             })
             .collect();
+        let is_injected = record.is_meta == Some(true)
+            || record.is_compact_summary == Some(true)
+            || (role == Role::User
+                && joined
+                    .starts_with("This session is being continued from a previous conversation"));
         entries.push(SourceText {
             turn,
             role,
-            is_meta: record.is_meta == Some(true),
+            is_injected,
             timestamp: record.timestamp.map(str::to_string),
             decoded: joined,
             spans,
@@ -893,6 +905,99 @@ fn marker_scan_text(text: &str) -> String {
     String::from_utf8(masked).expect("masking preserves UTF-8")
 }
 
+const WRAPPER_TAGS: &[&str] = &[
+    "system-reminder",
+    "command-message",
+    "command-name",
+    "command-args",
+    "local-command-stdout",
+    "local-command-caveat",
+    "user-prompt-submit-hook",
+    "task-notification",
+    "cross-session-message",
+];
+
+fn opening_tag_at(text: &str, start: usize) -> Option<(&str, usize)> {
+    let tail = text.get(start..)?;
+    if !tail.starts_with('<') {
+        return None;
+    }
+    let name_start = start + 1;
+    let name_end = text[name_start..]
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+        .map(|relative| name_start + relative)?;
+    if name_end == name_start {
+        return None;
+    }
+    let open_end = text[name_end..]
+        .find('>')
+        .map(|relative| name_end + relative + 1)?;
+    Some((&text[name_start..name_end], open_end))
+}
+
+fn wrapper_block_end(text: &str, name: &str, open_end: usize) -> usize {
+    if text[..open_end].trim_end().ends_with("/>") {
+        return open_end;
+    }
+    let close = format!("</{name}>");
+    text[open_end..]
+        .find(&close)
+        .map_or(text.len(), |relative| open_end + relative + close.len())
+}
+
+fn mask_wrapper_blocks(text: &str, masked: &mut [u8]) {
+    if let Some((name, open_end)) = opening_tag_at(text, 0) {
+        let end = wrapper_block_end(text, name, open_end);
+        blank_range_preserving_lines(masked, 0, end);
+    }
+
+    let mut cursor = 0usize;
+    while let Some(relative) = text[cursor..].find('<') {
+        let start = cursor + relative;
+        let Some((name, open_end)) = opening_tag_at(text, start) else {
+            cursor = start + 1;
+            continue;
+        };
+        if WRAPPER_TAGS.contains(&name) || name.starts_with("ide_") {
+            let end = wrapper_block_end(text, name, open_end);
+            blank_range_preserving_lines(masked, start, end);
+            cursor = end;
+        } else {
+            cursor = open_end;
+        }
+    }
+}
+
+fn is_bullet_prefix(text: &str) -> bool {
+    if text.starts_with("- ") || text.starts_with("* ") {
+        return true;
+    }
+    let digit_count = text.bytes().take_while(u8::is_ascii_digit).count();
+    digit_count > 0 && text[digit_count..].starts_with(". ")
+}
+
+fn mask_bulleted_lines(text: &str, masked: &mut [u8]) {
+    let mut line_start = 0usize;
+    for line in text.split_inclusive('\n') {
+        let line_end = line_start + line.trim_end_matches(['\r', '\n']).len();
+        let content_start = line_start
+            + text[line_start..line_end]
+                .find(|ch: char| !ch.is_whitespace())
+                .unwrap_or(line_end - line_start);
+        if is_bullet_prefix(&text[content_start..line_end]) {
+            blank_range_preserving_lines(masked, line_start, line_end);
+        }
+        line_start += line.len();
+    }
+}
+
+fn reaction_scan_text(text: &str) -> String {
+    let mut masked = marker_scan_text(text).into_bytes();
+    mask_wrapper_blocks(text, &mut masked);
+    mask_bulleted_lines(text, &mut masked);
+    String::from_utf8(masked).expect("masking preserves UTF-8")
+}
+
 fn target_fields(text: &str) -> (Option<String>, Option<String>) {
     let Some(target) = extract_targets(text).into_iter().next() else {
         return (None, None);
@@ -1011,7 +1116,7 @@ fn classification_plan(
     let mut texts = Vec::new();
     let mut turns = BTreeSet::new();
     for source in &sources.entries {
-        if source.role != Role::User || source.is_meta {
+        if source.role != Role::User || source.is_injected {
             continue;
         }
         if source.turn > min_turn_exclusive && is_classifiable_user(&source.decoded, &prior_user) {
@@ -1029,7 +1134,7 @@ fn starts_with_command_after(text: &str, prefix: &str) -> bool {
 }
 
 fn lexical_reaction_sentence(text: &str) -> Option<(IntentEventKind, usize, usize, &'static str)> {
-    let scan_text = marker_scan_text(text);
+    let scan_text = reaction_scan_text(text);
     for (start, end) in sentence_ranges(&scan_text) {
         let sentence = scan_text[start..end].trim();
         let lower = sentence.to_ascii_lowercase();
@@ -1121,7 +1226,7 @@ fn lexical_reaction_sentence(text: &str) -> Option<(IntentEventKind, usize, usiz
 }
 
 fn classifier_marker_sentence(text: &str) -> Option<(usize, usize, &'static str)> {
-    let scan_text = marker_scan_text(text);
+    let scan_text = reaction_scan_text(text);
     for (start, end) in sentence_ranges(&scan_text) {
         let lower = scan_text[start..end].trim().to_ascii_lowercase();
         let marker = if lower.starts_with("you misunderstood") {
@@ -1224,7 +1329,7 @@ fn extract_from_sources(
     for source in &source_texts.entries {
         match source.role {
             Role::User => {
-                if source.is_meta {
+                if source.is_injected {
                     continue;
                 }
                 let text = &source.decoded;
@@ -1283,7 +1388,7 @@ fn extract_from_sources(
                 prior_user = text.clone();
             }
             Role::Assistant => {
-                if source.is_meta {
+                if source.is_injected {
                     continue;
                 }
                 let text = &source.decoded;
@@ -1756,6 +1861,133 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, IntentEventKind::Correction);
         assert_eq!(events[0].marker.as_deref(), Some("negative-command"));
+    }
+
+    #[test]
+    fn compact_summary_is_not_a_correction_but_the_same_human_turn_is() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","message":{"content":"Build parser"}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","isCompactSummary":true,"message":{"content":"Never --no-verify."}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+        assert!(events.is_empty());
+
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","message":{"content":"Build parser"}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","message":{"content":"Never --no-verify."}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, IntentEventKind::Correction);
+    }
+
+    #[test]
+    fn legacy_continuation_summary_is_not_a_correction_or_prior_user_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        let summary =
+            "This session is being continued from a previous conversation\nNever --no-verify.";
+        let first = serde_json::json!({
+            "type": "user",
+            "uuid": "u1",
+            "message": { "content": "Build parser" }
+        });
+        let second = serde_json::json!({
+            "type": "user",
+            "uuid": "u2",
+            "message": { "content": summary }
+        });
+        std::fs::write(&transcript, format!("{first}\n{second}\n")).unwrap();
+
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+        assert!(events.is_empty());
+
+        let first = serde_json::json!({
+            "type": "user",
+            "uuid": "u1",
+            "message": { "content": summary }
+        });
+        let second = serde_json::json!({
+            "type": "user",
+            "uuid": "u2",
+            "message": { "content": "Never --no-verify." }
+        });
+        std::fs::write(&transcript, format!("{first}\n{second}\n")).unwrap();
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+        assert!(
+            events.is_empty(),
+            "a continuation summary must not establish prior-user context"
+        );
+    }
+
+    #[test]
+    fn wrapper_tagged_correction_marker_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","message":{"content":"Build parser"}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","message":{"content":"Pasted context:\n<system-reminder>\nNever --no-verify.\n</system-reminder>\nEnd context."}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn bulleted_negative_command_is_ignored_but_plain_command_fires() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        for bullet in ["- do not push", "* do not push", "1. do not push"] {
+            let first = serde_json::json!({
+                "type": "user",
+                "uuid": "u1",
+                "message": { "content": "Build parser" }
+            });
+            let second = serde_json::json!({
+                "type": "user",
+                "uuid": "u2",
+                "message": { "content": bullet }
+            });
+            std::fs::write(&transcript, format!("{first}\n{second}\n")).unwrap();
+            let events =
+                extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+            assert!(events.is_empty(), "bullet {bullet:?} must abstain");
+        }
+
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","message":{"content":"Build parser"}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","message":{"content":"do not push"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, IntentEventKind::Correction);
     }
 
     #[test]
