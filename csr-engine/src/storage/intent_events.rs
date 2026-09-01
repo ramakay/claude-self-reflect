@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
-use crate::transcript::intent_events::{IntentEvent, IntentEventKind};
+use crate::transcript::intent_events::{IntentDetector, IntentEvent, IntentEventKind};
 
-pub const MIGRATION_ID: &str = "intent_events_v1";
+pub const MIGRATION_ID: &str = "intent_events_v3";
 
 fn parse_kind(value: &str) -> rusqlite::Result<IntentEventKind> {
     match value {
@@ -20,6 +20,20 @@ fn parse_kind(value: &str) -> rusqlite::Result<IntentEventKind> {
     }
 }
 
+fn parse_detector(value: Option<String>) -> rusqlite::Result<Option<IntentDetector>> {
+    match value.as_deref() {
+        None => Ok(None),
+        Some("lexical") => Ok(Some(IntentDetector::Lexical)),
+        Some("classifier") => Ok(Some(IntentDetector::Classifier)),
+        Some("both") => Ok(Some(IntentDetector::Both)),
+        Some(other) => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("unknown intent detector: {other}").into(),
+        )),
+    }
+}
+
 pub(crate) fn insert(conn: &Connection, events: &[IntentEvent]) -> Result<usize> {
     let transaction = conn.unchecked_transaction()?;
     let mut inserted = 0usize;
@@ -27,23 +41,32 @@ pub(crate) fn insert(conn: &Connection, events: &[IntentEvent]) -> Result<usize>
         let mut statement = transaction.prepare_cached(
             "INSERT OR IGNORE INTO intent_events
              (session_id, project, turn, kind, quote, transcript_path,
-              byte_start, byte_end, prior_claim, symbol, file, classifier_hash, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              byte_start, byte_end, prior_claim, symbol, file, classifier_hash,
+              detector, classifier_score, marker, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, ?15, ?16)",
         )?;
         for event in events {
+            let canonical_path = event
+                .transcript_path
+                .canonicalize()
+                .unwrap_or_else(|_| event.transcript_path.clone());
             inserted += statement.execute(params![
                 event.session_id,
                 event.project,
                 i64::from(event.turn),
                 event.kind.as_str(),
                 event.quote,
-                event.transcript_path.to_string_lossy(),
+                canonical_path.to_string_lossy(),
                 i64::try_from(event.byte_start)?,
                 i64::try_from(event.byte_end)?,
                 event.prior_claim,
                 event.symbol,
                 event.file,
                 event.classifier_hash,
+                event.detector.map(IntentDetector::as_str),
+                event.classifier_score,
+                event.marker,
                 event.ts,
             ])?;
         }
@@ -59,7 +82,8 @@ pub(crate) fn list(
 ) -> Result<Vec<IntentEvent>> {
     let mut statement = conn.prepare(
         "SELECT session_id, project, turn, kind, quote, transcript_path,
-                byte_start, byte_end, prior_claim, symbol, file, classifier_hash, ts
+                byte_start, byte_end, prior_claim, symbol, file, classifier_hash,
+                detector, classifier_score, marker, ts
          FROM intent_events
          WHERE (?1 IS NULL OR project = ?1)
            AND (?2 IS NULL OR julianday(ts) >= julianday(?2))
@@ -100,7 +124,10 @@ pub(crate) fn list(
             symbol: row.get(9)?,
             file: row.get(10)?,
             classifier_hash: row.get(11)?,
-            ts: row.get(12)?,
+            detector: parse_detector(row.get(12)?)?,
+            classifier_score: row.get(13)?,
+            marker: row.get(14)?,
+            ts: row.get(15)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -121,12 +148,25 @@ pub(crate) fn count(
     Ok(usize::try_from(count)?)
 }
 
+pub(crate) fn count_session_kind(
+    conn: &Connection,
+    session_id: &str,
+    kind: IntentEventKind,
+) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM intent_events WHERE session_id = ?1 AND kind = ?2",
+        params![session_id, kind.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(usize::try_from(count)?)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use crate::storage::Storage;
-    use crate::transcript::intent_events::{IntentEvent, IntentEventKind};
+    use crate::transcript::intent_events::{IntentDetector, IntentEvent, IntentEventKind};
 
     fn event() -> IntentEvent {
         IntentEvent {
@@ -142,6 +182,9 @@ mod tests {
             symbol: Some("new_parser".into()),
             file: None,
             classifier_hash: "classifier-v1".into(),
+            detector: Some(IntentDetector::Lexical),
+            classifier_score: Some("correction:0.710000".into()),
+            marker: None,
             ts: "2026-09-01T10:00:00Z".into(),
         }
     }
@@ -188,5 +231,26 @@ mod tests {
 
         assert!(update.unwrap_err().to_string().contains("append-only"));
         assert!(delete.unwrap_err().to_string().contains("append-only"));
+    }
+
+    #[test]
+    fn same_parent_coordinates_from_two_child_transcripts_do_not_collide() {
+        let storage = Storage::open_memory().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let first_path = temp.path().join("agent-first.jsonl");
+        let second_path = temp.path().join("agent-second.jsonl");
+        std::fs::write(&first_path, "first\n").unwrap();
+        std::fs::write(&second_path, "second\n").unwrap();
+        let mut first = event();
+        first.session_id = "parent-session".into();
+        first.transcript_path = first_path.clone();
+        let mut second = first.clone();
+        second.transcript_path = second_path.clone();
+
+        assert_eq!(storage.insert_intent_events(&[first, second]).unwrap(), 2);
+        let rows = storage.list_intent_events(None, None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].transcript_path, first_path.canonicalize().unwrap());
+        assert_eq!(rows[1].transcript_path, second_path.canonicalize().unwrap());
     }
 }

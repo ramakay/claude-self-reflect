@@ -8,7 +8,7 @@ use crate::mcp::tools::ConversationLookup;
 use crate::search::cross_project::resolve_project_from_cwd;
 
 fn locate_transcript(input: &HookInput, projects_dir: &Path) -> Option<PathBuf> {
-    if let Some(path) = input.transcript_path.as_deref().map(PathBuf::from) {
+    if let Some(path) = input.agent_transcript_path.as_deref().map(PathBuf::from) {
         if path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
             return Some(path);
         }
@@ -40,8 +40,6 @@ fn locate_transcript(input: &HookInput, projects_dir: &Path) -> Option<PathBuf> 
             }) {
                 return Some(path);
             }
-        } else if transcripts.len() == 1 {
-            return transcripts.into_iter().next();
         }
     }
     None
@@ -105,17 +103,36 @@ mod tests {
     #[test]
     fn explicit_transcript_path_wins_when_present() {
         let temp = tempfile::tempdir().unwrap();
-        let transcript = temp.path().join("agent-explicit.jsonl");
-        std::fs::write(&transcript, "{}\n").unwrap();
-        let input = HookInput {
-            transcript_path: Some(transcript.to_string_lossy().into_owned()),
-            session_id: Some("parent".into()),
-            ..Default::default()
-        };
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("agent-explicit.jsonl");
+        std::fs::write(&parent, "{}\n").unwrap();
+        std::fs::write(&child, "{}\n").unwrap();
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "session_id": "parent",
+            "transcript_path": parent,
+            "agent_transcript_path": child,
+            "agent_id": "child-7"
+        }))
+        .unwrap();
 
         assert_eq!(
             locate_transcript(&input, &temp.path().join("missing")),
-            Some(transcript)
+            Some(child)
         );
+    }
+
+    #[test]
+    fn parent_transcript_is_never_used_for_subagent_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent.jsonl");
+        std::fs::write(&parent, "{}\n").unwrap();
+        let input = HookInput {
+            transcript_path: Some(parent.to_string_lossy().into_owned()),
+            session_id: Some("missing-parent".into()),
+            agent_id: Some("missing-child".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(locate_transcript(&input, temp.path()), None);
     }
 }

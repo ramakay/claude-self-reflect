@@ -710,14 +710,20 @@ fn test_hook_input_stop_hook_active_missing() {
 fn test_hook_input_subagent_stop_fields() {
     let json = r#"{
         "session_id":"parent-1",
+        "transcript_path":"/tmp/parent-1.jsonl",
         "agent_id":"child-7",
         "agent_type":"general-purpose",
+        "agent_transcript_path":"/tmp/parent-1/subagents/agent-child-7.jsonl",
         "last_assistant_message":"finished the task"
     }"#;
     let input: csr_engine::hooks::HookInput = serde_json::from_str(json).unwrap();
     assert_eq!(input.session_id.as_deref(), Some("parent-1"));
     assert_eq!(input.agent_id.as_deref(), Some("child-7"));
     assert_eq!(input.agent_type.as_deref(), Some("general-purpose"));
+    assert_eq!(
+        input.agent_transcript_path.as_deref(),
+        Some("/tmp/parent-1/subagents/agent-child-7.jsonl")
+    );
     assert_eq!(
         input.last_assistant_message.as_deref(),
         Some("finished the task")
@@ -1397,9 +1403,9 @@ fn test_import_current_transcript_helper() {
     assert!(chunk_count > 0, "transcript should be indexed after import");
 }
 
-/// Test: stop hook imports transcript for all sessions.
+/// Test: stop hook imports transcript even when recursive intent capture is gated.
 #[test]
-fn test_stop_hook_imports_for_all_sessions() {
+fn test_stop_hook_active_still_imports_transcript() {
     let tmp = tempfile::TempDir::new().unwrap();
     let transcript = tmp.path().join("non-ralph-session.jsonl");
     std::fs::write(
@@ -1425,6 +1431,7 @@ fn test_stop_hook_imports_for_all_sessions() {
     let input = csr_engine::hooks::HookInput {
         transcript_path: Some(transcript.to_string_lossy().to_string()),
         cwd: Some(tmp.path().to_string_lossy().to_string()),
+        stop_hook_active: Some(true),
         ..Default::default()
     };
 

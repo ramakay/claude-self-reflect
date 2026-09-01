@@ -103,6 +103,15 @@ impl Storage {
         intent_events::count(&conn, project, since)
     }
 
+    pub fn count_session_intent_events(
+        &self,
+        session_id: &str,
+        kind: crate::transcript::intent_events::IntentEventKind,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        intent_events::count_session_kind(&conn, session_id, kind)
+    }
+
     // ─── Chunk operations ───
 
     pub fn insert_chunk(&self, chunk: &ConversationChunk, embedding: &[f32]) -> Result<()> {

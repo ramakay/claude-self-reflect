@@ -1,6 +1,7 @@
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::{collections::BTreeMap, ops::AddAssign};
+use std::{collections::BTreeMap, collections::BTreeSet, ops::AddAssign};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -13,14 +14,21 @@ use crate::hooks::reaction::Reaction;
 use super::{parse_transcript, truncate_chars, Role};
 
 const PRIOR_CLAIM_CHARS: usize = 240;
+const ABANDONMENT_LEXICON_VERSION: &str = "intent-abandonment-v2";
 const ABANDONMENT_MARKERS: &[&str] = &[
-    "abandon",
+    "abandoning",
     "dropping",
-    "out of scope",
     "reverting",
     "not doing",
-    "instead of",
-    "gave up",
+    "gave up on",
+    "out of scope",
+    "was rejected",
+    "got blocked",
+    "cannot-so",
+    "retrying with",
+    "trying-instead",
+    "falling back to",
+    "switching-to-instead",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +37,24 @@ pub enum IntentEventKind {
     Correction,
     Redirect,
     Abandoned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentDetector {
+    Lexical,
+    Classifier,
+    Both,
+}
+
+impl IntentDetector {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Classifier => "classifier",
+            Self::Both => "both",
+        }
+    }
 }
 
 impl IntentEventKind {
@@ -55,6 +81,9 @@ pub struct IntentEvent {
     pub symbol: Option<String>,
     pub file: Option<String>,
     pub classifier_hash: String,
+    pub detector: Option<IntentDetector>,
+    pub classifier_score: Option<String>,
+    pub marker: Option<String>,
     pub ts: String,
 }
 
@@ -63,8 +92,13 @@ pub struct IntentBackfillStats {
     pub files_scanned: usize,
     pub files_skipped: usize,
     pub inserted: usize,
+    pub alignment_misses: usize,
+    pub distinct_sessions: usize,
     pub by_kind: BTreeMap<String, usize>,
+    pub by_marker: BTreeMap<String, usize>,
     pub by_project: BTreeMap<String, usize>,
+    sessions: BTreeSet<String>,
+    events: Vec<IntentEvent>,
 }
 
 impl IntentBackfillStats {
@@ -83,11 +117,13 @@ impl IntentBackfillStats {
             output.push_str(&format!("  {project}: {total}\n"));
         }
         output.push_str(&format!(
-            "  correction={} redirect={} abandoned={} total={} {}={}\n",
+            "  correction={} redirect={} abandoned={} total={} distinct_sessions={} alignment_misses={} {}={}\n",
             self.by_kind.get("correction").copied().unwrap_or(0),
             self.by_kind.get("redirect").copied().unwrap_or(0),
             self.by_kind.get("abandoned").copied().unwrap_or(0),
             self.total_events(),
+            self.distinct_sessions,
+            self.alignment_misses,
             if dry_run { "would_insert" } else { "inserted" },
             if dry_run {
                 self.total_events()
@@ -95,8 +131,196 @@ impl IntentBackfillStats {
                 self.inserted
             }
         ));
+        for (marker, total) in &self.by_marker {
+            output.push_str(&format!("  marker[{marker}]={total}\n"));
+        }
         output
     }
+
+    pub fn events(&self) -> &[IntentEvent] {
+        &self.events
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgreementCounts {
+    pub ledger_total: usize,
+    pub ledger_matched: usize,
+    pub event_total: usize,
+    pub event_matched: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntentAgreementReport {
+    pub shared_sessions: usize,
+    pub by_kind: BTreeMap<String, AgreementCounts>,
+}
+
+impl IntentAgreementReport {
+    pub fn format_text(&self) -> String {
+        let mut output = format!(
+            "intent agreement: shared_sessions={}\n",
+            self.shared_sessions
+        );
+        for kind in ["correction", "redirect", "abandoned"] {
+            let counts = self.by_kind.get(kind).cloned().unwrap_or_default();
+            let recall = if counts.ledger_total == 0 {
+                "n/a".to_string()
+            } else {
+                format!(
+                    "{:.3}",
+                    counts.ledger_matched as f64 / counts.ledger_total as f64
+                )
+            };
+            let precision = if counts.event_total == 0 {
+                "n/a".to_string()
+            } else {
+                format!(
+                    "{:.3}",
+                    counts.event_matched as f64 / counts.event_total as f64
+                )
+            };
+            output.push_str(&format!(
+                "  {kind}: ledger_matched={}/{} recall={} event_matched={}/{} precision={}\n",
+                counts.ledger_matched,
+                counts.ledger_total,
+                recall,
+                counts.event_matched,
+                counts.event_total,
+                precision
+            ));
+        }
+        output
+    }
+}
+
+#[derive(Debug)]
+struct LedgerQuote {
+    session_id: String,
+    kind: IntentEventKind,
+    normalized: String,
+}
+
+fn normalize_agreement_quote(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn decoded_event_quote(event: &IntentEvent) -> String {
+    let encoded = format!("\"{}\"", event.quote);
+    serde_json::from_str::<String>(&encoded).unwrap_or_else(|_| event.quote.clone())
+}
+
+fn quotes_match(left: &str, right: &str) -> bool {
+    !left.is_empty() && !right.is_empty() && (left.contains(right) || right.contains(left))
+}
+
+pub fn agreement_report(
+    ledger_dir: &Path,
+    events: &[IntentEvent],
+) -> Result<IntentAgreementReport> {
+    let mut paths = std::fs::read_dir(ledger_dir)
+        .with_context(|| format!("reading intent ledger {}", ledger_dir.display()))?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut ledger_quotes = Vec::new();
+    let mut ledger_sessions = BTreeSet::new();
+    for path in paths {
+        let raw = std::fs::read_to_string(&path)?;
+        for line in raw.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(session_id) = value.get("session_id").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            ledger_sessions.insert(session_id.to_string());
+            let Some(narration) = value.get("narration") else {
+                continue;
+            };
+            for (key, kind) in [
+                ("corrections", IntentEventKind::Correction),
+                ("redirects", IntentEventKind::Redirect),
+                ("abandoned", IntentEventKind::Abandoned),
+            ] {
+                let Some(items) = narration.get(key).and_then(|value| value.as_array()) else {
+                    continue;
+                };
+                for item in items {
+                    if item.get("verified").and_then(|value| value.as_bool()) != Some(true) {
+                        continue;
+                    }
+                    let Some(quote) = item.get("quote").and_then(|value| value.as_str()) else {
+                        continue;
+                    };
+                    ledger_quotes.push(LedgerQuote {
+                        session_id: session_id.to_string(),
+                        kind,
+                        normalized: normalize_agreement_quote(quote),
+                    });
+                }
+            }
+        }
+    }
+
+    let event_sessions: BTreeSet<String> = events
+        .iter()
+        .map(|event| event.session_id.clone())
+        .collect();
+    let shared: BTreeSet<String> = ledger_sessions
+        .intersection(&event_sessions)
+        .cloned()
+        .collect();
+    let mut report = IntentAgreementReport {
+        shared_sessions: shared.len(),
+        ..Default::default()
+    };
+
+    for ledger in ledger_quotes
+        .iter()
+        .filter(|quote| shared.contains(quote.session_id.as_str()))
+    {
+        let counts = report
+            .by_kind
+            .entry(ledger.kind.as_str().to_string())
+            .or_default();
+        counts.ledger_total += 1;
+        if events.iter().any(|event| {
+            event.session_id == ledger.session_id
+                && event.kind == ledger.kind
+                && quotes_match(
+                    &normalize_agreement_quote(&decoded_event_quote(event)),
+                    &ledger.normalized,
+                )
+        }) {
+            counts.ledger_matched += 1;
+        }
+    }
+    for event in events
+        .iter()
+        .filter(|event| shared.contains(event.session_id.as_str()))
+    {
+        let counts = report
+            .by_kind
+            .entry(event.kind.as_str().to_string())
+            .or_default();
+        counts.event_total += 1;
+        let normalized = normalize_agreement_quote(&decoded_event_quote(event));
+        if ledger_quotes.iter().any(|ledger| {
+            ledger.session_id == event.session_id
+                && ledger.kind == event.kind
+                && quotes_match(&normalized, &ledger.normalized)
+        }) {
+            counts.event_matched += 1;
+        }
+    }
+    Ok(report)
 }
 
 #[derive(Debug)]
@@ -159,17 +383,27 @@ fn retain_since(events: &mut Vec<IntentEvent>, since: Option<chrono::DateTime<ch
 
 fn account_events(stats: &mut IntentBackfillStats, events: &[IntentEvent]) {
     for event in events {
+        stats.sessions.insert(event.session_id.clone());
         stats
             .by_kind
             .entry(event.kind.as_str().to_string())
             .or_default()
             .add_assign(1);
+        if let Some(marker) = &event.marker {
+            stats
+                .by_marker
+                .entry(marker.clone())
+                .or_default()
+                .add_assign(1);
+        }
         stats
             .by_project
             .entry(event.project.clone())
             .or_default()
             .add_assign(1);
     }
+    stats.distinct_sessions = stats.sessions.len();
+    stats.events.extend_from_slice(events);
 }
 
 #[cfg(test)]
@@ -223,7 +457,7 @@ pub async fn backfill_intent_events(
             stats.files_skipped += 1;
             continue;
         }
-        let Ok(mut events) = extract_intent_events(
+        let Ok(extraction) = extract_intent_events_since(
             &transcript.path,
             &transcript.session_id,
             &transcript.project,
@@ -234,6 +468,8 @@ pub async fn backfill_intent_events(
             stats.files_skipped += 1;
             continue;
         };
+        stats.alignment_misses += extraction.alignment_misses;
+        let mut events = extraction.events;
         retain_since(&mut events, since);
         account_events(&mut stats, &events);
         if !dry_run {
@@ -270,13 +506,27 @@ struct TranscriptBlock<'a> {
 }
 
 #[derive(Debug)]
+struct RawTextSpan {
+    decoded_start: usize,
+    decoded_end: usize,
+    raw_start: usize,
+    raw_end: usize,
+}
+
+#[derive(Debug)]
 struct SourceText {
     turn: u32,
     role: Role,
     timestamp: Option<String>,
     decoded: String,
-    raw_start: usize,
-    raw_end: usize,
+    spans: Vec<RawTextSpan>,
+}
+
+#[derive(Debug)]
+struct SourceTexts {
+    entries: Vec<SourceText>,
+    alignment_misses: usize,
+    last_turn: u32,
 }
 
 fn borrowed_subslice_offset(haystack: &str, needle: &str) -> Option<usize> {
@@ -315,13 +565,14 @@ fn raw_text_values(line: &str, record: &TranscriptLine<'_>) -> Vec<(String, usiz
         .collect()
 }
 
-fn source_texts(path: &Path) -> Result<Vec<SourceText>> {
+fn source_texts(path: &Path) -> Result<SourceTexts> {
     let parsed = parse_transcript(path)?;
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading transcript bytes from {}", path.display()))?;
     let mut sources = Vec::new();
     let mut absolute = 0usize;
     let mut next_entry = 0usize;
+    let mut alignment_misses = 0usize;
     for segment in raw.split_inclusive('\n') {
         let line = segment.strip_suffix('\n').unwrap_or(segment);
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -363,25 +614,141 @@ fn source_texts(path: &Path) -> Result<Vec<SourceText>> {
                 })
             });
         let Some(relative) = entry_position else {
+            alignment_misses += 1;
             absolute += segment.len();
             continue;
         };
         let entry_index = next_entry + relative;
         let turn = parsed.entries[entry_index].turn as u32;
         next_entry = entry_index + 1;
-        for (decoded, start, end) in texts {
-            sources.push(SourceText {
-                turn,
-                role,
-                timestamp: record.timestamp.map(str::to_string),
-                decoded,
-                raw_start: absolute + start,
-                raw_end: absolute + end,
-            });
-        }
+        let mut decoded_offset = 0usize;
+        let spans = texts
+            .iter()
+            .map(|(decoded, start, end)| {
+                let decoded_start = decoded_offset;
+                let decoded_end = decoded_start + decoded.len();
+                decoded_offset = decoded_end + 1;
+                RawTextSpan {
+                    decoded_start,
+                    decoded_end,
+                    raw_start: absolute + start,
+                    raw_end: absolute + end,
+                }
+            })
+            .collect();
+        sources.push(SourceText {
+            turn,
+            role,
+            timestamp: record.timestamp.map(str::to_string),
+            decoded: joined,
+            spans,
+        });
         absolute += segment.len();
     }
-    Ok(sources)
+    let last_turn = parsed
+        .entries
+        .last()
+        .map(|entry| entry.turn as u32)
+        .unwrap_or(0);
+    Ok(SourceTexts {
+        entries: sources,
+        alignment_misses,
+        last_turn,
+    })
+}
+
+fn source_texts_tail(raw: &str, starting_turn: u32) -> SourceTexts {
+    let parsed = super::parse_transcript_fragment(raw);
+    let mut entries = Vec::new();
+    let mut relative = 0usize;
+    let mut alignment_misses = 0usize;
+    let mut next_entry = 0usize;
+    for segment in raw.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let Ok(record) = serde_json::from_str::<TranscriptLine<'_>>(line) else {
+            if !line.trim().is_empty() {
+                alignment_misses += 1;
+            }
+            relative += segment.len();
+            continue;
+        };
+        let role = match record.record_type {
+            Some("user") => Role::User,
+            Some("assistant") => Role::Assistant,
+            _ => {
+                relative += segment.len();
+                continue;
+            }
+        };
+        let texts = raw_text_values(line, &record);
+        if texts.is_empty() {
+            relative += segment.len();
+            continue;
+        }
+        let joined = texts
+            .iter()
+            .map(|(text, _, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry_position = parsed.entries[next_entry..]
+            .iter()
+            .position(|entry| {
+                entry.role == role
+                    && record
+                        .uuid
+                        .is_some_and(|uuid| entry.uuid.as_deref() == Some(uuid))
+            })
+            .or_else(|| {
+                parsed.entries[next_entry..].iter().position(|entry| {
+                    entry.role == role
+                        && entry.timestamp.as_deref() == record.timestamp
+                        && entry.text == joined
+                })
+            });
+        let Some(entry_position) = entry_position else {
+            alignment_misses += 1;
+            relative += segment.len();
+            continue;
+        };
+        let entry_index = next_entry + entry_position;
+        let turn = starting_turn.saturating_add(parsed.entries[entry_index].turn as u32);
+        next_entry = entry_index + 1;
+        let mut decoded_offset = 0usize;
+        let spans = texts
+            .iter()
+            .map(|(decoded, start, end)| {
+                let decoded_start = decoded_offset;
+                let decoded_end = decoded_start + decoded.len();
+                decoded_offset = decoded_end + 1;
+                RawTextSpan {
+                    decoded_start,
+                    decoded_end,
+                    raw_start: relative + start,
+                    raw_end: relative + end,
+                }
+            })
+            .collect();
+        entries.push(SourceText {
+            turn,
+            role,
+            timestamp: record.timestamp.map(str::to_string),
+            decoded: joined,
+            spans,
+        });
+        relative += segment.len();
+    }
+    SourceTexts {
+        entries,
+        alignment_misses,
+        last_turn: starting_turn.saturating_add(
+            parsed
+                .entries
+                .last()
+                .map(|entry| entry.turn as u32)
+                .unwrap_or(0),
+        ),
+    }
 }
 
 fn decoded_boundary_to_raw(encoded: &str, target: usize) -> Option<usize> {
@@ -426,9 +793,22 @@ fn decoded_boundary_to_raw(encoded: &str, target: usize) -> Option<usize> {
 fn sentence_ranges(text: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut start = 0usize;
+    let mut in_backticks = false;
     for (offset, ch) in text.char_indices() {
-        if matches!(ch, '.' | '!' | '?') {
-            let end = offset + ch.len_utf8();
+        if ch == '`' {
+            in_backticks = !in_backticks;
+            continue;
+        }
+        let next_is_boundary = text
+            .get(offset + ch.len_utf8()..)
+            .and_then(|tail| tail.chars().next())
+            .is_none_or(char::is_whitespace);
+        if ch == '\n' || (!in_backticks && matches!(ch, '.' | '!' | '?') && next_is_boundary) {
+            let end = if ch == '\n' {
+                offset
+            } else {
+                offset + ch.len_utf8()
+            };
             let trimmed_start = start
                 + text[start..end]
                     .find(|c: char| !c.is_whitespace())
@@ -436,7 +816,7 @@ fn sentence_ranges(text: &str) -> Vec<(usize, usize)> {
             if trimmed_start < end {
                 ranges.push((trimmed_start, end));
             }
-            start = end;
+            start = offset + ch.len_utf8();
         }
     }
     if start < text.len() {
@@ -467,6 +847,38 @@ struct EventContext<'a> {
     session_id: &'a str,
     project: &'a str,
     transcript_path: &'a Path,
+    byte_base: usize,
+    min_turn_exclusive: u32,
+    initial_prior_user: &'a str,
+    initial_prior_assistant: &'a str,
+}
+
+struct DetectionReceipt {
+    detector: Option<IntentDetector>,
+    classifier_score: Option<String>,
+    marker: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClassifierEvidence {
+    reaction: Option<Reaction>,
+    proposed: Option<Reaction>,
+    confidence: f32,
+}
+
+fn classifier_score(evidence: ClassifierEvidence) -> Option<String> {
+    evidence
+        .proposed
+        .map(|reaction| format!("{}:{:.6}", reaction.as_str(), evidence.confidence))
+}
+
+fn abandonment_lexicon_hash() -> String {
+    let material = format!(
+        "{}\n{}",
+        ABANDONMENT_LEXICON_VERSION,
+        ABANDONMENT_MARKERS.join("\n")
+    );
+    blake3::hash(material.as_bytes()).to_hex().to_string()
 }
 
 fn make_event(
@@ -475,18 +887,23 @@ fn make_event(
     kind: IntentEventKind,
     prior_claim: &str,
     context: &EventContext<'_>,
+    detection: DetectionReceipt,
 ) -> Option<IntentEvent> {
-    let encoded = context
-        .raw_transcript
-        .get(source.raw_start..source.raw_end)?;
-    let relative_start = decoded_boundary_to_raw(encoded, decoded_range.start)?;
-    let relative_end = decoded_boundary_to_raw(encoded, decoded_range.end)?;
-    let byte_start = source.raw_start.checked_add(relative_start)?;
-    let byte_end = source.raw_start.checked_add(relative_end)?;
+    let span = source.spans.iter().find(|span| {
+        decoded_range.start >= span.decoded_start && decoded_range.end <= span.decoded_end
+    })?;
+    let encoded = context.raw_transcript.get(span.raw_start..span.raw_end)?;
+    let relative_start =
+        decoded_boundary_to_raw(encoded, decoded_range.start - span.decoded_start)?;
+    let relative_end = decoded_boundary_to_raw(encoded, decoded_range.end - span.decoded_start)?;
+    let relative_byte_start = span.raw_start.checked_add(relative_start)?;
+    let relative_byte_end = span.raw_start.checked_add(relative_end)?;
     let quote = context
         .raw_transcript
-        .get(byte_start..byte_end)?
+        .get(relative_byte_start..relative_byte_end)?
         .to_string();
+    let byte_start = context.byte_base.checked_add(relative_byte_start)?;
+    let byte_end = context.byte_base.checked_add(relative_byte_end)?;
     let decoded_quote = source.decoded.get(decoded_range)?;
     let (symbol, file) = target_fields(decoded_quote);
     Some(IntentEvent {
@@ -501,7 +918,14 @@ fn make_event(
         prior_claim: truncate_chars(prior_claim, PRIOR_CLAIM_CHARS),
         symbol,
         file,
-        classifier_hash: crate::hooks::reaction::classifier_hash(),
+        classifier_hash: if kind == IntentEventKind::Abandoned {
+            abandonment_lexicon_hash()
+        } else {
+            crate::hooks::reaction::classifier_hash()
+        },
+        detector: detection.detector,
+        classifier_score: detection.classifier_score,
+        marker: detection.marker,
         ts: source
             .timestamp
             .clone()
@@ -509,6 +933,324 @@ fn make_event(
     })
 }
 
+fn is_classifiable_user(text: &str, prior_user: &str) -> bool {
+    !prior_user.is_empty()
+        && !crate::hooks::reaction::is_queued_message(text)
+        && !crate::transcript::instrumentation::is_noisy_steer_text(text)
+        && !crate::extraction::provenance::is_csr_emission(text)
+        && crate::extraction::provenance::extractable(text).is_some()
+}
+
+fn classification_plan(
+    sources: &SourceTexts,
+    min_turn_exclusive: u32,
+    initial_prior_user: &str,
+) -> (Vec<String>, BTreeSet<u32>) {
+    let mut prior_user = initial_prior_user.to_string();
+    let mut texts = Vec::new();
+    let mut turns = BTreeSet::new();
+    for source in &sources.entries {
+        if source.role != Role::User {
+            continue;
+        }
+        if source.turn > min_turn_exclusive && is_classifiable_user(&source.decoded, &prior_user) {
+            texts.push(source.decoded.clone());
+            turns.insert(source.turn);
+        }
+        prior_user = source.decoded.clone();
+    }
+    (texts, turns)
+}
+
+fn starts_with_command_after(text: &str, prefix: &str) -> bool {
+    text.strip_prefix(prefix)
+        .is_some_and(|tail| tail.split_whitespace().next().is_some())
+}
+
+fn lexical_reaction_sentence(text: &str) -> Option<(IntentEventKind, usize, usize, &'static str)> {
+    for (start, end) in sentence_ranges(text) {
+        let sentence = text[start..end].trim();
+        let lower = sentence.to_ascii_lowercase();
+        let correction = if lower.starts_with("no,") || lower.starts_with("no.") {
+            Some("no")
+        } else if lower.starts_with("no that") || lower.starts_with("no, that") {
+            Some("no-that")
+        } else if lower.starts_with("not what i asked")
+            || lower.starts_with("that is not what i asked")
+            || lower.starts_with("that's not what i asked")
+        {
+            Some("not-what-i-asked")
+        } else if [
+            "that's wrong",
+            "that is wrong",
+            "that's not right",
+            "that is not right",
+            "that's incorrect",
+            "that is incorrect",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        {
+            Some("that-is-wrong")
+        } else if [
+            "wrong file",
+            "wrong agent",
+            "wrong branch",
+            "wrong approach",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        {
+            Some("wrong-target")
+        } else if lower == "stop."
+            || lower == "stop!"
+            || lower == "stop"
+            || lower.starts_with("stop,")
+        {
+            Some("stop")
+        } else if starts_with_command_after(&lower, "don't ")
+            || starts_with_command_after(&lower, "do not ")
+            || (starts_with_command_after(&lower, "never ") && !lower.starts_with("never mind"))
+        {
+            Some("negative-command")
+        } else if lower.starts_with("i said ") {
+            Some("i-said")
+        } else if starts_with_command_after(&lower, "revert") {
+            Some("revert")
+        } else if starts_with_command_after(&lower, "undo") {
+            Some("undo")
+        } else {
+            None
+        };
+        if let Some(marker) = correction {
+            return Some((IntentEventKind::Correction, start, end, marker));
+        }
+
+        let redirect = if lower.starts_with("actually, forget ")
+            || lower.starts_with("actually forget ")
+            || lower.starts_with("actually, scrap ")
+            || lower.starts_with("actually scrap ")
+            || lower.starts_with("actually, drop ")
+            || lower.starts_with("actually drop ")
+        {
+            Some("actually-pivot")
+        } else if lower.starts_with("forget that") || lower.starts_with("forget the ") {
+            Some("forget")
+        } else if lower.starts_with("never mind") {
+            Some("never-mind")
+        } else if lower.starts_with("let's ") && lower.contains(" first instead") {
+            Some("first-instead")
+        } else if (lower.ends_with(" instead.") || lower.ends_with(" instead"))
+            && (lower.contains(" don't ")
+                || lower.contains(" do not ")
+                || lower.contains(" not ")
+                || lower.starts_with("not ")
+                || lower.starts_with("no"))
+        {
+            Some("negated-instead")
+        } else {
+            None
+        };
+        if let Some(marker) = redirect {
+            return Some((IntentEventKind::Redirect, start, end, marker));
+        }
+    }
+    None
+}
+
+fn classifier_marker_sentence(text: &str) -> Option<(usize, usize, &'static str)> {
+    for (start, end) in sentence_ranges(text) {
+        let lower = text[start..end].trim().to_ascii_lowercase();
+        let marker = if lower.starts_with("you misunderstood") {
+            Some("you-misunderstood")
+        } else if lower.starts_with("this does not meet")
+            || lower.starts_with("this is still wrong")
+        {
+            Some("explicit-failure")
+        } else if lower.starts_with("change of direction") || lower.starts_with("new task:") {
+            Some("explicit-pivot")
+        } else if lower.starts_with("put that aside") {
+            Some("put-aside")
+        } else {
+            None
+        };
+        if let Some(marker) = marker {
+            return Some((start, end, marker));
+        }
+    }
+    None
+}
+
+fn abandonment_marker(sentence: &str) -> Option<&'static str> {
+    let lower = sentence.trim().to_ascii_lowercase();
+    let first_person = |verb: &str| {
+        lower.starts_with(verb)
+            || [
+                "i am ", "i'm ", "i will ", "i'll ", "we are ", "we're ", "we will ", "we'll ",
+            ]
+            .iter()
+            .any(|prefix| lower.starts_with(&format!("{prefix}{verb}")))
+    };
+    let cannot_so = lower.split_once(" so ").is_some_and(|(_, outcome)| {
+        let has_inability = lower.contains("cannot ") || lower.contains("can't ");
+        let explicit_pivot = [
+            "i'll ",
+            "i will ",
+            "we'll ",
+            "we will ",
+            "switching ",
+            "trying ",
+            "retrying ",
+            "using ",
+            "falling back ",
+            "skipping ",
+            "dropping ",
+        ]
+        .iter()
+        .any(|prefix| outcome.trim_start().starts_with(prefix));
+        has_inability && explicit_pivot
+    });
+    if first_person("abandoning") {
+        Some("abandoning")
+    } else if first_person("dropping") {
+        Some("dropping")
+    } else if first_person("reverting") {
+        Some("reverting")
+    } else if lower.starts_with("not doing")
+        || lower.starts_with("i am not doing")
+        || lower.starts_with("i'm not doing")
+        || lower.starts_with("we are not doing")
+        || lower.starts_with("we're not doing")
+    {
+        Some("not doing")
+    } else if lower.starts_with("gave up on")
+        || lower.starts_with("i gave up on")
+        || lower.starts_with("we gave up on")
+    {
+        Some("gave up on")
+    } else if lower.contains("out of scope") {
+        Some("out of scope")
+    } else if lower.contains("was rejected") {
+        Some("was rejected")
+    } else if lower.contains("got blocked") {
+        Some("got blocked")
+    } else if cannot_so {
+        Some("cannot-so")
+    } else if lower.contains("retrying with") {
+        Some("retrying with")
+    } else if lower.contains("trying ") && lower.contains(" instead") {
+        Some("trying-instead")
+    } else if lower.contains("falling back to") {
+        Some("falling back to")
+    } else if lower.contains("switching to") && lower.contains(" instead") {
+        Some("switching-to-instead")
+    } else {
+        None
+    }
+}
+
+fn extract_from_sources(
+    source_texts: &SourceTexts,
+    context: &EventContext<'_>,
+    classifiable_turns: &BTreeSet<u32>,
+    mut classify: impl FnMut(&str, &str) -> ClassifierEvidence,
+) -> (Vec<IntentEvent>, String, String) {
+    let mut events = Vec::new();
+    let mut prior_user = context.initial_prior_user.to_string();
+    let mut prior_assistant = context.initial_prior_assistant.to_string();
+    for source in &source_texts.entries {
+        match source.role {
+            Role::User => {
+                let text = &source.decoded;
+                if classifiable_turns.contains(&source.turn) {
+                    let evidence = classify(text, &prior_user);
+                    let lexical = lexical_reaction_sentence(text);
+                    if let Some((kind, start, end, _marker)) = lexical {
+                        let classifier_kind = match evidence.reaction {
+                            Some(Reaction::Correction) => Some(IntentEventKind::Correction),
+                            Some(Reaction::Redirect) => Some(IntentEventKind::Redirect),
+                            _ => None,
+                        };
+                        let detector = if classifier_kind == Some(kind) {
+                            IntentDetector::Both
+                        } else {
+                            IntentDetector::Lexical
+                        };
+                        if let Some(event) = make_event(
+                            source,
+                            start..end,
+                            kind,
+                            &prior_assistant,
+                            context,
+                            DetectionReceipt {
+                                detector: Some(detector),
+                                classifier_score: classifier_score(evidence),
+                                marker: None,
+                            },
+                        ) {
+                            events.push(event);
+                        }
+                    } else if let (Some((start, end, _marker)), Some(kind)) = (
+                        classifier_marker_sentence(text),
+                        match evidence.reaction {
+                            Some(Reaction::Correction) => Some(IntentEventKind::Correction),
+                            Some(Reaction::Redirect) => Some(IntentEventKind::Redirect),
+                            _ => None,
+                        },
+                    ) {
+                        if let Some(event) = make_event(
+                            source,
+                            start..end,
+                            kind,
+                            &prior_assistant,
+                            context,
+                            DetectionReceipt {
+                                detector: Some(IntentDetector::Classifier),
+                                classifier_score: classifier_score(evidence),
+                                marker: None,
+                            },
+                        ) {
+                            events.push(event);
+                        }
+                    }
+                }
+                prior_user = text.clone();
+            }
+            Role::Assistant => {
+                let text = &source.decoded;
+                if source.turn > context.min_turn_exclusive
+                    && !crate::extraction::provenance::is_csr_emission(text)
+                    && crate::extraction::provenance::extractable(text).is_some()
+                {
+                    for (start, end) in sentence_ranges(text) {
+                        let sentence = &text[start..end];
+                        if let Some(marker) = abandonment_marker(sentence) {
+                            if let Some(event) = make_event(
+                                source,
+                                start..end,
+                                IntentEventKind::Abandoned,
+                                &prior_assistant,
+                                context,
+                                DetectionReceipt {
+                                    detector: Some(IntentDetector::Lexical),
+                                    classifier_score: None,
+                                    marker: Some(marker.to_string()),
+                                },
+                            ) {
+                                events.push(event);
+                            }
+                        }
+                    }
+                }
+                prior_assistant = text.clone();
+            }
+            Role::System => {}
+        }
+    }
+    (events, prior_user, prior_assistant)
+}
+
+#[cfg(test)]
 fn extract_with_classifier(
     transcript_path: &Path,
     session_id: &str,
@@ -522,111 +1264,261 @@ fn extract_with_classifier(
         session_id,
         project,
         transcript_path,
+        byte_base: 0,
+        min_turn_exclusive: 0,
+        initial_prior_user: "",
+        initial_prior_assistant: "",
     };
-    let mut events = Vec::new();
-    let mut prior_user = String::new();
-    let mut prior_assistant = String::new();
-    for source in &sources {
-        match source.role {
-            Role::User => {
-                let text = &source.decoded;
-                let gated = !prior_user.is_empty()
-                    && !crate::transcript::instrumentation::is_noisy_steer_text(text)
-                    && !crate::extraction::provenance::is_csr_emission(text)
-                    && crate::extraction::provenance::extractable(text).is_some();
-                if gated {
-                    let kind = match classify(text, &prior_user) {
-                        Some(Reaction::Correction) => Some(IntentEventKind::Correction),
-                        Some(Reaction::Redirect) => Some(IntentEventKind::Redirect),
-                        _ => None,
-                    };
-                    if let Some(kind) = kind {
-                        if let Some(event) =
-                            make_event(source, 0..text.len(), kind, &prior_assistant, &context)
-                        {
-                            events.push(event);
-                        }
-                    }
-                }
-                prior_user = text.clone();
+    let (_, classifiable_turns) = classification_plan(&sources, 0, "");
+    Ok(
+        extract_from_sources(&sources, &context, &classifiable_turns, |text, prior| {
+            let reaction = classify(text, prior);
+            ClassifierEvidence {
+                reaction,
+                proposed: reaction,
+                confidence: reaction.map_or(0.0, |_| 1.0),
             }
-            Role::Assistant => {
-                let text = &source.decoded;
-                if !crate::extraction::provenance::is_csr_emission(text)
-                    && crate::extraction::provenance::extractable(text).is_some()
-                {
-                    for (start, end) in sentence_ranges(text) {
-                        let sentence = &text[start..end];
-                        let lower = sentence.to_ascii_lowercase();
-                        if ABANDONMENT_MARKERS
-                            .iter()
-                            .any(|marker| lower.contains(marker))
-                        {
-                            if let Some(event) = make_event(
-                                source,
-                                start..end,
-                                IntentEventKind::Abandoned,
-                                &prior_assistant,
-                                &context,
-                            ) {
-                                events.push(event);
-                            }
-                        }
-                    }
-                }
-                prior_assistant = text.clone();
-            }
-            Role::System => {}
-        }
-    }
-    Ok(events)
+        })
+        .0,
+    )
 }
 
 /// Deterministically extract receipted corrections, redirects, and explicit
 /// abandonment statements from one Claude transcript. The only model work is
 /// the existing local MiniLM reaction classifier; no generative model is used.
+#[derive(Debug)]
+pub struct IntentExtraction {
+    pub events: Vec<IntentEvent>,
+    pub alignment_misses: usize,
+    pub last_turn: u32,
+    pub byte_offset: usize,
+    pub prior_user: String,
+    pub prior_assistant: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IntentHighWater {
+    pub byte_offset: usize,
+    pub last_turn: u32,
+    pub prior_user: String,
+    pub prior_assistant: String,
+}
+
+impl From<&IntentExtraction> for IntentHighWater {
+    fn from(extraction: &IntentExtraction) -> Self {
+        Self {
+            byte_offset: extraction.byte_offset,
+            last_turn: extraction.last_turn,
+            prior_user: extraction.prior_user.clone(),
+            prior_assistant: extraction.prior_assistant.clone(),
+        }
+    }
+}
+
+pub async fn extract_intent_events_since(
+    transcript_path: &Path,
+    session_id: &str,
+    project: &str,
+    embeddings: &Arc<EmbeddingEngine>,
+) -> Result<IntentExtraction> {
+    extract_intent_events_after(transcript_path, session_id, project, embeddings, 0).await
+}
+
+pub async fn extract_intent_events_after(
+    transcript_path: &Path,
+    session_id: &str,
+    project: &str,
+    embeddings: &Arc<EmbeddingEngine>,
+    min_turn_exclusive: u32,
+) -> Result<IntentExtraction> {
+    let sources = source_texts(transcript_path)?;
+    let (classifiable, classifiable_turns) = classification_plan(&sources, min_turn_exclusive, "");
+
+    let raw = std::fs::read_to_string(transcript_path)?;
+    let last_turn = sources.last_turn.max(min_turn_exclusive);
+    let context = EventContext {
+        raw_transcript: &raw,
+        session_id,
+        project,
+        transcript_path,
+        byte_base: 0,
+        min_turn_exclusive,
+        initial_prior_user: "",
+        initial_prior_assistant: "",
+    };
+
+    if classifiable.is_empty() {
+        let (events, prior_user, prior_assistant) =
+            extract_from_sources(&sources, &context, &classifiable_turns, |_text, _prior| {
+                ClassifierEvidence {
+                    reaction: None,
+                    proposed: None,
+                    confidence: 0.0,
+                }
+            });
+        return Ok(IntentExtraction {
+            events,
+            alignment_misses: sources.alignment_misses,
+            last_turn,
+            byte_offset: raw.len(),
+            prior_user,
+            prior_assistant,
+        });
+    }
+
+    let probes = crate::hooks::reaction::ProbeSet::load_or_build(embeddings).await;
+    let vectors = if probes.is_some() {
+        let engine = embeddings.clone();
+        tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = classifiable.iter().map(String::as_str).collect();
+            engine.embed(&refs)
+        })
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut vectors = vectors.into_iter();
+    let (events, prior_user, prior_assistant) = extract_from_sources(
+        &sources,
+        &context,
+        &classifiable_turns,
+        |text, prior_user| {
+            let Some(vector) = vectors.next() else {
+                return ClassifierEvidence {
+                    reaction: None,
+                    proposed: None,
+                    confidence: 0.0,
+                };
+            };
+            let Some(probes) = probes.as_ref() else {
+                return ClassifierEvidence {
+                    reaction: None,
+                    proposed: None,
+                    confidence: 0.0,
+                };
+            };
+            let decision = probes.classify(text, prior_user, &vector, None);
+            ClassifierEvidence {
+                reaction: decision.reaction,
+                proposed: decision.proposed_reaction,
+                confidence: decision.confidence,
+            }
+        },
+    );
+    Ok(IntentExtraction {
+        events,
+        alignment_misses: sources.alignment_misses,
+        last_turn,
+        byte_offset: raw.len(),
+        prior_user,
+        prior_assistant,
+    })
+}
+
+/// Stop-hook extractor: read only bytes appended after the durable high-water
+/// mark. The carried user/assistant context is the minimum state needed to
+/// classify the first new user entry without reopening the old prefix.
+pub async fn extract_intent_events_incremental(
+    transcript_path: &Path,
+    session_id: &str,
+    project: &str,
+    embeddings: &Arc<EmbeddingEngine>,
+    high_water: &IntentHighWater,
+) -> Result<IntentExtraction> {
+    let mut state = high_water.clone();
+    let metadata = std::fs::metadata(transcript_path)?;
+    if state.byte_offset as u64 > metadata.len() {
+        state = IntentHighWater::default();
+    }
+    let mut file = std::fs::File::open(transcript_path)?;
+    file.seek(SeekFrom::Start(state.byte_offset as u64))?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    let sources = source_texts_tail(&raw, state.last_turn);
+
+    let (classifiable, classifiable_turns) =
+        classification_plan(&sources, state.last_turn, &state.prior_user);
+
+    let probes = if classifiable.is_empty() {
+        None
+    } else {
+        crate::hooks::reaction::ProbeSet::load_or_build(embeddings).await
+    };
+    let mut vectors = if probes.is_some() {
+        let engine = embeddings.clone();
+        tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = classifiable.iter().map(String::as_str).collect();
+            engine.embed(&refs)
+        })
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .unwrap_or_default()
+        .into_iter()
+    } else {
+        Vec::new().into_iter()
+    };
+    let context = EventContext {
+        raw_transcript: &raw,
+        session_id,
+        project,
+        transcript_path,
+        byte_base: state.byte_offset,
+        min_turn_exclusive: state.last_turn,
+        initial_prior_user: &state.prior_user,
+        initial_prior_assistant: &state.prior_assistant,
+    };
+    let (events, prior_user, prior_assistant) = extract_from_sources(
+        &sources,
+        &context,
+        &classifiable_turns,
+        |text, preceding_user| {
+            let Some(vector) = vectors.next() else {
+                return ClassifierEvidence {
+                    reaction: None,
+                    proposed: None,
+                    confidence: 0.0,
+                };
+            };
+            let Some(probes) = probes.as_ref() else {
+                return ClassifierEvidence {
+                    reaction: None,
+                    proposed: None,
+                    confidence: 0.0,
+                };
+            };
+            let decision = probes.classify(text, preceding_user, &vector, None);
+            ClassifierEvidence {
+                reaction: decision.reaction,
+                proposed: decision.proposed_reaction,
+                confidence: decision.confidence,
+            }
+        },
+    );
+    Ok(IntentExtraction {
+        events,
+        alignment_misses: sources.alignment_misses,
+        last_turn: sources.last_turn,
+        byte_offset: state.byte_offset + raw.len(),
+        prior_user,
+        prior_assistant,
+    })
+}
+
 pub async fn extract_intent_events(
     transcript_path: &Path,
     session_id: &str,
     project: &str,
     embeddings: &Arc<EmbeddingEngine>,
 ) -> Result<Vec<IntentEvent>> {
-    let sources = source_texts(transcript_path)?;
-    let mut prior_user = String::new();
-    let mut classifiable = Vec::new();
-    for source in &sources {
-        if source.role != Role::User {
-            continue;
-        }
-        let text = &source.decoded;
-        if !prior_user.is_empty()
-            && !crate::transcript::instrumentation::is_noisy_steer_text(text)
-            && !crate::extraction::provenance::is_csr_emission(text)
-            && crate::extraction::provenance::extractable(text).is_some()
-        {
-            classifiable.push(text.clone());
-        }
-        prior_user = text.clone();
-    }
-
-    if classifiable.is_empty() {
-        return extract_with_classifier(transcript_path, session_id, project, |_text, _prior| None);
-    }
-
-    let probes = crate::hooks::reaction::ProbeSet::load_or_build(embeddings)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("reaction exemplar probes could not be loaded or built"))?;
-    let engine = embeddings.clone();
-    let vectors = tokio::task::spawn_blocking(move || {
-        let refs: Vec<&str> = classifiable.iter().map(String::as_str).collect();
-        engine.embed(&refs)
-    })
-    .await??;
-    let mut vectors = vectors.into_iter();
-    extract_with_classifier(transcript_path, session_id, project, |text, prior_user| {
-        let vector = vectors.next()?;
-        probes.classify(text, prior_user, &vector, None).reaction
-    })
+    Ok(
+        extract_intent_events_since(transcript_path, session_id, project, embeddings)
+            .await?
+            .events,
+    )
 }
 
 #[cfg(test)]
@@ -678,6 +1570,7 @@ mod tests {
         let raw = concat!(
             "{\"type\":\"assistant\",\"timestamp\":\"2026-09-01T10:00:00Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"The first idea may work. We are dropping `OldParser` instead of changing it. The final design is ready.\"}]}}\n",
             "{\"type\":\"assistant\",\"timestamp\":\"2026-09-01T10:01:00Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"This is ordinary progress without a marker.\"}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-09-01T10:02:00Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"The network is dropping packets. The operation cannot continue so the caller receives an error.\"}]}}\n",
         );
         std::fs::write(&transcript, raw).unwrap();
 
@@ -716,6 +1609,116 @@ mod tests {
     }
 
     #[test]
+    fn multiple_text_blocks_in_one_user_entry_are_one_logical_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","timestamp":"2026-09-01T10:00:00Z","message":{"content":[{"type":"text","text":"Implement parser"},{"type":"text","text":"No, use NewParser"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| {
+            Some(Reaction::Correction)
+        })
+        .unwrap();
+
+        assert!(
+            events.is_empty(),
+            "one opening entry is not a reaction turn"
+        );
+    }
+
+    #[test]
+    fn prior_claim_joins_all_text_blocks_from_the_preceding_assistant_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","message":{"content":"Build parser"}}"#,
+                "\n",
+                r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"I chose OldParser."},{"type":"text","text":"It lives in old.rs."}]}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","message":{"content":"No, use NewParser."}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let events = extract_with_classifier(&transcript, "s", "p", |text, _prior| {
+            (text == "No, use NewParser.").then_some(Reaction::Correction)
+        })
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].prior_claim,
+            "I chose OldParser.\nIt lives in old.rs."
+        );
+    }
+
+    #[test]
+    fn textbook_probe_turns_produce_four_corrections_and_one_redirect() {
+        let probe = Path::new("/tmp/csr-b2/probe-projects/-tmp-probe/probe-1.jsonl");
+        assert!(probe.is_file(), "B2 probe transcript must be present");
+        let events =
+            extract_with_classifier(probe, "probe-1", "-tmp-probe", |_text, _prior| None).unwrap();
+        let user_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind != IntentEventKind::Abandoned)
+            .collect();
+        assert_eq!(
+            user_events
+                .iter()
+                .filter(|event| event.kind == IntentEventKind::Correction)
+                .count(),
+            4
+        );
+        assert_eq!(
+            user_events
+                .iter()
+                .filter(|event| event.kind == IntentEventKind::Redirect)
+                .count(),
+            1
+        );
+        assert_eq!(
+            user_events
+                .iter()
+                .find(|event| event.kind == IntentEventKind::Redirect)
+                .map(|event| event.turn),
+            Some(15)
+        );
+        assert!(user_events
+            .iter()
+            .all(|event| !event.quote.contains("thanks") && event.quote != "continue"));
+    }
+
+    #[test]
+    fn two_child_transcripts_with_identical_coordinates_both_persist() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("agent-first.jsonl");
+        let second = temp.path().join("agent-second.jsonl");
+        let line = concat!(
+            r#"{"type":"assistant","timestamp":"2026-09-01T10:00:00Z","message":{"content":"I am dropping OldParser."}}"#,
+            "\n"
+        );
+        std::fs::write(&first, line).unwrap();
+        std::fs::write(&second, line).unwrap();
+        let mut events =
+            extract_with_classifier(&first, "parent", "p", |_text, _prior| None).unwrap();
+        events
+            .extend(extract_with_classifier(&second, "parent", "p", |_text, _prior| None).unwrap());
+        let storage = crate::storage::Storage::open_memory().unwrap();
+
+        assert_eq!(storage.insert_intent_events(&events).unwrap(), 2);
+        assert_eq!(storage.list_intent_events(None, None).unwrap().len(), 2);
+    }
+
+    #[test]
     fn backfill_dry_run_counts_events_without_writing() {
         let temp = tempfile::tempdir().unwrap();
         let projects = temp.path().join("projects");
@@ -741,5 +1744,52 @@ mod tests {
         assert_eq!(stats.by_project.get("project-a"), Some(&1));
         assert_eq!(stats.inserted, 0);
         assert!(storage.list_intent_events(None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agreement_is_whitespace_normalized_and_limited_to_shared_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = temp.path().join("ledger");
+        std::fs::create_dir(&ledger).unwrap();
+        std::fs::write(
+            ledger.join("records.jsonl"),
+            concat!(
+                r#"{"session_id":"shared","narration":{"abandoned":[{"quote":"--bare was rejected because auth failed","verified":true}]}}"#,
+                "\n",
+                r#"{"session_id":"ledger-only","narration":{"abandoned":[{"quote":"never seen","verified":true}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let event = IntentEvent {
+            session_id: "shared".into(),
+            project: "p".into(),
+            turn: 2,
+            kind: IntentEventKind::Abandoned,
+            quote: "--bare  was rejected because auth failed.".into(),
+            transcript_path: temp.path().join("shared.jsonl"),
+            byte_start: 0,
+            byte_end: 40,
+            prior_claim: String::new(),
+            symbol: None,
+            file: None,
+            classifier_hash: abandonment_lexicon_hash(),
+            detector: Some(IntentDetector::Lexical),
+            classifier_score: None,
+            marker: Some("was rejected".into()),
+            ts: "2026-09-01T00:00:00Z".into(),
+        };
+
+        let report = agreement_report(&ledger, &[event]).unwrap();
+        assert_eq!(report.shared_sessions, 1);
+        assert_eq!(
+            report.by_kind.get("abandoned"),
+            Some(&AgreementCounts {
+                ledger_total: 1,
+                ledger_matched: 1,
+                event_total: 1,
+                event_matched: 1,
+            })
+        );
     }
 }

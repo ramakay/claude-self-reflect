@@ -153,6 +153,14 @@ pub fn parse_transcript(path: &Path) -> Result<ParsedTranscript> {
     let file =
         File::open(path).with_context(|| format!("opening transcript {}", path.display()))?;
     let reader = BufReader::new(file);
+    Ok(parse_transcript_reader(reader))
+}
+
+pub(crate) fn parse_transcript_fragment(raw: &str) -> ParsedTranscript {
+    parse_transcript_reader(BufReader::new(raw.as_bytes()))
+}
+
+fn parse_transcript_reader(reader: impl BufRead) -> ParsedTranscript {
     let mut out = ParsedTranscript::default();
     let mut turn = 0usize;
     // (timestamp, text) pairs already materialized as a queued-instruction
@@ -196,7 +204,7 @@ pub fn parse_transcript(path: &Path) -> Result<ParsedTranscript> {
         }
     }
 
-    Ok(out)
+    out
 }
 
 /// What one JSONL line resolves to.

@@ -1819,9 +1819,94 @@ pub fn run(conn: &Connection) -> Result<()> {
             BEFORE DELETE ON intent_events
             BEGIN SELECT RAISE(ABORT, 'intent_events is append-only'); END;",
     )?;
+    migrate_intent_events_identity_v2(conn)?;
+    migrate_intent_events_detector_v3(conn)?;
 
     finish_chunks_fts_compaction(conn)?;
 
+    Ok(())
+}
+
+/// `intent_events_v2`: make the transcript part of an event's identity.  A
+/// parent session may have many child transcripts whose turns and byte
+/// offsets overlap, so the v1 key lost all but the first child event.
+fn migrate_intent_events_identity_v2(conn: &Connection) -> Result<()> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'intent_events'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    let compact: String = sql.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if compact.contains("UNIQUE(session_id,transcript_path,turn,kind,byte_start)") {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS intent_events_no_update;
+         DROP TRIGGER IF EXISTS intent_events_no_delete;
+         DROP INDEX IF EXISTS idx_intent_events_project_ts;
+         DROP INDEX IF EXISTS idx_intent_events_project_symbol;
+         ALTER TABLE intent_events RENAME TO intent_events_v1_old;
+         CREATE TABLE intent_events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id      TEXT NOT NULL,
+            project         TEXT NOT NULL,
+            turn            INTEGER NOT NULL,
+            kind            TEXT NOT NULL CHECK (kind IN ('correction','redirect','abandoned')),
+            quote           TEXT NOT NULL,
+            transcript_path TEXT NOT NULL,
+            byte_start      INTEGER NOT NULL,
+            byte_end        INTEGER NOT NULL,
+            prior_claim     TEXT NOT NULL DEFAULT '',
+            symbol          TEXT,
+            file            TEXT,
+            classifier_hash TEXT NOT NULL,
+            ts              TEXT NOT NULL,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(session_id, transcript_path, turn, kind, byte_start)
+         );
+         INSERT INTO intent_events
+            (id, session_id, project, turn, kind, quote, transcript_path,
+             byte_start, byte_end, prior_claim, symbol, file, classifier_hash,
+             ts, created_at)
+         SELECT id, session_id, project, turn, kind, quote, transcript_path,
+                byte_start, byte_end, prior_claim, symbol, file, classifier_hash,
+                ts, created_at
+           FROM intent_events_v1_old;
+         DROP TABLE intent_events_v1_old;
+         CREATE INDEX idx_intent_events_project_ts ON intent_events(project, ts);
+         CREATE INDEX idx_intent_events_project_symbol ON intent_events(project, symbol);
+         CREATE TRIGGER intent_events_no_update
+            BEFORE UPDATE ON intent_events
+            BEGIN SELECT RAISE(ABORT, 'intent_events is append-only'); END;
+         CREATE TRIGGER intent_events_no_delete
+            BEFORE DELETE ON intent_events
+            BEGIN SELECT RAISE(ABORT, 'intent_events is append-only'); END;",
+    )?;
+    Ok(())
+}
+
+/// `intent_events_v3`: detector provenance and abandonment-marker receipts.
+/// These are deliberately additive ALTERs so an interrupted upgrade is
+/// repaired one missing column at a time without rebuilding immutable rows.
+fn migrate_intent_events_detector_v3(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "intent_events", "detector")? {
+        conn.execute("ALTER TABLE intent_events ADD COLUMN detector TEXT", [])?;
+    }
+    if !has_column(conn, "intent_events", "classifier_score")? {
+        conn.execute(
+            "ALTER TABLE intent_events ADD COLUMN classifier_score TEXT",
+            [],
+        )?;
+    }
+    if !has_column(conn, "intent_events", "marker")? {
+        conn.execute("ALTER TABLE intent_events ADD COLUMN marker TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -3097,25 +3182,72 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "row must survive a rerun that is already a no-op");
     }
-}
-#[test]
-fn intent_events_migration_is_idempotent_on_the_same_database() {
-    let conn = Connection::open_in_memory().unwrap();
-    run(&conn).unwrap();
-    run(&conn).unwrap();
 
-    let objects: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+    #[test]
+    fn intent_events_migration_is_idempotent_on_the_same_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        run(&conn).unwrap();
+
+        let objects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
                     'intent_events',
                     'idx_intent_events_project_ts',
                     'idx_intent_events_project_symbol',
                     'intent_events_no_update',
                     'intent_events_no_delete'
                 )",
-            [],
-            |row| row.get(0),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(objects, 5);
+        for column in ["detector", "classifier_score", "marker"] {
+            assert!(has_column(&conn, "intent_events", column).unwrap());
+        }
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='intent_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let compact: String = sql.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains("UNIQUE(session_id,transcript_path,turn,kind,byte_start)"));
+    }
+
+    #[test]
+    fn intent_events_identity_rebuild_preserves_v1_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE intent_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL, project TEXT NOT NULL, turn INTEGER NOT NULL,
+                kind TEXT NOT NULL, quote TEXT NOT NULL, transcript_path TEXT NOT NULL,
+                byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL,
+                prior_claim TEXT NOT NULL DEFAULT '', symbol TEXT, file TEXT,
+                classifier_hash TEXT NOT NULL, ts TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(session_id, turn, kind, byte_start));
+             INSERT INTO intent_events
+                (session_id, project, turn, kind, quote, transcript_path,
+                 byte_start, byte_end, classifier_hash, ts)
+             VALUES ('s', 'p', 3, 'correction', 'No.', '/tmp/child.jsonl',
+                     10, 13, 'old', '2026-09-01T00:00:00Z');",
         )
         .unwrap();
-    assert_eq!(objects, 5);
+
+        run(&conn).unwrap();
+        run(&conn).unwrap();
+
+        let row: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT quote, transcript_path, detector FROM intent_events WHERE session_id='s'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("No.".into(), "/tmp/child.jsonl".into(), None));
+    }
 }

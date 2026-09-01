@@ -37,6 +37,8 @@ pub struct HookInput {
     pub session_id: Option<String>,
     #[serde(alias = "transcriptPath")]
     pub transcript_path: Option<String>,
+    #[serde(alias = "agentTranscriptPath")]
+    pub agent_transcript_path: Option<String>,
     pub cwd: Option<String>,
     pub reason: Option<String>,
     /// Tool name for PostToolUse hook

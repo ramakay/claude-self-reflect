@@ -1476,6 +1476,9 @@ mod tests {
                 symbol: Some("NeverShippedParser".into()),
                 file: None,
                 classifier_hash: "test".into(),
+                detector: Some(crate::transcript::intent_events::IntentDetector::Lexical),
+                classifier_score: None,
+                marker: None,
                 ts: old.to_rfc3339(),
             }],
         )
@@ -1501,7 +1504,8 @@ mod tests {
             .iter()
             .find(|receipt| receipt.kind == "intent_event")
             .expect("candidate must retain the intent-event receipt");
-        assert_eq!(receipt.path.as_deref(), transcript.to_str());
+        let canonical_transcript = transcript.canonicalize().unwrap();
+        assert_eq!(receipt.path.as_deref(), canonical_transcript.to_str());
         let start = receipt.byte_start.unwrap();
         let end = receipt.byte_end.unwrap();
         assert_eq!(

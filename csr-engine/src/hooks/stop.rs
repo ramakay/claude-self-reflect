@@ -580,27 +580,47 @@ pub async fn extract_and_store_episode(
             Some(crate::transcript::instrumentation::STEER_FILTER_VERSION);
     }
 
-    if std::env::var("CSR_NO_INTENT_CAPTURE").as_deref() != Ok("1") {
-        match crate::transcript::intent_events::extract_intent_events(
+    let intent_size_allowed = std::fs::metadata(&tp).is_ok_and(|metadata| {
+        metadata.len() <= crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES
+    });
+    if std::env::var("CSR_NO_INTENT_CAPTURE").as_deref() != Ok("1")
+        && !stop_hook_is_active(input)
+        && intent_size_allowed
+    {
+        let high_water_key = format!("intent_high_water:{session_id}");
+        let high_water = engine
+            .storage()
+            .get_meta(&high_water_key)?
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        match crate::transcript::intent_events::extract_intent_events_incremental(
             &tp,
             session_id,
             project_name,
             engine.embeddings(),
+            &high_water,
         )
         .await
         {
-            Ok(events) => {
-                episode.correction_count = Some(
-                    events
-                        .iter()
-                        .filter(|event| {
-                            event.kind
-                                == crate::transcript::intent_events::IntentEventKind::Correction
-                        })
-                        .count() as u32,
-                );
-                if let Err(error) = engine.storage().insert_intent_events(&events) {
+            Ok(extraction) => {
+                if let Err(error) = engine.storage().insert_intent_events(&extraction.events) {
                     eprintln!("CSR: intent event persist error (non-fatal): {error}");
+                } else {
+                    let high_water =
+                        crate::transcript::intent_events::IntentHighWater::from(&extraction);
+                    engine
+                        .storage()
+                        .set_meta(&high_water_key, &serde_json::to_string(&high_water)?)?;
+                    episode.correction_count = Some(
+                        engine
+                            .storage()
+                            .count_session_intent_events(
+                                session_id,
+                                crate::transcript::intent_events::IntentEventKind::Correction,
+                            )?
+                            .try_into()
+                            .unwrap_or(u32::MAX),
+                    );
                 }
             }
             Err(error) => eprintln!("CSR: intent extraction error (non-fatal): {error}"),
@@ -860,9 +880,6 @@ fn load_task_state_from_dir(dir: &Path) -> Option<TaskDirState> {
 /// Handle the stop hook.
 /// Always returns Ok(()) to never block Claude Code (C-1 fix).
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
-    if stop_hook_is_active(input) {
-        return Ok(());
-    }
     // Import growing transcript for ALL sessions (real-time searchability)
     super::import_current_transcript(input, engine, cwd).await;
 
@@ -1601,13 +1618,62 @@ mod tests {
 
         let episode = stored_episode(&storage, session_id);
         assert_eq!(episode.correction_count, Some(1));
-        let events = storage.list_intent_events(None, None).unwrap();
+        let mut events = storage.list_intent_events(None, None).unwrap();
         assert_eq!(events.len(), 1);
         let bytes = std::fs::read(&transcript).unwrap();
         assert_eq!(
             &bytes[events[0].byte_start..events[0].byte_end],
             events[0].quote.as_bytes()
         );
+
+        let first_high_water: crate::transcript::intent_events::IntentHighWater =
+            serde_json::from_str(
+                &storage
+                    .get_meta(&format!("intent_high_water:{session_id}"))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(first_high_water.last_turn, 3);
+        assert_eq!(
+            first_high_water.byte_offset,
+            std::fs::metadata(&transcript).unwrap().len() as usize
+        );
+        extract_and_store_episode(&input, &engine, tmp.path())
+            .await
+            .unwrap();
+        assert_eq!(storage.list_intent_events(None, None).unwrap().len(), 1);
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2026-09-01T10:03:00Z","message":{{"content":"I used the root config."}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2026-09-01T10:04:00Z","message":{{"content":"wrong file. use `config/app.toml`."}}}}"#
+        )
+        .unwrap();
+        extract_and_store_episode(&input, &engine, tmp.path())
+            .await
+            .unwrap();
+        events = storage.list_intent_events(None, None).unwrap();
+        assert_eq!(events.len(), 2);
+        let second_high_water: crate::transcript::intent_events::IntentHighWater =
+            serde_json::from_str(
+                &storage
+                    .get_meta(&format!("intent_high_water:{session_id}"))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(second_high_water.last_turn, 5);
+        assert!(second_high_water.byte_offset > first_high_water.byte_offset);
     }
 
     #[test]
@@ -1667,6 +1733,13 @@ mod tests {
         assert!(
             ep.steer_count.is_none(),
             "oversized scan must leave steer_count None"
+        );
+        assert_eq!(
+            storage
+                .get_meta(&format!("intent_high_water:{session_id}"))
+                .unwrap(),
+            None,
+            "oversized Stop transcript must not enter intent extraction"
         );
         assert!(ep.steers.is_empty());
     }

@@ -355,6 +355,9 @@ enum BackfillAction {
         /// Print counts without inserting intent_events rows.
         #[arg(long)]
         dry_run: bool,
+        /// Compare deterministic events with verified narrator-ledger quotes.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
     },
 }
 
@@ -877,6 +880,7 @@ async fn main() -> Result<()> {
                 since,
                 project,
                 dry_run,
+                ledger,
             },
     }) = &args.command
     {
@@ -911,6 +915,11 @@ async fn main() -> Result<()> {
             .await?
         };
         print!("{}", stats.format_text(*dry_run));
+        if let Some(ledger) = ledger {
+            let agreement =
+                csr_engine::transcript::intent_events::agreement_report(ledger, stats.events())?;
+            print!("{}", agreement.format_text());
+        }
         return Ok(());
     }
 
