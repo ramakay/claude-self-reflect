@@ -230,6 +230,7 @@ pub async fn reflect_on_past(
     min_score: f32,
     project: Option<&str>,
 ) -> Result<String> {
+    let search_mode = search_mode_from(std::env::var("CSR_SEARCH_MODE").ok().as_deref());
     // `partition_enabled` (the pre-existing `CSR_NO_VALIDITY_PARTITION` kill
     // switch) gates ancestry availability too, so it must NOT be folded with
     // `CSR_DREAM_CONSUMPTION` — that fold is exactly the regression the
@@ -285,6 +286,7 @@ pub async fn reflect_on_past(
         consumption_mode,
         active_forgetting,
         rerank_intent,
+        search_mode,
     )
     .await
 }
@@ -297,6 +299,42 @@ pub(crate) enum RecallRerankMode<'a> {
     Runtime,
     Baseline,
     Candidate(&'a crate::search::trained_rerank::LinearModel),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SearchMode {
+    Hybrid,
+    Vector,
+    Fts,
+}
+
+pub(crate) fn search_mode_from(value: Option<&str>) -> SearchMode {
+    match value {
+        Some("vector") => SearchMode::Vector,
+        Some("fts") => SearchMode::Fts,
+        _ => SearchMode::Hybrid,
+    }
+}
+
+fn fuse_rrf(semantic_order: &[String], fts_order: &[String], k: usize) -> Vec<String> {
+    let mut fused_order = Vec::with_capacity(semantic_order.len() + fts_order.len());
+    let mut scores: HashMap<String, f64> = HashMap::new();
+
+    for ranking in [semantic_order, fts_order] {
+        let mut seen = HashSet::new();
+        for (rank, id) in ranking.iter().enumerate() {
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            if !scores.contains_key(id) {
+                fused_order.push(id.clone());
+            }
+            *scores.entry(id.clone()).or_default() += 1.0 / (k + rank) as f64;
+        }
+    }
+
+    fused_order.sort_by(|left, right| scores[right].total_cmp(&scores[left]));
+    fused_order
 }
 
 /// Everything in `reflect_on_past` after query embedding — the seam the
@@ -322,6 +360,7 @@ async fn reflect_on_past_with_vec_intent(
     consumption_mode: ConsumptionMode,
     active_forgetting: bool,
     rerank_intent: &str,
+    search_mode: SearchMode,
 ) -> Result<String> {
     reflect_on_past_with_vec_mode(
         storage,
@@ -336,6 +375,7 @@ async fn reflect_on_past_with_vec_intent(
         consumption_mode,
         active_forgetting,
         rerank_intent,
+        search_mode,
         RecallRerankMode::Runtime,
         true,
     )
@@ -370,6 +410,7 @@ async fn reflect_on_past_with_vec(
         consumption_mode,
         active_forgetting,
         "other",
+        SearchMode::Hybrid,
     )
     .await
 }
@@ -388,6 +429,7 @@ pub(crate) async fn reflect_on_past_with_vec_mode(
     consumption_mode: ConsumptionMode,
     active_forgetting: bool,
     rerank_intent: &str,
+    search_mode: SearchMode,
     rerank_mode: RecallRerankMode<'_>,
     record_retrievals: bool,
 ) -> Result<String> {
@@ -407,6 +449,7 @@ pub(crate) async fn reflect_on_past_with_vec_mode(
         consumption_mode,
         active_forgetting,
         rerank_intent,
+        search_mode,
         rerank_mode,
         record_retrievals,
     )
@@ -444,6 +487,7 @@ pub(crate) async fn reflect_for_curated_eval_with_vec(
         consumption_mode,
         active_forgetting,
         "explore",
+        SearchMode::Hybrid,
         rerank_mode,
         false,
     )
@@ -478,6 +522,7 @@ async fn reflect_on_past_with_vec_in_scope(
         consumption_mode,
         active_forgetting,
         "other",
+        SearchMode::Hybrid,
         RecallRerankMode::Runtime,
         true,
     )
@@ -498,6 +543,7 @@ async fn reflect_on_past_with_vec_in_scope_mode(
     consumption_mode: ConsumptionMode,
     active_forgetting: bool,
     rerank_intent: &str,
+    search_mode: SearchMode,
     rerank_mode: RecallRerankMode<'_>,
     record_retrievals: bool,
 ) -> Result<String> {
@@ -519,6 +565,7 @@ async fn reflect_on_past_with_vec_in_scope_mode(
         consumption_mode,
         active_forgetting,
         rerank_intent,
+        search_mode,
         rerank_mode,
     )
     .await?;
@@ -550,6 +597,7 @@ async fn reflect_on_past_with_vec_in_scope_mode(
                 consumption_mode,
                 active_forgetting,
                 rerank_intent,
+                search_mode,
                 rerank_mode,
             )
             .await?;
@@ -679,12 +727,15 @@ async fn reflect_gather_pass(
     consumption_mode: ConsumptionMode,
     active_forgetting: bool,
     rerank_intent: &str,
+    search_mode: SearchMode,
     rerank_mode: RecallRerankMode<'_>,
 ) -> Result<GatherPass> {
     let search_start = Instant::now();
 
-    // Search BOTH chunks and reflections, merge by score
-    let (chunk_results, reflection_results) = {
+    // Search BOTH chunks and reflections unless keyword-only ablation is active.
+    let (chunk_results, reflection_results) = if search_mode == SearchMode::Fts {
+        (Vec::new(), Vec::new())
+    } else {
         let idx = search.read().await;
         let chunks = if scope.effective_project.is_some() {
             let mut ids = HashSet::new();
@@ -726,11 +777,6 @@ async fn reflect_gather_pass(
         .unwrap_or_default();
     let tad_config = decay::DecayConfig::for_search();
 
-    // The FTS decision must use the score this candidate had before the
-    // opt-in multiplier. Otherwise accelerated decay can pull new valid FTS
-    // candidates into the result set even though active forgetting is only
-    // allowed to reorder the already-demoted section.
-    let mut semantic_top_score = 0.0f32;
     let mut ancestry_applied_ids = HashSet::new();
     let mut enriched: Vec<EnrichedResult> = chunk_results
         .iter()
@@ -751,24 +797,6 @@ async fn reflect_gather_pass(
                 if ancestry_applied {
                     ancestry_applied_ids.insert(c.id.clone());
                 }
-                // FTS membership is decided from the pre-opt-in score:
-                // ordinary wall-clock TAD for valid/annotated chunks and
-                // the historical raw score for Demote chunks. Neither
-                // release ancestry nor active forgetting may expand the
-                // candidate set merely by crossing the fallback threshold.
-                let fallback_score = score_chunk_candidate(
-                    r.score,
-                    c,
-                    &now,
-                    events,
-                    &tad_config,
-                    &signals.validity,
-                    None,
-                    false,
-                    scope,
-                )
-                .0;
-                semantic_top_score = semantic_top_score.max(fallback_score);
                 EnrichedResult {
                     score: final_score,
                     chunk: c.clone(),
@@ -807,7 +835,6 @@ async fn reflect_gather_pass(
                 .unwrap_or_else(|| "unknown".to_string());
             // Cross-project multiplicative penalty
             let final_score = decayed_score * project_scope_multiplier(&project_name, scope);
-            semantic_top_score = semantic_top_score.max(final_score);
             let tag_prefix = if tags.iter().any(|t| t == "session_episode") {
                 "[episode] "
             } else if tags.iter().any(|t| t == "session_story") {
@@ -839,31 +866,45 @@ async fn reflect_gather_pass(
         }
     }
 
-    // FTS5 hybrid fallback: if semantic results are weak (top score < 0.5)
-    // or empty, supplement with keyword search results
-    if semantic_top_score < 0.5 {
+    let mut fts_order = Vec::new();
+    // Hybrid always supplements semantic retrieval with FTS5. Vector mode
+    // skips FTS entirely; FTS mode reaches this block with no semantic hits.
+    if search_mode != SearchMode::Vector {
         let fts_searches = if scope.effective_project.is_some() {
-            scope
-                .family_projects
-                .iter()
+            let mut projects: Vec<&str> =
+                scope.family_projects.iter().map(String::as_str).collect();
+            projects.sort_unstable();
+            projects
+                .into_iter()
                 .map(|project| storage.fts5_search(query, fetch, Some(project)))
                 .collect::<Vec<_>>()
         } else {
             vec![storage.fts5_search(query, fetch, None)]
         };
-        let mut fts_chunks = Vec::new();
+        let mut fts_hits = Vec::new();
         let mut fts_window_full = false;
-        for chunks in fts_searches.into_iter().flatten() {
-            fts_window_full |= chunks.len() == fetch;
-            fts_chunks.extend(chunks);
+        for hits in fts_searches.into_iter().flatten() {
+            fts_window_full |= hits.len() == fetch;
+            fts_hits.extend(hits);
         }
-        if !fts_chunks.is_empty() {
+        fts_hits.sort_by(|left, right| {
+            left.2
+                .total_cmp(&right.2)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.0.id.cmp(&right.0.id))
+        });
+        fts_order = fts_hits
+            .iter()
+            .map(|(chunk, _, _)| chunk.id.clone())
+            .collect();
+        if !fts_hits.is_empty() {
             window_full |= fts_window_full;
             let existing_ids: HashSet<String> =
                 enriched.iter().map(|e| e.chunk.id.clone()).collect();
-            let appended: Vec<crate::import::ConversationChunk> = fts_chunks
+            let appended: Vec<crate::import::ConversationChunk> = fts_hits
                 .into_iter()
-                .filter(|c| !existing_ids.contains(&c.id))
+                .map(|(chunk, _, _)| chunk)
+                .filter(|chunk| !existing_ids.contains(&chunk.id))
                 .collect();
             // Validity was resolved over the SEMANTIC candidate set only —
             // FTS-appended chunks can carry conversation ids that set never
@@ -1069,7 +1110,17 @@ async fn reflect_gather_pass(
             })?
         })
         .collect();
-    let rank_of = |id: &str| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
+    let final_order = match search_mode {
+        SearchMode::Hybrid => fuse_rrf(&order, &fts_order, 60),
+        SearchMode::Vector => order,
+        SearchMode::Fts => fts_order,
+    };
+    let rank_of = |id: &str| {
+        final_order
+            .iter()
+            .position(|candidate_id| candidate_id == id)
+            .unwrap_or(usize::MAX)
+    };
     enriched.sort_by_key(|e| rank_of(&e.chunk.id));
 
     // Dedupe BEFORE the limit cut (CodeRabbit): truncating first let a higher-
@@ -1114,7 +1165,6 @@ async fn reflect_gather_pass(
         ancestry_candidates_used,
         "release ancestry applied to search candidates"
     );
-
     Ok(GatherPass {
         enriched,
         display_rank_scores,
@@ -1399,7 +1449,11 @@ pub async fn search_by_file(
     // supported-language file with no definitions and no recorded edits is
     // indexed and legitimately empty. Report the real state so the caller can
     // tell a coverage gap from an honest absence.
-    let chunks = storage.fts5_search(file_path, limit, project)?;
+    let chunks: Vec<_> = storage
+        .fts5_search(file_path, limit, project)?
+        .into_iter()
+        .map(|(chunk, _, _)| chunk)
+        .collect();
     Ok(format::format_file_results(
         &chunks,
         file_path,
@@ -3202,6 +3256,7 @@ mod tests {
             ConsumptionMode::Off,
             false,
             "other",
+            SearchMode::Hybrid,
             RecallRerankMode::Baseline,
             false,
         )
@@ -3220,6 +3275,7 @@ mod tests {
             ConsumptionMode::Off,
             false,
             "explore",
+            SearchMode::Hybrid,
             RecallRerankMode::Candidate(&model),
             false,
         )
@@ -3807,6 +3863,134 @@ mod tests {
         assert!(!output.contains("<id>fts-child-"), "{output}");
     }
 
+    #[tokio::test]
+    async fn hybrid_surfaces_exact_identifier_below_semantic_threshold() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        let semantic = crate::import::ConversationChunk {
+            id: "semantic-high".into(),
+            conversation_id: "semantic-conversation".into(),
+            project_name: "test".into(),
+            timestamp: now.clone(),
+            content: "unrelated conceptual match".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let identifier = crate::import::ConversationChunk {
+            id: "identifier-low".into(),
+            conversation_id: "identifier-conversation".into(),
+            project_name: "test".into(),
+            timestamp: now,
+            content: "implementation of parse_widget_identifier".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 1,
+            is_sidechain: false,
+        };
+        let semantic_vec = vec![1.0, 0.0, 0.0, 0.0];
+        let identifier_vec = vec![0.4, 0.916_515_1, 0.0, 0.0];
+        storage.insert_chunk(&semantic, &semantic_vec).unwrap();
+        storage.insert_chunk(&identifier, &identifier_vec).unwrap();
+        let mut engine = SearchEngine::new(8);
+        engine.insert_chunk(semantic.id.clone(), semantic_vec);
+        engine.insert_chunk(identifier.id.clone(), identifier_vec);
+        let search = Arc::new(RwLock::new(engine));
+
+        let output = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "parse_widget_identifier",
+            5,
+            0.5,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            output.contains("<id>identifier-low</id>"),
+            "hybrid search must include an exact FTS identifier even when another semantic hit exceeds 0.5:\n{output}"
+        );
+    }
+
+    async fn render_ablation_mode(mode: SearchMode) -> String {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        let make_chunk =
+            |id: &str, conversation_id: &str, content: &str| crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation_id.into(),
+                project_name: "test".into(),
+                timestamp: now.clone(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+        let semantic = make_chunk(
+            "mode-semantic",
+            "mode-semantic-conversation",
+            "conceptual vector-only match",
+        );
+        let keyword = make_chunk(
+            "mode-keyword",
+            "mode-keyword-conversation",
+            "exact_mode_identifier keyword-only match",
+        );
+        let semantic_vec = vec![1.0, 0.0, 0.0, 0.0];
+        let keyword_vec = vec![0.0, 1.0, 0.0, 0.0];
+        storage.insert_chunk(&semantic, &semantic_vec).unwrap();
+        storage.insert_chunk(&keyword, &keyword_vec).unwrap();
+        let mut engine = SearchEngine::new(8);
+        engine.insert_chunk(semantic.id.clone(), semantic_vec);
+        engine.insert_chunk(keyword.id.clone(), keyword_vec);
+
+        reflect_on_past_with_vec_mode(
+            &storage,
+            &Arc::new(RwLock::new(engine)),
+            &[1.0, 0.0, 0.0, 0.0],
+            "exact_mode_identifier",
+            5,
+            0.5,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            mode,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn vector_mode_excludes_fts_only_hits() {
+        let output = render_ablation_mode(SearchMode::Vector).await;
+        assert!(output.contains("<id>mode-semantic</id>"), "{output}");
+        assert!(!output.contains("<id>mode-keyword</id>"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn fts_mode_excludes_semantic_only_hits() {
+        let output = render_ablation_mode(SearchMode::Fts).await;
+        assert!(output.contains("<id>mode-keyword</id>"), "{output}");
+        assert!(!output.contains("<id>mode-semantic</id>"), "{output}");
+    }
+
     fn demote_validity(note: &str) -> ConvValidity {
         ConvValidity {
             demote: true,
@@ -3830,6 +4014,35 @@ mod tests {
                 "value {value:?} must leave active forgetting off"
             );
         }
+    }
+
+    #[test]
+    fn search_mode_parses_known_values_and_defaults_to_hybrid() {
+        assert_eq!(search_mode_from(None), SearchMode::Hybrid);
+        assert_eq!(search_mode_from(Some("hybrid")), SearchMode::Hybrid);
+        assert_eq!(search_mode_from(Some("vector")), SearchMode::Vector);
+        assert_eq!(search_mode_from(Some("fts")), SearchMode::Fts);
+        for value in [Some(""), Some("unknown"), Some("HYBRID"), Some(" fts ")] {
+            assert_eq!(
+                search_mode_from(value),
+                SearchMode::Hybrid,
+                "value {value:?} must fall back to hybrid"
+            );
+        }
+    }
+
+    #[test]
+    fn rrf_combines_rankings_and_breaks_ties_by_semantic_order() {
+        let semantic = ["a", "b", "c"].map(str::to_string);
+        let fts = ["c", "b", "d"].map(str::to_string);
+        assert_eq!(fuse_rrf(&semantic, &fts, 60), ["c", "b", "a", "d"]);
+
+        let semantic_tie = ["semantic-first", "fts-first"].map(str::to_string);
+        let fts_tie = ["fts-first", "semantic-first"].map(str::to_string);
+        assert_eq!(
+            fuse_rrf(&semantic_tie, &fts_tie, 60),
+            ["semantic-first", "fts-first"]
+        );
     }
 
     #[test]
@@ -5321,7 +5534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e2e_ancestry_cannot_activate_fts_when_fts_validity_batch_fails() {
+    async fn e2e_fts_validity_failure_keeps_unconditional_keyword_hit() {
         let storage = Arc::new(Storage::open_memory().unwrap());
         let now = chrono::Utc::now();
         let semantic = crate::import::ConversationChunk {
@@ -5396,10 +5609,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(out.contains("<id>chunk-semantic</id>"), "{out}");
         assert!(
-            !out.contains("chunk-fts-failure"),
-            "ancestry must not activate FTS when that pass cannot verify validity:\n{out}"
+            out.contains("<id>chunk-semantic</id>"),
+            "the semantic hit must survive the fail-open validity batch:\n{out}"
+        );
+        assert!(
+            out.contains("<id>chunk-fts-failure</id>"),
+            "always-on hybrid search must keep the FTS hit even when its validity batch fails open:\n{out}"
         );
     }
 
@@ -5504,7 +5720,7 @@ mod tests {
             &off_search,
             &q,
             "zebraquark",
-            4,
+            5,
             0.1,
             Some("all"),
             0,
@@ -5516,6 +5732,7 @@ mod tests {
         .unwrap();
 
         let off_ids = [
+            "chunk-fts-valid",
             "chunk-valid-a",
             "chunk-valid-b",
             "chunk-demoted-old",
@@ -5525,10 +5742,6 @@ mod tests {
             pos_of(&off, &format!("<id>{}</id>", pair[0]))
                 < pos_of(&off, &format!("<id>{}</id>", pair[1]))
         }));
-        assert!(
-            !off.contains("chunk-fts-valid"),
-            "the pre-feature raw top score is above the FTS threshold:\n{off}"
-        );
 
         let (on_storage, on_search) = active_forgetting_e2e_fixture();
         let on = reflect_on_past_with_vec(
@@ -5536,7 +5749,7 @@ mod tests {
             &on_search,
             &q,
             "zebraquark",
-            4,
+            5,
             0.1,
             Some("all"),
             0,
@@ -5548,18 +5761,15 @@ mod tests {
         .unwrap();
 
         assert!(
-            pos_of(&on, "<id>chunk-valid-a</id>") < pos_of(&on, "<id>chunk-valid-b</id>")
+            pos_of(&on, "<id>chunk-fts-valid</id>") < pos_of(&on, "<id>chunk-valid-a</id>")
+                && pos_of(&on, "<id>chunk-valid-a</id>") < pos_of(&on, "<id>chunk-valid-b</id>")
                 && pos_of(&on, "<id>chunk-valid-b</id>")
                     < pos_of(&on, "<id>chunk-demoted-new</id>")
                 && pos_of(&on, "<id>chunk-demoted-new</id>")
                     < pos_of(&on, "<id>chunk-demoted-old</id>"),
             "active forgetting must reorder only the demoted section by accelerated score:\n{on}"
         );
-        assert!(
-            !on.contains("chunk-fts-valid"),
-            "accelerated decay must not change FTS fallback activation or valid candidates:\n{on}"
-        );
-        for id in ["chunk-valid-a", "chunk-valid-b"] {
+        for id in ["chunk-fts-valid", "chunk-valid-a", "chunk-valid-b"] {
             assert_eq!(
                 rendered_result(&on, id),
                 rendered_result(&off, id),
@@ -5844,9 +6054,10 @@ mod tests {
             "demoted chunk must not occupy a page slot valid candidates can fill:\n{out}"
         );
 
-        // 3) KILL SWITCH: partition off restores pure score order — the
-        //    demoted chunk leads again, no annotation anywhere.
-        let out = reflect_on_past_with_vec(
+        // 3) KILL SWITCH: in vector ablation, partition off restores pure
+        //    semantic score order — the demoted chunk leads again, no
+        //    annotation anywhere.
+        let out = reflect_on_past_with_vec_mode(
             &storage,
             &search,
             &q,
@@ -5858,6 +6069,10 @@ mod tests {
             false,
             ConsumptionMode::Off,
             false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Runtime,
+            true,
         )
         .await
         .unwrap();

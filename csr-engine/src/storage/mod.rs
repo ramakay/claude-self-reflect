@@ -253,7 +253,7 @@ impl Storage {
         query: &str,
         limit: usize,
         project: Option<&str>,
-    ) -> Result<Vec<ConversationChunk>> {
+    ) -> Result<Vec<(ConversationChunk, usize, f64)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::fts5_search(&conn, query, limit, project)
     }
@@ -1644,7 +1644,9 @@ mod tests {
             "the replaced text must leave the index"
         );
         assert_eq!(
-            storage.fts5_search("survivingtoken", 10, None).unwrap()[0].id,
+            storage.fts5_search("survivingtoken", 10, None).unwrap()[0]
+                .0
+                .id,
             "c1"
         );
 

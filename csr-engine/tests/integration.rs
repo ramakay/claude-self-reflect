@@ -377,12 +377,12 @@ fn test_fts5_search() {
     // Search for docker-compose
     let results = storage.fts5_search("docker-compose", 10, None).unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].id, "fts-1");
+    assert_eq!(results[0].0.id, "fts-1");
 
     // Search for JWT
     let results = storage.fts5_search("JWT", 10, None).unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].id, "fts-2");
+    assert_eq!(results[0].0.id, "fts-2");
 }
 
 // ─── Test 6: Reflection store + retrieve ───

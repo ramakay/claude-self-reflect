@@ -702,6 +702,7 @@ fn propose_task_resolutions(
         let Ok(hits) = storage.fts5_search(&todo.content, 3, Some(project_name)) else {
             continue;
         };
+        let hits: Vec<_> = hits.into_iter().map(|(chunk, _, _)| chunk).collect();
         // fts5_search OR-joins terms, so a hit can rank on one shared word.
         // Require most of the subject's significant tokens verbatim in the hit
         // before proposing — identity, not similarity (Codex: single-word

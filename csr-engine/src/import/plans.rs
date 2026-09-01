@@ -207,7 +207,12 @@ fn correlate_via_fts(plan: &PlanDoc, storage: &Storage) -> Option<(String, Optio
     // fts5_search already strips FTS5 syntax characters per word and OR-joins the
     // result, so malformed input (odd leftover punctuation) can't error the query.
     let query = tokens.join(" ");
-    let hits = storage.fts5_search(&query, 5, None).ok()?;
+    let hits: Vec<_> = storage
+        .fts5_search(&query, 5, None)
+        .ok()?
+        .into_iter()
+        .map(|(chunk, _, _)| chunk)
+        .collect();
     if hits.is_empty() {
         return None;
     }

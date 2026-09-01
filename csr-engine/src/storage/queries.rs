@@ -549,7 +549,7 @@ pub fn fts5_search(
     query: &str,
     limit: usize,
     project: Option<&str>,
-) -> Result<Vec<ConversationChunk>> {
+) -> Result<Vec<(ConversationChunk, usize, f64)>> {
     // Sanitize for FTS5: split into OR-joined quoted words
     // "Apify runaway cost" → '"apify" OR "runaway" OR "cost"' (matches any word)
     // Quoting prevents hyphens/special chars from being parsed as FTS5 operators
@@ -571,30 +571,40 @@ pub fn fts5_search(
         .collect::<Vec<_>>()
         .join(" OR ");
 
-    let chunks = if let Some(p) = project.filter(|p| *p != "all") {
+    let chunks_with_bm25 = if let Some(p) = project.filter(|p| *p != "all") {
         let mut stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain,
+                    bm25(chunks_fts)
              FROM chunks c
              JOIN chunks_fts fts ON fts.rowid = c.rowid
              WHERE chunks_fts MATCH ?1 AND c.project_name = ?2
              ORDER BY fts.rank
              LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![fts_query, p, limit as i64], row_to_chunk)?;
+        let rows = stmt.query_map(params![fts_query, p, limit as i64], |row| {
+            Ok((row_to_chunk(row)?, row.get::<_, f64>(8)?))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         let mut stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain,
+                    bm25(chunks_fts)
              FROM chunks c
              JOIN chunks_fts fts ON fts.rowid = c.rowid
              WHERE chunks_fts MATCH ?1
              ORDER BY fts.rank
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![fts_query, limit as i64], row_to_chunk)?;
+        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+            Ok((row_to_chunk(row)?, row.get::<_, f64>(8)?))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    Ok(chunks)
+    Ok(chunks_with_bm25
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, (chunk, bm25))| (chunk, ordinal, bm25))
+        .collect())
 }
 
 // ─── Reflection tag queries ───
@@ -3090,6 +3100,37 @@ mod tests {
     }
 
     #[test]
+    fn fts5_search_returns_bm25_order_with_zero_based_ordinals() {
+        let conn = mem();
+        insert_chunk(
+            &conn,
+            &test_chunk("dense", "needle needle needle"),
+            &[0.1; 4],
+        )
+        .unwrap();
+        insert_chunk(
+            &conn,
+            &test_chunk("sparse", "needle with several unrelated filler words"),
+            &[0.2; 4],
+        )
+        .unwrap();
+
+        let hits = fts5_search(&conn, "needle", 10, None).unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0.id, "dense");
+        assert_eq!(hits[0].1, 0);
+        assert!(hits[0].2.is_finite());
+        assert_eq!(hits[1].0.id, "sparse");
+        assert_eq!(hits[1].1, 1);
+        assert!(hits[1].2.is_finite());
+        assert!(
+            hits[0].2 <= hits[1].2,
+            "FTS5 bm25 order must be ascending: {hits:?}"
+        );
+    }
+
+    #[test]
     fn chunk_reimport_preserves_rowids_and_replaces_one_fts_document() {
         // Break caught: using INSERT OR REPLACE for either TEXT-keyed table
         // deletes and reinserts its row, changing the implicit rowid. For
@@ -3129,7 +3170,9 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(
-            fts5_search(&conn, "replacementtoken", 10, None).unwrap()[0].id,
+            fts5_search(&conn, "replacementtoken", 10, None).unwrap()[0]
+                .0
+                .id,
             "stable"
         );
         let indexed_documents: i64 = conn
@@ -3167,7 +3210,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fts5_search(&conn, "beforetoken", 10, None).unwrap()[0].id,
+            fts5_search(&conn, "beforetoken", 10, None).unwrap()[0].0.id,
             "direct"
         );
 
@@ -3180,7 +3223,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(
-            fts5_search(&conn, "aftertoken", 10, None).unwrap()[0].id,
+            fts5_search(&conn, "aftertoken", 10, None).unwrap()[0].0.id,
             "direct"
         );
 
