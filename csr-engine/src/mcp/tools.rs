@@ -302,13 +302,23 @@ pub(crate) enum RecallRerankMode<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SearchMode {
+pub enum SearchMode {
     Hybrid,
     Vector,
     Fts,
 }
 
-pub(crate) fn search_mode_from(value: Option<&str>) -> SearchMode {
+impl SearchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::Vector => "vector",
+            Self::Fts => "fts",
+        }
+    }
+}
+
+pub fn search_mode_from(value: Option<&str>) -> SearchMode {
     match value {
         Some("vector") => SearchMode::Vector,
         Some("fts") => SearchMode::Fts,
@@ -492,6 +502,61 @@ pub(crate) async fn reflect_for_curated_eval_with_vec(
         false,
     )
     .await
+}
+
+/// One conversation-level hit from the production recall pipeline for an
+/// offline benchmark. Chunk candidates are collapsed after production fusion
+/// and reranking, so a long session cannot occupy multiple result slots.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BenchHit {
+    pub conversation_id: String,
+    pub score: f32,
+}
+
+pub(crate) async fn reflect_for_bench_with_vec(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query_vec: &[f32],
+    query: &str,
+    fetch: usize,
+    mode: SearchMode,
+) -> Result<Vec<BenchHit>> {
+    let scope = SearchProjectScope::resolve_with(storage, Some("csr-bench"), None, None)?;
+    let candidate_fetch = fetch.saturating_mul(4).max(20);
+    let mut pass = reflect_gather_pass(
+        storage,
+        search,
+        query_vec,
+        query,
+        candidate_fetch,
+        -1.0,
+        &scope,
+        false,
+        ConsumptionMode::Off,
+        false,
+        "explore",
+        mode,
+        RecallRerankMode::Baseline,
+    )
+    .await?;
+    apply_resolutions_before_limit(
+        &mut pass.enriched,
+        storage,
+        &pass.validity,
+        candidate_fetch,
+        false,
+    );
+    let mut seen = HashSet::new();
+    Ok(pass
+        .enriched
+        .into_iter()
+        .filter(|result| seen.insert(result.chunk.conversation_id.clone()))
+        .take(fetch)
+        .map(|result| BenchHit {
+            conversation_id: result.chunk.conversation_id,
+            score: result.score,
+        })
+        .collect())
 }
 
 #[allow(clippy::too_many_arguments)]

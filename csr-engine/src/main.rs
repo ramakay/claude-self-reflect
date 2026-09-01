@@ -194,6 +194,36 @@ enum Commands {
         #[arg(long)]
         live: bool,
     },
+    /// Run a reproducible retrieval benchmark in a scratch in-memory store.
+    Bench {
+        /// Input shape: agentmemory or longmemeval.
+        #[arg(long)]
+        format: String,
+        /// agentmemory directory (sessions.json + queries.json) or LongMemEval JSON file.
+        #[arg(long)]
+        data: PathBuf,
+        /// Override the agentmemory queries.json path.
+        #[arg(long)]
+        queries: Option<PathBuf>,
+        /// Retrieval cutoff.
+        #[arg(long, default_value_t = 5)]
+        k: usize,
+        /// Search ablation: vector, fts, or hybrid.
+        #[arg(long, default_value = "hybrid")]
+        mode: String,
+        /// Output directory for scores.ndjson, summary.json, and table.md.
+        #[arg(long, default_value = "target/csr-bench")]
+        out: PathBuf,
+        /// Exclude LongMemEval's four *_abs question types (enabled by default).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+        drop_abstention: bool,
+        /// Maximum number of scored questions after filtering/stratification.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keep at most N questions of each question type.
+        #[arg(long)]
+        stratify: Option<usize>,
+    },
     /// Backfill session stories from V3/heuristic data (zero cost)
     BackfillStories {
         /// Preview without writing
@@ -673,6 +703,39 @@ async fn main() -> Result<()> {
         if !out.ends_with('\n') {
             println!();
         }
+        return Ok(());
+    }
+
+    if let Some(Commands::Bench {
+        format,
+        data,
+        queries,
+        k,
+        mode,
+        out,
+        drop_abstention,
+        limit,
+        stratify,
+    }) = &args.command
+    {
+        let format = csr_engine::eval::bench::BenchFormat::parse(format)?;
+        if !matches!(mode.as_str(), "hybrid" | "vector" | "fts") {
+            anyhow::bail!("unknown --mode {mode:?}; expected hybrid, vector, or fts");
+        }
+        let mode = csr_engine::mcp::tools::search_mode_from(Some(mode));
+        let table = csr_engine::eval::bench::run(csr_engine::eval::bench::BenchConfig {
+            format,
+            data: data.clone(),
+            queries: queries.clone(),
+            k: *k,
+            mode,
+            out: out.clone(),
+            drop_abstention: *drop_abstention,
+            limit: *limit,
+            stratify: *stratify,
+        })
+        .await?;
+        print!("{table}");
         return Ok(());
     }
 

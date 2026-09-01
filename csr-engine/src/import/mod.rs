@@ -526,6 +526,99 @@ pub(crate) fn parse_jsonl_file_with_stats(
 /// (all-MiniLM-L6-v2) so each chunk embeds in full rather than head-truncated.
 const CHUNK_CHAR_BUDGET: usize = 900;
 
+/// Chunk an already-parsed sequence of messages through the same bounded
+/// transcript path used by JSONL imports. Benchmark adapters use this seam so
+/// their scratch corpora cannot silently get a different chunking policy.
+pub(crate) fn chunk_messages(
+    conversation_id: &str,
+    project_name: &str,
+    timestamp: &str,
+    messages: &[(crate::provenance::Speaker, String)],
+) -> Vec<ConversationChunk> {
+    let mut chunks = Vec::new();
+    let mut buffer = String::new();
+    let mut authors = Vec::new();
+    let mut message_count = 0;
+    let summary = None;
+
+    for (author, message) in messages {
+        if message.len() > CHUNK_CHAR_BUDGET {
+            if !buffer.is_empty() {
+                push_chunk(
+                    &mut chunks,
+                    conversation_id,
+                    project_name,
+                    timestamp,
+                    std::mem::take(&mut buffer),
+                    message_count,
+                    &summary,
+                    chunk_author(&authors),
+                    false,
+                );
+                authors.clear();
+                message_count = 0;
+            }
+            let mut start = 0;
+            while start < message.len() {
+                let mut end = (start + CHUNK_CHAR_BUDGET).min(message.len());
+                end = message.floor_char_boundary(end);
+                if end <= start {
+                    end = message.len();
+                }
+                push_chunk(
+                    &mut chunks,
+                    conversation_id,
+                    project_name,
+                    timestamp,
+                    message[start..end].to_string(),
+                    1,
+                    &summary,
+                    *author,
+                    false,
+                );
+                start = end;
+            }
+            continue;
+        }
+
+        if !buffer.is_empty() && buffer.len() + message.len() + 2 > CHUNK_CHAR_BUDGET {
+            push_chunk(
+                &mut chunks,
+                conversation_id,
+                project_name,
+                timestamp,
+                std::mem::take(&mut buffer),
+                message_count,
+                &summary,
+                chunk_author(&authors),
+                false,
+            );
+            authors.clear();
+            message_count = 0;
+        }
+        if !buffer.is_empty() {
+            buffer.push_str("\n\n");
+        }
+        buffer.push_str(message);
+        authors.push(*author);
+        message_count += 1;
+    }
+    if !buffer.is_empty() {
+        push_chunk(
+            &mut chunks,
+            conversation_id,
+            project_name,
+            timestamp,
+            buffer,
+            message_count,
+            &summary,
+            chunk_author(&authors),
+            false,
+        );
+    }
+    chunks
+}
+
 /// Per-tool_result character cap. Bounds giant logs while preserving enough of a
 /// fetched doc / subagent report for the size-based chunker to slice and embed.
 const MAX_TOOL_RESULT_CHARS: usize = 4000;
@@ -1008,6 +1101,24 @@ fn generate_chunk_id(conversation_id: &str, chunk_index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_messages_reuses_budget_ids_and_authority_rules() {
+        let long = "x".repeat(CHUNK_CHAR_BUDGET + 1);
+        let chunks = chunk_messages(
+            "bench-session",
+            "bench",
+            "2026-01-01T00:00:00Z",
+            &[(crate::provenance::Speaker::Assistant, long)],
+        );
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].id, generate_chunk_id("bench-session", 0));
+        assert_eq!(chunks[1].id, generate_chunk_id("bench-session", 1));
+        assert_eq!(chunks[0].author, crate::provenance::Speaker::Assistant);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.content.len() <= CHUNK_CHAR_BUDGET));
+    }
 
     #[test]
     fn sidechain_attribution_uses_project_ancestor_and_parent_session() {
