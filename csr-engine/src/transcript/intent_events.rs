@@ -487,6 +487,8 @@ struct TranscriptLine<'a> {
     record_type: Option<&'a str>,
     timestamp: Option<&'a str>,
     uuid: Option<&'a str>,
+    #[serde(rename = "isMeta")]
+    is_meta: Option<bool>,
     #[serde(borrow)]
     message: Option<TranscriptMessage<'a>>,
 }
@@ -517,6 +519,7 @@ struct RawTextSpan {
 struct SourceText {
     turn: u32,
     role: Role,
+    is_meta: bool,
     timestamp: Option<String>,
     decoded: String,
     spans: Vec<RawTextSpan>,
@@ -639,6 +642,7 @@ fn source_texts(path: &Path) -> Result<SourceTexts> {
         sources.push(SourceText {
             turn,
             role,
+            is_meta: record.is_meta == Some(true),
             timestamp: record.timestamp.map(str::to_string),
             decoded: joined,
             spans,
@@ -732,6 +736,7 @@ fn source_texts_tail(raw: &str, starting_turn: u32) -> SourceTexts {
         entries.push(SourceText {
             turn,
             role,
+            is_meta: record.is_meta == Some(true),
             timestamp: record.timestamp.map(str::to_string),
             decoded: joined,
             spans,
@@ -830,6 +835,62 @@ fn sentence_ranges(text: &str) -> Vec<(usize, usize)> {
         }
     }
     ranges
+}
+
+fn blank_range_preserving_lines(bytes: &mut [u8], start: usize, end: usize) {
+    for byte in &mut bytes[start..end] {
+        if !matches!(*byte, b'\n' | b'\r') {
+            *byte = b' ';
+        }
+    }
+}
+
+fn marker_scan_text(text: &str) -> String {
+    let mut masked = text.as_bytes().to_vec();
+
+    let mut cursor = 0usize;
+    while let Some(relative_open) = text[cursor..].find("```") {
+        let open = cursor + relative_open;
+        let after_open = open + 3;
+        let end = text[after_open..]
+            .find("```")
+            .map_or(text.len(), |relative_close| after_open + relative_close + 3);
+        blank_range_preserving_lines(&mut masked, open, end);
+        cursor = end;
+        if cursor == text.len() {
+            break;
+        }
+    }
+
+    let mut line_start = 0usize;
+    for line in text.split_inclusive('\n') {
+        let line_end = line_start + line.trim_end_matches(['\r', '\n']).len();
+        if text[line_start..line_end].starts_with("> ") {
+            blank_range_preserving_lines(&mut masked, line_start, line_end);
+        }
+        line_start += line.len();
+    }
+
+    let mut open = 0usize;
+    while open < masked.len() {
+        let Some(relative_open) = masked[open..].iter().position(|byte| *byte == b'`') else {
+            break;
+        };
+        let open_tick = open + relative_open;
+        let Some(relative_close) = masked[open_tick + 1..]
+            .iter()
+            .position(|byte| *byte == b'`')
+        else {
+            break;
+        };
+        let close_tick = open_tick + 1 + relative_close;
+        if text[open_tick + 1..close_tick].chars().count() > 40 {
+            blank_range_preserving_lines(&mut masked, open_tick, close_tick + 1);
+        }
+        open = close_tick + 1;
+    }
+
+    String::from_utf8(masked).expect("masking preserves UTF-8")
 }
 
 fn target_fields(text: &str) -> (Option<String>, Option<String>) {
@@ -950,7 +1011,7 @@ fn classification_plan(
     let mut texts = Vec::new();
     let mut turns = BTreeSet::new();
     for source in &sources.entries {
-        if source.role != Role::User {
+        if source.role != Role::User || source.is_meta {
             continue;
         }
         if source.turn > min_turn_exclusive && is_classifiable_user(&source.decoded, &prior_user) {
@@ -968,8 +1029,9 @@ fn starts_with_command_after(text: &str, prefix: &str) -> bool {
 }
 
 fn lexical_reaction_sentence(text: &str) -> Option<(IntentEventKind, usize, usize, &'static str)> {
-    for (start, end) in sentence_ranges(text) {
-        let sentence = text[start..end].trim();
+    let scan_text = marker_scan_text(text);
+    for (start, end) in sentence_ranges(&scan_text) {
+        let sentence = scan_text[start..end].trim();
         let lower = sentence.to_ascii_lowercase();
         let correction = if lower.starts_with("no,") || lower.starts_with("no.") {
             Some("no")
@@ -1059,8 +1121,9 @@ fn lexical_reaction_sentence(text: &str) -> Option<(IntentEventKind, usize, usiz
 }
 
 fn classifier_marker_sentence(text: &str) -> Option<(usize, usize, &'static str)> {
-    for (start, end) in sentence_ranges(text) {
-        let lower = text[start..end].trim().to_ascii_lowercase();
+    let scan_text = marker_scan_text(text);
+    for (start, end) in sentence_ranges(&scan_text) {
+        let lower = scan_text[start..end].trim().to_ascii_lowercase();
         let marker = if lower.starts_with("you misunderstood") {
             Some("you-misunderstood")
         } else if lower.starts_with("this does not meet")
@@ -1161,11 +1224,14 @@ fn extract_from_sources(
     for source in &source_texts.entries {
         match source.role {
             Role::User => {
+                if source.is_meta {
+                    continue;
+                }
                 let text = &source.decoded;
                 if classifiable_turns.contains(&source.turn) {
                     let evidence = classify(text, &prior_user);
                     let lexical = lexical_reaction_sentence(text);
-                    if let Some((kind, start, end, _marker)) = lexical {
+                    if let Some((kind, start, end, marker)) = lexical {
                         let classifier_kind = match evidence.reaction {
                             Some(Reaction::Correction) => Some(IntentEventKind::Correction),
                             Some(Reaction::Redirect) => Some(IntentEventKind::Redirect),
@@ -1185,12 +1251,12 @@ fn extract_from_sources(
                             DetectionReceipt {
                                 detector: Some(detector),
                                 classifier_score: classifier_score(evidence),
-                                marker: None,
+                                marker: Some(marker.to_string()),
                             },
                         ) {
                             events.push(event);
                         }
-                    } else if let (Some((start, end, _marker)), Some(kind)) = (
+                    } else if let (Some((start, end, marker)), Some(kind)) = (
                         classifier_marker_sentence(text),
                         match evidence.reaction {
                             Some(Reaction::Correction) => Some(IntentEventKind::Correction),
@@ -1207,7 +1273,7 @@ fn extract_from_sources(
                             DetectionReceipt {
                                 detector: Some(IntentDetector::Classifier),
                                 classifier_score: classifier_score(evidence),
-                                marker: None,
+                                marker: Some(marker.to_string()),
                             },
                         ) {
                             events.push(event);
@@ -1217,13 +1283,17 @@ fn extract_from_sources(
                 prior_user = text.clone();
             }
             Role::Assistant => {
+                if source.is_meta {
+                    continue;
+                }
                 let text = &source.decoded;
                 if source.turn > context.min_turn_exclusive
                     && !crate::extraction::provenance::is_csr_emission(text)
                     && crate::extraction::provenance::extractable(text).is_some()
                 {
-                    for (start, end) in sentence_ranges(text) {
-                        let sentence = &text[start..end];
+                    let scan_text = marker_scan_text(text);
+                    for (start, end) in sentence_ranges(&scan_text) {
+                        let sentence = &scan_text[start..end];
                         if let Some(marker) = abandonment_marker(sentence) {
                             if let Some(event) = make_event(
                                 source,
@@ -1633,6 +1703,102 @@ mod tests {
     }
 
     #[test]
+    fn meta_user_entries_are_not_corrections_or_prior_user_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","message":{"content":"Build parser"}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","isMeta":true,"message":{"content":"Never --no-verify."}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+        assert!(events.is_empty());
+
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","isMeta":true,"message":{"content":"Injected setup"}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","message":{"content":"Never --no-verify."}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+        assert!(
+            events.is_empty(),
+            "metadata must not establish prior-user context"
+        );
+    }
+
+    #[test]
+    fn non_meta_negative_command_is_a_correction_with_its_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","message":{"content":"Build parser"}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","message":{"content":"Never --no-verify."}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, IntentEventKind::Correction);
+        assert_eq!(events[0].marker.as_deref(), Some("negative-command"));
+    }
+
+    #[test]
+    fn fenced_and_quoted_correction_markers_are_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","message":{"content":"Build parser"}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","message":{"content":"Example:\n```text\nNever --no-verify.\n```\n> Do not forward this task.\nDone."}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn long_inline_code_correction_markers_are_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        let inline = format!("`Never {}`", "x".repeat(64));
+        let first = serde_json::json!({
+            "type": "user",
+            "uuid": "u1",
+            "message": { "content": "Build parser" }
+        });
+        let second = serde_json::json!({
+            "type": "user",
+            "uuid": "u2",
+            "message": { "content": inline }
+        });
+        std::fs::write(&transcript, format!("{first}\n{second}\n")).unwrap();
+
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn prior_claim_joins_all_text_blocks_from_the_preceding_assistant_entry() {
         let temp = tempfile::tempdir().unwrap();
         let transcript = temp.path().join("session.jsonl");
@@ -1659,6 +1825,30 @@ mod tests {
             events[0].prior_claim,
             "I chose OldParser.\nIt lives in old.rs."
         );
+    }
+
+    #[test]
+    fn meta_assistant_entry_does_not_replace_prior_claim() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","message":{"content":"Build parser"}}"#,
+                "\n",
+                r#"{"type":"assistant","uuid":"a1","message":{"content":"I chose OldParser."}}"#,
+                "\n",
+                r#"{"type":"assistant","uuid":"a2","isMeta":true,"message":{"content":"Injected hook output."}}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","message":{"content":"No, use NewParser."}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].prior_claim, "I chose OldParser.");
     }
 
     #[test]
