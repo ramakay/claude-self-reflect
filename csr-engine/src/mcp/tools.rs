@@ -522,41 +522,60 @@ pub(crate) async fn reflect_for_bench_with_vec(
     mode: SearchMode,
 ) -> Result<Vec<BenchHit>> {
     let scope = SearchProjectScope::resolve_with(storage, Some("csr-bench"), None, None)?;
-    let candidate_fetch = fetch.saturating_mul(4).max(20);
-    let mut pass = reflect_gather_pass(
-        storage,
-        search,
-        query_vec,
-        query,
-        candidate_fetch,
-        -1.0,
-        &scope,
-        false,
-        ConsumptionMode::Off,
-        false,
-        "explore",
-        mode,
-        RecallRerankMode::Baseline,
-    )
-    .await?;
-    apply_resolutions_before_limit(
-        &mut pass.enriched,
-        storage,
-        &pass.validity,
-        candidate_fetch,
-        false,
-    );
-    let mut seen = HashSet::new();
-    Ok(pass
-        .enriched
-        .into_iter()
-        .filter(|result| seen.insert(result.chunk.conversation_id.clone()))
-        .take(fetch)
-        .map(|result| BenchHit {
-            conversation_id: result.chunk.conversation_id,
-            score: result.score,
-        })
-        .collect())
+    let mut candidate_fetch = fetch.saturating_mul(4).max(20);
+    let mut previous_candidates = HashSet::new();
+    loop {
+        let mut pass = reflect_gather_pass(
+            storage,
+            search,
+            query_vec,
+            query,
+            candidate_fetch,
+            -1.0,
+            &scope,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "explore",
+            mode,
+            RecallRerankMode::Baseline,
+        )
+        .await?;
+        apply_resolutions_before_limit(
+            &mut pass.enriched,
+            storage,
+            &pass.validity,
+            candidate_fetch,
+            false,
+        );
+        let candidate_ids = pass
+            .enriched
+            .iter()
+            .map(|result| result.chunk.id.clone())
+            .collect::<HashSet<_>>();
+        let unique_conversations = pass
+            .enriched
+            .iter()
+            .map(|result| result.chunk.conversation_id.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        let exhausted = !pass.window_full || candidate_ids == previous_candidates;
+        if unique_conversations >= fetch || exhausted || candidate_fetch == usize::MAX {
+            let mut seen = HashSet::new();
+            return Ok(pass
+                .enriched
+                .into_iter()
+                .filter(|result| seen.insert(result.chunk.conversation_id.clone()))
+                .take(fetch)
+                .map(|result| BenchHit {
+                    conversation_id: result.chunk.conversation_id,
+                    score: result.score,
+                })
+                .collect());
+        }
+        previous_candidates = candidate_ids;
+        candidate_fetch = candidate_fetch.saturating_mul(2);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3943,6 +3962,57 @@ mod tests {
         assert!(output.contains("<id>fts-parent</id>"), "{output}");
         assert!(output.contains("<id>fts-extra-"), "{output}");
         assert!(!output.contains("<id>fts-child-"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn bench_refetches_past_a_dominant_conversations_initial_chunk_window() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        for index in 0..20 {
+            let chunk = crate::import::ConversationChunk {
+                id: format!("a-dominant-{index:02}"),
+                conversation_id: "dominant-conversation".into(),
+                project_name: "csr-bench".into(),
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                content: "windowtoken".into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::Assistant,
+                seq: index,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
+        }
+        let gold = crate::import::ConversationChunk {
+            id: "z-gold".into(),
+            conversation_id: "gold-conversation".into(),
+            project_name: "csr-bench".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            content: "windowtoken".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&gold, &[0.0; 4]).unwrap();
+        let search = Arc::new(RwLock::new(SearchEngine::new(32)));
+
+        let hits = reflect_for_bench_with_vec(
+            &storage,
+            &search,
+            &[0.0; 4],
+            "windowtoken",
+            5,
+            SearchMode::Fts,
+        )
+        .await
+        .unwrap();
+        assert!(
+            hits.iter()
+                .take(5)
+                .any(|hit| hit.conversation_id == "gold-conversation"),
+            "adaptive refetch must find a distinct conversation below the initial 20 chunks: {hits:?}"
+        );
     }
 
     #[tokio::test]

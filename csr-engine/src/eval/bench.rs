@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use crate::embeddings::EmbeddingEngine;
 use crate::import::chunk_messages;
 use crate::mcp::tools::{reflect_for_bench_with_vec, SearchMode};
-use crate::provenance::Speaker;
+use crate::provenance::{ChunkProvenance, Speaker};
 use crate::search::SearchEngine;
 use crate::storage::Storage;
 
@@ -65,6 +65,8 @@ struct BenchQuestion {
 #[derive(Debug)]
 struct AgentmemoryCorpus {
     dataset: String,
+    input_files: Vec<InputFileReceipt>,
+    queries_override: Option<String>,
     sessions: Vec<BenchSession>,
     questions: Vec<BenchQuestion>,
 }
@@ -82,6 +84,7 @@ struct LongMemEvalQuestion {
 struct LongMemEvalCorpus {
     questions: Vec<LongMemEvalQuestion>,
     dropped_abstention: usize,
+    input_files: Vec<InputFileReceipt>,
 }
 
 #[derive(Deserialize)]
@@ -118,13 +121,27 @@ struct RawLongMemEval {
     haystack_sessions: Vec<Vec<RawTurn>>,
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+fn read_json_with_receipt<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    role: &str,
+) -> Result<(T, InputFileReceipt)> {
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("canonicalizing benchmark input {}", path.display()))?;
+    let bytes = fs::read(&canonical)
+        .with_context(|| format!("reading benchmark input {}", canonical.display()))?;
+    let parsed = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing benchmark input {}", canonical.display()))?;
+    let receipt = InputFileReceipt {
+        role: role.into(),
+        path: canonical.display().to_string(),
+        blake3: blake3::hash(&bytes).to_hex().to_string(),
+    };
+    Ok((parsed, receipt))
 }
 
 fn read_agentmemory(data: PathBuf, queries: Option<&Path>) -> Result<AgentmemoryCorpus> {
-    let (session_path, default_query_path, dataset) = if data.is_dir() {
+    let data_is_dir = data.is_dir();
+    let (session_path, default_query_path, mut dataset) = if data_is_dir {
         let dataset = data
             .file_name()
             .and_then(|name| name.to_str())
@@ -136,16 +153,32 @@ fn read_agentmemory(data: PathBuf, queries: Option<&Path>) -> Result<Agentmemory
             dataset,
         )
     } else {
-        (
-            data.clone(),
-            data.with_file_name("queries.json"),
-            "agentmemory".into(),
-        )
+        let dataset = data
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or("agentmemory")
+            .to_string();
+        (data.clone(), data.with_file_name("queries.json"), dataset)
     };
-    let raw_sessions: Vec<RawSession> = read_json(&session_path)?;
-    let raw_questions: Vec<RawAgentQuestion> = read_json(queries.unwrap_or(&default_query_path))?;
+    let query_path = queries.unwrap_or(&default_query_path);
+    let (raw_sessions, sessions_receipt): (Vec<RawSession>, _) =
+        read_json_with_receipt(&session_path, "sessions")?;
+    let (raw_questions, queries_receipt): (Vec<RawAgentQuestion>, _) =
+        read_json_with_receipt(query_path, "queries")?;
+    if !data_is_dir {
+        dataset = Path::new(&sessions_receipt.path)
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or("agentmemory")
+            .to_string();
+    }
+    let queries_override = queries.map(|_| queries_receipt.path.clone());
     Ok(AgentmemoryCorpus {
         dataset,
+        queries_override,
+        input_files: vec![sessions_receipt, queries_receipt],
         sessions: raw_sessions
             .into_iter()
             .map(|session| BenchSession {
@@ -178,7 +211,8 @@ fn read_longmemeval(
     drop_abstention: bool,
     limit: Option<usize>,
 ) -> Result<LongMemEvalCorpus> {
-    let raw: Vec<RawLongMemEval> = read_json(path)?;
+    let (raw, input_receipt): (Vec<RawLongMemEval>, _) =
+        read_json_with_receipt(path, "longmemeval")?;
     let dropped_abstention = raw
         .iter()
         .filter(|row| drop_abstention && ABSTENTION_TYPES.contains(&row.question_type.as_str()))
@@ -232,6 +266,7 @@ fn read_longmemeval(
     Ok(LongMemEvalCorpus {
         questions,
         dropped_abstention,
+        input_files: vec![input_receipt],
     })
 }
 
@@ -404,13 +439,29 @@ static PROCESS_EMBEDDING_MEMO: LazyLock<Mutex<EmbeddingMemo>> =
     LazyLock::new(|| Mutex::new(EmbeddingMemo::default()));
 
 #[derive(Debug, Serialize)]
+pub struct InputFileReceipt {
+    pub role: String,
+    pub path: String,
+    pub blake3: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct BenchSummary {
     pub dataset: String,
     pub split: String,
-    pub commit_sha: String,
+    pub build_commit: String,
+    pub build_dirty: bool,
+    pub cwd_head: Option<String>,
     pub embedding_model: String,
     pub k: usize,
+    pub ranking_depth: usize,
     pub mode: String,
+    pub input_files: Vec<InputFileReceipt>,
+    pub queries_override: Option<String>,
+    pub drop_abstention: bool,
+    pub limit: Option<usize>,
+    pub stratify: Option<usize>,
+    pub scored_question_ids: Vec<String>,
     pub scored_questions: usize,
     pub dropped_abstention: usize,
     pub precision_at_k: f64,
@@ -434,23 +485,38 @@ fn upper_median(values: &[f64]) -> f64 {
 fn summarize(
     dataset: &str,
     split: &str,
-    commit_sha: &str,
     embedding_model: &str,
     k: usize,
+    ranking_depth: usize,
     mode: &str,
     rows: &[BenchScoreRow],
     init_inclusive: &[f64],
     dropped_abstention: usize,
     embedding_memo: MemoStats,
+    input_files: Vec<InputFileReceipt>,
+    drop_abstention: bool,
+    limit: Option<usize>,
+    stratify: Option<usize>,
+    scored_question_ids: Vec<String>,
+    queries_override: Option<String>,
 ) -> BenchSummary {
     let n = rows.len().max(1) as f64;
     BenchSummary {
         dataset: dataset.into(),
         split: split.into(),
-        commit_sha: commit_sha.into(),
+        build_commit: env!("CSR_BUILD_GIT_SHA").into(),
+        build_dirty: env!("CSR_BUILD_GIT_DIRTY") == "true",
+        cwd_head: cwd_head(),
         embedding_model: embedding_model.into(),
         k,
+        ranking_depth,
         mode: mode.into(),
+        input_files,
+        queries_override,
+        drop_abstention,
+        limit,
+        stratify,
+        scored_question_ids,
         scored_questions: rows.len(),
         dropped_abstention,
         precision_at_k: rows.iter().map(|row| row.precision_at_k).sum::<f64>() / n,
@@ -469,10 +535,10 @@ fn summarize(
             (format!("P@{k}"), "relevant retrieved sessions divided by K".into()),
             (format!("R@{k}"), "relevant retrieved sessions divided by all dataset gold sessions".into()),
             (format!("recall_any@{k}"), "1 when any dataset gold session appears in top K, else 0 (agentmemory headline metric)".into()),
-            ("MRR".into(), "reciprocal rank of the first dataset gold session".into()),
+            (format!("MRR@{ranking_depth}"), format!("reciprocal rank of the first dataset gold session within the top {ranking_depth}")),
             ("NDCG@10".into(), "binary-gain normalized discounted cumulative gain at 10".into()),
             ("query_latency_p50_ms".into(), "upper median of query embedding plus retrieval only".into()),
-            ("init_inclusive_latency_p50_ms".into(), "upper median including scratch-store indexing; agentmemory initializes once, LongMemEval initializes per question".into()),
+            ("init_inclusive_latency_p50_ms".into(), "upper median of cold-start indexing plus query; per-question re-init applies only to the longmemeval format".into()),
         ]),
         embedding_memo,
     }
@@ -523,6 +589,7 @@ async fn index_sessions(
                 .as_deref()
                 .unwrap_or("1970-01-01T00:00:00Z"),
             &session.messages,
+            false,
         ));
     }
     let contents = chunks
@@ -537,6 +604,14 @@ async fn index_sessions(
     let mut search = SearchEngine::new(chunks.len().max(16));
     for (chunk, vector) in chunks.into_iter().zip(vectors) {
         storage.insert_chunk(&chunk, &vector)?;
+        storage.insert_chunk_provenance(
+            &chunk.id,
+            &ChunkProvenance {
+                author: chunk.author,
+                source_conv_id: chunk.conversation_id.clone(),
+                supersedes: None,
+            },
+        )?;
         search.insert_chunk(chunk.id, vector);
     }
     Ok((storage, Arc::new(RwLock::new(search))))
@@ -581,18 +656,15 @@ where
         .collect()
 }
 
-fn git_head() -> Result<String> {
+fn cwd_head() -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
-        .context("running git rev-parse HEAD")?;
+        .ok()?;
     if !output.status.success() {
-        bail!(
-            "git rev-parse HEAD failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        return None;
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn format_table(summary: &BenchSummary) -> String {
@@ -601,8 +673,8 @@ fn format_table(summary: &BenchSummary) -> String {
     } else {
         ""
     };
-    format!("| System | Dataset | Mode | P@{k} | R@{k} (fraction gold) | recall_any@{k} | MRR | NDCG@10 | query p50 | init-inclusive p50 |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n| CSR `{sha}` | {dataset} ({split}) | {mode} | {p:.3} | {r:.3} | {hit:.3} | {mrr:.3} | {ndcg:.3} | {query:.1} ms | {init:.1} ms |\n{published}\nReceipt: dataset={dataset}; split={split}; metric headline=recall_any@{k} (any gold in top K), distinct from fraction-of-gold R@{k}; commit={sha}; embedding={model}; K={k}; mode={mode}; scored={n}; abstention_dropped={dropped}.\nagentmemory's 95.2% is recall_any@5 at `565c238`, using 512-character session vectors with graph weight 0.\n",
-        k=summary.k, sha=summary.commit_sha, dataset=summary.dataset, split=summary.split, mode=summary.mode, p=summary.precision_at_k, r=summary.recall_at_k_fraction_of_gold, hit=summary.recall_any_at_k, mrr=summary.mrr, ndcg=summary.ndcg_at_10, query=summary.query_latency_p50_ms, init=summary.init_inclusive_latency_p50_ms, model=summary.embedding_model, n=summary.scored_questions, dropped=summary.dropped_abstention)
+    format!("| System | Dataset | Mode | P@{k} | R@{k} (fraction gold) | recall_any@{k} | MRR@{depth} | NDCG@10 | query p50 | init-inclusive p50 |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n| CSR `{sha}`{dirty} | {dataset} ({split}) | {mode} | {p:.3} | {r:.3} | {hit:.3} | {mrr:.3} | {ndcg:.3} | {query:.1} ms | {init:.1} ms |\n{published}\nReceipt: dataset={dataset}; split={split}; metric headline=recall_any@{k} (any gold in top K), distinct from fraction-of-gold R@{k}; build_commit={sha}; build_dirty={build_dirty}; embedding={model}; K={k}; ranking_depth={depth}; mode={mode}; scored={n}; abstention_dropped={dropped}.\nagentmemory's 95.2% is recall_any@5 at `565c238`, using 512-character session vectors with graph weight 0.\n",
+        k=summary.k, depth=summary.ranking_depth, sha=summary.build_commit, dirty=if summary.build_dirty { " (dirty)" } else { "" }, build_dirty=summary.build_dirty, dataset=summary.dataset, split=summary.split, mode=summary.mode, p=summary.precision_at_k, r=summary.recall_at_k_fraction_of_gold, hit=summary.recall_any_at_k, mrr=summary.mrr, ndcg=summary.ndcg_at_10, query=summary.query_latency_p50_ms, init=summary.init_inclusive_latency_p50_ms, model=summary.embedding_model, n=summary.scored_questions, dropped=summary.dropped_abstention)
 }
 
 fn validate_config(config: &BenchConfig) -> Result<()> {
@@ -654,7 +726,7 @@ pub async fn run(config: BenchConfig) -> Result<String> {
     let adapter = format!("csr-{}", config.mode.as_str());
     let mut rows = Vec::new();
     let mut init_inclusive = Vec::new();
-    let (dataset, split, dropped) = match config.format {
+    let (dataset, split, dropped, input_files, queries_override) = match config.format {
         BenchFormat::Agentmemory => {
             let mut corpus = read_agentmemory(config.data.clone(), config.queries.as_deref())?;
             corpus.questions = stratified(corpus.questions, config.stratify, |q| &q.kind);
@@ -687,7 +759,13 @@ pub async fn run(config: BenchConfig) -> Result<String> {
                 ));
                 init_inclusive.push(init_ms + query_ms);
             }
-            (corpus.dataset, "all".to_string(), 0)
+            (
+                corpus.dataset,
+                "all".to_string(),
+                0,
+                corpus.input_files,
+                corpus.queries_override,
+            )
         }
         BenchFormat::Longmemeval => {
             let mut corpus = read_longmemeval(&config.data, config.drop_abstention, None)?;
@@ -733,10 +811,18 @@ pub async fn run(config: BenchConfig) -> Result<String> {
             } else {
                 "all"
             };
+            let dataset = config
+                .data
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("longmemeval")
+                .to_string();
             (
-                "longmemeval_s_cleaned".to_string(),
+                dataset,
                 split.to_string(),
                 corpus.dropped_abstention,
+                corpus.input_files,
+                None,
             )
         }
     };
@@ -750,18 +836,24 @@ pub async fn run(config: BenchConfig) -> Result<String> {
     let summary = summarize(
         &dataset,
         &split,
-        &git_head()?,
         if config.mode == SearchMode::Fts {
             "not used (fts-only); vector model is sentence-transformers/all-MiniLM-L6-v2 (FastEmbed, 384-d)"
         } else {
             EMBEDDING_MODEL
         },
         config.k,
+        config.k.max(20),
         config.mode.as_str(),
         &rows,
         &init_inclusive,
         dropped,
         memo_after.since(memo_before),
+        input_files,
+        config.drop_abstention,
+        config.limit,
+        config.stratify,
+        rows.iter().map(|row| row.question_id.clone()).collect(),
+        queries_override,
     );
     let table = format_table(&summary);
     write_outputs(&config.out, &rows, &summary, &table)?;
@@ -790,6 +882,43 @@ mod tests {
         assert_eq!(corpus.questions[1].id, "q-b");
         assert_eq!(corpus.questions[1].kind, "multi-session");
         assert_eq!(corpus.questions[1].gold_session_ids, ["sess-a", "sess-b"]);
+    }
+
+    #[test]
+    fn agentmemory_file_form_uses_the_corpus_directory_basename() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let corpus_dir = temp.path().join("named-corpus");
+        fs::create_dir(&corpus_dir).unwrap();
+        fs::copy(
+            Path::new(FIXTURES).join("agentmemory/sessions.json"),
+            corpus_dir.join("sessions.json"),
+        )
+        .unwrap();
+        let override_path = corpus_dir.join("override-queries.json");
+        fs::copy(
+            Path::new(FIXTURES).join("agentmemory/queries.json"),
+            &override_path,
+        )
+        .unwrap();
+
+        let corpus =
+            read_agentmemory(corpus_dir.join("sessions.json"), Some(&override_path)).unwrap();
+        assert_eq!(corpus.dataset, "named-corpus");
+        let canonical_override = fs::canonicalize(&override_path).unwrap();
+        assert_eq!(
+            corpus.queries_override.as_deref(),
+            Some(canonical_override.to_str().unwrap())
+        );
+        assert_eq!(
+            corpus.input_files[1].path,
+            canonical_override.display().to_string()
+        );
+        assert_eq!(
+            corpus.input_files[1].blake3,
+            blake3::hash(&fs::read(canonical_override).unwrap())
+                .to_hex()
+                .to_string()
+        );
     }
 
     #[test]
@@ -925,14 +1054,20 @@ mod tests {
         let summary = summarize(
             "fixture",
             "all",
-            "abc",
             EMBEDDING_MODEL,
             3,
+            20,
             "hybrid",
             &[],
             &[],
             0,
             MemoStats::default(),
+            Vec::new(),
+            true,
+            None,
+            None,
+            Vec::new(),
+            None,
         );
         let table = format_table(&summary);
         assert!(!table.contains("| agentmemory `565c238` (published)"));
@@ -1003,6 +1138,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scratch_index_provenance_enables_user_authority_ranking() {
+        let sessions = vec![
+            BenchSession {
+                id: "assistant-conversation".into(),
+                timestamp: Some("2026-01-01T00:00:00Z".into()),
+                messages: vec![(Speaker::Assistant, "identical authoritytoken claim".into())],
+            },
+            BenchSession {
+                id: "user-conversation".into(),
+                timestamp: Some("2026-01-01T00:00:00Z".into()),
+                messages: vec![(Speaker::User, "identical authoritytoken claim".into())],
+            },
+        ];
+        let without_storage = Arc::new(Storage::open_memory().unwrap());
+        let mut without_search = SearchEngine::new(16);
+        for session in &sessions {
+            for chunk in chunk_messages(
+                &session.id,
+                PROJECT,
+                session.timestamp.as_deref().unwrap(),
+                &session.messages,
+                false,
+            ) {
+                let vector = vec![0.0; EmbeddingEngine::dimension()];
+                without_storage.insert_chunk(&chunk, &vector).unwrap();
+                without_search.insert_chunk(chunk.id, vector);
+            }
+        }
+        let without_search = Arc::new(RwLock::new(without_search));
+        let without_hits = query_store(
+            &without_storage,
+            &without_search,
+            None,
+            "authoritytoken",
+            2,
+            SearchMode::Vector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            without_hits.first().map(String::as_str),
+            Some("assistant-conversation"),
+            "without provenance an exact tie retains insertion order"
+        );
+
+        let (storage, search) = index_sessions(&sessions, None).await.unwrap();
+        let user_chunk_id = storage
+            .get_chunk_ids_for_conversation("user-conversation")
+            .unwrap()
+            .remove(0);
+        let provenance = storage
+            .get_chunk_provenance(&user_chunk_id)
+            .unwrap()
+            .expect("scratch chunks must carry real-import provenance");
+        assert_eq!(provenance.author, Speaker::User);
+        assert_eq!(provenance.source_conv_id, "user-conversation");
+
+        let hits = query_store(
+            &storage,
+            &search,
+            None,
+            "authoritytoken",
+            2,
+            SearchMode::Vector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.first().map(String::as_str), Some("user-conversation"));
+    }
+
+    #[tokio::test]
     async fn bench_query_collapses_multiple_matching_chunks_by_conversation() {
         let sessions = vec![BenchSession {
             id: "long-session".into(),
@@ -1024,9 +1230,9 @@ mod tests {
         let summary = summarize(
             "fixture",
             "test",
-            "deadbeef",
             "all-MiniLM-L6-v2",
             5,
+            20,
             "hybrid",
             &[
                 first,
@@ -1035,10 +1241,56 @@ mod tests {
             &[11.0, 3.0],
             0,
             MemoStats::default(),
+            Vec::new(),
+            true,
+            None,
+            None,
+            vec!["a".into(), "b".into()],
+            None,
         );
         assert_eq!(summary.query_latency_p50_ms, 9.0);
         assert_eq!(summary.init_inclusive_latency_p50_ms, 11.0);
         assert_eq!(summary.recall_any_at_k, 0.5);
+    }
+
+    #[test]
+    fn summary_receipts_identify_the_built_binary_and_exact_sample() {
+        let summary = summarize(
+            "fixture",
+            "all",
+            "model",
+            5,
+            20,
+            "hybrid",
+            &[],
+            &[],
+            0,
+            MemoStats::default(),
+            vec![InputFileReceipt {
+                role: "sessions".into(),
+                path: "/absolute/sessions.json".into(),
+                blake3: "abc123".into(),
+            }],
+            true,
+            Some(7),
+            Some(2),
+            vec!["q-2".into(), "q-1".into()],
+            Some("/absolute/override-queries.json".into()),
+        );
+        assert_eq!(summary.build_commit, env!("CSR_BUILD_GIT_SHA"));
+        assert_eq!(summary.build_dirty, env!("CSR_BUILD_GIT_DIRTY") == "true");
+        assert_eq!(summary.ranking_depth, 20);
+        assert_eq!(summary.input_files[0].path, "/absolute/sessions.json");
+        assert_eq!(summary.input_files[0].role, "sessions");
+        assert_eq!(
+            summary.queries_override.as_deref(),
+            Some("/absolute/override-queries.json")
+        );
+        assert_eq!(summary.scored_question_ids, ["q-2", "q-1"]);
+        assert_eq!(summary.limit, Some(7));
+        assert_eq!(summary.stratify, Some(2));
+        assert!(summary.drop_abstention);
+        assert!(summary.metric_definitions.contains_key("MRR@20"));
     }
 
     #[test]

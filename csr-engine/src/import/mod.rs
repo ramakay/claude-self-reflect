@@ -424,97 +424,15 @@ pub(crate) fn parse_jsonl_file_with_stats(
     // Priority: JSONL summary > first user message > None
     let chunk_summary = summary.or(first_user_message);
 
-    // Chunk by character budget, NOT a fixed message count. The embedding model
-    // (all-MiniLM-L6-v2) truncates input at ~256 tokens, so a chunk larger than
-    // ~900 chars only embeds its head — the rest is unsearchable. Sizing each chunk
-    // under that window means the whole conversation actually lands in vector space.
-    let mut chunks: Vec<ConversationChunk> = Vec::new();
-    let mut buf = String::new();
-    let mut buf_authors: Vec<crate::provenance::Speaker> = Vec::new();
-    let mut buf_sidechains: Vec<bool> = Vec::new();
-    let mut buf_msgs = 0usize;
-
-    for ((msg, author), sidechain) in messages.iter().zip(authors.iter()).zip(sidechains.iter()) {
-        // A single message larger than the budget is hard-split into multiple chunks
-        // so its tail (e.g. the end of a long report) is embedded too.
-        if msg.len() > CHUNK_CHAR_BUDGET {
-            if !buf.is_empty() {
-                push_chunk(
-                    &mut chunks,
-                    &conversation_id,
-                    project_name,
-                    &timestamp,
-                    std::mem::take(&mut buf),
-                    buf_msgs,
-                    &chunk_summary,
-                    chunk_author(&buf_authors),
-                    chunk_is_sidechain(&buf_sidechains, &conversation_id),
-                );
-                buf_authors.clear();
-                buf_sidechains.clear();
-                buf_msgs = 0;
-            }
-            let mut start = 0;
-            while start < msg.len() {
-                let mut end = (start + CHUNK_CHAR_BUDGET).min(msg.len());
-                end = msg.floor_char_boundary(end);
-                if end <= start {
-                    end = msg.len();
-                }
-                push_chunk(
-                    &mut chunks,
-                    &conversation_id,
-                    project_name,
-                    &timestamp,
-                    msg[start..end].to_string(),
-                    1,
-                    &chunk_summary,
-                    *author,
-                    chunk_is_sidechain(std::slice::from_ref(sidechain), &conversation_id),
-                );
-                start = end;
-            }
-            continue;
-        }
-
-        // Flush before exceeding the budget, then start a fresh chunk.
-        if !buf.is_empty() && buf.len() + msg.len() + 2 > CHUNK_CHAR_BUDGET {
-            push_chunk(
-                &mut chunks,
-                &conversation_id,
-                project_name,
-                &timestamp,
-                std::mem::take(&mut buf),
-                buf_msgs,
-                &chunk_summary,
-                chunk_author(&buf_authors),
-                chunk_is_sidechain(&buf_sidechains, &conversation_id),
-            );
-            buf_authors.clear();
-            buf_sidechains.clear();
-            buf_msgs = 0;
-        }
-        if !buf.is_empty() {
-            buf.push_str("\n\n");
-        }
-        buf.push_str(msg);
-        buf_authors.push(*author);
-        buf_sidechains.push(*sidechain);
-        buf_msgs += 1;
-    }
-    if !buf.is_empty() {
-        push_chunk(
-            &mut chunks,
-            &conversation_id,
-            project_name,
-            &timestamp,
-            buf,
-            buf_msgs,
-            &chunk_summary,
-            chunk_author(&buf_authors),
-            chunk_is_sidechain(&buf_sidechains, &conversation_id),
-        );
-    }
+    let chunks = chunk_message_core(
+        &conversation_id,
+        project_name,
+        &timestamp,
+        &messages,
+        &authors,
+        &sidechains,
+        &chunk_summary,
+    );
 
     Ok(ParsedConversation {
         chunks,
@@ -534,14 +452,49 @@ pub(crate) fn chunk_messages(
     project_name: &str,
     timestamp: &str,
     messages: &[(crate::provenance::Speaker, String)],
+    is_sidechain: bool,
 ) -> Vec<ConversationChunk> {
+    let contents = messages
+        .iter()
+        .map(|(_, message)| message.clone())
+        .collect::<Vec<_>>();
+    let authors = messages
+        .iter()
+        .map(|(author, _)| *author)
+        .collect::<Vec<_>>();
+    let sidechains = vec![is_sidechain; messages.len()];
+    chunk_message_core(
+        conversation_id,
+        project_name,
+        timestamp,
+        &contents,
+        &authors,
+        &sidechains,
+        &None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chunk_message_core(
+    conversation_id: &str,
+    project_name: &str,
+    timestamp: &str,
+    messages: &[String],
+    message_authors: &[crate::provenance::Speaker],
+    message_sidechains: &[bool],
+    summary: &Option<String>,
+) -> Vec<ConversationChunk> {
+    debug_assert_eq!(messages.len(), message_authors.len());
+    debug_assert_eq!(messages.len(), message_sidechains.len());
     let mut chunks = Vec::new();
     let mut buffer = String::new();
     let mut authors = Vec::new();
+    let mut sidechains = Vec::new();
     let mut message_count = 0;
-    let summary = None;
 
-    for (author, message) in messages {
+    for ((message, author), is_sidechain) in
+        messages.iter().zip(message_authors).zip(message_sidechains)
+    {
         if message.len() > CHUNK_CHAR_BUDGET {
             if !buffer.is_empty() {
                 push_chunk(
@@ -551,11 +504,12 @@ pub(crate) fn chunk_messages(
                     timestamp,
                     std::mem::take(&mut buffer),
                     message_count,
-                    &summary,
+                    summary,
                     chunk_author(&authors),
-                    false,
+                    chunk_is_sidechain(&sidechains, conversation_id),
                 );
                 authors.clear();
+                sidechains.clear();
                 message_count = 0;
             }
             let mut start = 0;
@@ -572,9 +526,9 @@ pub(crate) fn chunk_messages(
                     timestamp,
                     message[start..end].to_string(),
                     1,
-                    &summary,
+                    summary,
                     *author,
-                    false,
+                    chunk_is_sidechain(std::slice::from_ref(is_sidechain), conversation_id),
                 );
                 start = end;
             }
@@ -589,11 +543,12 @@ pub(crate) fn chunk_messages(
                 timestamp,
                 std::mem::take(&mut buffer),
                 message_count,
-                &summary,
+                summary,
                 chunk_author(&authors),
-                false,
+                chunk_is_sidechain(&sidechains, conversation_id),
             );
             authors.clear();
+            sidechains.clear();
             message_count = 0;
         }
         if !buffer.is_empty() {
@@ -601,6 +556,7 @@ pub(crate) fn chunk_messages(
         }
         buffer.push_str(message);
         authors.push(*author);
+        sidechains.push(*is_sidechain);
         message_count += 1;
     }
     if !buffer.is_empty() {
@@ -611,9 +567,9 @@ pub(crate) fn chunk_messages(
             timestamp,
             buffer,
             message_count,
-            &summary,
+            summary,
             chunk_author(&authors),
-            false,
+            chunk_is_sidechain(&sidechains, conversation_id),
         );
     }
     chunks
@@ -1110,6 +1066,7 @@ mod tests {
             "bench",
             "2026-01-01T00:00:00Z",
             &[(crate::provenance::Speaker::Assistant, long)],
+            false,
         );
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].id, generate_chunk_id("bench-session", 0));
@@ -1118,6 +1075,55 @@ mod tests {
         assert!(chunks
             .iter()
             .all(|chunk| chunk.content.len() <= CHUNK_CHAR_BUDGET));
+    }
+
+    #[test]
+    fn jsonl_import_and_chunk_messages_have_exact_chunk_parity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("parity-conversation.jsonl");
+        let long = format!("user-start {} user-end", "é".repeat(500));
+        let assistant = "assistant follow-up".to_string();
+        let lines = [
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-02-03T04:05:06Z",
+                "isSidechain": true,
+                "message": {"content": long}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-02-03T04:05:06Z",
+                "isSidechain": true,
+                "message": {"content": assistant}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let imported = parse_jsonl_file_with_stats(&path, "parity-project")
+            .unwrap()
+            .chunks;
+        let direct = chunk_messages(
+            "parity-conversation",
+            "parity-project",
+            "2026-02-03T04:05:06Z",
+            &[(Speaker::User, long), (Speaker::Assistant, assistant)],
+            true,
+        );
+        assert_eq!(imported.len(), direct.len());
+        for (left, right) in imported.iter().zip(&direct) {
+            assert_eq!(left.id, right.id);
+            assert_eq!(left.content, right.content);
+            assert_eq!(left.message_count, right.message_count);
+            assert_eq!(left.author, right.author);
+            assert_eq!(left.is_sidechain, right.is_sidechain);
+        }
     }
 
     #[test]
