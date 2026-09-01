@@ -212,7 +212,7 @@ async fn walk_knn(
         let mut rows: Vec<EvidenceRow> = fts_chunks
             .iter()
             .enumerate()
-            .map(|(i, c)| EvidenceRow {
+            .map(|(i, (c, _, _))| EvidenceRow {
                 id: c.id.clone(),
                 conversation_id: c.conversation_id.clone(),
                 // fts.rank order preserved as a descending score; TSV-only.
@@ -293,7 +293,7 @@ async fn walk_knn(
         *rrf_score.entry(row.id.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank);
         meta.entry(row.id.clone()).or_insert_with(|| row.clone());
     }
-    for (i, c) in fts_chunks.iter().enumerate() {
+    for (i, (c, _, _)) in fts_chunks.iter().enumerate() {
         let rank = (i + 1) as f32;
         *rrf_score.entry(c.id.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank);
         meta.entry(c.id.clone()).or_insert_with(|| EvidenceRow {

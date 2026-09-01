@@ -866,6 +866,14 @@ async fn reflect_gather_pass(
         }
     }
 
+    // Snapshot only candidates produced by the semantic/reflection channels.
+    // FTS-only chunks are appended below and still participate in reranking,
+    // but must not receive a semantic-list RRF contribution.
+    let semantic_candidate_ids: HashSet<String> = enriched
+        .iter()
+        .map(|result| result.chunk.id.clone())
+        .collect();
+
     let mut fts_order = Vec::new();
     // Hybrid always supplements semantic retrieval with FTS5. Vector mode
     // skips FTS entirely; FTS mode reaches this block with no semantic hits.
@@ -1110,8 +1118,17 @@ async fn reflect_gather_pass(
             })?
         })
         .collect();
+    let semantic_order: Vec<String> = order
+        .iter()
+        .filter(|id| semantic_candidate_ids.contains(*id))
+        .cloned()
+        .collect();
+    // This establishes the initial order for every mode. The validity
+    // partition runs later: it preserves the valid section byte-for-byte,
+    // while active forgetting may reorder only the demoted section by
+    // accelerated decay in hybrid, vector, and FTS modes alike.
     let final_order = match search_mode {
-        SearchMode::Hybrid => fuse_rrf(&order, &fts_order, 60),
+        SearchMode::Hybrid => fuse_rrf(&semantic_order, &fts_order, 60),
         SearchMode::Vector => order,
         SearchMode::Fts => fts_order,
     };
@@ -3991,6 +4008,136 @@ mod tests {
         assert!(!output.contains("<id>mode-semantic</id>"), "{output}");
     }
 
+    #[tokio::test]
+    async fn hybrid_limit_one_does_not_double_count_fts_only_hit() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        let make_chunk =
+            |id: &str, conversation_id: &str, content: &str| crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation_id.into(),
+                project_name: "test".into(),
+                timestamp: now.clone(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+        let semantic = make_chunk(
+            "rrf-semantic",
+            "rrf-semantic-conversation",
+            "true semantic result without the identifier",
+        );
+        let keyword = make_chunk(
+            "rrf-keyword-only",
+            "rrf-keyword-conversation",
+            "rrf_conflict_identifier keyword-only result",
+        );
+        let semantic_vec = vec![1.0, 0.0, 0.0, 0.0];
+        let keyword_vec = vec![0.0, 1.0, 0.0, 0.0];
+        storage.insert_chunk(&semantic, &semantic_vec).unwrap();
+        storage.insert_chunk(&keyword, &keyword_vec).unwrap();
+        let mut engine = SearchEngine::new(8);
+        engine.insert_chunk(semantic.id.clone(), semantic_vec);
+        engine.insert_chunk(keyword.id.clone(), keyword_vec);
+        let search = Arc::new(RwLock::new(engine));
+
+        for active_forgetting in [false, true] {
+            let output = reflect_on_past_with_vec_mode(
+                &storage,
+                &search,
+                &[1.0, 0.0, 0.0, 0.0],
+                "rrf_conflict_identifier",
+                1,
+                0.5,
+                Some("all"),
+                0,
+                true,
+                ConsumptionMode::Full,
+                active_forgetting,
+                "other",
+                SearchMode::Hybrid,
+                RecallRerankMode::Baseline,
+                false,
+            )
+            .await
+            .unwrap();
+
+            assert!(output.contains("<id>rrf-semantic</id>"), "{output}");
+            assert!(!output.contains("<id>rrf-keyword-only</id>"), "{output}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fts_mode_keeps_bm25_order_for_valid_results_with_active_forgetting_on_and_off() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let make_chunk = |id: &str, conversation_id: &str, timestamp: &str, content: &str| {
+            crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation_id.into(),
+                project_name: "test".into(),
+                timestamp: timestamp.into(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            }
+        };
+        let bm25_first = make_chunk(
+            "bm25-first",
+            "bm25-first-conversation",
+            "2020-01-01T00:00:00Z",
+            "bm25_order_identifier bm25_order_identifier bm25_order_identifier",
+        );
+        let newest_but_bm25_second = make_chunk(
+            "bm25-second",
+            "bm25-second-conversation",
+            "2099-01-01T00:00:00Z",
+            "bm25_order_identifier with several unrelated filler words around it",
+        );
+        storage.insert_chunk(&bm25_first, &[0.0; 4]).unwrap();
+        storage
+            .insert_chunk(&newest_but_bm25_second, &[0.0; 4])
+            .unwrap();
+        let stored_order = storage
+            .fts5_search("bm25_order_identifier", 2, Some("test"))
+            .unwrap();
+        assert_eq!(stored_order[0].0.id, "bm25-first");
+        assert_eq!(stored_order[1].0.id, "bm25-second");
+
+        for active_forgetting in [false, true] {
+            let output = reflect_on_past_with_vec_mode(
+                &storage,
+                &Arc::new(RwLock::new(SearchEngine::new(8))),
+                &[1.0, 0.0, 0.0, 0.0],
+                "bm25_order_identifier",
+                2,
+                0.5,
+                Some("test"),
+                0,
+                true,
+                ConsumptionMode::Full,
+                active_forgetting,
+                "other",
+                SearchMode::Fts,
+                RecallRerankMode::Baseline,
+                false,
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                pos_of(&output, "<id>bm25-first</id>")
+                    < pos_of(&output, "<id>bm25-second</id>"),
+                "FTS valid results must retain BM25 order with active_forgetting={active_forgetting}:\n{output}"
+            );
+        }
+    }
+
     fn demote_validity(note: &str) -> ConvValidity {
         ConvValidity {
             demote: true,
@@ -5732,8 +5879,8 @@ mod tests {
         .unwrap();
 
         let off_ids = [
-            "chunk-fts-valid",
             "chunk-valid-a",
+            "chunk-fts-valid",
             "chunk-valid-b",
             "chunk-demoted-old",
             "chunk-demoted-new",
@@ -5761,8 +5908,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            pos_of(&on, "<id>chunk-fts-valid</id>") < pos_of(&on, "<id>chunk-valid-a</id>")
-                && pos_of(&on, "<id>chunk-valid-a</id>") < pos_of(&on, "<id>chunk-valid-b</id>")
+            pos_of(&on, "<id>chunk-valid-a</id>") < pos_of(&on, "<id>chunk-fts-valid</id>")
+                && pos_of(&on, "<id>chunk-fts-valid</id>") < pos_of(&on, "<id>chunk-valid-b</id>")
                 && pos_of(&on, "<id>chunk-valid-b</id>")
                     < pos_of(&on, "<id>chunk-demoted-new</id>")
                 && pos_of(&on, "<id>chunk-demoted-new</id>")
