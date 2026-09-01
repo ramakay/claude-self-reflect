@@ -81,6 +81,10 @@ pub struct Episode {
     /// the displayed count from surviving quotes only, never trust this total.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instrumentation_version: Option<u32>,
+    /// Number of deterministic Correction events measured in this transcript.
+    /// `None` means intent capture was disabled or could not be measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction_count: Option<u32>,
 }
 
 /// Extract a structured episode from JSONL transcript lines.
@@ -415,6 +419,7 @@ fn extract_episode_from_messages(
         steer_count: None,
         steers: Vec::new(),
         instrumentation_version: None,
+        correction_count: None,
     }
 }
 
@@ -573,6 +578,33 @@ pub async fn extract_and_store_episode(
         episode.steers = instrumentation.steers;
         episode.instrumentation_version =
             Some(crate::transcript::instrumentation::STEER_FILTER_VERSION);
+    }
+
+    if std::env::var("CSR_NO_INTENT_CAPTURE").as_deref() != Ok("1") {
+        match crate::transcript::intent_events::extract_intent_events(
+            &tp,
+            session_id,
+            project_name,
+            engine.embeddings(),
+        )
+        .await
+        {
+            Ok(events) => {
+                episode.correction_count = Some(
+                    events
+                        .iter()
+                        .filter(|event| {
+                            event.kind
+                                == crate::transcript::intent_events::IntentEventKind::Correction
+                        })
+                        .count() as u32,
+                );
+                if let Err(error) = engine.storage().insert_intent_events(&events) {
+                    eprintln!("CSR: intent event persist error (non-fatal): {error}");
+                }
+            }
+            Err(error) => eprintln!("CSR: intent extraction error (non-fatal): {error}"),
+        }
     }
 
     // Authoritative on-disk task directory overrides transcript-mined todos
@@ -828,6 +860,9 @@ fn load_task_state_from_dir(dir: &Path) -> Option<TaskDirState> {
 /// Handle the stop hook.
 /// Always returns Ok(()) to never block Claude Code (C-1 fix).
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
+    if stop_hook_is_active(input) {
+        return Ok(());
+    }
     // Import growing transcript for ALL sessions (real-time searchability)
     super::import_current_transcript(input, engine, cwd).await;
 
@@ -842,6 +877,10 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     }
 
     Ok(())
+}
+
+fn stop_hook_is_active(input: &HookInput) -> bool {
+    input.stop_hook_active == Some(true)
 }
 
 /// Write a rolling "session_latest" reflection with current session state.
@@ -1308,6 +1347,7 @@ mod tests {
             steer_count: None,
             steers: vec![],
             instrumentation_version: None,
+            correction_count: None,
         };
 
         let json = serde_json::to_string(&ep).unwrap();
@@ -1359,6 +1399,7 @@ mod tests {
             steer_count: None,
             steers: vec![],
             instrumentation_version: None,
+            correction_count: None,
         };
 
         let tags = episode_tags(&ep);
@@ -1451,6 +1492,7 @@ mod tests {
         assert!(ep2.top_errors.is_empty());
         assert!(ep2.steer_count.is_none());
         assert!(ep2.steers.is_empty());
+        assert!(ep2.correction_count.is_none());
     }
 
     // --- extract_and_store_episode instrumentation wiring (plan §4.1) ---
@@ -1526,6 +1568,55 @@ mod tests {
         assert_eq!(ep.steer_count, Some(1));
         assert_eq!(ep.steers.len(), 1);
         assert!(ep.steers[0].text.contains("hindi"));
+    }
+
+    #[tokio::test]
+    async fn stop_capture_persists_a_correction_with_an_exact_byte_receipt() {
+        let (engine, storage) = instrumentation_test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let transcript = tmp.path().join("correction.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","timestamp":"2026-09-01T10:00:00Z","message":{"content":"Implement the parser"}}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-09-01T10:01:00Z","message":{"content":"I changed `old_parser`."}}"#,
+                "\n",
+                r#"{"type":"user","timestamp":"2026-09-01T10:02:00Z","message":{"content":"no, that is not what I asked for"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let session_id = "cccccccc-1111-2222-3333-444444444444";
+        let input = HookInput {
+            transcript_path: Some(transcript.to_string_lossy().to_string()),
+            session_id: Some(session_id.to_string()),
+            cwd: Some(tmp.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        extract_and_store_episode(&input, &engine, tmp.path())
+            .await
+            .unwrap();
+
+        let episode = stored_episode(&storage, session_id);
+        assert_eq!(episode.correction_count, Some(1));
+        let events = storage.list_intent_events(None, None).unwrap();
+        assert_eq!(events.len(), 1);
+        let bytes = std::fs::read(&transcript).unwrap();
+        assert_eq!(
+            &bytes[events[0].byte_start..events[0].byte_end],
+            events[0].quote.as_bytes()
+        );
+    }
+
+    #[test]
+    fn active_stop_hook_is_skipped() {
+        let input = HookInput {
+            stop_hook_active: Some(true),
+            ..Default::default()
+        };
+        assert!(stop_hook_is_active(&input));
     }
 
     #[tokio::test]

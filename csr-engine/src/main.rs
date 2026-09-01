@@ -70,7 +70,7 @@ enum Commands {
     },
     /// Handle Claude Code hook events
     Hook {
-        /// Hook name: session-start, session-end, precompact, stop, post-tool-use, prompt-submit, install
+        /// Hook name: session-start, session-end, precompact, stop, subagent-stop, post-tool-use, prompt-submit, install
         name: String,
 
         /// For install: auto-apply to settings.json
@@ -237,6 +237,11 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Historical deterministic capture operations.
+    Backfill {
+        #[command(subcommand)]
+        action: BackfillAction,
+    },
     /// Code-graph operations (v9.4 conversation-provenance graph)
     Codegraph {
         #[command(subcommand)]
@@ -334,6 +339,22 @@ enum Commands {
         /// Current working directory (for project resolution)
         #[arg(long)]
         cwd: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BackfillAction {
+    /// Capture corrections, redirects, and explicit abandoned approaches from transcripts.
+    Intent {
+        /// Ignore events older than this UTC date (YYYY-MM-DD).
+        #[arg(long)]
+        since: Option<String>,
+        /// Restrict to one normalized Claude project name.
+        #[arg(long)]
+        project: Option<String>,
+        /// Print counts without inserting intent_events rows.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -847,6 +868,49 @@ async fn main() -> Result<()> {
             dry_run,
         )?;
         print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
+    if let Some(Commands::Backfill {
+        action:
+            BackfillAction::Intent {
+                since,
+                project,
+                dry_run,
+            },
+    }) = &args.command
+    {
+        if std::env::var("CSR_NO_INTENT_CAPTURE").as_deref() == Ok("1") {
+            println!("intent backfill: disabled (CSR_NO_INTENT_CAPTURE)");
+            return Ok(());
+        }
+        let stats = if *dry_run {
+            let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new()?);
+            csr_engine::transcript::intent_events::backfill_intent_events(
+                None,
+                &embeddings,
+                &args.projects_dir,
+                since.as_deref(),
+                project.as_deref(),
+                true,
+            )
+            .await?
+        } else {
+            if let Some(parent) = args.db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+            csr_engine::transcript::intent_events::backfill_intent_events(
+                Some(eng.storage()),
+                eng.embeddings(),
+                &args.projects_dir,
+                since.as_deref(),
+                project.as_deref(),
+                false,
+            )
+            .await?
+        };
+        print!("{}", stats.format_text(*dry_run));
         return Ok(());
     }
 

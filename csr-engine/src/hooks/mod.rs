@@ -19,6 +19,7 @@ pub mod session_briefing;
 pub mod session_end;
 pub mod session_start;
 pub mod stop;
+pub mod subagent_stop;
 
 use std::io::Read;
 use std::path::Path;
@@ -51,6 +52,13 @@ pub struct HookInput {
     pub prompt: Option<String>,
     /// Hook event source (e.g. "startup", "resume", "compact", "clear") for SessionStart
     pub source: Option<String>,
+    /// SubagentStop child identifier and metadata (Claude Code payload).
+    #[serde(alias = "agentId", alias = "agentName")]
+    pub agent_id: Option<String>,
+    #[serde(alias = "agentType", alias = "agentDisplayName")]
+    pub agent_type: Option<String>,
+    #[serde(alias = "lastAssistantMessage")]
+    pub last_assistant_message: Option<String>,
 }
 
 /// Read and parse JSON from stdin. Returns a default HookInput if stdin is empty or invalid.
@@ -150,6 +158,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
         "session-end" => session_end::handle(&input, engine, &cwd).await,
         "precompact" => precompact::handle(&input, engine, &cwd).await,
         "stop" => stop::handle(&input, engine, &cwd).await,
+        "subagent-stop" => subagent_stop::handle(&input, engine, &cwd).await,
         "post-tool-use" => post_tool_use::handle(&input, engine, &cwd).await,
         "prompt-submit" => prompt_submit::handle(&input, engine, &cwd).await,
         _ => {

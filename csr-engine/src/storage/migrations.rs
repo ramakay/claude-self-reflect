@@ -1786,6 +1786,40 @@ pub fn run(conn: &Connection) -> Result<()> {
             ON backfill_unfinished_receipts(project);",
     )?;
 
+    // B2 intent channel v1: immutable, receipted human corrections/redirects
+    // and explicit assistant abandonment statements. Idempotency is the
+    // transcript identity tuple; later observations append, never rewrite.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS intent_events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id      TEXT NOT NULL,
+            project         TEXT NOT NULL,
+            turn            INTEGER NOT NULL,
+            kind            TEXT NOT NULL CHECK (kind IN ('correction','redirect','abandoned')),
+            quote           TEXT NOT NULL,
+            transcript_path TEXT NOT NULL,
+            byte_start      INTEGER NOT NULL,
+            byte_end        INTEGER NOT NULL,
+            prior_claim     TEXT NOT NULL DEFAULT '',
+            symbol          TEXT,
+            file            TEXT,
+            classifier_hash TEXT NOT NULL,
+            ts              TEXT NOT NULL,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(session_id, turn, kind, byte_start)
+        );
+        CREATE INDEX IF NOT EXISTS idx_intent_events_project_ts
+            ON intent_events(project, ts);
+        CREATE INDEX IF NOT EXISTS idx_intent_events_project_symbol
+            ON intent_events(project, symbol);
+        CREATE TRIGGER IF NOT EXISTS intent_events_no_update
+            BEFORE UPDATE ON intent_events
+            BEGIN SELECT RAISE(ABORT, 'intent_events is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS intent_events_no_delete
+            BEFORE DELETE ON intent_events
+            BEGIN SELECT RAISE(ABORT, 'intent_events is append-only'); END;",
+    )?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())
@@ -3063,4 +3097,25 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "row must survive a rerun that is already a no-op");
     }
+}
+#[test]
+fn intent_events_migration_is_idempotent_on_the_same_database() {
+    let conn = Connection::open_in_memory().unwrap();
+    run(&conn).unwrap();
+    run(&conn).unwrap();
+
+    let objects: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+                    'intent_events',
+                    'idx_intent_events_project_ts',
+                    'idx_intent_events_project_symbol',
+                    'intent_events_no_update',
+                    'intent_events_no_delete'
+                )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(objects, 5);
 }

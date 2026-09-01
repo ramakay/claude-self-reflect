@@ -178,14 +178,14 @@ fn normalize(s: &str) -> String {
         .to_lowercase()
 }
 
-fn content_tokens(s: &str) -> HashSet<String> {
+pub(crate) fn content_tokens(s: &str) -> HashSet<String> {
     s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .filter(|w| w.len() > 3 && !STOP.contains(&w.to_lowercase().as_str()))
         .map(|w| w.to_lowercase())
         .collect()
 }
 
-fn containment(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+pub(crate) fn containment(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
     if a.is_empty() {
         return 0.0;
     }
@@ -288,6 +288,16 @@ pub struct LoadedPrompt {
     pub ts: i64,
     /// Receipt: 1-based line number in `history.jsonl`.
     pub line_no: usize,
+    /// Present when this prompt came from B2's immutable intent ledger rather
+    /// than `history.jsonl`.
+    pub intent_receipt: Option<IntentPromptReceipt>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntentPromptReceipt {
+    pub session_id: String,
+    pub turn: u32,
+    pub byte_start: usize,
 }
 
 /// Loader: single line-delimited file, window-filtered, family-attributed
@@ -331,9 +341,56 @@ pub fn load_history_prompts(
             display: p.display,
             ts,
             line_no: i + 1,
+            intent_receipt: None,
         });
     }
     Ok(out)
+}
+
+fn load_intent_prompts(
+    conn: &Connection,
+    window: (i64, i64),
+    families: &[family::Family],
+) -> Result<Vec<LoadedPrompt>> {
+    let events = crate::storage::intent_events::list(conn, None, None)?;
+    let mut prompts = Vec::new();
+    for event in events {
+        let eligible = match event.kind {
+            crate::transcript::intent_events::IntentEventKind::Abandoned => true,
+            crate::transcript::intent_events::IntentEventKind::Correction => {
+                event.symbol.is_some()
+                    || event.file.is_some()
+                    || !extract_targets(&event.quote).is_empty()
+            }
+            crate::transcript::intent_events::IntentEventKind::Redirect => false,
+        };
+        if !eligible {
+            continue;
+        }
+        let Some(ts) = crate::temporal::parse_timestamp(&event.ts).map(|value| value.timestamp())
+        else {
+            continue;
+        };
+        if ts < window.0 || ts > window.1 {
+            continue;
+        }
+        let Some(family) = family::family_containing(families, &event.project) else {
+            continue;
+        };
+        prompts.push(LoadedPrompt {
+            family: family.name.clone(),
+            project_path: event.transcript_path.to_string_lossy().into_owned(),
+            display: event.quote,
+            ts,
+            line_no: event.turn as usize,
+            intent_receipt: Some(IntentPromptReceipt {
+                session_id: event.session_id,
+                turn: event.turn,
+                byte_start: event.byte_start,
+            }),
+        });
+    }
+    Ok(prompts)
 }
 
 /// Episode text per family, for dedup-vs-episodes: `(normalized
@@ -459,7 +516,7 @@ fn mk_target(phrase: String, s: usize, e: usize) -> Option<ApproachTarget> {
 
 /// Deterministic extraction: backticked spans first, then whitespace
 /// tokens. Byte offsets are exact — they are the prompt receipt.
-fn extract_targets(display: &str) -> Vec<ApproachTarget> {
+pub(crate) fn extract_targets(display: &str) -> Vec<ApproachTarget> {
     let mut out = Vec::new();
     let bytes = display.as_bytes();
     let mut start: Option<usize> = None;
@@ -486,7 +543,9 @@ fn extract_targets(display: &str) -> Vec<ApproachTarget> {
             !(c.is_alphanumeric() || c == '_' || c == '/' || c == '.' || c == '-')
         });
         if clean.len() >= 4 && !out.iter().any(|t: &ApproachTarget| t.phrase == clean) {
-            if let Some(t) = mk_target(clean.to_string(), s, e) {
+            let clean_start = s + tok.find(clean).unwrap_or(0);
+            let clean_end = clean_start + clean.len();
+            if let Some(t) = mk_target(clean.to_string(), clean_start, clean_end) {
                 out.push(t);
             }
         }
@@ -1039,8 +1098,22 @@ fn build_candidate(
         target_desc,
         later_count
     );
-    let mut receipts = vec![
-        Receipt {
+    let prompt_receipt = match &p.intent_receipt {
+        Some(intent) => Receipt {
+            kind: "intent_event",
+            oid: None,
+            path: Some(p.project_path.clone()),
+            byte_start: Some(intent.byte_start.saturating_add(t.byte_start)),
+            byte_end: Some(intent.byte_start.saturating_add(t.byte_end)),
+            detail: format!(
+                "intent_events session {} turn {} @ {} (unix {})",
+                intent.session_id,
+                intent.turn,
+                iso_date(p.ts),
+                p.ts
+            ),
+        },
+        None => Receipt {
             kind: "prompt",
             oid: None,
             path: Some(p.project_path.clone()),
@@ -1053,6 +1126,9 @@ fn build_candidate(
                 p.ts
             ),
         },
+    };
+    let mut receipts = vec![
+        prompt_receipt,
         Receipt {
             kind: "git_oid",
             oid: Some(head.to_string()),
@@ -1121,7 +1197,8 @@ pub fn generate_abandonment_candidates(
 ) -> Result<AbandonmentReport> {
     let mut rep = AbandonmentReport::default();
     let (by_toplevel, by_name_toplevel) = build_family_repo_maps(conn, families)?;
-    let prompts = load_history_prompts(history_file, window, &by_toplevel)?;
+    let mut prompts = load_history_prompts(history_file, window, &by_toplevel)?;
+    prompts.extend(load_intent_prompts(conn, window, families)?);
     rep.prompts_loaded = prompts.len();
 
     let mut by_family: HashMap<String, Vec<LoadedPrompt>> = HashMap::new();
@@ -1290,6 +1367,16 @@ mod tests {
     }
 
     #[test]
+    fn extract_targets_trims_punctuation_from_the_receipt_span() {
+        let text = "change (src/widget.rs), then continue";
+        let target = extract_targets(text)
+            .into_iter()
+            .find(|target| target.phrase == "src/widget.rs")
+            .unwrap();
+        assert_eq!(&text[target.byte_start..target.byte_end], "src/widget.rs");
+    }
+
+    #[test]
     fn normalize_ts_secs_treats_13_digit_values_as_milliseconds() {
         assert_eq!(normalize_ts_secs(1_759_019_847_017), 1_759_019_847);
         assert_eq!(normalize_ts_secs(1_759_019_847), 1_759_019_847);
@@ -1357,6 +1444,70 @@ mod tests {
             "no subagent fixture is present -- bar clause must be honestly false"
         );
         let _ = by_top; // exercised via generate_abandonment_candidates above
+    }
+
+    #[test]
+    fn correction_intent_event_is_a_receipted_abandonment_evidence_leg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        if !init_repo(&repo) {
+            return;
+        }
+        std::fs::write(repo.join("a.rs"), "fn foo() {}\n").unwrap();
+        assert!(commit_all(&repo, "seed"));
+        let conn = open_conn();
+        seed_project_file(&conn, "proj", &repo.join("a.rs"));
+        let quote = "No, use `NeverShippedParser` instead";
+        let transcript = tmp.path().join("session.jsonl");
+        std::fs::write(&transcript, quote).unwrap();
+        let old = chrono::Utc::now() - chrono::Duration::days(20);
+        crate::storage::intent_events::insert(
+            &conn,
+            &[crate::transcript::intent_events::IntentEvent {
+                session_id: "session-1".into(),
+                project: "proj".into(),
+                turn: 9,
+                kind: crate::transcript::intent_events::IntentEventKind::Correction,
+                quote: quote.into(),
+                transcript_path: transcript.clone(),
+                byte_start: 0,
+                byte_end: quote.len(),
+                prior_claim: "I used the first parser".into(),
+                symbol: Some("NeverShippedParser".into()),
+                file: None,
+                classifier_hash: "test".into(),
+                ts: old.to_rfc3339(),
+            }],
+        )
+        .unwrap();
+        let history = tmp.path().join("history.jsonl");
+        std::fs::write(&history, "").unwrap();
+        let families = family::compute_families(&conn).unwrap();
+
+        let report = generate_abandonment_candidates(
+            &conn,
+            &history,
+            (0, chrono::Utc::now().timestamp()),
+            50,
+            &families,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.prompts_loaded, 1);
+        assert_eq!(report.candidates.len(), 1);
+        let receipt = report.candidates[0]
+            .receipts
+            .iter()
+            .find(|receipt| receipt.kind == "intent_event")
+            .expect("candidate must retain the intent-event receipt");
+        assert_eq!(receipt.path.as_deref(), transcript.to_str());
+        let start = receipt.byte_start.unwrap();
+        let end = receipt.byte_end.unwrap();
+        assert_eq!(
+            &std::fs::read(&transcript).unwrap()[start..end],
+            b"NeverShippedParser"
+        );
     }
 
     #[test]

@@ -1694,6 +1694,7 @@ mod tests {
             steer_count: None,
             steers: vec![],
             instrumentation_version: None,
+            correction_count: None,
             anchors: vec![],
         };
         let verdicts = vec![
@@ -1752,6 +1753,7 @@ mod tests {
             steer_count: None,
             steers: vec![],
             instrumentation_version: None,
+            correction_count: None,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2h ago");
@@ -1789,6 +1791,7 @@ mod tests {
             steer_count: None,
             steers: vec![],
             instrumentation_version: None,
+            correction_count: None,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1w ago");
@@ -1828,6 +1831,7 @@ mod tests {
             steer_count: None,
             steers: vec![],
             instrumentation_version: None,
+            correction_count: None,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2m ago");
@@ -1868,6 +1872,7 @@ mod tests {
             steer_count: None,
             steers: vec![],
             instrumentation_version: None,
+            correction_count: None,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1m ago");
@@ -2078,6 +2083,7 @@ mod tests {
             steer_count: None,
             steers: vec![],
             instrumentation_version: None,
+            correction_count: None,
             anchors: vec![],
         }
     }

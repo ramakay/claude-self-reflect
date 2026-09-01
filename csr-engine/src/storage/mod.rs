@@ -7,6 +7,7 @@ pub mod dream_clusters;
 pub mod dream_delivery;
 pub mod dream_items;
 pub mod dream_report;
+pub mod intent_events;
 pub mod migrations;
 pub mod queries;
 pub mod recap_feeds;
@@ -78,6 +79,28 @@ impl Storage {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    pub fn insert_intent_events(
+        &self,
+        events: &[crate::transcript::intent_events::IntentEvent],
+    ) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        intent_events::insert(&conn, events)
+    }
+
+    pub fn list_intent_events(
+        &self,
+        project: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<crate::transcript::intent_events::IntentEvent>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        intent_events::list(&conn, project, since)
+    }
+
+    pub fn count_intent_events(&self, project: Option<&str>, since: Option<&str>) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        intent_events::count(&conn, project, since)
     }
 
     // ─── Chunk operations ───

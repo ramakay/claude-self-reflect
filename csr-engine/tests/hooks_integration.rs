@@ -706,6 +706,24 @@ fn test_hook_input_stop_hook_active_missing() {
     assert_eq!(input.stop_hook_active, None);
 }
 
+#[test]
+fn test_hook_input_subagent_stop_fields() {
+    let json = r#"{
+        "session_id":"parent-1",
+        "agent_id":"child-7",
+        "agent_type":"general-purpose",
+        "last_assistant_message":"finished the task"
+    }"#;
+    let input: csr_engine::hooks::HookInput = serde_json::from_str(json).unwrap();
+    assert_eq!(input.session_id.as_deref(), Some("parent-1"));
+    assert_eq!(input.agent_id.as_deref(), Some("child-7"));
+    assert_eq!(input.agent_type.as_deref(), Some("general-purpose"));
+    assert_eq!(
+        input.last_assistant_message.as_deref(),
+        Some("finished the task")
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Predictive Injection Tests
 // ═══════════════════════════════════════════════════════════════
@@ -1195,6 +1213,7 @@ fn test_explore_prompt_never_fails() {
         steer_count: None,
         steers: vec![],
         instrumentation_version: None,
+        correction_count: None,
         anchors: vec![],
     };
 
@@ -1708,6 +1727,7 @@ fn test_episode_struct_serialization() {
         steer_count: None,
         steers: vec![],
         instrumentation_version: None,
+        correction_count: None,
         anchors: vec![],
     };
 

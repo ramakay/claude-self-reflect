@@ -30,6 +30,7 @@
 //! `get_full_conversation` call [`crate::mcp::tools::find_conversation_file`].
 
 pub mod instrumentation;
+pub mod intent_events;
 pub mod query;
 
 use anyhow::{Context, Result};

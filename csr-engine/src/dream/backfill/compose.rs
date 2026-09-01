@@ -1699,6 +1699,7 @@ mod tests {
             display: "please add `widget.rs`".to_string(),
             ts: (now - Duration::days(30)).timestamp(),
             line_no: 1,
+            intent_receipt: None,
         };
         let target = ApproachTarget {
             phrase: "widget.rs".to_string(),
@@ -1769,6 +1770,7 @@ mod tests {
                 display: "please add `widget.rs`".to_string(),
                 ts: (now - Duration::days(30)).timestamp(),
                 line_no: 1,
+                intent_receipt: None,
             },
             target: ApproachTarget {
                 phrase: "widget.rs".to_string(),

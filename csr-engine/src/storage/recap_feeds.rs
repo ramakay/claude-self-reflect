@@ -762,6 +762,7 @@ mod tests {
             steer_count: None,
             steers: vec![],
             instrumentation_version: None,
+            correction_count: None,
             anchors: vec![],
         };
         let feeds = RecapFeeds {
