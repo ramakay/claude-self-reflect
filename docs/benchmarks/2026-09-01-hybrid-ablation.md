@@ -19,7 +19,7 @@ Vector-only misses the first identifier entirely; the old gate found it only bec
 
 ## coding-agent-life-v1, three modes
 
-See `2026-09-01-coding-agent-life-v1.md`: R@5 = 1.000 and P@5 = 0.240 (the ceiling) in all three modes; only MRR moves (vector 0.922, fts 0.897, hybrid 0.867) on 15 queries. The corpus is too small and too keyword-friendly to rank the modes.
+See `2026-09-01-coding-agent-life-v1.md` (build `230447c`, `build_dirty=false`): R@5 = 1.000 and P@5 = 0.240 (the ceiling) in all three modes; only MRR@20 moves (vector 0.917, fts 0.897, hybrid 0.867) on 15 queries. The corpus is too small and too keyword-friendly to rank the modes.
 
 ## Pending
 
