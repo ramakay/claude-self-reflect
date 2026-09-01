@@ -88,6 +88,7 @@ use crate::storage::dream_attribution::{marker_line, DREAM_CARD_PROPOSAL_HEADER}
 use crate::storage::Storage;
 
 use super::adjudicate::{load_episode, EpisodeFacts};
+use super::intent_channel::AbandonmentCandidate;
 use super::subagent_citation::{build_dream_citation_evidence, DreamCitationEvidence};
 use super::unfinished::scan_unfinished_at;
 
@@ -552,7 +553,12 @@ fn load_citation_episode(conn: &Connection, episode_id: &str) -> Result<Option<C
 /// Resolve the exact dash-encoded Claude project directory from the parent
 /// transcript path already recorded by import. A missing/mismatched path is
 /// fail-closed: this parent contributes no citations, and no path is guessed.
-fn project_dir_for_parent(
+///
+/// `pub(super)` (pass 3): [`super::intent_channel`] reuses this same
+/// fail-closed lookup to build its own family-wide subagent-transcript
+/// index (see that module's `build_family_subagent_index`), rather than
+/// re-deriving the `import_state` resolution rule a second time.
+pub(super) fn project_dir_for_parent(
     conn: &Connection,
     parent_session_id: &str,
     projects_root: &Path,
@@ -846,6 +852,102 @@ pub fn drain(storage: &Storage, n: usize) -> Result<DrainStats> {
         }
         if drain_one(storage, entry, now, projects_root.as_deref())? {
             stats.drained += 1;
+        }
+    }
+    Ok(stats)
+}
+
+// ---------------------------------------------------------------------
+// Pass 3: silent-abandonment persistence (`intent_channel`)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AbandonmentDrainStats {
+    pub candidates: usize,
+    pub persisted: usize,
+    /// Subset of `persisted` whose `evidence_provenance.bar_clause_met` is
+    /// `true` — i.e. a family subagent transcript (unrestricted by time —
+    /// see `intent_channel::FamilySubagentIndex`'s doc) corroborates the
+    /// target. A genuinely-fired abandonment candidate usually has NO
+    /// citation for its own target (any transcript authoring it AFTER the
+    /// prompt would already have suppressed the candidate via the guard's
+    /// own leg C) — a low or zero count here is the expected, honest
+    /// receipt, not a defect.
+    pub bar_eligible: usize,
+    /// Skipped because a same-`(project, subject_key)` dream is already
+    /// open within the last 30 days (D7, same gate [`drain`] enforces).
+    pub skipped_recent_topic: usize,
+    pub persist_errors: usize,
+}
+
+/// Persist [`intent_channel::generate_abandonment_candidates`]'s surviving
+/// candidates into `dreams_v1` — a new pipeline stage wired in by
+/// `cli::handle_backfill` right after Stage 2-3, gated identically
+/// (respects `CSR_NO_DREAMING` via that caller, which checks it before
+/// generating candidates at all — see `intent_channel`'s own module doc).
+///
+/// Reuses the PRE-EXISTING `CATEGORY_UNFINISHED` value rather than adding a
+/// fourth `dreams_v1.category` CHECK value: an abandonment claim tells the
+/// identical "you left this open" story the home-page `unfinished` feed and
+/// Queue U's own backfill card already tell (see the module doc's "card
+/// voice" judgment-call note above) — just sourced from a third scan (raw
+/// `history.jsonl` prompts) rather than `episode_index`/`dream_relations`.
+/// Widening the CHECK constraint a THIRD time (after `strategy` then
+/// `supersession`) with no behavioral need for a distinct value would
+/// repeat the exact schema-churn-with-no-consumer anti-pattern that
+/// constraint's own migration comment already warns against.
+///
+/// Applies the SAME D7 30-day-per-`(project, subject_key)` reuse gate
+/// [`drain`] already enforces (`subject_key` here is the target phrase —
+/// the closest stable topic key this channel has), so a repeated nightly
+/// run over an unchanged corpus does not spam duplicate rows for a prompt
+/// that is still abandoned.
+pub fn persist_abandonment_candidates(
+    storage: &Storage,
+    candidates: &[AbandonmentCandidate],
+    now: DateTime<Utc>,
+) -> Result<AbandonmentDrainStats> {
+    let mut stats = AbandonmentDrainStats {
+        candidates: candidates.len(),
+        ..Default::default()
+    };
+    for candidate in candidates {
+        let subject_key = candidate.target.phrase.as_str();
+        let recent = storage.with_connection(|conn| {
+            recent_open_dream_exists(conn, &candidate.family, subject_key, now)
+        })?;
+        if recent {
+            stats.skipped_recent_topic += 1;
+            continue;
+        }
+        let dream_id = compute_dream_id(&candidate.family, CATEGORY_UNFINISHED, subject_key, now);
+        let revision_hash = content_hash(&[
+            &candidate.family,
+            subject_key,
+            &candidate.head_oid,
+            &candidate.claim,
+        ]);
+        let Ok(evidence_provenance) = serde_json::to_string(&candidate.citation_evidence) else {
+            stats.persist_errors += 1;
+            continue;
+        };
+        if let Err(error) = record_backfill_dream_row(
+            storage,
+            &dream_id,
+            &candidate.family,
+            CATEGORY_UNFINISHED,
+            Some(subject_key),
+            &revision_hash,
+            &candidate.claim,
+            &evidence_provenance,
+        ) {
+            tracing::warn!(%error, project = %candidate.family, subject_key, "dream backfill: failed to persist abandonment dream row");
+            stats.persist_errors += 1;
+            continue;
+        }
+        stats.persisted += 1;
+        if candidate.citation_evidence.bar_clause_met {
+            stats.bar_eligible += 1;
         }
     }
     Ok(stats)
@@ -1570,5 +1672,132 @@ mod tests {
         let stats = stats.unwrap();
         assert!(stats.disabled);
         assert_eq!(stats.drained, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Pass 3 (intent_channel silent-abandonment persistence).
+    //
+    // Required test (c): a fired candidate persists a `dreams_v1` row with
+    // category='unfinished', non-empty prose, and the horizon-oid receipt.
+    // `AbandonmentCandidate`'s fields are all public, so this constructs
+    // one directly rather than standing up a real git fixture (that path
+    // is already covered end-to-end by `intent_channel`'s own tests) --
+    // this test is scoped to the PERSISTENCE half only.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn persist_abandonment_candidates_writes_unfinished_rows_with_horizon_receipt() {
+        use crate::dream::backfill::intent_channel::{ApproachTarget, LoadedPrompt, TargetKind};
+        use crate::dream::backfill::subagent_citation::DreamCitationEvidence;
+
+        let storage = open();
+        let now = Utc::now();
+        let head_oid = "deadbeefcafef00d1234".to_string();
+        let prompt = LoadedPrompt {
+            family: "p".to_string(),
+            project_path: "/repo".to_string(),
+            display: "please add `widget.rs`".to_string(),
+            ts: (now - Duration::days(30)).timestamp(),
+            line_no: 1,
+        };
+        let target = ApproachTarget {
+            phrase: "widget.rs".to_string(),
+            byte_start: 12,
+            byte_end: 21,
+            kind: TargetKind::PathLike,
+            ident: None,
+        };
+        let claim = format!(
+            "On 2020-01-01, you asked: \"widget.rs\" — and as of {head_oid} (2020-02-01) \
+             no commit after that prompt touches `widget.rs`, and none of the 0 later \
+             prompts in this project revisit it. The request appears to have been \
+             silently dropped."
+        );
+        let evidence = DreamCitationEvidence::audited(vec!["sess-a".to_string()], vec![]);
+        let candidate = crate::dream::backfill::intent_channel::AbandonmentCandidate {
+            family: "p".to_string(),
+            prompt,
+            target,
+            head_oid: head_oid.clone(),
+            claim: claim.clone(),
+            receipts: vec![],
+            citation_evidence: evidence,
+        };
+
+        let stats = persist_abandonment_candidates(&storage, &[candidate], now).unwrap();
+        assert_eq!(stats.candidates, 1);
+        assert_eq!(stats.persisted, 1);
+        assert_eq!(stats.skipped_recent_topic, 0);
+        assert_eq!(stats.persist_errors, 0);
+        assert_eq!(
+            stats.bar_eligible, 0,
+            "no citation was attached -- honestly 0"
+        );
+
+        let (category, prose, subject_key): (String, String, Option<String>) = storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT category, prose, subject_key FROM dreams_v1 WHERE project = 'p'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(category, "unfinished");
+        assert!(!prose.is_empty());
+        assert_eq!(prose, claim);
+        assert!(
+            prose.contains(&head_oid),
+            "prose must carry the horizon-oid receipt"
+        );
+        assert_eq!(subject_key.as_deref(), Some("widget.rs"));
+    }
+
+    #[test]
+    fn persist_abandonment_candidates_respects_the_thirty_day_topic_reuse_gate() {
+        use crate::dream::backfill::intent_channel::{ApproachTarget, LoadedPrompt, TargetKind};
+        use crate::dream::backfill::subagent_citation::DreamCitationEvidence;
+
+        let storage = open();
+        let now = Utc::now();
+        let make_candidate = || crate::dream::backfill::intent_channel::AbandonmentCandidate {
+            family: "p".to_string(),
+            prompt: LoadedPrompt {
+                family: "p".to_string(),
+                project_path: "/repo".to_string(),
+                display: "please add `widget.rs`".to_string(),
+                ts: (now - Duration::days(30)).timestamp(),
+                line_no: 1,
+            },
+            target: ApproachTarget {
+                phrase: "widget.rs".to_string(),
+                byte_start: 12,
+                byte_end: 21,
+                kind: TargetKind::PathLike,
+                ident: None,
+            },
+            head_oid: "abc123".to_string(),
+            claim: "claim text abc123".to_string(),
+            receipts: vec![],
+            citation_evidence: DreamCitationEvidence::audited(vec![], vec![]),
+        };
+
+        let first = persist_abandonment_candidates(&storage, &[make_candidate()], now).unwrap();
+        assert_eq!(first.persisted, 1);
+
+        let second = persist_abandonment_candidates(&storage, &[make_candidate()], now).unwrap();
+        assert_eq!(
+            second.persisted, 0,
+            "same (project, subject_key) within 30 days must be skipped, not duplicated"
+        );
+        assert_eq!(second.skipped_recent_topic, 1);
+    }
+
+    #[test]
+    fn persist_abandonment_candidates_is_a_no_op_over_an_empty_slice() {
+        let storage = open();
+        let stats = persist_abandonment_candidates(&storage, &[], Utc::now()).unwrap();
+        assert_eq!(stats, AbandonmentDrainStats::default());
     }
 }

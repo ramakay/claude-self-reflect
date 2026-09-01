@@ -78,11 +78,13 @@
   {% endif %}
 
   {% if view.copy_block %}
-  <h3 class="sub" id="copy">Copy block — paste into a new session</h3>
-  <p class="marker">Assembled from stored rows only.{% if not view.copy_block.has_night_pass %}
-    No night-pass thread exists for this session, and the block says so where the finding
-    would have been.{% endif %}</p>
-  <pre class="copy-block">{{ view.copy_block.markdown }}</pre>
+  <details class="fold" id="copy">
+    <summary><svg class="icon"><use href="#i-arrow"/></svg>Copy resume block<span class="fold-note">paste into a new session</span></summary>
+    <p class="marker">Assembled from stored rows only.{% if not view.copy_block.has_night_pass %}
+      No night-pass thread exists for this session, and the block says so where the finding
+      would have been.{% endif %}</p>
+    <pre class="copy-block">{{ view.copy_block.markdown }}</pre>
+  </details>
   {% endif %}
 
   {% if view.plan %}
@@ -91,7 +93,6 @@
   <p class="prose">A plan pass ran for this item and the deterministic verifier kept none of
     the drafted steps. Nothing is shown because nothing traced.</p>
   {% else %}
-  {% if view.plan.context %}<p class="prose">{{ view.plan.context }}</p>{% endif %}
   <ol class="plan-steps">
     {% for step in view.plan.steps %}
     <li>
@@ -101,7 +102,12 @@
     </li>
     {% endfor %}
   </ol>
-  {% if view.plan.acceptance %}<p class="prose"><b>Acceptance check:</b> {{ view.plan.acceptance }}</p>{% endif %}
+  {% if view.plan.acceptance %}
+  <details class="fold">
+    <summary><svg class="icon"><use href="#i-arrow"/></svg>Acceptance check<span class="fold-note">machine gate</span></summary>
+    <p class="prose">{{ view.plan.acceptance }}</p>
+  </details>
+  {% endif %}
   {% endif %}
   {% if view.plan.dropped_note %}<p class="marker">{{ view.plan.dropped_note }}</p>{% endif %}
   <p class="marker">drafted by {{ view.plan.model }}</p>
@@ -111,9 +117,10 @@
       else-branch printing zeros: a dream with no recorded usage was not
       free, it was unmeasured. -#}
   {% if view.spend %}
-  <h3 class="sub">Spend</h3>
-  <p class="spend"><b>{{ view.spend.tokens }}</b> · {{ view.spend.cost }}</p>
-  <p class="marker">{{ view.spend.detail }}</p>
+  <details class="fold">
+    <summary><svg class="icon"><use href="#i-arrow"/></svg>Spend<span class="fold-note">{{ view.spend.tokens }} · {{ view.spend.cost }}</span></summary>
+    <p class="marker">{{ view.spend.detail }}</p>
+  </details>
   {% endif %}
 </section>
 
@@ -122,35 +129,38 @@
   {% if view.ast.rendered %}
   <p class="marker">{{ view.ast.path }} · ⌗{{ view.ast.before_oid }} → ⌗{{ view.ast.after_oid }} · {{ view.ast.counts }}</p>
   {% if view.ast.truncation %}<p class="marker">{{ view.ast.truncation }}</p>{% endif %}
-  <div class="ast-grid">
-    <div>
-      <h3 class="sub">before ⌗{{ view.ast.before_oid }}</h3>
-      <ul class="ast-tree">
-        {% for node in view.ast.before %}
-        <li class="{% if node.witnessed %}witnessed{% else %}resolved{% endif %}">
-          {{ node.name }} <span class="ast-kind">{{ node.kind }} · {{ node.status }}</span>
-          {% if node.witnessed %}{% if node.receipt %}<span class="ast-receipt">⌗{{ node.receipt }}</span>{% else %}<span class="ast-receipt">witnessed, no receipt</span>{% endif %}
-          {% else %}<span class="ast-kind">resolved, not witnessed</span>{% endif %}
-        </li>
-        {% endfor %}
-      </ul>
+  <details class="fold">
+    <summary><svg class="icon"><use href="#i-arrow"/></svg>Symbol trees<span class="fold-note">before → after</span></summary>
+    <div class="ast-grid">
+      <div>
+        <h3 class="sub">before ⌗{{ view.ast.before_oid }}</h3>
+        <ul class="ast-tree">
+          {% for node in view.ast.before %}
+          <li class="{% if node.witnessed %}witnessed{% else %}resolved{% endif %}">
+            {{ node.name }} <span class="ast-kind">{{ node.kind }} · {{ node.status }}</span>
+            {% if node.witnessed %}{% if node.receipt %}<span class="ast-receipt">⌗{{ node.receipt }}</span>{% else %}<span class="ast-receipt">witnessed, no receipt</span>{% endif %}
+            {% else %}<span class="ast-kind">resolved, not witnessed</span>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+      </div>
+      <div>
+        <h3 class="sub">after ⌗{{ view.ast.after_oid }}</h3>
+        <ul class="ast-tree">
+          {% for node in view.ast.after %}
+          <li class="{% if node.witnessed %}witnessed{% else %}resolved{% endif %}">
+            {{ node.name }} <span class="ast-kind">{{ node.kind }} · {{ node.status }}</span>
+            {% if node.witnessed %}{% if node.receipt %}<span class="ast-receipt">⌗{{ node.receipt }}</span>{% else %}<span class="ast-receipt">witnessed, no receipt</span>{% endif %}
+            {% else %}<span class="ast-kind">resolved, not witnessed</span>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+      </div>
     </div>
-    <div>
-      <h3 class="sub">after ⌗{{ view.ast.after_oid }}</h3>
-      <ul class="ast-tree">
-        {% for node in view.ast.after %}
-        <li class="{% if node.witnessed %}witnessed{% else %}resolved{% endif %}">
-          {{ node.name }} <span class="ast-kind">{{ node.kind }} · {{ node.status }}</span>
-          {% if node.witnessed %}{% if node.receipt %}<span class="ast-receipt">⌗{{ node.receipt }}</span>{% else %}<span class="ast-receipt">witnessed, no receipt</span>{% endif %}
-          {% else %}<span class="ast-kind">resolved, not witnessed</span>{% endif %}
-        </li>
-        {% endfor %}
-      </ul>
-    </div>
-  </div>
-  <p class="marker">Solid rows are witnessed by the ledger and carry their receipt. Dotted rows
-    were resolved deterministically by the AST engine and are not witnessed — they are
-    candidates, not evidence.</p>
+    <p class="marker">Solid rows are witnessed by the ledger and carry their receipt. Dotted rows
+      were resolved deterministically by the AST engine and are not witnessed — they are
+      candidates, not evidence.</p>
+  </details>
   {% else %}
   <p class="abstained">{{ view.ast.abstention }}</p>
   {% endif %}
@@ -159,7 +169,7 @@
 <section class="panel" aria-labelledby="evidence-h">
   <h2 id="evidence-h">Evidence ({{ view.evidence_count }})</h2>
   <ul class="evidence">
-    {% for line in view.evidence_lines %}<li>☾ {{ line }}</li>{% endfor %}
+    {% for line in view.evidence_lines %}<li><svg class="icon icon-moon"><use href="#i-moon"/></svg>{{ line }}</li>{% endfor %}
   </ul>
 </section>
 

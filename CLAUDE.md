@@ -1,4 +1,36 @@
-# Claude Self-Reflect v10.1 — Action Guide
+# Claude Self-Reflect — Action Guide (10.x in development)
+
+## Version reality — read before claiming anything is shipped
+
+**Shipped/live series is 9.5.x. As of 2026-08-19 the latest published version is `9.5.3`**
+(npm `claude-self-reflect`, highest git tag `v9.5.3`). **10.x has never been released — zero
+`v10*` tags exist.** `csr-engine/Cargo.toml` reads `10.1.0` because that is the *in-development*
+version on unreleased feature branches, NOT a shipped product.
+
+Rules that follow from this:
+
+1. **Never present a 10.x feature as current, live, or available to users.** Dreaming, recap
+   paragraph, memory-registry spine, csr_transcript, `--as-of`, and everything else this guide
+   documents under a "(v10)" / "(v10.1)" heading is unreleased work-in-progress on branches.
+   When you describe them, say "in development for 10.x", not "CSR does X".
+2. **This guide documents the 10.x development target, not the shipped 9.5.x binary.** The
+   binary a user has installed via npm is 9.5.3 and does not have these features unless they
+   built from a feature branch. Check `csr-engine --version` / `npm view claude-self-reflect
+   version` before telling a user what their install can do — pulled fresh, never from memory.
+3. Do not conflate the two series in user-facing text, release notes, or status claims. If you
+   are unsure whether something shipped, it did not; verify against the tag list.
+
+## Release strategy — target release branches, never main
+
+**Work targets a release branch. Never offer, suggest, or perform a push to `main`.** `main` is
+protected and moves only through reviewed PRs merged by the maintainer.
+
+- Feature work lives on `feat/*` / `fix/*` branches; a release is assembled on its own release
+  branch and tagged from there.
+- When work is ready, the deliverable is a **PR against the target branch** — opening it is a
+  publish action, so it waits for explicit maintainer approval (see GOAL-SEEKING rule 5).
+- Do not propose `git push origin main`, direct commits to `main`, or "I'll just push this up"
+  to any shared branch. State which branch the work sits on and stop there.
 
 ## Architecture
 

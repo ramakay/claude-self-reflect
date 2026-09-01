@@ -872,7 +872,7 @@ mod tests {
 
         // Brief + copy block, both composed from stored rows.
         assert!(body.contains("close the release gate"));
-        assert!(body.contains("Copy block"));
+        assert!(body.contains("Copy resume block"));
         assert!(body.contains("Resume: open item 0"));
         // The no-night-pass gap is stated, not left blank.
         assert!(body.contains("No night-pass thread is on record for this session"));

@@ -22,7 +22,11 @@
 //!   same work but WITH persistence into `dream_relations` (dry-run's own
 //!   `rank::dry_run` already persists too — see its own doc — so the two
 //!   are behaviorally identical up to this point; `--stage` exists for
-//!   partial REAL runs beyond stage 2).
+//!   partial REAL runs beyond stage 2). ALSO runs Stage 3a (pass 3: the
+//!   `intent_channel` silent-abandonment scan + `dreams_v1` persist) —
+//!   deterministic and zero-LLM like Stage 2-3 itself, so it is not gated
+//!   behind a separate stage number; it stops being reached only when
+//!   `--stage` is `0` or `1`.
 //! - `3` or omitted: + Stage 4/5 adjudicate + verify, budgeted by
 //!   `--budget-calls`. The full run.
 //!
@@ -37,7 +41,7 @@ use chrono::Utc;
 
 use crate::storage::Storage;
 
-use super::{adjudicate, compose, funnel, rank, unfinished};
+use super::{adjudicate, compose, funnel, intent_channel, rank, unfinished};
 
 /// `csr-engine dream backfill`.
 #[allow(clippy::too_many_arguments)]
@@ -164,6 +168,52 @@ pub fn handle_backfill(
             stats.outside_window
         );
     }
+    // Stage 3a (pass 3, new): silent-abandonment candidates mined from
+    // `~/.claude/history.jsonl` (`intent_channel`) — see that module's own
+    // doc for the guard/legs this checks. Deterministic, zero-LLM, so it
+    // runs alongside Stage 2-3 rather than gated behind `--stage 3`
+    // (reserved for the LLM adjudicate/verify stage below). Scoped to the
+    // SAME `families` list `--project` already narrowed above, so this
+    // never scans/git-queries a family the caller didn't ask for.
+    // `CSR_NO_DREAMING` is re-checked here (not just at the top of this
+    // function) so a toggle mid-process between the two checks still fails
+    // closed, matching every other backfill-pipeline read/write.
+    if !crate::daemon::dream_cadence::dreaming_disabled() {
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            let history_file = home.join(".claude/history.jsonl");
+            if history_file.exists() {
+                let projects_root = home.join(".claude/projects");
+                let window = (0i64, now.timestamp());
+                let report = storage.with_connection(|conn| {
+                    intent_channel::generate_abandonment_candidates(
+                        conn,
+                        &history_file,
+                        window,
+                        intent_channel::DEFAULT_GIT_BUDGET_PER_FAMILY,
+                        &families,
+                        Some(projects_root.as_path()),
+                    )
+                })?;
+                let persist_stats =
+                    compose::persist_abandonment_candidates(&storage, &report.candidates, now)?;
+                println!(
+                    "Stage 3a: {} prompt(s) loaded, {} candidate(s) survived the guard \
+                     ({} satisfied [{} via subagent], {} recurrence, {} dedup-vs-episode) -> \
+                     persisted {} (bar-eligible {}), skipped {} (recent topic)",
+                    report.prompts_loaded,
+                    report.candidates.len(),
+                    report.satisfied_skipped,
+                    report.subagent_satisfied_skipped,
+                    report.recurrence_skipped,
+                    report.dedup_vs_episodes,
+                    persist_stats.persisted,
+                    persist_stats.bar_eligible,
+                    persist_stats.skipped_recent_topic
+                );
+            }
+        }
+    }
+
     if matches!(stage, Some(s) if s <= 2) {
         return Ok(());
     }

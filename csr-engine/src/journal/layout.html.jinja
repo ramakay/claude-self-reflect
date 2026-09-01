@@ -6,90 +6,54 @@
 <meta name="referrer" content="no-referrer">
 <title>{% block title %}CSR Dream Journal{% endblock %}</title>
 <style>
-  /* Journal v4 server surface — P6 locked spec.
-     Four bans, enforced here and nowhere else:
-       1. No manila. No beige/tan/cream/kraft fill on any surface.
-       2. No left tab-bar navigation. An active nav item is brighter text
-          plus a small leading dot — never a bar, pill, tab or background
-          block.
-       3. No outer frame. Zones bleed to all four edges and meet at 1px
-          hairlines with square corners. Nothing floats.
-       4. Flat only. No gradients, shadows, glows, bevels, blur. Radius <= 3px.
-     The complete LIGHT palette is defined on bare :root; only the tokens
-     change in the two dark blocks, so the toggle wins in both directions.
+  /* Green journal surface — deep-green ground, cream content cards.
+     Two surfaces, one token set:
+       - GROUND (dark green): light text. The default :root aliases below.
+       - CARD (cream): dark text. `.card`/`.panel` re-scope the same
+         semantic aliases so every descendant inverts automatically — no
+         per-rule edits. CSS custom properties inherit; that carries it.
+     A committed single look in both OS themes ("cream stays the content
+     surface"), so there are no dark-mode overrides.
      No @font-face and no network request of any kind. */
   :root {
-    /* base palette — light */
-    --sky-top: #F3F4F0;
-    --sky-bottom: #F3F4F0;
-    --ink: #20231F;
-    --slate: #646A65;
-    --label: #737A76;
-    --purple: #344A68;              /* receipt mono / link */
-    --purple-bg: rgba(52, 74, 104, 0.06);
-    --glass: #FCFCF9;               /* ledger surface */
-    --glass-border: #D9DCD5;        /* hairline */
-    --highlight: rgba(32, 35, 31, 0.05);
-    --radius-pane: 3px;
-    --radius-tile: 2px;
+    /* ground tokens — light on deep green */
+    --ground: #151C13;
+    --on-ground: #E9E6DB;
+    --on-ground-muted: #AAB1A2;
+    --on-ground-faint: #8B9282;
+    --hairline-dark: #2B3729;
+    /* card tokens — dark on cream */
+    --card: #F2F0E6;
+    --ink: #1A201A;
+    --ink-muted: #545B4E;
+    --ink-faint: #6E756A;
+    --hairline: #DAD8CC;
+    /* accents */
+    --receipt: #3D5470;            /* slate — receipts/links on cream */
+    --accent-ground: #9FB4C6;      /* lighter slate — links on green */
+    --panel-dark: #1E2A1C;         /* code/copy sub-panel on ground */
+    --highlight: rgba(233, 230, 219, 0.06);
+    --radius-pane: 10px;
+    --radius-tile: 8px;
     --serif: 'Playfair Display', Georgia, 'Times New Roman', serif;
     --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
-    /* semantic aliases — defined ONCE, over the bases above */
-    --bg: #F3F4F0;
-    --bg-card: var(--glass);
-    --fg: var(--ink);
-    --fg-muted: var(--slate);
-    --border: var(--glass-border);
-    --accent: var(--purple);
-    --red: #94404B;                 /* obsolete rose */
-    --red-bg: rgba(148, 64, 75, 0.06);
-    --amber: #8A5A13;               /* superseded amber */
-    --amber-bg: rgba(138, 90, 19, 0.06);
-    --green: #3F7455;               /* reinstated sage */
-    --green-bg: rgba(63, 116, 85, 0.06);
-    --neutral: #737A76;             /* unverified — never a semantic hue */
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --sky-top: #151722;
-      --sky-bottom: #151722;
-      --ink: #F1EEE6;
-      --slate: #9B9EAC;
-      --label: #9B9EAC;
-      --purple: #B8C7E8;
-      --purple-bg: rgba(184, 199, 232, 0.10);
-      --glass: #1D202B;
-      --glass-border: #343846;
-      --highlight: rgba(241, 238, 230, 0.08);
-      --bg: #151722;
-      --red: #D5767C;
-      --red-bg: rgba(213, 118, 124, 0.10);
-      --amber: #E0A24E;
-      --amber-bg: rgba(224, 162, 78, 0.10);
-      --green: #73A987;
-      --green-bg: rgba(115, 169, 135, 0.10);
-      --neutral: #858A96;
-    }
-  }
-  :root[data-theme="dark"] {
-    --sky-top: #151722;
-    --sky-bottom: #151722;
-    --ink: #F1EEE6;
-    --slate: #9B9EAC;
-    --label: #9B9EAC;
-    --purple: #B8C7E8;
-    --purple-bg: rgba(184, 199, 232, 0.10);
-    --glass: #1D202B;
-    --glass-border: #343846;
-    --highlight: rgba(241, 238, 230, 0.08);
-    --bg: #151722;
-    --red: #D5767C;
-    --red-bg: rgba(213, 118, 124, 0.10);
-    --amber: #E0A24E;
-    --amber-bg: rgba(224, 162, 78, 0.10);
-    --green: #73A987;
-    --green-bg: rgba(115, 169, 135, 0.10);
-    --neutral: #858A96;
+    /* semantic aliases — GROUND context (most chrome). Card selectors
+       below override these to the cream/ink variants. */
+    --bg: var(--ground);
+    --bg-card: var(--card);
+    --fg: var(--on-ground);
+    --fg-muted: var(--on-ground-muted);
+    --label: var(--on-ground-faint);
+    --border: var(--hairline-dark);
+    --accent: var(--accent-ground);
+    /* verdict hues — tuned to read on cream cards */
+    --red: #A64B43;                /* obsolete rose */
+    --red-bg: rgba(166, 75, 67, 0.08);
+    --amber: #986A16;              /* superseded gold */
+    --amber-bg: rgba(152, 106, 22, 0.08);
+    --green: #4E7355;              /* reinstated sage */
+    --green-bg: rgba(78, 115, 85, 0.08);
+    --neutral: #7C8377;            /* unverified — never a semantic hue */
   }
 
   * { box-sizing: border-box; }
@@ -106,6 +70,27 @@
   }
   a { color: var(--accent); }
 
+  /* Card surfaces: re-scope the semantic aliases so every descendant
+     (which reads --fg/--fg-muted/--label/--border/--accent) inverts to
+     dark-on-cream automatically. Custom properties inherit, so scoping
+     on the container carries the whole subtree. */
+  .card, .panel {
+    --fg: var(--ink);
+    --fg-muted: var(--ink-muted);
+    --label: var(--ink-faint);
+    --border: var(--hairline);
+    --accent: var(--receipt);
+    color: var(--ink);
+  }
+  /* The copy/code block is a dark sub-panel on the ground even inside a
+     cream panel — restore light-on-dark tokens for it. */
+  .copy-block {
+    --fg-muted: var(--on-ground-muted);
+    --border: var(--hairline-dark);
+    background: var(--panel-dark);
+    color: var(--on-ground);
+  }
+
   .masthead {
     display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem 1rem;
     padding: 1.1rem 1.5rem; border-bottom: 1px solid var(--border);
@@ -120,6 +105,17 @@
     font-size: 0.75rem; color: var(--label);
   }
   .masthead-meta span + span::before { content: " · "; }
+
+  /* Inline SVG icon set (sprite below <body>). No emoji, no icon font,
+     no network request — one <symbol> per glyph, referenced by <use>. */
+  .icon { width: 1em; height: 1em; fill: none; stroke: currentColor;
+    stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round;
+    vertical-align: -0.125em; flex: none; }
+  .icon-moon { fill: currentColor; stroke: none; }
+  .wordmark .icon { width: 1.05em; height: 1.05em; color: var(--fg);
+    vertical-align: -0.14em; margin-right: 0.4rem; }
+  .evidence .icon, .brief-lines .icon { color: var(--accent); opacity: 0.85;
+    margin-right: 0.4rem; }
 
   /* Two zones, meeting at one hairline, both bleeding to the edges. */
   .shell { display: grid; grid-template-columns: 14rem minmax(0, 1fr); }
@@ -295,7 +291,9 @@
      the measured total either way. */
   .brief { max-height: 16rem; overflow-y: auto; overscroll-behavior: contain; }
   .brief-lines { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.45rem; }
-  .brief-lines li { font-size: 0.875rem; color: var(--fg-muted); }
+  .brief-lines li { font-size: 0.875rem; color: var(--fg-muted);
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    overflow: hidden; }
   .brief-lines b {
     display: block; font-family: var(--mono); font-size: 0.6875rem;
     letter-spacing: 0.06em; text-transform: uppercase; color: var(--label); font-weight: 600;
@@ -381,6 +379,23 @@
   .empty p { margin: 0.35rem 0; color: var(--fg-muted); }
   .empty .lead { font-family: var(--serif); font-size: 1.25rem; color: var(--fg); }
 
+  /* Disclosure fold: machine payloads (copy block, raw plan/acceptance
+     JSON, spend, churn) collapse so the memo reads as narrative, with the
+     raw rows one click away. Native <details>, no JS. */
+  .fold { margin: 0.9rem 0 0; padding-top: 0.7rem; border-top: 1px solid var(--border); }
+  .fold > summary {
+    cursor: pointer; list-style: none; display: flex; align-items: center;
+    font-family: var(--mono); font-size: 0.6875rem; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--label);
+  }
+  .fold > summary::-webkit-details-marker { display: none; }
+  .fold > summary .icon { width: 0.8em; height: 0.8em; margin-right: 0.4rem;
+    color: var(--label); transition: transform 0.15s ease; }
+  .fold[open] > summary .icon { transform: rotate(90deg); }
+  .fold > summary .fold-note { margin-left: 0.5rem; font-weight: 400;
+    text-transform: none; letter-spacing: 0; color: var(--label); }
+  .fold > *:not(summary) { margin-top: 0.7rem; }
+
   .pager { display: flex; gap: 1rem; margin: 1.75rem 0 0; font-family: var(--mono); font-size: 0.8125rem; }
 
   .colophon {
@@ -391,8 +406,13 @@
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-moon" viewBox="0 0 32 32"><path d="M25.7 22.8A12 12 0 0 1 11.2 5.1a12.5 12.5 0 1 0 14.5 17.7Z"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+</svg>
 <header class="masthead">
-  <a class="wordmark" href="/">CSR <span>Dream Journal</span></a>
+  <a class="wordmark" href="/"><svg class="icon icon-moon"><use href="#i-moon"/></svg>CSR <span>Dream Journal</span></a>
   <p class="masthead-meta">{% block masthead_meta %}{% endblock %}</p>
 </header>
 {% block shell %}

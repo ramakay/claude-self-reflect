@@ -418,8 +418,8 @@ mod tests {
         assert!(html.contains(r#"<a class="current" href="/board">Board</a>"#));
     }
 
-    /// Ban 1, 3 and 4: no manila fill, no rounded floating frame, nothing
-    /// non-flat.
+    /// Ban 1, 3 and 4: no manila fill (cream is the card surface, not the
+    /// ground), no literal radius outside the two tokens, nothing non-flat.
     #[test]
     fn the_stylesheet_obeys_the_four_design_bans() {
         let html = board_html(&board_feed_of(vec![adverse("c00")]));
@@ -433,9 +433,18 @@ mod tests {
         ] {
             assert!(!css.contains(banned), "flat only: {banned} is banned");
         }
-        // Radius <= 3px everywhere: the two radius tokens are the only source.
-        assert!(css.contains("--radius-pane: 3px;"));
-        assert!(css.contains("--radius-tile: 2px;"));
+        // Radius comes only from the two tokens (10px pane / 8px tile); no
+        // rule states a literal radius of its own.
+        assert!(css.contains("--radius-pane: 10px;"));
+        assert!(css.contains("--radius-tile: 8px;"));
+        for (i, _) in css.match_indices("border-radius:") {
+            let rest = &css[i + "border-radius:".len()..];
+            assert!(
+                rest.trim_start().starts_with("var(--radius-"),
+                "border-radius must come from a radius token, found: {}",
+                rest.chars().take(40).collect::<String>()
+            );
+        }
         for rem_radius in [
             "border-radius: 999px",
             "border-radius: 1.25rem",
@@ -446,7 +455,8 @@ mod tests {
                 "radius must stay <= 3px: {rem_radius}"
             );
         }
-        // No manila / beige / tan / cream fill anywhere in the palette.
+        // No manila / beige / tan fill anywhere. Cream (#F2F0E6) is the card
+        // surface by design and is deliberately not in this list.
         for manila in [
             "#f5f0e1", "#faf3e0", "#f0e6d2", "#e8dcc0", "bisque", "wheat", "tan;",
         ] {
@@ -467,61 +477,56 @@ mod tests {
     }
 
     #[test]
-    fn both_themes_are_defined_and_light_is_defined_on_bare_root() {
+    fn single_look_tokens_live_on_bare_root_and_cards_rescope_them() {
         let html = board_html(&BoardFeed::default());
-        let bare = html.find("  :root {").expect("bare :root light palette");
-        let media = html
-            .find("@media (prefers-color-scheme: dark)")
-            .expect("dark media query");
-        let attr = html
-            .find(r#":root[data-theme="dark"]"#)
-            .expect("data-theme dark block");
-        assert!(bare < media && media < attr, "token blocks out of order");
+        let css = &html[..html.find("</style>").expect("stylesheet")];
+        let root = css.find("  :root {").expect("bare :root token block");
+        let cards = css
+            .find(".card, .panel {")
+            .expect("card/panel rescope block");
+        assert!(root < cards, "root tokens must precede the card rescope");
+        // One committed look in both OS themes: no dark-mode override blocks.
         assert!(
-            html[media..attr].contains(r#":not([data-theme="light"])"#),
-            "the dark media query must yield to an explicit light choice"
+            !css.contains("prefers-color-scheme"),
+            "single look: no prefers-color-scheme override"
+        );
+        assert!(
+            !css.contains("data-theme"),
+            "single look: no data-theme override"
         );
 
-        // Semantic tokens are aliases defined ONCE, on bare `:root`, over a
-        // base palette. Both dark blocks re-point the bases, so the aliases
-        // follow without being restated. Asserting the aliases appear inside
-        // the dark blocks would be asserting duplication, not correctness —
-        // what has to hold is: every alias is defined on bare `:root`, and
-        // every base it resolves to is redefined in BOTH dark blocks.
-        const ALIASES: [(&str, &str); 5] = [
-            ("--bg-card:", "--glass:"),
-            ("--fg:", "--ink:"),
-            ("--fg-muted:", "--slate:"),
-            ("--border:", "--glass-border:"),
-            ("--accent:", "--purple:"),
+        // Semantic aliases are defined ONCE on bare `:root` over the ground
+        // palette; `.card, .panel` re-points the same aliases at the cream
+        // palette so every descendant inverts without per-rule edits.
+        const ROOT_ALIASES: [(&str, &str); 5] = [
+            ("--bg:", "var(--ground)"),
+            ("--fg:", "var(--on-ground)"),
+            ("--fg-muted:", "var(--on-ground-muted)"),
+            ("--border:", "var(--hairline-dark)"),
+            ("--accent:", "var(--accent-ground)"),
         ];
-        for (alias, base) in ALIASES {
+        let root_block = &css[root..cards];
+        for (alias, base) in ROOT_ALIASES {
             assert!(
-                html[..media].contains(alias),
-                "alias {alias} must be defined on bare :root"
-            );
-            assert!(
-                html[..media].contains(base),
-                "light palette missing base {base}"
-            );
-            assert!(
-                html[media..attr].contains(base),
-                "prefers-color-scheme dark block missing base {base}"
-            );
-            assert!(
-                html[attr..].contains(base),
-                "[data-theme=dark] block missing base {base}"
+                root_block.contains(&format!("{alias} {base};")),
+                "bare :root must define {alias} as {base}"
             );
         }
-
-        // Every semantic verdict hue exists in BOTH modes too — a card in
-        // light mode must not fall back to an undefined colour.
-        for hue in ["--red:", "--amber:", "--green:", "--neutral:"] {
-            assert!(html[..media].contains(hue), "light palette missing {hue}");
-            assert!(html[media..attr].contains(hue), "dark media missing {hue}");
+        let card_end = css[cards..]
+            .find('}')
+            .map(|i| cards + i)
+            .expect("card block end");
+        let card_block = &css[cards..card_end];
+        const CARD_ALIASES: [(&str, &str); 4] = [
+            ("--fg:", "var(--ink)"),
+            ("--fg-muted:", "var(--ink-muted)"),
+            ("--border:", "var(--hairline)"),
+            ("--accent:", "var(--receipt)"),
+        ];
+        for (alias, base) in CARD_ALIASES {
             assert!(
-                html[attr..].contains(hue),
-                "[data-theme=dark] missing {hue}"
+                card_block.contains(&format!("{alias} {base};")),
+                ".card/.panel must re-point {alias} to {base}"
             );
         }
     }
@@ -689,7 +694,8 @@ mod tests {
             ..DetailContext::default()
         };
         let html = detail_html(&item, &context);
-        assert!(html.contains(r#"<p class="spend">"#));
+        assert!(html.contains(r#"<details class="fold">"#));
+        assert!(html.contains(r#"Spend<span class="fold-note">"#));
         assert!(html.contains("1,000,000 in · 1,000,000 out"));
         assert!(html.contains("≈$18.0000 at list price"));
         assert!(html.contains("2 calls · claude-sonnet-5"));
