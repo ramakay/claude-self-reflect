@@ -8,7 +8,9 @@ use rusqlite::params;
 
 use super::dream_delivery::{self, DeliveryChannel, DreamHeadline};
 use super::Storage;
-use crate::hooks::recap::{CorrectionLine, DreamClause, RetiredLine, SettledFact};
+use crate::hooks::recap::{
+    CorrectionIdentity, CorrectionLine, DreamClause, RetiredLine, SettledFact,
+};
 
 const LEDGER_FEED_LIMIT: i64 = 5;
 const RETIRED_FEED_LIMIT: i64 = 3;
@@ -101,12 +103,11 @@ impl Storage {
         Ok(rows)
     }
 
-    /// Record only correction entries proven to be present in a composed recap.
+    /// Record correction entries selected structurally by the recap composer.
     pub fn record_correction_deliveries(
         &self,
         target_session_id: &str,
-        corrections: &[CorrectionLine],
-        composed: &str,
+        corrections: &[CorrectionIdentity],
     ) -> Result<usize> {
         let conn = self
             .conn
@@ -114,15 +115,12 @@ impl Storage {
             .map_err(|error| anyhow::anyhow!("lock: {error}"))?;
         let mut recorded = 0;
         for line in corrections {
-            let marker = format!("({}:{}, {})", line.session8, line.turn, line.date);
-            if composed.contains(&marker) {
-                recorded += conn.execute(
-                    "INSERT OR IGNORE INTO correction_deliveries
+            recorded += conn.execute(
+                "INSERT OR IGNORE INTO correction_deliveries
                         (source_session8, source_turn, source_date, target_session_id)
                      VALUES (?1, ?2, ?3, ?4)",
-                    params![line.session8, line.turn, line.date, target_session_id],
-                )?;
-            }
+                params![line.session8, line.turn, line.date, target_session_id],
+            )?;
         }
         Ok(recorded)
     }

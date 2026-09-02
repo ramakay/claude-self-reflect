@@ -842,6 +842,7 @@ mod tests {
                     quote: "Never bypass verification".into(),
                     kind: "correction".into(),
                     marker: Some("never".into()),
+                    session_id: "abcdef12-full-session".into(),
                     session8: "abcdef12".into(),
                     turn: 4,
                     byte_receipt: "one.jsonl:10-35".into(),
@@ -850,6 +851,7 @@ mod tests {
                     quote: "Use the other approach".into(),
                     kind: "redirect".into(),
                     marker: None,
+                    session_id: "98765432-full-session".into(),
                     session8: "98765432".into(),
                     turn: 8,
                     byte_receipt: "two.jsonl:90-112".into(),
@@ -859,9 +861,10 @@ mod tests {
         let html = corrections(&view).expect("render");
         assert!(html.contains("Never bypass verification"));
         assert!(html.contains("correction"));
-        assert!(html.contains("abcdef12:4"));
+        assert!(html.contains("<span title=\"abcdef12-full-session\">abcdef12:4</span>"));
         assert!(html.contains("one.jsonl:10-35"));
         assert!(html.contains("Use the other approach"));
+        assert!(html.contains("<span title=\"98765432-full-session\">98765432:8</span>"));
         assert!(html.contains("two.jsonl:90-112"));
     }
 }

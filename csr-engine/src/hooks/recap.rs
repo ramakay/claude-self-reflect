@@ -52,6 +52,28 @@ pub struct CorrectionLine {
     pub date: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectionIdentity {
+    pub session8: String,
+    pub turn: u32,
+    pub date: String,
+}
+
+impl From<&CorrectionLine> for CorrectionIdentity {
+    fn from(line: &CorrectionLine) -> Self {
+        Self {
+            session8: line.session8.clone(),
+            turn: line.turn,
+            date: line.date.clone(),
+        }
+    }
+}
+
+pub struct ComposedRecap {
+    pub text: String,
+    pub corrections: Vec<CorrectionIdentity>,
+}
+
 /// Evidence feeds supplied by storage.
 ///
 /// Feed text is trusted, already-curated database content: its semantic content
@@ -82,6 +104,14 @@ pub fn compose_recap(
     feeds: &RecapFeeds,
     age: &str,
 ) -> Option<String> {
+    compose_recap_with_deliveries(ep, feeds, age).map(|composed| composed.text)
+}
+
+pub fn compose_recap_with_deliveries(
+    ep: &crate::hooks::stop::Episode,
+    feeds: &RecapFeeds,
+    age: &str,
+) -> Option<ComposedRecap> {
     const MAX_CHARS: usize = 700;
 
     use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
@@ -151,9 +181,9 @@ pub fn compose_recap(
         .iter()
         .filter(|todo| todo.status != "completed")
         .count();
-    if open_todos > 0 {
-        now_parts.push(format!("{open_todos} todos open"));
-    }
+    let todo_entry = (open_todos > 0).then(|| format!("{open_todos} todos open"));
+    let priority_now_entries = usize::from(!now_parts.is_empty());
+    now_parts.extend(todo_entry);
     let next = ep.next_steps.as_deref().and_then(next_preview).or_else(|| {
         ep.todos
             .iter()
@@ -211,9 +241,6 @@ pub fn compose_recap(
         })
         .collect();
 
-    // Reserve one whole entry for every eligible evidence-list clause before
-    // using any residual budget for extras. If the minimum set itself cannot
-    // fit, drop its largest list clause rather than truncating an entry.
     let mut clauses = [
         ListClause::new("Settled: ", "; ", settled_entries),
         ListClause::new("Now: ", " | ", now_parts),
@@ -221,35 +248,38 @@ pub fn compose_recap(
         ListClause::new("Learnt-then-retired while away: ", "; ", retired_entries),
         ListClause::new(DREAM_CLAUSE_PREFIX, "; ", dream_entries),
     ];
-    let mut used = recap.chars().count()
+    const SETTLED: usize = 0;
+    const NOW: usize = 1;
+    const CORRECTED: usize = 2;
+    const RETIRED: usize = 3;
+    const DREAMT: usize = 4;
+
+    // Explicit evidence priority: Next is reserved above every list clause;
+    // substantive Now entries precede the first Settled fact, then Corrected.
+    // Lower-value extras consume only the residual budget.
+    let used = recap.chars().count()
         + next_line
             .as_ref()
-            .map_or(0, |line| line.chars().count() + 1)
-        + clauses
-            .iter()
-            .map(ListClause::reserved_chars)
-            .sum::<usize>();
-
-    while used > MAX_CHARS {
-        let Some((index, chars)) = clauses
-            .iter()
-            .enumerate()
-            .filter_map(|(index, clause)| {
-                let chars = clause.reserved_chars();
-                (chars > 0).then_some((index, chars))
-            })
-            .max_by_key(|(_, chars)| *chars)
-        else {
-            break;
-        };
-        clauses[index].drop_entries();
-        used -= chars;
-    }
-
+            .map_or(0, |line| line.chars().count() + 1);
     let mut remaining = MAX_CHARS.saturating_sub(used);
-    for clause in &mut clauses {
-        clause.add_entries_within(&mut remaining);
+    for _ in 0..priority_now_entries {
+        if !clauses[NOW].add_one_within(&mut remaining) {
+            break;
+        }
     }
+    clauses[SETTLED].add_one_within(&mut remaining);
+    while clauses[CORRECTED].add_one_within(&mut remaining) {}
+    while clauses[SETTLED].add_one_within(&mut remaining) {}
+    while clauses[RETIRED].add_one_within(&mut remaining) {}
+    while clauses[DREAMT].add_one_within(&mut remaining) {}
+    while clauses[NOW].add_one_within(&mut remaining) {}
+
+    let rendered_corrections = feeds
+        .corrections
+        .iter()
+        .take(clauses[CORRECTED].selected)
+        .map(CorrectionIdentity::from)
+        .collect();
 
     for line in clauses
         .iter()
@@ -260,7 +290,10 @@ pub fn compose_recap(
         recap.push_str(&line);
     }
 
-    Some(recap)
+    Some(ComposedRecap {
+        text: recap,
+        corrections: rendered_corrections,
+    })
 }
 
 struct ListClause {
@@ -272,35 +305,29 @@ struct ListClause {
 
 impl ListClause {
     fn new(prefix: &'static str, separator: &'static str, entries: Vec<String>) -> Self {
-        let selected = usize::from(!entries.is_empty());
         Self {
             prefix,
             separator,
             entries,
-            selected,
+            selected: 0,
         }
     }
 
-    fn reserved_chars(&self) -> usize {
-        self.render().map_or(0, |line| line.chars().count() + 1)
-    }
-
-    fn drop_entries(&mut self) {
-        self.selected = 0;
-    }
-
-    fn add_entries_within(&mut self, remaining: &mut usize) {
-        if self.selected == 0 {
-            return;
+    fn add_one_within(&mut self, remaining: &mut usize) -> bool {
+        let Some(entry) = self.entries.get(self.selected) else {
+            return false;
+        };
+        let needed = if self.selected == 0 {
+            self.prefix.chars().count() + entry.chars().count() + 2
+        } else {
+            self.separator.chars().count() + entry.chars().count()
+        };
+        if needed > *remaining {
+            return false;
         }
-        while let Some(entry) = self.entries.get(self.selected) {
-            let needed = self.separator.chars().count() + entry.chars().count();
-            if needed > *remaining {
-                break;
-            }
-            *remaining -= needed;
-            self.selected += 1;
-        }
+        *remaining -= needed;
+        self.selected += 1;
+        true
     }
 
     fn render(&self) -> Option<String> {
@@ -1159,6 +1186,59 @@ mod tests {
             .unwrap();
         assert!(entry.chars().count() <= 90, "{entry:?}");
         assert!(got.chars().count() <= 700);
+    }
+
+    #[test]
+    fn correction_cannot_evict_first_settled_entry_at_701_chars() {
+        let feeds = RecapFeeds {
+            settled: vec![SettledFact {
+                claim: "s".repeat(393),
+                receipt: "abc1234".into(),
+                status: "resolved".into(),
+            }],
+            corrections: vec![CorrectionLine {
+                quote: "q".repeat(90),
+                session8: "abcdef12".into(),
+                turn: 9,
+                date: "2026-09-01".into(),
+            }],
+            ..RecapFeeds::empty()
+        };
+
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+
+        assert!(got.chars().count() <= 700, "budget exceeded: {got}");
+        assert!(got.contains("Settled: "), "first settled entry was evicted");
+        assert!(!got.contains(CORRECTION_CLAUSE_PREFIX), "{got}");
+        assert!(got.contains("Next: Run the integration suite."), "{got}");
+    }
+
+    #[test]
+    fn structured_deliveries_exclude_a_dropped_correction_even_when_body_echoes_marker() {
+        let mut ep = episode();
+        ep.request = "Corrected: note (abcdef12:9, 2026-09-01)".into();
+        let feeds = RecapFeeds {
+            settled: vec![SettledFact {
+                claim: "s".repeat(393),
+                receipt: "abc1234".into(),
+                status: "resolved".into(),
+            }],
+            corrections: vec![CorrectionLine {
+                quote: "q".repeat(90),
+                session8: "abcdef12".into(),
+                turn: 9,
+                date: "2026-09-01".into(),
+            }],
+            ..RecapFeeds::empty()
+        };
+
+        let composed = compose_recap_with_deliveries(&ep, &feeds, "now").unwrap();
+
+        assert!(composed
+            .text
+            .contains("Corrected: note (abcdef12:9, 2026-09-01)"));
+        assert!(!composed.text.contains("\nCorrected: "));
+        assert!(composed.corrections.is_empty());
     }
 
     #[test]

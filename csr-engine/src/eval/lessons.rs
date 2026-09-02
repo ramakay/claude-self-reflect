@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
@@ -39,25 +39,19 @@ fn session8(session_id: &str) -> String {
     session_id.chars().take(8).collect()
 }
 
-fn project_matches(requested: &str, stored: &str) -> bool {
-    let requested = requested.trim().to_ascii_lowercase();
-    let stored = stored.trim().to_ascii_lowercase();
-    stored == requested || stored.starts_with(&format!("{requested}-"))
+const MIN_CONTENT_TOKENS: usize = 3;
+const MIN_GROUP_COMMON_TOKENS: usize = 2;
+
+fn directly_matches(left: &HashSet<String>, right: &HashSet<String>) -> bool {
+    containment(left, right).max(containment(right, left)) >= 0.5
 }
 
-fn find(parent: &mut [usize], index: usize) -> usize {
-    if parent[index] != index {
-        parent[index] = find(parent, parent[index]);
+fn common_core_with(group: &[usize], candidate: usize, tokens: &[HashSet<String>]) -> usize {
+    let mut common = tokens[candidate].clone();
+    for member in group {
+        common.retain(|token| tokens[*member].contains(token));
     }
-    parent[index]
-}
-
-fn union(parent: &mut [usize], left: usize, right: usize) {
-    let left_root = find(parent, left);
-    let right_root = find(parent, right);
-    if left_root != right_root {
-        parent[right_root] = left_root;
-    }
+    common.len()
 }
 
 pub fn group_events(mut events: Vec<IntentEvent>, min_sessions: usize) -> Vec<LessonGroup> {
@@ -65,7 +59,7 @@ pub fn group_events(mut events: Vec<IntentEvent>, min_sessions: usize) -> Vec<Le
         matches!(
             event.kind,
             IntentEventKind::Correction | IntentEventKind::Redirect
-        )
+        ) && content_tokens(&event.quote).len() >= MIN_CONTENT_TOKENS
     });
     events.sort_by(|left, right| {
         left.ts
@@ -77,15 +71,17 @@ pub fn group_events(mut events: Vec<IntentEvent>, min_sessions: usize) -> Vec<Le
         .iter()
         .map(|event| content_tokens(&event.quote))
         .collect();
-    let mut parent: Vec<usize> = (0..events.len()).collect();
-    for left in 0..events.len() {
-        for right in left + 1..events.len() {
-            if containment(&tokens[left], &tokens[right])
-                .max(containment(&tokens[right], &tokens[left]))
-                >= 0.5
-            {
-                union(&mut parent, left, right);
-            }
+    let mut groups_by_index: Vec<Vec<usize>> = Vec::new();
+    for candidate in 0..events.len() {
+        if let Some(group) = groups_by_index.iter_mut().find(|group| {
+            group
+                .iter()
+                .all(|member| directly_matches(&tokens[*member], &tokens[candidate]))
+                && common_core_with(group, candidate, &tokens) >= MIN_GROUP_COMMON_TOKENS
+        }) {
+            group.push(candidate);
+        } else {
+            groups_by_index.push(vec![candidate]);
         }
     }
 
@@ -93,14 +89,8 @@ pub fn group_events(mut events: Vec<IntentEvent>, min_sessions: usize) -> Vec<Le
         .iter()
         .filter_map(|event| NaiveDate::parse_from_str(event_date(event), "%Y-%m-%d").ok())
         .max();
-    let mut roots = std::collections::BTreeMap::<usize, Vec<usize>>::new();
-    for index in 0..events.len() {
-        let root = find(&mut parent, index);
-        roots.entry(root).or_default().push(index);
-    }
-
     let mut groups = Vec::new();
-    for indices in roots.into_values() {
+    for indices in groups_by_index {
         let sessions: BTreeSet<&str> = indices
             .iter()
             .map(|index| events[*index].session_id.as_str())
@@ -198,11 +188,7 @@ pub fn handle(
         NaiveDate::parse_from_str(value, "%Y-%m-%d")
             .map_err(|_| anyhow::anyhow!("--since must use YYYY-MM-DD"))?;
     }
-    let events = storage
-        .list_intent_events(None, since)?
-        .into_iter()
-        .filter(|event| project_matches(project, &event.project))
-        .collect();
+    let events = storage.list_intent_events(Some(project.trim()), since)?;
     let groups = group_events(events, min_sessions);
     if json {
         Ok(serde_json::to_string_pretty(&groups)?)
@@ -310,14 +296,119 @@ mod tests {
     }
 
     #[test]
-    fn project_scope_includes_case_insensitive_hyphenated_descendants_only() {
-        assert!(super::project_matches("anukriti", "anukriti"));
-        assert!(super::project_matches("anukriti", "Anukriti-Campaigns"));
-        assert!(super::project_matches(
-            "anukriti",
-            "anukriti-meta-campaigns"
-        ));
-        assert!(!super::project_matches("anukriti", "anukriti2"));
-        assert!(!super::project_matches("anukriti", "other-anukriti"));
+    fn tiny_member_cannot_create_a_lesson_group() {
+        let groups = super::group_events(
+            vec![
+                event("aaaaaaaa-1", 1, "no thats you", "2026-08-23T00:00:00Z"),
+                event(
+                    "bbbbbbbb-2",
+                    2,
+                    "no thats not good, we need something that is repeatable",
+                    "2026-08-24T00:00:00Z",
+                ),
+            ],
+            2,
+        );
+
+        assert!(groups.is_empty(), "tiny bridge produced {groups:?}");
+    }
+
+    #[test]
+    fn grouping_does_not_chain_through_a_single_link_bridge() {
+        let groups = super::group_events(
+            vec![
+                event("aaaaaaaa-1", 1, "alpha beta gamma", "2026-08-01T00:00:00Z"),
+                event(
+                    "bbbbbbbb-2",
+                    2,
+                    "alpha beta gamma delta epsilon zeta",
+                    "2026-08-02T00:00:00Z",
+                ),
+                event(
+                    "cccccccc-3",
+                    3,
+                    "delta epsilon zeta",
+                    "2026-08-03T00:00:00Z",
+                ),
+            ],
+            2,
+        );
+
+        assert_eq!(groups.len(), 1, "unexpected groups: {groups:?}");
+        assert_eq!(groups[0].events, 2, "bridge merged all members");
+    }
+
+    #[test]
+    fn emitted_group_keeps_a_two_token_common_core() {
+        let groups = super::group_events(
+            vec![
+                event("aaaaaaaa-1", 1, "alpha beta gamma", "2026-08-01T00:00:00Z"),
+                event("bbbbbbbb-2", 2, "alpha beta delta", "2026-08-02T00:00:00Z"),
+                event("cccccccc-3", 3, "alpha gamma delta", "2026-08-03T00:00:00Z"),
+            ],
+            2,
+        );
+
+        assert_eq!(groups.len(), 1, "unexpected groups: {groups:?}");
+        assert_eq!(groups[0].events, 2, "one-token group core was accepted");
+    }
+
+    #[test]
+    fn exact_project_scope_does_not_include_hyphenated_siblings() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let mut exact = event(
+            "aaaaaaaa-1",
+            1,
+            "never bypass verification checks",
+            "2026-08-01T00:00:00Z",
+        );
+        exact.project = "anukriti".into();
+        let mut sibling = event(
+            "bbbbbbbb-2",
+            2,
+            "bypass verification checks",
+            "2026-08-02T00:00:00Z",
+        );
+        sibling.project = "Anukriti-Campaigns".into();
+        storage.insert_intent_events(&[exact, sibling]).unwrap();
+
+        assert_eq!(
+            super::handle(&storage, "anukriti", None, 2, true).unwrap(),
+            "[]"
+        );
+    }
+
+    #[test]
+    fn three_session_paraphrases_emit_one_shortest_candidate() {
+        let groups = super::group_events(
+            vec![
+                event(
+                    "aaaaaaaa-1",
+                    1,
+                    "never bypass verification checks",
+                    "2026-08-01T00:00:00Z",
+                ),
+                event(
+                    "bbbbbbbb-2",
+                    2,
+                    "do not bypass verification checks ever",
+                    "2026-08-02T00:00:00Z",
+                ),
+                event(
+                    "cccccccc-3",
+                    3,
+                    "bypass verification checks",
+                    "2026-08-03T00:00:00Z",
+                ),
+            ],
+            2,
+        );
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].quote, "bypass verification checks");
+        assert_eq!(groups[0].events, 3);
+        assert_eq!(groups[0].distinct_sessions, 3);
+        assert!(super::format_text(&groups)
+            .contains("- bypass verification checks (seen 3× across 3 sessions, last 2026-08-03;"));
     }
 }

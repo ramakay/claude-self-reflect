@@ -20,7 +20,7 @@
       <li class="week-dream">
         <p class="week-kicker">{{ event.kind }}{% if event.marker %} · {{ event.marker }}{% endif %}</p>
         <p>{{ event.quote }}</p>
-        <p class="week-kicker">{{ event.session8 }}:{{ event.turn }} · <code>{{ event.byte_receipt }}</code></p>
+        <p class="week-kicker"><span title="{{ event.session_id }}">{{ event.session8 }}:{{ event.turn }}</span> · <code>{{ event.byte_receipt }}</code></p>
       </li>
       {% endfor %}
     </ul>

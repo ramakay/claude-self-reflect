@@ -158,12 +158,13 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             .take(MAX_TIER0_VERIFY)
             .map(|a| (a.name.clone(), verify_anchor(a, cwd)))
             .collect();
-        output.push_str(&format_session_start_tier0(
+        output.push_str(&format_session_start_tier0_for_session(
             engine.storage(),
             project_name,
             ep,
             &verdicts,
             age,
+            input.session_id.as_deref(),
         ));
         output.push_str(&format_episode_index(&episodes[1..]));
         output.push_str(DEEPER_CONTEXT_FOOTER);
@@ -819,12 +820,13 @@ fn recap_disabled() -> bool {
         .unwrap_or(false)
 }
 
-fn format_session_start_tier0(
+fn format_session_start_tier0_for_session(
     storage: &crate::storage::Storage,
     project: &str,
     ep: &Episode,
     anchor_verdicts: &[(String, AnchorVerdict)],
     age: &str,
+    target_session_id: Option<&str>,
 ) -> String {
     let recap = if recap_disabled() {
         None
@@ -880,8 +882,9 @@ fn format_session_start_tier0(
             open_proposals,
             top_dream,
         };
-        let composed = crate::hooks::recap::compose_recap(ep, &feeds, age);
-        if let (Some(text), Some(id)) = (composed.as_deref(), dream_id) {
+        let composed = crate::hooks::recap::compose_recap_with_deliveries(ep, &feeds, age);
+        if let (Some(composed), Some(id)) = (composed.as_ref(), dream_id) {
+            let text = &composed.text;
             if text.contains(crate::hooks::recap::DREAM_CLAUSE_PREFIX) {
                 crate::storage::dream_delivery::claim_delivery(
                     storage,
@@ -891,16 +894,14 @@ fn format_session_start_tier0(
                 );
             }
         }
-        if let Some(text) = composed.as_deref() {
-            if text.contains(crate::hooks::recap::CORRECTION_CLAUSE_PREFIX) {
-                if let Err(error) =
-                    storage.record_correction_deliveries(&ep.session_id, &feeds.corrections, text)
-                {
-                    tracing::debug!(%error, "session-start correction delivery receipt unavailable");
-                }
+        if let (Some(target_session_id), Some(composed)) = (target_session_id, composed.as_ref()) {
+            if let Err(error) =
+                storage.record_correction_deliveries(target_session_id, &composed.corrections)
+            {
+                tracing::debug!(%error, "session-start correction delivery receipt unavailable");
             }
         }
-        composed
+        composed.map(|composed| composed.text)
     };
 
     format_tier0_block_with_recap(ep, anchor_verdicts, age, recap.as_deref())
@@ -2155,7 +2156,14 @@ mod tests {
         seed_recap_feeds(&storage, &ep);
         let verdicts = vec![("validate_token".to_string(), AnchorVerdict::Intact)];
 
-        let block = format_session_start_tier0(&storage, &ep.project, &ep, &verdicts, "2h ago");
+        let block = format_session_start_tier0_for_session(
+            &storage,
+            &ep.project,
+            &ep,
+            &verdicts,
+            "2h ago",
+            None,
+        );
 
         assert!(block.starts_with(
             "recap [2h ago]: Fix the auth middleware regression: Fixed token validation."
@@ -2196,7 +2204,15 @@ mod tests {
             }])
             .unwrap();
 
-        let block = format_session_start_tier0(&storage, &ep.project, &ep, &[], "now");
+        let target_session = "current-session";
+        let block = format_session_start_tier0_for_session(
+            &storage,
+            &ep.project,
+            &ep,
+            &[],
+            "now",
+            Some(target_session),
+        );
 
         assert!(block.contains("Corrected: Never bypass verification (12345678:6,"));
         assert!(block.chars().count() <= 700 + 300);
@@ -2204,12 +2220,55 @@ mod tests {
             .with_connection(|conn| {
                 Ok(conn.query_row(
                     "SELECT COUNT(*) FROM correction_deliveries WHERE target_session_id = ?1",
-                    [&ep.session_id],
+                    [target_session],
                     |row| row.get(0),
                 )?)
             })
             .unwrap();
         assert_eq!(delivered, 1);
+    }
+
+    #[test]
+    fn session_start_without_current_session_abstains_from_delivery_receipt() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let ep = minimal_episode("Fix verification", "Kept the checks", None);
+        storage
+            .insert_intent_events(&[crate::transcript::intent_events::IntentEvent {
+                session_id: "12345678-source".into(),
+                project: ep.project.clone(),
+                turn: 6,
+                kind: crate::transcript::intent_events::IntentEventKind::Correction,
+                quote: "Never bypass verification".into(),
+                transcript_path: std::path::PathBuf::from("/tmp/csr-b3/recent.jsonl"),
+                byte_start: 10,
+                byte_end: 35,
+                prior_claim: String::new(),
+                symbol: None,
+                file: None,
+                classifier_hash: "fixture".into(),
+                detector: None,
+                classifier_score: None,
+                marker: Some("never".into()),
+                ts: Utc::now().to_rfc3339(),
+            }])
+            .unwrap();
+
+        let block =
+            format_session_start_tier0_for_session(&storage, &ep.project, &ep, &[], "now", None);
+
+        assert!(block.contains("Corrected: Never bypass verification"));
+        let delivered: i64 = storage
+            .with_connection(|conn| {
+                Ok(
+                    conn.query_row("SELECT COUNT(*) FROM correction_deliveries", [], |row| {
+                        row.get(0)
+                    })?,
+                )
+            })
+            .unwrap();
+        assert_eq!(delivered, 0);
     }
 
     #[test]
@@ -2219,7 +2278,8 @@ mod tests {
         let storage = crate::storage::Storage::open_memory().unwrap();
         let ep = minimal_episode("", "", Some("continue work"));
 
-        let block = format_session_start_tier0(&storage, &ep.project, &ep, &[], "2h ago");
+        let block =
+            format_session_start_tier0_for_session(&storage, &ep.project, &ep, &[], "2h ago", None);
 
         assert_eq!(
             block,
@@ -2242,7 +2302,8 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         );
         seed_recap_feeds(&storage, &ep);
 
-        let block = format_session_start_tier0(&storage, &ep.project, &ep, &[], "2h ago");
+        let block =
+            format_session_start_tier0_for_session(&storage, &ep.project, &ep, &[], "2h ago", None);
         std::env::remove_var("CSR_NO_RECAP");
 
         assert!(block.starts_with("CSR CONTINUUM [2h ago]: Fix the auth middleware regression\n"));

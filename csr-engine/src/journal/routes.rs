@@ -1298,8 +1298,9 @@ mod tests {
     /// accept a non-GET method; everything else must refuse.
     #[tokio::test]
     async fn no_other_mutating_route_exists() {
-        const PATHS: [&str; 7] = [
+        const PATHS: [&str; 8] = [
             "/",
+            "/corrections",
             "/dream/id00",
             "/dream/id00/",
             "/api/dreams",
