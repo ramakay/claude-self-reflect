@@ -286,6 +286,19 @@ pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) 
     Ok(())
 }
 
+pub fn delete_chunk(conn: &Connection, chunk_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
+        params![chunk_id],
+    )?;
+    conn.execute(
+        "DELETE FROM chunk_provenance WHERE chunk_id = ?1",
+        params![chunk_id],
+    )?;
+    conn.execute("DELETE FROM chunks WHERE id = ?1", params![chunk_id])?;
+    Ok(())
+}
+
 pub fn load_all_chunk_vectors(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> {
     let mut stmt = conn.prepare("SELECT chunk_id, embedding FROM chunk_embeddings")?;
     let rows = stmt.query_map([], |row| {

@@ -223,26 +223,38 @@ impl SearchEngine {
         limit: usize,
         min_score: f32,
     ) -> Vec<SearchResult> {
+        if limit == 0 {
+            return Vec::new();
+        }
         if id_map.len() <= EXACT_SCAN_THRESHOLD {
             return Self::exact_scan(index, id_map, query_vec, limit, min_score, None);
         }
-        let neighbours = index.search(query_vec, limit, EF_SEARCH);
-
-        let mut results: Vec<SearchResult> = neighbours
-            .into_iter()
-            .filter_map(|n| {
-                // hnsw_rs DistCosine returns distance = 1.0 - cosine_similarity
-                let score = 1.0 - n.distance;
-                if score >= min_score && n.d_id < id_map.len() && !id_map[n.d_id].is_empty() {
-                    Some(SearchResult {
-                        id: id_map[n.d_id].clone(),
-                        score,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Removed/replaced vectors remain as blank tombstones in HNSW. Over-fetch
+        // adaptively so nearby tombstones cannot consume the caller's result limit.
+        let max_elements = id_map.len();
+        let mut fetch_limit = limit.min(max_elements);
+        let mut results = loop {
+            let neighbours = index.search(query_vec, fetch_limit, EF_SEARCH.max(fetch_limit));
+            let found = neighbours
+                .into_iter()
+                .filter_map(|n| {
+                    // hnsw_rs DistCosine returns distance = 1.0 - cosine_similarity
+                    let score = 1.0 - n.distance;
+                    if score >= min_score && n.d_id < id_map.len() && !id_map[n.d_id].is_empty() {
+                        Some(SearchResult {
+                            id: id_map[n.d_id].clone(),
+                            score,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            if found.len() >= limit || fetch_limit >= max_elements {
+                break found;
+            }
+            fetch_limit = (fetch_limit.saturating_mul(2)).min(max_elements);
+        };
 
         results.sort_by(|a, b| {
             b.score
@@ -298,7 +310,7 @@ impl SearchEngine {
     }
 
     pub fn chunk_count(&self) -> usize {
-        self.chunk_id_map.len()
+        self.chunk_id_set.len()
     }
 
     pub fn reflection_count(&self) -> usize {
@@ -319,7 +331,7 @@ impl SearchEngine {
         min_score: f32,
         allowed_ids: &HashSet<String>,
     ) -> Vec<SearchResult> {
-        if self.chunk_id_map.is_empty() || allowed_ids.is_empty() {
+        if self.chunk_id_map.is_empty() || allowed_ids.is_empty() || limit == 0 {
             return Vec::new();
         }
         if self.chunk_id_map.len() <= EXACT_SCAN_THRESHOLD {
@@ -654,6 +666,23 @@ pub fn cleanup_stale_index_files(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_count_tracks_active_ids_across_vector_replacement() {
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("chunk".into(), vec![0.1; 384]);
+        assert_eq!(engine.chunk_count(), 1);
+
+        engine.remove_chunk("chunk");
+        assert_eq!(engine.chunk_count(), 0, "blanked slots are not live chunks");
+
+        engine.insert_chunk("chunk".into(), vec![0.9; 384]);
+        assert_eq!(
+            engine.chunk_count(),
+            1,
+            "remove then insert replaces one live vector; it does not add a chunk"
+        );
+    }
 
     #[test]
     fn tiny_index_search_never_empty() {

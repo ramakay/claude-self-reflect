@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::ServiceExt;
 use tokio::sync::RwLock;
 
@@ -508,14 +508,39 @@ impl Engine {
     /// Flush the HNSW index to disk if it has been modified.
     /// Safe to call multiple times — skips if not dirty.
     pub async fn flush_index(&self) {
+        if let Err(e) = self.flush_index_checked().await {
+            tracing::warn!(error = %e, "failed to flush HNSW index (non-fatal)");
+        }
+    }
+
+    /// Flush the HNSW index and propagate persistence failures to the caller.
+    /// Maintenance commands use this so they cannot report success while the
+    /// durable index still contains stale vectors.
+    pub async fn flush_index_checked(&self) -> Result<()> {
         let mut idx = self.search.write().await;
         if idx.is_dirty() {
             // Query current DB counts for staleness-correct manifest
-            let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
-            let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
-            if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
-                tracing::warn!(error = %e, "failed to flush HNSW index (non-fatal)");
-            }
+            let chunk_count = self.storage.count_chunk_embeddings()?;
+            let refl_count = self.storage.count_reflection_embeddings()?;
+            idx.dump_to_disk(&self.index_dir, chunk_count, refl_count)
+                .with_context(|| {
+                    format!("persisting HNSW index to {}", self.index_dir.display())
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Remove the persisted manifest before a maintenance operation mutates
+    /// vectors. If the operation is interrupted or its final dump fails, the
+    /// next process must rebuild from SQLite instead of accepting stale files
+    /// whose row counts happen to match.
+    pub fn invalidate_index_manifest(&self) -> Result<()> {
+        let path = self.index_dir.join("manifest.json");
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("invalidating HNSW manifest at {}", path.display())),
         }
     }
 

@@ -256,6 +256,15 @@ impl Daemon {
                     }
                     let s = storage.clone();
                     let _ = tokio::task::spawn_blocking(move || {
+                        match s.refresh_contamination_cache() {
+                            Ok(measurement) => tracing::debug!(
+                                conversations = measurement.conversations,
+                                total_conversations = measurement.total_conversations,
+                                pct = measurement.pct,
+                                "contamination measurement refreshed"
+                            ),
+                            Err(e) => tracing::warn!("contamination refresh failed: {e}"),
+                        }
                         let Some(home) = dirs::home_dir() else { return };
                         let path = home.join(".claude/history.jsonl");
                         match crate::import::registry::ingest_history(&s, &path) {

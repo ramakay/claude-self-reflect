@@ -135,7 +135,7 @@ fn conversation_is_contaminated(
         || csr_hook_wrappers_scrubbed > 0
         || entries
             .iter()
-            .any(|entry| crate::extraction::provenance::is_csr_emission(&entry.text))
+            .any(|entry| crate::import::contamination_reason(&entry.text).is_some())
 }
 
 fn transcript_mtime(path: &Path) -> Result<i64> {

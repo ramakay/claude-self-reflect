@@ -374,6 +374,15 @@ enum BackfillAction {
         #[arg(long)]
         ledger: Option<PathBuf>,
     },
+    /// Remove persisted CSR emissions and replace their stale search vectors.
+    Scrub {
+        /// Print per-conversation actions without changing SQLite or HNSW.
+        #[arg(long)]
+        dry_run: bool,
+        /// Restrict remediation to one contaminated conversation.
+        #[arg(long)]
+        conversation: Option<String>,
+    },
 }
 
 /// `csr-engine dream backfill` / `csr-engine dream drain`
@@ -958,6 +967,27 @@ async fn main() -> Result<()> {
             let agreement =
                 csr_engine::transcript::intent_events::agreement_report(ledger, stats.events())?;
             print!("{}", agreement.format_text());
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::Backfill {
+        action: BackfillAction::Scrub {
+            dry_run,
+            conversation,
+        },
+    }) = &args.command
+    {
+        let report = if *dry_run {
+            let storage = csr_engine::storage::Storage::open_read_only(&args.db_path)?;
+            csr_engine::import::scrub::dry_run_scrub(&storage, conversation.as_deref())?
+        } else {
+            let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+            csr_engine::import::scrub::run_scrub(&eng, false, conversation.as_deref()).await?
+        };
+        print!("{}", report.format_text(*dry_run));
+        if !dry_run {
+            println!("restart Claude Code: the running MCP server holds its own index");
         }
         return Ok(());
     }

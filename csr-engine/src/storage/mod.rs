@@ -27,11 +27,22 @@ use anyhow::Result;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::import::{ConversationChunk, CsrSuppressionStats};
+use crate::provenance::ChunkProvenance;
 
 /// SQLite storage with FTS5 for full-text search.
 /// Thread-safe via Mutex around the Connection.
 pub struct Storage {
     conn: Mutex<Connection>,
+}
+
+const CONTAMINATION_META_KEY: &str = "contamination_measurement_v1";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ContaminationMeasurement {
+    pub conversations: usize,
+    pub total_conversations: usize,
+    pub pct: f64,
+    pub last_measured: String,
 }
 
 impl Storage {
@@ -110,6 +121,31 @@ impl Storage {
     pub fn count_intent_events(&self, project: Option<&str>, since: Option<&str>) -> Result<usize> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         intent_events::count(&conn, project, since)
+    }
+
+    pub fn count_correction_redirect_events_since(&self, since: &str) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM intent_events
+             WHERE kind IN ('correction', 'redirect')
+               AND julianday(ts) >= julianday(?1)",
+            [since],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn dream_counts_by_category(&self) -> Result<(i64, i64, i64)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN category = 'unfinished' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN category = 'strategy' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN category = 'supersession' THEN 1 ELSE 0 END), 0)
+             FROM dreams_v1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(Into::into)
     }
 
     pub fn count_session_intent_events(
@@ -469,6 +505,58 @@ impl Storage {
         queries::count_conversations(&conn)
     }
 
+    /// Return each distinct conversation whose persisted chunk content matches
+    /// the shared CSR-contamination predicate, with the first matching reason.
+    pub fn contaminated_conversations(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut statement = conn.prepare(
+            "SELECT conversation_id, content FROM chunks ORDER BY conversation_id, rowid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut contaminated = Vec::new();
+        let mut last_contaminated: Option<String> = None;
+        for row in rows {
+            let (conversation_id, content) = row?;
+            if last_contaminated.as_deref() == Some(&conversation_id) {
+                continue;
+            }
+            if let Some(reason) = crate::import::contamination_reason(&content) {
+                last_contaminated = Some(conversation_id.clone());
+                contaminated.push((conversation_id, reason.to_string()));
+            }
+        }
+        Ok(contaminated)
+    }
+
+    pub fn refresh_contamination_cache(&self) -> Result<ContaminationMeasurement> {
+        let conversations = self.contaminated_conversations()?.len();
+        let total_conversations = self.count_conversations()?;
+        let pct = if total_conversations == 0 {
+            0.0
+        } else {
+            conversations as f64 / total_conversations as f64 * 100.0
+        };
+        let measurement = ContaminationMeasurement {
+            conversations,
+            total_conversations,
+            pct,
+            last_measured: chrono::Utc::now().to_rfc3339(),
+        };
+        self.set_meta(
+            CONTAMINATION_META_KEY,
+            &serde_json::to_string(&measurement)?,
+        )?;
+        Ok(measurement)
+    }
+
+    pub fn cached_contamination(&self) -> Result<Option<ContaminationMeasurement>> {
+        self.get_meta(CONTAMINATION_META_KEY)?
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .transpose()
+    }
+
     pub fn count_projects(&self) -> Result<usize> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::count_projects(&conn)
@@ -606,6 +694,25 @@ impl Storage {
         queries::insert_chunk_with_source(&conn, chunk, embedding, source)
     }
 
+    /// Atomically replace every persisted chunk for one conversation. Embeddings
+    /// must be prepared before calling this method, so an embedding failure cannot
+    /// leave the conversation deleted or partially rebuilt.
+    pub fn replace_conversation_chunks_atomic(
+        &self,
+        conversation_id: &str,
+        rows: &[(ConversationChunk, Vec<f32>, ChunkProvenance, String)],
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.unchecked_transaction()?;
+        queries::delete_chunks_for_conversation(&tx, conversation_id)?;
+        for (chunk, embedding, provenance, source) in rows {
+            queries::insert_chunk_with_source(&tx, chunk, embedding, source)?;
+            queries::insert_chunk_provenance(&tx, &chunk.id, provenance)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Record a task-derived resolution proposal. Proposals are NOT verdicts:
     /// they live in their own table, invisible to search annotation, until a
     /// human promotes one via csr_resolve (Codex adversarial review — automatic
@@ -685,6 +792,11 @@ impl Storage {
     pub fn delete_chunks_for_conversation(&self, conversation_id: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::delete_chunks_for_conversation(&conn, conversation_id)
+    }
+
+    pub fn delete_chunk(&self, chunk_id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::delete_chunk(&conn, chunk_id)
     }
 
     pub fn record_narrative_usage(&self, row: &NarrativeUsageRow) -> Result<()> {
@@ -1647,6 +1759,52 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contaminated_conversations_uses_shared_content_predicate_and_caches_measurement() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                for (id, conversation_id, content) in [
+                    ("clean-1", "clean", "ordinary user-authored work"),
+                    (
+                        "recap-1",
+                        "recap",
+                        "[[CSR:RECAP]] generated recap paragraph",
+                    ),
+                    (
+                        "wrapper-1",
+                        "wrapper",
+                        "<system-reminder>CSR PICKUP — old context</system-reminder>",
+                    ),
+                ] {
+                    conn.execute(
+                        "INSERT INTO chunks
+                         (id, conversation_id, project_name, timestamp, content, message_count)
+                         VALUES (?1, ?2, 'project', '2026-09-01T00:00:00Z', ?3, 1)",
+                        rusqlite::params![id, conversation_id, content],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(storage.cached_contamination().unwrap().is_none());
+        assert_eq!(
+            storage.contaminated_conversations().unwrap(),
+            vec![
+                ("recap".to_string(), "machine_sentinel".to_string()),
+                ("wrapper".to_string(), "system_reminder".to_string()),
+            ]
+        );
+
+        let measured = storage.refresh_contamination_cache().unwrap();
+        assert_eq!(measured.conversations, 2);
+        assert_eq!(measured.total_conversations, 3);
+        assert!((measured.pct - 66.666_666).abs() < 0.001);
+        assert!(!measured.last_measured.is_empty());
+        assert_eq!(storage.cached_contamination().unwrap(), Some(measured));
+    }
 
     /// A raw `INSERT OR REPLACE INTO chunks` must not strand the replaced row's
     /// document in the FTS index.

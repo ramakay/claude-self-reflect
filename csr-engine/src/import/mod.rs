@@ -5,6 +5,7 @@ pub mod dream_marker;
 pub mod memory_registry;
 pub mod plans;
 pub mod registry;
+pub mod scrub;
 pub mod watcher;
 
 use std::collections::HashSet;
@@ -36,6 +37,36 @@ static CSR_SYSTEM_REMINDER_RE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+
+/// Classify persisted text with the one contamination predicate shared by
+/// measurement, scrub, and trained re-ranker harvesting.
+pub fn contamination_reason(text: &str) -> Option<&'static str> {
+    if crate::extraction::provenance::MACHINE_SENTINELS
+        .iter()
+        .any(|sentinel| text.contains(sentinel))
+    {
+        Some("machine_sentinel")
+    } else if CSR_SYSTEM_REMINDER_RE.is_match(text) {
+        Some("system_reminder")
+    } else if crate::extraction::provenance::is_csr_emission(text) {
+        Some("csr_emission")
+    } else {
+        None
+    }
+}
+
+/// Remove exact wrapper spans and paragraphs that are themselves CSR output.
+/// `None` means the content was pure contamination and should be dropped.
+pub(crate) fn scrub_contaminated_text(text: &str) -> Option<String> {
+    let without_wrappers = CSR_SYSTEM_REMINDER_RE.replace_all(text, "");
+    let clean = without_wrappers
+        .split("\n\n")
+        .filter(|paragraph| contamination_reason(paragraph).is_none())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let clean = clean.trim().to_string();
+    (!clean.is_empty() && contamination_reason(&clean).is_none()).then_some(clean)
+}
 
 /// Single tool-use marker token produced by `extract_tool_context`:
 /// `[Word]` or `[Word: detail]` (detail may contain spaces, never brackets).
@@ -432,7 +463,15 @@ pub(crate) fn parse_jsonl_file_with_stats(
         &authors,
         &sidechains,
         &chunk_summary,
-    );
+    )
+    .into_iter()
+    .filter_map(|mut chunk| {
+        scrub_contaminated_text(&chunk.content).map(|content| {
+            chunk.content = content;
+            chunk
+        })
+    })
+    .collect();
 
     Ok(ParsedConversation {
         chunks,
@@ -796,11 +835,12 @@ fn sanitize_text_for_search(
     sanitizer: &mut CsrMessageSanitizer,
 ) -> String {
     let stripped = crate::storage::dream_attribution::strip_card_judgment(text);
-    if scrub_wrappers {
+    let sanitized = if scrub_wrappers {
         scrub_csr_system_reminders(&stripped, &mut sanitizer.stats.csr_hook_wrappers_scrubbed)
     } else {
         stripped
-    }
+    };
+    scrub_contaminated_text(&sanitized).unwrap_or_default()
 }
 
 fn scrub_csr_system_reminders(text: &str, count: &mut usize) -> String {
@@ -1057,6 +1097,75 @@ fn generate_chunk_id(conversation_id: &str, chunk_index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contamination_predicate_detects_machine_sentinel() {
+        assert_eq!(
+            contamination_reason("ordinary text\n\n[[CSR:LESSONS]] generated memory"),
+            Some("machine_sentinel")
+        );
+    }
+
+    #[test]
+    fn contamination_predicate_detects_system_reminder_wrapper() {
+        assert_eq!(
+            contamination_reason(
+                "<system-reminder>CSR ENDLESS MEMORY ACTIVE\nPAST CONTEXT</system-reminder>"
+            ),
+            Some("system_reminder")
+        );
+    }
+
+    #[test]
+    fn contamination_predicate_detects_recap_header() {
+        assert_eq!(
+            contamination_reason("recap [2h ago]: fixed the stale index"),
+            Some("csr_emission")
+        );
+    }
+
+    #[test]
+    fn contamination_predicate_accepts_clean_text() {
+        assert_eq!(
+            contamination_reason("We fixed the stale HNSW vector by replacing it explicitly."),
+            None
+        );
+    }
+
+    #[test]
+    fn parser_never_emits_cross_message_contamination() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cross-message.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-09-01T00:00:00Z",
+                "message": {"content": "LAST: prior generated state"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-09-01T00:00:01Z",
+                "message": {"content": "NEXT: generated continuation"}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let chunks = parse_jsonl_file(&path, "project").unwrap();
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| contamination_reason(&chunk.content).is_none()),
+            "the final chunk boundary must enforce the shared predicate: {chunks:?}"
+        );
+    }
 
     #[test]
     fn chunk_messages_reuses_budget_ids_and_authority_rules() {

@@ -29,6 +29,7 @@ pub struct StatusReport {
     pub csr_self_suppressed: i64,
     pub csr_tool_blocks_suppressed: i64,
     pub csr_hook_wrappers_scrubbed: i64,
+    pub contamination: ContaminationStatus,
     pub enrichment: EnrichmentBreakdown,
     pub narratives: NarrativeStatus,
     pub ratification: RatificationStatus,
@@ -44,8 +45,8 @@ pub struct StatusReport {
     /// Native memory-file spine (`~/.claude/projects/*/memory/*.md`) — metadata
     /// only; bodies are never embedded or injected. See `gather_memory_registry`.
     pub memory_registry: MemoryRegistryStatus,
-    /// v10 "dreaming" summary (`crate::dream`) — witness_verdicts totals and
-    /// current demoted-symbol count. See `gather_dream`.
+    /// v10 "dreaming" summary (`crate::dream`) — actual `dreams_v1` output,
+    /// recent corrections, compatibility verdict totals, and demotions.
     pub dream: DreamStatus,
     /// Journal v3 Phase 1.5 "dream threads" summary (`crate::dream::threads`)
     /// — night-pass propose-verify extraction. See `gather_dream_threads`.
@@ -150,6 +151,38 @@ pub struct DreamVerdictTotals {
     pub reinstated: i64,
 }
 
+#[derive(Serialize, Debug, Default, PartialEq)]
+pub struct ContaminationStatus {
+    pub conversations: usize,
+    pub total_conversations: usize,
+    pub pct: f64,
+    pub last_measured: Option<String>,
+}
+
+impl From<crate::storage::ContaminationMeasurement> for ContaminationStatus {
+    fn from(measurement: crate::storage::ContaminationMeasurement) -> Self {
+        Self {
+            conversations: measurement.conversations,
+            total_conversations: measurement.total_conversations,
+            pct: measurement.pct,
+            last_measured: Some(measurement.last_measured),
+        }
+    }
+}
+
+#[derive(Serialize, Debug, Default, PartialEq, Eq)]
+pub struct DreamCategoryTotals {
+    pub unfinished: i64,
+    pub strategy: i64,
+    pub supersession: i64,
+}
+
+impl DreamCategoryTotals {
+    fn total(&self) -> i64 {
+        self.unfinished + self.strategy + self.supersession
+    }
+}
+
 /// v10 "dreaming" summary block. `last_run` is the `created_at` timestamp of
 /// the globally newest `witness_verdicts` event (`None` if `dream` has never
 /// run). `demoted_symbols` is the count on the `Demote` channel right now —
@@ -165,8 +198,12 @@ pub struct DreamStatus {
     /// Whether daemon dreaming is enabled by configuration.
     pub daemon_enabled: bool,
     pub last_run: Option<String>,
+    /// Backward-compatible alias for `verdict_events_total`.
     pub events_total: i64,
+    pub verdict_events_total: i64,
     pub by_verdict: DreamVerdictTotals,
+    pub dreams: DreamCategoryTotals,
+    pub corrections_7d: i64,
     pub demoted_symbols: i64,
     /// Total durable witnesses available for a first dream cycle.
     pub witnesses_ledgered: i64,
@@ -325,7 +362,10 @@ impl Default for DreamStatus {
             daemon_enabled: true,
             last_run: None,
             events_total: 0,
+            verdict_events_total: 0,
             by_verdict: DreamVerdictTotals::default(),
+            dreams: DreamCategoryTotals::default(),
+            corrections_7d: 0,
             demoted_symbols: 0,
             witnesses_ledgered: 0,
             ancestry_cached_conversations: 0,
@@ -550,6 +590,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             csr_self_suppressed: 0,
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
+            contamination: ContaminationStatus::default(),
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus {
                 disabled: crate::narrative::narratives_disabled(),
@@ -582,6 +623,13 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let csr_self_suppressed = storage.get_csr_self_suppressed().unwrap_or(0);
     let csr_tool_blocks_suppressed = storage.get_csr_tool_blocks_suppressed().unwrap_or(0);
     let csr_hook_wrappers_scrubbed = storage.get_csr_hook_wrappers_scrubbed().unwrap_or(0);
+    let contamination = if deep {
+        storage.refresh_contamination_cache().ok()
+    } else {
+        storage.cached_contamination().unwrap_or(None)
+    }
+    .map(ContaminationStatus::from)
+    .unwrap_or_default();
     let newest_chunk = storage.get_newest_chunk_timestamp().unwrap_or(None);
     let db_size_bytes = storage.get_db_size().unwrap_or(0);
     // Cached verdict (24h TTL, refreshed by the daemon or --deep). A full
@@ -636,6 +684,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         csr_self_suppressed,
         csr_tool_blocks_suppressed,
         csr_hook_wrappers_scrubbed,
+        contamination,
         enrichment,
         narratives,
         ratification,
@@ -955,6 +1004,12 @@ fn gather_dream_with(
     } else {
         0
     };
+    let (unfinished, strategy, supersession_dreams) =
+        storage.dream_counts_by_category().unwrap_or((0, 0, 0));
+    let corrections_since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+    let corrections_7d = storage
+        .count_correction_redirect_events_since(&corrections_since)
+        .unwrap_or(0);
     let last_daemon_run_dt = crate::daemon::dream_cadence::read_last_run(storage);
     let last_daemon_run = last_daemon_run_dt.map(|t| t.to_rfc3339());
     let daemon_enabled = !crate::daemon::dream_cadence::dreaming_disabled()
@@ -978,15 +1033,23 @@ fn gather_dream_with(
         .flatten()
         .map(|t| t.to_rfc3339());
 
+    let verdict_events_total = obsolete + superseded + reinstated;
     DreamStatus {
         daemon_enabled,
         last_run,
-        events_total: obsolete + superseded + reinstated,
+        events_total: verdict_events_total,
+        verdict_events_total,
         by_verdict: DreamVerdictTotals {
             obsolete,
             superseded,
             reinstated,
         },
+        dreams: DreamCategoryTotals {
+            unfinished,
+            strategy,
+            supersession: supersession_dreams,
+        },
+        corrections_7d,
         demoted_symbols,
         witnesses_ledgered,
         ancestry_cached_conversations: storage.ancestry_cache_count().unwrap_or(0),
@@ -1439,11 +1502,12 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
         report.projects,
         format_narrative_segment(&report.narratives),
     );
-    // I7: dreams are user-facing under the AnnotateOnly default — show the
-    // verdict count whenever any exist; otherwise say when a cycle is
-    // overdue so "no dreams" is distinguishable from "daemon never ran".
-    if report.dream.events_total > 0 {
-        out.push_str(&format!(" | ☾ {} dreams", report.dream.events_total));
+    let dream_total = report.dream.dreams.total();
+    if dream_total > 0 || report.dream.corrections_7d > 0 {
+        out.push_str(&format!(" | ☾ {dream_total} dreams"));
+        if report.dream.corrections_7d > 0 {
+            out.push_str(&format!(" · {} corrections", report.dream.corrections_7d));
+        }
     } else if report.dream.daemon_enabled
         && report
             .dream
@@ -1477,6 +1541,12 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
             " | ☾ dreaming {} {}",
             SPINNER[frame],
             format_dreaming_elapsed(dreaming.elapsed_secs)
+        ));
+    }
+    if report.contamination.conversations > 0 {
+        out.push_str(&format!(
+            " | ⚠ {} contaminated",
+            report.contamination.conversations
         ));
     }
     // A newer binary is installed but the live MCP server predates it. Say so
@@ -1551,6 +1621,7 @@ mod tests {
             csr_self_suppressed: 0,
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
+            contamination: ContaminationStatus::default(),
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus::default(),
             ratification: RatificationStatus::default(),
@@ -1617,6 +1688,53 @@ mod tests {
     }
 
     #[test]
+    fn status_json_distinguishes_contamination_dreams_and_verdict_events() {
+        let mut report = base_report();
+        report.contamination = ContaminationStatus {
+            conversations: 2,
+            total_conversations: 10,
+            pct: 20.0,
+            last_measured: Some("2026-09-01T12:00:00Z".into()),
+        };
+        report.dream.dreams = DreamCategoryTotals {
+            unfinished: 3,
+            strategy: 2,
+            supersession: 1,
+        };
+        report.dream.corrections_7d = 4;
+        report.dream.verdict_events_total = 99;
+        report.dream.events_total = 99;
+
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["contamination"]["conversations"], 2);
+        assert_eq!(value["contamination"]["total_conversations"], 10);
+        assert_eq!(value["contamination"]["pct"], 20.0);
+        assert_eq!(value["dream"]["dreams"]["unfinished"], 3);
+        assert_eq!(value["dream"]["dreams"]["strategy"], 2);
+        assert_eq!(value["dream"]["dreams"]["supersession"], 1);
+        assert_eq!(value["dream"]["corrections_7d"], 4);
+        assert_eq!(value["dream"]["verdict_events_total"], 99);
+        assert_eq!(value["dream"]["events_total"], 99);
+    }
+
+    #[test]
+    fn compact_contamination_badge_only_appears_for_a_measured_nonzero_count() {
+        let mut report = base_report();
+        assert!(!format_compact(&report, 0).contains("contaminated"));
+
+        report.contamination = ContaminationStatus {
+            conversations: 7,
+            total_conversations: 100,
+            pct: 7.0,
+            last_measured: Some("2026-09-01T12:00:00Z".into()),
+        };
+        assert!(format_compact(&report, 0).contains("⚠ 7 contaminated"));
+
+        report.contamination.conversations = 0;
+        assert!(!format_compact(&report, 0).contains("contaminated"));
+    }
+
+    #[test]
     fn trained_rerank_model_age_is_derived_from_the_active_model_timestamp() {
         let now = crate::temporal::parse_timestamp("2026-08-24T12:00:00Z").unwrap();
 
@@ -1673,10 +1791,16 @@ mod tests {
             daemon_enabled: true,
             last_run: Some("2026-08-05 10:00:00".into()),
             events_total: 3,
+            verdict_events_total: 3,
             by_verdict: DreamVerdictTotals {
                 obsolete: 2,
                 superseded: 1,
                 reinstated: 0,
+            },
+            dreams: DreamCategoryTotals {
+                unfinished: 2,
+                strategy: 1,
+                supersession: 0,
             },
             demoted_symbols: 3,
             witnesses_ledgered: 0,
@@ -1692,7 +1816,7 @@ mod tests {
         );
         assert!(
             line.contains("☾ 3 dreams"),
-            "verdict events must also surface as dreams: {line:?}"
+            "stored dreams must surface independently of verdict events: {line:?}"
         );
     }
 
@@ -1700,10 +1824,18 @@ mod tests {
     fn test_compact_shows_dreams_segment_without_demotion() {
         let mut report = base_report();
         report.dream.events_total = 545;
+        report.dream.verdict_events_total = 545;
+        report.dream.dreams.unfinished = 4;
+        report.dream.dreams.supersession = 2;
+        report.dream.corrections_7d = 3;
         let line = format_compact(&report, 0);
         assert!(
-            line.contains("☾ 545 dreams"),
-            "annotate-only verdicts must be visible: {line:?}"
+            line.contains("☾ 6 dreams · 3 corrections"),
+            "the compact line must count dreams_v1 and recent corrections: {line:?}"
+        );
+        assert!(
+            !line.contains("545 dreams"),
+            "verdicts are not dreams: {line:?}"
         );
         assert!(
             !line.contains("forgotten"),
@@ -1734,7 +1866,7 @@ mod tests {
     #[test]
     fn test_compact_dream_segment_coexists_with_stale_marker() {
         let mut report = base_report();
-        report.dream.events_total = 2;
+        report.dream.dreams.unfinished = 2;
         report.mcp_binary_stale = true;
         let line = format_compact(&report, 0);
         let dreams = line.find("☾ 2 dreams").expect("dreams segment present");
@@ -2200,6 +2332,46 @@ mod tests {
                 observed_head_oid: "headoid".into(),
             })
             .unwrap();
+        storage
+            .with_connection(|conn| {
+                for (dream_id, category) in [
+                    ("dream-u", "unfinished"),
+                    ("dream-s", "strategy"),
+                    ("dream-x", "supersession"),
+                ] {
+                    conn.execute(
+                        "INSERT INTO dreams_v1
+                         (dream_id, project, category, revision_hash, prose)
+                         VALUES (?1, 'proj', ?2, ?1, 'prose')",
+                        rusqlite::params![dream_id, category],
+                    )?;
+                }
+                let now = chrono::Utc::now().to_rfc3339();
+                for (session, kind) in [
+                    ("correction-session", "correction"),
+                    ("redirect-session", "redirect"),
+                    ("abandoned-session", "abandoned"),
+                ] {
+                    conn.execute(
+                        "INSERT INTO intent_events
+                         (session_id, project, turn, kind, quote, transcript_path,
+                          byte_start, byte_end, classifier_hash, ts)
+                         VALUES (?1, 'proj', 1, ?2, 'quote', '/tmp/test.jsonl', 0, 1,
+                                 'fixture-classifier', ?3)",
+                        rusqlite::params![session, kind, now],
+                    )?;
+                }
+                conn.execute(
+                    "INSERT INTO intent_events
+                     (session_id, project, turn, kind, quote, transcript_path,
+                      byte_start, byte_end, classifier_hash, ts)
+                     VALUES ('old-correction', 'proj', 1, 'correction', 'quote',
+                             '/tmp/test.jsonl', 0, 1, 'fixture-classifier', ?1)",
+                    [(chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         drop(storage);
 
         // CSR_DREAM_CONSUMPTION is unset in this test process — the real
@@ -2215,6 +2387,11 @@ mod tests {
         );
         assert_eq!(report.dream.by_verdict.obsolete, 1);
         assert_eq!(report.dream.by_verdict.superseded, 0);
+        assert_eq!(report.dream.verdict_events_total, 1);
+        assert_eq!(report.dream.dreams.unfinished, 1);
+        assert_eq!(report.dream.dreams.strategy, 1);
+        assert_eq!(report.dream.dreams.supersession, 1);
+        assert_eq!(report.dream.corrections_7d, 2);
         assert_eq!(
             report.dream.demoted_symbols, 0,
             "forgotten-symbol count is Full-channel only and must stay 0 under the default"
