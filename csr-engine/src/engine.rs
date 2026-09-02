@@ -530,6 +530,29 @@ impl Engine {
         Ok(())
     }
 
+    /// Rebuild the in-memory search index from the vectors stored in SQLite
+    /// (chunks and reflections), swap it in, and persist it. Maintenance
+    /// commands that blank many HNSW slots (`backfill scrub`) call this at the
+    /// end so the persisted index is compact: search never has to over-fetch
+    /// past tombstones, and the next process start loads from cache instead
+    /// of rebuilding. Returns `(chunks, reflections)` indexed.
+    pub async fn rebuild_search_index(&self) -> Result<(usize, usize)> {
+        let chunk_vecs = self.storage.load_all_chunk_vectors()?;
+        let reflection_vecs = self.storage.load_all_reflection_vectors()?;
+        let estimated_size = (chunk_vecs.len() + 1000).max(10_000);
+        let mut fresh = SearchEngine::new(estimated_size);
+        for (id, vec) in &chunk_vecs {
+            fresh.insert_chunk(id.clone(), vec.clone());
+        }
+        for (id, vec) in &reflection_vecs {
+            fresh.insert_reflection(id.clone(), vec.clone());
+        }
+        let counts = (chunk_vecs.len(), reflection_vecs.len());
+        *self.search.write().await = fresh;
+        self.flush_index_checked().await?;
+        Ok(counts)
+    }
+
     /// Remove the persisted manifest before a maintenance operation mutates
     /// vectors. If the operation is interrupted or its final dump fails, the
     /// next process must rebuild from SQLite instead of accepting stale files

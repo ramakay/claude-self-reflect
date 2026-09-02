@@ -16,6 +16,8 @@ pub struct ScrubReport {
     pub chunks_rewritten: usize,
     pub chunks_dropped: usize,
     pub vectors_replaced: usize,
+    /// `(chunks, reflections)` in the compact index persisted after a real run.
+    pub index_rebuilt: Option<(usize, usize)>,
     pub actions: Vec<String>,
 }
 
@@ -34,6 +36,11 @@ impl ScrubReport {
             self.chunks_dropped,
             self.vectors_replaced
         ));
+        if let Some((chunks, reflections)) = self.index_rebuilt {
+            output.push_str(&format!(
+                "index rebuilt: {chunks} chunks, {reflections} reflections\n"
+            ));
+        }
         output
     }
 }
@@ -419,7 +426,13 @@ pub async fn run_scrub(
             }
         }
     }
-    engine.flush_index_checked().await?;
+    if report.conversations_scrubbed > 0 {
+        // Replacing vectors leaves blank tombstones in the in-memory HNSW.
+        // Rebuild a compact index from SQLite and persist it so queries never
+        // have to over-fetch past tombstones and the next start loads from
+        // cache. Runs of zero conversations touch neither index nor manifest.
+        report.index_rebuilt = Some(engine.rebuild_search_index().await?);
+    }
     engine.storage().refresh_contamination_cache()?;
     Ok(report)
 }

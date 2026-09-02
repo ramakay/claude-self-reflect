@@ -229,32 +229,23 @@ impl SearchEngine {
         if id_map.len() <= EXACT_SCAN_THRESHOLD {
             return Self::exact_scan(index, id_map, query_vec, limit, min_score, None);
         }
-        // Removed/replaced vectors remain as blank tombstones in HNSW. Over-fetch
-        // adaptively so nearby tombstones cannot consume the caller's result limit.
-        let max_elements = id_map.len();
-        let mut fetch_limit = limit.min(max_elements);
-        let mut results = loop {
-            let neighbours = index.search(query_vec, fetch_limit, EF_SEARCH.max(fetch_limit));
-            let found = neighbours
-                .into_iter()
-                .filter_map(|n| {
-                    // hnsw_rs DistCosine returns distance = 1.0 - cosine_similarity
-                    let score = 1.0 - n.distance;
-                    if score >= min_score && n.d_id < id_map.len() && !id_map[n.d_id].is_empty() {
-                        Some(SearchResult {
-                            id: id_map[n.d_id].clone(),
-                            score,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            if found.len() >= limit || fetch_limit >= max_elements {
-                break found;
-            }
-            fetch_limit = (fetch_limit.saturating_mul(2)).min(max_elements);
-        };
+        let neighbours = index.search(query_vec, limit, EF_SEARCH);
+
+        let mut results: Vec<SearchResult> = neighbours
+            .into_iter()
+            .filter_map(|n| {
+                // hnsw_rs DistCosine returns distance = 1.0 - cosine_similarity
+                let score = 1.0 - n.distance;
+                if score >= min_score && n.d_id < id_map.len() && !id_map[n.d_id].is_empty() {
+                    Some(SearchResult {
+                        id: id_map[n.d_id].clone(),
+                        score,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         results.sort_by(|a, b| {
             b.score
