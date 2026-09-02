@@ -24,7 +24,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::import::{ConversationChunk, CsrSuppressionStats};
 
@@ -66,6 +66,15 @@ impl Storage {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;",
         )?;
         migrations::run(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Open an existing database without running migrations or permitting writes.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

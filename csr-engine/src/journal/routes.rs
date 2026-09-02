@@ -80,6 +80,7 @@ pub fn router(app_state: JournalState) -> Router {
     Router::new()
         .route("/", get(dreams_home))
         .route("/board", get(board))
+        .route("/corrections", get(corrections))
         // axum 0.8 spells path parameters `{id}`, not `:id` (0.7 syntax).
         // The served URL is `/dream/<id>` either way.
         .route("/dream/{id}", get(detail))
@@ -220,6 +221,23 @@ async fn board(State(app_state): State<JournalState>) -> Response {
         Err(error) => notice(
             StatusCode::INTERNAL_SERVER_ERROR,
             NoticeView::feed_error(&format!("board projection failed: {error}")),
+        ),
+    }
+}
+
+async fn corrections(State(app_state): State<JournalState>) -> Response {
+    let loaded = tokio::task::spawn_blocking(move || app_state.feed().load_corrections()).await;
+    match loaded {
+        Ok(Ok(events)) => render_or_500(render::corrections(&state::CorrectionsView::from_events(
+            events,
+        ))),
+        Ok(Err(error)) => notice(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            NoticeView::feed_error(&error.to_string()),
+        ),
+        Err(error) => notice(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            NoticeView::feed_error(&format!("corrections task failed: {error}")),
         ),
     }
 }
@@ -599,6 +617,14 @@ mod tests {
             "zero week-dreams must never read as an all-clear"
         );
         assert!(!body.contains("<script"), "home must work with JS off");
+    }
+
+    #[tokio::test]
+    async fn corrections_route_is_registered_as_a_read_page() {
+        let (status, _, body) = get_path(state_with(0), "/corrections").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("What changed the agent's course"));
+        assert!(body.contains("Nothing on record yet."));
     }
 
     #[tokio::test]

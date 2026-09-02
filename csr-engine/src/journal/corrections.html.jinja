@@ -1,0 +1,32 @@
+{% extends "layout.html" %}
+{% block title %}Corrections — CSR Dream Journal{% endblock %}
+{% block masthead_meta %}<span>intent-events</span>{% endblock %}
+{% block shell %}
+<div class="shell">
+  <aside class="sidebar">
+    <p class="rail-title">Journal</p>
+    <ul class="nav">
+      <li><a href="/">Dreams</a></li>
+      <li><a href="/board">Board</a></li>
+      <li><a class="current" href="/corrections">Corrections</a></li>
+    </ul>
+  </aside>
+  <main class="main"><div class="wrap">
+    <p class="eyebrow">Corrections</p>
+    <h1>What changed the agent's course</h1>
+    {% if view.events %}
+    <ul class="week-dreams">
+      {% for event in view.events %}
+      <li class="week-dream">
+        <p class="week-kicker">{{ event.kind }}{% if event.marker %} · {{ event.marker }}{% endif %}</p>
+        <p>{{ event.quote }}</p>
+        <p class="week-kicker">{{ event.session8 }}:{{ event.turn }} · <code>{{ event.byte_receipt }}</code></p>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p>Nothing on record yet.</p>
+    {% endif %}
+  </div></main>
+</div>
+{% endblock %}

@@ -103,8 +103,12 @@ pub const RECAP_SENTINEL: &str = "[[CSR:RECAP]]";
 /// a token.
 pub const DREAM_SENTINEL: &str = "[[CSR:DREAM]]";
 
+/// Marks machine-generated `csr-engine lessons` candidate blocks so pasted
+/// output cannot become new transcript evidence.
+pub const LESSONS_SENTINEL: &str = "[[CSR:LESSONS]]";
+
 /// Every machine-owned sentinel whose presence rejects the text outright.
-const MACHINE_SENTINELS: [&str; 2] = [RECAP_SENTINEL, DREAM_SENTINEL];
+pub(crate) const MACHINE_SENTINELS: [&str; 3] = [RECAP_SENTINEL, DREAM_SENTINEL, LESSONS_SENTINEL];
 
 /// Code points that render as zero-width/invisible. An adversarial re-paste
 /// can interleave these around or inside the sentinel to defeat a naive
@@ -472,6 +476,13 @@ mod tests {
         let long_preamble = "a".repeat(HEADER_WINDOW + 200);
         let text = format!("{long_preamble} trailing note {RECAP_SENTINEL} more text");
         assert!(is_csr_emission(&text));
+    }
+
+    #[test]
+    fn lessons_sentinel_rejects_machine_generated_candidates() {
+        let text = "human-looking preamble\n[[CSR:LESSONS]]\n- Never bypass checks";
+        assert!(is_csr_emission(text));
+        assert!(extractable(text).is_none());
     }
 
     #[test]

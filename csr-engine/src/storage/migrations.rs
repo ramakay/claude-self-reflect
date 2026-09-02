@@ -1379,6 +1379,18 @@ pub fn run(conn: &Connection) -> Result<()> {
             ON dream_deliveries(delivered_at);",
     )?;
 
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS correction_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_session8 TEXT NOT NULL,
+            source_turn INTEGER NOT NULL,
+            source_date TEXT NOT NULL,
+            target_session_id TEXT NOT NULL,
+            delivered_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(source_session8, source_turn, source_date, target_session_id)
+        );",
+    )?;
+
     // D5 one-shot backfill: rewrite worktree-local paths already stored in
     // code_evolution.file_path / code_nodes.file to canonical main-repo form.
     // Gated by `meta` so it runs exactly once per database, never on every

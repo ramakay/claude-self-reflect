@@ -22,19 +22,21 @@ use anyhow::{anyhow, Result};
 use minijinja::Environment;
 use serde::Serialize;
 
-use super::state::{BoardView, DetailView, ResolveReceipt};
+use super::state::{BoardView, CorrectionsView, DetailView, ResolveReceipt};
 
 const LAYOUT: &str = include_str!("layout.html.jinja");
 const LANDING: &str = include_str!("landing.html.jinja");
 const DREAMS: &str = include_str!("dreams.html.jinja");
 const DETAIL: &str = include_str!("detail.html.jinja");
 const NOTICE: &str = include_str!("notice.html.jinja");
+const CORRECTIONS: &str = include_str!("corrections.html.jinja");
 
 const LAYOUT_NAME: &str = "layout.html";
 const LANDING_NAME: &str = "landing.html";
 const DREAMS_NAME: &str = "dreams.html";
 const DETAIL_NAME: &str = "detail.html";
 const NOTICE_NAME: &str = "notice.html";
+const CORRECTIONS_NAME: &str = "corrections.html";
 
 /// One week-dream as rendered. Hypothesis is optional (clause drops).
 #[derive(Debug, Clone, Serialize)]
@@ -204,6 +206,7 @@ fn build_env() -> std::result::Result<Environment<'static>, String> {
         (DREAMS_NAME, DREAMS),
         (DETAIL_NAME, DETAIL),
         (NOTICE_NAME, NOTICE),
+        (CORRECTIONS_NAME, CORRECTIONS),
     ] {
         env.add_template(name, source)
             .map_err(|e| format!("compiling journal template {name}: {e}"))?;
@@ -240,6 +243,10 @@ pub fn detail(view: &DetailView) -> Result<String> {
 
 pub fn notice(view: &NoticeView) -> Result<String> {
     render(NOTICE_NAME, view)
+}
+
+pub fn corrections(view: &CorrectionsView) -> Result<String> {
+    render(CORRECTIONS_NAME, view)
 }
 
 #[cfg(test)]
@@ -825,5 +832,36 @@ mod tests {
         let html = dreams_home(&DreamsHomeView::from_week(dreams)).expect("render");
         assert!(html.contains("next move (dreamed)"));
         assert!(!html.contains("Also live this week"));
+    }
+
+    #[test]
+    fn corrections_page_renders_two_receipted_events() {
+        let view = crate::journal::state::CorrectionsView {
+            events: vec![
+                crate::journal::state::CorrectionEventView {
+                    quote: "Never bypass verification".into(),
+                    kind: "correction".into(),
+                    marker: Some("never".into()),
+                    session8: "abcdef12".into(),
+                    turn: 4,
+                    byte_receipt: "one.jsonl:10-35".into(),
+                },
+                crate::journal::state::CorrectionEventView {
+                    quote: "Use the other approach".into(),
+                    kind: "redirect".into(),
+                    marker: None,
+                    session8: "98765432".into(),
+                    turn: 8,
+                    byte_receipt: "two.jsonl:90-112".into(),
+                },
+            ],
+        };
+        let html = corrections(&view).expect("render");
+        assert!(html.contains("Never bypass verification"));
+        assert!(html.contains("correction"));
+        assert!(html.contains("abcdef12:4"));
+        assert!(html.contains("one.jsonl:10-35"));
+        assert!(html.contains("Use the other approach"));
+        assert!(html.contains("two.jsonl:90-112"));
     }
 }

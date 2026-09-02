@@ -279,6 +279,21 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Distill repeated user corrections into CLAUDE.md candidate lines.
+    Lessons {
+        /// Restrict candidates to this normalized project name.
+        #[arg(long)]
+        project: String,
+        /// Ignore events older than this UTC date (YYYY-MM-DD).
+        #[arg(long)]
+        since: Option<String>,
+        /// Minimum number of distinct sessions represented by a group.
+        #[arg(long, default_value_t = 2)]
+        min_sessions: usize,
+        /// Emit structured groups and all byte receipts as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run one v10 "dreaming" cycle: HEAD stamp-spans, then the
     /// deterministic successor join over the witness ledger, emitting
     /// `witness_verdicts` events (anchor_obsolete / superseded_by /
@@ -540,6 +555,30 @@ async fn main() -> Result<()> {
 
     if let Some(Commands::Telemetry { since, json, tui }) = args.command {
         return csr_engine::telemetry::handle(&args.db_path, &args.projects_dir, since, json, tui);
+    }
+
+    if let Some(Commands::Lessons {
+        project,
+        since,
+        min_sessions,
+        json,
+    }) = args.command
+    {
+        let storage = csr_engine::storage::Storage::open_read_only(&args.db_path)?;
+        print!(
+            "{}",
+            csr_engine::eval::lessons::handle(
+                &storage,
+                &project,
+                since.as_deref(),
+                min_sessions,
+                json,
+            )?
+        );
+        if json {
+            println!();
+        }
+        return Ok(());
     }
 
     if let Some(Commands::AuditRerankLabels {

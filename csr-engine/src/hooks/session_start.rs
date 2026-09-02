@@ -847,6 +847,13 @@ fn format_session_start_tier0(
                 tracing::debug!(%error, "session-start recap proposal feed unavailable");
                 0
             });
+        let correction_since = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+        let corrections = storage
+            .recap_corrections(project, &correction_since, 2)
+            .unwrap_or_else(|error| {
+                tracing::debug!(%error, "session-start recap correction feed unavailable");
+                Vec::new()
+            });
         // Journal v4 P5 delivery channel (b). The feed is read here but the
         // delivery is recorded below, and only if the composed paragraph
         // actually carries the clause — the composer drops clauses that do
@@ -869,6 +876,7 @@ fn format_session_start_tier0(
             settled,
             still_open,
             retired_while_away,
+            corrections,
             open_proposals,
             top_dream,
         };
@@ -881,6 +889,15 @@ fn format_session_start_tier0(
                     crate::storage::dream_delivery::DeliveryChannel::Recap,
                     Some(&ep.session_id),
                 );
+            }
+        }
+        if let Some(text) = composed.as_deref() {
+            if text.contains(crate::hooks::recap::CORRECTION_CLAUSE_PREFIX) {
+                if let Err(error) =
+                    storage.record_correction_deliveries(&ep.session_id, &feeds.corrections, text)
+                {
+                    tracing::debug!(%error, "session-start correction delivery receipt unavailable");
+                }
             }
         }
         composed
@@ -2149,6 +2166,50 @@ mod tests {
         assert!(!block.contains("LAST:"));
         assert!(block.contains("ANCHORS: 1 intact, 0 modified since checkpoint"));
         assert!(block.contains(r#"Full state: csr_reflect_on_past("conv_s")"#));
+    }
+
+    #[test]
+    fn session_start_recap_shows_recent_correction_and_receipts_delivery() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let ep = minimal_episode("Fix verification", "Kept the checks", None);
+        let source_session = "12345678-source";
+        storage
+            .insert_intent_events(&[crate::transcript::intent_events::IntentEvent {
+                session_id: source_session.into(),
+                project: ep.project.clone(),
+                turn: 6,
+                kind: crate::transcript::intent_events::IntentEventKind::Correction,
+                quote: "Never bypass verification".into(),
+                transcript_path: std::path::PathBuf::from("/tmp/csr-b3/recent.jsonl"),
+                byte_start: 10,
+                byte_end: 35,
+                prior_claim: String::new(),
+                symbol: None,
+                file: None,
+                classifier_hash: "fixture".into(),
+                detector: None,
+                classifier_score: None,
+                marker: Some("never".into()),
+                ts: Utc::now().to_rfc3339(),
+            }])
+            .unwrap();
+
+        let block = format_session_start_tier0(&storage, &ep.project, &ep, &[], "now");
+
+        assert!(block.contains("Corrected: Never bypass verification (12345678:6,"));
+        assert!(block.chars().count() <= 700 + 300);
+        let delivered: i64 = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM correction_deliveries WHERE target_session_id = ?1",
+                    [&ep.session_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(delivered, 1);
     }
 
     #[test]

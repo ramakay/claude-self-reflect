@@ -8,6 +8,7 @@
 pub mod bench;
 pub mod codegraph;
 pub mod continuity;
+pub mod lessons;
 pub mod provenance;
 pub mod trained_rerank;
 

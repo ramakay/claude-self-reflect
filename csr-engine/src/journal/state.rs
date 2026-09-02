@@ -71,6 +71,47 @@ pub const MAX_LEDGER_ROWS: usize = 40;
 /// The origin tag every write this surface makes carries (locked decision 4).
 pub const JOURNAL_ORIGIN: &str = "journal_ui";
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CorrectionsView {
+    pub events: Vec<CorrectionEventView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CorrectionEventView {
+    pub quote: String,
+    pub kind: String,
+    pub marker: Option<String>,
+    pub session8: String,
+    pub turn: u32,
+    pub byte_receipt: String,
+}
+
+impl CorrectionsView {
+    pub fn from_events(events: Vec<crate::transcript::intent_events::IntentEvent>) -> Self {
+        let events = events
+            .into_iter()
+            .rev()
+            .take(50)
+            .map(|event| {
+                let basename = event
+                    .transcript_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("transcript");
+                CorrectionEventView {
+                    quote: event.quote,
+                    kind: event.kind.as_str().to_string(),
+                    marker: event.marker,
+                    session8: event.session_id.chars().take(8).collect(),
+                    turn: event.turn,
+                    byte_receipt: format!("{basename}:{}-{}", event.byte_start, event.byte_end),
+                }
+            })
+            .collect();
+        Self { events }
+    }
+}
+
 // --- board columns (P2b) -----------------------------------------------------
 
 /// The three evidence-maturity columns, left→right by **descending
@@ -355,6 +396,10 @@ pub trait DreamFeed: Send + Sync + 'static {
         &self,
         _now: DateTime<Utc>,
     ) -> Result<Vec<crate::journal::week::WeekDream>> {
+        Ok(Vec::new())
+    }
+
+    fn load_corrections(&self) -> Result<Vec<crate::transcript::intent_events::IntentEvent>> {
         Ok(Vec::new())
     }
 
@@ -662,6 +707,10 @@ impl DreamFeed for StorageDreamFeed {
     fn load_week_dreams(&self, now: DateTime<Utc>) -> Result<Vec<crate::journal::week::WeekDream>> {
         self.storage
             .with_connection(|conn| crate::journal::week::load_week_dreams(conn, now))
+    }
+
+    fn load_corrections(&self) -> Result<Vec<crate::transcript::intent_events::IntentEvent>> {
+        self.storage.list_intent_events(None, None)
     }
 
     fn detail_context(&self, item: &DreamItem) -> Result<DetailContext> {

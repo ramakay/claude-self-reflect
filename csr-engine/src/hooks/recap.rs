@@ -44,6 +44,14 @@ pub struct RetiredLine {
     pub date: String,
 }
 
+/// A recent user correction with its transcript receipt.
+pub struct CorrectionLine {
+    pub quote: String,
+    pub session8: String,
+    pub turn: u32,
+    pub date: String,
+}
+
 /// Evidence feeds supplied by storage.
 ///
 /// Feed text is trusted, already-curated database content: its semantic content
@@ -53,6 +61,7 @@ pub struct RecapFeeds {
     pub settled: Vec<SettledFact>,
     pub still_open: Vec<SettledFact>,
     pub retired_while_away: Vec<RetiredLine>,
+    pub corrections: Vec<CorrectionLine>,
     pub open_proposals: usize,
     /// The top undelivered dream for this project, or `None`. `None` drops
     /// the `Dreamt:` clause entirely — the clause is never emitted with a
@@ -65,6 +74,7 @@ pub struct RecapFeeds {
 /// recording a delivery — recording one for a clause that got dropped would
 /// claim the user was shown something they were not.
 pub const DREAM_CLAUSE_PREFIX: &str = "Dreamt: ";
+pub const CORRECTION_CLAUSE_PREFIX: &str = "Corrected: ";
 
 /// Compose an evidence-backed recap without reading external state.
 pub fn compose_recap(
@@ -167,6 +177,21 @@ pub fn compose_recap(
         .collect();
     let next_line = next.map(|next| format!("Next: {next}."));
 
+    let correction_entries: Vec<String> = feeds
+        .corrections
+        .iter()
+        .take(2)
+        .map(|line| {
+            format!(
+                "{} ({}:{}, {})",
+                compact_preview(&normalize_feed_text(&line.quote), 90),
+                normalize_feed_text(&line.session8),
+                line.turn,
+                normalize_feed_text(&line.date)
+            )
+        })
+        .collect();
+
     // Journal v4 P5 delivery channel (b): one clause naming the top dream and
     // its receipt. Same evidence gating as every other clause — no feed, no
     // clause; and the feed itself cannot carry a receiptless conclusion.
@@ -192,6 +217,7 @@ pub fn compose_recap(
     let mut clauses = [
         ListClause::new("Settled: ", "; ", settled_entries),
         ListClause::new("Now: ", " | ", now_parts),
+        ListClause::new(CORRECTION_CLAUSE_PREFIX, "; ", correction_entries),
         ListClause::new("Learnt-then-retired while away: ", "; ", retired_entries),
         ListClause::new(DREAM_CLAUSE_PREFIX, "; ", dream_entries),
     ];
@@ -592,6 +618,7 @@ mod tests {
                 receipt_oid: "77fedca".into(),
                 date: "2026-08-06".into(),
             }],
+            corrections: vec![],
             open_proposals: 2,
             top_dream: None,
         }
@@ -854,6 +881,7 @@ mod tests {
                 receipt_oid: "retired-receipt".into(),
                 date: "2026-08-07".into(),
             }],
+            corrections: vec![],
             open_proposals: 8,
             top_dream: None,
         };
@@ -961,6 +989,7 @@ mod tests {
                 receipt_oid: "77fedca".into(),
                 date: "2026-08-06".into(),
             }],
+            corrections: vec![],
             open_proposals: 3,
             top_dream: None,
         };
@@ -1001,6 +1030,7 @@ mod tests {
                 settled: vec![],
                 still_open: vec![],
                 retired_while_away: vec![],
+                corrections: vec![],
                 open_proposals: 0,
                 top_dream: None,
             }
@@ -1102,6 +1132,33 @@ mod tests {
             got.contains("Dreamt: parse_config went stale (2026-08-11, abc1234)."),
             "clause missing or unreceipted: {got}"
         );
+    }
+
+    #[test]
+    fn correction_clause_follows_now_with_bounded_quote_and_receipt() {
+        let feeds = RecapFeeds {
+            corrections: vec![CorrectionLine {
+                quote: "Never bypass verification, even when the quote is deliberately made much longer than ninety characters for this regression".into(),
+                session8: "abcdef12".into(),
+                turn: 9,
+                date: "2026-09-01".into(),
+            }],
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        let now = got.find("Now: ").unwrap();
+        let corrected = got.find("Corrected: ").unwrap();
+        assert!(now < corrected, "{got}");
+        assert!(got.contains("(abcdef12:9, 2026-09-01)."), "{got}");
+        let entry = got
+            .split("Corrected: ")
+            .nth(1)
+            .unwrap()
+            .split(" (")
+            .next()
+            .unwrap();
+        assert!(entry.chars().count() <= 90, "{entry:?}");
+        assert!(got.chars().count() <= 700);
     }
 
     #[test]

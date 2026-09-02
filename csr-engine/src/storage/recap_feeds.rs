@@ -8,7 +8,7 @@ use rusqlite::params;
 
 use super::dream_delivery::{self, DeliveryChannel, DreamHeadline};
 use super::Storage;
-use crate::hooks::recap::{DreamClause, RetiredLine, SettledFact};
+use crate::hooks::recap::{CorrectionLine, DreamClause, RetiredLine, SettledFact};
 
 const LEDGER_FEED_LIMIT: i64 = 5;
 const RETIRED_FEED_LIMIT: i64 = 3;
@@ -59,6 +59,74 @@ fn shorten_receipt(evidence: &str) -> String {
 }
 
 impl Storage {
+    /// Newest correction/redirect receipts for the project since `since_ts`.
+    pub fn recap_corrections(
+        &self,
+        project: &str,
+        since_ts: &str,
+        limit: usize,
+    ) -> Result<Vec<CorrectionLine>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock: {error}"))?;
+        let mut statement = conn.prepare(
+            "SELECT quote, session_id, turn, SUBSTR(datetime(ts), 1, 10)
+             FROM intent_events
+             WHERE project = ?1
+               AND kind IN ('correction', 'redirect')
+               AND julianday(ts) >= julianday(?2)
+             ORDER BY julianday(ts) DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement
+            .query_map(params![project, since_ts, i64::try_from(limit)?], |row| {
+                let quote: String = row.get(0)?;
+                let session_id: String = row.get(1)?;
+                let turn: i64 = row.get(2)?;
+                Ok(CorrectionLine {
+                    quote: quote.chars().take(90).collect(),
+                    session8: session_id.chars().take(8).collect(),
+                    turn: u32::try_from(turn).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
+                    date: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Record only correction entries proven to be present in a composed recap.
+    pub fn record_correction_deliveries(
+        &self,
+        target_session_id: &str,
+        corrections: &[CorrectionLine],
+        composed: &str,
+    ) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock: {error}"))?;
+        let mut recorded = 0;
+        for line in corrections {
+            let marker = format!("({}:{}, {})", line.session8, line.turn, line.date);
+            if composed.contains(&marker) {
+                recorded += conn.execute(
+                    "INSERT OR IGNORE INTO correction_deliveries
+                        (source_session8, source_turn, source_date, target_session_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![line.session8, line.turn, line.date, target_session_id],
+                )?;
+            }
+        }
+        Ok(recorded)
+    }
+
     /// Resolution ledger evidence for the previous conversation and current
     /// project. The highest ledger id is the current verdict for a chunk.
     pub fn recap_ledger_feeds(
@@ -301,6 +369,95 @@ fn settled_fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SettledFac
 mod tests {
     use super::*;
     use crate::storage::Storage;
+    use crate::transcript::intent_events::{IntentEvent, IntentEventKind};
+    use std::path::PathBuf;
+
+    fn intent_event(
+        session: &str,
+        project: &str,
+        turn: u32,
+        kind: IntentEventKind,
+        quote: &str,
+        ts: &str,
+    ) -> IntentEvent {
+        IntentEvent {
+            session_id: session.into(),
+            project: project.into(),
+            turn,
+            kind,
+            quote: quote.into(),
+            transcript_path: PathBuf::from(format!("/tmp/{session}.jsonl")),
+            byte_start: 1,
+            byte_end: 2,
+            prior_claim: String::new(),
+            symbol: None,
+            file: None,
+            classifier_hash: "v1".into(),
+            detector: None,
+            classifier_score: None,
+            marker: None,
+            ts: ts.into(),
+        }
+    }
+
+    #[test]
+    fn correction_feed_is_project_scoped_recent_bounded_and_newest_first() {
+        let storage = Storage::open_memory().unwrap();
+        let events = vec![
+            intent_event(
+                "aaaaaaaa-old",
+                "p",
+                1,
+                IntentEventKind::Correction,
+                "old",
+                "2026-08-20T00:00:00Z",
+            ),
+            intent_event(
+                "bbbbbbbb-new",
+                "p",
+                2,
+                IntentEventKind::Redirect,
+                &"q".repeat(120),
+                "2026-09-01T12:00:00Z",
+            ),
+            intent_event(
+                "cccccccc-next",
+                "p",
+                3,
+                IntentEventKind::Correction,
+                "second",
+                "2026-08-31T12:00:00Z",
+            ),
+            intent_event(
+                "dddddddd-drop",
+                "p",
+                4,
+                IntentEventKind::Abandoned,
+                "abandoned",
+                "2026-09-01T13:00:00Z",
+            ),
+            intent_event(
+                "eeeeeeee-other",
+                "other",
+                5,
+                IntentEventKind::Correction,
+                "other",
+                "2026-09-01T14:00:00Z",
+            ),
+        ];
+        storage.insert_intent_events(&events).unwrap();
+
+        let got = storage
+            .recap_corrections("p", "2026-08-25T00:00:00Z", 2)
+            .unwrap();
+
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].session8, "bbbbbbbb");
+        assert_eq!(got[0].turn, 2);
+        assert_eq!(got[0].date, "2026-09-01");
+        assert_eq!(got[0].quote.chars().count(), 90);
+        assert_eq!(got[1].session8, "cccccccc");
+    }
 
     fn seed_chunk(storage: &Storage, id: &str, conversation: &str, project: &str) {
         storage
@@ -769,6 +926,7 @@ mod tests {
             settled: vec![],
             still_open: vec![],
             retired_while_away,
+            corrections: vec![],
             open_proposals: 0,
             top_dream: None,
         };
