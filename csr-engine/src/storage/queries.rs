@@ -70,7 +70,7 @@ pub(crate) fn parent_provenance_context(
                 "SELECT event_id, trust_tier
                    FROM provenance_events
                   WHERE conversation_id = ?1 AND message_key = ?2
-                  ORDER BY CASE WHEN channel IN ('assistant_message', 'codex_assistant')
+                  ORDER BY trust_tier, CASE WHEN channel IN ('assistant_message', 'codex_assistant')
                                 THEN 0 ELSE 1 END,
                            event_id
                   LIMIT 1",
@@ -100,9 +100,45 @@ pub(crate) fn parent_provenance_context(
 /// transaction. Re-importing a growing final chunk cannot leave stale spans.
 pub fn replace_chunk_evidence(conn: &Connection, evidence: &ChunkEvidence) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
+    let relink = evidence_needs_relink(&tx, evidence)?;
     replace_chunk_evidence_inner(&tx, evidence)?;
+    if relink {
+        super::sidechain_provenance::relink_conversations(
+            &tx,
+            &evidence
+                .events
+                .iter()
+                .map(|e| e.conversation_id.clone())
+                .collect::<Vec<_>>(),
+        )?;
+    } else {
+        super::artifact_provenance::lower_descendants(&tx)?;
+    }
     tx.commit()?;
     Ok(())
+}
+
+fn evidence_needs_relink(conn: &Connection, evidence: &ChunkEvidence) -> Result<bool> {
+    for event in &evidence.events {
+        if event.parent_event_id.is_some() {
+            return Ok(true);
+        }
+        let (session,message):(Option<i64>,Option<i64>)=conn.query_row("SELECT MIN(trust_tier),MIN(CASE WHEN message_key=?2 THEN trust_tier END) FROM provenance_events WHERE conversation_id=?1",params![event.conversation_id,event.message_key],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        if session.is_none()
+            || session.is_some_and(|t| t > event.trust_tier.as_i64())
+            || message.is_some_and(|t| t > event.trust_tier.as_i64())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(conn
+        .query_row(
+            "SELECT is_sidechain FROM chunks WHERE id=?1",
+            [&evidence.chunk_id],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false))
 }
 
 pub fn replace_chunk_evidence_batch(conn: &Connection, evidence: &[ChunkEvidence]) -> Result<()> {
@@ -111,6 +147,7 @@ pub fn replace_chunk_evidence_batch(conn: &Connection, evidence: &[ChunkEvidence
         replace_chunk_evidence_inner(&tx, row)
             .with_context(|| format!("persisting provenance for chunk {}", row.chunk_id))?;
     }
+    super::sidechain_provenance::relink(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -144,6 +181,9 @@ pub fn replace_backfill_evidence_batch(
             replace_chunk_evidence_inner(&tx, row)?;
             written += 1;
         }
+    }
+    if written > 0 {
+        super::sidechain_provenance::relink(&tx)?;
     }
     tx.commit()?;
     Ok(written)
@@ -579,6 +619,9 @@ pub fn rescope_sidechain_conversation(
         |row| row.get::<_, i64>(0),
     )? != 0;
     if !needs_repair {
+        let tx = conn.transaction()?;
+        super::sidechain_provenance::relink_conversations(&tx, &[conversation_id.into()])?;
+        tx.commit()?;
         return Ok(());
     }
     let tx = conn.transaction()?;
@@ -595,6 +638,7 @@ pub fn rescope_sidechain_conversation(
          ON CONFLICT(chunk_id) DO UPDATE SET source_conv_id = excluded.source_conv_id",
         params![conversation_id, parent_conversation_id],
     )?;
+    super::sidechain_provenance::relink_conversations(&tx, &[conversation_id.into()])?;
     tx.commit()?;
     Ok(())
 }
@@ -3162,6 +3206,72 @@ pub fn insert_resolutions(
     }
     tx.commit()?;
     Ok(chunk_ids.len())
+}
+
+/// Caller owns the transaction containing the immutable local confirmation,
+/// ledger payload, derivation edges and (for the journal) UI audit row.
+pub(crate) fn append_resolutions_with_confirmation(
+    conn: &Connection,
+    chunk_ids: &[String],
+    status: &str,
+    evidence: &str,
+    claim: Option<&str>,
+    confirmation: Option<&crate::provenance::ResolutionConfirmation>,
+) -> Result<(usize, &'static str)> {
+    use crate::storage::artifact_provenance::{
+        record_inputs, ArtifactInput, ArtifactKind, InputEnvelope,
+    };
+    let payload =
+        crate::provenance::ResolutionConfirmationPayload::new(chunk_ids, status, claim, evidence);
+    let confirmation = confirmation.filter(|c| c.matches(&payload));
+    let source = if confirmation.is_some() {
+        RESOLUTION_SOURCE_USER_CONFIRMED
+    } else {
+        RESOLUTION_SOURCE_AGENT
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let event = confirmation
+        .filter(|_| !chunk_ids.is_empty())
+        .map(|confirmation| {
+            let id = format!("confirmation:{}", uuid::Uuid::new_v4());
+            ProvenanceEvent {
+                event_id: id.clone(),
+                conversation_id: id,
+                message_key: payload.digest().into(),
+                seq: 0,
+                channel: "user_confirmation".into(),
+                trust_tier: TrustTier::UserConfirmed,
+                parent_event_id: None,
+                receipt_kind: confirmation.receipt_kind().into(),
+                receipt_ref: Some(payload.digest().into()),
+                observed_at: now.clone(),
+            }
+        });
+    if let Some(event) = &event {
+        insert_provenance_event(conn, event)?;
+    }
+    for chunk_id in chunk_ids {
+        conn.execute("INSERT INTO resolution_ledger(chunk_id,status,evidence,claim,source,created_at,event_id) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![chunk_id,status,evidence,claim,source,now,event.as_ref().map(|e|&e.event_id)])?;
+        let id = conn.last_insert_rowid().to_string();
+        if let Some(event) = &event {
+            let input = ArtifactInput::observed(
+                event.clone(),
+                payload.canonical_json(),
+                0,
+                payload.canonical_json().chars().count(),
+                crate::provenance::content_hash(payload.canonical_json()),
+            );
+            let body = serde_json::json!([claim, evidence]).to_string();
+            record_inputs(
+                conn,
+                ArtifactKind::Resolution,
+                &id,
+                &body,
+                &InputEnvelope::new(vec![input]),
+            )?;
+        }
+    }
+    Ok((chunk_ids.len(), source))
 }
 
 /// Batch-fetch the latest user-confirmed resolution entry per chunk id.

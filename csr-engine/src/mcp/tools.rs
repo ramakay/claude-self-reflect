@@ -1312,7 +1312,7 @@ pub async fn resolve_chunks(
     status: String,
     evidence: String,
     claim: Option<String>,
-    source: &str,
+    confirmation: Option<&crate::provenance::ResolutionConfirmation>,
 ) -> Result<String> {
     if !matches!(status.as_str(), "resolved" | "still_open" | "regressed") {
         anyhow::bail!(
@@ -1327,7 +1327,13 @@ pub async fn resolve_chunks(
         anyhow::bail!("evidence must not be empty");
     }
 
-    let n = storage.insert_resolutions(&chunk_ids, &status, &evidence, claim.as_deref(), source)?;
+    let (n, source) = storage.insert_resolutions_with_confirmation(
+        &chunk_ids,
+        &status,
+        &evidence,
+        claim.as_deref(),
+        confirmation,
+    )?;
 
     Ok(format!(
         "recorded {} verdict(s): {} (source: {})",

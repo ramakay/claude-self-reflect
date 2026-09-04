@@ -1,4 +1,6 @@
 pub mod ancestry;
+pub mod artifact_backfill;
+pub mod artifact_provenance;
 pub mod chunk_binding;
 pub mod codegraph;
 pub mod dream_attribution;
@@ -11,6 +13,7 @@ pub mod intent_events;
 pub mod migrations;
 pub mod queries;
 pub mod recap_feeds;
+pub mod sidechain_provenance;
 pub mod trained_rerank;
 pub mod usage_reservation;
 pub mod witness_ledger;
@@ -46,6 +49,28 @@ pub struct ContaminationMeasurement {
 }
 
 impl Storage {
+    pub fn insert_resolutions_with_confirmation(
+        &self,
+        chunk_ids: &[String],
+        status: &str,
+        evidence: &str,
+        claim: Option<&str>,
+        confirmation: Option<&crate::provenance::ResolutionConfirmation>,
+    ) -> Result<(usize, &'static str)> {
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let result = queries::append_resolutions_with_confirmation(
+                &tx,
+                chunk_ids,
+                status,
+                evidence,
+                claim,
+                confirmation,
+            )?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
     /// Run an internal read or write operation while holding the SQLite mutex.
     ///
     /// Kept crate-private so diagnostics can take consistent multi-table
@@ -105,8 +130,12 @@ impl Storage {
         &self,
         events: &[crate::transcript::intent_events::IntentEvent],
     ) -> Result<usize> {
+        let inputs = artifact_backfill::prepare_intent_inputs(self, events);
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        intent_events::insert(&conn, events)
+        let savepoint = conn.unchecked_transaction()?;
+        let count = intent_events::insert_with_inputs(&savepoint, events, &inputs)?;
+        savepoint.commit()?;
+        Ok(count)
     }
 
     pub fn list_intent_events(
@@ -321,7 +350,11 @@ impl Storage {
         embedding: &[f32],
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::insert_reflection(&conn, id, content, tags, embedding)
+        let tx = conn.unchecked_transaction()?;
+        queries::insert_reflection(&tx, id, content, tags, embedding)?;
+        artifact_provenance::lower_descendants(&tx)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn load_all_chunk_ids(&self) -> Result<Vec<String>> {
@@ -515,7 +548,11 @@ impl Storage {
 
     pub fn delete_reflection(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::delete_reflection(&conn, id)
+        let tx = conn.unchecked_transaction()?;
+        queries::delete_reflection(&tx, id)?;
+        artifact_provenance::lower_descendants(&tx)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get_enrichment_reflection_id(

@@ -34,11 +34,22 @@ fn parse_detector(value: Option<String>) -> rusqlite::Result<Option<IntentDetect
     }
 }
 
+#[cfg(test)]
 pub(crate) fn insert(conn: &Connection, events: &[IntentEvent]) -> Result<usize> {
     let transaction = conn.unchecked_transaction()?;
+    let inserted = insert_with_inputs(&transaction, events, &[])?;
+    transaction.commit()?;
+    Ok(inserted)
+}
+
+pub(crate) fn insert_with_inputs(
+    conn: &Connection,
+    events: &[IntentEvent],
+    inputs: &[super::artifact_provenance::InputEnvelope],
+) -> Result<usize> {
     let mut inserted = 0usize;
     {
-        let mut statement = transaction.prepare_cached(
+        let mut statement = conn.prepare_cached(
             "INSERT OR IGNORE INTO intent_events
              (session_id, project, turn, kind, quote, transcript_path,
               byte_start, byte_end, prior_claim, symbol, file, classifier_hash,
@@ -46,12 +57,12 @@ pub(crate) fn insert(conn: &Connection, events: &[IntentEvent]) -> Result<usize>
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                      ?13, ?14, ?15, ?16)",
         )?;
-        for event in events {
+        for (index, event) in events.iter().enumerate() {
             let canonical_path = event
                 .transcript_path
                 .canonicalize()
                 .unwrap_or_else(|_| event.transcript_path.clone());
-            inserted += statement.execute(params![
+            let added = statement.execute(params![
                 event.session_id,
                 event.project,
                 i64::from(event.turn),
@@ -69,9 +80,12 @@ pub(crate) fn insert(conn: &Connection, events: &[IntentEvent]) -> Result<usize>
                 event.marker,
                 event.ts,
             ])?;
+            inserted += added;
+            if let Some(input) = inputs.get(index).filter(|_| added > 0) {
+                super::artifact_backfill::record_intent(conn, event, input)?;
+            }
         }
     }
-    transaction.commit()?;
     Ok(inserted)
 }
 

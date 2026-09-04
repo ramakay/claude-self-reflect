@@ -15,9 +15,6 @@
 use rmcp::model::{ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationSchema};
 use rmcp::service::RequestContext;
 use rmcp::RoleServer;
-use serde::Serialize;
-use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
 
 use crate::storage::queries::{RESOLUTION_SOURCE_AGENT, RESOLUTION_SOURCE_USER_CONFIRMED};
 
@@ -66,50 +63,7 @@ pub async fn request_confirmation(content: &str, context: &RequestContext<RoleSe
     }
 }
 
-/// Exact ledger payload shown to the user and echoed by a confirming client.
-/// Field order is part of the canonical JSON and therefore part of its digest.
-#[derive(Debug)]
-pub struct ResolutionConfirmationPayload {
-    canonical_json: String,
-    digest: String,
-}
-
-#[derive(Serialize)]
-struct CanonicalResolutionPayload<'a> {
-    chunk_ids: &'a [String],
-    status: &'a str,
-    claim: Option<&'a str>,
-    evidence: &'a str,
-}
-
-impl ResolutionConfirmationPayload {
-    pub fn new(chunk_ids: &[String], status: &str, claim: Option<&str>, evidence: &str) -> Self {
-        let canonical_json = serde_json::to_string(&CanonicalResolutionPayload {
-            chunk_ids,
-            status,
-            claim,
-            evidence,
-        })
-        .expect("resolution payload serialization is infallible");
-        let digest_bytes = Sha256::digest(canonical_json.as_bytes());
-        let mut digest = String::with_capacity(digest_bytes.len() * 2);
-        for byte in digest_bytes {
-            write!(&mut digest, "{byte:02x}").expect("writing to String is infallible");
-        }
-        Self {
-            canonical_json,
-            digest,
-        }
-    }
-
-    pub fn canonical_json(&self) -> &str {
-        &self.canonical_json
-    }
-
-    pub fn digest(&self) -> &str {
-        &self.digest
-    }
-}
+pub use crate::provenance::ResolutionConfirmationPayload;
 
 /// Classify an elicitation response conservatively. This records a local
 /// authority event for this exact resolution-ledger payload only. It does not
@@ -153,7 +107,7 @@ fn resolution_source_from_response<E>(
 pub async fn request_resolution_confirmation(
     payload: &ResolutionConfirmationPayload,
     context: &RequestContext<RoleServer>,
-) -> &'static str {
+) -> Option<crate::provenance::ResolutionConfirmation> {
     let canonical_json = payload.canonical_json().to_string();
     let digest = payload.digest().to_string();
     let message = format!(
@@ -167,7 +121,7 @@ pub async fn request_resolution_confirmation(
         .required_string_with("payload_digest", |value| value.with_default(digest))
         .build();
     let Ok(schema) = schema else {
-        return RESOLUTION_SOURCE_AGENT;
+        return None;
     };
     let params = ElicitRequestParams::FormElicitationParams {
         meta: None,
@@ -178,7 +132,15 @@ pub async fn request_resolution_confirmation(
         .peer
         .create_elicitation_with_timeout(params, Some(std::time::Duration::from_secs(30)))
         .await;
-    resolution_source_from_response(payload, response)
+    resolution_confirmation_from_response(payload, response)
+}
+
+fn resolution_confirmation_from_response<E>(
+    payload: &ResolutionConfirmationPayload,
+    response: Result<ElicitResult, E>,
+) -> Option<crate::provenance::ResolutionConfirmation> {
+    (resolution_source_from_response(payload, response) == RESOLUTION_SOURCE_USER_CONFIRMED)
+        .then(|| crate::provenance::ResolutionConfirmation::elicited(payload.clone()))
 }
 
 #[cfg(test)]
@@ -210,6 +172,52 @@ mod tests {
             Some("the claim"),
             "commit abc",
         )
+    }
+
+    #[test]
+    fn confirmation_persists_a_new_immutable_event_and_mismatch_stays_agent() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let payload = sample_resolution_payload();
+        for _ in 0..2 {
+            let accepted=ElicitResult::new(ElicitationAction::Accept).with_content(serde_json::json!({"confirm":true,"canonical_payload":payload.canonical_json(),"payload_digest":payload.digest()}));
+            let receipt =
+                resolution_confirmation_from_response(&payload, Ok::<_, &str>(accepted)).unwrap();
+            let (count, source) = storage
+                .insert_resolutions_with_confirmation(
+                    &["chunk-2".into(), "chunk-1".into()],
+                    "resolved",
+                    "commit abc",
+                    Some("the claim"),
+                    Some(&receipt),
+                )
+                .unwrap();
+            assert_eq!((count, source), (2, RESOLUTION_SOURCE_USER_CONFIRMED));
+            let (_, source) = storage
+                .insert_resolutions_with_confirmation(
+                    &["changed".into()],
+                    "resolved",
+                    "commit abc",
+                    Some("the claim"),
+                    Some(&receipt),
+                )
+                .unwrap();
+            assert_eq!(source, RESOLUTION_SOURCE_AGENT);
+        }
+        storage.with_connection(|c| {
+            let events:i64=c.query_row("SELECT COUNT(*) FROM provenance_events WHERE channel='user_confirmation' AND trust_tier=4 AND receipt_kind='elicitation_digest' AND receipt_ref=?1",[payload.digest()],|r|r.get(0))?;
+            assert_eq!(events,2,"later confirmations append new immutable events");
+            let supported:i64=c.query_row("SELECT COUNT(*) FROM resolution_ledger r JOIN provenance_events e ON e.event_id=r.event_id WHERE r.min_trust=4 AND r.source='user_confirmed'",[],|r|r.get(0))?;
+            assert_eq!(supported,4);
+            let unsupported:i64=c.query_row("SELECT COUNT(*) FROM resolution_ledger WHERE source='agent' AND min_trust=0 AND event_id IS NULL",[],|r|r.get(0))?;
+            assert_eq!(unsupported,2);
+            assert!(c.execute("UPDATE provenance_events SET receipt_ref='changed' WHERE channel='user_confirmation'",[]).is_err());
+            Ok(())
+        }).unwrap();
+        assert!(resolution_confirmation_from_response(
+            &payload,
+            Err::<ElicitResult, _>("unsupported client")
+        )
+        .is_none());
     }
 
     #[test]

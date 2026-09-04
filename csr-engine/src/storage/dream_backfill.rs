@@ -32,7 +32,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 /// A fully materialized `episode_index` row.
@@ -153,6 +153,48 @@ fn open_todo_count(todos: &[EpisodeTodo]) -> i64 {
 /// `journal::composer`, `storage::dream_items` and `storage::dream_clusters`
 /// to select episode reflections — reused here rather than invented fresh.
 pub fn materialize_episode_index(conn: &Connection) -> Result<MaterializeStats> {
+    super::artifact_provenance::atomic_write(conn, materialize_episode_index_inner)
+}
+
+pub(crate) fn projection_matches_source(conn: &Connection, id: &str) -> Result<bool> {
+    let source: Option<(String, String)> = conn
+        .query_row(
+            "SELECT content,timestamp FROM reflections WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((content, ts)) = source else {
+        return Ok(false);
+    };
+    let Ok(record) = serde_json::from_str::<EpisodeRecord>(&content) else {
+        return Ok(false);
+    };
+    let expected = EpisodeIndexRow {
+        episode_id: id.into(),
+        session_id: record.session_id,
+        project: record.project.clone(),
+        ts: if record.timestamp.trim().is_empty() {
+            ts
+        } else {
+            record.timestamp
+        },
+        outcome: record.outcome,
+        request: record.request,
+        completed: record.completed,
+        next_steps: record.next_steps.filter(|s| !s.trim().is_empty()),
+        blockers: record.blockers.filter(|s| !s.trim().is_empty()),
+        todo_count: open_todo_count(&record.todos),
+        files_json: serde_json::to_string(&record.files_modified)?,
+        anchors_json: serde_json::to_string(&record.anchors)?,
+        prev_episode_id: record.prev_episode_id.filter(|s| !s.trim().is_empty()),
+    };
+    Ok(load_project_rows(conn, &record.project)?
+        .iter()
+        .any(|row| row == &expected))
+}
+
+fn materialize_episode_index_inner(conn: &Connection) -> Result<MaterializeStats> {
     let rows: Vec<(String, String, String)> = {
         let mut stmt = conn.prepare(
             "SELECT id, content, timestamp FROM reflections
@@ -234,6 +276,17 @@ pub fn materialize_episode_index(conn: &Connection) -> Result<MaterializeStats> 
             anchors_json,
             prev_episode_id,
         ])?;
+        let parent = super::artifact_provenance::artifact_input(
+            conn,
+            super::artifact_provenance::ArtifactKind::Reflection,
+            &id,
+        )?;
+        super::artifact_provenance::record_stored_inputs(
+            conn,
+            super::artifact_provenance::ArtifactKind::EpisodeIndex,
+            &id,
+            &super::artifact_provenance::InputEnvelope::new(vec![parent]),
+        )?;
         stats.upserted += 1;
     }
 
@@ -505,9 +558,9 @@ pub fn episode_vectors(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> {
 }
 
 /// Read back every materialized `episode_index` row for `project`, ordered
-/// by `ts`. Test/inspection helper — later pipeline stages are expected to
-/// query narrower slices (`WHERE outcome IN (...)`, etc.) directly.
-#[cfg(test)]
+/// by `ts`. Used by `projection_matches_source` and tests — later pipeline
+/// stages are expected to query narrower slices (`WHERE outcome IN (...)`,
+/// etc.) directly.
 pub(crate) fn load_project_rows(conn: &Connection, project: &str) -> Result<Vec<EpisodeIndexRow>> {
     let mut stmt = conn.prepare(
         "SELECT episode_id, session_id, project, ts, outcome, request, completed,

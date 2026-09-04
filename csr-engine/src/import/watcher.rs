@@ -302,6 +302,7 @@ impl FileWatcher {
 
         self.storage
             .mark_file_imported_with_suppression(file_path, chunk_count, suppression)?;
+        self.storage.relink_conversation(&conv_id)?;
 
         // Layer 1: Heuristic enrichment (inline, instant, free)
         if !self

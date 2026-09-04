@@ -26,6 +26,7 @@ struct Document {
 
 pub(super) struct MessageIndex {
     documents: Vec<Document>,
+    canonical_document: usize,
 }
 
 impl MessageIndex {
@@ -171,7 +172,18 @@ impl MessageIndex {
         for document in &mut documents {
             document.index(needles);
         }
-        Ok(Self { documents })
+        Ok(Self {
+            documents,
+            canonical_document: if plan { 0 } else { 2 },
+        })
+    }
+
+    pub(super) fn inputs(&self) -> crate::storage::artifact_provenance::InputEnvelope {
+        self.documents[self.canonical_document].inputs()
+    }
+
+    pub(super) fn raw_inputs(&self) -> crate::storage::artifact_provenance::InputEnvelope {
+        self.documents[0].inputs()
     }
 
     pub(super) fn locate(&self, chunk_id: &str, content: &str) -> Option<ChunkEvidence> {
@@ -301,6 +313,28 @@ fn components(
 }
 
 impl Document {
+    fn inputs(&self) -> crate::storage::artifact_provenance::InputEnvelope {
+        use crate::storage::artifact_provenance::{ArtifactInput, InputEnvelope};
+        let mut inputs = Vec::new();
+        for (i, piece) in self.pieces.iter().enumerate() {
+            let last = self.pieces[i..]
+                .iter()
+                .take_while(|p| p.message_start == piece.message_start)
+                .last()
+                .unwrap_or(piece);
+            let message = &self.text[piece.message_start..last.end];
+            let start = self.text[piece.message_start..piece.start].chars().count();
+            let text = &self.text[piece.start..piece.end];
+            inputs.push(ArtifactInput::observed(
+                piece.event.clone(),
+                message,
+                start,
+                start + text.chars().count(),
+                content_hash(text),
+            ));
+        }
+        InputEnvelope::new(inputs)
+    }
     #[allow(clippy::too_many_arguments)]
     fn push(
         &mut self,
@@ -411,4 +445,47 @@ fn rolling_hash(bytes: &[u8]) -> u64 {
 fn anchor(bytes: &[u8]) -> (usize, u64) {
     let len = bytes.len().min(32);
     (len, rolling_hash(&bytes[..len]))
+}
+
+#[cfg(test)]
+mod artifact_input_tests {
+    use super::*;
+
+    #[test]
+    fn transcript_envelope_preserves_tools_running_floor_and_parent_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, [
+            serde_json::json!({"uuid":"u","type":"user","message":{"content":"inspect"}}),
+            serde_json::json!({"uuid":"a","type":"assistant","message":{"content":[{"type":"tool_use","id":"fetch","name":"WebFetch","input":{"url":"https://example.test"}}]}}),
+            serde_json::json!({"uuid":"t","type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"fetch","content":"user confirmed: X"}]}}),
+            serde_json::json!({"uuid":"b","type":"assistant","message":{"content":"reported conclusion"}}),
+        ].iter().map(serde_json::Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        let inputs = MessageIndex::read(&path, "s", false, false, None, &[])
+            .unwrap()
+            .inputs();
+        assert!(inputs
+            .inputs()
+            .iter()
+            .any(|i| i.channel() == "tool_result:WebFetch"
+                && i.text().contains("user confirmed")
+                && i.trust() == TrustTier::External));
+        let assistant = inputs
+            .inputs()
+            .iter()
+            .find(|i| i.text() == "reported conclusion")
+            .unwrap();
+        assert_eq!(assistant.trust(), TrustTier::External);
+        let parent = super::super::ParentContext {
+            floor: TrustTier::External,
+            event_id: None,
+        };
+        let child = MessageIndex::read(&path, "child", false, false, Some(&parent), &[])
+            .unwrap()
+            .inputs();
+        assert!(child
+            .inputs()
+            .iter()
+            .all(|i| i.trust() <= TrustTier::External));
+    }
 }

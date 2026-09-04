@@ -392,6 +392,11 @@ enum BackfillAction {
 
 #[derive(Subcommand, Debug)]
 enum ProvenanceAction {
+    /// Re-derive deterministic artifact floors; model-produced legacy rows remain unknown.
+    BackfillArtifacts {
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
     /// Populate structural provenance for chunks that do not have spans yet.
     Backfill {
         /// Override the SQLite database path for this operation.
@@ -584,6 +589,20 @@ async fn main() -> Result<()> {
             swiftbar,
             deep,
         );
+    }
+
+    if let Some(Commands::Provenance {
+        action: ProvenanceAction::BackfillArtifacts { db },
+    }) = &args.command
+    {
+        let storage = csr_engine::storage::Storage::open(db.as_ref().unwrap_or(&args.db_path))?;
+        let written = csr_engine::storage::artifact_backfill::backfill(&storage)?;
+        let lowered = storage.relink_sidechains()?;
+        println!(
+            "{}",
+            serde_json::json!({"artifacts_written":written,"lowered":lowered})
+        );
+        return Ok(());
     }
 
     if let Some(Commands::Provenance {

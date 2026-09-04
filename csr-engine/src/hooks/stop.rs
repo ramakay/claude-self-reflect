@@ -480,6 +480,21 @@ pub fn episode_tags(episode: &Episode) -> Vec<String> {
 
 /// Store an episode as a reflection, replacing any existing episode for the same session.
 pub async fn store_episode(engine: &Engine, episode: &Episode) -> Result<()> {
+    store_episode_supported(
+        engine,
+        episode,
+        crate::storage::artifact_provenance::InputEnvelope::default(),
+        None,
+    )
+    .await
+}
+
+async fn store_episode_supported(
+    engine: &Engine,
+    episode: &Episode,
+    inputs: crate::storage::artifact_provenance::InputEnvelope,
+    ranges: Option<Vec<(usize, usize)>>,
+) -> Result<()> {
     let tags = episode_tags(episode);
     let conv_tag = format!("conv_{}", episode.session_id);
 
@@ -505,9 +520,14 @@ pub async fn store_episode(engine: &Engine, episode: &Episode) -> Result<()> {
 
     // Generate a new ID and insert
     let id = uuid::Uuid::new_v4().to_string();
-    engine
-        .storage()
-        .insert_reflection(&id, &content, &tags, &embedding)?;
+    engine.storage().insert_derived_reflection_ranges(
+        &id,
+        &content,
+        &tags,
+        &embedding,
+        &inputs,
+        &ranges.unwrap_or_else(|| vec![(0, content.chars().count()); inputs.inputs().len()]),
+    )?;
 
     // Also insert into the in-memory search index
     {
@@ -516,6 +536,70 @@ pub async fn store_episode(engine: &Engine, episode: &Episode) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn episode_support(
+    episode: &Episode,
+    content: &str,
+    mut inputs: crate::storage::artifact_provenance::InputEnvelope,
+    transcript_path: &Path,
+    tasks: Option<crate::storage::artifact_provenance::InputEnvelope>,
+) -> (
+    crate::storage::artifact_provenance::InputEnvelope,
+    Vec<(usize, usize)>,
+) {
+    use crate::storage::artifact_provenance::ArtifactInput;
+    let mut ranges = vec![(0, content.chars().count()); inputs.inputs().len()];
+    let field_range = |field: &str| {
+        let value = serde_json::to_value(episode)
+            .ok()
+            .and_then(|v| v.get(field).cloned())
+            .unwrap_or_default();
+        let needle = format!("\"{field}\":{value}");
+        content
+            .find(&needle)
+            .map(|at| {
+                let start = content[..at].chars().count() + field.chars().count() + 3;
+                (start, start + value.to_string().chars().count())
+            })
+            .unwrap_or((0, content.chars().count()))
+    };
+    for (field, text, channel) in [
+        ("request", episode.request.as_str(), "user_message"),
+        ("completed", episode.completed.as_str(), "assistant_message"),
+    ] {
+        if text.is_empty() {
+            continue;
+        }
+        let quoted = inputs
+            .inputs()
+            .iter()
+            .filter(|i| i.channel() == channel)
+            .find_map(|i| i.quoted_span(text, None))
+            .unwrap_or_else(|| ArtifactInput::unknown(text));
+        inputs.push(quoted);
+        ranges.push(field_range(field));
+    }
+    if let Some(plan) = &episode.approved_plan {
+        // `extract_episode` observed an ExitPlanMode tool call. This records
+        // that local observation, never an approval or user confirmation.
+        inputs.push(crate::storage::artifact_backfill::local_observation(
+            "observed_exit_plan_mode",
+            "jsonl_tool_call",
+            &transcript_path.to_string_lossy(),
+            plan,
+        ));
+        ranges.push(field_range("approved_plan"));
+    }
+    if let Some(tasks) = tasks {
+        for field in ["todos", "next_steps", "outcome"] {
+            for input in tasks.inputs() {
+                inputs.push(input.clone());
+                ranges.push(field_range(field));
+            }
+        }
+    }
+    (inputs, ranges)
 }
 
 /// Best-effort instrumentation scan over the transcript at `transcript_path`.
@@ -560,6 +644,14 @@ pub async fn extract_and_store_episode(
     // Read transcript lines
     let raw = std::fs::read_to_string(&tp)?;
     let lines: Vec<&str> = raw.lines().collect();
+
+    let mut provenance_inputs = crate::import::transcript_inputs(engine.storage(), &tp, session_id)
+        .unwrap_or_else(|_| {
+            crate::storage::artifact_provenance::InputEnvelope::new(vec![
+                crate::storage::artifact_provenance::ArtifactInput::unknown(&raw),
+            ])
+        });
+    let mut task_inputs = None;
 
     let mut episode = extract_episode(&lines, session_id, project_name);
 
@@ -653,6 +745,7 @@ pub async fn extract_and_store_episode(
         // than let them set next_steps and cap the outcome (Codex). A dir with
         // zero task files carries no signal; transcript state stands.
         if state.files_seen > state.parse_failures {
+            task_inputs = Some(state.inputs);
             episode.todos = state.todos;
             episode.next_steps = episode
                 .todos
@@ -689,6 +782,18 @@ pub async fn extract_and_store_episode(
         episode
             .anchors
             .extend(crate::extraction::anchors::capture_file_anchors(&path));
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            provenance_inputs.push(crate::storage::artifact_backfill::local_observation(
+                "local_file",
+                "file_content",
+                &path.to_string_lossy(),
+                &text,
+            ));
+        } else {
+            provenance_inputs.push(crate::storage::artifact_provenance::ArtifactInput::unknown(
+                &path.to_string_lossy(),
+            ));
+        }
     }
 
     // Chain link: most recent episode for this project, excluding this session.
@@ -707,9 +812,24 @@ pub async fn extract_and_store_episode(
             })
             .collect();
         episode.prev_episode_id = pick_prev_episode(&candidates, session_id);
+        if let Some(parent) = &episode.prev_episode_id {
+            for (id, content, _, _) in &existing {
+                if serde_json::from_str::<serde_json::Value>(content)
+                    .ok()
+                    .is_some_and(|v| v["session_id"].as_str() == Some(parent.as_str()))
+                {
+                    provenance_inputs.push(engine.storage().artifact_input(
+                        crate::storage::artifact_provenance::ArtifactKind::Reflection,
+                        id,
+                    )?);
+                }
+            }
+        }
     }
 
-    store_episode(engine, &episode).await?;
+    let content = serde_json::to_string(&episode)?;
+    let (inputs, ranges) = episode_support(&episode, &content, provenance_inputs, &tp, task_inputs);
+    store_episode_supported(engine, &episode, inputs, Some(ranges)).await?;
 
     // Persist anchors for fast birth-time symbol join (non-fatal)
     if let Err(e) =
@@ -815,6 +935,7 @@ struct TaskDirState {
     todos: Vec<TodoItem>,
     files_seen: usize,
     parse_failures: usize,
+    inputs: crate::storage::artifact_provenance::InputEnvelope,
 }
 
 /// Read numeric `N.json` task files from a directory. Testable helper used by
@@ -845,11 +966,21 @@ fn load_task_state_from_dir(dir: &Path) -> Option<TaskDirState> {
     let files_seen = files.len();
     let mut parse_failures = 0usize;
     let mut todos = Vec::new();
+    let mut inputs = crate::storage::artifact_provenance::InputEnvelope::default();
     for (_, path) in files {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             parse_failures += 1;
+            inputs.push(crate::storage::artifact_provenance::ArtifactInput::unknown(
+                &path.to_string_lossy(),
+            ));
             continue;
         };
+        inputs.push(crate::storage::artifact_backfill::local_observation(
+            "task_file",
+            "file_content",
+            &path.to_string_lossy(),
+            &raw,
+        ));
         let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
             parse_failures += 1;
             continue;
@@ -874,6 +1005,7 @@ fn load_task_state_from_dir(dir: &Path) -> Option<TaskDirState> {
         todos,
         files_seen,
         parse_failures,
+        inputs,
     })
 }
 
@@ -1445,6 +1577,45 @@ mod tests {
         assert!(plan.contains("Fix validate_token"));
         assert!(ep.prev_episode_id.is_none());
         assert!(ep.anchors.is_empty());
+    }
+
+    #[test]
+    fn episode_support_keeps_intent_span_and_observed_plan_below_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let raw = concat!(
+            r#"{"type":"user","uuid":"u","message":{"content":"fix auth"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a","message":{"content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"Fix auth then test"}}]}}"#,
+            "\n"
+        );
+        std::fs::write(&path, raw).unwrap();
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let episode = extract_episode(&raw.lines().collect::<Vec<_>>(), "session", "project");
+        let inputs = crate::import::transcript_inputs(&storage, &path, "session").unwrap();
+        let content = serde_json::to_string(&episode).unwrap();
+        let (support, ranges) = episode_support(&episode, &content, inputs, &path, None);
+        let plan = support
+            .inputs()
+            .iter()
+            .position(|i| i.channel() == "observed_exit_plan_mode")
+            .unwrap();
+        assert_eq!(
+            support.inputs()[plan].trust(),
+            crate::provenance::TrustTier::TrustedTool
+        );
+        assert!(content
+            .chars()
+            .skip(ranges[plan].0)
+            .take(ranges[plan].1 - ranges[plan].0)
+            .collect::<String>()
+            .contains("Fix auth"));
+        assert!(support
+            .inputs()
+            .iter()
+            .zip(&ranges)
+            .any(|(i, r)| i.channel() == "user_message" && i.text() == "fix auth" && r.0 > 0));
+        assert!(support.floor() <= crate::provenance::TrustTier::TrustedTool);
     }
 
     #[test]

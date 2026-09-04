@@ -815,7 +815,7 @@ fn test_resolve_chunks_invalid_status_errors() {
         "bogus".to_string(),
         "some evidence".to_string(),
         None,
-        "agent",
+        None,
     ));
     assert!(result.is_err());
 }

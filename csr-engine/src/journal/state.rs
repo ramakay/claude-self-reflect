@@ -766,19 +766,28 @@ impl DreamFeed for StorageDreamFeed {
         }
         let status = action.status();
         let evidence = action.evidence_for(item);
+        let confirmation = crate::provenance::ResolutionConfirmation::journal(
+            crate::provenance::ResolutionConfirmationPayload::new(
+                &chunk_ids,
+                status,
+                Some(&item.item),
+                &evidence,
+            ),
+        );
         let written = self
             .storage
             .with_connection(|conn| {
-                let written = queries::insert_resolutions(
-                    conn,
+                let tx = conn.unchecked_transaction()?;
+                let (written, _) = queries::append_resolutions_with_confirmation(
+                    &tx,
                     &chunk_ids,
                     status,
                     &evidence,
                     Some(&item.item),
-                    queries::RESOLUTION_SOURCE_USER_CONFIRMED,
+                    Some(&confirmation),
                 )?;
-                ensure_journal_audit(conn)?;
-                conn.execute(
+                ensure_journal_audit(&tx)?;
+                tx.execute(
                     "INSERT INTO journal_audit
                         (action, item_id, project, origin_session, status, chunk_count, origin)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -792,6 +801,7 @@ impl DreamFeed for StorageDreamFeed {
                         JOURNAL_ORIGIN,
                     ],
                 )?;
+                tx.commit()?;
                 Ok(written)
             })
             .map_err(|e| ResolveError::Storage(e.to_string()))?;
@@ -2569,7 +2579,7 @@ mod tests {
                 action.status().to_string(),
                 "parity probe".to_string(),
                 None,
-                queries::RESOLUTION_SOURCE_AGENT,
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("csr_resolve rejects {}: {e}", action.status()));
@@ -2650,6 +2660,30 @@ mod tests {
         assert_eq!(action, "dismiss");
         assert_eq!(origin, JOURNAL_ORIGIN);
         assert_eq!(chunks, 1);
+        storage.with_connection(|conn| {
+            let event:(String,i64,i64)=conn.query_row("SELECT e.receipt_kind,e.trust_tier,r.min_trust FROM resolution_ledger r JOIN provenance_events e ON e.event_id=r.event_id WHERE r.chunk_id='chunk-1'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            assert_eq!(event,("journal_ui".into(),4,4));
+            conn.execute_batch("CREATE TRIGGER fail_audit BEFORE INSERT ON journal_audit BEGIN SELECT RAISE(ABORT,'injected audit failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(feed.record_verdict(&item, JournalAction::Resolve).is_err());
+        storage
+            .with_connection(|conn| {
+                let count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM resolution_ledger", [], |r| r.get(0))?;
+                assert_eq!(
+                    count, 1,
+                    "failed UI audit rolls back the ledger and its event"
+                );
+                let events: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE channel='user_confirmation'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(events, 1);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

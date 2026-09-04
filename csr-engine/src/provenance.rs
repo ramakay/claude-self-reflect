@@ -15,6 +15,81 @@ use std::convert::Infallible;
 use std::fmt;
 use std::str::FromStr;
 
+/// Exact canonical ledger payload; field order is part of the digest contract.
+#[derive(Debug, Clone)]
+pub struct ResolutionConfirmationPayload {
+    canonical_json: String,
+    digest: String,
+}
+
+impl ResolutionConfirmationPayload {
+    pub fn new(chunk_ids: &[String], status: &str, claim: Option<&str>, evidence: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        #[derive(serde::Serialize)]
+        struct Payload<'a> {
+            chunk_ids: &'a [String],
+            status: &'a str,
+            claim: Option<&'a str>,
+            evidence: &'a str,
+        }
+        let canonical_json = serde_json::to_string(&Payload {
+            chunk_ids,
+            status,
+            claim,
+            evidence,
+        })
+        .expect("resolution payload serialization is infallible");
+        let digest = Sha256::digest(canonical_json.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Self {
+            canonical_json,
+            digest,
+        }
+    }
+    pub fn canonical_json(&self) -> &str {
+        &self.canonical_json
+    }
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
+/// Created only at platform confirmation boundaries, never deserialized from
+/// tool arguments, memory tags, or a source string. A local authority event for
+/// this ledger payload only; no principal/target/risk/scope binding is implied.
+#[derive(Debug)]
+pub struct ResolutionConfirmation {
+    payload: ResolutionConfirmationPayload,
+    receipt_kind: &'static str,
+}
+
+impl ResolutionConfirmation {
+    pub(crate) fn elicited(payload: ResolutionConfirmationPayload) -> Self {
+        Self {
+            payload,
+            receipt_kind: "elicitation_digest",
+        }
+    }
+    pub(crate) fn journal(payload: ResolutionConfirmationPayload) -> Self {
+        Self {
+            payload,
+            receipt_kind: "journal_ui",
+        }
+    }
+    pub fn matches(&self, payload: &ResolutionConfirmationPayload) -> bool {
+        self.payload.canonical_json == payload.canonical_json
+            && self.payload.digest == payload.digest
+    }
+    pub fn payload(&self) -> &ResolutionConfirmationPayload {
+        &self.payload
+    }
+    pub fn receipt_kind(&self) -> &'static str {
+        self.receipt_kind
+    }
+}
+
 /// Cached authority floor for persisted memory.
 ///
 /// The integer representation is part of the SQLite schema contract. New

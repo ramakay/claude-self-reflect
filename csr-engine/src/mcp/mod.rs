@@ -801,7 +801,7 @@ impl CsrServer {
             p.claim.as_deref(),
             &p.evidence,
         );
-        let source = elicitation::request_resolution_confirmation(&payload, &context).await;
+        let confirmation = elicitation::request_resolution_confirmation(&payload, &context).await;
 
         let result = tools::resolve_chunks(
             &self.storage,
@@ -809,7 +809,7 @@ impl CsrServer {
             p.status,
             p.evidence,
             p.claim,
-            source,
+            confirmation.as_ref(),
         )
         .await;
 

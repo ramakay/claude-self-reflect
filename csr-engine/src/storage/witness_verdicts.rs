@@ -216,6 +216,7 @@ pub fn insert_verdict_if_changed(conn: &Connection, row: &WitnessVerdictRow) -> 
             row.observed_head_oid,
         ],
     )?;
+    super::artifact_backfill::record_witness(&tx, &tx.last_insert_rowid().to_string())?;
     tx.commit()?;
     Ok(changed > 0)
 }

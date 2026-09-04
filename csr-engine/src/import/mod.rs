@@ -345,6 +345,62 @@ pub(crate) fn sidechain_parent_message_key(path: &Path) -> Option<String> {
     None
 }
 
+/// Cold producer input: reuse the message-coordinate parser and its running
+/// context floor, not the legacy MAX speaker aggregate used for display.
+pub fn transcript_inputs(
+    storage: &crate::storage::Storage,
+    path: &Path,
+    conversation_id: &str,
+) -> Result<crate::storage::artifact_provenance::InputEnvelope> {
+    transcript_inputs_variant(storage, path, conversation_id, false)
+}
+
+pub(crate) fn transcript_inputs_variant(
+    storage: &crate::storage::Storage,
+    path: &Path,
+    conversation_id: &str,
+    raw: bool,
+) -> Result<crate::storage::artifact_provenance::InputEnvelope> {
+    let sidechain = path
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "subagents");
+    let parent = if sidechain {
+        let parent_id = path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str());
+        Some(match parent_id {
+            Some(id) => storage
+                .parent_provenance_context(id, sidechain_parent_message_key(path).as_deref())?,
+            None => ParentContext {
+                floor: crate::provenance::TrustTier::Unknown,
+                event_id: None,
+            },
+        })
+    } else {
+        None
+    };
+    let codex = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("rollout-"));
+    let index = provenance_matcher::MessageIndex::read(
+        path,
+        conversation_id,
+        codex,
+        path.extension().is_some_and(|e| e == "md"),
+        parent.as_ref(),
+        &[],
+    )?;
+    Ok(if raw {
+        index.raw_inputs()
+    } else {
+        index.inputs()
+    })
+}
+
 pub(crate) fn parse_jsonl_file_with_stats(
     path: &Path,
     project_name: &str,

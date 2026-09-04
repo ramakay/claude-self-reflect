@@ -251,11 +251,11 @@ impl Engine {
     /// only new chunks are embedded (chunks beyond prev_count are new).
     /// Returns the number of NEW chunks imported (0 if nothing new).
     pub async fn import_file(&self, file_path: &Path, project_name: &str) -> Result<usize> {
-        let attribution = import::ConversationAttribution {
-            project_name: project_name.to_string(),
-            source: "conversation",
-            parent_conversation_id: None,
-        };
+        let mut attribution =
+            import::derive_conversation_attribution(&self.projects_dir, file_path);
+        if attribution.parent_conversation_id.is_none() {
+            attribution.project_name = project_name.into();
+        }
         self.import_file_with_attribution(file_path, &attribution)
             .await
     }
@@ -327,6 +327,7 @@ impl Engine {
                 chunks.len(),
                 suppression,
             )?;
+            self.storage.relink_conversation(&conversation_id)?;
             return Ok(0);
         }
 
@@ -371,6 +372,7 @@ impl Engine {
 
         self.storage
             .mark_file_imported_with_suppression(file_path, chunks.len(), suppression)?;
+        self.storage.relink_conversation(&conversation_id)?;
 
         // Layer 1: Heuristic enrichment only on first import (not incremental updates)
         if prev_count == 0 {
