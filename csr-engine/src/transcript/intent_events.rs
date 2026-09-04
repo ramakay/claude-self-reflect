@@ -2084,6 +2084,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs the external B2 probe transcript at /tmp/csr-b2/probe-projects/-tmp-probe/probe-1.jsonl; run with --ignored when it exists"]
     fn textbook_probe_turns_produce_four_corrections_and_one_redirect() {
         let probe = Path::new("/tmp/csr-b2/probe-projects/-tmp-probe/probe-1.jsonl");
         assert!(probe.is_file(), "B2 probe transcript must be present");
