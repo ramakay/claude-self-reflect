@@ -21,6 +21,7 @@ pub mod setup;
 pub mod status;
 pub mod storage;
 pub mod summarizer;
+pub mod system_export;
 pub mod telemetry;
 pub mod temporal;
 pub mod transcript;
