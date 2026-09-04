@@ -237,6 +237,25 @@ fn draw_index_panel(f: &mut Frame, area: Rect, t: &Telemetry) {
     if let Some(ref newest) = t.status.newest_chunk {
         lines.push(Line::from(format!("  newest      {}", newest)));
     }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "Provenance",
+        Style::default().add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(format!(
+        "  spans       {}/{}  ({} unknown)",
+        t.status.provenance_coverage.chunks_with_spans,
+        t.status.provenance_coverage.chunks_total,
+        t.status.provenance_coverage.chunks_unknown,
+    )));
+    lines.push(Line::from(format!(
+        "  tool share  {}",
+        t.status
+            .provenance_coverage
+            .tool_result_share_mean
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "unknown".into()),
+    )));
 
     let src = &t.status.aux.sources;
     let miss = &t.status.aux.schema_misses;

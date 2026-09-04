@@ -30,6 +30,7 @@ pub struct StatusReport {
     pub csr_tool_blocks_suppressed: i64,
     pub csr_hook_wrappers_scrubbed: i64,
     pub contamination: ContaminationStatus,
+    pub provenance_coverage: ProvenanceCoverageStatus,
     pub enrichment: EnrichmentBreakdown,
     pub narratives: NarrativeStatus,
     pub ratification: RatificationStatus,
@@ -467,6 +468,14 @@ pub struct CoverageStats {
     pub gap: i64,
 }
 
+#[derive(Serialize, Default, Debug, PartialEq)]
+pub struct ProvenanceCoverageStatus {
+    pub chunks_with_spans: i64,
+    pub chunks_unknown: i64,
+    pub chunks_total: i64,
+    pub tool_result_share_mean: Option<f64>,
+}
+
 #[derive(Serialize, Default, Debug, PartialEq, Eq)]
 pub struct SchemaMissCounts {
     pub tasks: i64,
@@ -593,6 +602,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
             contamination: ContaminationStatus::default(),
+            provenance_coverage: ProvenanceCoverageStatus::default(),
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus {
                 disabled: crate::narrative::narratives_disabled(),
@@ -632,6 +642,19 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     }
     .map(ContaminationStatus::from)
     .unwrap_or_default();
+    let provenance_coverage = storage
+        .provenance_coverage()
+        .map(
+            |(chunks_with_spans, chunks_unknown, chunks_total, tool_result_share_mean)| {
+                ProvenanceCoverageStatus {
+                    chunks_with_spans,
+                    chunks_unknown,
+                    chunks_total,
+                    tool_result_share_mean,
+                }
+            },
+        )
+        .unwrap_or_default();
     let newest_chunk = storage.get_newest_chunk_timestamp().unwrap_or(None);
     let db_size_bytes = storage.get_db_size().unwrap_or(0);
     // Cached verdict (24h TTL, refreshed by the daemon or --deep). A full
@@ -687,6 +710,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         csr_tool_blocks_suppressed,
         csr_hook_wrappers_scrubbed,
         contamination,
+        provenance_coverage,
         enrichment,
         narratives,
         ratification,
@@ -1363,6 +1387,12 @@ fn print_swiftbar(report: &StatusReport) {
     println!("--Reflections: {} | font=Menlo", report.reflections);
     println!("--Conversations: {} | font=Menlo", report.conversations);
     println!("--Projects: {} | font=Menlo", report.projects);
+    println!(
+        "--Provenance: {}/{} spans, {} unknown | font=Menlo",
+        report.provenance_coverage.chunks_with_spans,
+        report.provenance_coverage.chunks_total,
+        report.provenance_coverage.chunks_unknown,
+    );
 
     // Section: Import Progress
     let bar_filled = (report.import_percent / 10.0).round() as usize;
@@ -1509,6 +1539,14 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
         report.projects,
         format_narrative_segment(&report.narratives),
     );
+    if report.provenance_coverage.chunks_total > 0 {
+        out.push_str(&format!(
+            " | prov {}/{} ?{}",
+            report.provenance_coverage.chunks_with_spans,
+            report.provenance_coverage.chunks_total,
+            report.provenance_coverage.chunks_unknown,
+        ));
+    }
     let dream_total = report.dream.dreams.total();
     if dream_total > 0 || report.dream.corrections_7d > 0 {
         out.push_str(&format!(" | ☾ {dream_total} dreams"));
@@ -1629,6 +1667,7 @@ mod tests {
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
             contamination: ContaminationStatus::default(),
+            provenance_coverage: ProvenanceCoverageStatus::default(),
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus::default(),
             ratification: RatificationStatus::default(),
@@ -1650,6 +1689,18 @@ mod tests {
     fn test_compact_format() {
         // Just verify it doesn't panic
         print_compact(&base_report());
+    }
+
+    #[test]
+    fn compact_renders_provenance_coverage() {
+        let mut report = base_report();
+        report.provenance_coverage = ProvenanceCoverageStatus {
+            chunks_with_spans: 80,
+            chunks_unknown: 25,
+            chunks_total: 100,
+            tool_result_share_mean: Some(0.2),
+        };
+        assert!(format_compact(&report, 0).contains("prov 80/100 ?25"));
     }
 
     #[test]

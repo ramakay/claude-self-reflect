@@ -29,6 +29,17 @@ pub mod text {
             t.status.imported_files,
             t.status.total_jsonl_files,
         );
+        println!(
+            "  Provenance {}/{} chunks with spans, {} unknown, tool share mean={}",
+            t.status.provenance_coverage.chunks_with_spans,
+            t.status.provenance_coverage.chunks_total,
+            t.status.provenance_coverage.chunks_unknown,
+            t.status
+                .provenance_coverage
+                .tool_result_share_mean
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_else(|| "unknown".into()),
+        );
         let e = &t.status.enrichment;
         println!(
             "  Enrich  heuristic={} v3={} ai={}  (v3_failed={} ai_failed={} ai_processing={})",

@@ -1,6 +1,6 @@
 //! Daemon module — background processing for progressive enrichment.
 //!
-//! Runs seven background tasks:
+//! Runs eight background tasks:
 //! 1. File watcher (existing) — auto-import new JSONL files
 //! 2. Extraction loop (Layer 2) — V3 extraction on imported conversations
 //! 3. Narrator loop (Layer 3) — AI batch narrative generation (if API key set)
@@ -9,6 +9,7 @@
 //!    witness ledger (see that module for cadence/persistence/cost-discipline)
 //! 6. Release-ancestry loop — precomputes deterministic TAD v2 episode labels
 //! 7. Memory registry loop — periodic metadata-only scan of native memory files (`~/.claude/projects/*/memory/*.md`) into `memory_registry`; never embeds or injects memory content
+//! 8. Provenance backfill loop — one idle-gated structural batch at a time
 
 pub mod consolidation;
 pub mod dream_cadence;
@@ -36,6 +37,12 @@ use crate::storage::Storage;
 pub fn memory_registry_disabled() -> bool {
     std::env::var("CSR_NO_MEMORY_REGISTRY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+pub fn provenance_backfill_disabled() -> bool {
+    std::env::var("CSR_NO_PROVENANCE_BACKFILL")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
@@ -397,6 +404,70 @@ impl Daemon {
             );
         }
 
+        // Populate one structural-provenance batch per idle window. Parsing
+        // happens before the bounded write transaction and the shared permit
+        // keeps it out of the watch/import and dream critical sections.
+        let provenance_backfill_handle = {
+            let storage = self.storage.clone();
+            let projects_root = self.projects_dir.clone();
+            let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
+            tokio::spawn(async move {
+                loop {
+                    for _ in 0..30 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    if provenance_backfill_disabled()
+                        || !dream_cadence::is_idle(
+                            dream_cadence::last_activity_at(&storage),
+                            chrono::Utc::now(),
+                            dream_cadence::idle_secs(),
+                        )
+                    {
+                        continue;
+                    }
+                    let Some(permit) =
+                        acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref())
+                            .await
+                    else {
+                        return;
+                    };
+                    if provenance_backfill_disabled()
+                        || !dream_cadence::is_idle(
+                            dream_cadence::last_activity_at(&storage),
+                            chrono::Utc::now(),
+                            dream_cadence::idle_secs(),
+                        )
+                    {
+                        drop(permit);
+                        continue;
+                    }
+                    let storage = storage.clone();
+                    let projects_root = projects_root.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        match crate::import::provenance_backfill::backfill_incremental(
+                            &storage,
+                            &projects_root,
+                            crate::import::provenance_backfill::DEFAULT_BATCH_SIZE,
+                        ) {
+                            Ok(stats) => tracing::debug!(
+                                scanned = stats.chunks_scanned,
+                                reconstructed = stats.chunks_reconstructed,
+                                unknown = stats.chunks_unreconstructible,
+                                "provenance backfill batch completed"
+                            ),
+                            Err(error) => tracing::warn!(%error, "provenance backfill failed"),
+                        }
+                    })
+                    .await;
+                }
+            })
+        };
+
         // Optional Codex rollout loop. It runs once immediately and then every
         // 30 minutes. Missing ~/.codex/sessions is deliberately silent, and the
         // directory is re-checked each cycle so a later installation is detected.
@@ -551,6 +622,7 @@ impl Daemon {
         // Memory registry only upserts its own SQLite table transactionally —
         // no HNSW mutation — so a timeout here cannot corrupt the search index.
         let _ = tokio::time::timeout(timeout, memory_registry_handle).await;
+        let _ = tokio::time::timeout(timeout, provenance_backfill_handle).await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
         // The dream loop's tick awaits its `spawn_blocking` cycle directly
         // (see `dream_cadence::tick`) and checks the shutdown flag between
@@ -1364,6 +1436,19 @@ mod tests {
         std::env::set_var("CSR_NO_MEMORY_REGISTRY", "0");
         assert!(!memory_registry_disabled());
         std::env::remove_var("CSR_NO_MEMORY_REGISTRY");
+    }
+
+    #[test]
+    fn provenance_backfill_kill_switch_env() {
+        std::env::remove_var("CSR_NO_PROVENANCE_BACKFILL");
+        assert!(!provenance_backfill_disabled());
+        std::env::set_var("CSR_NO_PROVENANCE_BACKFILL", "1");
+        assert!(provenance_backfill_disabled());
+        std::env::set_var("CSR_NO_PROVENANCE_BACKFILL", "TRUE");
+        assert!(provenance_backfill_disabled());
+        std::env::set_var("CSR_NO_PROVENANCE_BACKFILL", "0");
+        assert!(!provenance_backfill_disabled());
+        std::env::remove_var("CSR_NO_PROVENANCE_BACKFILL");
     }
 
     #[test]

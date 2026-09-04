@@ -242,6 +242,11 @@ enum Commands {
         #[command(subcommand)]
         action: BackfillAction,
     },
+    /// Structural memory provenance operations.
+    Provenance {
+        #[command(subcommand)]
+        action: ProvenanceAction,
+    },
     /// Code-graph operations (v9.4 conversation-provenance graph)
     Codegraph {
         #[command(subcommand)]
@@ -382,6 +387,22 @@ enum BackfillAction {
         /// Restrict remediation to one contaminated conversation.
         #[arg(long)]
         conversation: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProvenanceAction {
+    /// Populate structural provenance for chunks that do not have spans yet.
+    Backfill {
+        /// Override the SQLite database path for this operation.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Inspect and reconstruct without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Maximum chunks per write transaction.
+        #[arg(long, default_value_t = csr_engine::import::provenance_backfill::DEFAULT_BATCH_SIZE)]
+        batch: usize,
     },
 }
 
@@ -560,6 +581,42 @@ async fn main() -> Result<()> {
             swiftbar,
             deep,
         );
+    }
+
+    if let Some(Commands::Provenance {
+        action: ProvenanceAction::Backfill { db, dry_run, batch },
+    }) = &args.command
+    {
+        let db_path = db.as_ref().unwrap_or(&args.db_path);
+        let storage = csr_engine::storage::Storage::open(db_path)?;
+        let stats = csr_engine::import::provenance_backfill::backfill(
+            &storage,
+            &args.projects_dir,
+            *batch,
+            *dry_run,
+        )?;
+        let (chunks_with_spans, chunks_unknown, chunks_total, tool_result_share_mean) =
+            storage.provenance_coverage()?;
+        let tier_histogram = storage
+            .provenance_tier_histogram()?
+            .into_iter()
+            .map(|(tier, count)| (tier.to_string(), count))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "backfill": stats,
+                "dry_run": dry_run,
+                "provenance_coverage": {
+                    "chunks_with_spans": chunks_with_spans,
+                    "chunks_unknown": chunks_unknown,
+                    "chunks_total": chunks_total,
+                    "tool_result_share_mean": tool_result_share_mean,
+                },
+                "tier_histogram": tier_histogram,
+            }))?
+        );
+        return Ok(());
     }
 
     if let Some(Commands::Telemetry { since, json, tui }) = args.command {
