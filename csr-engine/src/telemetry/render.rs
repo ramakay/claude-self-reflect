@@ -43,6 +43,24 @@ pub mod text {
             t.status.provenance_coverage.source_unparsed,
             t.status.provenance_coverage.source_unmatched,
         );
+        for family in t
+            .status
+            .provenance_coverage
+            .artifacts
+            .iter()
+            .filter(|family| family.total() > 0)
+        {
+            println!(
+                "    {:<24} unknown={} external={} trusted_tool={} user_history={} user_confirmed={} system={}",
+                family.kind,
+                family.unknown,
+                family.external,
+                family.trusted_tool,
+                family.user_history,
+                family.user_confirmed,
+                family.system,
+            );
+        }
         let e = &t.status.enrichment;
         println!(
             "  Enrich  heuristic={} v3={} ai={}  (v3_failed={} ai_failed={} ai_processing={})",

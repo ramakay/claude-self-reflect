@@ -568,6 +568,7 @@ fn test_format_search_results_structure() {
             is_sidechain: false,
         },
         resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
         validity_demoted: false,
     }];
 
@@ -602,6 +603,7 @@ fn test_format_recency_results_includes_age_stamp() {
             is_sidechain: false,
         },
         resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
         validity_demoted: false,
     }];
 
@@ -632,6 +634,7 @@ fn test_dedupe_results_collapses_same_conversation_duplicate() {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: csr_engine::provenance::TrustTier::Unknown,
             validity_demoted: false,
         },
         EnrichedResult {
@@ -649,6 +652,7 @@ fn test_dedupe_results_collapses_same_conversation_duplicate() {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: csr_engine::provenance::TrustTier::Unknown,
             validity_demoted: false,
         },
     ];
@@ -687,6 +691,7 @@ fn test_format_quick_check_structure() {
             is_sidechain: false,
         },
         resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
         validity_demoted: false,
     }];
 
@@ -724,6 +729,7 @@ fn test_xml_escaping_in_output() {
             is_sidechain: false,
         },
         resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
         validity_demoted: false,
     }];
 
@@ -765,6 +771,7 @@ fn test_resolve_and_annotate() {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: csr_engine::provenance::TrustTier::Unknown,
             validity_demoted: false,
         },
         EnrichedResult {
@@ -782,6 +789,7 @@ fn test_resolve_and_annotate() {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: csr_engine::provenance::TrustTier::Unknown,
             validity_demoted: false,
         },
     ];
@@ -1028,6 +1036,7 @@ fn test_full_pipeline_storage_search_format() {
                     score: r.score,
                     chunk: c.clone(),
                     resolution: None,
+                    trust: csr_engine::provenance::TrustTier::Unknown,
                     validity_demoted: false,
                 })
         })

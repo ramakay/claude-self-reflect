@@ -555,10 +555,13 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             continue;
         }
 
+        // The bracket label carries the cached floor beside the source so a
+        // tool-derived line and a user-authored line read differently; the
+        // author is no longer shown (it was a MAX aggregate).
         let item = InjectionItem {
             content: result.content.clone(),
             score: result.final_score,
-            source: result.source.clone(),
+            source: format!("{}|{}", result.source, result.min_trust),
         };
 
         ctx.winning_strategies.push(item);
@@ -1123,6 +1126,12 @@ async fn search_reflections_with_vec(
             } else {
                 "reflection"
             };
+            let min_trust = storage
+                .get_artifact_min_trust(
+                    crate::storage::artifact_provenance::ArtifactKind::Reflection,
+                    &result.id,
+                )
+                .unwrap_or(crate::provenance::TrustTier::Unknown);
             raw_results.push(RawResult {
                 content: formatter::truncate_item(&content, 300),
                 score: result.score,
@@ -1134,7 +1143,7 @@ async fn search_reflections_with_vec(
                 conversation_id: None,
                 memory_id: Some(result.id.clone()),
                 author: Some(crate::provenance::Speaker::ToolResult),
-                min_trust: crate::provenance::TrustTier::Unknown,
+                min_trust,
             });
         }
     }

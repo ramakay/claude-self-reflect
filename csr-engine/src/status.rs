@@ -477,6 +477,32 @@ pub struct ProvenanceCoverageStatus {
     pub source_missing: i64,
     pub source_unparsed: i64,
     pub source_unmatched: i64,
+    /// Per-family tier histogram over cached artifact floors. Empty only when
+    /// the histogram query failed; a family with no rows still appears with
+    /// zero counts so the Unknown share is visible rather than assumed.
+    pub artifacts: Vec<ArtifactTierCounts>,
+}
+
+#[derive(Serialize, Default, Debug, PartialEq, Eq, Clone)]
+pub struct ArtifactTierCounts {
+    pub kind: String,
+    pub unknown: i64,
+    pub external: i64,
+    pub trusted_tool: i64,
+    pub user_history: i64,
+    pub user_confirmed: i64,
+    pub system: i64,
+}
+
+impl ArtifactTierCounts {
+    pub fn total(&self) -> i64 {
+        self.unknown
+            + self.external
+            + self.trusted_tool
+            + self.user_history
+            + self.user_confirmed
+            + self.system
+    }
 }
 
 #[derive(Serialize, Default, Debug, PartialEq, Eq)]
@@ -647,6 +673,22 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     .unwrap_or_default();
     let [source_missing, source_unparsed, source_unmatched] =
         storage.provenance_failure_counts().unwrap_or_default();
+    let artifacts: Vec<ArtifactTierCounts> = storage
+        .artifact_tier_histograms()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(kind, c)| ArtifactTierCounts {
+                    kind: kind.as_str().to_string(),
+                    unknown: c[0],
+                    external: c[1],
+                    trusted_tool: c[2],
+                    user_history: c[3],
+                    user_confirmed: c[4],
+                    system: c[5],
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let provenance_coverage = storage
         .provenance_coverage()
         .map(
@@ -658,6 +700,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
                     tool_result_share_mean,
                     source_missing,
                     source_unparsed,
+                    artifacts: artifacts.clone(),
                     source_unmatched,
                 }
             },
@@ -1716,6 +1759,51 @@ mod tests {
             ..Default::default()
         };
         assert!(format_compact(&report, 0).contains("prov 80/100 ?25"));
+    }
+
+    #[test]
+    fn status_reports_per_family_artifact_tier_histograms() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::{test_observed_input, InputEnvelope};
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .insert_derived_reflection(
+                "r-ext",
+                "derived",
+                &[],
+                &[0.0; 4],
+                &InputEnvelope::new(vec![test_observed_input(
+                    "tool_result:Bash",
+                    TrustTier::External,
+                    "src",
+                )]),
+            )
+            .unwrap();
+        storage
+            .insert_reflection("r-unknown", "plain", &[], &[0.0; 4])
+            .unwrap();
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        let reflections = report
+            .provenance_coverage
+            .artifacts
+            .iter()
+            .find(|f| f.kind == "reflection")
+            .expect("reflection family present");
+        assert_eq!((reflections.external, reflections.unknown), (1, 1));
+        assert!(report
+            .provenance_coverage
+            .artifacts
+            .iter()
+            .any(|f| f.kind == "witness_verdict" && f.total() == 0));
+        let json = serde_json::to_value(&report.provenance_coverage).unwrap();
+        assert!(json["artifacts"].is_array());
     }
 
     #[test]

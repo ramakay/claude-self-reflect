@@ -814,6 +814,64 @@ pub fn lower_descendants(conn: &Connection) -> Result<usize> {
     }
 }
 
+/// Cached floors for a mixed id list (chunks and reflections, the two families
+/// that reach search output), read from the indexed cache columns only. Ids
+/// that match neither table are absent; callers render them Unknown.
+pub fn min_trust_batch(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, TrustTier>> {
+    let mut out = std::collections::HashMap::with_capacity(ids.len());
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let bound: Vec<&dyn rusqlite::ToSql> =
+        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    for table in ["chunks", "reflections"] {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, min_trust FROM {table} WHERE id IN ({placeholders})"
+        ))?;
+        for row in stmt.query_map(bound.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                TrustTier::from_db(r.get::<_, i64>(1).ok()),
+            ))
+        })? {
+            let (id, tier) = row?;
+            out.entry(id).or_insert(tier);
+        }
+    }
+    Ok(out)
+}
+
+/// Per-family tier histogram over the cached floor columns: one row per
+/// artifact kind, counts indexed by `TrustTier::as_i64()`.
+pub fn artifact_tier_histograms(conn: &Connection) -> Result<Vec<(ArtifactKind, [i64; 6])>> {
+    let mut out = Vec::with_capacity(ARTIFACT_KINDS.len());
+    for kind in ARTIFACT_KINDS {
+        let mut counts = [0_i64; 6];
+        let mut stmt = conn.prepare(&format!(
+            "SELECT min_trust, COUNT(*) FROM {} GROUP BY min_trust",
+            kind.table()
+        ))?;
+        for row in stmt.query_map([], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?))
+        })? {
+            let (tier, count) = row?;
+            counts[TrustTier::from_db(tier).as_i64() as usize] += count;
+        }
+        out.push((*kind, counts));
+    }
+    Ok(out)
+}
+
+/// Cached floor of the newest episode reflection for `session_id`, Unknown
+/// when none is on record. Cold path (SessionStart), indexed tag scan.
+pub fn episode_floor_for_session(conn: &Connection, session_id: &str) -> Result<TrustTier> {
+    Ok(episode_reflection_input(conn, session_id)?.trust())
+}
+
 impl Storage {
     pub fn get_artifact_min_trust(&self, kind: ArtifactKind, id: &str) -> Result<TrustTier> {
         self.with_connection(|c| cached_floor(c, kind, id))
@@ -874,6 +932,18 @@ impl Storage {
             tx.commit()?;
             Ok(floor)
         })
+    }
+    pub fn get_min_trust_batch(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, TrustTier>> {
+        self.with_connection(|c| min_trust_batch(c, ids))
+    }
+    pub fn artifact_tier_histograms(&self) -> Result<Vec<(ArtifactKind, [i64; 6])>> {
+        self.with_connection(artifact_tier_histograms)
+    }
+    pub fn episode_floor_for_session(&self, session_id: &str) -> Result<TrustTier> {
+        self.with_connection(|c| episode_floor_for_session(c, session_id))
     }
     pub fn lower_artifact_descendants(&self) -> Result<usize> {
         self.with_connection(|c| {

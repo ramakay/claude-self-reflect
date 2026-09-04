@@ -199,6 +199,7 @@ fn lookup_by_conv_tag(
                     is_sidechain: false,
                 },
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             }
         })
@@ -883,6 +884,7 @@ async fn reflect_gather_pass(
                     score: final_score,
                     chunk: c.clone(),
                     resolution: None,
+                    trust: crate::provenance::TrustTier::Unknown,
                     validity_demoted: false,
                 }
             })
@@ -943,6 +945,7 @@ async fn reflect_gather_pass(
                     is_sidechain: false,
                 },
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             });
         }
@@ -1060,6 +1063,7 @@ async fn reflect_gather_pass(
                         ..chunk
                     },
                     resolution: None,
+                    trust: crate::provenance::TrustTier::Unknown,
                     validity_demoted: false,
                 });
             }
@@ -1387,7 +1391,7 @@ async fn quick_check_with_vec(
     let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
     let chunks = storage.get_chunks_by_ids(&ids)?;
 
-    let enriched: Vec<EnrichedResult> = results
+    let mut enriched: Vec<EnrichedResult> = results
         .iter()
         .filter_map(|r| {
             chunks
@@ -1397,10 +1401,12 @@ async fn quick_check_with_vec(
                     score: r.score,
                     chunk: c.clone(),
                     resolution: None,
+                    trust: crate::provenance::TrustTier::Unknown,
                     validity_demoted: false,
                 })
         })
         .collect();
+    apply_trust_labels(&mut enriched, storage);
 
     Ok(format::format_quick_check(&enriched, query))
 }
@@ -1904,8 +1910,10 @@ fn append_memory_provenance_hop(
     for row in &hits {
         let mem_type = row.mem_type.as_deref().unwrap_or("unknown");
         let description = sanitize_memory_description(row.description.as_deref().unwrap_or(""));
+        // The link is frontmatter (origin_session_id), which anything that
+        // can write a memory file can forge: label it, never raise it.
         out.push_str(&format!(
-            "distilled into memory: {} ({}, {}) — {}\n",
+            "distilled into memory: {} ({}, {}) — {} [trust: unknown; frontmatter link, unverified]\n",
             row.slug, mem_type, row.project, description
         ));
     }
@@ -1970,12 +1978,13 @@ pub(crate) fn format_why(
                     .collect::<Vec<_>>()
                     .join(",");
                 out.push_str(&format!(
-                    "  best_via={} reached_by={} route_scores={} score={:.3}{} [{}] conv_{}: {}\n",
+                    "  best_via={} reached_by={} route_scores={} score={:.3}{} trust={} [{}] conv_{}: {}\n",
                     it.best_route,
                     reached_by,
                     route_scores,
                     it.score,
                     score_marker,
+                    it.trust,
                     format::age_stamp(&it.timestamp),
                     it.conversation_id,
                     it.excerpt
@@ -2601,12 +2610,14 @@ fn enrich_results_with_active_forgetting(
                     score: r.score,
                     chunk: c.clone(),
                     resolution: None,
+                    trust: crate::provenance::TrustTier::Unknown,
                     validity_demoted: false,
                 })
         })
         .collect();
     format::dedupe_results(&mut enriched_vec);
     apply_resolutions(&mut enriched_vec, storage);
+    apply_trust_labels(&mut enriched_vec, storage);
     let validity_chunks: Vec<crate::import::ConversationChunk> =
         enriched_vec.iter().map(|e| e.chunk.clone()).collect();
     let validity = resolve_validity_with(storage, &validity_chunks, consumption_mode);
@@ -3200,6 +3211,25 @@ fn apply_validity_partition(
     *enriched = kept;
 }
 
+/// Label every result with its cached row-level floor. One indexed batch read
+/// per family (chunks, then reflections); never a join to provenance events
+/// or derivation rows. Unknown stays Unknown and is rendered, not dropped.
+/// Non-fatal: a storage error leaves the Unknown default in place.
+pub fn apply_trust_labels(enriched: &mut [EnrichedResult], storage: &Arc<Storage>) {
+    if enriched.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
+    let Ok(floors) = storage.get_min_trust_batch(&ids) else {
+        return;
+    };
+    for e in enriched.iter_mut() {
+        if let Some(tier) = floors.get(&e.chunk.id) {
+            e.trust = *tier;
+        }
+    }
+}
+
 /// Annotate `enriched` results with user-confirmed resolution-ledger verdicts
 /// and stable-sink confirmed "resolved" entries to the bottom of the slice,
 /// preserving relative order otherwise. Agent observations never annotate or
@@ -3261,6 +3291,7 @@ fn apply_resolutions_before_limit(
     active_forgetting: bool,
 ) {
     apply_resolutions(enriched, storage);
+    apply_trust_labels(enriched, storage);
     apply_validity_partition(enriched, validity, active_forgetting);
     enriched.truncate(limit);
 }
@@ -3767,6 +3798,7 @@ mod tests {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: crate::provenance::TrustTier::Unknown,
             validity_demoted: false,
         }
     }
@@ -3793,6 +3825,82 @@ mod tests {
 
         let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
         assert_eq!(ids, ["unresolved-1", "unresolved-2"]);
+    }
+
+    #[test]
+    fn trust_labels_read_cached_columns_only_for_chunks_and_reflections() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::{test_observed_input, InputEnvelope};
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "INSERT INTO chunks(id,conversation_id,project_name,timestamp,content,message_count,min_trust)
+                     VALUES('chunk-user','conv','p','now','text',1,3)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .insert_derived_reflection(
+                "refl-tool",
+                "derived",
+                &[],
+                &[0.0; 4],
+                &InputEnvelope::new(vec![test_observed_input(
+                    "tool_result:WebFetch",
+                    TrustTier::External,
+                    "source",
+                )]),
+            )
+            .unwrap();
+        // Hot path contract: the event and derivation tables are not consulted.
+        storage
+            .with_connection(|c| {
+                c.execute_batch(
+                    "PRAGMA foreign_keys=OFF;
+                     DROP TABLE artifact_derivations; DROP TABLE chunk_spans;
+                     DROP TABLE provenance_events;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut enriched = vec![
+            enriched_result("chunk-user", 0.9, 0),
+            enriched_result("refl-tool", 0.8, 1),
+            enriched_result("nowhere", 0.7, 2),
+        ];
+        apply_trust_labels(&mut enriched, &storage);
+        let tiers: Vec<TrustTier> = enriched.iter().map(|e| e.trust).collect();
+        assert_eq!(
+            tiers,
+            [
+                TrustTier::UserHistory,
+                TrustTier::External,
+                TrustTier::Unknown
+            ]
+        );
+    }
+
+    #[test]
+    fn format_why_renders_the_cached_floor_per_item() {
+        use crate::search::reinstatement::{EvidenceItem, ReinstateTrace, Via};
+        use std::collections::{BTreeMap, BTreeSet};
+        let item = EvidenceItem {
+            chunk_id: "chunk".into(),
+            conversation_id: "conv".into(),
+            score: 0.8,
+            best_route: Via::Seed,
+            routes: BTreeSet::from([Via::Seed]),
+            route_scores: BTreeMap::from([(Via::Seed, 0.8)]),
+            timestamp: "2026-08-01T00:00:00Z".into(),
+            excerpt: "evidence".into(),
+            ratification: None,
+            trust: crate::provenance::TrustTier::External,
+        };
+        let rendered = format_why("q", &[item], &HashSet::new(), &ReinstateTrace::default());
+        assert!(rendered.contains(" trust=external "), "{rendered}");
     }
 
     #[test]
@@ -3851,6 +3959,7 @@ mod tests {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: crate::provenance::TrustTier::Unknown,
             validity_demoted: false,
         }
     }
@@ -6688,6 +6797,7 @@ mod tests {
             timestamp: timestamp.into(),
             excerpt: "excerpt".into(),
             ratification: None,
+            trust: crate::provenance::TrustTier::Unknown,
         }
     }
 
@@ -7310,11 +7420,11 @@ mod tests {
         );
         assert!(
             rendered.find("score=0.696 [recent↑]").unwrap()
-                < rendered.find("score=0.715 [").unwrap(),
+                < rendered.find("score=0.715 trust=").unwrap(),
             "the newer item must render before its higher-scored sibling:\n{rendered}"
         );
         assert!(
-            rendered.contains("score=0.715 ["),
+            rendered.contains("score=0.715 trust="),
             "the higher-scored sibling must not carry a marker:\n{rendered}"
         );
     }
@@ -7508,6 +7618,7 @@ mod why_marker_tests {
             timestamp: timestamp.to_string(),
             excerpt: chunk_id.to_string(),
             ratification: None,
+            trust: crate::provenance::TrustTier::Unknown,
         }
     }
 

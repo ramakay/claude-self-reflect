@@ -109,6 +109,9 @@ pub struct EvidenceItem {
     /// ordering is fixed and never fed into any score/sort. `None` when the
     /// conversation has no ratification row yet (silent, not an error).
     pub ratification: Option<f32>,
+    /// Cached row-level provenance floor of the chunk, read from
+    /// `chunks.min_trust` in the same batched detail fetch; a label only.
+    pub trust: crate::provenance::TrustTier,
 }
 
 /// Auditable stage counters for one reinstatement walk. Surfaced counts are
@@ -1095,7 +1098,7 @@ pub async fn reinstate(
 
     let mut items = Vec::with_capacity(fused.len());
     for c in fused {
-        let Some((_prov, timestamp, content, _min_trust)) = detail.get(&c.id) else {
+        let Some((_prov, timestamp, content, min_trust)) = detail.get(&c.id) else {
             continue;
         };
         let ratification = ratification_scores.get(&c.conversation_id).copied();
@@ -1110,6 +1113,7 @@ pub async fn reinstate(
             timestamp: timestamp.clone(),
             excerpt: clean_excerpt(content),
             ratification,
+            trust: *min_trust,
         });
     }
 
@@ -1503,6 +1507,7 @@ mod tests {
             timestamp: "2026-08-01T00:00:00Z".into(),
             excerpt: "evidence".into(),
             ratification: None,
+            trust: crate::provenance::TrustTier::Unknown,
         };
         let trace = ReinstateTrace {
             scope_projects: vec!["project".into()],

@@ -76,6 +76,10 @@ pub struct EnrichedResult {
     /// flag is never set, so output is byte-identical to pre-partition
     /// behavior.
     pub validity_demoted: bool,
+    /// Cached row-level provenance floor (chunks.min_trust or
+    /// reflections.min_trust), read from the cache column only and always
+    /// rendered: Unknown is a label, never an omission.
+    pub trust: crate::provenance::TrustTier,
 }
 
 /// Effective rerank score for a result whose position differs from raw-score
@@ -323,6 +327,7 @@ pub(crate) fn format_search_results_with_rank_scores(
                 xml_escape(note)
             ));
         }
+        out.push_str(&format!("      <trust>{}</trust>\n", r.trust));
 
         out.push_str("    </r>\n");
     }
@@ -610,6 +615,7 @@ pub fn format_recency_results(
                 xml_escape(note)
             ));
         }
+        out.push_str(&format!("    <trust>{}</trust>\n", r.trust));
         out.push_str("  </result>\n");
     }
 
@@ -699,6 +705,7 @@ pub fn format_more_results(
                 xml_escape(note)
             ));
         }
+        out.push_str(&format!("    <trust>{}</trust>\n", r.trust));
         out.push_str("  </result>\n");
     }
 
@@ -1082,6 +1089,7 @@ mod tests {
             score: 0.9,
             chunk: make_chunk(id, conv, "shared decision text"),
             resolution: None,
+            trust: crate::provenance::TrustTier::Unknown,
             validity_demoted: false,
         };
         // Correlated plan + its origin conversation both matched: plan drops.
@@ -1112,6 +1120,7 @@ mod tests {
                 score: 0.9,
                 chunk,
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             }
         };
@@ -1166,12 +1175,14 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("same-id", "conv-a", "content A"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.5,
                 chunk: make_chunk("same-id", "conv-b", "content B"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
         ];
@@ -1189,12 +1200,14 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("id-1", "conv-1", content),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.7,
                 chunk: make_chunk("id-2", "conv-1", content),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
         ];
@@ -1211,12 +1224,14 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("id-1", "conv-1", content),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.8,
                 chunk: make_chunk("id-2", "conv-2", content),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
         ];
@@ -1231,12 +1246,14 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("id-1", "conv-1", "Hello   World"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.7,
                 chunk: make_chunk("id-2", "conv-1", "hello world"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
         ];
@@ -1300,12 +1317,45 @@ mod tests {
     }
 
     #[test]
+    fn search_results_render_the_cached_floor_for_every_result() {
+        use crate::provenance::TrustTier;
+        let results = vec![
+            EnrichedResult {
+                score: 0.9,
+                chunk: make_chunk("id-user", "conv-1", "a user line"),
+                resolution: None,
+                trust: TrustTier::UserHistory,
+                validity_demoted: false,
+            },
+            EnrichedResult {
+                score: 0.8,
+                chunk: make_chunk("id-unknown", "conv-2", "a legacy line"),
+                resolution: None,
+                trust: TrustTier::Unknown,
+                validity_demoted: false,
+            },
+        ];
+        let rendered = format_search_results(&results, "query", "all", 1, 1);
+        assert!(
+            rendered.contains("<trust>user_history</trust>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("<trust>unknown</trust>"),
+            "Unknown is rendered, never omitted:\n{rendered}"
+        );
+        let more = format_more_results(&results, "query", 0, 2);
+        assert_eq!(more.matches("<trust>").count(), 2, "{more}");
+    }
+
+    #[test]
     fn format_search_results_renders_resolution_and_footer_count() {
         let results = vec![
             EnrichedResult {
                 score: 0.9,
                 chunk: make_chunk("id-open", "conv-1", "open item"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
             EnrichedResult {
@@ -1317,6 +1367,7 @@ mod tests {
                     "2026-07-20T10:00:00Z",
                     "user_confirmed",
                 ),
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
         ];
@@ -1337,6 +1388,7 @@ mod tests {
             score: 0.9,
             chunk: make_chunk("id-1", "conv-1", "plain item"),
             resolution: None,
+            trust: crate::provenance::TrustTier::Unknown,
             validity_demoted: false,
         }];
         let xml = format_search_results(&results, "q", "all", 1, 1);
@@ -1351,18 +1403,21 @@ mod tests {
                 score: 0.474,
                 chunk: make_chunk("boosted", "conv-1", "boosted result"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.765,
                 chunk: make_chunk("demoted", "conv-2", "demoted result"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.200,
                 chunk: make_chunk("validity-tail", "conv-3", "validity-demoted tail"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: true,
             },
         ];
@@ -1439,6 +1494,7 @@ mod tests {
                 "resolved — evidence cites [stale anchor] old_fn wording (verified 2026-01-01)"
                     .to_string(),
             ),
+            trust: crate::provenance::TrustTier::Unknown,
             validity_demoted: false, // kill switch on: the partition never set it
         }];
         let xml = format_search_results(&results, "q", "all", 5, 3);
@@ -1470,6 +1526,7 @@ mod tests {
 \x20     <cid>conv-1</cid>\n\
 \x20     <id>c-1</id>\n\
 \x20     <resolution>resolved \u{2014} evidence cites [stale anchor] old_fn wording (verified 2026-01-01)</resolution>\n\
+\x20     <trust>unknown</trust>\n\
 \x20   </r>\n\
 \x20 </results>\n\
 \x20 <note>1 resolved item(s) demoted within page \u{2014} matched but verified addressed</note>\n\
@@ -1596,6 +1653,7 @@ mod tests {
             score,
             chunk: make_chunk("qc1", "conv-qc", content),
             resolution: None,
+            trust: crate::provenance::TrustTier::Unknown,
             validity_demoted: false,
         }
     }
