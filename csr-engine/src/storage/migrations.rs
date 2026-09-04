@@ -1848,6 +1848,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     )?;
     migrate_intent_events_identity_v2(conn)?;
     migrate_intent_events_detector_v3(conn)?;
+    migrate_artifact_provenance(conn)?;
 
     finish_chunks_fts_compaction(conn)?;
 
@@ -2014,6 +2015,80 @@ fn migrate_provenance_substrate(conn: &Connection) -> Result<()> {
             PRIMARY KEY (chunk_id, event_id, start_char, end_char)
          );
          CREATE INDEX IF NOT EXISTS idx_chunk_spans_chunk ON chunk_spans(chunk_id);",
+    )?;
+    Ok(())
+}
+
+/// Additive cached floors: legacy content and agent-writable tags supply no
+/// evidence. Keep this after all artifact tables and intent identity migrations.
+fn migrate_artifact_provenance(conn: &Connection) -> Result<()> {
+    for table in [
+        "reflections",
+        "witness_verdicts",
+        "dream_threads",
+        "dream_plans",
+        "dreams_v1",
+        "intent_events",
+        "resolution_ledger",
+        "resolution_proposals",
+        "episode_index",
+        "dream_relations",
+        "derivation_ledger",
+        "journal_headlines",
+        "session_instrumentation",
+        "ratification_scores",
+    ] {
+        if !has_column(conn, table, "min_trust")? {
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN min_trust INTEGER NOT NULL DEFAULT 0 CHECK(min_trust BETWEEN 0 AND 5)"), [])?;
+        }
+    }
+    if !has_column(conn, "resolution_ledger", "event_id")? {
+        conn.execute("ALTER TABLE resolution_ledger ADD COLUMN event_id TEXT REFERENCES provenance_events(event_id)", [])?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_provenance_events_parent ON provenance_events(parent_event_id);
+         CREATE TABLE IF NOT EXISTS artifact_derivations (
+            artifact_kind TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            artifact_start_char INTEGER NOT NULL CHECK(artifact_start_char >= 0),
+            artifact_end_char INTEGER NOT NULL CHECK(artifact_end_char >= artifact_start_char),
+            support_event_id TEXT REFERENCES provenance_events(event_id),
+            -- Keep the receipt when an importer replaces/deletes a chunk.
+            -- Cold-path validation treats a missing/version-mismatched parent
+            -- as Unknown; a restrictive FK would block ordinary reimports.
+            support_chunk_id TEXT,
+            support_start_char INTEGER NOT NULL CHECK(support_start_char >= 0),
+            support_end_char INTEGER NOT NULL CHECK(support_end_char >= support_start_char),
+            CHECK(support_event_id IS NOT NULL OR support_chunk_id IS NOT NULL)
+         );
+         CREATE INDEX IF NOT EXISTS idx_artifact_derivations_artifact
+            ON artifact_derivations(artifact_kind,artifact_id);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_artifact_derivations_identity
+            ON artifact_derivations(artifact_kind,artifact_id,artifact_start_char,artifact_end_char,
+                COALESCE(support_event_id,''),COALESCE(support_chunk_id,''),support_start_char,support_end_char);
+         CREATE TRIGGER IF NOT EXISTS confirmation_event_no_update
+            BEFORE UPDATE ON provenance_events WHEN OLD.channel='user_confirmation'
+            BEGIN SELECT RAISE(ABORT,'confirmation events are immutable'); END;
+         CREATE TRIGGER IF NOT EXISTS confirmation_event_no_delete
+            BEFORE DELETE ON provenance_events WHEN OLD.channel='user_confirmation'
+            BEGIN SELECT RAISE(ABORT,'confirmation events are immutable'); END;"
+    )?;
+    // Only this cache may change. The complete preexisting intent payload and
+    // its transcript identity remain append-only, including nullable fields.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS intent_events_no_update;
+        CREATE TRIGGER intent_events_no_update BEFORE UPDATE ON intent_events
+        WHEN NEW.id IS NOT OLD.id OR NEW.session_id IS NOT OLD.session_id
+          OR NEW.project IS NOT OLD.project OR NEW.turn IS NOT OLD.turn
+          OR NEW.kind IS NOT OLD.kind OR NEW.quote IS NOT OLD.quote
+          OR NEW.transcript_path IS NOT OLD.transcript_path
+          OR NEW.byte_start IS NOT OLD.byte_start OR NEW.byte_end IS NOT OLD.byte_end
+          OR NEW.prior_claim IS NOT OLD.prior_claim OR NEW.symbol IS NOT OLD.symbol
+          OR NEW.file IS NOT OLD.file OR NEW.classifier_hash IS NOT OLD.classifier_hash
+          OR NEW.ts IS NOT OLD.ts OR NEW.created_at IS NOT OLD.created_at
+          OR NEW.detector IS NOT OLD.detector OR NEW.classifier_score IS NOT OLD.classifier_score
+          OR NEW.marker IS NOT OLD.marker
+        BEGIN SELECT RAISE(ABORT,'intent_events is append-only'); END;",
     )?;
     Ok(())
 }
@@ -2500,6 +2575,110 @@ mod tests {
                 .is_ok(),
             "seq and is_sidechain columns must exist after migration"
         );
+    }
+
+    #[test]
+    fn artifact_receipts_survive_replacement_of_source_chunks() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch("INSERT INTO chunks(id,conversation_id,project_name,timestamp,content,message_count) VALUES('c','s','p','now','old',1);
+            INSERT INTO artifact_derivations VALUES('reflection','r',0,3,NULL,'c',0,3);
+            DELETE FROM chunks WHERE id='c';").unwrap();
+        let support: String = conn
+            .query_row(
+                "SELECT support_chunk_id FROM artifact_derivations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            support, "c",
+            "a missing parent remains countable and can lower descendants to Unknown"
+        );
+    }
+
+    #[test]
+    fn artifact_floors_default_unknown_and_migrate_legacy_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE reflections (id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT NOT NULL, timestamp TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')));
+            INSERT INTO reflections(id,content,tags,timestamp) VALUES('old','unchanged','[\"source:user\"]','2026-01-01');").unwrap();
+        run(&conn).unwrap();
+        run(&conn).unwrap();
+        for table in [
+            "reflections",
+            "witness_verdicts",
+            "dream_threads",
+            "dream_plans",
+            "dreams_v1",
+            "intent_events",
+            "resolution_ledger",
+            "resolution_proposals",
+            "episode_index",
+            "dream_relations",
+            "derivation_ledger",
+            "journal_headlines",
+            "session_instrumentation",
+            "ratification_scores",
+        ] {
+            let column: (i64, String) = conn.query_row("SELECT \"notnull\", dflt_value FROM pragma_table_info(?1) WHERE name='min_trust'", [table], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(column, (1, "0".into()), "{table}");
+        }
+        let row: (String, i64) = conn
+            .query_row(
+                "SELECT content,min_trust FROM reflections WHERE id='old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("unchanged".into(), 0));
+        assert!(conn
+            .prepare("SELECT event_id FROM resolution_ledger")
+            .is_ok());
+        assert!(conn.prepare("SELECT artifact_kind,artifact_id,artifact_start_char,artifact_end_char,support_event_id,support_chunk_id,support_start_char,support_end_char FROM artifact_derivations").is_ok());
+    }
+
+    #[test]
+    fn artifact_floor_maintenance_preserves_intent_and_confirmation_immutability() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch("INSERT INTO intent_events(session_id,project,turn,kind,quote,transcript_path,byte_start,byte_end,classifier_hash,ts) VALUES('s','p',1,'correction','no','/a',0,2,'h','now');
+          INSERT INTO provenance_events VALUES('confirm','s','digest',0,'user_confirmation',4,NULL,'elicitation_digest','digest','now');").unwrap();
+        conn.execute("UPDATE intent_events SET min_trust=3", [])
+            .unwrap();
+        assert!(conn
+            .execute("UPDATE intent_events SET quote='yes'", [])
+            .is_err());
+        assert!(conn
+            .execute("UPDATE intent_events SET classifier_score='forged'", [])
+            .is_err());
+        assert!(conn.execute("DELETE FROM intent_events", []).is_err());
+        assert!(conn
+            .execute(
+                "UPDATE provenance_events SET trust_tier=5 WHERE event_id='confirm'",
+                []
+            )
+            .is_err());
+        assert!(conn
+            .execute("DELETE FROM provenance_events WHERE event_id='confirm'", [])
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO artifact_derivations VALUES('reflection','x',0,2,NULL,NULL,0,2)",
+                []
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO artifact_derivations VALUES('reflection','x',2,1,'confirm',NULL,0,2)",
+                []
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO artifact_derivations VALUES('reflection','x',0,2,'confirm',NULL,0,2)",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

@@ -53,28 +53,28 @@ use super::verify::{quote_verified, verify_and_apply, OidCache, VerifyOutcome};
 /// quote-vector documentation are reproduced in this module's doc comments
 /// instead of parsed at test time).
 const FIXTURE_SQL: &str = r#"
-INSERT INTO episode_index VALUES ('ep-001','s-01','acme-telemetry','2026-02-10T14:00:00Z','completed',
+INSERT INTO episode_index (episode_id,session_id,project,ts,outcome,request,completed,next_steps,blockers,todo_count,files_json,anchors_json,prev_episode_id,present_at_head,days_since_last_touch,refreshed_at) VALUES ('ep-001','s-01','acme-telemetry','2026-02-10T14:00:00Z','completed',
  'Implement frame parsing for the telemetry stream using a callback-based parser',
  'Wrote parse_frame() callback parser in src/parser.rs; handles partial frames via re-entrant callbacks and a ring buffer',
  NULL, NULL, 0, '["src/parser.rs"]',
  '[{"file":"src/parser.rs","node_kind":"function","name":"parse_frame","body_hash":"aaaa111122223333"}]',
  NULL, 1, 68, datetime('now'));
 
-INSERT INTO episode_index VALUES ('ep-002','s-02','acme-telemetry','2026-03-05T09:30:00Z','completed',
+INSERT INTO episode_index (episode_id,session_id,project,ts,outcome,request,completed,next_steps,blockers,todo_count,files_json,anchors_json,prev_episode_id,present_at_head,days_since_last_touch,refreshed_at) VALUES ('ep-002','s-02','acme-telemetry','2026-03-05T09:30:00Z','completed',
  'Parser drops frames under sustained load; redesign it',
  'Replaced the callback parser with an iterator-based FrameIter; parse_frame callback design retired because re-entrancy caused frame drops under load',
  NULL, NULL, 0, '["src/parser.rs"]',
  '[{"file":"src/parser.rs","node_kind":"function","name":"frame_iter","body_hash":"bbbb444455556666"}]',
  NULL, 1, 68, datetime('now'));
 
-INSERT INTO episode_index VALUES ('ep-003','s-05','acme-telemetry','2026-06-18T20:15:00Z','completed',
+INSERT INTO episode_index (episode_id,session_id,project,ts,outcome,request,completed,next_steps,blockers,todo_count,files_json,anchors_json,prev_episode_id,present_at_head,days_since_last_touch,refreshed_at) VALUES ('ep-003','s-05','acme-telemetry','2026-06-18T20:15:00Z','completed',
  'Add reconnect logic for dropped telemetry links',
  'Added exponential reconnect in src/link.rs; also patched parse_frame in src/parser.rs to handle the new heartbeat frame via a callback shim',
  NULL, NULL, 0, '["src/link.rs","src/parser.rs"]',
  '[{"file":"src/link.rs","node_kind":"function","name":"reconnect","body_hash":"eeee777788889999"},{"file":"src/parser.rs","node_kind":"function","name":"parse_frame","body_hash":"cccc000011112222"}]',
  NULL, 1, 68, datetime('now'));
 
-INSERT INTO episode_index VALUES ('ep-004','s-03','acme-telemetry','2026-03-20T11:00:00Z','partial',
+INSERT INTO episode_index (episode_id,session_id,project,ts,outcome,request,completed,next_steps,blockers,todo_count,files_json,anchors_json,prev_episode_id,present_at_head,days_since_last_touch,refreshed_at) VALUES ('ep-004','s-03','acme-telemetry','2026-03-20T11:00:00Z','partial',
  'Wire the retry budget into the uploader',
  'Started retry budget plumbing in src/uploader.rs; upload_batch takes a budget param now',
  'finish retry budget wiring in src/uploader.rs; add backoff cap and jitter',
@@ -83,38 +83,38 @@ INSERT INTO episode_index VALUES ('ep-004','s-03','acme-telemetry','2026-03-20T1
  '[{"file":"src/uploader.rs","node_kind":"function","name":"upload_batch","body_hash":"dddd333344445555"}]',
  NULL, 1, 150, datetime('now'));
 
-INSERT INTO episode_index VALUES ('ep-000','s-08','acme-telemetry','2026-07-30T10:00:00Z','completed',
+INSERT INTO episode_index (episode_id,session_id,project,ts,outcome,request,completed,next_steps,blockers,todo_count,files_json,anchors_json,prev_episode_id,present_at_head,days_since_last_touch,refreshed_at) VALUES ('ep-000','s-08','acme-telemetry','2026-07-30T10:00:00Z','completed',
  'Add JSON config loading',
  'Wrote load_config() in src/config.rs reading config.json with serde_json',
  NULL, NULL, 0, '["src/config.rs"]',
  '[{"file":"src/config.rs","node_kind":"function","name":"load_config","body_hash":"1111aaaa2222bbbb"}]',
  NULL, 1, 5, datetime('now'));
-INSERT INTO episode_index VALUES ('ep-005','s-09','acme-telemetry','2026-08-20T16:45:00Z','completed',
+INSERT INTO episode_index (episode_id,session_id,project,ts,outcome,request,completed,next_steps,blockers,todo_count,files_json,anchors_json,prev_episode_id,present_at_head,days_since_last_touch,refreshed_at) VALUES ('ep-005','s-09','acme-telemetry','2026-08-20T16:45:00Z','completed',
  'Swap JSON config to TOML',
  'Rewrote src/config.rs: load_config now parses config.toml; JSON path deleted',
  NULL, NULL, 0, '["src/config.rs"]',
  '[{"file":"src/config.rs","node_kind":"function","name":"load_config","body_hash":"3333cccc4444dddd"}]',
  NULL, 1, 5, datetime('now'));
 
-INSERT INTO episode_index VALUES ('ep-006','s-04','acme-telemetry','2026-04-02T13:00:00Z','partial',
+INSERT INTO episode_index (episode_id,session_id,project,ts,outcome,request,completed,next_steps,blockers,todo_count,files_json,anchors_json,prev_episode_id,present_at_head,days_since_last_touch,refreshed_at) VALUES ('ep-006','s-04','acme-telemetry','2026-04-02T13:00:00Z','partial',
  'Migrate the ops dashboards to the new metrics schema',
  'Mapped half the dashboard panels to the new schema',
  'migrate the remaining dashboards', NULL,
  1, '["dash/panels.yaml"]', '[]', NULL, 1, 40, datetime('now'));
-INSERT INTO episode_index VALUES ('ep-007','s-04b','acme-telemetry','2026-04-03T09:00:00Z','completed',
+INSERT INTO episode_index (episode_id,session_id,project,ts,outcome,request,completed,next_steps,blockers,todo_count,files_json,anchors_json,prev_episode_id,present_at_head,days_since_last_touch,refreshed_at) VALUES ('ep-007','s-04b','acme-telemetry','2026-04-03T09:00:00Z','completed',
  'Actually, first fix the alert routing bug',
  'Fixed alert routing dedup in src/alerts.rs',
  NULL, NULL, 0, '["src/alerts.rs"]',
  '[{"file":"src/alerts.rs","node_kind":"function","name":"route_alert","body_hash":"5555eeee6666ffff"}]',
  'ep-006', 1, 40, datetime('now'));
 
-INSERT INTO episode_index VALUES ('ep-008','s-06','acme-telemetry','2026-05-01T10:00:00Z','completed',
+INSERT INTO episode_index (episode_id,session_id,project,ts,outcome,request,completed,next_steps,blockers,todo_count,files_json,anchors_json,prev_episode_id,present_at_head,days_since_last_touch,refreshed_at) VALUES ('ep-008','s-06','acme-telemetry','2026-05-01T10:00:00Z','completed',
  'Add p99 latency gauge',
  'Added p99_gauge() to src/metrics.rs',
  NULL, NULL, 0, '["src/metrics.rs"]',
  '[{"file":"src/metrics.rs","node_kind":"function","name":"p99_gauge","body_hash":"7777000088881111"}]',
  NULL, 1, 20, datetime('now'));
-INSERT INTO episode_index VALUES ('ep-009','s-07','acme-telemetry','2026-05-22T15:00:00Z','completed',
+INSERT INTO episode_index (episode_id,session_id,project,ts,outcome,request,completed,next_steps,blockers,todo_count,files_json,anchors_json,prev_episode_id,present_at_head,days_since_last_touch,refreshed_at) VALUES ('ep-009','s-07','acme-telemetry','2026-05-22T15:00:00Z','completed',
  'Count dropped packets per link',
  'Added drop_counter() to src/metrics.rs',
  NULL, NULL, 0, '["src/metrics.rs"]',
@@ -134,10 +134,10 @@ INSERT INTO witness_ledger VALUES (4,'acme-telemetry','src/config.rs','load_conf
  'b3:3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c','committed',
  'd4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4','conversation','s-09','2026-08-20T16:50:00Z');
 
-INSERT INTO witness_verdicts VALUES (1,1,'superseded_by',2,
+INSERT INTO witness_verdicts (id,witness_id,verdict,successor_witness_id,receipt_oid,observed_head_oid,created_at) VALUES (1,1,'superseded_by',2,
  'feedfacefeedfacefeedfacefeedfacefeedface',
  'b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2','2026-03-05T09:40:00Z');
-INSERT INTO witness_verdicts VALUES (2,3,'superseded_by',4,
+INSERT INTO witness_verdicts (id,witness_id,verdict,successor_witness_id,receipt_oid,observed_head_oid,created_at) VALUES (2,3,'superseded_by',4,
  'cafebabecafebabecafebabecafebabecafebabe',
  'd4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4','2026-08-20T16:55:00Z');
 "#;
