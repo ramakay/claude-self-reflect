@@ -1216,10 +1216,19 @@ mod tests {
         )
         .await
         .unwrap();
+        // Both chunks carry identical zero vectors, so this is an exact tie.
+        // HNSW makes no ordering promise on ties (the order varied under the
+        // full parallel suite), so assert membership only: without provenance
+        // neither conversation is preferred.
+        let mut without_sorted = without_hits.clone();
+        without_sorted.sort();
         assert_eq!(
-            without_hits.first().map(String::as_str),
-            Some("assistant-conversation"),
-            "without provenance an exact tie retains insertion order"
+            without_sorted,
+            vec![
+                "assistant-conversation".to_string(),
+                "user-conversation".to_string()
+            ],
+            "without provenance both tied conversations surface, neither boosted"
         );
 
         let (storage, search) = index_sessions(&sessions, None).await.unwrap();
