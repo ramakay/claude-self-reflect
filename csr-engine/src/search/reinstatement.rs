@@ -256,10 +256,15 @@ impl Candidate {
 }
 
 /// Per-candidate detail for provenance rerank and final item assembly:
-/// (provenance, timestamp, content). Reflection-sourced candidates carry
+/// (provenance, timestamp, content, cached trust floor). Reflection-sourced candidates carry
 /// provenance=None — rerank's content-based penalties (scaffold/CSR-echo)
 /// still apply to them.
-type CandidateDetail = (Option<ChunkProvenance>, String, String);
+type CandidateDetail = (
+    Option<ChunkProvenance>,
+    String,
+    String,
+    crate::provenance::TrustTier,
+);
 
 /// Observer-effect defense: a chunk that quotes the query VERBATIM is a session
 /// that *asked* the question (or an imported eval/test transcript), not the one
@@ -312,9 +317,14 @@ fn rerank_pool(
     let rank_cands: Vec<RankCandidate> = fused
         .iter()
         .map(|c| {
-            let (provenance, timestamp, content) = match detail.get(&c.id) {
-                Some((p, t, s)) => (p.clone(), Some(t.clone()), s.clone()),
-                None => (None, None, String::new()),
+            let (provenance, timestamp, content, min_trust) = match detail.get(&c.id) {
+                Some((p, t, s, trust)) => (p.clone(), Some(t.clone()), s.clone(), *trust),
+                None => (
+                    None,
+                    None,
+                    String::new(),
+                    crate::provenance::TrustTier::Unknown,
+                ),
             };
             let echo = echo_check && content.to_lowercase().contains(&query_lower);
             RankCandidate {
@@ -326,6 +336,7 @@ fn rerank_pool(
                 },
                 content,
                 provenance,
+                min_trust,
                 timestamp,
             }
         })
@@ -1050,11 +1061,22 @@ pub async fn reinstate(
     let mut detail: HashMap<String, CandidateDetail> = HashMap::new();
     for m in storage.get_chunks_by_ids(&chunk_pool_ids)? {
         let prov = storage.get_chunk_provenance(&m.id).ok().flatten();
-        detail.insert(m.id, (prov, m.timestamp, m.content));
+        let min_trust = storage
+            .get_chunk_min_trust(&m.id)
+            .unwrap_or(crate::provenance::TrustTier::Unknown);
+        detail.insert(m.id, (prov, m.timestamp, m.content, min_trust));
     }
     for c in fused.iter().filter(|c| c.is_reflection_only()) {
         if let Ok(Some((content, _tags, timestamp))) = storage.get_reflection_by_id(&c.id) {
-            detail.insert(c.id.clone(), (None, timestamp, content));
+            detail.insert(
+                c.id.clone(),
+                (
+                    None,
+                    timestamp,
+                    content,
+                    crate::provenance::TrustTier::Unknown,
+                ),
+            );
         }
     }
     // Drop candidates whose backing row vanished (pruned chunk, deleted
@@ -1073,7 +1095,7 @@ pub async fn reinstate(
 
     let mut items = Vec::with_capacity(fused.len());
     for c in fused {
-        let Some((_prov, timestamp, content)) = detail.get(&c.id) else {
+        let Some((_prov, timestamp, content, _min_trust)) = detail.get(&c.id) else {
             continue;
         };
         let ratification = ratification_scores.get(&c.conversation_id).copied();
@@ -1240,6 +1262,11 @@ mod tests {
             }),
             ts.into(),
             content.into(),
+            if author == Some(crate::provenance::Speaker::User) {
+                crate::provenance::TrustTier::UserHistory
+            } else {
+                crate::provenance::TrustTier::Unknown
+            },
         )
     }
 

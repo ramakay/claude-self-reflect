@@ -612,6 +612,45 @@ async fn index_sessions(
                 supersedes: None,
             },
         )?;
+        let tier = match chunk.author {
+            Speaker::User => crate::provenance::TrustTier::UserHistory,
+            Speaker::Assistant => crate::provenance::TrustTier::Unknown,
+            Speaker::ToolResult => crate::provenance::TrustTier::External,
+        };
+        let event_id = format!("bench:{}", chunk.id);
+        storage.replace_chunk_evidence(&crate::provenance::ChunkEvidence {
+            chunk_id: chunk.id.clone(),
+            events: vec![crate::provenance::ProvenanceEvent {
+                event_id: event_id.clone(),
+                conversation_id: chunk.conversation_id.clone(),
+                message_key: chunk.id.clone(),
+                seq: chunk.seq,
+                channel: match chunk.author {
+                    Speaker::User => "user_message",
+                    Speaker::Assistant => "assistant_message",
+                    Speaker::ToolResult => "tool_result:unknown",
+                }
+                .into(),
+                trust_tier: tier,
+                parent_event_id: None,
+                receipt_kind: "eval_fixture".into(),
+                receipt_ref: None,
+                observed_at: chunk.timestamp.clone(),
+            }],
+            spans: vec![crate::provenance::ChunkSpan {
+                chunk_id: chunk.id.clone(),
+                event_id,
+                start_char: 0,
+                end_char: chunk.content.chars().count(),
+                content_hash: crate::provenance::content_hash(&chunk.content),
+            }],
+            min_trust: tier,
+            tool_result_share: Some(if chunk.author == Speaker::ToolResult {
+                1.0
+            } else {
+                0.0
+            }),
+        })?;
         search.insert_chunk(chunk.id, vector);
     }
     Ok((storage, Arc::new(RwLock::new(search))))

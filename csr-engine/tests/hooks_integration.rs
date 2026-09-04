@@ -794,6 +794,7 @@ fn test_predictor_semantic_only() {
         RawResult {
             content: "high".into(),
             author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.9,
             source: "chunk".into(),
             timestamp: None,
@@ -806,6 +807,7 @@ fn test_predictor_semantic_only() {
         RawResult {
             content: "low".into(),
             author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.4,
             source: "chunk".into(),
             timestamp: None,
@@ -834,6 +836,7 @@ fn test_predictor_recency_boost() {
         RawResult {
             content: "recent".into(),
             author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: Some(now),
@@ -846,6 +849,7 @@ fn test_predictor_recency_boost() {
         RawResult {
             content: "old".into(),
             author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: Some(old),
@@ -869,6 +873,7 @@ fn test_predictor_file_overlap() {
         RawResult {
             content: "with overlap".into(),
             author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: None,
@@ -881,6 +886,7 @@ fn test_predictor_file_overlap() {
         RawResult {
             content: "no overlap".into(),
             author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: None,
@@ -904,6 +910,7 @@ fn test_predictor_cross_project() {
     let results = vec![RawResult {
         content: "cross-project insight".into(),
         author: None,
+        min_trust: csr_engine::provenance::TrustTier::Unknown,
         score: 0.8,
         source: "reflection".into(),
         timestamp: None,

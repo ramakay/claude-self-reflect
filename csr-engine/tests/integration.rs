@@ -1575,6 +1575,7 @@ fn test_lapi_phase_aware_scoring() {
         RawResult {
             content: "docker container fix".into(),
             author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "chunk".into(),
             timestamp: None,
@@ -1587,6 +1588,7 @@ fn test_lapi_phase_aware_scoring() {
         RawResult {
             content: "session strategy for docker".into(),
             author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "reflection".into(),
             timestamp: None,
@@ -1628,6 +1630,7 @@ fn test_lapi_stop_phase_prefers_anti_patterns() {
         RawResult {
             content: "regular chunk content".into(),
             author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "chunk".into(),
             timestamp: None,
@@ -1640,6 +1643,7 @@ fn test_lapi_stop_phase_prefers_anti_patterns() {
         RawResult {
             content: "failed approach for this problem".into(),
             author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "anti_pattern".into(),
             timestamp: None,

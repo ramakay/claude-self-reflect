@@ -754,7 +754,7 @@ async fn test_search_latency_p95(
         .unwrap_or(0.0);
     let ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    if p95 < 10.0 {
+    if search_latency_passes(p95) {
         EvalResult::pass(
             "Search Latency P95",
             "performance",
@@ -766,14 +766,24 @@ async fn test_search_latency_p95(
             "Search Latency P95",
             "performance",
             ms,
-            format!("p95: {p95:.2}ms (target <10ms)"),
+            format!("p95: {p95:.2}ms (target <1ms)"),
         )
     }
+}
+
+fn search_latency_passes(p95_ms: f64) -> bool {
+    p95_ms < 1.0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_latency_gate_enforces_sub_millisecond_p95() {
+        assert!(search_latency_passes(0.999));
+        assert!(!search_latency_passes(1.0));
+    }
 
     #[test]
     fn test_eval_result_formatting() {

@@ -3,7 +3,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::provenance::Speaker;
 use crate::storage::trained_rerank::ModelAttempt;
 use crate::storage::Storage;
 
@@ -505,14 +504,6 @@ fn candidate_recency(timestamp: Option<&str>) -> Option<f64> {
     Some(0.5_f64.powf(age_days / 14.0))
 }
 
-fn speaker_name(speaker: Speaker) -> &'static str {
-    match speaker {
-        Speaker::User => "user",
-        Speaker::Assistant => "assistant",
-        Speaker::ToolResult => "tool_result",
-    }
-}
-
 fn score_runtime_candidates(
     model: &LinearModel,
     candidates: &[RankCandidate],
@@ -539,7 +530,8 @@ fn score_runtime_candidates(
                 .filter(|value| !value.is_empty())
                 .unwrap_or("chunk"),
             intent,
-            author: provenance.map(|value| speaker_name(value.author)),
+            author: (candidate.min_trust >= crate::provenance::TrustTier::UserHistory)
+                .then_some("user"),
             is_scaffold: super::rerank::is_scaffold_text(&candidate.content),
             is_mechanic: super::rerank::is_mechanic_text(&candidate.content),
             supersedes: provenance.is_some_and(|value| value.supersedes.is_some()),
@@ -650,7 +642,8 @@ pub fn rerank_prompt_with_model(
             baseline_score: Some(f64::from(candidate.final_score)),
             source_type: &candidate.source,
             intent,
-            author: candidate.author.map(speaker_name),
+            author: (candidate.min_trust >= crate::provenance::TrustTier::UserHistory)
+                .then_some("user"),
             is_scaffold: scaffold,
             is_mechanic: mechanic,
             supersedes: false,
@@ -661,7 +654,7 @@ pub fn rerank_prompt_with_model(
         let mut residual = bounded_residual(model.probability(&features)?);
         if scaffold
             || mechanic
-            || super::rerank::is_poison_content(candidate.author, &candidate.content)
+            || super::rerank::is_poison_content(candidate.min_trust, &candidate.content)
         {
             residual = residual.min(0.0);
         }
@@ -684,6 +677,7 @@ pub fn rerank_prompt_with_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provenance::Speaker;
 
     fn valid_attempt(model_id: &str, trained_at: &str, model: &LinearModel) -> ModelAttempt {
         let (weights_json, normalization_json) = model.persistence_json().unwrap();
@@ -866,6 +860,7 @@ mod tests {
             content: "design history".into(),
             provenance: None,
             timestamp: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
         };
         let contexts = [(
             "candidate".into(),
@@ -908,6 +903,7 @@ mod tests {
             content: "the actual design decision".into(),
             provenance: None,
             timestamp: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
         };
         let scaffold = RankCandidate {
             id: "scaffold".into(),
@@ -915,6 +911,7 @@ mod tests {
             content: "<command-message>quoted decision</command-message>".into(),
             provenance: None,
             timestamp: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
         };
         let order = score_runtime_candidates(
             &model,
@@ -949,6 +946,7 @@ mod tests {
             conversation_id: Some("poison-conv".into()),
             timestamp: None,
             author: Some(Speaker::ToolResult),
+            min_trust: crate::provenance::TrustTier::External,
         };
         let plain = crate::injection::predictor::ScoredResult {
             content: "the user's actual design decision".into(),
@@ -960,6 +958,7 @@ mod tests {
             conversation_id: Some("plain-conv".into()),
             timestamp: None,
             author: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
         };
         let ranked = rerank_prompt_with_model(&[poison, plain], "other", &model).unwrap();
         assert_eq!(ranked[0].memory_id.as_deref(), Some("plain"));
@@ -984,6 +983,7 @@ mod tests {
             content: "older candidate".into(),
             provenance: None,
             timestamp: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
         };
         let newer = RankCandidate {
             id: "newer".into(),
@@ -991,6 +991,7 @@ mod tests {
             content: "newer candidate".into(),
             provenance: None,
             timestamp: Some(chrono::Utc::now().to_rfc3339()),
+            min_trust: crate::provenance::TrustTier::Unknown,
         };
 
         let ranked = rerank_with_model_scored(

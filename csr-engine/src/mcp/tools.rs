@@ -751,10 +751,8 @@ fn recall_display_rank_scores(
 
     let eligible = |candidate: &&crate::search::rerank::RankCandidate| {
         candidate.timestamp.is_some()
-            && candidate
-                .provenance
-                .as_ref()
-                .is_some_and(|provenance| provenance.author == crate::provenance::Speaker::User)
+            && candidate.min_trust >= crate::provenance::TrustTier::UserHistory
+            && candidate.provenance.is_some()
             && !crate::search::rerank::is_scaffold_text(&candidate.content)
     };
     let top_eligible = candidates
@@ -779,7 +777,7 @@ fn recall_display_rank_scores(
         .iter()
         .map(|candidate| {
             let primacy_bonus = if candidate.provenance.as_ref().is_some_and(|provenance| {
-                provenance.author == crate::provenance::Speaker::User
+                candidate.min_trust >= crate::provenance::TrustTier::UserHistory
                     && Some(provenance.source_conv_id.as_str()) == primacy_conversation
             }) {
                 PRIMACY_BOOST
@@ -1069,8 +1067,8 @@ async fn reflect_gather_pass(
     }
 
     // Provenance-aware re-rank (v9.3): authority + meaning layered on the decayed
-    // score. User-authored content is boosted, tool-mechanic build-log and
-    // non-user authority claims are demoted — so a founding decision out-ranks the
+    // score. A cached floor at UserHistory or above is boosted; lower-floor
+    // authority claims and tool-mechanic build logs are demoted, so a founding decision out-ranks the
     // [Edit:]/[Bash:] chunks that used to bury it. Falls back to score order when
     // no provenance/meaning signal differs.
     // NO STACKING (v10): Demote-channel chunks are excluded from reranking
@@ -1092,6 +1090,9 @@ async fn reflect_gather_pass(
             cosine: e.score,
             content: e.chunk.content.clone(),
             provenance: storage.get_chunk_provenance(&e.chunk.id).ok().flatten(),
+            min_trust: storage
+                .get_chunk_min_trust(&e.chunk.id)
+                .unwrap_or(crate::provenance::TrustTier::Unknown),
             timestamp: Some(e.chunk.timestamp.clone()),
         })
         .collect();

@@ -24,6 +24,8 @@ pub struct ScoredResult {
     pub timestamp: Option<String>,
     /// Authorship resolved from chunk provenance when available.
     pub author: Option<crate::provenance::Speaker>,
+    /// Cached row-level provenance floor. Unknown for non-chunk artifacts.
+    pub min_trust: crate::provenance::TrustTier,
 }
 
 /// What contributed to a result's score.
@@ -59,6 +61,8 @@ pub struct RawResult {
     pub memory_id: Option<String>,
     /// Authorship resolved from chunk provenance when available.
     pub author: Option<crate::provenance::Speaker>,
+    /// Cached row-level provenance floor. Unknown for non-chunk artifacts.
+    pub min_trust: crate::provenance::TrustTier,
 }
 
 /// Score and rank results for injection.
@@ -166,6 +170,7 @@ fn score_result(
     let conversation_id = result.conversation_id.clone();
     let timestamp = result.timestamp.clone();
     let author = result.author;
+    let min_trust = result.min_trust;
     let mut signals = Vec::new();
 
     // 1. Semantic match (raw HNSW score, already 0.0-1.0)
@@ -209,6 +214,7 @@ fn score_result(
         conversation_id,
         timestamp,
         author,
+        min_trust,
     }
 }
 
@@ -356,6 +362,7 @@ mod tests {
             RawResult {
                 content: "high match".into(),
                 author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.9,
                 source: "chunk".into(),
                 timestamp: None,
@@ -368,6 +375,7 @@ mod tests {
             RawResult {
                 content: "low match".into(),
                 author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.5,
                 source: "chunk".into(),
                 timestamp: None,
@@ -401,6 +409,7 @@ mod tests {
         let live_timestamp = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
         let raw = |content: &str, conversation_id: &str, chunk_id: &str| RawResult {
             author: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
             content: content.into(),
             score: 0.8,
             source: "chunk".into(),
@@ -441,6 +450,7 @@ mod tests {
         let raw = || RawResult {
             content: "<command-message>quoted workflow</command-message>".into(),
             author: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "chunk".into(),
             timestamp: Some(timestamp.clone()),
@@ -494,6 +504,7 @@ mod tests {
         let raw = || RawResult {
             content: "organic conversation".into(),
             author: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "chunk".into(),
             timestamp: Some(timestamp.clone()),
@@ -553,6 +564,7 @@ mod tests {
             RawResult {
                 content: "recent".into(),
                 author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: Some(now),
@@ -565,6 +577,7 @@ mod tests {
             RawResult {
                 content: "old".into(),
                 author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: Some(old),
@@ -590,6 +603,7 @@ mod tests {
             RawResult {
                 content: "with file overlap".into(),
                 author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: None,
@@ -602,6 +616,7 @@ mod tests {
             RawResult {
                 content: "no overlap".into(),
                 author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: None,
@@ -625,6 +640,7 @@ mod tests {
             RawResult {
                 content: "matching error".into(),
                 author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "reflection".into(),
                 timestamp: None,
@@ -637,6 +653,7 @@ mod tests {
             RawResult {
                 content: "no error match".into(),
                 author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "reflection".into(),
                 timestamp: None,
@@ -708,6 +725,7 @@ mod tests {
             RawResult {
                 content: "from continued session".into(),
                 author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: None,
@@ -720,6 +738,7 @@ mod tests {
             RawResult {
                 content: "from older session".into(),
                 author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.75,
                 source: "chunk".into(),
                 timestamp: None,
@@ -775,6 +794,7 @@ mod tests {
         let results = vec![RawResult {
             content: "unrelated session".into(),
             author: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: None,

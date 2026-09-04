@@ -672,14 +672,8 @@ fn scored_exposure_item(result: &predictor::ScoredResult) -> Option<ExposureItem
         cosine: Some(f64::from(result.raw_score)),
         recency,
         graph_proximity: None,
-        author: result
-            .author
-            .map(|author| match author {
-                crate::provenance::Speaker::User => "user",
-                crate::provenance::Speaker::Assistant => "assistant",
-                crate::provenance::Speaker::ToolResult => "tool_result",
-            })
-            .map(str::to_string),
+        author: (result.min_trust >= crate::provenance::TrustTier::UserHistory)
+            .then(|| "user".to_string()),
         is_scaffold: crate::search::rerank::is_scaffold_text(&result.content),
         is_mechanic: crate::search::rerank::is_mechanic_text(&result.content),
         supersedes: false,
@@ -1073,6 +1067,9 @@ async fn search_chunks_with_vec(
                     conversation_id: Some(chunk.conversation_id),
                     memory_id: Some(result.id.clone()),
                     author: Some(chunk.author),
+                    min_trust: storage
+                        .get_chunk_min_trust(&result.id)
+                        .unwrap_or(crate::provenance::TrustTier::Unknown),
                 });
             }
         }
@@ -1137,6 +1134,7 @@ async fn search_reflections_with_vec(
                 conversation_id: None,
                 memory_id: Some(result.id.clone()),
                 author: Some(crate::provenance::Speaker::ToolResult),
+                min_trust: crate::provenance::TrustTier::Unknown,
             });
         }
     }
@@ -1546,6 +1544,52 @@ pub fn symbol_overlap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn chunk_search_reads_cached_floor_without_provenance_event_tables() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let chunk = crate::import::ConversationChunk {
+            id: "cached-search-floor".into(),
+            conversation_id: "search-conv".into(),
+            project_name: "project".into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            content: "cached structural trust".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE chunks SET min_trust=3 WHERE id='cached-search-floor'",
+                    [],
+                )?;
+                conn.execute("DROP TABLE chunk_spans", [])?;
+                conn.execute("DROP TABLE provenance_events", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let mut search = crate::search::SearchEngine::new(8);
+        search.insert_chunk(chunk.id.clone(), vec![1.0, 0.0]);
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+
+        let results = search_chunks_with_vec(&engine, &[1.0, 0.0], 1, 0.0, "project").await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].min_trust,
+            crate::provenance::TrustTier::UserHistory
+        );
+    }
 
     #[test]
     fn prompt_ancestry_excludes_only_demoted_chunk_in_shared_conversation() {
