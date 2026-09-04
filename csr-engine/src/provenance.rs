@@ -11,7 +11,190 @@
 //! as a decision or correction — never `assistant` narration or `tool_result`
 //! / file content masquerading as one.
 
+use std::convert::Infallible;
+use std::fmt;
 use std::str::FromStr;
+
+/// Cached authority floor for persisted memory.
+///
+/// The integer representation is part of the SQLite schema contract. New
+/// variants must not renumber existing values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(i64)]
+pub enum TrustTier {
+    Unknown = 0,
+    External = 1,
+    TrustedTool = 2,
+    UserHistory = 3,
+    UserConfirmed = 4,
+    System = 5,
+}
+
+impl TrustTier {
+    pub const fn as_i64(self) -> i64 {
+        self as i64
+    }
+
+    /// Decode a nullable SQLite value conservatively.
+    pub const fn from_db(value: Option<i64>) -> Self {
+        match value {
+            Some(1) => Self::External,
+            Some(2) => Self::TrustedTool,
+            Some(3) => Self::UserHistory,
+            Some(4) => Self::UserConfirmed,
+            Some(5) => Self::System,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub const fn min(self, other: Self) -> Self {
+        if self.as_i64() <= other.as_i64() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+impl fmt::Display for TrustTier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Unknown => "unknown",
+            Self::External => "external",
+            Self::TrustedTool => "trusted_tool",
+            Self::UserHistory => "user_history",
+            Self::UserConfirmed => "user_confirmed",
+            Self::System => "system",
+        })
+    }
+}
+
+impl FromStr for TrustTier {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "unknown" => Self::Unknown,
+            "external" => Self::External,
+            "trusted_tool" => Self::TrustedTool,
+            "user_history" => Self::UserHistory,
+            "user_confirmed" => Self::UserConfirmed,
+            "system" => Self::System,
+            _ => Self::Unknown,
+        })
+    }
+}
+
+/// Tools whose results are observations of local state only.
+pub const LOCAL_ONLY_TOOLS: &[&str] = &[
+    "Read",
+    "Grep",
+    "Glob",
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "NotebookEdit",
+    "LS",
+    "TodoWrite",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskList",
+];
+
+/// Fixed platform-observed channel rules. Tool and assistant channels are
+/// handled beside this table because their tier depends on a tool name or the
+/// running context floor.
+pub const CHANNEL_TIER_RULES: &[(&str, TrustTier)] = &[
+    ("user_message", TrustTier::UserHistory),
+    ("codex_user", TrustTier::UserHistory),
+    ("plan_file", TrustTier::TrustedTool),
+    ("reflection", TrustTier::Unknown),
+    ("memory_metadata", TrustTier::Unknown),
+];
+
+/// Map a platform-observed channel to a tier without consulting its text.
+pub fn trust_for_channel(channel: &str, context_floor: TrustTier) -> TrustTier {
+    if matches!(channel, "assistant_message" | "codex_assistant") {
+        return context_floor;
+    }
+    if let Some(tool) = channel
+        .strip_prefix("tool_result:")
+        .or_else(|| channel.strip_prefix("codex_tool:"))
+    {
+        return if LOCAL_ONLY_TOOLS.contains(&tool) {
+            TrustTier::TrustedTool
+        } else {
+            TrustTier::External
+        };
+    }
+    if matches!(channel, "tool_result" | "codex_tool") {
+        return TrustTier::External;
+    }
+    CHANNEL_TIER_RULES
+        .iter()
+        .find_map(|(known, tier)| (*known == channel).then_some(*tier))
+        .unwrap_or(TrustTier::Unknown)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenanceEvent {
+    pub event_id: String,
+    pub conversation_id: String,
+    pub message_key: String,
+    pub seq: usize,
+    pub channel: String,
+    pub trust_tier: TrustTier,
+    pub parent_event_id: Option<String>,
+    pub receipt_kind: String,
+    pub receipt_ref: Option<String>,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkSpan {
+    pub chunk_id: String,
+    pub event_id: String,
+    pub start_char: usize,
+    pub end_char: usize,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkEvidence {
+    pub chunk_id: String,
+    pub events: Vec<ProvenanceEvent>,
+    pub spans: Vec<ChunkSpan>,
+    pub min_trust: TrustTier,
+    pub tool_result_share: Option<f64>,
+}
+
+pub fn content_hash(text: &str) -> String {
+    blake3::hash(text.as_bytes()).to_hex().to_string()
+}
+
+/// Revalidate a span against the extracted event text. This is a cold-path
+/// integrity check; retrieval reads the cached chunk floor instead.
+pub fn validated_span_tier(
+    event: &ProvenanceEvent,
+    span: &ChunkSpan,
+    extracted_message_text: &str,
+) -> TrustTier {
+    if span.event_id != event.event_id || span.end_char < span.start_char {
+        return TrustTier::Unknown;
+    }
+    let text = extracted_message_text
+        .chars()
+        .skip(span.start_char)
+        .take(span.end_char - span.start_char)
+        .collect::<String>();
+    if text.chars().count() != span.end_char - span.start_char
+        || content_hash(&text) != span.content_hash
+    {
+        TrustTier::Unknown
+    } else {
+        event.trust_tier
+    }
+}
 
 /// Who authored a chunk of conversation content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +250,139 @@ pub struct ChunkProvenance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_tier_has_stable_ordered_sqlite_encoding() {
+        let cases = [
+            (TrustTier::Unknown, 0_i64, "unknown"),
+            (TrustTier::External, 1, "external"),
+            (TrustTier::TrustedTool, 2, "trusted_tool"),
+            (TrustTier::UserHistory, 3, "user_history"),
+            (TrustTier::UserConfirmed, 4, "user_confirmed"),
+            (TrustTier::System, 5, "system"),
+        ];
+
+        for (tier, encoded, rendered) in cases {
+            assert_eq!(tier.as_i64(), encoded);
+            assert_eq!(TrustTier::from_db(Some(encoded)), tier);
+            assert_eq!(tier.to_string(), rendered);
+            assert_eq!(rendered.parse::<TrustTier>().unwrap(), tier);
+        }
+        assert!(TrustTier::Unknown < TrustTier::External);
+        assert!(TrustTier::External < TrustTier::TrustedTool);
+        assert!(TrustTier::TrustedTool < TrustTier::UserHistory);
+        assert!(TrustTier::UserHistory < TrustTier::UserConfirmed);
+        assert!(TrustTier::UserConfirmed < TrustTier::System);
+        assert_eq!(
+            TrustTier::System.min(TrustTier::External),
+            TrustTier::External
+        );
+    }
+
+    #[test]
+    fn missing_or_unparseable_trust_is_unknown() {
+        assert_eq!(TrustTier::from_db(None), TrustTier::Unknown);
+        assert_eq!(TrustTier::from_db(Some(-1)), TrustTier::Unknown);
+        assert_eq!(TrustTier::from_db(Some(99)), TrustTier::Unknown);
+        assert_eq!("user".parse::<TrustTier>().unwrap(), TrustTier::Unknown);
+        assert_eq!("999".parse::<TrustTier>().unwrap(), TrustTier::Unknown);
+    }
+
+    #[test]
+    fn fixed_channel_rules_map_each_declared_row() {
+        for (channel, expected) in CHANNEL_TIER_RULES {
+            assert_eq!(
+                trust_for_channel(channel, TrustTier::External),
+                *expected,
+                "channel {channel}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_tool_allowlist_is_exhaustively_mapped() {
+        for tool in LOCAL_ONLY_TOOLS {
+            assert_eq!(
+                trust_for_channel(&format!("tool_result:{tool}"), TrustTier::UserHistory),
+                TrustTier::TrustedTool,
+                "tool {tool}"
+            );
+            assert_eq!(
+                trust_for_channel(&format!("codex_tool:{tool}"), TrustTier::UserHistory),
+                TrustTier::TrustedTool,
+                "codex tool {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_and_unknown_channels_never_inherit_textual_authority() {
+        for channel in [
+            "tool_result:Bash",
+            "tool_result:WebFetch",
+            "tool_result:mcp__memory__store",
+            "tool_result:MadeUp",
+            "codex_tool:Bash",
+        ] {
+            assert_eq!(
+                trust_for_channel(channel, TrustTier::System),
+                TrustTier::External,
+                "channel {channel}"
+            );
+        }
+        assert_eq!(
+            trust_for_channel("unclassified", TrustTier::System),
+            TrustTier::Unknown
+        );
+    }
+
+    #[test]
+    fn assistant_channel_uses_context_floor_and_missing_context_is_unknown() {
+        assert_eq!(
+            trust_for_channel("assistant_message", TrustTier::External),
+            TrustTier::External
+        );
+        assert_eq!(
+            trust_for_channel("codex_assistant", TrustTier::Unknown),
+            TrustTier::Unknown
+        );
+    }
+
+    #[test]
+    fn changed_span_content_decodes_to_unknown() {
+        let event = ProvenanceEvent {
+            event_id: "event-1".into(),
+            conversation_id: "conv".into(),
+            message_key: "message".into(),
+            seq: 0,
+            channel: "user_message".into(),
+            trust_tier: TrustTier::UserHistory,
+            parent_event_id: None,
+            receipt_kind: "jsonl".into(),
+            receipt_ref: Some("/tmp/transcript.jsonl#byte=0".into()),
+            observed_at: "2026-09-04T00:00:00Z".into(),
+        };
+        let span = ChunkSpan {
+            chunk_id: "chunk-1".into(),
+            event_id: event.event_id.clone(),
+            start_char: 0,
+            end_char: 5,
+            content_hash: content_hash("hello"),
+        };
+
+        assert_eq!(
+            validated_span_tier(&event, &span, "hello world"),
+            TrustTier::UserHistory
+        );
+        assert_eq!(
+            validated_span_tier(&event, &span, "hullo world"),
+            TrustTier::Unknown
+        );
+        assert_eq!(
+            validated_span_tier(&event, &span, "short"),
+            TrustTier::Unknown
+        );
+    }
 
     #[test]
     fn speaker_roundtrips_through_string() {

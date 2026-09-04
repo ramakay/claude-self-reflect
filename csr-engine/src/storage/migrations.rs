@@ -772,6 +772,8 @@ pub fn run(conn: &Connection) -> Result<()> {
         );
     }
 
+    migrate_provenance_substrate(conn)?;
+
     // The FTS migration records its durable compaction state in meta. Create
     // this small table before the larger metadata block below so the schema
     // replacement and its pending marker can commit atomically.
@@ -1965,6 +1967,57 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// Expand the schema with message-bound provenance coordinates. Existing
+/// chunks retain an Unknown floor until a structural import or backfill can
+/// attach evidence; the migration never infers trust from legacy authorship.
+fn migrate_provenance_substrate(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "chunks", "min_trust")? {
+        conn.execute(
+            "ALTER TABLE chunks ADD COLUMN min_trust INTEGER NOT NULL DEFAULT 0
+                 CHECK (min_trust BETWEEN 0 AND 5)",
+            [],
+        )?;
+    }
+    if !has_column(conn, "chunks", "tool_result_share")? {
+        conn.execute(
+            "ALTER TABLE chunks ADD COLUMN tool_result_share REAL
+                 CHECK (tool_result_share IS NULL OR
+                        (tool_result_share >= 0.0 AND tool_result_share <= 1.0))",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_chunks_min_trust ON chunks(min_trust);
+
+         CREATE TABLE IF NOT EXISTS provenance_events (
+            event_id        TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            message_key     TEXT NOT NULL,
+            seq             INTEGER NOT NULL,
+            channel         TEXT NOT NULL,
+            trust_tier      INTEGER NOT NULL DEFAULT 0
+                CHECK (trust_tier BETWEEN 0 AND 5),
+            parent_event_id TEXT REFERENCES provenance_events(event_id),
+            receipt_kind    TEXT NOT NULL,
+            receipt_ref     TEXT,
+            observed_at     TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_provenance_events_conversation_seq
+            ON provenance_events(conversation_id, seq);
+
+         CREATE TABLE IF NOT EXISTS chunk_spans (
+            chunk_id    TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+            event_id    TEXT NOT NULL REFERENCES provenance_events(event_id),
+            start_char  INTEGER NOT NULL CHECK (start_char >= 0),
+            end_char    INTEGER NOT NULL CHECK (end_char >= start_char),
+            content_hash TEXT NOT NULL,
+            PRIMARY KEY (chunk_id, event_id, start_char, end_char)
+         );
+         CREATE INDEX IF NOT EXISTS idx_chunk_spans_chunk ON chunk_spans(chunk_id);",
+    )?;
+    Ok(())
+}
+
 /// Does `table` carry an index named `index_name`? Answered from
 /// `pragma_index_list`, so a column that exists without its index — the exact
 /// shape a half-applied migration leaves behind — is *detected*, not assumed
@@ -2447,6 +2500,110 @@ mod tests {
                 .is_ok(),
             "seq and is_sidechain columns must exist after migration"
         );
+    }
+
+    #[test]
+    fn provenance_substrate_migration_is_idempotent_and_defaults_closed() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+
+        conn.execute(
+            "INSERT INTO chunks
+                (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES ('c1', 'conv', 'project', '2026-09-04T00:00:00Z', 'body', 1)",
+            [],
+        )
+        .unwrap();
+        let cached: (i64, Option<f64>) = conn
+            .query_row(
+                "SELECT min_trust, tool_result_share FROM chunks WHERE id='c1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cached, (0, None));
+
+        let objects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+                    'provenance_events', 'chunk_spans',
+                    'idx_chunks_min_trust', 'idx_provenance_events_conversation_seq',
+                    'idx_chunk_spans_chunk')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(objects, 5);
+    }
+
+    #[test]
+    fn provenance_substrate_migrates_legacy_chunks_without_rewriting_them() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chunks (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                project_name TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                content TEXT NOT NULL,
+                message_count INTEGER NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+             );
+             INSERT INTO chunks
+                (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES ('legacy', 'old-conv', 'old-project', '2026-01-02T03:04:05Z',
+                     'legacy text', 7);",
+        )
+        .unwrap();
+
+        run(&conn).expect("migrate legacy database");
+        let row: (String, String, i64, Option<f64>) = conn
+            .query_row(
+                "SELECT conversation_id, content, min_trust, tool_result_share
+                   FROM chunks WHERE id='legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("old-conv".into(), "legacy text".into(), 0, None));
+    }
+
+    #[test]
+    fn provenance_substrate_rejects_invalid_coordinates_and_tiers() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let bad_tier = conn.execute(
+            "INSERT INTO provenance_events
+                (event_id, conversation_id, message_key, seq, channel, trust_tier,
+                 receipt_kind, observed_at)
+             VALUES ('e1', 'conv', 'm1', 0, 'user_message', 99, 'jsonl', 'now')",
+            [],
+        );
+        assert!(bad_tier.is_err());
+
+        conn.execute(
+            "INSERT INTO chunks
+                (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES ('c1', 'conv', 'p', 'now', 'body', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provenance_events
+                (event_id, conversation_id, message_key, seq, channel, trust_tier,
+                 receipt_kind, observed_at)
+             VALUES ('e1', 'conv', 'm1', 0, 'user_message', 3, 'jsonl', 'now')",
+            [],
+        )
+        .unwrap();
+        let bad_span = conn.execute(
+            "INSERT INTO chunk_spans
+                (chunk_id, event_id, start_char, end_char, content_hash)
+             VALUES ('c1', 'e1', 4, 2, 'hash')",
+            [],
+        );
+        assert!(bad_span.is_err());
     }
 
     #[test]

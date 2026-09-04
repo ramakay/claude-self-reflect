@@ -199,9 +199,25 @@ impl FileWatcher {
             return Ok(());
         }
 
-        let parsed = import::parse_jsonl_file_with_stats(file_path, &attribution.project_name)?;
-        let suppression = parsed.suppression;
-        let chunks = parsed.chunks;
+        let parent_context = attribution
+            .parent_conversation_id
+            .as_deref()
+            .map(|parent_id| {
+                let message_key = import::sidechain_parent_message_key(file_path);
+                self.storage
+                    .parent_provenance_context(parent_id, message_key.as_deref())
+            })
+            .transpose()?;
+        let parsed = import::parse_jsonl_file_with_stats_and_parent(
+            file_path,
+            &attribution.project_name,
+            parent_context.as_ref(),
+        )?;
+        let import::ParsedConversation {
+            chunks,
+            suppression,
+            evidence,
+        } = parsed;
         if chunks.is_empty() {
             // Record the skip so this file isn't re-parsed every watcher pass
             // and import_percent counts it as processed.
@@ -276,6 +292,9 @@ impl FileWatcher {
                     },
                 ) {
                     tracing::warn!(error = %error, chunk = %chunk.id, "chunk provenance persist failed");
+                }
+                if let Some(chunk_evidence) = evidence.get(&chunk.id) {
+                    self.storage.replace_chunk_evidence(chunk_evidence)?;
                 }
                 idx.insert_chunk(chunk.id.clone(), embedding);
             }

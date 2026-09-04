@@ -1,13 +1,13 @@
 //! Aux-source adapter: import `~/.claude/plans/*.md` plan documents into the CSR
 //! corpus as embedded, provenance-linked chunks (`source = "plan"`).
 //!
-//! Plans are user-ratified decisions that often outlive the conversation that
-//! produced them (a plan doc gets revised across many sessions), so they need their
+//! Plans are agent-written local files; observing one is not proof that a user
+//! approved it. They often outlive the conversation that produced them, so they need their
 //! own idempotent import path rather than piggybacking on the JSONL importer:
 //! reimport must replace stale content in place, and correlation to an origin
 //! conversation is a best-effort guess, not a guarantee (see `correlate_project`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -15,7 +15,9 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::engine::Engine;
 use crate::import::ConversationChunk;
-use crate::provenance::{ChunkProvenance, Speaker};
+use crate::provenance::{
+    ChunkEvidence, ChunkProvenance, ChunkSpan, ProvenanceEvent, Speaker, TrustTier,
+};
 use crate::storage::Storage;
 
 /// A single `*.md` plan document discovered on disk, ready for correlation + import.
@@ -349,11 +351,94 @@ fn push_plan_chunks(
             content[start..end].to_string(),
             1,
             summary,
-            Speaker::User, // plans are user-ratified — never assistant/tool_result
+            Speaker::User, // legacy display aggregate only; trust is cached separately
             false,         // plans are never sidechain transcripts
         );
         start = end;
     }
+}
+
+fn plan_evidence(
+    plan: &PlanDoc,
+    conversation_id: &str,
+    chunks: &[ConversationChunk],
+) -> HashMap<String, ChunkEvidence> {
+    let message_key = crate::provenance::content_hash(&plan.content);
+    let event = ProvenanceEvent {
+        event_id: super::provenance_event_id(conversation_id, &message_key, 0, "plan_file", 0),
+        conversation_id: conversation_id.to_string(),
+        message_key,
+        seq: 0,
+        channel: "plan_file".to_string(),
+        trust_tier: TrustTier::TrustedTool,
+        parent_event_id: None,
+        receipt_kind: "plan_file".to_string(),
+        receipt_ref: Some(format!("{}#byte=0", plan.path.display())),
+        observed_at: plan.mtime.clone(),
+    };
+    let mut byte_start = 0usize;
+    chunks
+        .iter()
+        .map(|chunk| {
+            let byte_end = byte_start + chunk.content.len();
+            let start_char = plan.content[..byte_start].chars().count();
+            let end_char = plan.content[..byte_end].chars().count();
+            byte_start = byte_end;
+            (
+                chunk.id.clone(),
+                ChunkEvidence {
+                    chunk_id: chunk.id.clone(),
+                    events: vec![event.clone()],
+                    spans: vec![ChunkSpan {
+                        chunk_id: chunk.id.clone(),
+                        event_id: event.event_id.clone(),
+                        start_char,
+                        end_char,
+                        content_hash: crate::provenance::content_hash(&chunk.content),
+                    }],
+                    min_trust: TrustTier::TrustedTool,
+                    tool_result_share: Some(0.0),
+                },
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn reconstruct_plan_evidence(
+    path: &Path,
+    conversation_id: &str,
+    project_name: &str,
+    timestamp: &str,
+) -> Result<HashMap<String, (String, ChunkEvidence)>> {
+    let content = std::fs::read_to_string(path)?;
+    let plan = PlanDoc {
+        slug: conversation_id
+            .strip_prefix("plan:")
+            .unwrap_or(conversation_id)
+            .to_string(),
+        path: path.to_path_buf(),
+        mtime: timestamp.to_string(),
+        content,
+    };
+    let mut chunks = Vec::new();
+    push_plan_chunks(
+        &mut chunks,
+        conversation_id,
+        project_name,
+        timestamp,
+        &plan.content,
+        &plan_summary(&plan.content),
+    );
+    let evidence = plan_evidence(&plan, conversation_id, &chunks);
+    Ok(chunks
+        .into_iter()
+        .filter_map(|chunk| {
+            evidence
+                .get(&chunk.id)
+                .cloned()
+                .map(|row| (chunk.id, (chunk.content, row)))
+        })
+        .collect())
 }
 
 /// Import one plan: wipe any existing chunks for `plan:<slug>` (idempotent even
@@ -392,6 +477,7 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
         &plan.content,
         &summary,
     );
+    let evidence = plan_evidence(plan, &conv_id, &new_chunks);
 
     if new_chunks.is_empty() {
         storage.upsert_import_state_explicit(&conv_id, &conv_id, 0, &plan.mtime)?;
@@ -425,6 +511,9 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
                 ) {
                     eprintln!("CSR: plan chunk provenance persist error (non-fatal): {e}");
                 }
+            }
+            if let Some(chunk_evidence) = evidence.get(&chunk.id) {
+                storage.replace_chunk_evidence(chunk_evidence)?;
             }
             idx.insert_chunk(chunk.id.clone(), embedding.clone());
         }
@@ -663,6 +752,11 @@ mod tests {
                 .expect("provenance edge");
             assert_eq!(prov.author, Speaker::User);
             assert_eq!(prov.source_conv_id, "conv-lapi-origin");
+            assert_eq!(
+                storage.get_chunk_min_trust(id).unwrap(),
+                crate::provenance::TrustTier::TrustedTool,
+                "plan correlation must not turn file content into user history"
+            );
         }
 
         // Reimport with shrunk content: old chunks must be gone, new ones present,
@@ -710,6 +804,10 @@ mod tests {
         for id in &ids {
             // No correlation -> no provenance edge should have been written.
             assert!(storage.get_chunk_provenance(id).unwrap().is_none());
+            assert_eq!(
+                storage.get_chunk_min_trust(id).unwrap(),
+                crate::provenance::TrustTier::TrustedTool
+            );
         }
     }
 }

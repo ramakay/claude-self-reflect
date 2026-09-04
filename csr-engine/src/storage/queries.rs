@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::import::{ConversationChunk, CsrSuppressionStats};
-use crate::provenance::{ChunkProvenance, Speaker};
+use crate::provenance::{ChunkEvidence, ChunkProvenance, ProvenanceEvent, Speaker, TrustTier};
 
 /// Upsert provenance for a chunk (who authored it, source conv, supersession).
 pub fn insert_chunk_provenance(
@@ -25,6 +25,261 @@ pub fn insert_chunk_provenance(
         ],
     )?;
     Ok(())
+}
+
+pub fn insert_provenance_event(conn: &Connection, event: &ProvenanceEvent) -> Result<()> {
+    conn.execute(
+        "INSERT INTO provenance_events
+            (event_id, conversation_id, message_key, seq, channel, trust_tier,
+             parent_event_id, receipt_kind, receipt_ref, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(event_id) DO UPDATE SET
+            trust_tier = MIN(provenance_events.trust_tier, excluded.trust_tier),
+            parent_event_id = COALESCE(provenance_events.parent_event_id,
+                                       excluded.parent_event_id),
+            receipt_ref = COALESCE(provenance_events.receipt_ref,
+                                   excluded.receipt_ref)",
+        params![
+            event.event_id,
+            event.conversation_id,
+            event.message_key,
+            event.seq as i64,
+            event.channel,
+            event.trust_tier.as_i64(),
+            event.parent_event_id,
+            event.receipt_kind,
+            event.receipt_ref,
+            event.observed_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn parent_provenance_context(
+    conn: &Connection,
+    conversation_id: &str,
+    message_key: Option<&str>,
+) -> Result<crate::import::ParentContext> {
+    if let Some(message_key) = message_key {
+        let matched = conn
+            .query_row(
+                "SELECT event_id, trust_tier
+                   FROM provenance_events
+                  WHERE conversation_id = ?1 AND message_key = ?2
+                  ORDER BY CASE WHEN channel IN ('assistant_message', 'codex_assistant')
+                                THEN 0 ELSE 1 END,
+                           event_id
+                  LIMIT 1",
+                params![conversation_id, message_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        if let Some((event_id, tier)) = matched {
+            return Ok(crate::import::ParentContext {
+                floor: TrustTier::from_db(tier),
+                event_id: Some(event_id),
+            });
+        }
+    }
+    let floor = conn.query_row(
+        "SELECT MIN(trust_tier) FROM provenance_events WHERE conversation_id = ?1",
+        [conversation_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    Ok(crate::import::ParentContext {
+        floor: TrustTier::from_db(floor),
+        event_id: None,
+    })
+}
+
+/// Replace one chunk's structural evidence and its cached trust fields in one
+/// transaction. Re-importing a growing final chunk cannot leave stale spans.
+pub fn replace_chunk_evidence(conn: &Connection, evidence: &ChunkEvidence) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    replace_chunk_evidence_inner(&tx, evidence)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn replace_chunk_evidence_batch(conn: &Connection, evidence: &[ChunkEvidence]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for row in evidence {
+        replace_chunk_evidence_inner(&tx, row)
+            .with_context(|| format!("persisting provenance for chunk {}", row.chunk_id))?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn replace_chunk_evidence_inner(conn: &Connection, evidence: &ChunkEvidence) -> Result<()> {
+    for event in &evidence.events {
+        insert_provenance_event(conn, event)?;
+    }
+    conn.execute(
+        "DELETE FROM chunk_spans WHERE chunk_id = ?1",
+        [&evidence.chunk_id],
+    )?;
+    for span in &evidence.spans {
+        anyhow::ensure!(
+            span.chunk_id == evidence.chunk_id,
+            "span chunk id does not match evidence chunk id"
+        );
+        conn.execute(
+            "INSERT INTO chunk_spans
+                (chunk_id, event_id, start_char, end_char, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                span.chunk_id,
+                span.event_id,
+                span.start_char as i64,
+                span.end_char as i64,
+                span.content_hash,
+            ],
+        )?;
+    }
+
+    let (tier, tool_chars, span_count, unknown_share, chunk_content): (
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+        String,
+    ) = conn.query_row(
+        "SELECT MIN(pe.trust_tier),
+                    COALESCE(SUM(CASE
+                        WHEN pe.channel LIKE 'tool_result:%'
+                          OR pe.channel LIKE 'codex_tool:%'
+                        THEN cs.end_char - cs.start_char ELSE 0 END), 0),
+                    COUNT(cs.event_id),
+                    COALESCE(SUM(CASE WHEN pe.receipt_kind = 'unreconstructible'
+                                      THEN 1 ELSE 0 END), 0),
+                    c.content
+               FROM chunks c
+               LEFT JOIN chunk_spans cs ON cs.chunk_id = c.id
+               LEFT JOIN provenance_events pe ON pe.event_id = cs.event_id
+              WHERE c.id = ?1
+              GROUP BY c.id",
+        [&evidence.chunk_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let chunk_chars = chunk_content.chars().count() as i64;
+    let min_trust = TrustTier::from_db(tier);
+    let tool_result_share = if span_count == 0 || chunk_chars == 0 || unknown_share > 0 {
+        None
+    } else {
+        Some(tool_chars as f64 / chunk_chars as f64)
+    };
+    anyhow::ensure!(
+        min_trust <= evidence.min_trust,
+        "persisted chunk floor exceeds the structurally observed floor"
+    );
+    anyhow::ensure!(
+        match (tool_result_share, evidence.tool_result_share) {
+            (None, None) => true,
+            (Some(actual), Some(expected)) => (actual - expected).abs() < f64::EPSILON,
+            _ => false,
+        },
+        "provided tool-result share does not match persisted spans: actual={tool_result_share:?}, expected={:?}, spans={span_count}, chars={chunk_chars}, tool_chars={tool_chars}",
+        evidence.tool_result_share,
+    );
+    conn.execute(
+        "UPDATE chunks SET min_trust = ?2, tool_result_share = ?3 WHERE id = ?1",
+        params![evidence.chunk_id, min_trust.as_i64(), tool_result_share],
+    )?;
+    Ok(())
+}
+
+pub fn get_chunk_min_trust(conn: &Connection, chunk_id: &str) -> Result<TrustTier> {
+    let encoded = conn
+        .query_row(
+            "SELECT min_trust FROM chunks WHERE id = ?1",
+            [chunk_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(TrustTier::from_db(encoded))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenanceBackfillRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub project_name: String,
+    pub timestamp: String,
+    pub content: String,
+    pub source: String,
+    pub is_sidechain: bool,
+    pub source_path: Option<String>,
+}
+
+pub fn list_chunks_missing_spans(
+    conn: &Connection,
+    after_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ProvenanceBackfillRow>> {
+    let mut statement = conn.prepare(
+        "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content,
+                c.source, c.is_sidechain,
+                (SELECT i.file_path FROM import_state i
+                  WHERE i.conversation_id = c.conversation_id
+                    AND i.file_path NOT LIKE 'plan:%'
+                  ORDER BY i.file_path LIMIT 1)
+           FROM chunks c
+          WHERE c.id > COALESCE(?1, '')
+            AND NOT EXISTS (SELECT 1 FROM chunk_spans s WHERE s.chunk_id = c.id)
+          ORDER BY c.id
+          LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![after_id, limit as i64], |row| {
+        Ok(ProvenanceBackfillRow {
+            id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            project_name: row.get(2)?,
+            timestamp: row.get(3)?,
+            content: row.get(4)?,
+            source: row.get(5)?,
+            is_sidechain: row.get::<_, i64>(6)? != 0,
+            source_path: row.get(7)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub fn provenance_coverage(conn: &Connection) -> Result<(i64, i64, i64, Option<f64>)> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(CASE WHEN EXISTS (
+                    SELECT 1 FROM chunk_spans s WHERE s.chunk_id = c.id
+                ) THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN c.min_trust = 0 THEN 1 ELSE 0 END), 0),
+                COUNT(*), AVG(c.tool_result_share)
+           FROM chunks c",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+    .map_err(Into::into)
+}
+
+pub fn provenance_tier_histogram(conn: &Connection) -> Result<Vec<(TrustTier, i64)>> {
+    let mut statement = conn
+        .prepare("SELECT min_trust, COUNT(*) FROM chunks GROUP BY min_trust ORDER BY min_trust")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            TrustTier::from_db(row.get::<_, Option<i64>>(0)?),
+            row.get(1)?,
+        ))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 /// Upsert a derivation-ledger entry (Pillar 1). `times_reused` is preserved on
@@ -382,6 +637,26 @@ pub fn insert_reflection(
     conn.execute(
         "INSERT OR REPLACE INTO reflection_embeddings (reflection_id, embedding) VALUES (?1, ?2)",
         params![id, vec_to_bytes(embedding)],
+    )?;
+
+    let message_key = crate::provenance::content_hash(content);
+    let event_id = blake3::hash(format!("reflection\0{id}\0{message_key}").as_bytes())
+        .to_hex()
+        .to_string();
+    insert_provenance_event(
+        conn,
+        &ProvenanceEvent {
+            event_id: format!("reflection:{event_id}"),
+            conversation_id: format!("reflection:{id}"),
+            message_key,
+            seq: 0,
+            channel: "reflection".to_string(),
+            trust_tier: TrustTier::Unknown,
+            parent_event_id: None,
+            receipt_kind: "reflection_row".to_string(),
+            receipt_ref: Some(id.to_string()),
+            observed_at: now,
+        },
     )?;
 
     Ok(())

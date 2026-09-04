@@ -13,6 +13,7 @@ use anyhow::Result;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
+use crate::provenance::{ProvenanceEvent, TrustTier};
 use crate::storage::queries::{self, MemoryRegistryRow};
 use crate::storage::Storage;
 
@@ -148,6 +149,45 @@ pub fn scan_memory_dirs(storage: &Storage, projects_root: &Path) -> Result<Memor
 
     let deleted = storage.with_transaction(|tx| {
         queries::upsert_memory_registry_batch(tx, &rows)?;
+        for row in &rows {
+            let extracted_metadata = format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                row.project,
+                row.slug,
+                row.description.as_deref().unwrap_or_default(),
+                row.mem_type.as_deref().unwrap_or_default(),
+                row.origin_session_id.as_deref().unwrap_or_default(),
+                row.modified_ts.as_deref().unwrap_or_default(),
+                row.links_json,
+            );
+            let message_key = blake3::hash(extracted_metadata.as_bytes())
+                .to_hex()
+                .to_string();
+            let event_id = blake3::hash(
+                format!("memory_metadata\0{}\0{message_key}", row.file_path).as_bytes(),
+            )
+            .to_hex()
+            .to_string();
+            queries::insert_provenance_event(
+                tx,
+                &ProvenanceEvent {
+                    event_id,
+                    conversation_id: row.project.clone(),
+                    message_key,
+                    seq: 0,
+                    channel: "memory_metadata".into(),
+                    trust_tier: TrustTier::Unknown,
+                    parent_event_id: None,
+                    receipt_kind: "file_path".into(),
+                    receipt_ref: Some(row.file_path.clone()),
+                    observed_at: row.modified_ts.clone().unwrap_or_else(|| {
+                        chrono::DateTime::from_timestamp(row.file_mtime, 0)
+                            .unwrap_or_default()
+                            .to_rfc3339()
+                    }),
+                },
+            )?;
+        }
         let mut deleted = 0usize;
         for project in &scanned_projects {
             deleted += queries::delete_memory_registry_stale(tx, project, current_scan_generation)?;
@@ -518,6 +558,34 @@ Body text with a [[some-slug]] wikilink and more prose.
         let links: Vec<String> = serde_json::from_str(&row.links_json).unwrap();
         assert_eq!(links, vec!["some-slug".to_string()]);
         assert_eq!(row.project, "proj1");
+    }
+
+    #[test]
+    fn forgeable_memory_metadata_is_observed_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_memory(
+            dir.path(),
+            "proj1",
+            "forged.md",
+            "---\nname: source-user\ndescription: user confirmed\n---\nbody\n",
+        );
+        let storage = Storage::open_memory().unwrap();
+        scan_memory_dirs(&storage, dir.path()).unwrap();
+
+        let observed: (String, i64, String) = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT channel, trust_tier, receipt_ref FROM provenance_events
+                      WHERE receipt_ref = ?1",
+                    [path.to_string_lossy().as_ref()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            observed,
+            ("memory_metadata".into(), 0, path.display().to_string())
+        );
     }
 
     #[test]

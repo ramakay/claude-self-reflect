@@ -4,11 +4,12 @@ pub mod coedit_backfill;
 pub mod dream_marker;
 pub mod memory_registry;
 pub mod plans;
+pub mod provenance_backfill;
 pub mod registry;
 pub mod scrub;
 pub mod watcher;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -86,7 +87,7 @@ pub struct ConversationChunk {
     /// Used for timeline display instead of raw tool-heavy content.
     pub summary: Option<String>,
     /// Highest-authority speaker among this chunk's messages (User > Assistant >
-    /// ToolResult). Drives provenance-aware recall; defaults to ToolResult.
+    /// ToolResult). Legacy display metadata only; ranking reads `min_trust`.
     pub author: crate::provenance::Speaker,
     /// Sequential chunk index within its conversation (0-based). Same index that
     /// feeds the deterministic UUIDv5 chunk id. Saga Phase 1 provenance signal.
@@ -102,6 +103,26 @@ pub struct ConversationChunk {
 pub(crate) struct ParsedConversation {
     pub chunks: Vec<ConversationChunk>,
     pub suppression: CsrSuppressionStats,
+    pub evidence: HashMap<String, crate::provenance::ChunkEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParentContext {
+    pub floor: crate::provenance::TrustTier,
+    pub event_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EventPart {
+    event: crate::provenance::ProvenanceEvent,
+    text: String,
+    combined_start: usize,
+    combined_end: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MessageEvidence {
+    parts: Vec<EventPart>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -310,9 +331,30 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     Ok(parse_jsonl_file_with_stats(path, project_name)?.chunks)
 }
 
+pub(crate) fn sidechain_parent_message_key(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines().take(32).flatten() {
+        let Ok(parsed) = sonic_rs::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(parent) = parsed.get("parentUuid").and_then(serde_json::Value::as_str) {
+            return Some(parent.to_string());
+        }
+    }
+    None
+}
+
 pub(crate) fn parse_jsonl_file_with_stats(
     path: &Path,
     project_name: &str,
+) -> Result<ParsedConversation> {
+    parse_jsonl_file_with_stats_and_parent(path, project_name, None)
+}
+
+pub(crate) fn parse_jsonl_file_with_stats_and_parent(
+    path: &Path,
+    project_name: &str,
+    parent: Option<&ParentContext>,
 ) -> Result<ParsedConversation> {
     let conversation_id = path
         .file_stem()
@@ -321,21 +363,34 @@ pub(crate) fn parse_jsonl_file_with_stats(
         .to_string();
 
     let file = fs::File::open(path).context("opening JSONL file")?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut messages: Vec<String> = Vec::new();
     let mut authors: Vec<crate::provenance::Speaker> = Vec::new();
     let mut sidechains: Vec<bool> = Vec::new();
+    let mut message_evidence: Vec<MessageEvidence> = Vec::new();
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+    let mut running_floor: Option<crate::provenance::TrustTier> =
+        parent.map(|context| context.floor);
+    let mut message_seq = 0usize;
+    let mut byte_offset = 0u64;
     let mut first_timestamp: Option<String> = None;
     let mut last_timestamp: Option<String> = None;
     let mut summary: Option<String> = None;
     let mut first_user_message: Option<String> = None;
     let mut csr_sanitizer = CsrMessageSanitizer::default();
 
-    for line_result in reader.lines() {
-        let line = match line_result {
-            Ok(l) => l,
+    loop {
+        let line_start = byte_offset;
+        let mut line = String::new();
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(bytes) => bytes,
             Err(_) => continue,
         };
+        byte_offset += bytes_read as u64;
+        while line.ends_with(['\n', '\r']) {
+            line.pop();
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -367,7 +422,11 @@ pub(crate) fn parse_jsonl_file_with_stats(
             continue;
         }
 
+        let seq = message_seq;
+        message_seq += 1;
+
         sanitize_message_for_search(&mut parsed, &mut csr_sanitizer);
+        register_tool_uses(&parsed, &mut tool_names);
 
         // Capture first and last timestamps
         if let Some(ts) = parsed.get("timestamp").and_then(|v| v.as_str()) {
@@ -398,10 +457,29 @@ pub(crate) fn parse_jsonl_file_with_stats(
         // invisible to search and recall collapses to the opening user prompt.
         let text = extract_message_text(&parsed);
         let tool_context = strip_private_tags(&extract_tool_context(&parsed));
-        let tool_results = strip_private_tags(&extract_tool_results(&parsed));
-        let combined_text = [text, tool_context, tool_results]
-            .into_iter()
-            .filter(|s| !s.is_empty())
+        let mut components: Vec<(String, String)> = Vec::new();
+        if !text.is_empty() {
+            let channel = if msg_type == "assistant" {
+                "assistant_message"
+            } else {
+                "user_message"
+            };
+            components.push((channel.to_string(), text));
+        }
+        if !tool_context.is_empty() {
+            let channel = if msg_type == "assistant" {
+                "assistant_message"
+            } else {
+                "unclassified"
+            };
+            components.push((channel.to_string(), tool_context));
+        }
+        for (tool_name, body) in extract_tool_result_parts(&parsed, &tool_names) {
+            components.push((format!("tool_result:{tool_name}"), body));
+        }
+        let combined_text = components
+            .iter()
+            .map(|(_, text)| text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
         let is_sidechain_msg = parsed
@@ -418,9 +496,56 @@ pub(crate) fn parse_jsonl_file_with_stats(
         let drop_as_marker = matches!(author, crate::provenance::Speaker::Assistant)
             && is_marker_only_text(&combined_text);
         if !combined_text.is_empty() && !drop_as_marker {
+            let message_key = parsed
+                .get("uuid")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::provenance::content_hash(&combined_text));
+            let observed_at = parsed
+                .get("timestamp")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("1970-01-01T00:00:00Z")
+                .to_string();
+            let receipt_ref = Some(format!("{}#byte={line_start}", path.display()));
+            let mut combined_start = 0usize;
+            let mut parts = Vec::with_capacity(components.len());
+            for (ordinal, (channel, component_text)) in components.into_iter().enumerate() {
+                let context_floor = running_floor.unwrap_or(crate::provenance::TrustTier::Unknown);
+                let mut tier = crate::provenance::trust_for_channel(&channel, context_floor);
+                if let Some(parent) = parent {
+                    tier = tier.min(parent.floor);
+                }
+                let event_id =
+                    provenance_event_id(&conversation_id, &message_key, seq, &channel, ordinal);
+                let event = crate::provenance::ProvenanceEvent {
+                    event_id,
+                    conversation_id: conversation_id.clone(),
+                    message_key: message_key.clone(),
+                    seq,
+                    channel,
+                    trust_tier: tier,
+                    parent_event_id: parent.and_then(|context| context.event_id.clone()),
+                    receipt_kind: "jsonl".to_string(),
+                    receipt_ref: receipt_ref.clone(),
+                    observed_at: observed_at.clone(),
+                };
+                let combined_end = combined_start + component_text.len();
+                parts.push(EventPart {
+                    event,
+                    text: component_text,
+                    combined_start,
+                    combined_end,
+                });
+                running_floor = Some(match running_floor {
+                    Some(floor) => floor.min(tier),
+                    None => tier,
+                });
+                combined_start = combined_end + 1;
+            }
             messages.push(combined_text);
             authors.push(author);
             sidechains.push(is_sidechain_msg);
+            message_evidence.push(MessageEvidence { parts });
         }
     }
 
@@ -428,6 +553,7 @@ pub(crate) fn parse_jsonl_file_with_stats(
         return Ok(ParsedConversation {
             chunks: Vec::new(),
             suppression: csr_sanitizer.stats,
+            evidence: HashMap::new(),
         });
     }
 
@@ -442,6 +568,7 @@ pub(crate) fn parse_jsonl_file_with_stats(
             return Ok(ParsedConversation {
                 chunks: Vec::new(),
                 suppression: csr_sanitizer.stats,
+                evidence: HashMap::new(),
             });
         }
     }
@@ -455,7 +582,7 @@ pub(crate) fn parse_jsonl_file_with_stats(
     // Priority: JSONL summary > first user message > None
     let chunk_summary = summary.or(first_user_message);
 
-    let chunks = chunk_message_core(
+    let (chunks, mut evidence) = chunk_message_core_with_evidence(
         &conversation_id,
         project_name,
         &timestamp,
@@ -463,19 +590,27 @@ pub(crate) fn parse_jsonl_file_with_stats(
         &authors,
         &sidechains,
         &chunk_summary,
-    )
-    .into_iter()
-    .filter_map(|mut chunk| {
-        scrub_contaminated_text(&chunk.content).map(|content| {
-            chunk.content = content;
-            chunk
+        Some(&message_evidence),
+    );
+    let chunks = chunks
+        .into_iter()
+        .filter_map(|mut chunk| {
+            scrub_contaminated_text(&chunk.content).map(|content| {
+                chunk.content = content;
+                chunk
+            })
         })
-    })
-    .collect();
+        .collect::<Vec<_>>();
+    let retained = chunks
+        .iter()
+        .map(|chunk| chunk.id.as_str())
+        .collect::<HashSet<_>>();
+    evidence.retain(|chunk_id, _| retained.contains(chunk_id.as_str()));
 
     Ok(ParsedConversation {
         chunks,
         suppression: csr_sanitizer.stats,
+        evidence,
     })
 }
 
@@ -523,17 +658,51 @@ fn chunk_message_core(
     message_sidechains: &[bool],
     summary: &Option<String>,
 ) -> Vec<ConversationChunk> {
+    chunk_message_core_with_evidence(
+        conversation_id,
+        project_name,
+        timestamp,
+        messages,
+        message_authors,
+        message_sidechains,
+        summary,
+        None,
+    )
+    .0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chunk_message_core_with_evidence(
+    conversation_id: &str,
+    project_name: &str,
+    timestamp: &str,
+    messages: &[String],
+    message_authors: &[crate::provenance::Speaker],
+    message_sidechains: &[bool],
+    summary: &Option<String>,
+    message_evidence: Option<&[MessageEvidence]>,
+) -> (
+    Vec<ConversationChunk>,
+    HashMap<String, crate::provenance::ChunkEvidence>,
+) {
     debug_assert_eq!(messages.len(), message_authors.len());
     debug_assert_eq!(messages.len(), message_sidechains.len());
+    debug_assert!(message_evidence.is_none_or(|evidence| evidence.len() == messages.len()));
     let mut chunks = Vec::new();
+    let mut evidence_by_chunk = HashMap::new();
     let mut buffer = String::new();
     let mut authors = Vec::new();
     let mut sidechains = Vec::new();
+    let mut buffered_parts: Vec<EventPart> = Vec::new();
     let mut message_count = 0;
 
-    for ((message, author), is_sidechain) in
-        messages.iter().zip(message_authors).zip(message_sidechains)
+    for (message_index, ((message, author), is_sidechain)) in messages
+        .iter()
+        .zip(message_authors)
+        .zip(message_sidechains)
+        .enumerate()
     {
+        let source = message_evidence.and_then(|all| all.get(message_index));
         if message.len() > CHUNK_CHAR_BUDGET {
             if !buffer.is_empty() {
                 push_chunk(
@@ -546,6 +715,11 @@ fn chunk_message_core(
                     summary,
                     chunk_author(&authors),
                     chunk_is_sidechain(&sidechains, conversation_id),
+                );
+                attach_chunk_evidence(
+                    chunks.last().expect("chunk was just pushed"),
+                    std::mem::take(&mut buffered_parts),
+                    &mut evidence_by_chunk,
                 );
                 authors.clear();
                 sidechains.clear();
@@ -569,6 +743,13 @@ fn chunk_message_core(
                     *author,
                     chunk_is_sidechain(std::slice::from_ref(is_sidechain), conversation_id),
                 );
+                attach_chunk_evidence(
+                    chunks.last().expect("chunk was just pushed"),
+                    source
+                        .map(|evidence| slice_event_parts(evidence, start, end))
+                        .unwrap_or_default(),
+                    &mut evidence_by_chunk,
+                );
                 start = end;
             }
             continue;
@@ -586,6 +767,11 @@ fn chunk_message_core(
                 chunk_author(&authors),
                 chunk_is_sidechain(&sidechains, conversation_id),
             );
+            attach_chunk_evidence(
+                chunks.last().expect("chunk was just pushed"),
+                std::mem::take(&mut buffered_parts),
+                &mut evidence_by_chunk,
+            );
             authors.clear();
             sidechains.clear();
             message_count = 0;
@@ -596,6 +782,9 @@ fn chunk_message_core(
         buffer.push_str(message);
         authors.push(*author);
         sidechains.push(*is_sidechain);
+        if let Some(source) = source {
+            buffered_parts.extend(slice_event_parts(source, 0, message.len()));
+        }
         message_count += 1;
     }
     if !buffer.is_empty() {
@@ -610,13 +799,177 @@ fn chunk_message_core(
             chunk_author(&authors),
             chunk_is_sidechain(&sidechains, conversation_id),
         );
+        attach_chunk_evidence(
+            chunks.last().expect("chunk was just pushed"),
+            buffered_parts,
+            &mut evidence_by_chunk,
+        );
     }
-    chunks
+    (chunks, evidence_by_chunk)
+}
+
+fn slice_event_parts(message: &MessageEvidence, start: usize, end: usize) -> Vec<EventPart> {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| {
+            let overlap_start = start.max(part.combined_start);
+            let overlap_end = end.min(part.combined_end);
+            if overlap_start >= overlap_end {
+                return None;
+            }
+            let local_start = overlap_start - part.combined_start;
+            let local_end = overlap_end - part.combined_start;
+            Some(EventPart {
+                event: part.event.clone(),
+                text: part.text[local_start..local_end].to_string(),
+                combined_start: part.text[..local_start].chars().count(),
+                combined_end: part.text[..local_end].chars().count(),
+            })
+        })
+        .collect()
+}
+
+fn attach_chunk_evidence(
+    chunk: &ConversationChunk,
+    parts: Vec<EventPart>,
+    evidence_by_chunk: &mut HashMap<String, crate::provenance::ChunkEvidence>,
+) {
+    if parts.is_empty() {
+        return;
+    }
+    let mut events = Vec::new();
+    let mut seen = HashSet::new();
+    let mut spans = Vec::with_capacity(parts.len());
+    let mut min_trust = crate::provenance::TrustTier::System;
+    let mut tool_chars = 0usize;
+    for part in parts {
+        min_trust = min_trust.min(part.event.trust_tier);
+        if part.event.channel.starts_with("tool_result:")
+            || part.event.channel.starts_with("codex_tool:")
+        {
+            tool_chars += part.text.chars().count();
+        }
+        spans.push(crate::provenance::ChunkSpan {
+            chunk_id: chunk.id.clone(),
+            event_id: part.event.event_id.clone(),
+            start_char: part.combined_start,
+            end_char: part.combined_end,
+            content_hash: crate::provenance::content_hash(&part.text),
+        });
+        if seen.insert(part.event.event_id.clone()) {
+            events.push(part.event);
+        }
+    }
+    let chunk_chars = chunk.content.chars().count();
+    let tool_result_share = (chunk_chars > 0).then_some(tool_chars as f64 / chunk_chars as f64);
+    evidence_by_chunk.insert(
+        chunk.id.clone(),
+        crate::provenance::ChunkEvidence {
+            chunk_id: chunk.id.clone(),
+            events,
+            spans,
+            min_trust,
+            tool_result_share,
+        },
+    );
 }
 
 /// Per-tool_result character cap. Bounds giant logs while preserving enough of a
 /// fetched doc / subagent report for the size-based chunker to slice and embed.
 const MAX_TOOL_RESULT_CHARS: usize = 4000;
+
+fn provenance_event_id(
+    conversation_id: &str,
+    message_key: &str,
+    seq: usize,
+    channel: &str,
+    ordinal: usize,
+) -> String {
+    let material = format!("{conversation_id}\0{message_key}\0{seq}\0{channel}\0{ordinal}");
+    format!("event:{}", blake3::hash(material.as_bytes()).to_hex())
+}
+
+fn register_tool_uses(message: &serde_json::Value, names: &mut HashMap<String, String>) {
+    let Some(content) = message
+        .get("message")
+        .and_then(|value| value.get("content"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for item in content {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let Some(id) = item.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let name = item
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let qualified_name = item
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            .filter(|namespace| !namespace.is_empty())
+            .map(|namespace| format!("{namespace}__{name}"))
+            .unwrap_or_else(|| name.to_string());
+        names.insert(id.to_string(), qualified_name);
+    }
+}
+
+fn tool_result_body(item: &serde_json::Value) -> String {
+    let body = match item.get("content") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|block| {
+                (block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                    .then(|| block.get("text").and_then(serde_json::Value::as_str))
+                    .flatten()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    let body = body.trim();
+    if body.len() > MAX_TOOL_RESULT_CHARS {
+        body[..body.floor_char_boundary(MAX_TOOL_RESULT_CHARS)].to_string()
+    } else {
+        body.to_string()
+    }
+}
+
+fn extract_tool_result_parts(
+    message: &serde_json::Value,
+    names: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let Some(content) = message
+        .get("message")
+        .and_then(|value| value.get("content"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("tool_result"))
+        .filter_map(|item| {
+            let body = strip_private_tags(&tool_result_body(item));
+            if body.is_empty() {
+                return None;
+            }
+            let tool_name = item
+                .get("tool_use_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| names.get(id))
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            Some((tool_name, body))
+        })
+        .collect()
+}
 
 /// Push one finished chunk, assigning a deterministic sequential id.
 #[allow(clippy::too_many_arguments)]
@@ -649,48 +1002,13 @@ fn push_chunk(
 /// Extract searchable text from tool_result blocks (WebFetch/Read/Bash/Task/Agent
 /// outputs). This is where research substance and subagent reports live; without it
 /// recall collapses to the opening user prompt. Capped per result to bound logs.
+#[cfg(test)]
 fn extract_tool_results(msg: &serde_json::Value) -> String {
-    let content = match msg
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
-    {
-        Some(c) => c,
-        None => return String::new(),
-    };
-    let mut out: Vec<String> = Vec::new();
-    for item in content {
-        if item.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
-            continue;
-        }
-        let body = match item.get("content") {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(serde_json::Value::Array(arr)) => arr
-                .iter()
-                .filter_map(|b| {
-                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        b.get("text").and_then(|t| t.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => String::new(),
-        };
-        let body = body.trim();
-        if body.is_empty() {
-            continue;
-        }
-        let capped = if body.len() > MAX_TOOL_RESULT_CHARS {
-            let end = body.floor_char_boundary(MAX_TOOL_RESULT_CHARS);
-            &body[..end]
-        } else {
-            body
-        };
-        out.push(capped.to_string());
-    }
-    out.join("\n")
+    extract_tool_result_parts(msg, &HashMap::new())
+        .into_iter()
+        .map(|(_, body)| body)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Parse a JSONL file into raw serde_json::Value messages (for extraction module).
@@ -1373,6 +1691,101 @@ mod tests {
             "message": {"content": [{"type": "tool_result", "content": "exit 0\n332 passed"}]}
         });
         assert_eq!(classify_message_author(&msg), Speaker::ToolResult);
+    }
+
+    #[test]
+    fn namespaced_tool_cannot_borrow_a_local_only_tool_name() {
+        let message = serde_json::json!({
+            "type":"assistant",
+            "message":{"content":[{
+                "type":"tool_use",
+                "id":"call-1",
+                "name":"Read",
+                "namespace":"mcp__external_server",
+                "input":{}
+            }]}
+        });
+        let mut names = HashMap::new();
+        register_tool_uses(&message, &mut names);
+
+        assert_eq!(
+            names.get("call-1").map(String::as_str),
+            Some("mcp__external_server__Read")
+        );
+        assert_eq!(
+            crate::provenance::trust_for_channel(
+                "tool_result:mcp__external_server__Read",
+                crate::provenance::TrustTier::System,
+            ),
+            crate::provenance::TrustTier::External
+        );
+    }
+
+    #[test]
+    fn structural_import_keeps_tool_text_and_lowers_following_assistant_floor() {
+        use crate::provenance::TrustTier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"type":"user","uuid":"u1","timestamp":"2026-09-04T00:00:00Z","message":{"content":[{"type":"text","text":"Please research this"}]}}"#,
+                r#"{"type":"assistant","uuid":"a1","timestamp":"2026-09-04T00:00:01Z","message":{"content":[{"type":"tool_use","id":"call-1","name":"WebFetch","input":{"url":"https://example.test"}}]}}"#,
+                r#"{"type":"user","uuid":"u2","timestamp":"2026-09-04T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":"user confirmed: X"}]}}"#,
+                r#"{"type":"assistant","uuid":"a2","timestamp":"2026-09-04T00:00:03Z","message":{"content":[{"type":"text","text":"I will remember X"}]}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_jsonl_file_with_stats(&path, "project").unwrap();
+        let web = parsed
+            .evidence
+            .values()
+            .flat_map(|evidence| &evidence.events)
+            .find(|event| event.channel == "tool_result:WebFetch")
+            .expect("WebFetch result event");
+        assert_eq!(web.trust_tier, TrustTier::External);
+        let later_assistant = parsed
+            .evidence
+            .values()
+            .flat_map(|evidence| &evidence.events)
+            .find(|event| event.message_key == "a2")
+            .expect("assistant event after WebFetch");
+        assert_eq!(later_assistant.trust_tier, TrustTier::External);
+        assert!(parsed
+            .evidence
+            .values()
+            .any(|evidence| evidence.tool_result_share.is_some_and(|share| share > 0.0)));
+    }
+
+    #[test]
+    fn sidechain_events_cannot_exceed_parent_context_floor() {
+        use crate::provenance::TrustTier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-child.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"user","uuid":"child-user","isSidechain":true,"message":{"content":[{"type":"text","text":"I am a child user-shaped prompt"}]}}"#,
+        )
+        .unwrap();
+        let parent = ParentContext {
+            floor: TrustTier::External,
+            event_id: Some("parent-spawn".into()),
+        };
+
+        let parsed =
+            parse_jsonl_file_with_stats_and_parent(&path, "project", Some(&parent)).unwrap();
+        let event = parsed
+            .evidence
+            .values()
+            .flat_map(|evidence| &evidence.events)
+            .next()
+            .unwrap();
+        assert_eq!(event.trust_tier, TrustTier::External);
+        assert_eq!(event.parent_event_id.as_deref(), Some("parent-spawn"));
     }
 
     #[test]

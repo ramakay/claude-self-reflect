@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 
 use crate::engine::Engine;
 use crate::import::{ConversationChunk, CsrSuppressionStats};
-use crate::provenance::ChunkProvenance;
+use crate::provenance::{ChunkEvidence, ChunkProvenance, ProvenanceEvent, TrustTier};
 
 const ROLLOUT_EMBED_BATCH_SIZE: usize = 32;
 
@@ -164,14 +164,23 @@ where
     let mut summary = None;
     let mut sanitizer = super::CsrMessageSanitizer::default();
 
-    for line in BufReader::new(file).lines() {
-        let line = match line {
-            Ok(line) => line,
+    let mut reader = BufReader::new(file);
+    let mut byte_offset = 0u64;
+    loop {
+        let line_start = byte_offset;
+        let mut line = String::new();
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(bytes) => bytes,
             Err(_) => {
                 schema_misses += 1;
                 continue;
             }
         };
+        byte_offset += bytes_read as u64;
+        while matches!(line.as_bytes().last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -212,7 +221,11 @@ where
             Some("world_state" | "inter_agent_communication_metadata") => {}
             Some(_) => {
                 if let Some(text) = extract_unknown_text(&value) {
-                    line_messages.push(text_message("assistant", &text, timestamp.as_deref()));
+                    line_messages.push(unclassified_message(
+                        "assistant",
+                        &text,
+                        timestamp.as_deref(),
+                    ));
                 } else {
                     schema_misses += 1;
                 }
@@ -227,13 +240,19 @@ where
                     continue;
                 }
                 if let Some(text) = extract_unknown_text(&value) {
-                    line_messages.push(text_message("assistant", &text, timestamp.as_deref()));
+                    line_messages.push(unclassified_message(
+                        "assistant",
+                        &text,
+                        timestamp.as_deref(),
+                    ));
                 } else {
                     schema_misses += 1;
                 }
             }
         }
         for mut message in line_messages {
+            message["_csr_receipt_ref"] =
+                serde_json::Value::String(format!("{}#byte={line_start}", path.display()));
             super::sanitize_message_for_search(&mut message, &mut sanitizer);
             if summary.is_none()
                 && message.get("type").and_then(serde_json::Value::as_str) == Some("user")
@@ -356,7 +375,7 @@ fn parse_response_item(
         Some("reasoning") => {}
         Some(_) | None => {
             if let Some(text) = extract_unknown_text(payload) {
-                messages.push(text_message("assistant", &text, timestamp));
+                messages.push(unclassified_message("assistant", &text, timestamp));
             } else {
                 *schema_misses += 1;
             }
@@ -379,7 +398,7 @@ fn parse_event_message(
         Some("agent_message") => "assistant",
         _ => {
             if let Some(text) = extract_unknown_text(payload) {
-                messages.push(text_message(
+                messages.push(unclassified_message(
                     "assistant",
                     &text,
                     value.get("timestamp").and_then(serde_json::Value::as_str),
@@ -423,7 +442,11 @@ fn canonical_message(
         return None;
     }
     let text = content_text(value.get("content"))?;
-    Some(text_message(role, &text, timestamp))
+    let mut message = text_message(role, &text, timestamp);
+    if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
+        message["uuid"] = serde_json::Value::String(id.to_string());
+    }
+    Some(message)
 }
 
 fn content_text(content: Option<&serde_json::Value>) -> Option<String> {
@@ -447,6 +470,12 @@ fn text_message(role: &str, text: &str, timestamp: Option<&str>) -> serde_json::
         serde_json::json!({"type":"text", "text":text}),
         timestamp,
     )
+}
+
+fn unclassified_message(role: &str, text: &str, timestamp: Option<&str>) -> serde_json::Value {
+    let mut message = text_message(role, text, timestamp);
+    message["_csr_channel"] = serde_json::Value::String("unclassified".to_string());
+    message
 }
 
 fn block_message(
@@ -501,24 +530,100 @@ fn visit_rollout_message_chunks<F>(
     metadata: &RolloutMetadata,
     message: &serde_json::Value,
     next_seq: &mut usize,
+    event_seq: usize,
+    tool_names: &mut std::collections::HashMap<String, String>,
+    running_floor: &mut Option<TrustTier>,
     mut visit: F,
 ) -> Result<()>
 where
-    F: FnMut(ConversationChunk) -> Result<()>,
+    F: FnMut(ConversationChunk, ChunkEvidence) -> Result<()>,
 {
     const BUDGET: usize = 900;
+    super::register_tool_uses(message, tool_names);
     let text = super::extract_message_text(message);
     let tool_context = super::extract_tool_context(message);
-    let tool_results = super::extract_tool_results(message);
-    let content = [text, tool_context, tool_results]
-        .into_iter()
-        .filter(|part| !part.is_empty())
+    let role = message
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let override_channel = message
+        .get("_csr_channel")
+        .and_then(serde_json::Value::as_str);
+    let mut components = Vec::new();
+    if !text.is_empty() {
+        let channel = override_channel.unwrap_or(if role == "user" {
+            "codex_user"
+        } else {
+            "codex_assistant"
+        });
+        components.push((channel.to_string(), text));
+    }
+    if !tool_context.is_empty() {
+        components.push(("codex_assistant".to_string(), tool_context));
+    }
+    for (tool_name, body) in super::extract_tool_result_parts(message, tool_names) {
+        components.push((format!("codex_tool:{tool_name}"), body));
+    }
+    let content = components
+        .iter()
+        .map(|(_, part)| part.as_str())
         .collect::<Vec<_>>()
         .join("\n");
     if content.is_empty() {
         return Ok(());
     }
     let author = super::classify_message_author(message);
+    let message_key = message
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::provenance::content_hash(&content));
+    let observed_at = message
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&metadata.timestamp)
+        .to_string();
+    let receipt_ref = message
+        .get("_csr_receipt_ref")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut combined_start = 0usize;
+    let mut parts = Vec::new();
+    for (ordinal, (channel, component)) in components.into_iter().enumerate() {
+        let context_floor = running_floor.unwrap_or(TrustTier::Unknown);
+        let tier = crate::provenance::trust_for_channel(&channel, context_floor);
+        let event = ProvenanceEvent {
+            event_id: super::provenance_event_id(
+                &metadata.conversation_id,
+                &message_key,
+                event_seq,
+                &channel,
+                ordinal,
+            ),
+            conversation_id: metadata.conversation_id.clone(),
+            message_key: message_key.clone(),
+            seq: event_seq,
+            channel,
+            trust_tier: tier,
+            parent_event_id: None,
+            receipt_kind: "jsonl".to_string(),
+            receipt_ref: receipt_ref.clone(),
+            observed_at: observed_at.clone(),
+        };
+        let combined_end = combined_start + component.len();
+        parts.push(super::EventPart {
+            event,
+            text: component,
+            combined_start,
+            combined_end,
+        });
+        *running_floor = Some(match *running_floor {
+            Some(floor) => floor.min(tier),
+            None => tier,
+        });
+        combined_start = combined_end + 1;
+    }
+    let message_evidence = super::MessageEvidence { parts };
     let mut start = 0;
     while start < content.len() {
         let mut end = (start + BUDGET).min(content.len());
@@ -527,7 +632,7 @@ where
             end = content.len();
         }
         let seq = *next_seq;
-        visit(ConversationChunk {
+        let chunk = ConversationChunk {
             id: super::generate_chunk_id(&metadata.conversation_id, seq),
             conversation_id: metadata.conversation_id.clone(),
             project_name: metadata.project_name.clone(),
@@ -538,7 +643,17 @@ where
             author,
             seq,
             is_sidechain: false,
-        })?;
+        };
+        let mut evidence = std::collections::HashMap::new();
+        super::attach_chunk_evidence(
+            &chunk,
+            super::slice_event_parts(&message_evidence, start, end),
+            &mut evidence,
+        );
+        let chunk_evidence = evidence
+            .remove(&chunk.id)
+            .expect("non-empty rollout chunk has structural evidence");
+        visit(chunk, chunk_evidence)?;
         *next_seq += 1;
         start = end;
     }
@@ -560,11 +675,21 @@ fn rollout_chunks(parsed: &ParsedRollout) -> Vec<ConversationChunk> {
     };
     let mut chunks = Vec::new();
     let mut next_seq = 0;
-    for message in &parsed.messages {
-        visit_rollout_message_chunks(&metadata, message, &mut next_seq, |chunk| {
-            chunks.push(chunk);
-            Ok(())
-        })
+    let mut tool_names = std::collections::HashMap::new();
+    let mut floor = None;
+    for (event_seq, message) in parsed.messages.iter().enumerate() {
+        visit_rollout_message_chunks(
+            &metadata,
+            message,
+            &mut next_seq,
+            event_seq,
+            &mut tool_names,
+            &mut floor,
+            |chunk, _| {
+                chunks.push(chunk);
+                Ok(())
+            },
+        )
         .expect("collecting rollout chunks cannot fail");
     }
     chunks
@@ -581,20 +706,35 @@ fn stream_rollout_chunk_batches<F>(
     mut visit_batch: F,
 ) -> Result<RolloutStreamOutcome>
 where
-    F: FnMut(&[ConversationChunk]) -> Result<()>,
+    F: FnMut(&[ConversationChunk], &[ChunkEvidence]) -> Result<()>,
 {
     anyhow::ensure!(batch_size > 0, "rollout batch size must be positive");
     let mut pending = Vec::with_capacity(batch_size);
+    let mut pending_evidence = Vec::with_capacity(batch_size);
     let mut next_seq = 0usize;
+    let mut event_seq = 0usize;
+    let mut tool_names = std::collections::HashMap::new();
+    let mut floor = None;
     let Some((streamed_metadata, mut outcome)) = visit_rollout_messages(path, |message| {
-        visit_rollout_message_chunks(metadata, &message, &mut next_seq, |chunk| {
-            pending.push(chunk);
-            if pending.len() == batch_size {
-                visit_batch(&pending)?;
-                pending.clear();
-            }
-            Ok(())
-        })?;
+        visit_rollout_message_chunks(
+            metadata,
+            &message,
+            &mut next_seq,
+            event_seq,
+            &mut tool_names,
+            &mut floor,
+            |chunk, evidence| {
+                pending.push(chunk);
+                pending_evidence.push(evidence);
+                if pending.len() == batch_size {
+                    visit_batch(&pending, &pending_evidence)?;
+                    pending.clear();
+                    pending_evidence.clear();
+                }
+                Ok(())
+            },
+        )?;
+        event_seq += 1;
         Ok(())
     })?
     else {
@@ -606,10 +746,28 @@ where
     debug_assert_eq!(streamed_metadata.conversation_id, metadata.conversation_id);
     debug_assert_eq!(streamed_metadata.project_name, metadata.project_name);
     if !pending.is_empty() {
-        visit_batch(&pending)?;
+        visit_batch(&pending, &pending_evidence)?;
     }
     outcome.chunks = next_seq;
     Ok(outcome)
+}
+
+pub(crate) fn reconstruct_rollout_evidence(
+    path: &Path,
+) -> Result<std::collections::HashMap<String, (String, ChunkEvidence)>> {
+    let metadata = scan_rollout_metadata(path)?
+        .ok_or_else(|| anyhow::anyhow!("rollout contains no session metadata"))?;
+    let mut evidence = std::collections::HashMap::new();
+    stream_rollout_chunk_batches(path, &metadata, ROLLOUT_EMBED_BATCH_SIZE, |chunks, rows| {
+        evidence.extend(
+            chunks
+                .iter()
+                .zip(rows)
+                .map(|(chunk, row)| (chunk.id.clone(), (chunk.content.clone(), row.clone()))),
+        );
+        Ok(())
+    })?;
+    Ok(evidence)
 }
 
 /// Import every changed rollout discovered beneath the optional Codex root.
@@ -639,14 +797,16 @@ pub(crate) fn import_changed_rollouts(engine: &Engine, root: &Path) -> Result<Ro
             &file.path,
             &metadata,
             ROLLOUT_EMBED_BATCH_SIZE,
-            |chunks| {
+            |chunks, evidence| {
                 let texts = chunks
                     .iter()
                     .map(|chunk| chunk.content.as_str())
                     .collect::<Vec<_>>();
                 let embeddings = engine.embeddings().embed(&texts)?;
                 let mut index = engine.search().blocking_write();
-                for (chunk, embedding) in chunks.iter().zip(embeddings) {
+                for ((chunk, chunk_evidence), embedding) in
+                    chunks.iter().zip(evidence).zip(embeddings)
+                {
                     storage.insert_chunk_with_source(chunk, &embedding, "codex_rollout")?;
                     storage.insert_chunk_provenance(
                         &chunk.id,
@@ -656,6 +816,7 @@ pub(crate) fn import_changed_rollouts(engine: &Engine, root: &Path) -> Result<Ro
                             supersedes: None,
                         },
                     )?;
+                    storage.replace_chunk_evidence(chunk_evidence)?;
                     index.insert_chunk(chunk.id.clone(), embedding);
                 }
                 Ok(())
@@ -681,7 +842,107 @@ pub(crate) fn import_changed_rollouts(engine: &Engine, root: &Path) -> Result<Ro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embeddings::EmbeddingEngine;
+    use crate::search::SearchEngine;
+    use crate::storage::Storage;
     use std::path::Path;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn test_engine(storage: Arc<Storage>, root: &Path) -> Engine {
+        Engine::from_parts(
+            storage,
+            Arc::new(EmbeddingEngine::new().unwrap()),
+            Arc::new(RwLock::new(SearchEngine::new(64))),
+            root.to_path_buf(),
+        )
+    }
+
+    #[test]
+    fn rollout_receipt_uses_the_actual_jsonl_byte_offset() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout-offset.jsonl");
+        let metadata =
+            r#"{"type":"session_meta","payload":{"id":"offset-fixture","cwd":"/tmp/project"}}"#;
+        let message = r#"{"type":"message","role":"user","content":"remember this"}"#;
+        std::fs::write(&path, format!("{metadata}\n{message}\n")).unwrap();
+
+        let mut observed = Vec::new();
+        visit_rollout_messages(&path, |message| {
+            observed.push(
+                message
+                    .get("_csr_receipt_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap()
+                    .to_string(),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            observed,
+            vec![format!("{}#byte={}", path.display(), metadata.len() + 1)]
+        );
+    }
+
+    #[test]
+    fn codex_response_channels_distinguish_assistant_from_unclassified_payloads() {
+        let mut assistant = Vec::new();
+        let mut misses = 0;
+        parse_response_item(
+            &serde_json::json!({
+                "type":"response_item",
+                "payload":{"type":"agent_message", "content":"assistant prose"}
+            }),
+            &mut assistant,
+            &mut misses,
+        );
+        assert_eq!(assistant.len(), 1);
+        assert!(assistant[0].get("_csr_channel").is_none());
+
+        let mut unknown = Vec::new();
+        parse_response_item(
+            &serde_json::json!({
+                "type":"response_item",
+                "payload":{"type":"future_payload", "text":"unclassified prose"}
+            }),
+            &mut unknown,
+            &mut misses,
+        );
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(
+            unknown[0]
+                .get("_csr_channel")
+                .and_then(serde_json::Value::as_str),
+            Some("unclassified")
+        );
+    }
+
+    #[test]
+    fn imported_rollout_chunks_receive_cached_structural_floors() {
+        let root = tempfile::tempdir().unwrap();
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
+        let target = root.path().join("rollout-copy.jsonl");
+        std::fs::copy(source, &target).unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+
+        let stats = import_changed_rollouts(&engine, root.path()).unwrap();
+        assert_eq!(stats.files_imported, 1);
+        let ids = storage
+            .get_chunk_ids_for_conversation("codex:modern-fixture")
+            .unwrap();
+        assert!(!ids.is_empty());
+        let tiers = ids
+            .iter()
+            .map(|id| storage.get_chunk_min_trust(id).unwrap())
+            .collect::<Vec<_>>();
+        assert!(tiers.contains(&crate::provenance::TrustTier::UserHistory));
+        assert!(tiers.contains(&crate::provenance::TrustTier::TrustedTool));
+        assert!(tiers.contains(&crate::provenance::TrustTier::Unknown));
+    }
 
     #[test]
     fn modern_fixture_parses_messages_cwd_and_scrubs_csr_calls() {
@@ -724,7 +985,7 @@ mod tests {
         let expected = rollout_chunks(&parsed);
         let metadata = scan_rollout_metadata(&path).unwrap().unwrap();
         let mut streamed = Vec::new();
-        let outcome = stream_rollout_chunk_batches(&path, &metadata, 2, |batch| {
+        let outcome = stream_rollout_chunk_batches(&path, &metadata, 2, |batch, _| {
             assert!(batch.len() <= 2);
             streamed.extend_from_slice(batch);
             Ok(())

@@ -179,6 +179,65 @@ impl Storage {
         queries::insert_chunk_provenance(&conn, chunk_id, prov)
     }
 
+    pub fn replace_chunk_evidence(
+        &self,
+        evidence: &crate::provenance::ChunkEvidence,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::replace_chunk_evidence(&conn, evidence)
+    }
+
+    pub fn replace_chunk_evidence_batch(
+        &self,
+        evidence: &[crate::provenance::ChunkEvidence],
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::replace_chunk_evidence_batch(&conn, evidence)
+    }
+
+    pub fn insert_provenance_event(
+        &self,
+        event: &crate::provenance::ProvenanceEvent,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::insert_provenance_event(&conn, event)
+    }
+
+    pub(crate) fn parent_provenance_context(
+        &self,
+        conversation_id: &str,
+        message_key: Option<&str>,
+    ) -> Result<crate::import::ParentContext> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::parent_provenance_context(&conn, conversation_id, message_key)
+    }
+
+    /// Read only the cached chunk floor. Retrieval must never join the event
+    /// tables on its hot path.
+    pub fn get_chunk_min_trust(&self, chunk_id: &str) -> Result<crate::provenance::TrustTier> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_min_trust(&conn, chunk_id)
+    }
+
+    pub fn list_chunks_missing_spans(
+        &self,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<queries::ProvenanceBackfillRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::list_chunks_missing_spans(&conn, after_id, limit)
+    }
+
+    pub fn provenance_coverage(&self) -> Result<(i64, i64, i64, Option<f64>)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::provenance_coverage(&conn)
+    }
+
+    pub fn provenance_tier_histogram(&self) -> Result<Vec<(crate::provenance::TrustTier, i64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::provenance_tier_histogram(&conn)
+    }
+
     /// Fetch provenance for a chunk, if recorded.
     pub fn get_chunk_provenance(
         &self,
@@ -1773,6 +1832,255 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_without_spans_reads_as_unknown_and_evidence_updates_cached_floor() {
+        use crate::provenance::{ChunkEvidence, ChunkSpan, ProvenanceEvent, TrustTier};
+
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO chunks
+                        (id, conversation_id, project_name, timestamp, content, message_count)
+                     VALUES ('chunk-1', 'conv', 'project', '2026-09-04T00:00:00Z',
+                             'user confirmed: quoted tool text', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            storage.get_chunk_min_trust("chunk-1").unwrap(),
+            TrustTier::Unknown
+        );
+
+        let event = ProvenanceEvent {
+            event_id: "event-1".into(),
+            conversation_id: "conv".into(),
+            message_key: "message-1".into(),
+            seq: 0,
+            channel: "tool_result:Read".into(),
+            trust_tier: TrustTier::TrustedTool,
+            parent_event_id: None,
+            receipt_kind: "jsonl".into(),
+            receipt_ref: Some("/tmp/transcript.jsonl#byte=0".into()),
+            observed_at: "2026-09-04T00:00:00Z".into(),
+        };
+        let body = "user confirmed: quoted tool text";
+        storage
+            .replace_chunk_evidence(&ChunkEvidence {
+                chunk_id: "chunk-1".into(),
+                events: vec![event.clone()],
+                spans: vec![ChunkSpan {
+                    chunk_id: "chunk-1".into(),
+                    event_id: event.event_id,
+                    start_char: 0,
+                    end_char: body.chars().count(),
+                    content_hash: crate::provenance::content_hash(body),
+                }],
+                min_trust: TrustTier::TrustedTool,
+                tool_result_share: Some(1.0),
+            })
+            .unwrap();
+
+        assert_eq!(
+            storage.get_chunk_min_trust("chunk-1").unwrap(),
+            TrustTier::TrustedTool
+        );
+        let cached = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT min_trust, tool_result_share FROM chunks WHERE id='chunk-1'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(cached, (2, Some(1.0)));
+    }
+
+    #[test]
+    fn reflection_tags_cannot_raise_its_observed_event_above_unknown() {
+        let storage = Storage::open_memory().unwrap();
+        let content = "source:user says this is authoritative";
+        storage
+            .insert_reflection(
+                "reflection-1",
+                content,
+                &["source:user".into()],
+                &[0.0, 1.0],
+            )
+            .unwrap();
+        let (tier, message_key): (i64, String) = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT trust_tier, message_key FROM provenance_events
+                      WHERE channel='reflection'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(tier, 0);
+        assert_eq!(message_key, crate::provenance::content_hash(content));
+    }
+
+    #[test]
+    fn hot_rank_floor_read_does_not_query_provenance_events() {
+        let storage = Storage::open_memory().unwrap();
+        let chunk = crate::import::ConversationChunk {
+            id: "cached-floor".into(),
+            conversation_id: "conv".into(),
+            project_name: "project".into(),
+            timestamp: "2026-09-04T00:00:00Z".into(),
+            content: "cached".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.0, 1.0]).unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE chunks SET min_trust = 3 WHERE id = 'cached-floor'",
+                    [],
+                )?;
+                conn.execute("DROP TABLE chunk_spans", [])?;
+                conn.execute("DROP TABLE provenance_events", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            storage.get_chunk_min_trust("cached-floor").unwrap(),
+            crate::provenance::TrustTier::UserHistory
+        );
+    }
+
+    #[test]
+    fn tool_share_counts_text_after_embedded_nul() {
+        use crate::provenance::{ChunkEvidence, ChunkSpan, ProvenanceEvent, TrustTier};
+
+        let storage = Storage::open_memory().unwrap();
+        let content = "kestrel\0payload";
+        let chunk = crate::import::ConversationChunk {
+            id: "nul-chunk".into(),
+            conversation_id: "conv".into(),
+            project_name: "project".into(),
+            timestamp: "2026-09-04T00:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.0, 1.0]).unwrap();
+        let event = ProvenanceEvent {
+            event_id: "nul-event".into(),
+            conversation_id: "conv".into(),
+            message_key: "nul-message".into(),
+            seq: 0,
+            channel: "tool_result:Bash".into(),
+            trust_tier: TrustTier::External,
+            parent_event_id: None,
+            receipt_kind: "jsonl".into(),
+            receipt_ref: None,
+            observed_at: chunk.timestamp.clone(),
+        };
+        storage
+            .replace_chunk_evidence(&ChunkEvidence {
+                chunk_id: chunk.id.clone(),
+                events: vec![event.clone()],
+                spans: vec![ChunkSpan {
+                    chunk_id: chunk.id,
+                    event_id: event.event_id,
+                    start_char: 0,
+                    end_char: content.chars().count(),
+                    content_hash: crate::provenance::content_hash(content),
+                }],
+                min_trust: TrustTier::External,
+                tool_result_share: Some(1.0),
+            })
+            .unwrap();
+
+        let share = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT tool_result_share FROM chunks WHERE id='nul-chunk'",
+                    [],
+                    |row| row.get::<_, f64>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(share, 1.0);
+    }
+
+    #[test]
+    fn reobserving_an_event_can_only_lower_its_persisted_floor() {
+        use crate::provenance::{ChunkEvidence, ChunkSpan, ProvenanceEvent, TrustTier};
+
+        let storage = Storage::open_memory().unwrap();
+        let chunk = crate::import::ConversationChunk {
+            id: "monotone-chunk".into(),
+            conversation_id: "conv".into(),
+            project_name: "project".into(),
+            timestamp: "2026-09-04T00:00:00Z".into(),
+            content: "assistant observation".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.0, 1.0]).unwrap();
+        let evidence = |tier| ChunkEvidence {
+            chunk_id: chunk.id.clone(),
+            events: vec![ProvenanceEvent {
+                event_id: "stable-event".into(),
+                conversation_id: chunk.conversation_id.clone(),
+                message_key: "stable-message".into(),
+                seq: 0,
+                channel: "assistant_message".into(),
+                trust_tier: tier,
+                parent_event_id: None,
+                receipt_kind: "jsonl".into(),
+                receipt_ref: None,
+                observed_at: chunk.timestamp.clone(),
+            }],
+            spans: vec![ChunkSpan {
+                chunk_id: chunk.id.clone(),
+                event_id: "stable-event".into(),
+                start_char: 0,
+                end_char: chunk.content.chars().count(),
+                content_hash: crate::provenance::content_hash(&chunk.content),
+            }],
+            min_trust: tier,
+            tool_result_share: Some(0.0),
+        };
+
+        storage
+            .replace_chunk_evidence(&evidence(TrustTier::UserHistory))
+            .unwrap();
+        storage
+            .replace_chunk_evidence(&evidence(TrustTier::External))
+            .unwrap();
+        assert_eq!(
+            storage.get_chunk_min_trust(&chunk.id).unwrap(),
+            TrustTier::External
+        );
+
+        storage
+            .replace_chunk_evidence(&evidence(TrustTier::UserHistory))
+            .expect("a later higher observation must remain at the stored floor");
+        assert_eq!(
+            storage.get_chunk_min_trust(&chunk.id).unwrap(),
+            TrustTier::External
+        );
+    }
 
     #[test]
     fn contaminated_conversations_uses_shared_content_predicate_and_caches_measurement() {

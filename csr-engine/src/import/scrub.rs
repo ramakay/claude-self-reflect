@@ -5,9 +5,10 @@ use anyhow::{Context, Result};
 
 use crate::engine::Engine;
 use crate::import::{
-    derive_conversation_attribution, parse_jsonl_file, scrub_contaminated_text, ConversationChunk,
+    derive_conversation_attribution, parse_jsonl_file_with_stats_and_parent,
+    scrub_contaminated_text, ConversationChunk, ParentContext,
 };
-use crate::provenance::ChunkProvenance;
+use crate::provenance::{ChunkEvidence, ChunkProvenance, TrustTier};
 use crate::storage::Storage;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -68,6 +69,7 @@ struct ScrubPlan {
     old_chunks: Vec<ConversationChunk>,
     sources: HashMap<String, String>,
     provenance: HashMap<String, ChunkProvenance>,
+    structural_evidence: HashMap<String, ChunkEvidence>,
     kind: ScrubPlanKind,
 }
 
@@ -109,13 +111,23 @@ fn load_plan(storage: &Storage, conversation_id: &str) -> Result<ScrubPlan> {
         .collect::<Result<HashMap<_, _>>>()?;
 
     let path = source_path(storage, conversation_id)?;
+    let mut structural_evidence = HashMap::new();
     let kind = if let Some(path) = path.filter(|path| path.exists()) {
         let project = old_chunks
             .first()
             .map(|chunk| chunk.project_name.as_str())
             .unwrap_or_default();
-        let chunks = parse_jsonl_file(&path, project)
+        let parent = old_chunks
+            .iter()
+            .any(|chunk| chunk.is_sidechain)
+            .then_some(ParentContext {
+                floor: TrustTier::Unknown,
+                event_id: None,
+            });
+        let parsed = parse_jsonl_file_with_stats_and_parent(&path, project, parent.as_ref())
             .with_context(|| format!("re-parsing {}", path.display()))?;
+        let chunks = parsed.chunks;
+        structural_evidence = parsed.evidence;
         let new_ids = chunks
             .iter()
             .map(|chunk| chunk.id.clone())
@@ -166,6 +178,7 @@ fn load_plan(storage: &Storage, conversation_id: &str) -> Result<ScrubPlan> {
         old_chunks,
         sources,
         provenance,
+        structural_evidence,
         kind,
     })
 }
@@ -331,6 +344,9 @@ pub async fn run_scrub(
                         &chunk.id,
                         &provenance_for(&plan, chunk, default_source_conv_id),
                     )?;
+                    if let Some(evidence) = plan.structural_evidence.get(&chunk.id) {
+                        engine.storage().replace_chunk_evidence(evidence)?;
+                    }
                     if changed_ids.contains(&chunk.id) {
                         replace_vector(engine, chunk, embedding).await;
                     }
@@ -383,6 +399,11 @@ pub async fn run_scrub(
                 engine
                     .storage()
                     .replace_conversation_chunks_atomic(&plan.conversation_id, &rows)?;
+                let evidence = chunks
+                    .iter()
+                    .filter_map(|chunk| plan.structural_evidence.get(&chunk.id).cloned())
+                    .collect::<Vec<_>>();
+                engine.storage().replace_chunk_evidence_batch(&evidence)?;
                 {
                     let mut index = engine.search().write().await;
                     for id in &old_ids {
@@ -416,6 +437,9 @@ pub async fn run_scrub(
                     engine.storage().insert_chunk_provenance(
                         &chunk.id,
                         &provenance_for(&plan, chunk, &plan.conversation_id),
+                    )?;
+                    engine.storage().replace_chunk_evidence(
+                        &super::provenance_backfill::unreconstructible_chunk_evidence(chunk, None),
                     )?;
                     replace_vector(engine, chunk, embedding).await;
                 }

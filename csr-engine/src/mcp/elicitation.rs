@@ -112,8 +112,8 @@ impl ResolutionConfirmationPayload {
 }
 
 /// Classify an elicitation response conservatively. This records a local
-/// authority event for this exact resolution-ledger payload only. It is not
-/// PPMF confirmation: no principal, action target, risk, or scope is bound.
+/// authority event for this exact resolution-ledger payload only. It does not
+/// bind a principal, action target, risk, or broader scope.
 fn resolution_source_from_response<E>(
     payload: &ResolutionConfirmationPayload,
     response: Result<ElicitResult, E>,
