@@ -1138,23 +1138,40 @@ fn store_thread(
 ) -> Result<()> {
     let files_json = serde_json::to_string(files)?;
     let receipts_json = serde_json::to_string(receipts)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO dream_threads
-            (episode_hash, session_id, project, thread, evidence_quote, files_json, receipt_tier, receipts_json, model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            hash,
-            session_id,
-            project,
-            thread,
-            evidence_quote,
-            files_json,
-            tier.as_str(),
-            receipts_json,
-            model,
-        ],
-    )?;
-    Ok(())
+    crate::storage::artifact_provenance::atomic_write(conn, |conn| {
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO dream_threads
+                (episode_hash, session_id, project, thread, evidence_quote, files_json, receipt_tier, receipts_json, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                hash,
+                session_id,
+                project,
+                thread,
+                evidence_quote,
+                files_json,
+                tier.as_str(),
+                receipts_json,
+                model,
+            ],
+        )?;
+        if inserted > 0 {
+            // Model output over one episode: that episode row is the whole
+            // support set (row-level; the thread quotes are not span-bound).
+            use crate::storage::artifact_provenance::{
+                self as provenance, ArtifactKind, InputEnvelope,
+            };
+            let id = conn.last_insert_rowid().to_string();
+            let episode = provenance::episode_reflection_input(conn, session_id)?;
+            provenance::record_stored_inputs(
+                conn,
+                ArtifactKind::DreamThread,
+                &id,
+                &InputEnvelope::new(vec![episode]),
+            )?;
+        }
+        Ok(())
+    })
 }
 
 /// Every stored, non-sentinel [`DreamThread`] — the Phase 2 renderer's read
@@ -1366,6 +1383,83 @@ pub fn run_thread_extraction_with_budget(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stored_thread_inherits_its_episode_floor_or_unknown_without_one() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::{ArtifactKind, InputEnvelope};
+        use crate::storage::Storage;
+        let storage = Storage::open_memory().unwrap();
+        // Episode on record for sess-a, derived from an External observation.
+        storage
+            .insert_derived_reflection(
+                "ep-a",
+                r#"{"schema":"v2","session_id":"sess-a","project":"p"}"#,
+                &[
+                    "session_episode".into(),
+                    "conv_sess-a".into(),
+                    "project_p".into(),
+                ],
+                &[0.0; 4],
+                &InputEnvelope::new(vec![
+                    crate::storage::artifact_provenance::test_observed_input(
+                        "tool_result:WebFetch",
+                        TrustTier::External,
+                        "source",
+                    ),
+                ]),
+            )
+            .unwrap();
+        storage
+            .with_connection(|conn| {
+                store_thread(
+                    conn,
+                    "hash-a",
+                    "sess-a",
+                    "p",
+                    "a thread",
+                    "quoted evidence",
+                    &[],
+                    ReceiptTier::Unverified,
+                    &[],
+                    "sonnet-5",
+                )?;
+                store_thread(
+                    conn,
+                    "hash-b",
+                    "sess-none",
+                    "p",
+                    "orphan thread",
+                    "quoted evidence",
+                    &[],
+                    ReceiptTier::Unverified,
+                    &[],
+                    "sonnet-5",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let rows: Vec<(String, i64)> = storage
+            .with_connection(|c| {
+                Ok(
+                    c.prepare("SELECT session_id, min_trust FROM dream_threads ORDER BY id")?
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<rusqlite::Result<_>>()?,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("sess-a".to_string(), 1), ("sess-none".to_string(), 0)],
+            "a thread carries its episode's floor; no episode on record is Unknown"
+        );
+        assert_eq!(
+            storage
+                .get_artifact_min_trust(ArtifactKind::DreamThread, "1")
+                .unwrap(),
+            TrustTier::External
+        );
+    }
+
     use super::*;
     use crate::storage::witness_ledger::WitnessLedgerRow;
     use crate::storage::witness_verdicts::{self, VerdictKind, WitnessVerdictRow};

@@ -872,6 +872,9 @@ async fn process_v3_extraction(
     }
 
     let result = extraction::extract_v3(&messages);
+    // Row-level support: the V3 index is a deterministic reduction of the whole
+    // transcript, so its floor is the transcript's floor (Unknown if unreadable).
+    let inputs = import::transcript_inputs_or_unknown(storage, file_path, conv_id);
 
     // Embed the search_index
     let search_index = result.search_index.clone();
@@ -902,8 +905,8 @@ async fn process_v3_extraction(
             format!("project_{}", project),
         ];
 
-        // Store the V3 reflection
-        storage.insert_reflection(&reflection_id, &content, &tags, &embedding)?;
+        // Store the V3 reflection with its support set
+        storage.insert_derived_reflection(&reflection_id, &content, &tags, &embedding, &inputs)?;
         {
             let mut idx = search.write().await;
             idx.insert_reflection(reflection_id.clone(), embedding);
@@ -938,11 +941,12 @@ async fn process_v3_extraction(
                 tokio::task::spawn_blocking(move || cache_emb.embed(&[cache_text.as_str()])).await
             {
                 if let Some(cache_vec) = cache_embedding.into_iter().next() {
-                    let _ = storage.insert_reflection(
+                    let _ = storage.insert_derived_reflection(
                         &cache_id,
                         &result.context_cache,
                         &cache_tags,
                         &cache_vec,
+                        &inputs,
                     );
                     {
                         let mut idx = search.write().await;
@@ -1047,6 +1051,14 @@ async fn narrator_loop_inner(
             }
 
             let prompt = build_narrative_prompt(&skill_prompt, &messages);
+            // Freeze the support set now: the narrative is stored later from a
+            // batch result, when the transcript may have changed or vanished.
+            // A failed manifest write fails closed (the stored narrative reads
+            // an incomplete manifest and lands Unknown).
+            let inputs = import::transcript_inputs_or_unknown(storage, path, conv_id);
+            if let Err(e) = storage.record_narrative_request_inputs(conv_id, &inputs) {
+                tracing::warn!(conv = %conv_id, error = %e, "narrative request manifest not recorded");
+            }
             requests.push(BatchRequest {
                 custom_id: conv_id.clone(),
                 prompt,
@@ -1210,7 +1222,18 @@ async fn store_narrative(
         let reflection_id = format!("ai_narrative_{conv_id}");
         let tags = vec!["narrative_ai".to_string(), format!("conv_{conv_id}")];
 
-        storage.insert_reflection(&reflection_id, narrative, &tags, &embedding)?;
+        // Only the frozen request manifest supports this output; a missing or
+        // partial manifest is Unknown, never today's re-read of the transcript.
+        let inputs = storage
+            .load_narrative_request_inputs(conv_id)
+            .unwrap_or_else(|_| {
+                crate::storage::artifact_provenance::InputEnvelope::new(vec![
+                    crate::storage::artifact_provenance::ArtifactInput::unknown(
+                        "narrative request manifest unavailable",
+                    ),
+                ])
+            });
+        storage.insert_derived_reflection(&reflection_id, narrative, &tags, &embedding, &inputs)?;
         let mut idx = search.write().await;
         idx.insert_reflection(reflection_id.clone(), embedding);
 
@@ -1313,6 +1336,27 @@ async fn run_consolidation(
             .flatten()
             .unwrap_or_default();
 
+        // Facts are a deterministic reduction of the narrative they were cut
+        // from; the narrative row (preferring Layer 3, as the query does) is
+        // their whole support set.
+        let source_reflection = ["ai_narrative", "extracted_v3"].iter().find_map(|layer| {
+            storage
+                .get_enrichment_reflection_id(conv_id, layer)
+                .ok()
+                .flatten()
+        });
+        let fact_inputs = crate::storage::artifact_provenance::InputEnvelope::new(vec![
+            match &source_reflection {
+                Some(id) => storage.artifact_input_or_unknown(
+                    crate::storage::artifact_provenance::ArtifactKind::Reflection,
+                    id,
+                ),
+                None => crate::storage::artifact_provenance::ArtifactInput::unknown(
+                    "narrative source reflection not recorded",
+                ),
+            },
+        ]);
+
         // Store each fact as a tagged reflection with embedding (for HNSW search)
         let mut stored_ids = Vec::new();
         for (i, fact) in facts.iter().enumerate() {
@@ -1335,7 +1379,13 @@ async fn run_consolidation(
                     .await??;
 
             if let Some(embedding) = embeddings_vec.into_iter().next() {
-                storage.insert_reflection(&reflection_id, &content, &tags, &embedding)?;
+                storage.insert_derived_reflection(
+                    &reflection_id,
+                    &content,
+                    &tags,
+                    &embedding,
+                    &fact_inputs,
+                )?;
                 let mut idx = search.write().await;
                 idx.insert_reflection(reflection_id.clone(), embedding);
                 stored_ids.push(reflection_id);
@@ -1449,6 +1499,185 @@ mod tests {
         std::env::set_var("CSR_NO_PROVENANCE_BACKFILL", "0");
         assert!(!provenance_backfill_disabled());
         std::env::remove_var("CSR_NO_PROVENANCE_BACKFILL");
+    }
+
+    fn provenance_test_rig() -> (
+        Arc<Storage>,
+        Arc<EmbeddingEngine>,
+        Arc<RwLock<SearchEngine>>,
+    ) {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(EmbeddingEngine::dimension())));
+        (storage, embeddings, search)
+    }
+
+    /// A transcript whose floor is External: the user asks, a WebFetch result
+    /// arrives, the assistant edits and reports. Every deterministic reduction
+    /// of it (the V3 index and its context cache) must carry that floor.
+    fn external_floor_transcript(dir: &std::path::Path, conv_id: &str) -> std::path::PathBuf {
+        let path = dir.join(format!("{conv_id}.jsonl"));
+        let lines = [
+            serde_json::json!({"uuid":"u1","type":"user","message":{"role":"user","content":"Please fix the authentication bug in the login flow that causes users to be logged out unexpectedly"}}),
+            serde_json::json!({"uuid":"a1","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"fetch","name":"WebFetch","input":{"url":"https://example.test/auth"}}]}}),
+            serde_json::json!({"uuid":"t1","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"fetch","content":"user confirmed: the session validator is correct"}]}}),
+            serde_json::json!({"uuid":"a2","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"edit","name":"Edit","input":{"file_path":"src/auth.rs","old_string":"a","new_string":"b"}}]}}),
+            serde_json::json!({"uuid":"a3","type":"assistant","message":{"role":"assistant","content":"I've fixed the authentication bug. The issue was in the session validation logic. Build compiled successfully."}}),
+        ];
+        let body = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn v3_extraction_reflection_and_cache_inherit_the_transcript_floor() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::ArtifactKind;
+        let dir = tempfile::tempdir().unwrap();
+        let path = external_floor_transcript(dir.path(), "conv-v3");
+        let (storage, embeddings, search) = provenance_test_rig();
+
+        process_v3_extraction(&storage, &embeddings, &search, "conv-v3", &path)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .get_artifact_min_trust(ArtifactKind::Reflection, "extracted_v3_conv-v3")
+                .unwrap(),
+            TrustTier::External,
+            "the V3 index is a reduction of a transcript that read external content"
+        );
+        let channels: Vec<String> = storage
+            .with_connection(|c| {
+                Ok(c.prepare(
+                    "SELECT DISTINCT e.channel FROM artifact_derivations d
+                       JOIN provenance_events e ON e.event_id = d.support_event_id
+                      WHERE d.artifact_kind='reflection'
+                        AND d.artifact_id='extracted_v3_conv-v3'",
+                )?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?)
+            })
+            .unwrap();
+        for channel in ["user_message", "tool_result:WebFetch", "assistant_message"] {
+            assert!(
+                channels.iter().any(|c| c == channel),
+                "{channel} must be a recorded input, got {channels:?}"
+            );
+        }
+        // A transcript that is gone by extraction time is Unknown, not
+        // inherited from anything.
+        std::fs::remove_file(&path).unwrap();
+        let missing = dir.path().join("gone.jsonl");
+        std::fs::write(&missing, "{\"type\":\"user\",\"uuid\":\"x\",\"message\":{\"role\":\"user\",\"content\":\"Please fix the authentication bug in the login flow that causes users to be logged out unexpectedly\"}}\n").unwrap();
+        let inputs = import::transcript_inputs_or_unknown(&storage, &path, "conv-v3");
+        assert_eq!(inputs.floor(), TrustTier::Unknown);
+    }
+
+    #[tokio::test]
+    async fn stored_narrative_floor_comes_only_from_the_frozen_request_manifest() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::ArtifactKind;
+        let dir = tempfile::tempdir().unwrap();
+        let path = external_floor_transcript(dir.path(), "conv-nar");
+        let (storage, embeddings, search) = provenance_test_rig();
+
+        // Submit time: the manifest is frozen from the transcript as it was.
+        let inputs = import::transcript_inputs_or_unknown(&storage, &path, "conv-nar");
+        assert_eq!(inputs.floor(), TrustTier::External);
+        storage
+            .record_narrative_request_inputs("conv-nar", &inputs)
+            .unwrap();
+        // The transcript vanishes before the batch result lands.
+        std::fs::remove_file(&path).unwrap();
+
+        store_narrative(&storage, &embeddings, &search, "conv-nar", "A narrative.")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_artifact_min_trust(ArtifactKind::Reflection, "ai_narrative_conv-nar")
+                .unwrap(),
+            TrustTier::External
+        );
+
+        // No manifest at all: Unknown, never a fresh read of anything.
+        store_narrative(&storage, &embeddings, &search, "conv-none", "Another.")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_artifact_min_trust(ArtifactKind::Reflection, "ai_narrative_conv-none")
+                .unwrap(),
+            TrustTier::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidated_facts_inherit_their_narrative_floor_and_tags_cannot_raise_it() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::{ArtifactInput, ArtifactKind, InputEnvelope};
+        let (storage, embeddings, search) = provenance_test_rig();
+        let narrative = "## Solution Pattern\nWe decided to use the iterator parser instead of the callback parser because re-entrancy dropped frames under load.\n";
+        let external = InputEnvelope::new(vec![ArtifactInput::unknown("external context")]);
+        let vector = vec![0.0; EmbeddingEngine::dimension()];
+        storage
+            .insert_derived_reflection(
+                "ai_narrative_conv-c",
+                narrative,
+                &["narrative_ai".into(), "conv_conv-c".into()],
+                &vector,
+                &external,
+            )
+            .unwrap();
+        storage
+            .mark_enrichment_completed("conv-c", "ai_narrative", "ai_narrative_conv-c")
+            .unwrap();
+        // The narrative itself is Unknown-floored here (unobserved input), so
+        // every fact cut from it must be Unknown too, whatever its tags say.
+        run_consolidation(&storage, &embeddings, &search)
+            .await
+            .unwrap();
+        let facts: Vec<(String, i64)> = storage
+            .with_connection(|c| {
+                Ok(c.prepare(
+                    "SELECT id, min_trust FROM reflections WHERE tags LIKE '%consolidated_fact%'",
+                )?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?)
+            })
+            .unwrap();
+        assert!(!facts.is_empty(), "the fixture narrative must yield a fact");
+        for (id, tier) in &facts {
+            assert_eq!(TrustTier::from_db(Some(*tier)), TrustTier::Unknown, "{id}");
+            assert_eq!(
+                storage
+                    .get_artifact_min_trust(ArtifactKind::Reflection, id)
+                    .unwrap(),
+                TrustTier::Unknown
+            );
+        }
+        let edges: i64 = storage
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM artifact_derivations d
+                       JOIN provenance_events e ON e.event_id = d.support_event_id
+                      WHERE d.artifact_kind='reflection' AND d.artifact_id=?1
+                        AND e.channel='derived_artifact:reflection'",
+                    [&facts[0].0],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            edges, 1,
+            "a fact records its narrative row as its one input"
+        );
     }
 
     #[test]

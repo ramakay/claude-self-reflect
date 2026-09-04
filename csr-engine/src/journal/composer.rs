@@ -1307,25 +1307,54 @@ pub fn store_plan(
     plan: &VerifiedPlan,
     model: &str,
 ) -> Result<()> {
-    conn.execute(
-        "INSERT OR IGNORE INTO dream_plans
-            (plan_hash, item_id, project, session_id, context, steps_json, files_json,
-             acceptance, dropped, model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            hash,
-            item.id,
-            item.project,
-            item.origin_session,
-            plan.context,
-            serde_json::to_string(&plan.steps)?,
-            serde_json::to_string(&plan.files)?,
-            plan.acceptance,
-            plan.dropped as i64,
-            model,
-        ],
-    )?;
-    Ok(())
+    crate::storage::artifact_provenance::atomic_write(conn, |conn| {
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO dream_plans
+                (plan_hash, item_id, project, session_id, context, steps_json, files_json,
+                 acceptance, dropped, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                hash,
+                item.id,
+                item.project,
+                item.origin_session,
+                plan.context,
+                serde_json::to_string(&plan.steps)?,
+                serde_json::to_string(&plan.files)?,
+                plan.acceptance,
+                plan.dropped as i64,
+                model,
+            ],
+        )?;
+        if inserted > 0 {
+            // Model output over the item's episode and that session's stored
+            // threads: each is one row-level input, read from cached floors.
+            use crate::storage::artifact_provenance::{
+                self as provenance, ArtifactKind, InputEnvelope,
+            };
+            let id = conn.last_insert_rowid().to_string();
+            let mut inputs = InputEnvelope::new(vec![provenance::episode_reflection_input(
+                conn,
+                &item.origin_session,
+            )?]);
+            let thread_ids: Vec<String> = conn
+                .prepare(
+                    "SELECT CAST(id AS TEXT) FROM dream_threads
+                      WHERE session_id = ?1 AND thread <> '' ORDER BY id",
+                )?
+                .query_map([&item.origin_session], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for thread_id in &thread_ids {
+                inputs.push(provenance::artifact_input(
+                    conn,
+                    ArtifactKind::DreamThread,
+                    thread_id,
+                )?);
+            }
+            provenance::record_stored_inputs(conn, ArtifactKind::DreamPlan, &id, &inputs)?;
+        }
+        Ok(())
+    })
 }
 
 /// Newest stored plan for `item_id`, or `None`. Sentinel rows (no steps) are
@@ -2295,6 +2324,82 @@ mod tests {
         assert_eq!(spend.calls, 1);
         assert_eq!(spend.input_tokens, 1_200);
         assert_eq!(spend.output_tokens, 340);
+    }
+
+    #[test]
+    fn a_stored_plan_inherits_the_minimum_of_its_episode_and_threads() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::{
+            self as provenance, ArtifactKind, InputEnvelope,
+        };
+        let storage = Storage::open_memory().expect("storage");
+        let item = item();
+        storage
+            .insert_derived_reflection(
+                "ep-plan",
+                r#"{"schema":"v2","session_id":"sess-plan","project":"csr"}"#,
+                &[
+                    "session_episode".into(),
+                    format!("conv_{}", item.origin_session),
+                    "project_csr".into(),
+                ],
+                &[0.0; 4],
+                &InputEnvelope::new(vec![provenance::test_observed_input(
+                    "user_message",
+                    TrustTier::UserHistory,
+                    "source",
+                )]),
+            )
+            .unwrap();
+        let plan = VerifiedPlan {
+            context: "context".into(),
+            steps: vec![],
+            files: vec![],
+            acceptance: None,
+            dropped: 0,
+        };
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO dream_threads
+                       (episode_hash, session_id, project, thread, evidence_quote,
+                        files_json, receipt_tier, receipts_json, model)
+                     VALUES ('h', ?1, 'csr', 'thread', 'q', '[]', 'unverified', '[]', 'm')",
+                    params![item.origin_session],
+                )?;
+                // A thread derived from an External observation, so the plan's
+                // floor must come from the thread, not the UserHistory episode.
+                provenance::record_stored_inputs(
+                    conn,
+                    ArtifactKind::DreamThread,
+                    "1",
+                    &InputEnvelope::new(vec![provenance::test_observed_input(
+                        "tool_result:WebFetch",
+                        TrustTier::External,
+                        "source",
+                    )]),
+                )?;
+                store_plan(conn, "hash-floor", &item, &plan, "sonnet-5")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_artifact_min_trust(ArtifactKind::DreamPlan, "1")
+                .unwrap(),
+            TrustTier::External,
+            "the External thread, not the UserHistory episode, sets the floor"
+        );
+        let edges: i64 = storage
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM artifact_derivations WHERE artifact_kind='dream_plan'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(edges, 2);
     }
 
     #[test]

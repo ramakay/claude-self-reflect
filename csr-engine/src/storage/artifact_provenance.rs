@@ -504,6 +504,26 @@ pub fn chunk_inputs(conn: &Connection, id: &str) -> Result<InputEnvelope> {
     Ok(inputs)
 }
 
+/// Newest `session_episode` reflection for `session_id` as a row-level input.
+/// Dream threads and plans are model output over exactly that episode, so it
+/// is their support set; no episode on record is an Unknown input.
+pub fn episode_reflection_input(conn: &Connection, session_id: &str) -> Result<ArtifactInput> {
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM reflections
+              WHERE tags LIKE '%\"session_episode\"%'
+                AND tags LIKE '%\"conv_' || ?1 || '\"%'
+              ORDER BY timestamp DESC, id DESC LIMIT 1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match id {
+        Some(id) => artifact_input(conn, ArtifactKind::Reflection, &id)?,
+        None => ArtifactInput::unknown(&format!("no episode on record for session {session_id}")),
+    })
+}
+
 /// Recheck source version and floor inside the publishing transaction. Captured
 /// inputs can only decrease; a concurrent parent replacement cannot raise them.
 fn input_event(
@@ -807,6 +827,54 @@ impl Storage {
     pub fn chunk_inputs(&self, id: &str) -> Result<InputEnvelope> {
         self.with_connection(|c| chunk_inputs(c, id))
     }
+    /// Freeze the support set of an asynchronous producer request (the AI
+    /// narrative batch) before its result exists; `load_narrative_request_inputs`
+    /// recovers exactly that set when the result is stored.
+    pub fn record_narrative_request_inputs(&self, id: &str, inputs: &InputEnvelope) -> Result<()> {
+        self.with_connection(|c| record_request_inputs(c, id, inputs))
+    }
+    pub fn load_narrative_request_inputs(&self, id: &str) -> Result<InputEnvelope> {
+        self.with_connection(|c| load_request_inputs(c, id))
+    }
+    /// Cold read that fails closed: a missing or unreadable artifact is an
+    /// Unknown input, never an error the producer might swallow into "no input".
+    pub fn artifact_input_or_unknown(&self, kind: ArtifactKind, id: &str) -> ArtifactInput {
+        self.artifact_input(kind, id)
+            .unwrap_or_else(|_| ArtifactInput::unknown(&format!("{}:{id}", kind.as_str())))
+    }
+    /// Row-level envelope over a conversation's chunks from cached floors only.
+    pub fn conversation_chunk_inputs(&self, chunk_ids: &[String]) -> InputEnvelope {
+        let mut inputs = Vec::with_capacity(chunk_ids.len());
+        for id in chunk_ids {
+            inputs.push(
+                self.chunk_input(id)
+                    .unwrap_or_else(|_| ArtifactInput::unknown(&format!("chunk:{id}"))),
+            );
+        }
+        if inputs.is_empty() {
+            inputs.push(ArtifactInput::unknown("conversation without chunks"));
+        }
+        InputEnvelope::new(inputs)
+    }
+    /// Upsert a ratification score and its support edges in one transaction.
+    pub fn upsert_ratification_score_with_inputs(
+        &self,
+        row: &super::queries::RatificationScoreRow,
+        inputs: &InputEnvelope,
+    ) -> Result<TrustTier> {
+        self.with_connection(|c| {
+            let tx = c.unchecked_transaction()?;
+            queries::upsert_ratification_score(&tx, row)?;
+            let floor = record_stored_inputs(
+                &tx,
+                ArtifactKind::Ratification,
+                &row.conversation_id,
+                inputs,
+            )?;
+            tx.commit()?;
+            Ok(floor)
+        })
+    }
     pub fn lower_artifact_descendants(&self) -> Result<usize> {
         self.with_connection(|c| {
             let tx = c.unchecked_transaction()?;
@@ -843,6 +911,27 @@ impl Storage {
             Ok(())
         })
     }
+}
+
+/// Test-only: an observed input at a chosen tier, so other modules' tests can
+/// build properly derived fixture rows instead of writing floors directly
+/// (a positive floor without derivation rows is exactly what
+/// `lower_descendants` treats as stale and zeroes).
+#[cfg(test)]
+pub fn test_observed_input(channel: &str, tier: TrustTier, text: &str) -> ArtifactInput {
+    let event = ProvenanceEvent {
+        event_id: format!("test-observed:{}:{}", channel, content_hash(text)),
+        conversation_id: "test-observed".into(),
+        message_key: content_hash(text),
+        seq: 0,
+        channel: channel.into(),
+        trust_tier: tier,
+        parent_event_id: None,
+        receipt_kind: "jsonl".into(),
+        receipt_ref: Some("/fixture#byte=0".into()),
+        observed_at: "2026-09-04T00:00:00Z".into(),
+    };
+    ArtifactInput::observed(event, text, 0, text.chars().count(), content_hash(text))
 }
 
 #[cfg(test)]

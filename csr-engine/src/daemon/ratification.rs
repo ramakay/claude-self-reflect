@@ -459,13 +459,19 @@ pub async fn process_ratification(storage: &Arc<Storage>, conv_id: &str) -> Resu
                     Some(serde_json::to_string(&shas)?)
                 };
 
-                storage.upsert_ratification_score(&RatificationScoreRow {
-                    conversation_id: conv_id.into(),
-                    score,
-                    acts_json,
-                    ledger_refs,
-                    extractor_version: EXTRACTOR_VERSION.into(),
-                })?;
+                // Model output over the conversation digest: every chunk that
+                // fed the digest is one row-level input, read from cached floors.
+                let inputs = storage.conversation_chunk_inputs(&chunk_ids);
+                storage.upsert_ratification_score_with_inputs(
+                    &RatificationScoreRow {
+                        conversation_id: conv_id.into(),
+                        score,
+                        acts_json,
+                        ledger_refs,
+                        extractor_version: EXTRACTOR_VERSION.into(),
+                    },
+                    &inputs,
+                )?;
                 storage.mark_enrichment_completed(conv_id, "ratification", conv_id)?;
                 Ok(())
             }
@@ -522,6 +528,52 @@ fn conversation_time_span(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ratification_floor_is_the_minimum_of_its_conversation_chunks() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::ArtifactKind;
+        use crate::storage::queries::RatificationScoreRow;
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        storage
+            .with_connection(|c| {
+                for (id, tier) in [("c-user", 3), ("c-tool", 1)] {
+                    c.execute(
+                        "INSERT INTO chunks(id,conversation_id,project_name,timestamp,content,message_count,min_trust)
+                         VALUES(?1,'conv','p','now','text',1,?2)",
+                        rusqlite::params![id, tier],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let inputs = storage.conversation_chunk_inputs(&["c-user".into(), "c-tool".into()]);
+        assert_eq!(inputs.floor(), TrustTier::External);
+        let floor = storage
+            .upsert_ratification_score_with_inputs(
+                &RatificationScoreRow {
+                    conversation_id: "conv".into(),
+                    score: 0.5,
+                    acts_json: "[]".into(),
+                    ledger_refs: None,
+                    extractor_version: "test".into(),
+                },
+                &inputs,
+            )
+            .unwrap();
+        assert_eq!(floor, TrustTier::External);
+        assert_eq!(
+            storage
+                .get_artifact_min_trust(ArtifactKind::Ratification, "conv")
+                .unwrap(),
+            TrustTier::External
+        );
+        // A conversation with no chunks has no observable support.
+        assert_eq!(
+            storage.conversation_chunk_inputs(&[]).floor(),
+            TrustTier::Unknown
+        );
+    }
+
     use super::*;
 
     #[test]

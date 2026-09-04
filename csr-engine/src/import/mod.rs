@@ -355,6 +355,22 @@ pub fn transcript_inputs(
     transcript_inputs_variant(storage, path, conversation_id, false)
 }
 
+/// Producer-side convenience: the transcript's input envelope, or a single
+/// Unknown input naming the path when the file cannot be read or parsed.
+/// Never an empty envelope, so a producer's floor can never be an empty-set
+/// maximum.
+pub fn transcript_inputs_or_unknown(
+    storage: &crate::storage::Storage,
+    path: &Path,
+    conversation_id: &str,
+) -> crate::storage::artifact_provenance::InputEnvelope {
+    use crate::storage::artifact_provenance::{ArtifactInput, InputEnvelope};
+    match transcript_inputs(storage, path, conversation_id) {
+        Ok(inputs) if !inputs.inputs().is_empty() => inputs,
+        _ => InputEnvelope::new(vec![ArtifactInput::unknown(&path.to_string_lossy())]),
+    }
+}
+
 pub(crate) fn transcript_inputs_variant(
     storage: &crate::storage::Storage,
     path: &Path,

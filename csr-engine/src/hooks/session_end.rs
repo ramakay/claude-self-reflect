@@ -178,9 +178,17 @@ async fn try_v3_story_synthesis(engine: &Engine, conv_id: &str, project: &str) -
             }
         };
 
+    // The story is a deterministic reduction of the V3 reflection it was
+    // synthesized from; that row is its whole support set.
+    let inputs = crate::storage::artifact_provenance::InputEnvelope::new(vec![engine
+        .storage()
+        .artifact_input_or_unknown(
+            crate::storage::artifact_provenance::ArtifactKind::Reflection,
+            &ref_id,
+        )]);
     if let Err(e) = engine
         .storage()
-        .insert_reflection(&story_id, &story, &tags, &embedding)
+        .insert_derived_reflection(&story_id, &story, &tags, &embedding, &inputs)
     {
         eprintln!("CSR: V3 story store failed (non-fatal): {}", e);
         return false;
@@ -230,6 +238,9 @@ async fn run_v3_extraction(engine: &Engine, transcript_path: &Path, cwd: &Path) 
     if result.search_index.trim().is_empty() {
         return Ok(());
     }
+    // Row-level support: the whole transcript, Unknown if it cannot be parsed.
+    let inputs =
+        crate::import::transcript_inputs_or_unknown(engine.storage(), transcript_path, &conv_id);
 
     // Store rich V3 content: search_index + signature + context_cache
     // (same format as daemon, so story synthesis can see Signature for outcome extraction)
@@ -263,9 +274,13 @@ async fn run_v3_extraction(engine: &Engine, transcript_path: &Path, cwd: &Path) 
             idx.remove_reflection(&old_id);
         }
 
-        engine
-            .storage()
-            .insert_reflection(&reflection_id, &rich_content, &tags, &vec)?;
+        engine.storage().insert_derived_reflection(
+            &reflection_id,
+            &rich_content,
+            &tags,
+            &vec,
+            &inputs,
+        )?;
         {
             let mut idx = engine.search().write().await;
             idx.insert_reflection(reflection_id.clone(), vec);
@@ -297,11 +312,12 @@ async fn run_v3_extraction(engine: &Engine, transcript_path: &Path, cwd: &Path) 
                 tokio::task::spawn_blocking(move || cache_emb.embed(&[cache_text.as_str()])).await
             {
                 if let Some(cache_vec) = cache_embedding.into_iter().next() {
-                    let _ = engine.storage().insert_reflection(
+                    let _ = engine.storage().insert_derived_reflection(
                         &cache_id,
                         &result.context_cache,
                         &cache_tags,
                         &cache_vec,
+                        &inputs,
                     );
                     {
                         let mut idx = engine.search().write().await;
@@ -403,6 +419,56 @@ mod tests {
 
     fn msg(json: &str) -> serde_json::Value {
         serde_json::from_str(json).unwrap()
+    }
+
+    fn provenance_test_engine() -> (Engine, std::sync::Arc<crate::storage::Storage>) {
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let embeddings = std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap());
+        let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::search::SearchEngine::new(crate::embeddings::EmbeddingEngine::dimension()),
+        ));
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings,
+            search,
+            std::path::PathBuf::from("/tmp"),
+        );
+        (engine, storage)
+    }
+
+    #[tokio::test]
+    async fn synthesized_story_inherits_the_v3_reflection_floor() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::{ArtifactKind, InputEnvelope};
+        let (engine, storage) = provenance_test_engine();
+        let v3 = "## User Request\n\"Fix the authentication timeout bug in login flow\"\n\n## Solution Pattern\ncreation: auth.rs\n  Fixed timeout handling\n\n## Code Context\nLANGUAGES: Rust\n";
+        storage
+            .insert_derived_reflection(
+                "v3_conv-s",
+                v3,
+                &["narrative_v3".into(), "conv_conv-s".into()],
+                &[0.0; 384],
+                &InputEnvelope::new(vec![
+                    crate::storage::artifact_provenance::test_observed_input(
+                        "tool_result:WebFetch",
+                        TrustTier::External,
+                        "source",
+                    ),
+                ]),
+            )
+            .unwrap();
+        storage
+            .mark_enrichment_completed("conv-s", "extracted_v3", "v3_conv-s")
+            .unwrap();
+
+        assert!(try_v3_story_synthesis(&engine, "conv-s", "proj").await);
+        assert_eq!(
+            storage
+                .get_artifact_min_trust(ArtifactKind::Reflection, "story_conv-s")
+                .unwrap(),
+            TrustTier::External,
+            "a story is a reduction of its V3 row and carries that row's floor"
+        );
     }
 
     #[test]
