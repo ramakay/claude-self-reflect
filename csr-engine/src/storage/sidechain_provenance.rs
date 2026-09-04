@@ -41,7 +41,18 @@ pub(crate) fn relink_conversations(conn: &Connection, seeds: &[String]) -> Resul
         }
     }
     total+=conn.execute("UPDATE chunks SET min_trust=COALESCE((SELECT MIN(COALESCE(e.trust_tier,0)) FROM chunk_spans s LEFT JOIN provenance_events e USING(event_id) WHERE s.chunk_id=chunks.id),0) WHERE conversation_id IN (SELECT value FROM json_each(?1)) AND min_trust>0 AND min_trust>COALESCE((SELECT MIN(COALESCE(e.trust_tier,0)) FROM chunk_spans s LEFT JOIN provenance_events e USING(event_id) WHERE s.chunk_id=chunks.id),0)",[&family])?;
-    total += super::artifact_provenance::lower_descendants(conn)?;
+    // Only this family's chunks can have moved; lower from them, not the corpus.
+    let family_chunks: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM chunks WHERE conversation_id IN (SELECT value FROM json_each(?1))",
+        )?
+        .query_map([&family], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let seeds: Vec<(&str, &str)> = family_chunks
+        .iter()
+        .map(|id| ("chunk", id.as_str()))
+        .collect();
+    total += super::artifact_provenance::lower_from(conn, &seeds, &[])?;
     Ok(total)
 }
 

@@ -352,7 +352,9 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let tx = conn.unchecked_transaction()?;
         queries::insert_reflection(&tx, id, content, tags, embedding)?;
-        artifact_provenance::lower_descendants(&tx)?;
+        // A replaced body invalidates every snapshot of this row; a fresh id
+        // has no dependents and this is a single indexed lookup.
+        artifact_provenance::lower_from(&tx, &[("reflection", id)], &[])?;
         tx.commit()?;
         Ok(())
     }
@@ -550,7 +552,7 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let tx = conn.unchecked_transaction()?;
         queries::delete_reflection(&tx, id)?;
-        artifact_provenance::lower_descendants(&tx)?;
+        artifact_provenance::lower_from(&tx, &[("reflection", id)], &[])?;
         tx.commit()?;
         Ok(())
     }

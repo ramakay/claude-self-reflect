@@ -157,7 +157,8 @@ pub fn backfill(storage: &Storage) -> Result<usize> {
             provenance::record_stored_inputs(&tx,ArtifactKind::EpisodeIndex,id,&InputEnvelope::new(vec![input]))?;
         }
         written+=ids.len();
-        provenance::lower_descendants(&tx)?;
+        // record_stored_inputs already lowered from each written row; nothing
+        // else moved in this pass, so no corpus-wide sweep.
         tx.commit()?;
         Ok(())
     })?;

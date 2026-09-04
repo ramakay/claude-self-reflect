@@ -641,7 +641,8 @@ pub fn record_ranges(
     ranges: &[(usize, usize)],
     envelope: &InputEnvelope,
 ) -> Result<TrustTier> {
-    let (floor, invalidate) = record_edges(conn, kind.as_str(), id, ranges, envelope)?;
+    let (floor, invalidate, lowered_events) =
+        record_edges(conn, kind.as_str(), id, ranges, envelope)?;
     conn.execute(
         &format!(
             "UPDATE {} SET min_trust=?2 WHERE {}=?1 AND min_trust<>?2",
@@ -651,7 +652,9 @@ pub fn record_ranges(
         params![id, floor.as_i64()],
     )?;
     if invalidate {
-        lower_descendants(conn)?;
+        // This row's body or floor moved: anything that snapshotted it, and
+        // anything sharing a lowered input event, follows it down.
+        lower_from(conn, &[(kind.as_str(), id)], &lowered_events)?;
     }
     cached_floor(conn, kind, id)
 }
@@ -662,7 +665,7 @@ fn record_edges(
     id: &str,
     ranges: &[(usize, usize)],
     envelope: &InputEnvelope,
-) -> Result<(TrustTier, bool)> {
+) -> Result<(TrustTier, bool, Vec<String>)> {
     anyhow::ensure!(
         ranges.len() == envelope.inputs.len(),
         "every input needs an artifact range"
@@ -671,11 +674,15 @@ fn record_edges(
         "DELETE FROM artifact_derivations WHERE artifact_kind=?1 AND artifact_id=?2",
         params![kind, id],
     )? > 0;
+    let mut lowered_events = Vec::new();
     let mut floor = None;
     for (input, (start, end)) in envelope.inputs.iter().zip(ranges) {
         let (event, chunk) = input_event(conn, input)?;
         let (effective, lowered) = insert_event(conn, &event)?;
-        invalidate |= lowered;
+        if lowered {
+            invalidate = true;
+            lowered_events.push(event.event_id.clone());
+        }
         floor = Some(floor.map_or(effective, |f: TrustTier| f.min(effective)));
         conn.execute(
             "INSERT OR IGNORE INTO artifact_derivations VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -692,7 +699,7 @@ fn record_edges(
         )?;
     }
     let floor = floor.unwrap_or(TrustTier::Unknown);
-    Ok((floor, invalidate))
+    Ok((floor, invalidate, lowered_events))
 }
 
 /// Durable support captured from the submitted prompt, before polling. This is
@@ -702,15 +709,15 @@ pub fn record_request_inputs(conn: &Connection, id: &str, inputs: &InputEnvelope
     // protects standalone callers from publishing a trusted partial prefix.
     conn.execute_batch("SAVEPOINT csr_request_inputs")?;
     let result: Result<()> = (|| {
-        let (_, invalidate) = record_edges(
+        let (_, _, lowered_events) = record_edges(
             conn,
             "narrative_request",
             id,
             &vec![(0, 0); inputs.inputs.len()],
             inputs,
         )?;
-        if invalidate {
-            lower_descendants(conn)?;
+        if !lowered_events.is_empty() {
+            lower_from(conn, &[], &lowered_events)?;
         }
         Ok(())
     })();
@@ -783,6 +790,91 @@ fn snapshot_floor(conn: &Connection, receipt: &str) -> Result<TrustTier> {
     })
 }
 
+/// Targeted fixed-point lowering. `seeds` are rows whose body or floor just
+/// changed (`("chunk", id)` or `(kind.as_str(), id)`); `events` are input
+/// events already lowered by the caller. Only snapshots of those rows are
+/// re-validated and only artifacts deriving from lowered events are
+/// recomputed, transitively, so a producer write costs work proportional to
+/// its dependents, not to the corpus. Never raises anything.
+pub fn lower_from(conn: &Connection, seeds: &[(&str, &str)], events: &[String]) -> Result<usize> {
+    use std::collections::{HashSet, VecDeque};
+    let mut total = 0;
+    let mut queue: VecDeque<(String, String)> = seeds
+        .iter()
+        .map(|(kind, id)| (kind.to_string(), id.to_string()))
+        .collect();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut pending_events: Vec<String> = events.to_vec();
+    loop {
+        // 1. Re-validate every snapshot that references a changed row.
+        while let Some((kind, id)) = queue.pop_front() {
+            if !seen.insert((kind.clone(), id.clone())) {
+                continue;
+            }
+            let snapshots: Vec<(String, String, i64)> = conn
+                .prepare_cached(
+                    "SELECT event_id, receipt_ref, trust_tier FROM provenance_events
+                      WHERE receipt_kind='artifact_input' AND trust_tier>0
+                        AND json_extract(receipt_ref,'$.kind')=?1
+                        AND json_extract(receipt_ref,'$.id')=?2",
+                )?
+                .query_map(params![kind, id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (event_id, receipt, previous) in snapshots {
+                let current = snapshot_floor(conn, &receipt)?;
+                if current.as_i64() < previous {
+                    total += conn.execute(
+                        "UPDATE provenance_events SET trust_tier=?2 WHERE event_id=?1",
+                        params![event_id, current.as_i64()],
+                    )?;
+                    pending_events.push(event_id);
+                }
+            }
+        }
+        if pending_events.is_empty() {
+            return Ok(total);
+        }
+        // 2. Recompute every artifact deriving from a lowered event; a row that
+        //    drops becomes a seed for the next round.
+        let lowered = serde_json::to_string(&std::mem::take(&mut pending_events))?;
+        let dependents: Vec<(String, String)> = conn
+            .prepare_cached(
+                "SELECT DISTINCT artifact_kind, artifact_id FROM artifact_derivations
+                  WHERE support_event_id IN (SELECT value FROM json_each(?1))",
+            )?
+            .query_map([&lowered], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (kind_name, id) in dependents {
+            let Some(kind) = ArtifactKind::parse(&kind_name) else {
+                continue;
+            };
+            let floor: i64 = conn.query_row(
+                "SELECT COALESCE(MIN(COALESCE(e.trust_tier,0)),0) FROM artifact_derivations d
+                   LEFT JOIN provenance_events e ON e.event_id=d.support_event_id
+                  WHERE d.artifact_kind=?1 AND d.artifact_id=?2",
+                params![kind_name, id],
+                |r| r.get(0),
+            )?;
+            let key = if kind == ArtifactKind::Ledger {
+                "json_array(id,repo,branch,user)".to_string()
+            } else {
+                format!("CAST({} AS TEXT)", kind.key())
+            };
+            let changed = conn.execute(
+                &format!(
+                    "UPDATE {} SET min_trust=?2 WHERE {key}=?1 AND min_trust>?2",
+                    kind.table()
+                ),
+                params![id, floor],
+            )?;
+            if changed > 0 {
+                total += changed;
+                queue.push_back((kind_name, id));
+            }
+        }
+    }
+}
+
 /// Fixed-point invalidation follows version-bound artifact snapshots. A later
 /// source upgrade never changes a prior observation or raises descendants.
 pub fn lower_descendants(conn: &Connection) -> Result<usize> {
@@ -800,10 +892,14 @@ pub fn lower_descendants(conn: &Connection) -> Result<usize> {
             }
         }
         for kind in ARTIFACT_KINDS {
+            // CAST keeps TEXT affinity on both sides: comparing the TEXT
+            // artifact_id column to an INTEGER key column would otherwise apply
+            // numeric affinity and defeat idx_artifact_derivations_artifact
+            // (a full derivations scan per row; minutes on 54k witness rows).
             let key = if *kind == ArtifactKind::Ledger {
                 "json_array(derivation_ledger.id,derivation_ledger.repo,derivation_ledger.branch,derivation_ledger.user)".into()
             } else {
-                format!("{}.{}", kind.table(), kind.key())
+                format!("CAST({}.{} AS TEXT)", kind.table(), kind.key())
             };
             changed+=conn.execute(&format!("UPDATE {table} SET min_trust=COALESCE((SELECT MIN(COALESCE(e.trust_tier,0)) FROM artifact_derivations d LEFT JOIN provenance_events e ON e.event_id=d.support_event_id WHERE d.artifact_kind=?1 AND d.artifact_id={key}),0) WHERE min_trust>0 AND min_trust>COALESCE((SELECT MIN(COALESCE(e.trust_tier,0)) FROM artifact_derivations d LEFT JOIN provenance_events e ON e.event_id=d.support_event_id WHERE d.artifact_kind=?1 AND d.artifact_id={key}),0)",table=kind.table()),[kind.as_str()])?;
         }
@@ -1030,6 +1126,34 @@ mod tests {
             text.chars().count(),
             crate::provenance::content_hash(text),
         )
+    }
+
+    /// Wall-clock probe for the descendant-lowering pass that every plain
+    /// reflection insert runs. Needs a real database: set CSR_PROBE_DB to a
+    /// migrated copy (never the live file) and run with --ignored.
+    #[test]
+    #[ignore = "timing probe against a real database copy; set CSR_PROBE_DB and run with --ignored"]
+    fn probe_insert_reflection_wall_time_on_real_database() {
+        let Ok(path) = std::env::var("CSR_PROBE_DB") else {
+            eprintln!("CSR_PROBE_DB unset; nothing measured");
+            return;
+        };
+        let storage = Storage::open(std::path::Path::new(&path)).unwrap();
+        let vector = vec![0.0_f32; 384];
+        let mut samples = Vec::new();
+        for i in 0..5 {
+            let id = format!(
+                "probe-insert-{i}-{}",
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            );
+            let started = std::time::Instant::now();
+            storage
+                .insert_reflection(&id, "timing probe", &["probe".into()], &vector)
+                .unwrap();
+            samples.push(started.elapsed().as_millis());
+            storage.delete_reflection(&id).unwrap();
+        }
+        eprintln!("PROBE insert_reflection ms per call: {samples:?}");
     }
 
     #[test]

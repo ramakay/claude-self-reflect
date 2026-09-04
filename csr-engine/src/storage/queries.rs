@@ -112,7 +112,7 @@ pub fn replace_chunk_evidence(conn: &Connection, evidence: &ChunkEvidence) -> Re
                 .collect::<Vec<_>>(),
         )?;
     } else {
-        super::artifact_provenance::lower_descendants(&tx)?;
+        super::artifact_provenance::lower_from(&tx, &[("chunk", &evidence.chunk_id)], &[])?;
     }
     tx.commit()?;
     Ok(())

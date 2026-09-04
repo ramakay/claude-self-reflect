@@ -2063,6 +2063,11 @@ fn migrate_artifact_provenance(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_artifact_derivations_artifact
             ON artifact_derivations(artifact_kind,artifact_id);
+         CREATE INDEX IF NOT EXISTS idx_artifact_derivations_support_event
+            ON artifact_derivations(support_event_id);
+         CREATE INDEX IF NOT EXISTS idx_provenance_events_snapshot
+            ON provenance_events(json_extract(receipt_ref,'$.kind'), json_extract(receipt_ref,'$.id'))
+            WHERE receipt_kind='artifact_input';
          CREATE UNIQUE INDEX IF NOT EXISTS idx_artifact_derivations_identity
             ON artifact_derivations(artifact_kind,artifact_id,artifact_start_char,artifact_end_char,
                 COALESCE(support_event_id,''),COALESCE(support_chunk_id,''),support_start_char,support_end_char);
