@@ -147,6 +147,25 @@ pub(crate) fn parse_rollout(path: &Path) -> Result<Option<ParsedRollout>> {
 
 fn visit_rollout_messages<F>(
     path: &Path,
+    visit: F,
+) -> Result<Option<(RolloutMetadata, RolloutStreamOutcome)>>
+where
+    F: FnMut(serde_json::Value) -> Result<()>,
+{
+    visit_rollout_messages_inner(path, true, visit)
+}
+
+pub(super) fn visit_raw_rollout_messages<F>(path: &Path, visit: F) -> Result<()>
+where
+    F: FnMut(serde_json::Value) -> Result<()>,
+{
+    visit_rollout_messages_inner(path, false, visit)?;
+    Ok(())
+}
+
+fn visit_rollout_messages_inner<F>(
+    path: &Path,
+    sanitize: bool,
     mut visit: F,
 ) -> Result<Option<(RolloutMetadata, RolloutStreamOutcome)>>
 where
@@ -173,6 +192,7 @@ where
             Ok(0) => break,
             Ok(bytes) => bytes,
             Err(_) => {
+                anyhow::ensure!(sanitize, "cannot read rollout source");
                 schema_misses += 1;
                 continue;
             }
@@ -187,6 +207,7 @@ where
         let value: serde_json::Value = match sonic_rs::from_str(&line) {
             Ok(value) => value,
             Err(_) => {
+                anyhow::ensure!(sanitize, "cannot parse rollout source");
                 schema_misses += 1;
                 continue;
             }
@@ -253,7 +274,9 @@ where
         for mut message in line_messages {
             message["_csr_receipt_ref"] =
                 serde_json::Value::String(format!("{}#byte={line_start}", path.display()));
-            super::sanitize_message_for_search(&mut message, &mut sanitizer);
+            if sanitize {
+                super::sanitize_message_for_search(&mut message, &mut sanitizer);
+            }
             if summary.is_none()
                 && message.get("type").and_then(serde_json::Value::as_str) == Some("user")
             {
@@ -750,24 +773,6 @@ where
     }
     outcome.chunks = next_seq;
     Ok(outcome)
-}
-
-pub(crate) fn reconstruct_rollout_evidence(
-    path: &Path,
-) -> Result<std::collections::HashMap<String, (String, ChunkEvidence)>> {
-    let metadata = scan_rollout_metadata(path)?
-        .ok_or_else(|| anyhow::anyhow!("rollout contains no session metadata"))?;
-    let mut evidence = std::collections::HashMap::new();
-    stream_rollout_chunk_batches(path, &metadata, ROLLOUT_EMBED_BATCH_SIZE, |chunks, rows| {
-        evidence.extend(
-            chunks
-                .iter()
-                .zip(rows)
-                .map(|(chunk, row)| (chunk.id.clone(), (chunk.content.clone(), row.clone()))),
-        );
-        Ok(())
-    })?;
-    Ok(evidence)
 }
 
 /// Import every changed rollout discovered beneath the optional Codex root.

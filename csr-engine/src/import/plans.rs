@@ -404,43 +404,6 @@ fn plan_evidence(
         .collect()
 }
 
-pub(crate) fn reconstruct_plan_evidence(
-    path: &Path,
-    conversation_id: &str,
-    project_name: &str,
-    timestamp: &str,
-) -> Result<HashMap<String, (String, ChunkEvidence)>> {
-    let content = std::fs::read_to_string(path)?;
-    let plan = PlanDoc {
-        slug: conversation_id
-            .strip_prefix("plan:")
-            .unwrap_or(conversation_id)
-            .to_string(),
-        path: path.to_path_buf(),
-        mtime: timestamp.to_string(),
-        content,
-    };
-    let mut chunks = Vec::new();
-    push_plan_chunks(
-        &mut chunks,
-        conversation_id,
-        project_name,
-        timestamp,
-        &plan.content,
-        &plan_summary(&plan.content),
-    );
-    let evidence = plan_evidence(&plan, conversation_id, &chunks);
-    Ok(chunks
-        .into_iter()
-        .filter_map(|chunk| {
-            evidence
-                .get(&chunk.id)
-                .cloned()
-                .map(|row| (chunk.id, (chunk.content, row)))
-        })
-        .collect())
-}
-
 /// Import one plan: wipe any existing chunks for `plan:<slug>` (idempotent even
 /// across shrinking reimports), correlate it to a project/conversation, chunk +
 /// embed + store it with `source = "plan"`, and record its import_state mtime.

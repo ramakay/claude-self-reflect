@@ -30,7 +30,7 @@ pub mod text {
             t.status.total_jsonl_files,
         );
         println!(
-            "  Provenance {}/{} chunks with spans, {} unknown, tool share mean={}",
+            "  Provenance {}/{} chunks with spans, {} unknown, tool share mean={}; missing={} unparsed={} unmatched={}",
             t.status.provenance_coverage.chunks_with_spans,
             t.status.provenance_coverage.chunks_total,
             t.status.provenance_coverage.chunks_unknown,
@@ -39,6 +39,9 @@ pub mod text {
                 .tool_result_share_mean
                 .map(|value| format!("{value:.3}"))
                 .unwrap_or_else(|| "unknown".into()),
+            t.status.provenance_coverage.source_missing,
+            t.status.provenance_coverage.source_unparsed,
+            t.status.provenance_coverage.source_unmatched,
         );
         let e = &t.status.enrichment;
         println!(

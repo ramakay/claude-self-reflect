@@ -5,6 +5,7 @@ pub mod dream_marker;
 pub mod memory_registry;
 pub mod plans;
 pub mod provenance_backfill;
+mod provenance_matcher;
 pub mod registry;
 pub mod scrub;
 pub mod watcher;

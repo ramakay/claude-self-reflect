@@ -38,7 +38,11 @@ pub fn insert_provenance_event(conn: &Connection, event: &ProvenanceEvent) -> Re
             parent_event_id = COALESCE(provenance_events.parent_event_id,
                                        excluded.parent_event_id),
             receipt_ref = COALESCE(provenance_events.receipt_ref,
-                                   excluded.receipt_ref)",
+                                   excluded.receipt_ref),
+            receipt_kind = CASE WHEN provenance_events.receipt_kind = 'unreconstructible'
+                                THEN excluded.receipt_kind ELSE provenance_events.receipt_kind END,
+            observed_at = CASE WHEN excluded.receipt_kind IN ('source_missing', 'source_unparsed', 'source_unmatched', 'plan_file')
+                               THEN excluded.observed_at ELSE provenance_events.observed_at END",
         params![
             event.event_id,
             event.conversation_id,
@@ -111,6 +115,40 @@ pub fn replace_chunk_evidence_batch(conn: &Connection, evidence: &[ChunkEvidence
     Ok(())
 }
 
+/// Backfill cannot race a forward importer into replacing real JSONL receipts.
+/// Equality is checked inside the transaction; unchanged retries issue no writes.
+pub fn replace_backfill_evidence_batch(
+    conn: &Connection,
+    evidence: &[ChunkEvidence],
+) -> Result<usize> {
+    if evidence.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut written = 0;
+    for row in evidence {
+        let (count, real): (usize, bool) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(e.receipt_kind='jsonl'),0) FROM chunk_spans s JOIN provenance_events e USING(event_id) WHERE s.chunk_id=?1",
+            [&row.chunk_id], |r| Ok((r.get::<_, i64>(0)? as usize,r.get(1)?)))?;
+        if real {
+            continue;
+        }
+        let mut same = count == row.spans.len();
+        if same {
+            for (span, event) in row.spans.iter().zip(&row.events) {
+                same &= tx.query_row("SELECT EXISTS(SELECT 1 FROM chunk_spans s JOIN provenance_events e USING(event_id) WHERE s.chunk_id=?1 AND s.event_id=?2 AND s.start_char=?3 AND s.end_char=?4 AND s.content_hash=?5 AND e.receipt_kind=?6 AND e.receipt_ref IS ?7 AND e.observed_at=?8)",
+                    params![row.chunk_id,span.event_id,span.start_char as i64,span.end_char as i64,span.content_hash,event.receipt_kind,event.receipt_ref,event.observed_at], |r|r.get::<_,bool>(0))?;
+            }
+        }
+        if !same {
+            replace_chunk_evidence_inner(&tx, row)?;
+            written += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(written)
+}
+
 fn replace_chunk_evidence_inner(conn: &Connection, evidence: &ChunkEvidence) -> Result<()> {
     for event in &evidence.events {
         insert_provenance_event(conn, event)?;
@@ -151,7 +189,7 @@ fn replace_chunk_evidence_inner(conn: &Connection, evidence: &ChunkEvidence) -> 
                           OR pe.channel LIKE 'codex_tool:%'
                         THEN cs.end_char - cs.start_char ELSE 0 END), 0),
                     COUNT(cs.event_id),
-                    COALESCE(SUM(CASE WHEN pe.receipt_kind = 'unreconstructible'
+                    COALESCE(SUM(CASE WHEN pe.receipt_kind IN ('unreconstructible', 'source_missing', 'source_unparsed', 'source_unmatched')
                                       THEN 1 ELSE 0 END), 0),
                     c.content
                FROM chunks c
@@ -219,6 +257,7 @@ pub struct ProvenanceBackfillRow {
     pub source: String,
     pub is_sidechain: bool,
     pub source_path: Option<String>,
+    pub failure_observed_at: Option<String>,
 }
 
 pub fn list_chunks_missing_spans(
@@ -249,10 +288,43 @@ pub fn list_chunks_missing_spans(
             source: row.get(5)?,
             is_sidechain: row.get::<_, i64>(6)? != 0,
             source_path: row.get(7)?,
+            failure_observed_at: None,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+pub fn list_provenance_backfill_candidates(
+    conn: &Connection,
+    after: Option<(&str, &str)>,
+    limit: usize,
+    retry: bool,
+) -> Result<Vec<ProvenanceBackfillRow>> {
+    let mut statement = conn.prepare(
+        "SELECT c.id,c.conversation_id,c.project_name,c.timestamp,c.content,c.source,c.is_sidechain,
+           COALESCE((SELECT i.file_path FROM import_state i WHERE i.conversation_id=c.conversation_id AND i.file_path NOT LIKE 'plan:%' ORDER BY i.file_path LIMIT 1),
+                    (SELECT e.receipt_ref FROM chunk_spans s JOIN provenance_events e USING(event_id) WHERE s.chunk_id=c.id LIMIT 1)),
+           (SELECT MIN(e.observed_at) FROM chunk_spans s JOIN provenance_events e USING(event_id) WHERE s.chunk_id=c.id)
+         FROM chunks c
+         WHERE (c.conversation_id,c.id) > (?1,?2)
+           AND NOT EXISTS (SELECT 1 FROM chunk_spans s JOIN provenance_events e USING(event_id) WHERE s.chunk_id=c.id AND (?4=0 OR e.receipt_kind='jsonl'))
+         ORDER BY c.conversation_id,c.id LIMIT ?3")?;
+    let (conv, id) = after.unwrap_or(("", ""));
+    let rows = statement.query_map(params![conv, id, limit as i64, retry], |r| {
+        Ok(ProvenanceBackfillRow {
+            id: r.get(0)?,
+            conversation_id: r.get(1)?,
+            project_name: r.get(2)?,
+            timestamp: r.get(3)?,
+            content: r.get(4)?,
+            source: r.get(5)?,
+            is_sidechain: r.get(6)?,
+            source_path: r.get(7)?,
+            failure_observed_at: r.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub fn provenance_coverage(conn: &Connection) -> Result<(i64, i64, i64, Option<f64>)> {
@@ -280,6 +352,21 @@ pub fn provenance_tier_histogram(conn: &Connection) -> Result<Vec<(TrustTier, i6
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+pub fn provenance_failure_counts(conn: &Connection) -> Result<[i64; 3]> {
+    let mut counts = [0; 3];
+    let mut statement = conn.prepare("SELECT e.receipt_kind, COUNT(DISTINCT s.chunk_id) FROM provenance_events e JOIN chunk_spans s USING(event_id) WHERE e.receipt_kind IN ('source_missing','source_unparsed','source_unmatched') GROUP BY e.receipt_kind")?;
+    for row in statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        let (kind, count) = row?;
+        match kind.as_str() {
+            "source_missing" => counts[0] = count,
+            "source_unparsed" => counts[1] = count,
+            "source_unmatched" => counts[2] = count,
+            _ => {}
+        }
+    }
+    Ok(counts)
 }
 
 /// Upsert a derivation-ledger entry (Pillar 1). `times_reused` is preserved on

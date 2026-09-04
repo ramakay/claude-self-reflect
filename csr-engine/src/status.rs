@@ -474,6 +474,9 @@ pub struct ProvenanceCoverageStatus {
     pub chunks_unknown: i64,
     pub chunks_total: i64,
     pub tool_result_share_mean: Option<f64>,
+    pub source_missing: i64,
+    pub source_unparsed: i64,
+    pub source_unmatched: i64,
 }
 
 #[derive(Serialize, Default, Debug, PartialEq, Eq)]
@@ -642,6 +645,8 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     }
     .map(ContaminationStatus::from)
     .unwrap_or_default();
+    let [source_missing, source_unparsed, source_unmatched] =
+        storage.provenance_failure_counts().unwrap_or_default();
     let provenance_coverage = storage
         .provenance_coverage()
         .map(
@@ -651,6 +656,9 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
                     chunks_unknown,
                     chunks_total,
                     tool_result_share_mean,
+                    source_missing,
+                    source_unparsed,
+                    source_unmatched,
                 }
             },
         )
@@ -1388,10 +1396,13 @@ fn print_swiftbar(report: &StatusReport) {
     println!("--Conversations: {} | font=Menlo", report.conversations);
     println!("--Projects: {} | font=Menlo", report.projects);
     println!(
-        "--Provenance: {}/{} spans, {} unknown | font=Menlo",
+        "--Provenance: {}/{} spans, {} unknown; missing={} unparsed={} unmatched={} | font=Menlo",
         report.provenance_coverage.chunks_with_spans,
         report.provenance_coverage.chunks_total,
         report.provenance_coverage.chunks_unknown,
+        report.provenance_coverage.source_missing,
+        report.provenance_coverage.source_unparsed,
+        report.provenance_coverage.source_unmatched,
     );
 
     // Section: Import Progress
@@ -1541,10 +1552,13 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
     );
     if report.provenance_coverage.chunks_total > 0 {
         out.push_str(&format!(
-            " | prov {}/{} ?{}",
+            " | prov {}/{} ?{} missing={} unparsed={} unmatched={}",
             report.provenance_coverage.chunks_with_spans,
             report.provenance_coverage.chunks_total,
             report.provenance_coverage.chunks_unknown,
+            report.provenance_coverage.source_missing,
+            report.provenance_coverage.source_unparsed,
+            report.provenance_coverage.source_unmatched,
         ));
     }
     let dream_total = report.dream.dreams.total();
@@ -1699,8 +1713,17 @@ mod tests {
             chunks_unknown: 25,
             chunks_total: 100,
             tool_result_share_mean: Some(0.2),
+            ..Default::default()
         };
         assert!(format_compact(&report, 0).contains("prov 80/100 ?25"));
+    }
+
+    #[test]
+    fn status_reports_distinct_provenance_failure_reasons() {
+        let json = serde_json::to_value(ProvenanceCoverageStatus::default()).unwrap();
+        assert_eq!(json["source_missing"], 0);
+        assert_eq!(json["source_unparsed"], 0);
+        assert_eq!(json["source_unmatched"], 0);
     }
 
     #[test]

@@ -233,9 +233,32 @@ impl Storage {
         queries::provenance_coverage(&conn)
     }
 
+    pub(crate) fn list_provenance_backfill_candidates(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: usize,
+        retry: bool,
+    ) -> Result<Vec<queries::ProvenanceBackfillRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::list_provenance_backfill_candidates(&conn, after, limit, retry)
+    }
+
+    pub(crate) fn replace_backfill_evidence_batch(
+        &self,
+        evidence: &[crate::provenance::ChunkEvidence],
+    ) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::replace_backfill_evidence_batch(&conn, evidence)
+    }
+
     pub fn provenance_tier_histogram(&self) -> Result<Vec<(crate::provenance::TrustTier, i64)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::provenance_tier_histogram(&conn)
+    }
+
+    pub fn provenance_failure_counts(&self) -> Result<[i64; 3]> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::provenance_failure_counts(&conn)
     }
 
     /// Fetch provenance for a chunk, if recorded.

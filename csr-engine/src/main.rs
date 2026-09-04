@@ -403,6 +403,9 @@ enum ProvenanceAction {
         /// Maximum chunks per write transaction.
         #[arg(long, default_value_t = csr_engine::import::provenance_backfill::DEFAULT_BATCH_SIZE)]
         batch: usize,
+        /// Re-examine chunks with only non-JSONL receipts. Real JSONL spans are never replaced.
+        #[arg(long)]
+        retry_unknown: bool,
     },
 }
 
@@ -584,19 +587,28 @@ async fn main() -> Result<()> {
     }
 
     if let Some(Commands::Provenance {
-        action: ProvenanceAction::Backfill { db, dry_run, batch },
+        action:
+            ProvenanceAction::Backfill {
+                db,
+                dry_run,
+                batch,
+                retry_unknown,
+            },
     }) = &args.command
     {
         let db_path = db.as_ref().unwrap_or(&args.db_path);
         let storage = csr_engine::storage::Storage::open(db_path)?;
-        let stats = csr_engine::import::provenance_backfill::backfill(
+        let stats = csr_engine::import::provenance_backfill::backfill_with_retry(
             &storage,
             &args.projects_dir,
             *batch,
             *dry_run,
+            *retry_unknown,
         )?;
         let (chunks_with_spans, chunks_unknown, chunks_total, tool_result_share_mean) =
             storage.provenance_coverage()?;
+        let [source_missing, source_unparsed, source_unmatched] =
+            storage.provenance_failure_counts()?;
         let tier_histogram = storage
             .provenance_tier_histogram()?
             .into_iter()
@@ -612,6 +624,9 @@ async fn main() -> Result<()> {
                     "chunks_unknown": chunks_unknown,
                     "chunks_total": chunks_total,
                     "tool_result_share_mean": tool_result_share_mean,
+                    "source_missing": source_missing,
+                    "source_unparsed": source_unparsed,
+                    "source_unmatched": source_unmatched,
                 },
                 "tier_histogram": tier_histogram,
             }))?

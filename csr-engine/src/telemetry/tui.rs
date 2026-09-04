@@ -249,6 +249,12 @@ fn draw_index_panel(f: &mut Frame, area: Rect, t: &Telemetry) {
         t.status.provenance_coverage.chunks_unknown,
     )));
     lines.push(Line::from(format!(
+        "  missing={} unparsed={} unmatched={}",
+        t.status.provenance_coverage.source_missing,
+        t.status.provenance_coverage.source_unparsed,
+        t.status.provenance_coverage.source_unmatched,
+    )));
+    lines.push(Line::from(format!(
         "  tool share  {}",
         t.status
             .provenance_coverage
