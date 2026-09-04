@@ -258,8 +258,11 @@ fn draw_index_panel(f: &mut Frame, area: Rect, t: &Telemetry) {
         src.registry_sessions
     )));
     lines.push(Line::from(format!(
-        "  resolve     {} proposals / {} verdicts",
-        src.resolution_proposals, src.resolution_verdicts
+        "  resolve     {} proposals / {} verdicts ({} agent / {} user-confirmed)",
+        src.resolution_proposals,
+        src.resolution_verdicts,
+        src.resolution_verdicts_agent,
+        src.resolution_verdicts_user_confirmed
     )));
     let total_miss = miss.tasks + miss.plans + miss.history;
     if total_miss > 0 {

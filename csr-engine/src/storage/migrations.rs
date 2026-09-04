@@ -879,10 +879,23 @@ pub fn run(conn: &Connection) -> Result<()> {
             status TEXT NOT NULL CHECK(status IN ('resolved','still_open','regressed')),
             evidence TEXT NOT NULL,
             claim TEXT,
-            source TEXT NOT NULL DEFAULT 'agent',
+            source TEXT NOT NULL DEFAULT 'agent'
+                CHECK(source IN ('agent','user_confirmed')),
             created_at TEXT DEFAULT (datetime('now'))
          );
-         CREATE INDEX IF NOT EXISTS idx_resolution_chunk ON resolution_ledger(chunk_id, id);",
+         CREATE INDEX IF NOT EXISTS idx_resolution_chunk ON resolution_ledger(chunk_id, id);
+         CREATE TRIGGER IF NOT EXISTS resolution_source_insert_guard
+         BEFORE INSERT ON resolution_ledger
+         WHEN NEW.source NOT IN ('agent','user_confirmed')
+         BEGIN
+             SELECT RAISE(ABORT, 'invalid resolution source');
+         END;
+         CREATE TRIGGER IF NOT EXISTS resolution_source_immutable_guard
+         BEFORE UPDATE OF source ON resolution_ledger
+         WHEN NEW.source <> OLD.source
+         BEGIN
+             SELECT RAISE(ABORT, 'resolution source is immutable');
+         END;",
     )?;
 
     // v9.4 multi-source corpus: session registry (history.jsonl spine — never embedded,
@@ -2502,6 +2515,52 @@ mod tests {
             .is_ok(),
             "resolution_ledger table must exist after migration"
         );
+    }
+
+    #[test]
+    fn resolution_source_guard_preserves_legacy_agent_rows_without_upgrading_them() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE resolution_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chunk_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('resolved','still_open','regressed')),
+                evidence TEXT NOT NULL,
+                claim TEXT,
+                source TEXT NOT NULL DEFAULT 'agent',
+                created_at TEXT DEFAULT (datetime('now'))
+             );
+             INSERT INTO resolution_ledger
+                (chunk_id, status, evidence, claim, source)
+             VALUES ('legacy', 'resolved', 'old evidence', 'old claim', 'agent');",
+        )
+        .unwrap();
+        let legacy_id = conn.last_insert_rowid();
+
+        run(&conn).expect("migrate legacy ledger");
+
+        let legacy: (i64, String) = conn
+            .query_row(
+                "SELECT id, source FROM resolution_ledger WHERE chunk_id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (legacy_id, "agent".to_string()));
+        assert!(conn
+            .execute(
+                "UPDATE resolution_ledger SET source = 'user_confirmed' WHERE id = ?1",
+                [legacy_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO resolution_ledger
+                    (chunk_id, status, evidence, source)
+                 VALUES ('bad', 'resolved', 'bad source', 'journal_ui')",
+                [],
+            )
+            .is_err());
     }
 
     #[test]

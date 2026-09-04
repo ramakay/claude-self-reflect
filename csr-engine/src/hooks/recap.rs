@@ -20,6 +20,7 @@ pub struct SettledFact {
     pub claim: String,
     pub receipt: String,
     pub status: String,
+    pub source: String,
 }
 
 /// The one dream clause the recap may carry (Journal v4 P5, delivery channel
@@ -146,6 +147,7 @@ pub fn compose_recap_with_deliveries(
         .settled
         .iter()
         .filter(|fact| fact.status == "resolved")
+        .filter(|fact| fact.source == "user_confirmed")
         .filter(|fact| !normalize_feed_text(&fact.receipt).is_empty())
         .take(3)
         .map(format_fact)
@@ -165,9 +167,10 @@ pub fn compose_recap_with_deliveries(
         feeds
             .still_open
             .iter()
-            .take(STILL_OPEN_LIMIT)
             .filter(|fact| fact.status != "resolved")
+            .filter(|fact| fact.source == "user_confirmed")
             .filter(|fact| !normalize_feed_text(&fact.receipt).is_empty())
+            .take(STILL_OPEN_LIMIT)
             .map(format_fact),
     );
     if feeds.open_proposals > 0 {
@@ -628,17 +631,20 @@ mod tests {
                     claim: "schema is stable".into(),
                     receipt: "810283b".into(),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 },
                 SettledFact {
                     claim: "queries are indexed".into(),
                     receipt: "T2 2026-07-27".into(),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 },
             ],
             still_open: vec![SettledFact {
                 claim: "Windows path behavior".into(),
                 receipt: "91abcde".into(),
                 status: "still_open".into(),
+                source: "user_confirmed".into(),
             }],
             retired_while_away: vec![RetiredLine {
                 label: "old schema assumption".into(),
@@ -765,11 +771,13 @@ mod tests {
                     claim: "unreceipted".into(),
                     receipt: "".into(),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 },
                 SettledFact {
                     claim: "receipted".into(),
                     receipt: "abc1234".into(),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 },
             ],
             ..RecapFeeds::empty()
@@ -787,11 +795,13 @@ mod tests {
                     claim: "actually resolved".into(),
                     receipt: "abc1234".into(),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 },
                 SettledFact {
                     claim: "still open in settled feed".into(),
                     receipt: "def5678".into(),
                     status: "still_open".into(),
+                    source: "user_confirmed".into(),
                 },
             ],
             still_open: vec![
@@ -799,11 +809,13 @@ mod tests {
                     claim: "actually open".into(),
                     receipt: "fed4321".into(),
                     status: "regressed".into(),
+                    source: "user_confirmed".into(),
                 },
                 SettledFact {
                     claim: "resolved in open feed".into(),
                     receipt: "cba8765".into(),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 },
             ],
             ..RecapFeeds::empty()
@@ -817,6 +829,39 @@ mod tests {
     }
 
     #[test]
+    fn agent_resolution_never_renders_as_settled_or_user_open_state() {
+        let feeds = RecapFeeds {
+            settled: vec![SettledFact {
+                claim: "agent claimed completion".into(),
+                receipt: "agent123".into(),
+                status: "resolved".into(),
+                source: "agent".into(),
+            }],
+            still_open: vec![
+                SettledFact {
+                    claim: "agent claimed blocker".into(),
+                    receipt: "agent456".into(),
+                    status: "still_open".into(),
+                    source: "agent".into(),
+                },
+                SettledFact {
+                    claim: "confirmed blocker".into(),
+                    receipt: "user789".into(),
+                    status: "still_open".into(),
+                    source: "user_confirmed".into(),
+                },
+            ],
+            ..RecapFeeds::empty()
+        };
+
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        assert!(!got.contains("Settled:"));
+        assert!(!got.contains("agent claimed completion"));
+        assert!(!got.contains("agent claimed blocker"));
+        assert!(got.contains("confirmed blocker"));
+    }
+
+    #[test]
     fn bounds_still_open_facts_to_shared_query_limit() {
         let feeds = RecapFeeds {
             still_open: (0..=STILL_OPEN_LIMIT)
@@ -824,6 +869,7 @@ mod tests {
                     claim: format!("open fact {index}"),
                     receipt: format!("oid{index:04}"),
                     status: "still_open".into(),
+                    source: "user_confirmed".into(),
                 })
                 .collect(),
             ..RecapFeeds::empty()
@@ -864,6 +910,7 @@ mod tests {
                 claim: "done".into(),
                 receipt: "abc1234".into(),
                 status: "resolved".into(),
+                source: "user_confirmed".into(),
             }],
             ..RecapFeeds::empty()
         };
@@ -894,6 +941,7 @@ mod tests {
                     claim: format!("{}-{n}", "settled".repeat(30)),
                     receipt: format!("receipt{n}"),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 })
                 .collect(),
             still_open: (0..4)
@@ -901,6 +949,7 @@ mod tests {
                     claim: format!("{}-{n}", "open".repeat(30)),
                     receipt: format!("openoid{n}"),
                     status: "still_open".into(),
+                    source: "user_confirmed".into(),
                 })
                 .collect(),
             retired_while_away: vec![RetiredLine {
@@ -929,6 +978,7 @@ mod tests {
                 claim: "CSR CONTINUUM retained evidence".into(),
                 receipt: "abc1234".into(),
                 status: "resolved".into(),
+                source: "user_confirmed".into(),
             }],
             ..RecapFeeds::empty()
         };
@@ -1002,6 +1052,7 @@ mod tests {
                     claim: format!("{}-{n}", "settled evidence ".repeat(10)),
                     receipt: format!("settled{n}"),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 })
                 .collect(),
             still_open: (0..4)
@@ -1009,6 +1060,7 @@ mod tests {
                     claim: format!("{}-{n}", "open evidence ".repeat(10)),
                     receipt: format!("openoid{n}"),
                     status: "still_open".into(),
+                    source: "user_confirmed".into(),
                 })
                 .collect(),
             retired_while_away: vec![RetiredLine {
@@ -1036,6 +1088,7 @@ mod tests {
                 claim: "CSR CONTINUUM\nretained\tevidence".into(),
                 receipt: "abc\n1234".into(),
                 status: "resolved".into(),
+                source: "user_confirmed".into(),
             }],
             retired_while_away: vec![RetiredLine {
                 label: "old\nline".into(),
@@ -1195,6 +1248,7 @@ mod tests {
                 claim: "s".repeat(393),
                 receipt: "abc1234".into(),
                 status: "resolved".into(),
+                source: "user_confirmed".into(),
             }],
             corrections: vec![CorrectionLine {
                 quote: "q".repeat(90),
@@ -1222,6 +1276,7 @@ mod tests {
                 claim: "s".repeat(393),
                 receipt: "abc1234".into(),
                 status: "resolved".into(),
+                source: "user_confirmed".into(),
             }],
             corrections: vec![CorrectionLine {
                 quote: "q".repeat(90),
@@ -1290,6 +1345,7 @@ mod tests {
                     claim: format!("{}-{n}", "settled".repeat(30)),
                     receipt: format!("receipt{n}"),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 })
                 .collect(),
             top_dream: Some(dream()),

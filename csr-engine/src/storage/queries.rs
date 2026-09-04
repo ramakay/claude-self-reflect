@@ -2751,12 +2751,16 @@ pub fn list_session_ids(conn: &Connection, prefix: &str, limit: usize) -> Result
 
 // ─── Resolution ledger ───
 
+pub const RESOLUTION_SOURCE_AGENT: &str = "agent";
+pub const RESOLUTION_SOURCE_USER_CONFIRMED: &str = "user_confirmed";
+
 /// Latest explicit verdict for a chunk (or reflection) id.
 #[derive(Debug, Clone)]
 pub struct ResolutionEntry {
     pub status: String,
     pub evidence: String,
     pub claim: Option<String>,
+    pub source: String,
     pub created_at: String,
 }
 
@@ -2772,6 +2776,15 @@ pub fn insert_resolutions(
 ) -> Result<usize> {
     if chunk_ids.is_empty() {
         return Ok(0);
+    }
+    if !matches!(
+        source,
+        RESOLUTION_SOURCE_AGENT | RESOLUTION_SOURCE_USER_CONFIRMED
+    ) {
+        anyhow::bail!(
+            "invalid resolution source '{}': must be agent or user_confirmed",
+            source
+        );
     }
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -2789,8 +2802,9 @@ pub fn insert_resolutions(
     Ok(chunk_ids.len())
 }
 
-/// Batch-fetch the latest resolution entry per chunk_id (highest `id` wins).
-/// Chunk ids with no ledger rows are absent from the returned map.
+/// Batch-fetch the latest user-confirmed resolution entry per chunk id.
+/// Agent observations remain in the append-only audit ledger but are not
+/// authoritative search state and are absent from the returned map.
 pub fn get_resolutions_batch(
     conn: &Connection,
     chunk_ids: &[String],
@@ -2803,8 +2817,11 @@ pub fn get_resolutions_batch(
     let sql = format!(
         "SELECT chunk_id, status, evidence, claim, source, created_at
          FROM resolution_ledger
-         WHERE id IN (
-             SELECT MAX(id) FROM resolution_ledger WHERE chunk_id IN ({}) GROUP BY chunk_id
+         WHERE source = 'user_confirmed'
+           AND id IN (
+             SELECT MAX(id) FROM resolution_ledger
+             WHERE chunk_id IN ({}) AND source = 'user_confirmed'
+             GROUP BY chunk_id
          )",
         placeholders.join(", ")
     );
@@ -2821,6 +2838,7 @@ pub fn get_resolutions_batch(
                 status: row.get(1)?,
                 evidence: row.get(2)?,
                 claim: row.get(3)?,
+                source: row.get(4)?,
                 created_at: row.get(5)?,
             },
         ))

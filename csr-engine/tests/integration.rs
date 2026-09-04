@@ -745,7 +745,7 @@ fn test_resolve_and_annotate() {
             "resolved",
             "shipped and verified",
             None,
-            "agent",
+            "user_confirmed",
         )
         .unwrap();
 
@@ -815,6 +815,7 @@ fn test_resolve_chunks_invalid_status_errors() {
         "bogus".to_string(),
         "some evidence".to_string(),
         None,
+        "agent",
     ));
     assert!(result.is_err());
 }

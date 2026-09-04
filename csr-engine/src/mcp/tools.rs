@@ -1311,6 +1311,7 @@ pub async fn resolve_chunks(
     status: String,
     evidence: String,
     claim: Option<String>,
+    source: &str,
 ) -> Result<String> {
     if !matches!(status.as_str(), "resolved" | "still_open" | "regressed") {
         anyhow::bail!(
@@ -1325,10 +1326,12 @@ pub async fn resolve_chunks(
         anyhow::bail!("evidence must not be empty");
     }
 
-    let n =
-        storage.insert_resolutions(&chunk_ids, &status, &evidence, claim.as_deref(), "agent")?;
+    let n = storage.insert_resolutions(&chunk_ids, &status, &evidence, claim.as_deref(), source)?;
 
-    Ok(format!("recorded {} verdict(s): {}", n, status))
+    Ok(format!(
+        "recorded {} verdict(s): {} (source: {})",
+        n, status, source
+    ))
 }
 
 /// Quick existence check — count + top match only.
@@ -3190,11 +3193,10 @@ fn apply_validity_partition(
     *enriched = kept;
 }
 
-/// Annotate `enriched` results with any recorded resolution ledger verdicts
-/// (batch-fetched from storage) and stable-sink "resolved" entries to the
-/// bottom of the slice, preserving relative order otherwise. `still_open`
-/// and `regressed` verdicts annotate but do not move. Non-fatal: a storage
-/// error here must never fail the calling search.
+/// Annotate `enriched` results with user-confirmed resolution-ledger verdicts
+/// and stable-sink confirmed "resolved" entries to the bottom of the slice,
+/// preserving relative order otherwise. Agent observations never annotate or
+/// move results. Non-fatal: a storage error here must never fail the search.
 pub fn apply_resolutions(enriched: &mut Vec<EnrichedResult>, storage: &Arc<Storage>) {
     if enriched.is_empty() {
         return;
@@ -3210,11 +3212,12 @@ pub fn apply_resolutions(enriched: &mut Vec<EnrichedResult>, storage: &Arc<Stora
 
     for e in enriched.iter_mut() {
         if let Some(entry) = ledger.get(&e.chunk.id) {
-            e.resolution = Some(format::resolution_note(
+            e.resolution = format::resolution_note(
                 &entry.status,
                 &entry.evidence,
                 &entry.created_at,
-            ));
+                &entry.source,
+            );
         }
     }
 
@@ -3223,7 +3226,10 @@ pub fn apply_resolutions(enriched: &mut Vec<EnrichedResult>, storage: &Arc<Stora
     for e in std::mem::take(enriched) {
         let is_resolved = ledger
             .get(&e.chunk.id)
-            .map(|entry| entry.status == "resolved")
+            .map(|entry| {
+                entry.source == crate::storage::queries::RESOLUTION_SOURCE_USER_CONFIRMED
+                    && entry.status == "resolved"
+            })
             .unwrap_or(false);
         if is_resolved {
             resolved.push(e);
@@ -3767,7 +3773,7 @@ mod tests {
                 "resolved",
                 "shipped and verified",
                 None,
-                "agent",
+                "user_confirmed",
             )
             .unwrap();
         let mut enriched = vec![
@@ -3780,6 +3786,44 @@ mod tests {
 
         let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
         assert_eq!(ids, ["unresolved-1", "unresolved-2"]);
+    }
+
+    #[test]
+    fn agent_resolution_neither_annotates_nor_sinks_but_user_confirmed_does() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        storage
+            .insert_resolutions(
+                &["agent".to_string()],
+                "resolved",
+                "agent assertion",
+                None,
+                "agent",
+            )
+            .unwrap();
+        storage
+            .insert_resolutions(
+                &["confirmed".to_string()],
+                "resolved",
+                "user accepted",
+                None,
+                "user_confirmed",
+            )
+            .unwrap();
+        let mut enriched = vec![
+            enriched_result("agent", 0.9, 0),
+            enriched_result("confirmed", 0.8, 1),
+            enriched_result("plain", 0.7, 2),
+        ];
+
+        apply_resolutions(&mut enriched, &storage);
+
+        let ids: Vec<&str> = enriched.iter().map(|item| item.chunk.id.as_str()).collect();
+        assert_eq!(ids, ["agent", "plain", "confirmed"]);
+        assert!(enriched[0].resolution.is_none());
+        assert!(enriched[2]
+            .resolution
+            .as_deref()
+            .is_some_and(|note| note.contains("verified")));
     }
 
     // --- v10 dream-verdict validity partition ---

@@ -485,6 +485,8 @@ pub struct SourceCounts {
     pub task_sessions_on_disk: usize,
     pub resolution_proposals: i64,
     pub resolution_verdicts: i64,
+    pub resolution_verdicts_agent: i64,
+    pub resolution_verdicts_user_confirmed: i64,
 }
 
 #[derive(Serialize, Default, Debug, PartialEq, Eq)]
@@ -1211,6 +1213,9 @@ fn gather_aux(storage: &Storage, projects_dir: &Path) -> AuxStatus {
                 .count()
         })
         .unwrap_or(0);
+    let (resolution_verdicts_agent, resolution_verdicts_user_confirmed) = storage
+        .count_resolution_verdicts_by_source()
+        .unwrap_or((0, 0));
 
     AuxStatus {
         coverage: CoverageStats {
@@ -1228,7 +1233,9 @@ fn gather_aux(storage: &Storage, projects_dir: &Path) -> AuxStatus {
             registry_sessions: seen,
             task_sessions_on_disk,
             resolution_proposals: storage.count_resolution_proposals().unwrap_or(0),
-            resolution_verdicts: storage.count_resolution_verdicts().unwrap_or(0),
+            resolution_verdicts: resolution_verdicts_agent + resolution_verdicts_user_confirmed,
+            resolution_verdicts_agent,
+            resolution_verdicts_user_confirmed,
         },
     }
 }
@@ -1909,6 +1916,36 @@ mod tests {
         assert_eq!(report.aux.coverage, CoverageStats::default());
         assert_eq!(report.aux.file_history_sessions, 0);
         assert_eq!(report.aux.transcripts_unindexed, 0);
+    }
+
+    #[test]
+    fn status_splits_resolution_verdicts_by_source() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .insert_resolutions(&["agent".into()], "resolved", "agent", None, "agent")
+            .unwrap();
+        storage
+            .insert_resolutions(
+                &["confirmed-1".into(), "confirmed-2".into()],
+                "resolved",
+                "confirmed",
+                None,
+                "user_confirmed",
+            )
+            .unwrap();
+
+        let sources = gather_status(&db_path, &projects_dir, false)
+            .unwrap()
+            .aux
+            .sources;
+        assert_eq!(sources.resolution_verdicts, 3);
+        assert_eq!(sources.resolution_verdicts_agent, 1);
+        assert_eq!(sources.resolution_verdicts_user_confirmed, 2);
     }
 
     #[test]

@@ -748,6 +748,20 @@ impl Storage {
         Ok(conn.query_row("SELECT COUNT(*) FROM resolution_ledger", [], |r| r.get(0))?)
     }
 
+    /// Resolution-ledger row counts as `(agent, user_confirmed)`.
+    pub fn count_resolution_verdicts_by_source(&self) -> Result<(i64, i64)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.query_row(
+            "SELECT
+                COALESCE(SUM(source = 'agent'), 0),
+                COALESCE(SUM(source = 'user_confirmed'), 0)
+             FROM resolution_ledger",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(Into::into)
+    }
+
     /// Plan-corpus counts: (docs, chunks, unscoped_docs). Plan chunks are
     /// identified by their `plan:` conversation-id prefix, not `chunks.source`,
     /// matching how every reader distinguishes them.
@@ -1460,7 +1474,7 @@ impl Storage {
         queries::insert_resolutions(&conn, chunk_ids, status, evidence, claim, source)
     }
 
-    /// Batch-fetch latest resolution entries keyed by chunk_id.
+    /// Batch-fetch latest user-confirmed resolution entries keyed by chunk id.
     pub fn get_resolutions_batch(
         &self,
         chunk_ids: &[String],
@@ -2298,7 +2312,7 @@ mod tests {
                 "resolved",
                 "test evidence",
                 None,
-                "agent",
+                "user_confirmed",
             )
             .unwrap();
         assert_eq!(n, 2);
@@ -2313,16 +2327,95 @@ mod tests {
     }
 
     #[test]
+    fn agent_resolution_is_not_authoritative_but_user_confirmation_is() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .insert_resolutions(
+                &["agent-only".to_string()],
+                "resolved",
+                "agent assertion",
+                None,
+                "agent",
+            )
+            .unwrap();
+        storage
+            .insert_resolutions(
+                &["confirmed".to_string()],
+                "resolved",
+                "user accepted exact payload",
+                None,
+                "user_confirmed",
+            )
+            .unwrap();
+        storage
+            .insert_resolutions(
+                &["confirmed".to_string()],
+                "regressed",
+                "later agent assertion",
+                None,
+                "agent",
+            )
+            .unwrap();
+
+        let map = storage
+            .get_resolutions_batch(&["agent-only".to_string(), "confirmed".to_string()])
+            .unwrap();
+        assert!(!map.contains_key("agent-only"));
+        assert_eq!(map.get("confirmed").unwrap().source, "user_confirmed");
+        assert_eq!(map.get("confirmed").unwrap().status, "resolved");
+    }
+
+    #[test]
+    fn resolution_verdict_counts_are_split_by_source() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .insert_resolutions(&["a".to_string()], "resolved", "a", None, "agent")
+            .unwrap();
+        storage
+            .insert_resolutions(
+                &["b".to_string(), "c".to_string()],
+                "still_open",
+                "confirmed",
+                None,
+                "user_confirmed",
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage.count_resolution_verdicts_by_source().unwrap(),
+            (1, 2)
+        );
+    }
+
+    #[test]
     fn resolution_ledger_latest_wins() {
         let storage = Storage::open_memory().unwrap();
         storage
-            .insert_resolutions(&["c1".to_string()], "resolved", "first", None, "agent")
+            .insert_resolutions(
+                &["c1".to_string()],
+                "resolved",
+                "first",
+                None,
+                "user_confirmed",
+            )
             .unwrap();
         storage
-            .insert_resolutions(&["c1".to_string()], "regressed", "later", None, "agent")
+            .insert_resolutions(
+                &["c1".to_string()],
+                "regressed",
+                "later",
+                None,
+                "user_confirmed",
+            )
             .unwrap();
         storage
-            .insert_resolutions(&["c2".to_string()], "resolved", "ok", None, "agent")
+            .insert_resolutions(
+                &["c2".to_string()],
+                "resolved",
+                "ok",
+                None,
+                "user_confirmed",
+            )
             .unwrap();
 
         let map = storage
@@ -2336,7 +2429,13 @@ mod tests {
     fn resolution_ledger_unknown_id_absent() {
         let storage = Storage::open_memory().unwrap();
         storage
-            .insert_resolutions(&["c1".to_string()], "resolved", "evidence", None, "agent")
+            .insert_resolutions(
+                &["c1".to_string()],
+                "resolved",
+                "evidence",
+                None,
+                "user_confirmed",
+            )
             .unwrap();
 
         let map = storage

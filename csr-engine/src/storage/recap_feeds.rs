@@ -125,8 +125,9 @@ impl Storage {
         Ok(recorded)
     }
 
-    /// Resolution ledger evidence for the previous conversation and current
-    /// project. The highest ledger id is the current verdict for a chunk.
+    /// User-confirmed resolution evidence for the previous conversation and
+    /// current project. The highest confirmed ledger id is current; agent
+    /// observations are suppressed under the recap's abstention-first policy.
     pub fn recap_ledger_feeds(
         &self,
         project: &str,
@@ -143,31 +144,35 @@ impl Storage {
         // via chunk_provenance.source_conv_id — the second UNION arm credits
         // them through idx_chunk_provenance_source_conv (no scans either way).
         let mut settled_statement = conn.prepare(
-            "SELECT claim, evidence, status FROM (
+            "SELECT claim, evidence, status, source FROM (
                  SELECT COALESCE(r.claim, '') AS claim, r.evidence AS evidence,
-                        r.status AS status, r.id AS rid
+                        r.status AS status, r.source AS source, r.id AS rid
                  FROM chunks c INDEXED BY idx_chunks_conversation
                  JOIN resolution_ledger r ON r.chunk_id = c.id
                  WHERE c.conversation_id = ?1
                    AND c.project_name = ?2
                    AND r.status = 'resolved'
+                   AND r.source = 'user_confirmed'
                    AND r.id = (
                        SELECT MAX(latest.id)
                        FROM resolution_ledger latest
                        WHERE latest.chunk_id = r.chunk_id
+                         AND latest.source = 'user_confirmed'
                    )
                  UNION
-                 SELECT COALESCE(r.claim, ''), r.evidence, r.status, r.id
+                 SELECT COALESCE(r.claim, ''), r.evidence, r.status, r.source, r.id
                  FROM chunk_provenance p INDEXED BY idx_chunk_provenance_source_conv
                  JOIN chunks c ON c.id = p.chunk_id
                  JOIN resolution_ledger r ON r.chunk_id = c.id
                  WHERE p.source_conv_id = ?1
                    AND c.project_name = ?2
                    AND r.status = 'resolved'
+                   AND r.source = 'user_confirmed'
                    AND r.id = (
                        SELECT MAX(latest.id)
                        FROM resolution_ledger latest
                        WHERE latest.chunk_id = r.chunk_id
+                         AND latest.source = 'user_confirmed'
                    )
              )
              ORDER BY rid DESC
@@ -181,15 +186,17 @@ impl Storage {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut open_statement = conn.prepare(
-            "SELECT COALESCE(r.claim, ''), r.evidence, r.status
+            "SELECT COALESCE(r.claim, ''), r.evidence, r.status, r.source
              FROM resolution_ledger r INDEXED BY idx_resolution_open_recent
              JOIN chunks c ON c.id = r.chunk_id
              WHERE r.status IN ('still_open', 'regressed')
+               AND r.source = 'user_confirmed'
                AND c.project_name = ?1
                AND NOT EXISTS (
                    SELECT 1
                    FROM resolution_ledger latest
                    WHERE latest.chunk_id = r.chunk_id
+                     AND latest.source = 'user_confirmed'
                      AND latest.id > r.id
                )
              ORDER BY r.id DESC
@@ -345,6 +352,7 @@ impl Storage {
                    SELECT 1
                    FROM resolution_ledger r
                    WHERE r.chunk_id = p.chunk_id
+                     AND r.source = 'user_confirmed'
                      AND julianday(r.created_at) > julianday(p.created_at)
                )",
             [project],
@@ -360,6 +368,7 @@ fn settled_fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SettledFac
         claim: row.get(0)?,
         receipt: shorten_receipt(&evidence),
         status: row.get(2)?,
+        source: row.get(3)?,
     })
 }
 
@@ -482,8 +491,9 @@ mod tests {
             .with_connection(|conn| {
                 conn.execute(
                     "INSERT INTO resolution_ledger
-                        (chunk_id, status, evidence, claim, created_at)
-                     VALUES (?1, ?2, ?3, ?4, '2026-08-02T00:00:00Z')",
+                        (chunk_id, status, evidence, claim, source, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'user_confirmed',
+                             '2026-08-02T00:00:00Z')",
                     rusqlite::params![chunk_id, status, evidence, claim],
                 )?;
                 Ok(())
@@ -605,6 +615,47 @@ mod tests {
         assert_eq!(still_open.len(), 1);
         assert_eq!(still_open[0].claim, "open claim");
         assert_eq!(still_open[0].status, "regressed");
+    }
+
+    #[test]
+    fn recap_suppresses_agent_rows_and_carries_user_confirmed_source() {
+        let storage = Storage::open_memory().unwrap();
+        seed_chunk(&storage, "agent-settled", "current", "alpha");
+        seed_chunk(&storage, "agent-open", "older", "alpha");
+        seed_chunk(&storage, "confirmed", "current", "alpha");
+        storage
+            .with_connection(|conn| {
+                for (chunk_id, status, source) in [
+                    ("agent-settled", "resolved", "agent"),
+                    ("agent-open", "still_open", "agent"),
+                    ("confirmed", "resolved", "user_confirmed"),
+                ] {
+                    conn.execute(
+                        "INSERT INTO resolution_ledger
+                            (chunk_id, status, evidence, claim, source, created_at)
+                         VALUES (?1, ?2, 'receipt abcdef1', ?1, ?3,
+                                 '2026-08-02T00:00:00Z')",
+                        rusqlite::params![chunk_id, status, source],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .insert_resolutions(
+                &["confirmed".to_string()],
+                "regressed",
+                "later agent assertion",
+                Some("confirmed"),
+                "agent",
+            )
+            .unwrap();
+
+        let (settled, still_open) = storage.recap_ledger_feeds("alpha", "current").unwrap();
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].claim, "confirmed");
+        assert_eq!(settled[0].source, "user_confirmed");
+        assert!(still_open.is_empty());
     }
 
     #[test]
@@ -996,8 +1047,26 @@ mod tests {
             .with_connection(|conn| {
                 conn.execute(
                     "INSERT INTO resolution_ledger
-                        (chunk_id, status, evidence, claim, created_at)
-                     VALUES ('proposal', 'resolved', 'promoted', 'claim',
+                        (chunk_id, status, evidence, claim, source, created_at)
+                     VALUES ('proposal', 'resolved', 'agent assertion', 'claim', 'agent',
+                             '2026-08-02T12:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            storage.recap_open_proposals("alpha").unwrap(),
+            1,
+            "an agent observation must not promote or hide a proposal"
+        );
+
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO resolution_ledger
+                        (chunk_id, status, evidence, claim, source, created_at)
+                     VALUES ('proposal', 'resolved', 'promoted', 'claim', 'user_confirmed',
                              '2026-08-03T00:00:00Z')",
                     [],
                 )?;
@@ -1040,10 +1109,12 @@ mod tests {
                          FROM resolution_ledger r INDEXED BY idx_resolution_open_recent
                          JOIN chunks c ON c.id = r.chunk_id
                          WHERE r.status IN ('still_open', 'regressed')
+                           AND r.source = 'user_confirmed'
                            AND c.project_name = ?1
                            AND NOT EXISTS (
                                SELECT 1 FROM resolution_ledger latest
                                WHERE latest.chunk_id = r.chunk_id
+                                 AND latest.source = 'user_confirmed'
                                  AND latest.id > r.id
                            )
                          ORDER BY r.id DESC
@@ -1065,6 +1136,7 @@ mod tests {
                            AND NOT EXISTS (
                                SELECT 1 FROM resolution_ledger r
                                WHERE r.chunk_id = p.chunk_id
+                                 AND r.source = 'user_confirmed'
                                  AND julianday(r.created_at) > julianday(p.created_at)
                            )",
                     )?

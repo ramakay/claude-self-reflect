@@ -1027,7 +1027,7 @@ mod tests {
             storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
             if let Some(s) = status {
                 storage
-                    .insert_resolutions(&[id.to_string()], s, "seed", None, "agent")
+                    .insert_resolutions(&[id.to_string()], s, "seed", None, "user_confirmed")
                     .unwrap();
             }
         };

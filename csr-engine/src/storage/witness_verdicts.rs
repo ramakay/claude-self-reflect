@@ -1023,6 +1023,7 @@ pub fn open_proposal_claim_for_symbol(
            AND NOT EXISTS (
                SELECT 1 FROM resolution_ledger r
                WHERE r.chunk_id = p.chunk_id
+                 AND r.source = 'user_confirmed'
                  AND julianday(r.created_at) > julianday(p.created_at)
            )
          ORDER BY p.id DESC LIMIT 1",
@@ -1069,6 +1070,7 @@ pub fn day_digest(conn: &Connection, day: &str) -> Result<DayDigest> {
            AND NOT EXISTS (
                SELECT 1 FROM resolution_ledger r
                WHERE r.chunk_id = p.chunk_id
+                 AND r.source = 'user_confirmed'
                  AND julianday(r.created_at) > julianday(p.created_at)
            )",
         params![day],
@@ -1824,8 +1826,10 @@ mod tests {
             Some("foo looks resolved")
         );
         conn.execute(
-            "INSERT INTO resolution_ledger (chunk_id, status, evidence, claim, created_at)
-             VALUES ('chunk-1', 'resolved', 'promoted', 'foo looks resolved', '2026-01-03 00:00:00')",
+            "INSERT INTO resolution_ledger
+                (chunk_id, status, evidence, claim, source, created_at)
+             VALUES ('chunk-1', 'resolved', 'promoted', 'foo looks resolved',
+                     'user_confirmed', '2026-01-03 00:00:00')",
             [],
         )
         .unwrap();

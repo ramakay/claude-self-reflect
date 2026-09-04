@@ -2130,7 +2130,7 @@ mod tests {
                 "resolved",
                 "verified at abcdef123456",
                 Some("seeded fact"),
-                "agent",
+                "user_confirmed",
             )
             .unwrap();
         storage

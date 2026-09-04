@@ -50,8 +50,14 @@ pub mod text {
             src.registry_sessions,
         );
         println!(
-            "          proposals={} verdicts={}  schema_miss: tasks={} plans={} history={}",
-            src.resolution_proposals, src.resolution_verdicts, miss.tasks, miss.plans, miss.history,
+            "          proposals={} verdicts={} (agent={} user_confirmed={})  schema_miss: tasks={} plans={} history={}",
+            src.resolution_proposals,
+            src.resolution_verdicts,
+            src.resolution_verdicts_agent,
+            src.resolution_verdicts_user_confirmed,
+            miss.tasks,
+            miss.plans,
+            miss.history,
         );
         println!();
 

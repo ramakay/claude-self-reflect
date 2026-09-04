@@ -775,7 +775,7 @@ impl DreamFeed for StorageDreamFeed {
                     status,
                     &evidence,
                     Some(&item.item),
-                    JOURNAL_ORIGIN,
+                    queries::RESOLUTION_SOURCE_USER_CONFIRMED,
                 )?;
                 ensure_journal_audit(conn)?;
                 conn.execute(
@@ -2569,6 +2569,7 @@ mod tests {
                 action.status().to_string(),
                 "parity probe".to_string(),
                 None,
+                queries::RESOLUTION_SOURCE_AGENT,
             )
             .await
             .unwrap_or_else(|e| panic!("csr_resolve rejects {}: {e}", action.status()));
@@ -2597,8 +2598,8 @@ mod tests {
     }
 
     /// The production write path, end to end, against a real database: the
-    /// verdict lands in `resolution_ledger` tagged `journal_ui`, and an audit
-    /// row records the same write.
+    /// verdict lands in `resolution_ledger` as `user_confirmed`, while the
+    /// separate audit row retains the concrete `journal_ui` interaction.
     #[test]
     fn the_storage_feed_writes_a_journal_ui_verdict_and_an_audit_row() {
         let storage = Arc::new(Storage::open_memory().expect("memory storage"));
@@ -2634,7 +2635,7 @@ mod tests {
             })
             .expect("ledger row");
         assert_eq!(status, "still_open");
-        assert_eq!(source, JOURNAL_ORIGIN);
+        assert_eq!(source, queries::RESOLUTION_SOURCE_USER_CONFIRMED);
         assert!(evidence.contains("not actionable"));
 
         let (action, origin, chunks): (String, String, i64) = storage

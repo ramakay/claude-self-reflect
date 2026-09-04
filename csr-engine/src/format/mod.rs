@@ -857,18 +857,26 @@ pub fn age_stamp(timestamp: &str) -> String {
 /// `created_at` is an RFC3339 timestamp; only the date portion (first 10
 /// chars, `YYYY-MM-DD`) is shown — falls back to the full string if shorter
 /// than 10 chars.
-pub fn resolution_note(entry_status: &str, evidence: &str, created_at: &str) -> String {
+pub fn resolution_note(
+    entry_status: &str,
+    evidence: &str,
+    created_at: &str,
+    source: &str,
+) -> Option<String> {
+    if source != crate::storage::queries::RESOLUTION_SOURCE_USER_CONFIRMED {
+        return None;
+    }
     let date = if created_at.len() >= 10 {
         &created_at[..10]
     } else {
         created_at
     };
-    match entry_status {
+    Some(match entry_status {
         "resolved" => format!("resolved — {} (verified {})", evidence, date),
         "still_open" => format!("still open — verified {}", date),
         "regressed" => format!("regressed — {} ({})", evidence, date),
         other => format!("{} — {} ({})", other, evidence, date),
-    }
+    })
 }
 
 // ─── v9.4 code property graph formatters ───
@@ -1239,7 +1247,13 @@ mod tests {
 
     #[test]
     fn resolution_note_formats_resolved() {
-        let note = resolution_note("resolved", "shipped commit abc123", "2026-07-20T10:00:00Z");
+        let note = resolution_note(
+            "resolved",
+            "shipped commit abc123",
+            "2026-07-20T10:00:00Z",
+            "user_confirmed",
+        )
+        .unwrap();
         assert!(note.starts_with("resolved —"), "got: {note}");
         assert!(note.contains("shipped commit abc123"));
         assert!(note.contains("2026-07-20"));
@@ -1247,17 +1261,42 @@ mod tests {
 
     #[test]
     fn resolution_note_formats_still_open() {
-        let note = resolution_note("still_open", "unused evidence", "2026-07-20T10:00:00Z");
+        let note = resolution_note(
+            "still_open",
+            "unused evidence",
+            "2026-07-20T10:00:00Z",
+            "user_confirmed",
+        )
+        .unwrap();
         assert!(note.starts_with("still open —"), "got: {note}");
         assert!(note.contains("2026-07-20"));
     }
 
     #[test]
     fn resolution_note_formats_regressed() {
-        let note = resolution_note("regressed", "broke again in v9.4", "2026-07-20T10:00:00Z");
+        let note = resolution_note(
+            "regressed",
+            "broke again in v9.4",
+            "2026-07-20T10:00:00Z",
+            "user_confirmed",
+        )
+        .unwrap();
         assert!(note.starts_with("regressed —"), "got: {note}");
         assert!(note.contains("broke again in v9.4"));
         assert!(note.contains("2026-07-20"));
+    }
+
+    #[test]
+    fn agent_resolution_never_receives_verified_annotation() {
+        assert_eq!(
+            resolution_note(
+                "resolved",
+                "agent assertion",
+                "2026-07-20T10:00:00Z",
+                "agent",
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1272,11 +1311,12 @@ mod tests {
             EnrichedResult {
                 score: 0.8,
                 chunk: make_chunk("id-resolved", "conv-1", "resolved item"),
-                resolution: Some(resolution_note(
+                resolution: resolution_note(
                     "resolved",
                     "verified in prod",
                     "2026-07-20T10:00:00Z",
-                )),
+                    "user_confirmed",
+                ),
                 validity_demoted: false,
             },
         ];

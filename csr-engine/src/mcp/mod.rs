@@ -780,7 +780,7 @@ impl CsrServer {
 
     #[tool(
         name = "csr_resolve",
-        description = "Record an explicit verdict (resolved/still_open/regressed) about chunks surfaced in search results, verified against the repo or real world. Future searches annotate these chunks and demote resolved ones within the page. Verdict applies to the WHOLE chunk — for multi-claim chunks resolve only when all claims are addressed, otherwise use still_open. Append-only: a regressed verdict re-opens a resolved chunk.",
+        description = "Request and record an explicit verdict (resolved/still_open/regressed) about chunks surfaced in search results, verified against the repo or real world. Only an exact user-confirmed elicitation payload affects future search annotations, ranking, or Settled recap state; all other outcomes remain non-authoritative agent observations. Verdict applies to the WHOLE chunk — for multi-claim chunks resolve only when all claims are addressed, otherwise use still_open. Append-only: a user-confirmed regressed verdict re-opens a resolved chunk.",
         annotations(
             title = "Record Resolution Verdict",
             read_only_hint = false,
@@ -791,11 +791,27 @@ impl CsrServer {
     async fn resolve(
         &self,
         params: Parameters<ResolveParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
 
-        let result =
-            tools::resolve_chunks(&self.storage, p.chunk_ids, p.status, p.evidence, p.claim).await;
+        let payload = elicitation::ResolutionConfirmationPayload::new(
+            &p.chunk_ids,
+            &p.status,
+            p.claim.as_deref(),
+            &p.evidence,
+        );
+        let source = elicitation::request_resolution_confirmation(&payload, &context).await;
+
+        let result = tools::resolve_chunks(
+            &self.storage,
+            p.chunk_ids,
+            p.status,
+            p.evidence,
+            p.claim,
+            source,
+        )
+        .await;
 
         tool_result(result)
     }
