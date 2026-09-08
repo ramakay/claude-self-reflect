@@ -1761,3 +1761,87 @@ fn test_episode_struct_serialization() {
     assert_eq!(roundtrip.session_id, "integration-test-123");
     assert_eq!(roundtrip.tools_used.len(), 2);
 }
+
+// ─── No-op hook inputs skip Engine::new entirely (Stage 4) ───
+//
+// These spawn the real `csr-engine` binary so the assertion covers the
+// actual CLI entry point (src/main.rs), not just the `hook_is_noop` helper
+// in isolation. A nonexistent `--db-path` parent directory is the signal:
+// `Engine::new` (via `Storage::open`) requires the directory to already
+// exist, and main.rs only calls `create_dir_all` on the path that reaches
+// `Engine::new` — so if the DB file/dir show up, the engine ran.
+
+fn csr_engine_bin() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_csr-engine"))
+}
+
+/// Runs `csr-engine --db-path <db_path> --projects-dir <projects_dir> hook
+/// post-tool-use` with `stdin_json` piped to stdin, and returns whether the
+/// process exited successfully.
+fn run_post_tool_use_hook(
+    db_path: &std::path::Path,
+    projects_dir: &std::path::Path,
+    stdin_json: &str,
+) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(csr_engine_bin())
+        .args(["--db-path"])
+        .arg(db_path)
+        .args(["--projects-dir"])
+        .arg(projects_dir)
+        .args(["hook", "post-tool-use"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn csr-engine binary");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin_json.as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().expect("csr-engine did not exit");
+    output.status.success()
+}
+
+#[test]
+fn post_tool_use_noop_tool_never_creates_the_db() {
+    let tmp = TempDir::new().unwrap();
+    // Nested, nonexistent parent — only the code path that reaches
+    // `Engine::new` would create it.
+    let db_path = tmp.path().join("nested").join("does-not-exist.db");
+    let projects_dir = tmp.path().join("projects");
+
+    let ok = run_post_tool_use_hook(&db_path, &projects_dir, r#"{"tool_name":"Read"}"#);
+
+    assert!(ok, "hook post-tool-use for a Read tool should exit 0");
+    assert!(
+        !db_path.exists(),
+        "Read is not in post_tool_use's acted-on set — Engine::new (and the DB file it creates) \
+         must never run for it"
+    );
+    assert!(
+        !db_path.parent().unwrap().exists(),
+        "main.rs's create_dir_all(parent) must be skipped along with Engine::new"
+    );
+}
+
+#[test]
+fn post_tool_use_acted_on_tool_still_runs_the_full_path() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("nested").join("csr-engine.db");
+    let projects_dir = tmp.path().join("projects");
+
+    let ok = run_post_tool_use_hook(&db_path, &projects_dir, r#"{"tool_name":"Edit"}"#);
+
+    assert!(ok, "hook post-tool-use for an Edit tool should exit 0");
+    assert!(
+        db_path.exists(),
+        "Edit is in post_tool_use's acted-on set — Engine::new must run and create the DB file"
+    );
+}

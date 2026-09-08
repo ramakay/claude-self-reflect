@@ -167,7 +167,15 @@ impl Daemon {
             let interval = self.config.extraction_interval_secs;
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
-                extraction_loop(storage, embeddings, search, interval, shutdown).await;
+                extraction_loop(
+                    storage,
+                    embeddings,
+                    search,
+                    interval,
+                    shutdown,
+                    std::time::Duration::ZERO,
+                )
+                .await;
             })
         };
         tracing::info!("extraction loop started (Layer 2)");
@@ -778,13 +786,22 @@ async fn ancestry_refresh_loop(
 }
 
 /// Layer 2 extraction loop: finds conversations needing V3 extraction and processes them.
+///
+/// `initial_delay` is waited out once, before the first tick — used by the
+/// MCP-server path (`spawn_enrichment_loops`) so an idle `csr-engine serve`
+/// doesn't start embedding at t=0. The standalone daemon (`Daemon::run`)
+/// passes `Duration::ZERO`, preserving its existing immediate-start behavior.
 async fn extraction_loop(
     storage: Arc<Storage>,
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
     interval_secs: u64,
     shutdown: Arc<AtomicBool>,
+    initial_delay: std::time::Duration,
 ) {
+    if !initial_delay.is_zero() {
+        tokio::time::sleep(initial_delay).await;
+    }
     loop {
         if shutdown.load(Ordering::SeqCst) {
             tracing::info!("extraction loop: shutdown signal received");
@@ -1405,15 +1422,37 @@ async fn run_consolidation(
     Ok(())
 }
 
+/// Resolve the MCP-server extraction loop's initial delay:
+/// `CSR_ENRICH_INITIAL_DELAY_SECS` if it parses as a non-negative `u64`,
+/// else the default 120s. Junk/unset falls back to the default rather than
+/// erroring — this is read once at server startup and must never fail.
+/// A value of `0` is honored (explicit opt-out of the delay).
+fn resolve_enrich_initial_delay() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 120;
+    let secs = std::env::var("CSR_ENRICH_INITIAL_DELAY_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Spawn enrichment loops as background tokio tasks (for embedding in MCP server).
 /// Returns join handles that can be aborted on shutdown. Does NOT acquire the daemon lockfile
 /// (so the standalone `csr-engine daemon` can still run alongside if needed).
+///
+/// The extraction loop waits `CSR_ENRICH_INITIAL_DELAY_SECS` (default 120s)
+/// before its first tick: this function only runs inside `csr-engine serve`
+/// (src/engine.rs `serve_mcp`), where an MCP session that never calls a tool
+/// would otherwise start embedding at t=0 with no user request behind it.
+/// The standalone `csr-engine daemon` calls `extraction_loop` directly (see
+/// `Daemon::run` above) and keeps its immediate-start behavior.
 pub fn spawn_enrichment_loops(
     storage: Arc<Storage>,
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let shutdown = Arc::new(AtomicBool::new(false));
+    let initial_delay = resolve_enrich_initial_delay();
 
     // Layer 2: V3 extraction (free, runs every 60s — less aggressive than standalone daemon)
     let ext_handle = {
@@ -1422,7 +1461,7 @@ pub fn spawn_enrichment_loops(
         let idx = search.clone();
         let sd = shutdown.clone();
         tokio::spawn(async move {
-            extraction_loop(s, e, idx, 60, sd).await;
+            extraction_loop(s, e, idx, 60, sd, initial_delay).await;
         })
     };
 
@@ -1486,6 +1525,31 @@ mod tests {
         std::env::set_var("CSR_NO_MEMORY_REGISTRY", "0");
         assert!(!memory_registry_disabled());
         std::env::remove_var("CSR_NO_MEMORY_REGISTRY");
+    }
+
+    #[test]
+    fn enrich_initial_delay_env() {
+        // Unique to this module — no shared mutex needed, same rationale as
+        // memory_registry_kill_switch_env above.
+        std::env::remove_var("CSR_ENRICH_INITIAL_DELAY_SECS");
+        assert_eq!(
+            resolve_enrich_initial_delay(),
+            std::time::Duration::from_secs(120)
+        );
+        std::env::set_var("CSR_ENRICH_INITIAL_DELAY_SECS", "5");
+        assert_eq!(
+            resolve_enrich_initial_delay(),
+            std::time::Duration::from_secs(5)
+        );
+        // 0 is a valid, explicit opt-out — must be honored, not treated as unset.
+        std::env::set_var("CSR_ENRICH_INITIAL_DELAY_SECS", "0");
+        assert_eq!(resolve_enrich_initial_delay(), std::time::Duration::ZERO);
+        std::env::set_var("CSR_ENRICH_INITIAL_DELAY_SECS", "not-a-number");
+        assert_eq!(
+            resolve_enrich_initial_delay(),
+            std::time::Duration::from_secs(120)
+        );
+        std::env::remove_var("CSR_ENRICH_INITIAL_DELAY_SECS");
     }
 
     #[test]
