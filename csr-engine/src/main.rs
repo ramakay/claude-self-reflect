@@ -560,8 +560,16 @@ fn default_projects_dir() -> PathBuf {
         .join("projects")
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let workers = csr_engine::runtime::resolve_tokio_workers();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?;
+    runtime.block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -751,6 +759,11 @@ async fn main() -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        // The daemon embeds on its very first extraction tick (no initial
+        // sleep) — warm the model now, synchronously, instead of paying
+        // the load on that first tick with no log line to explain the
+        // stall.
+        eng.embeddings().warm()?;
         let config = csr_engine::daemon::DaemonConfig {
             extraction_interval_secs: 30,
             batch_size_trigger: batch_size,
@@ -1309,6 +1322,13 @@ async fn main() -> Result<()> {
     }
 
     let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+
+    if args.import || args.enrich {
+        // Both paths embed heavily and immediately — warm eagerly instead
+        // of paying the load cost inside the first batch with no log line
+        // to explain it. `--serve`/hooks never hit this branch.
+        eng.embeddings().warm()?;
+    }
 
     if args.import {
         let count = eng.import_conversations(args.limit).await?;

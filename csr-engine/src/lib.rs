@@ -16,6 +16,7 @@ pub mod ledger;
 pub mod mcp;
 pub mod narrative;
 pub mod provenance;
+pub mod runtime;
 pub mod search;
 pub mod setup;
 pub mod status;
