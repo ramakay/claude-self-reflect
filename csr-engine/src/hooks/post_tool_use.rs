@@ -13,10 +13,10 @@ use anyhow::Result;
 use super::HookInput;
 use crate::engine::Engine;
 
-/// Tool names this hook does anything with. Single source of truth for the
-/// gate below AND for the pre-`Engine::new` short-circuit in
-/// `hooks::hook_is_noop` — that check must never drift from this list, so it
-/// calls this function instead of duplicating the tool names.
+/// Tool names whose edits this hook tracks (code evolution + code graph).
+/// The transcript sync above the gate runs for every fire regardless; the
+/// installer's PostToolUse matcher (`Edit|Write|MultiEdit|NotebookEdit`,
+/// see `hooks::install`) is deliberately a superset of this list.
 pub fn is_acted_on_tool(tool_name: Option<&str>) -> bool {
     matches!(tool_name, Some("Edit") | Some("Write") | Some("MultiEdit"))
 }

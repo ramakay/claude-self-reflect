@@ -50,6 +50,10 @@ pub async fn handle(
     // Step 4: Create engine, import conversations
     eprintln!("[4/7] Importing conversations...");
     let eng = Engine::new(db_path, projects_dir)?;
+    // The ONNX model loads lazily everywhere else; setup is the one place a
+    // first-run download belongs in front of the user (with progress) rather
+    // than inside the first MCP tool call or a hook.
+    eng.embeddings().warm()?;
 
     // Count JSONL files for progress
     let total_files = count_total_files(projects_dir);

@@ -27,13 +27,15 @@ pub struct EmbeddingEngine {
 static MODEL_INIT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Resolve the ONNX intra-op thread cap: `CSR_EMBED_THREADS` if it parses
-/// as a positive `usize`, else `min(4, available_parallelism)`. Junk or
-/// unset values fall back to the default rather than erroring — this runs
-/// on the lazy-init path of every hook process and must never fail.
+/// as `1..=runtime::MAX_THREAD_OVERRIDE`, else `min(4, available_parallelism)`.
+/// Junk, zero, or oversized values fall back to the default rather than
+/// erroring — this runs on the lazy-init path of every hook process and must
+/// never fail, and ORT narrows the count to a C int, so an unbounded value
+/// could wrap to zero.
 fn resolve_intra_threads() -> usize {
     if let Ok(raw) = std::env::var("CSR_EMBED_THREADS") {
         if let Ok(n) = raw.trim().parse::<usize>() {
-            if n > 0 {
+            if (1..=crate::runtime::MAX_THREAD_OVERRIDE).contains(&n) {
                 return n;
             }
         }
@@ -233,6 +235,25 @@ mod tests {
                 .unwrap_or(4);
             assert_eq!(resolve_intra_threads(), expected);
         });
+    }
+
+    #[test]
+    fn thread_count_env_excessive_falls_back_to_default() {
+        with_env(Some("4294967296"), || {
+            let expected = std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(4);
+            assert_eq!(resolve_intra_threads(), expected);
+        });
+        with_env(
+            Some(&(crate::runtime::MAX_THREAD_OVERRIDE + 1).to_string()),
+            || {
+                let expected = std::thread::available_parallelism()
+                    .map(|n| n.get().min(4))
+                    .unwrap_or(4);
+                assert_eq!(resolve_intra_threads(), expected);
+            },
+        );
     }
 
     #[test]

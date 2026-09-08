@@ -2586,6 +2586,26 @@ mod tests {
     }
 
     #[test]
+    fn get_reflection_vectors_by_ids_crosses_the_sql_parameter_batch_boundary() {
+        // queries::get_reflection_vectors_by_ids binds at most 500 ids per
+        // statement; 1,001 requested ids force three statements and must
+        // still come back complete and correctly paired.
+        let storage = Storage::open_memory().unwrap();
+        let ids: Vec<String> = (0..1001).map(|i| format!("boundary-refl-{i}")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let mut v = [0.0_f32; 384];
+            v[0] = i as f32;
+            storage.insert_reflection(id, "content", &[], &v).unwrap();
+        }
+        let got = storage.get_reflection_vectors_by_ids(&ids).unwrap();
+        assert_eq!(got.len(), 1001);
+        for (id, vec) in got {
+            let i: usize = id.trim_start_matches("boundary-refl-").parse().unwrap();
+            assert_eq!(vec[0], i as f32, "vector paired with the wrong id");
+        }
+    }
+
+    #[test]
     fn derivation_ledger_roundtrip_and_reuse() {
         use crate::ledger::{CostBucket, LedgerEntry, Scope};
         let storage = Storage::open_memory().unwrap();

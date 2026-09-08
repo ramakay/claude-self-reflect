@@ -928,6 +928,10 @@ async fn run() -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        // Every eval mode embeds on its first step and the quick/full
+        // reports fold embedding errors into failed rows — load the model
+        // up front so a broken model cache still fails the command loudly.
+        eng.embeddings().warm()?;
         if continuity_live {
             let out = csr_engine::eval::continuity::run_continuity_live(
                 eng.storage(),
@@ -1306,25 +1310,13 @@ async fn run() -> Result<()> {
             return Ok(());
         }
 
-        // Parse stdin BEFORE Engine::new. For hook/input combinations
-        // `hook_is_noop` can prove need no engine work (see its doc comment
-        // for exactly which hooks/cases qualify and why), exit here: skip
-        // both the DB directory setup and Engine::new, whose HNSW load is
-        // the ~1.3GB/1s cost this stage exists to avoid paying on a no-op.
-        let noop_t0 = std::time::Instant::now();
-        let input = csr_engine::hooks::read_stdin_json();
-        if csr_engine::hooks::hook_is_noop(name, &input) {
-            csr_engine::hooks::log_noop_skip(name, noop_t0.elapsed());
-            return Ok(());
-        }
-
         // Other hooks need the engine
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-        csr_engine::hooks::dispatch_hook(name, &eng, input).await?;
+        csr_engine::hooks::dispatch_hook(name, &eng).await?;
         return Ok(());
     }
 
