@@ -883,6 +883,11 @@ impl Storage {
         queries::get_chunk_vectors_by_ids(&conn, ids)
     }
 
+    pub fn get_reflection_vectors_by_ids(&self, ids: &[String]) -> Result<Vec<(String, Vec<f32>)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_reflection_vectors_by_ids(&conn, ids)
+    }
+
     pub fn files_for_session(&self, session_id: &str, limit: usize) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::files_for_session(&conn, session_id, limit)
@@ -1447,6 +1452,64 @@ mod tests {
         assert!((map[&id1][0] - 0.1).abs() < 1e-6);
         assert!((map[&id2][0] - 0.2).abs() < 1e-6);
         assert!(!map.contains_key("nonexistent"));
+    }
+
+    #[test]
+    fn get_reflection_vectors_by_ids_returns_exactly_the_requested_ids() {
+        use std::collections::HashMap;
+
+        let storage = Storage::open_memory().unwrap();
+        let id1 = "vec-refl-1".to_string();
+        let id2 = "vec-refl-2".to_string();
+        let id3 = "vec-refl-3".to_string();
+        storage
+            .insert_reflection(&id1, "one", &[], &[0.1; 384])
+            .unwrap();
+        storage
+            .insert_reflection(&id2, "two", &[], &[0.2; 384])
+            .unwrap();
+        storage
+            .insert_reflection(&id3, "three", &[], &[0.3; 384])
+            .unwrap();
+
+        // Ask for a strict subset plus a nonexistent id — must get back
+        // exactly the requested-and-present ids, not the whole table.
+        let got = storage
+            .get_reflection_vectors_by_ids(&[id1.clone(), id3.clone(), "nonexistent".to_string()])
+            .unwrap();
+        assert_eq!(
+            got.len(),
+            2,
+            "must return exactly the requested-and-present ids"
+        );
+        let map: HashMap<String, Vec<f32>> = got.into_iter().collect();
+        assert!((map[&id1][0] - 0.1).abs() < 1e-6);
+        assert!((map[&id3][0] - 0.3).abs() < 1e-6);
+        assert!(
+            !map.contains_key(&id2),
+            "id2 was not requested and must not be returned"
+        );
+        assert!(!map.contains_key("nonexistent"));
+    }
+
+    #[test]
+    fn get_reflection_vectors_by_ids_crosses_the_sql_parameter_batch_boundary() {
+        // queries::get_reflection_vectors_by_ids binds at most 500 ids per
+        // statement; 1,001 requested ids force three statements and must
+        // still come back complete and correctly paired.
+        let storage = Storage::open_memory().unwrap();
+        let ids: Vec<String> = (0..1001).map(|i| format!("boundary-refl-{i}")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let mut v = [0.0_f32; 384];
+            v[0] = i as f32;
+            storage.insert_reflection(id, "content", &[], &v).unwrap();
+        }
+        let got = storage.get_reflection_vectors_by_ids(&ids).unwrap();
+        assert_eq!(got.len(), 1001);
+        for (id, vec) in got {
+            let i: usize = id.trim_start_matches("boundary-refl-").parse().unwrap();
+            assert_eq!(vec[0], i as f32, "vector paired with the wrong id");
+        }
     }
 
     #[test]
