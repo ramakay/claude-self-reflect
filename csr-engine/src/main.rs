@@ -928,9 +928,10 @@ async fn run() -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-        // Every eval mode embeds on its first step and the quick/full
-        // reports fold embedding errors into failed rows — load the model
-        // up front so a broken model cache still fails the command loudly.
+        // quick/full/continuity embed on their first step and fold embedding
+        // errors into failed report rows; codegraph modes only read storage.
+        // Load the model up front regardless so a broken model cache fails
+        // the command loudly, as the eager Engine::new did before lazy load.
         eng.embeddings().warm()?;
         if continuity_live {
             let out = csr_engine::eval::continuity::run_continuity_live(

@@ -60,11 +60,11 @@ impl EmbeddingEngine {
         matches!(self.model.lock(), Ok(guard) if guard.is_some())
     }
 
-    /// Force the model to load now instead of on first `embed`. Use only
-    /// where first-embed latency matters more than startup memory (the
-    /// import/daemon paths) — not the MCP server or hooks, which should
-    /// stay lazy so a no-op hook invocation never pays the ~1.3GB model
-    /// load.
+    /// Force the model to load now instead of on first `embed`. Use where
+    /// first-embed latency or an early failure matters more than startup
+    /// memory (daemon, --import/--enrich, setup, eval) — not the MCP server
+    /// or hooks, which stay lazy so a process that never embeds never pays
+    /// the model load (~130MB resident, ~45ms).
     pub fn warm(&self) -> Result<()> {
         self.ensure_loaded()
     }

@@ -142,6 +142,9 @@ LIVE_STAMP_MTIME_BEFORE="$(live_mtime mcp-binary.txt)"
 # The child's stderr is copied to $LAST_STDERR for the caller to inspect
 # (a fixed file, because callers invoke this inside command substitution).
 LAST_STDERR="$WORK_DIR/last_stderr.log"
+# Set to e.g. "info" around a trial that needs the engine's tracing lines
+# (stderr) as evidence; empty leaves the binary's default (warn).
+TRIAL_RUST_LOG=""
 run_timed_once() {
     local stdin_file="$1" expect="$2" db="$3"
     shift 3
@@ -151,6 +154,7 @@ run_timed_once() {
     (
         export HOME="$FAKE_HOME"
         unset CSR_DISABLE_RECURSIVE_HOOKS
+        if [[ -n "$TRIAL_RUST_LOG" ]]; then export RUST_LOG="$TRIAL_RUST_LOG"; fi
         timeout "$TIMEOUT_SECS" /usr/bin/time -l "$BINARY" --db-path "$db" --projects-dir "$PROJECTS_DIR" "$@" \
             <"$stdin_file" >"$outfile" 2>"$timefile"
     ) || status=$?
@@ -324,28 +328,36 @@ if [[ -z "$HOOK_DB" ]]; then
     ROW3_NOTE="$ROW2_NOTE"
 else
     # Row 2: post-tool-use for an Edit — the installed matcher's case. cwd sits
-    # inside the isolated HOME, which is what the hook's cwd guard requires.
+    # inside the isolated HOME, which is what the hook's cwd guard requires,
+    # and the edit carries a real old/new pair so code-evolution tracking and
+    # the code-graph re-extraction both run. No transcript_path: the fixture
+    # measures engine startup plus edit tracking, not a transcript import.
     log "=== Row 2: hook post-tool-use Edit, installed matcher (median of 3) ==="
     PTU_INPUT="$WORK_DIR/post_tool_use.json"
-    printf '{"session_id":"probe","tool_name":"Edit","tool_input":{"file_path":"%s"},"cwd":"%s"}' \
+    printf '{"session_id":"probe","tool_name":"Edit","tool_input":{"file_path":"%s","old_string":"    42\n","new_string":"    43\n"},"cwd":"%s"}' \
         "$HOOK_CWD/probe.rs" "$HOOK_CWD" >"$PTU_INPUT"
     ROW2_RESULT="$(median_trials 3 "$PTU_INPUT" 'CSR hook post-tool-use' "$HOOK_DB" hook post-tool-use)"
     if [[ "$ROW2_RESULT" != "fail" ]]; then
         read -r ROW2_RSS_MB ROW2_WALL_S ROW2_FP_MB <<<"$ROW2_RESULT"
+        ROW2_NOTE="edit tracked; no transcript in fixture"
     else
         ROW2_NOTE="a trial failed (see stderr)"
     fi
 
     # Row 3: prompt-submit with a real, search-worthy prompt so the hook runs
     # its full path (intent classification + injection search), not the
-    # short-prompt early return.
+    # short-prompt early return. The marker is the hook's own "Injected N
+    # items" stderr line, which it only prints after the prompt was embedded
+    # and searched — the timing line alone would also appear when embedding
+    # failed silently.
     log "=== Row 3: hook prompt-submit (median of 3) ==="
     PS_INPUT="$WORK_DIR/prompt_submit.json"
     printf '{"session_id":"probe","prompt":"why does the engine load the whole HNSW index at startup and how do I reduce its memory","cwd":"%s"}' \
         "$HOOK_CWD" >"$PS_INPUT"
-    ROW3_RESULT="$(median_trials 3 "$PS_INPUT" 'CSR hook prompt-submit' "$HOOK_DB" hook prompt-submit)"
+    ROW3_RESULT="$(median_trials 3 "$PS_INPUT" 'CSR: Injected [0-9]+ items' "$HOOK_DB" hook prompt-submit)"
     if [[ "$ROW3_RESULT" != "fail" ]]; then
         read -r ROW3_RSS_MB ROW3_WALL_S ROW3_FP_MB <<<"$ROW3_RESULT"
+        ROW3_NOTE="embedded + searched (Injected line present)"
     else
         ROW3_NOTE="a trial failed (see stderr)"
     fi
@@ -354,7 +366,7 @@ fi
 # ---------------------------------------------------------------------------
 # Row 4: steady-state private footprint after the MCP handshake (vmmap @ t=6s)
 # ---------------------------------------------------------------------------
-log "=== Row 4: steady-state private footprint (vmmap @ t=6s after initialize) ==="
+log "=== Row 4: steady-state private footprint (vmmap 6s after the initialize response) ==="
 VMMAP_OUT="$WORK_DIR/vmmap.txt"
 ROW4_STATUS="ok"
 ROW4_FOOTPRINT="n/a"
@@ -366,6 +378,12 @@ ROW4_MAPPED_FILE="n/a"
     { cat "$INIT_INPUT"; /bin/sleep 60; } | "$BINARY" --db-path "$DB_PATH" --projects-dir "$PROJECTS_DIR" \
         >"$WORK_DIR/steady_stdout.log" 2>"$WORK_DIR/steady_stderr.log" &
     SERVER_PID=$!
+    # Start the 6s clock from the initialize response, not from launch.
+    waited=0
+    until grep -q '"serverInfo"' "$WORK_DIR/steady_stdout.log" 2>/dev/null || ((waited >= 150)); do
+        sleep 0.2
+        waited=$((waited + 1))
+    done
     sleep 6
     if kill -0 "$SERVER_PID" 2>/dev/null; then
         vmmap --summary "$SERVER_PID" >"$VMMAP_OUT" 2>&1 || true
@@ -460,15 +478,24 @@ PYEOF
             FK_VIOLATIONS=$("$SQLITE3" "$DRIFT_DB" "PRAGMA foreign_key_check;" 2>/dev/null || echo "")
             if [[ "$AFTER_COUNT" == "$((BEFORE_COUNT + 1))" && -z "$FK_VIOLATIONS" ]]; then
                 log "drift row loaded cleanly: chunk_embeddings $BEFORE_COUNT -> $AFTER_COUNT"
+                # RUST_LOG=info exposes the engine's reconciliation receipt
+                # ("backfilled missing chunks into HNSW cache added=N"); the
+                # startup line alone is printed before reconciliation runs.
+                TRIAL_RUST_LOG="info"
                 DRIFT_OUT="$(run_timed_once "$INIT_INPUT" "$INIT_EXPECT" "$DRIFT_DB")"
+                TRIAL_RUST_LOG=""
                 if [[ "$(echo "$DRIFT_OUT" | awk '{print $4}')" == "ok" ]]; then
                     read -r ROW5_RSS_MB ROW5_WALL_S ROW5_FP_MB _ <<<"$DRIFT_OUT"
                     ROW5_RSS_MB=$(bytes_to_mb "$ROW5_RSS_MB")
                     ROW5_FP_MB=$(bytes_to_mb "$ROW5_FP_MB")
-                    if grep -q 'CSR startup:.*cached)' "$LAST_STDERR"; then
-                        ROW5_PATH="cached+backfill"
-                    elif grep -q 'CSR startup:.*rebuilt)' "$LAST_STDERR"; then
+                    # tracing colors its output; strip the ANSI codes before parsing.
+                    BACKFILLED=$(sed $'s/\x1b\\[[0-9;]*m//g' "$LAST_STDERR" | grep 'backfilled missing chunks into HNSW cache' | sed -n 's/.*added=\([0-9]*\).*/\1/p' | head -1)
+                    if grep -q 'CSR startup:.*rebuilt)' "$LAST_STDERR"; then
                         ROW5_PATH="full rebuild"
+                    elif grep -q 'CSR startup:.*cached)' "$LAST_STDERR" && [[ -n "$BACKFILLED" ]]; then
+                        ROW5_PATH="cached, backfilled added=$BACKFILLED"
+                    elif grep -q 'CSR startup:.*cached)' "$LAST_STDERR"; then
+                        ROW5_PATH="cached, backfill receipt missing"
                     fi
                     if [[ "$ROW1_RSS_MB" != "unmeasured" ]]; then
                         ROW5_DELTA_MB=$(awk -v a="$ROW5_RSS_MB" -v b="$ROW1_RSS_MB" 'BEGIN{printf "%+.1f", a-b}')

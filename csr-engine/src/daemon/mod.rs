@@ -1546,21 +1546,54 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn delayed_holds_the_loop_body_until_the_delay_elapses() {
+        use std::sync::Mutex;
+        let start = tokio::time::Instant::now();
+        let ran_at: Arc<Mutex<Option<tokio::time::Instant>>> = Arc::new(Mutex::new(None));
+        let slot = ran_at.clone();
+        let handle = tokio::spawn(delayed(std::time::Duration::from_secs(120), async move {
+            *slot.lock().unwrap() = Some(tokio::time::Instant::now());
+        }));
+        // Let the spawned wrapper poll once so its sleep timer is registered
+        // before the clock moves; otherwise advance() has nothing to fire.
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(119)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            ran_at.lock().unwrap().is_none(),
+            "body ran before the delay elapsed"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        let at = ran_at
+            .lock()
+            .unwrap()
+            .expect("body never ran after the delay");
+        let elapsed = at.duration_since(start);
+        assert!(
+            elapsed >= std::time::Duration::from_secs(120)
+                && elapsed <= std::time::Duration::from_secs(121),
+            "body ran at {elapsed:?}, expected ~120s"
+        );
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_aborted_before_the_deadline_never_runs_the_body() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let ran = Arc::new(AtomicBool::new(false));
         let flag = ran.clone();
         let handle = tokio::spawn(delayed(std::time::Duration::from_secs(120), async move {
             flag.store(true, Ordering::SeqCst);
         }));
-        tokio::time::advance(std::time::Duration::from_secs(119)).await;
         tokio::task::yield_now().await;
-        assert!(
-            !ran.load(Ordering::SeqCst),
-            "body ran before the delay elapsed"
-        );
-        tokio::time::advance(std::time::Duration::from_secs(2)).await;
-        handle.await.unwrap();
-        assert!(ran.load(Ordering::SeqCst), "body never ran after the delay");
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        // serve_mcp aborts the enrichment handles on shutdown; an abort
+        // during the delay must drop the pending loop, not run it later.
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(!ran.load(Ordering::SeqCst), "aborted body still ran");
     }
 
     #[tokio::test]
