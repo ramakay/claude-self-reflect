@@ -21,7 +21,8 @@
 # never land in the caller's directory. Every trial must also report the
 # "cached" startup path; a trial that rebuilt the index invalidates its row.
 # The real live data dir is refused as <db-path> even through a symlink, and
-# its hook-timing.log / mcp-binary.txt mtimes are checked before and after.
+# it is checked before and after for harness-tagged hook lines and for a
+# rewritten serving-binary stamp.
 #
 # Every trial must exit 0 AND leave the marker its scenario is expected to
 # produce (the MCP initialize response, the hook's own timing line); a row with
@@ -124,12 +125,21 @@ done
 # (Edit|Write|MultiEdit|NotebookEdit) is what fires this hook in production.
 printf 'fn probe() -> u32 {\n    42\n}\n' >"$HOOK_CWD/probe.rs"
 
-live_mtime() {
-    local f="$LIVE_DATA_DIR/$1"
-    if [[ -e "$f" ]]; then stat -f %m "$f"; else echo "absent"; fi
+# Isolation receipts. The operator's own Claude Code session keeps appending
+# to the live hook-timing.log while this runs, so an mtime check would flag
+# it; instead count the lines only this harness's fixtures can produce (its
+# hook cwd resolves to the project name "project") and compare the serving
+# binary stamp, which only an MCP server started with the real HOME rewrites.
+live_probe_lines() {
+    local f="$LIVE_DATA_DIR/hook-timing.log"
+    if [[ -e "$f" ]]; then grep -c 'CSR hook [a-z-]* \[project\]' "$f" || true; else echo 0; fi
 }
-LIVE_TIMING_MTIME_BEFORE="$(live_mtime hook-timing.log)"
-LIVE_STAMP_MTIME_BEFORE="$(live_mtime mcp-binary.txt)"
+live_stamp() {
+    local f="$LIVE_DATA_DIR/mcp-binary.txt"
+    if [[ -e "$f" ]]; then cat "$f"; else echo "absent"; fi
+}
+LIVE_PROBE_LINES_BEFORE="$(live_probe_lines)"
+LIVE_STAMP_BEFORE="$(live_stamp)"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -535,11 +545,11 @@ fi
 # ---------------------------------------------------------------------------
 # Live data dir must be untouched
 # ---------------------------------------------------------------------------
-LIVE_TIMING_MTIME_AFTER="$(live_mtime hook-timing.log)"
-LIVE_STAMP_MTIME_AFTER="$(live_mtime mcp-binary.txt)"
-LIVE_DIR_NOTE="untouched (hook-timing.log, mcp-binary.txt mtimes unchanged)"
-if [[ "$LIVE_TIMING_MTIME_BEFORE" != "$LIVE_TIMING_MTIME_AFTER" || "$LIVE_STAMP_MTIME_BEFORE" != "$LIVE_STAMP_MTIME_AFTER" ]]; then
-    LIVE_DIR_NOTE="WRITTEN DURING THE RUN — isolation failed (hook-timing.log $LIVE_TIMING_MTIME_BEFORE -> $LIVE_TIMING_MTIME_AFTER, mcp-binary.txt $LIVE_STAMP_MTIME_BEFORE -> $LIVE_STAMP_MTIME_AFTER)"
+LIVE_PROBE_LINES_AFTER="$(live_probe_lines)"
+LIVE_STAMP_AFTER="$(live_stamp)"
+LIVE_DIR_NOTE="untouched (no harness-tagged hook lines added to hook-timing.log, mcp-binary.txt unchanged)"
+if [[ "$LIVE_PROBE_LINES_BEFORE" != "$LIVE_PROBE_LINES_AFTER" || "$LIVE_STAMP_BEFORE" != "$LIVE_STAMP_AFTER" ]]; then
+    LIVE_DIR_NOTE="WRITTEN DURING THE RUN — isolation failed (harness-tagged hook lines $LIVE_PROBE_LINES_BEFORE -> $LIVE_PROBE_LINES_AFTER, mcp-binary.txt changed: $([[ "$LIVE_STAMP_BEFORE" != "$LIVE_STAMP_AFTER" ]] && echo yes || echo no))"
     log "$LIVE_DIR_NOTE"
 fi
 
