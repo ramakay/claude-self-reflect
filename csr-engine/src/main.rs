@@ -206,6 +206,9 @@ fn default_projects_dir() -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    // Raise the open-file ceiling before any index load so a low soft RLIMIT_NOFILE
+    // cannot turn a transient EMFILE inside hnsw_rs's mmap load into a process exit.
+    csr_engine::runtime::raise_fd_limit();
     let workers = csr_engine::runtime::resolve_tokio_workers();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
