@@ -539,20 +539,11 @@ impl Engine {
     /// past tombstones, and the next process start loads from cache instead
     /// of rebuilding. Returns `(chunks, reflections)` indexed.
     pub async fn rebuild_search_index(&self) -> Result<(usize, usize)> {
-        let chunk_vecs = self.storage.load_all_chunk_vectors()?;
-        let reflection_vecs = self.storage.load_all_reflection_vectors()?;
-        let estimated_size = (chunk_vecs.len() + 1000).max(10_000);
-        let mut fresh = SearchEngine::new(estimated_size);
-        for (id, vec) in &chunk_vecs {
-            fresh.insert_chunk(id.clone(), vec.clone());
-        }
-        for (id, vec) in &reflection_vecs {
-            fresh.insert_reflection(id.clone(), vec.clone());
-        }
-        let counts = (chunk_vecs.len(), reflection_vecs.len());
+        let (fresh, chunk_count, reflection_count) =
+            rebuild_search_index_streaming(&self.storage, RECONCILE_BATCH)?;
         *self.search.write().await = fresh;
         self.flush_index_checked().await?;
-        Ok(counts)
+        Ok((chunk_count, reflection_count))
     }
 
     /// Remove the persisted manifest before a maintenance operation mutates

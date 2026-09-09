@@ -15,10 +15,13 @@
 # (so hook-timing.log, mcp-binary.txt and the probe caches land there, never in
 # the real ~/.claude-self-reflect), with an explicit --projects-dir inside that
 # scratch HOME, and with the fastembed model cache COPIED in from the real
-# ~/Library/Caches so no scenario ever downloads. Hook rows run against a fresh
-# SQLite backup of <db-path> (hooks may write); rows that only read use it in
-# place. The real live data dir is refused as <db-path> even through a symlink,
-# and its hook-timing.log / mcp-binary.txt mtimes are checked before and after.
+# ~/Library/Caches so no scenario ever downloads. <db-path> itself is only ever
+# read (sqlite3 .backup + a copy of its index dir): rows 1-4 run on one fresh
+# snapshot, the drift row on another, so a rebuilt index or a hook's writes
+# never land in the caller's directory. Every trial must also report the
+# "cached" startup path; a trial that rebuilt the index invalidates its row.
+# The real live data dir is refused as <db-path> even through a symlink, and
+# its hook-timing.log / mcp-binary.txt mtimes are checked before and after.
 #
 # Every trial must exit 0 AND leave the marker its scenario is expected to
 # produce (the MCP initialize response, the hook's own timing line); a row with
@@ -87,11 +90,10 @@ if [[ -x /opt/homebrew/opt/sqlite/bin/sqlite3 ]]; then
 fi
 
 TIMEOUT_SECS=90
-SCRATCH_DIR="/tmp/csr-mem-profile"
-mkdir -p "$SCRATCH_DIR"
-# Fully resolved (macOS /tmp is a symlink to /private/tmp): the hooks compare
-# their canonicalized cwd against $HOME, so the scratch HOME must be canonical.
-WORK_DIR="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$(mktemp -d "$SCRATCH_DIR/run.XXXXXX")")"
+# Per-user temp root (never a predictable shared /tmp path), fully resolved:
+# macOS /tmp and /var are symlinks, and the hooks compare their canonicalized
+# cwd against $HOME, so the scratch HOME must be canonical.
+WORK_DIR="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$(mktemp -d "${TMPDIR:-/tmp}/csr-mem-profile.XXXXXX")")"
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
 
@@ -217,6 +219,11 @@ median_trials() {
             echo "fail"
             return
         fi
+        if ! grep -q 'CSR startup:.*cached)' "$LAST_STDERR"; then
+            log "FAILED trial $i/$trials: startup did not take the cached path (index rebuilt or startup line missing); the row would mix two startup paths"
+            echo "fail"
+            return
+        fi
         rss_vals+=("$r")
         wall_vals+=("$w")
         fp_vals+=("$f")
@@ -302,7 +309,18 @@ BIN_SIZE_MB=$(bytes_to_mb "$BIN_SIZE_BYTES")
 BIN_SHA256=$(shasum -a 256 "$BINARY" | awk '{print $1}')
 
 # ---------------------------------------------------------------------------
-# Row 1: bare MCP initialize (read-only: runs against <db-path> in place)
+# Snapshot for rows 1-4. Engine::new persists a rebuilt index next to the db
+# it was given, and hooks write, so the caller's directory is never handed
+# to the binary.
+# ---------------------------------------------------------------------------
+MAIN_DB="$(snapshot_db "$WORK_DIR/main")"
+if [[ -z "$MAIN_DB" ]]; then
+    echo "could not snapshot $DB_PATH (see stderr)" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Row 1: bare MCP initialize
 # ---------------------------------------------------------------------------
 log "=== Row 1: bare MCP initialize (median of 3) ==="
 INIT_INPUT="$WORK_DIR/init_input.jsonl"
@@ -311,105 +329,129 @@ INIT_INPUT="$WORK_DIR/init_input.jsonl"
     printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 } >"$INIT_INPUT"
 INIT_EXPECT='"serverInfo"'
-ROW1_RESULT="$(median_trials 3 "$INIT_INPUT" "$INIT_EXPECT" "$DB_PATH")"
+ROW1_RESULT="$(median_trials 3 "$INIT_INPUT" "$INIT_EXPECT" "$MAIN_DB")"
 ROW1_RSS_MB="unmeasured"; ROW1_WALL_S="n/a"; ROW1_FP_MB="n/a"
 if [[ "$ROW1_RESULT" != "fail" ]]; then
     read -r ROW1_RSS_MB ROW1_WALL_S ROW1_FP_MB <<<"$ROW1_RESULT"
 fi
 
 # ---------------------------------------------------------------------------
-# Rows 2-3: hooks, against a fresh snapshot (hooks may write to the DB)
+# Rows 2-3: hooks (they may write to the snapshot; row 1 was measured first)
 # ---------------------------------------------------------------------------
-HOOK_DB="$(snapshot_db "$WORK_DIR/hooks")"
+HOOK_DB="$MAIN_DB"
 ROW2_RSS_MB="unmeasured"; ROW2_WALL_S="n/a"; ROW2_FP_MB="n/a"; ROW2_NOTE="-"
 ROW3_RSS_MB="unmeasured"; ROW3_WALL_S="n/a"; ROW3_FP_MB="n/a"; ROW3_NOTE="-"
-if [[ -z "$HOOK_DB" ]]; then
-    ROW2_NOTE="snapshot of the db failed (see stderr)"
-    ROW3_NOTE="$ROW2_NOTE"
+# Row 2: post-tool-use for an Edit — the installed matcher's case. cwd sits
+# inside the isolated HOME, which is what the hook's cwd guard requires,
+# and the edit carries a real old/new pair so code-evolution tracking and
+# the code-graph re-extraction both run. No transcript_path: the fixture
+# measures engine startup plus edit tracking, not a transcript import.
+log "=== Row 2: hook post-tool-use Edit, installed matcher (median of 3) ==="
+PTU_INPUT="$WORK_DIR/post_tool_use.json"
+printf '{"session_id":"probe","tool_name":"Edit","tool_input":{"file_path":"%s","old_string":"    42\n","new_string":"    43\n"},"cwd":"%s"}' \
+    "$HOOK_CWD/probe.rs" "$HOOK_CWD" >"$PTU_INPUT"
+ROW2_RESULT="$(median_trials 3 "$PTU_INPUT" 'CSR hook post-tool-use' "$HOOK_DB" hook post-tool-use)"
+if [[ "$ROW2_RESULT" != "fail" ]]; then
+    read -r ROW2_RSS_MB ROW2_WALL_S ROW2_FP_MB <<<"$ROW2_RESULT"
+    ROW2_NOTE="edit tracked; no transcript in fixture"
 else
-    # Row 2: post-tool-use for an Edit — the installed matcher's case. cwd sits
-    # inside the isolated HOME, which is what the hook's cwd guard requires,
-    # and the edit carries a real old/new pair so code-evolution tracking and
-    # the code-graph re-extraction both run. No transcript_path: the fixture
-    # measures engine startup plus edit tracking, not a transcript import.
-    log "=== Row 2: hook post-tool-use Edit, installed matcher (median of 3) ==="
-    PTU_INPUT="$WORK_DIR/post_tool_use.json"
-    printf '{"session_id":"probe","tool_name":"Edit","tool_input":{"file_path":"%s","old_string":"    42\n","new_string":"    43\n"},"cwd":"%s"}' \
-        "$HOOK_CWD/probe.rs" "$HOOK_CWD" >"$PTU_INPUT"
-    ROW2_RESULT="$(median_trials 3 "$PTU_INPUT" 'CSR hook post-tool-use' "$HOOK_DB" hook post-tool-use)"
-    if [[ "$ROW2_RESULT" != "fail" ]]; then
-        read -r ROW2_RSS_MB ROW2_WALL_S ROW2_FP_MB <<<"$ROW2_RESULT"
-        ROW2_NOTE="edit tracked; no transcript in fixture"
-    else
-        ROW2_NOTE="a trial failed (see stderr)"
-    fi
+    ROW2_NOTE="a trial failed (see stderr)"
+fi
 
-    # Row 3: prompt-submit with a real, search-worthy prompt so the hook runs
-    # its full path (intent classification + injection search), not the
-    # short-prompt early return. The marker is the hook's own "Injected N
-    # items" stderr line, which it only prints after the prompt was embedded
-    # and searched — the timing line alone would also appear when embedding
-    # failed silently.
-    log "=== Row 3: hook prompt-submit (median of 3) ==="
-    PS_INPUT="$WORK_DIR/prompt_submit.json"
-    printf '{"session_id":"probe","prompt":"why does the engine load the whole HNSW index at startup and how do I reduce its memory","cwd":"%s"}' \
-        "$HOOK_CWD" >"$PS_INPUT"
-    ROW3_RESULT="$(median_trials 3 "$PS_INPUT" 'CSR: Injected [0-9]+ items' "$HOOK_DB" hook prompt-submit)"
-    if [[ "$ROW3_RESULT" != "fail" ]]; then
-        read -r ROW3_RSS_MB ROW3_WALL_S ROW3_FP_MB <<<"$ROW3_RESULT"
-        ROW3_NOTE="embedded + searched (Injected line present)"
-    else
-        ROW3_NOTE="a trial failed (see stderr)"
-    fi
+# Row 3: prompt-submit with a real, search-worthy prompt so the hook runs
+# its full path (intent classification + injection search), not the
+# short-prompt early return. The marker is the hook's own "Injected N
+# items" stderr line, which it only prints after the prompt was embedded
+# and searched — the timing line alone would also appear when embedding
+# failed silently.
+log "=== Row 3: hook prompt-submit (median of 3) ==="
+PS_INPUT="$WORK_DIR/prompt_submit.json"
+printf '{"session_id":"probe","prompt":"why does the engine load the whole HNSW index at startup and how do I reduce its memory","cwd":"%s"}' \
+    "$HOOK_CWD" >"$PS_INPUT"
+ROW3_RESULT="$(median_trials 3 "$PS_INPUT" 'CSR: Injected [0-9]+ items' "$HOOK_DB" hook prompt-submit)"
+if [[ "$ROW3_RESULT" != "fail" ]]; then
+    read -r ROW3_RSS_MB ROW3_WALL_S ROW3_FP_MB <<<"$ROW3_RESULT"
+    ROW3_NOTE="embedded + searched (Injected line present)"
+else
+    ROW3_NOTE="a trial failed (see stderr)"
 fi
 
 # ---------------------------------------------------------------------------
-# Row 4: steady-state private footprint after the MCP handshake (vmmap @ t=6s)
+# Row 4: steady-state private footprint, 6s after the initialize response.
+# Three separate servers, because the number is bimodal run to run (the
+# allocator keeps a variable amount of freed-but-dirty pages after the index
+# load): the row reports the median with the min-max spread.
 # ---------------------------------------------------------------------------
-log "=== Row 4: steady-state private footprint (vmmap 6s after the initialize response) ==="
-VMMAP_OUT="$WORK_DIR/vmmap.txt"
+log "=== Row 4: steady-state private footprint (vmmap 6s after the initialize response, 3 servers) ==="
 ROW4_STATUS="ok"
 ROW4_FOOTPRINT="n/a"
+ROW4_RANGE="n/a"
 ROW4_MALLOC_DIRTY="n/a"
 ROW4_MAPPED_FILE="n/a"
-(
-    export HOME="$FAKE_HOME"
-    unset CSR_DISABLE_RECURSIVE_HOOKS
-    { cat "$INIT_INPUT"; /bin/sleep 60; } | "$BINARY" --db-path "$DB_PATH" --projects-dir "$PROJECTS_DIR" \
-        >"$WORK_DIR/steady_stdout.log" 2>"$WORK_DIR/steady_stderr.log" &
-    SERVER_PID=$!
-    # Start the 6s clock from the initialize response, not from launch.
-    waited=0
-    until grep -q '"serverInfo"' "$WORK_DIR/steady_stdout.log" 2>/dev/null || ((waited >= 150)); do
-        sleep 0.2
-        waited=$((waited + 1))
-    done
-    sleep 6
-    if kill -0 "$SERVER_PID" 2>/dev/null; then
-        vmmap --summary "$SERVER_PID" >"$VMMAP_OUT" 2>&1 || true
-    fi
-    kill "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-) &
-STEADY_WRAPPER_PID=$!
-wait "$STEADY_WRAPPER_PID" || true
+ROW4_FP_VALS=()
+ROW4_MD_VALS=()
+ROW4_MF_VALS=()
+ROW4_HEAP_VALS=()
+ROW4_HEAP="n/a"
+for ((k = 1; k <= 3; k++)); do
+    VMMAP_OUT="$WORK_DIR/vmmap.$k.txt"
+    STEADY_OUT="$WORK_DIR/steady_stdout.$k.log"
+    STEADY_ERR="$WORK_DIR/steady_stderr.$k.log"
+    (
+        export HOME="$FAKE_HOME"
+        unset CSR_DISABLE_RECURSIVE_HOOKS
+        { cat "$INIT_INPUT"; /bin/sleep 60; } | "$BINARY" --db-path "$MAIN_DB" --projects-dir "$PROJECTS_DIR" \
+            >"$STEADY_OUT" 2>"$STEADY_ERR" &
+        SERVER_PID=$!
+        # Start the 6s clock from the initialize response, not from launch.
+        waited=0
+        until grep -q '"serverInfo"' "$STEADY_OUT" 2>/dev/null || ((waited >= 150)); do
+            sleep 0.2
+            waited=$((waited + 1))
+        done
+        sleep 6
+        if kill -0 "$SERVER_PID" 2>/dev/null; then
+            vmmap --summary "$SERVER_PID" >"$VMMAP_OUT" 2>&1 || true
+            # Live malloc bytes: the deterministic steady-state number. The
+            # footprint above also counts freed-but-not-yet-returned pages,
+            # which is why it swings ~130MB between otherwise identical runs.
+            heap -s "$SERVER_PID" 2>/dev/null | awk '/^All zones:.*bytes\)/{gsub(/[()]/, "", $(NF-1)); print $(NF-1); exit}' >"$WORK_DIR/heap.$k.txt" || true
+        fi
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    ) &
+    STEADY_WRAPPER_PID=$!
+    wait "$STEADY_WRAPPER_PID" || true
 
-if ! grep -q '"serverInfo"' "$WORK_DIR/steady_stdout.log" 2>/dev/null; then
-    ROW4_STATUS="unmeasured: server never answered initialize"
-    tail -5 "$WORK_DIR/steady_stderr.log" >&2 || true
-elif [[ -s "$VMMAP_OUT" ]]; then
-    RAW_FOOTPRINT=$(awk '/^Physical footprint:/{print $3; exit}' "$VMMAP_OUT")
-    RAW_MALLOC_DIRTY=$(parse_vmmap_col "$VMMAP_OUT" "MALLOC_SMALL " 3)
-    RAW_MAPPED_FILE=$(parse_vmmap_col "$VMMAP_OUT" "mapped file" 2)
-    if [[ -n "$RAW_FOOTPRINT" ]]; then
-        ROW4_FOOTPRINT="$(vmmap_size_to_mb "$RAW_FOOTPRINT")"
+    if ! grep -q '"serverInfo"' "$STEADY_OUT" 2>/dev/null; then
+        ROW4_STATUS="unmeasured: server $k never answered initialize"
+        tail -5 "$STEADY_ERR" >&2 || true
+        break
+    elif [[ -s "$VMMAP_OUT" ]]; then
+        RAW_FOOTPRINT=$(awk '/^Physical footprint:/{print $3; exit}' "$VMMAP_OUT")
+        RAW_MALLOC_DIRTY=$(parse_vmmap_col "$VMMAP_OUT" "MALLOC_SMALL " 3)
+        RAW_MAPPED_FILE=$(parse_vmmap_col "$VMMAP_OUT" "mapped file" 2)
+        if [[ -z "$RAW_FOOTPRINT" ]]; then
+            ROW4_STATUS="unmeasured: could not find 'Physical footprint:' in vmmap output (server $k)"
+            break
+        fi
+        ROW4_FP_VALS+=("$(vmmap_size_to_mb "$RAW_FOOTPRINT")")
+        [[ -n "$RAW_MALLOC_DIRTY" ]] && ROW4_MD_VALS+=("$(vmmap_size_to_mb "$RAW_MALLOC_DIRTY")")
+        [[ -n "$RAW_MAPPED_FILE" ]] && ROW4_MF_VALS+=("$(vmmap_size_to_mb "$RAW_MAPPED_FILE")")
+        HEAP_BYTES=$(cat "$WORK_DIR/heap.$k.txt" 2>/dev/null || true)
+        [[ "$HEAP_BYTES" =~ ^[0-9]+$ ]] && ROW4_HEAP_VALS+=("$(bytes_to_mb "$HEAP_BYTES")")
+        log "server $k/3: footprint=${ROW4_FP_VALS[$((k - 1))]}MB heap_live=${HEAP_BYTES:-?}B"
     else
-        ROW4_STATUS="unmeasured: could not find 'Physical footprint:' in vmmap output"
+        ROW4_STATUS="unmeasured: vmmap produced no output for server $k (process may have exited before t=6s)"
+        break
     fi
-    [[ -n "$RAW_MALLOC_DIRTY" ]] && ROW4_MALLOC_DIRTY="$(vmmap_size_to_mb "$RAW_MALLOC_DIRTY") MB"
-    [[ -n "$RAW_MAPPED_FILE" ]] && ROW4_MAPPED_FILE="$(vmmap_size_to_mb "$RAW_MAPPED_FILE") MB"
-else
-    ROW4_STATUS="unmeasured: vmmap produced no output (process may have exited before t=6s)"
+done
+if [[ "$ROW4_STATUS" == "ok" ]]; then
+    ROW4_FOOTPRINT="$(median_of "${ROW4_FP_VALS[@]}")"
+    ROW4_RANGE="$(printf '%s\n' "${ROW4_FP_VALS[@]}" | sort -n | head -1)-$(printf '%s\n' "${ROW4_FP_VALS[@]}" | sort -n | tail -1)"
+    [[ ${#ROW4_MD_VALS[@]} -gt 0 ]] && ROW4_MALLOC_DIRTY="$(median_of "${ROW4_MD_VALS[@]}") MB"
+    [[ ${#ROW4_MF_VALS[@]} -gt 0 ]] && ROW4_MAPPED_FILE="$(median_of "${ROW4_MF_VALS[@]}") MB"
+    [[ ${#ROW4_HEAP_VALS[@]} -gt 0 ]] && ROW4_HEAP="$(median_of "${ROW4_HEAP_VALS[@]}") MB"
 fi
 
 # ---------------------------------------------------------------------------
@@ -439,40 +481,14 @@ if [[ -n "$DRIFT_DB" ]]; then
 
     if [[ -n "$EMBED_SCHEMA" && -n "$BEFORE_COUNT" ]]; then
         INSERT_ERR="$WORK_DIR/drift_insert_err.log"
-        if python3 - "$DRIFT_DB" "$DRIFT_ID" >"$WORK_DIR/drift_insert_out.log" 2>"$INSERT_ERR" <<'PYEOF'
-import sqlite3
-import struct
-import random
-import sys
-
-db_path, drift_id = sys.argv[1], sys.argv[2]
-random.seed(42)
-vec = [random.uniform(-0.1, 0.1) for _ in range(384)]
-blob = struct.pack("<384f", *vec)
-
-conn = sqlite3.connect(db_path)
-conn.execute("PRAGMA foreign_keys=ON")
-conn.execute(
-    "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, "
-    "message_count, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    (
-        drift_id,
-        "csr-profile-drift-conv",
-        "csr-profile-drift-project",
-        "2026-09-08T00:00:00Z",
-        "synthetic drift probe row (profile-memory.sh)",
-        1,
-        "conversation",
-    ),
-)
-conn.execute(
-    "INSERT INTO chunk_embeddings (chunk_id, embedding) VALUES (?, ?)",
-    (drift_id, blob),
-)
-conn.commit()
-conn.close()
-print(f"inserted {len(blob)}-byte embedding for {drift_id}")
-PYEOF
+        # The chunks insert fires the chunks_fts FTS5 trigger, so it has to go
+        # through an FTS5-capable client ($SQLITE3), not python's sqlite3
+        # module. python only renders the 384-dim f32 blob as a hex literal.
+        DRIFT_HEX=$(python3 -c 'import struct, random; random.seed(42); print(struct.pack("<384f", *[random.uniform(-0.1, 0.1) for _ in range(384)]).hex())')
+        if "$SQLITE3" "$DRIFT_DB" "PRAGMA foreign_keys=ON;
+INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, source)
+VALUES ('$DRIFT_ID', 'csr-profile-drift-conv', 'csr-profile-drift-project', '2026-09-08T00:00:00Z', 'synthetic drift probe row (profile-memory.sh)', 1, 'conversation');
+INSERT INTO chunk_embeddings (chunk_id, embedding) VALUES ('$DRIFT_ID', X'$DRIFT_HEX');" >"$WORK_DIR/drift_insert_out.log" 2>"$INSERT_ERR"
         then
             AFTER_COUNT=$("$SQLITE3" "$DRIFT_DB" "SELECT COUNT(*) FROM chunk_embeddings;" 2>/dev/null || echo "")
             FK_VIOLATIONS=$("$SQLITE3" "$DRIFT_DB" "PRAGMA foreign_key_check;" 2>/dev/null || echo "")
@@ -537,7 +553,7 @@ echo "- Size: ${BIN_SIZE_MB} MB (${BIN_SIZE_BYTES} bytes)"
 echo "- SHA256: \`$BIN_SHA256\`"
 echo "- DB: \`$DB_PATH\`"
 echo "- Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "- Isolation: child HOME = scratch dir (model cache copied in, probe caches copied in); hook rows on a fresh snapshot"
+echo "- Isolation: child HOME = scratch dir (model cache copied in, probe caches copied in); rows 1-4 on one fresh db+index snapshot, row 5 on another; every trial confirmed the cached startup path"
 echo "- Live data dir ($LIVE_DATA_DIR): $LIVE_DIR_NOTE"
 echo
 echo "| # | Scenario | Peak RSS (MB) | Peak footprint (MB) | Wall (s) | Notes |"
@@ -546,10 +562,10 @@ printf '| 1 | bare MCP initialize (median of 3) | %s | %s | %s | - |\n' "$ROW1_R
 printf '| 2 | hook post-tool-use Edit, installed matcher (median of 3) | %s | %s | %s | %s |\n' "$ROW2_RSS_MB" "$ROW2_FP_MB" "$ROW2_WALL_S" "$ROW2_NOTE"
 printf '| 3 | hook prompt-submit, real prompt (median of 3) | %s | %s | %s | %s |\n' "$ROW3_RSS_MB" "$ROW3_FP_MB" "$ROW3_WALL_S" "$ROW3_NOTE"
 if [[ "$ROW4_STATUS" == "ok" ]]; then
-    printf '| 4 | steady-state private footprint @ t=6s after initialize | n/a | %s | n/a | vmmap: MALLOC_SMALL dirty=%s; mapped file resident=%s |\n' \
-        "$ROW4_FOOTPRINT" "$ROW4_MALLOC_DIRTY" "$ROW4_MAPPED_FILE"
+    printf '| 4 | steady-state private footprint, 6s after initialize (median of 3 servers) | n/a | %s | n/a | spread %s MB; live heap=%s; vmmap MALLOC_SMALL dirty=%s; mapped file resident=%s |\n' \
+        "$ROW4_FOOTPRINT" "$ROW4_RANGE" "$ROW4_HEAP" "$ROW4_MALLOC_DIRTY" "$ROW4_MAPPED_FILE"
 else
-    printf '| 4 | steady-state private footprint @ t=6s after initialize | n/a | unmeasured | n/a | %s |\n' "$ROW4_STATUS"
+    printf '| 4 | steady-state private footprint, 6s after initialize (median of 3 servers) | n/a | unmeasured | n/a | %s |\n' "$ROW4_STATUS"
 fi
 if [[ "$ROW5_STATUS" == "ok" ]]; then
     printf '| 5 | drift +1 bare initialize | %s | %s | %s | RSS delta vs row 1 = %s MB; startup path = %s |\n' "$ROW5_RSS_MB" "$ROW5_FP_MB" "$ROW5_WALL_S" "$ROW5_DELTA_MB" "$ROW5_PATH"

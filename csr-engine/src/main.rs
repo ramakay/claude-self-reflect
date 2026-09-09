@@ -928,11 +928,14 @@ async fn run() -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-        // quick/full/continuity embed on their first step and fold embedding
-        // errors into failed report rows; codegraph modes only read storage.
-        // Load the model up front regardless so a broken model cache fails
-        // the command loudly, as the eager Engine::new did before lazy load.
-        eng.embeddings().warm()?;
+        // quick/full/continuity/provenance embed on their first step and fold
+        // embedding errors into failed report rows, so load the model up front
+        // and let a broken model cache fail the command loudly. The codegraph
+        // modes only read storage; when codegraph is the selected branch
+        // (nothing above it in this if-chain is set) the model stays unloaded.
+        if continuity_live || continuity || provenance || !codegraph {
+            eng.embeddings().warm()?;
+        }
         if continuity_live {
             let out = csr_engine::eval::continuity::run_continuity_live(
                 eng.storage(),

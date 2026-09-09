@@ -31,12 +31,19 @@ pub async fn handle(
 ) -> Result<()> {
     eprintln!("\n=== Claude Self-Reflect Setup ===\n");
 
-    // Step 1: Ensure DB directory exists
+    // Step 1: Ensure DB directory exists, open the engine, and load the
+    // embedding model. The model loads lazily on first embed everywhere else;
+    // here a first-run download belongs in front of the user (with progress),
+    // and it has to succeed BEFORE the MCP server and hooks are written into
+    // Claude's config, so a failed download never leaves setup half-applied.
     let csr_dir = db_path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(csr_dir)?;
     eprintln!("[1/7] Database directory ready: {}", csr_dir.display());
+    let eng = Engine::new(db_path, projects_dir)?;
+    eng.embeddings().warm()?;
+    eprintln!("  Embedding model ready");
 
-    // Step 2: Register as MCP server (before Engine::new — works without DB)
+    // Step 2: Register as MCP server
     eprintln!("[2/7] Registering MCP server...");
     register_mcp_server()?;
 
@@ -47,14 +54,8 @@ pub async fn handle(
         eprintln!("  You can run `csr-engine hook install --apply` later.");
     }
 
-    // Step 4: Create engine, import conversations
+    // Step 4: Import conversations
     eprintln!("[4/7] Importing conversations...");
-    let eng = Engine::new(db_path, projects_dir)?;
-    // The ONNX model loads lazily on first embed; the eager callers are the
-    // daemon, --import/--enrich, eval, and this setup path, where a first-run
-    // download belongs in front of the user (with progress) rather than
-    // inside the first MCP tool call or a hook.
-    eng.embeddings().warm()?;
 
     // Count JSONL files for progress
     let total_files = count_total_files(projects_dir);
