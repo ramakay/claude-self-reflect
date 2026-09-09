@@ -97,21 +97,17 @@ impl Engine {
                     tracing::info!(blanked, "blanked orphan reflection entries in HNSW cache");
                 }
 
-                // Backfill reflections that exist in DB but not in HNSW
-                let missing: Vec<&str> = db_id_set
+                // Backfill reflections that exist in DB but not in HNSW.
+                // Fetch only the missing ids, in bounded batches — never the
+                // whole reflection table.
+                let missing: Vec<String> = db_id_set
                     .iter()
                     .filter(|id| !search.has_reflection(id))
-                    .copied()
+                    .map(|s| s.to_string())
                     .collect();
                 if !missing.is_empty() {
-                    if let Ok(all_vecs) = storage.load_all_reflection_vectors() {
-                        let mut added = 0;
-                        for (id, vec) in &all_vecs {
-                            if missing.contains(&id.as_str()) {
-                                search.insert_reflection(id.clone(), vec.clone());
-                                added += 1;
-                            }
-                        }
+                    if let Ok(added) = backfill_missing_reflections(&storage, &mut search, &missing)
+                    {
                         if added > 0 {
                             tracing::info!(added, "backfilled missing reflections into HNSW cache");
                         }
@@ -120,24 +116,18 @@ impl Engine {
             }
 
             // Backfill chunks added to DB since the last dump (additive drift).
-            // Cheap ID probe first; only load the (large) vector set if something is
-            // actually missing. This is what lets a stale-but-additive cache load in
-            // ~ms instead of triggering a full HNSW rebuild (~tens of seconds).
+            // Cheap ID probe first; only fetch the vectors that are actually
+            // missing (in bounded batches) if something is missing. This is what
+            // lets a stale-but-additive cache load in ~ms instead of triggering a
+            // full HNSW rebuild (~tens of seconds), while keeping peak transient
+            // memory O(batch) rather than O(corpus).
             if let Ok(db_chunk_ids) = storage.load_all_chunk_ids() {
-                let missing: std::collections::HashSet<&str> = db_chunk_ids
-                    .iter()
+                let missing: Vec<String> = db_chunk_ids
+                    .into_iter()
                     .filter(|id| !search.has_chunk(id))
-                    .map(|s| s.as_str())
                     .collect();
                 if !missing.is_empty() {
-                    if let Ok(all_vecs) = storage.load_all_chunk_vectors() {
-                        let mut added = 0;
-                        for (id, vec) in &all_vecs {
-                            if missing.contains(id.as_str()) {
-                                search.insert_chunk(id.clone(), vec.clone());
-                                added += 1;
-                            }
-                        }
+                    if let Ok(added) = backfill_missing_chunks(&storage, &mut search, &missing) {
                         if added > 0 {
                             tracing::info!(added, "backfilled missing chunks into HNSW cache");
                         }
@@ -146,21 +136,13 @@ impl Engine {
             }
             search
         } else {
-            // Cache miss — rebuild from SQLite vectors
+            // Cache miss — rebuild from SQLite vectors, streaming in bounded
+            // batches so peak transient memory is O(batch) instead of
+            // O(corpus) (no `load_all_chunk_vectors()` + clone-into-index).
             tracing::info!("building search index from stored vectors");
 
-            let chunk_vecs = storage.load_all_chunk_vectors()?;
-            let t_load = t0.elapsed();
-
-            let estimated_size = (chunk_vecs.len() + 1000).max(10_000);
-            let mut search = SearchEngine::new(estimated_size);
-            for (id, vec) in &chunk_vecs {
-                search.insert_chunk(id.clone(), vec.clone());
-            }
-            let reflection_vecs = storage.load_all_reflection_vectors()?;
-            for (id, vec) in &reflection_vecs {
-                search.insert_reflection(id.clone(), vec.clone());
-            }
+            let (mut search, chunk_total, reflection_total) =
+                rebuild_search_index_streaming(&storage, RECONCILE_BATCH)?;
             let t_hnsw = t0.elapsed();
 
             // Re-query counts right before dump to minimize staleness window (E-1)
@@ -175,19 +157,18 @@ impl Engine {
             let t_total = t0.elapsed();
 
             tracing::info!(
-                chunks = chunk_vecs.len(),
-                reflections = reflection_vecs.len(),
+                chunks = chunk_total,
+                reflections = reflection_total,
                 "search index rebuilt and cached"
             );
             let startup_line = format!(
-                "CSR startup: storage={:.0}ms embed={:.0}ms vectors={:.0}ms hnsw={:.0}ms dump={:.0}ms total={:.0}ms ({} chunks, rebuilt)",
+                "CSR startup: storage={:.0}ms embed={:.0}ms hnsw={:.0}ms dump={:.0}ms total={:.0}ms ({} chunks, rebuilt)",
                 t_storage.as_secs_f64() * 1000.0,
                 (t_embed - t_storage).as_secs_f64() * 1000.0,
-                (t_load - t_count).as_secs_f64() * 1000.0,
-                (t_hnsw - t_load).as_secs_f64() * 1000.0,
+                (t_hnsw - t_count).as_secs_f64() * 1000.0,
                 (t_total - t_hnsw).as_secs_f64() * 1000.0,
                 t_total.as_secs_f64() * 1000.0,
-                chunk_vecs.len(),
+                chunk_total,
             );
             eprintln!("{}", startup_line);
             log_timing(&startup_line);
@@ -509,5 +490,220 @@ impl Engine {
         }
 
         Ok(())
+    }
+}
+
+/// Batch size for reconciling the HNSW cache against SQLite: both the
+/// additive-drift backfill (missing ids only) and the cache-miss full
+/// rebuild fetch vectors this many ids at a time, so peak transient memory
+/// is O(batch) instead of O(corpus). See src/engine.rs:126-165 history.
+const RECONCILE_BATCH: usize = 2_000;
+
+/// Fetch and insert only the given missing chunk ids, in bounded batches.
+/// Never materializes more than `batch_size` vectors at once. Returns the
+/// number of points actually inserted.
+fn backfill_missing_chunks_batched(
+    storage: &Storage,
+    search: &mut SearchEngine,
+    missing_ids: &[String],
+    batch_size: usize,
+) -> Result<usize> {
+    let mut added = 0;
+    for batch in missing_ids.chunks(batch_size.max(1)) {
+        let vecs = storage.get_chunk_vectors_by_ids(batch)?;
+        added += vecs.len();
+        for (id, vec) in vecs {
+            search.insert_chunk(id, vec);
+        }
+    }
+    Ok(added)
+}
+
+fn backfill_missing_chunks(
+    storage: &Storage,
+    search: &mut SearchEngine,
+    missing_ids: &[String],
+) -> Result<usize> {
+    backfill_missing_chunks_batched(storage, search, missing_ids, RECONCILE_BATCH)
+}
+
+/// Reflection counterpart of [`backfill_missing_chunks_batched`].
+fn backfill_missing_reflections_batched(
+    storage: &Storage,
+    search: &mut SearchEngine,
+    missing_ids: &[String],
+    batch_size: usize,
+) -> Result<usize> {
+    let mut added = 0;
+    for batch in missing_ids.chunks(batch_size.max(1)) {
+        let vecs = storage.get_reflection_vectors_by_ids(batch)?;
+        added += vecs.len();
+        for (id, vec) in vecs {
+            search.insert_reflection(id, vec);
+        }
+    }
+    Ok(added)
+}
+
+fn backfill_missing_reflections(
+    storage: &Storage,
+    search: &mut SearchEngine,
+    missing_ids: &[String],
+) -> Result<usize> {
+    backfill_missing_reflections_batched(storage, search, missing_ids, RECONCILE_BATCH)
+}
+
+/// Rebuild the HNSW index from SQLite, streaming vectors in bounded batches
+/// instead of materializing `load_all_chunk_vectors()` (the whole corpus) as
+/// one `Vec<(String, Vec<f32>)>` before inserting. Cheap id probes
+/// (`load_all_chunk_ids` / `load_all_reflection_ids`) drive the batching;
+/// each batch's vectors are moved (not cloned) into the index and dropped
+/// before the next batch is fetched. Returns the built index plus the
+/// (chunks, reflections) counts actually inserted.
+fn rebuild_search_index_streaming(
+    storage: &Storage,
+    batch_size: usize,
+) -> Result<(SearchEngine, usize, usize)> {
+    let chunk_ids = storage.load_all_chunk_ids()?;
+    let reflection_ids = storage.load_all_reflection_ids()?;
+
+    let estimated_size = (chunk_ids.len() + 1000).max(10_000);
+    let mut search = SearchEngine::new(estimated_size);
+
+    let mut chunk_total = 0usize;
+    for batch in chunk_ids.chunks(batch_size.max(1)) {
+        let vecs = storage.get_chunk_vectors_by_ids(batch)?;
+        chunk_total += vecs.len();
+        for (id, vec) in vecs {
+            search.insert_chunk(id, vec);
+        }
+    }
+
+    let mut reflection_total = 0usize;
+    for batch in reflection_ids.chunks(batch_size.max(1)) {
+        let vecs = storage.get_reflection_vectors_by_ids(batch)?;
+        reflection_total += vecs.len();
+        for (id, vec) in vecs {
+            search.insert_reflection(id, vec);
+        }
+    }
+
+    Ok((search, chunk_total, reflection_total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::import::ConversationChunk;
+    use crate::provenance::Speaker;
+
+    fn insert_test_chunk(storage: &Storage, id: &str) {
+        storage
+            .insert_chunk(
+                &ConversationChunk {
+                    id: id.into(),
+                    conversation_id: "conv".into(),
+                    project_name: "proj".into(),
+                    timestamp: "2026-09-08T00:00:00Z".into(),
+                    content: "x".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::User,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                &[0.1_f32; 384],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn backfill_missing_chunks_inserts_exactly_the_missing_ids_in_batches() {
+        let storage = Storage::open_memory().unwrap();
+        for i in 0..10 {
+            insert_test_chunk(&storage, &format!("chunk-{i}"));
+        }
+        let mut search = SearchEngine::new(100);
+        // Pre-seed half of them as already-present — these must be skipped,
+        // not re-fetched (proves we fetch only the missing ids, not the corpus).
+        for i in 0..5 {
+            search.insert_chunk(format!("chunk-{i}"), vec![0.1_f32; 384]);
+        }
+
+        let db_ids = storage.load_all_chunk_ids().unwrap();
+        let missing: Vec<String> = db_ids
+            .into_iter()
+            .filter(|id| !search.has_chunk(id))
+            .collect();
+        assert_eq!(missing.len(), 5, "sanity: half should be missing");
+
+        // batch_size=2 over 5 missing ids forces 3 separate batched lookups
+        // (2, 2, 1) — exercises the bounded-batch path, not a single big fetch.
+        let added = backfill_missing_chunks_batched(&storage, &mut search, &missing, 2).unwrap();
+
+        assert_eq!(
+            added, 5,
+            "must insert exactly the missing ids, not the whole corpus"
+        );
+        for i in 5..10 {
+            assert!(search.has_chunk(&format!("chunk-{i}")));
+        }
+    }
+
+    #[test]
+    fn backfill_missing_reflections_inserts_exactly_the_missing_ids_in_batches() {
+        let storage = Storage::open_memory().unwrap();
+        for i in 0..7 {
+            storage
+                .insert_reflection(&format!("refl-{i}"), "content", &[], &[0.2_f32; 384])
+                .unwrap();
+        }
+        let mut search = SearchEngine::new(100);
+        for i in 0..3 {
+            search.insert_reflection(format!("refl-{i}"), vec![0.2_f32; 384]);
+        }
+
+        let db_ids = storage.load_all_reflection_ids().unwrap();
+        let missing: Vec<String> = db_ids
+            .into_iter()
+            .filter(|id| !search.has_reflection(id))
+            .collect();
+        assert_eq!(missing.len(), 4, "sanity: 4 should be missing");
+
+        let added =
+            backfill_missing_reflections_batched(&storage, &mut search, &missing, 3).unwrap();
+
+        assert_eq!(added, 4);
+        for i in 3..7 {
+            assert!(search.has_reflection(&format!("refl-{i}")));
+        }
+    }
+
+    #[test]
+    fn rebuild_search_index_streaming_inserts_all_corpus_points_via_batches() {
+        let storage = Storage::open_memory().unwrap();
+        for i in 0..7 {
+            insert_test_chunk(&storage, &format!("chunk-{i}"));
+        }
+        for i in 0..3 {
+            storage
+                .insert_reflection(&format!("refl-{i}"), "content", &[], &[0.2_f32; 384])
+                .unwrap();
+        }
+
+        // batch_size=2 forces multiple batches for both chunks (7) and
+        // reflections (3) — proves the rebuild path never needs a single
+        // corpus-sized fetch to produce a correct index.
+        let (search, chunk_total, reflection_total) =
+            rebuild_search_index_streaming(&storage, 2).unwrap();
+
+        assert_eq!(chunk_total, 7);
+        assert_eq!(reflection_total, 3);
+        for i in 0..7 {
+            assert!(search.has_chunk(&format!("chunk-{i}")));
+        }
+        for i in 0..3 {
+            assert!(search.has_reflection(&format!("refl-{i}")));
+        }
     }
 }

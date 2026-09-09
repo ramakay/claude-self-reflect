@@ -946,15 +946,49 @@ async fn run_consolidation(
     Ok(())
 }
 
+/// Resolve the MCP-server enrichment loops' initial delay:
+/// `CSR_ENRICH_INITIAL_DELAY_SECS` if it parses as a non-negative `u64`,
+/// else the default 120s. Junk/unset falls back to the default rather than
+/// erroring — this is read once at server startup and must never fail.
+/// A value of `0` is honored (explicit opt-out of the delay).
+fn resolve_enrich_initial_delay() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 120;
+    let secs = std::env::var("CSR_ENRICH_INITIAL_DELAY_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Hold an MCP-side enrichment loop back for `delay` before its first tick.
+/// Every loop `spawn_enrichment_loops` starts goes through this — extraction,
+/// narration and consolidation all embed (consolidation runs before its
+/// first sleep), so gating only one of them would still load the model at
+/// t=0 whenever the others have queued work.
+async fn delayed<F: std::future::Future<Output = ()>>(delay: std::time::Duration, fut: F) {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    fut.await;
+}
+
 /// Spawn enrichment loops as background tokio tasks (for embedding in MCP server).
 /// Returns join handles that can be aborted on shutdown. Does NOT acquire the daemon lockfile
 /// (so the standalone `csr-engine daemon` can still run alongside if needed).
+///
+/// All three loops wait `CSR_ENRICH_INITIAL_DELAY_SECS` (default 120s)
+/// before their first tick: this function only runs inside `csr-engine serve`
+/// (src/engine.rs `serve_mcp`), where an MCP session that never calls a tool
+/// would otherwise start embedding at t=0 with no user request behind it.
+/// The standalone `csr-engine daemon` (`Daemon::run` above) spawns its loops
+/// directly and keeps its immediate-start behavior.
 pub fn spawn_enrichment_loops(
     storage: Arc<Storage>,
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let shutdown = Arc::new(AtomicBool::new(false));
+    let initial_delay = resolve_enrich_initial_delay();
 
     // Layer 2: V3 extraction (free, runs every 60s — less aggressive than standalone daemon)
     let ext_handle = {
@@ -962,9 +996,7 @@ pub fn spawn_enrichment_loops(
         let e = embeddings.clone();
         let idx = search.clone();
         let sd = shutdown.clone();
-        tokio::spawn(async move {
-            extraction_loop(s, e, idx, 60, sd).await;
-        })
+        tokio::spawn(delayed(initial_delay, extraction_loop(s, e, idx, 60, sd)))
     };
 
     // Layer 3: AI narrative (only if API key set)
@@ -974,9 +1006,10 @@ pub fn spawn_enrichment_loops(
         let e = embeddings.clone();
         let idx = search.clone();
         let sd = shutdown.clone();
-        Some(tokio::spawn(async move {
-            narrator_loop(s, e, idx, client, 10, 1800, 60, sd).await;
-        }))
+        Some(tokio::spawn(delayed(
+            initial_delay,
+            narrator_loop(s, e, idx, client, 10, 1800, 60, sd),
+        )))
     } else {
         None
     };
@@ -987,9 +1020,7 @@ pub fn spawn_enrichment_loops(
         let e = embeddings.clone();
         let idx = search.clone();
         let sd = shutdown;
-        tokio::spawn(async move {
-            consolidation_loop(s, e, idx, sd).await;
-        })
+        tokio::spawn(delayed(initial_delay, consolidation_loop(s, e, idx, sd)))
     };
 
     let mut handles = vec![ext_handle, consol_handle];
@@ -1066,5 +1097,94 @@ mod tests {
         assert_eq!(*sampled[49], 49);
         assert_eq!(*sampled[50], 150); // first of the tail
         assert_eq!(*sampled[99], 199);
+    }
+
+    #[test]
+    fn enrich_initial_delay_env() {
+        // Unique to this module — no shared mutex needed, same rationale as
+        // memory_registry_kill_switch_env above.
+        std::env::remove_var("CSR_ENRICH_INITIAL_DELAY_SECS");
+        assert_eq!(
+            resolve_enrich_initial_delay(),
+            std::time::Duration::from_secs(120)
+        );
+        std::env::set_var("CSR_ENRICH_INITIAL_DELAY_SECS", "5");
+        assert_eq!(
+            resolve_enrich_initial_delay(),
+            std::time::Duration::from_secs(5)
+        );
+        // 0 is a valid, explicit opt-out — must be honored, not treated as unset.
+        std::env::set_var("CSR_ENRICH_INITIAL_DELAY_SECS", "0");
+        assert_eq!(resolve_enrich_initial_delay(), std::time::Duration::ZERO);
+        std::env::set_var("CSR_ENRICH_INITIAL_DELAY_SECS", "not-a-number");
+        assert_eq!(
+            resolve_enrich_initial_delay(),
+            std::time::Duration::from_secs(120)
+        );
+        std::env::remove_var("CSR_ENRICH_INITIAL_DELAY_SECS");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_holds_the_loop_body_until_the_delay_elapses() {
+        use std::sync::Mutex;
+        let start = tokio::time::Instant::now();
+        let ran_at: Arc<Mutex<Option<tokio::time::Instant>>> = Arc::new(Mutex::new(None));
+        let slot = ran_at.clone();
+        let handle = tokio::spawn(delayed(std::time::Duration::from_secs(120), async move {
+            *slot.lock().unwrap() = Some(tokio::time::Instant::now());
+        }));
+        // Let the spawned wrapper poll once so its sleep timer is registered
+        // before the clock moves; otherwise advance() has nothing to fire.
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(119)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            ran_at.lock().unwrap().is_none(),
+            "body ran before the delay elapsed"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        let at = ran_at
+            .lock()
+            .unwrap()
+            .expect("body never ran after the delay");
+        let elapsed = at.duration_since(start);
+        assert!(
+            elapsed >= std::time::Duration::from_secs(120)
+                && elapsed <= std::time::Duration::from_secs(121),
+            "body ran at {elapsed:?}, expected ~120s"
+        );
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_aborted_before_the_deadline_never_runs_the_body() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let handle = tokio::spawn(delayed(std::time::Duration::from_secs(120), async move {
+            flag.store(true, Ordering::SeqCst);
+        }));
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        // serve_mcp aborts the enrichment handles on shutdown; an abort
+        // during the delay must drop the pending loop, not run it later.
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(!ran.load(Ordering::SeqCst), "aborted body still ran");
+    }
+
+    #[tokio::test]
+    async fn delayed_with_zero_delay_runs_immediately() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        delayed(std::time::Duration::ZERO, async move {
+            flag.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert!(ran.load(Ordering::SeqCst));
     }
 }

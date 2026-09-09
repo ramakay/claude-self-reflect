@@ -42,6 +42,7 @@ ignore = "0.4"
 toml = "0.9"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 
