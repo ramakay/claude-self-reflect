@@ -5,6 +5,48 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.5.5] - 2026-09-09
+
+### Fixed
+
+- **Every engine process no longer pays for the embedding model and the
+  whole vector table at startup.** The MCP server and every hook fire
+  (prompt-submit, stop, post-tool-use for edits, session hooks) build the same
+  `Engine`; three of its startup costs were unconditional and are now not:
+  - The ONNX model (fp32 all-MiniLM-L6-v2) loaded eagerly whether or not the
+    process ever embedded. It now loads on the first `embed` behind a fallible
+    once-cell, with the existing retry loop. Paths that embed immediately
+    (`daemon`, `--import`/`--enrich`, `setup`, `eval`) still warm it up front;
+    `setup` does so before writing any MCP or hook config, so a failed
+    first-run download never leaves setup half-applied.
+  - Reconciling the HNSW cache against SQLite fetched the entire
+    `chunk_embeddings` table to backfill one missing vector (+380 MB
+    transient on a 237k-chunk corpus). It now fetches only the missing ids in
+    2,000-id batches (`get_chunk_vectors_by_ids` and the new
+    `get_reflection_vectors_by_ids`), and a cache-miss rebuild streams the
+    corpus in the same batches instead of materialising and cloning it.
+  - The MCP server started its extraction, narration and consolidation loops
+    at t=0. They now wait `CSR_ENRICH_INITIAL_DELAY_SECS` (default 120) so an
+    idle server does not start embedding before its first tool call. The
+    standalone `daemon` is unchanged.
+  - ORT intra-op threads and tokio workers are capped at `min(4, cores)`;
+    `CSR_EMBED_THREADS` / `CSR_TOKIO_WORKERS` override (1..=64). A server
+    now runs 6 threads instead of 37-55.
+
+  Measured with the new `csr-engine/scripts/profile-memory.sh` (macOS,
+  isolated scratch HOME, fresh db+index snapshots, medians of 3) on a
+  237,412-chunk corpus, 9.5.4 vs 9.5.5: bare MCP initialize 1253 → 1104 MB
+  peak RSS (1209 → 1039 MB private footprint, 0.86 → 0.74 s); a long-lived
+  server's live heap 898 → 798 MiB; one chunk of index drift on startup
+  +382 → +4 MB. prompt-submit's peak RSS rises 26 MB because the model now
+  loads after the index is resident, while its private footprint drops
+  170 MB. Every hook fire still costs the index load (~1.1 GB peak); that
+  needs a resident engine and is not in this release.
+  (9.5 port of #300; reviewed by Codex and CodeRabbit on the 10.x branch.)
+- Example `quick_check_floor` no longer trips clippy 1.98's
+  `chunks_exact_to_as_chunks`, which the release workflow runs with
+  `-D warnings`.
+
 ## [9.5.4] - 2026-08-20
 
 ### Fixed
