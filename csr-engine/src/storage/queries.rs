@@ -2869,6 +2869,41 @@ pub fn get_chunk_vectors_by_ids(
     Ok(results)
 }
 
+/// Reflection counterpart of [`get_chunk_vectors_by_ids`] — same chunked-IN-clause
+/// approach and blob decoding, scoped to `reflection_embeddings`. Lets the engine
+/// reconciliation path (engine.rs) fetch only the reflection ids missing from the
+/// HNSW cache instead of `load_all_reflection_vectors` (O(corpus)).
+pub fn get_reflection_vectors_by_ids(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<(String, Vec<f32>)>> {
+    const BATCH: usize = 500;
+    let mut results = Vec::new();
+    for batch in ids.chunks(BATCH) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT reflection_id, embedding FROM reflection_embeddings WHERE reflection_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let bound: Vec<&dyn rusqlite::ToSql> =
+            batch.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(bound.as_slice(), |row| {
+            let id: String = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((id, bytes_to_vec(&bytes)))
+        })?;
+        for row in rows {
+            results.push(row?);
+        }
+    }
+    Ok(results)
+}
+
 /// Most-touched files for a session (code_evolution), highest-frequency first. Lifted from
 /// the Phase 0 spike (examples/saga_spike.rs::files_for_session), now with a caller-supplied
 /// limit instead of a hardcoded 4.

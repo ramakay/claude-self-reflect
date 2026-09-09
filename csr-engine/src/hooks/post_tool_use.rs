@@ -13,6 +13,14 @@ use anyhow::Result;
 use super::HookInput;
 use crate::engine::Engine;
 
+/// Tool names whose edits this hook tracks (code evolution + code graph).
+/// The transcript sync above the gate runs for every fire regardless; the
+/// installer's PostToolUse matcher (`Edit|Write|MultiEdit|NotebookEdit`,
+/// see `hooks::install`) is deliberately a superset of this list.
+pub fn is_acted_on_tool(tool_name: Option<&str>) -> bool {
+    matches!(tool_name, Some("Edit") | Some("Write") | Some("MultiEdit"))
+}
+
 /// Handle the post-tool-use hook.
 /// Always returns Ok(()) to never block Claude Code (C-2 fix).
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
@@ -20,16 +28,14 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     super::import_current_transcript(input, engine, cwd).await;
 
     // Track code evolution for Edit/Write/MultiEdit operations (v9)
-    if let Some(ref tool_name) = input.tool_name {
-        if tool_name == "Edit" || tool_name == "Write" || tool_name == "MultiEdit" {
-            if let Err(e) = track_code_evolution(input, engine).await {
-                eprintln!("CSR: code evolution tracking error (non-fatal): {}", e);
-            }
-            // v9.4 liveness path: re-extract the touched file into the code graph
-            // so callers/callees/ledger reflect the edit immediately.
-            if let Err(e) = update_code_graph(input, engine) {
-                eprintln!("CSR: code graph update error (non-fatal): {}", e);
-            }
+    if is_acted_on_tool(input.tool_name.as_deref()) {
+        if let Err(e) = track_code_evolution(input, engine).await {
+            eprintln!("CSR: code evolution tracking error (non-fatal): {}", e);
+        }
+        // v9.4 liveness path: re-extract the touched file into the code graph
+        // so callers/callees/ledger reflect the edit immediately.
+        if let Err(e) = update_code_graph(input, engine) {
+            eprintln!("CSR: code graph update error (non-fatal): {}", e);
         }
     }
 
@@ -421,6 +427,21 @@ fn resolve_project_for_hook_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_acted_on_tool_true_for_edit_write_multiedit() {
+        assert!(is_acted_on_tool(Some("Edit")));
+        assert!(is_acted_on_tool(Some("Write")));
+        assert!(is_acted_on_tool(Some("MultiEdit")));
+    }
+
+    #[test]
+    fn is_acted_on_tool_false_for_everything_else() {
+        assert!(!is_acted_on_tool(Some("Read")));
+        assert!(!is_acted_on_tool(Some("Bash")));
+        assert!(!is_acted_on_tool(Some("Grep")));
+        assert!(!is_acted_on_tool(None));
+    }
 
     #[test]
     fn resolve_project_for_hook_from_file_parent() {
