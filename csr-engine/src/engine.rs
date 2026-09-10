@@ -190,6 +190,11 @@ impl Engine {
             // lock released on drop
         }
 
+        // The index is built and reconciled; hand the allocator's freed transient
+        // pages back to the OS so this server's steady-state footprint reflects live
+        // memory rather than retained slack (macOS-only; no-op elsewhere).
+        crate::runtime::release_freed_pages();
+
         Ok(Self {
             storage,
             embeddings,

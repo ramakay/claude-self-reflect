@@ -15,6 +15,7 @@ use fs2::FileExt;
 use hnsw_rs::api::AnnT;
 use hnsw_rs::hnsw::Hnsw;
 use hnsw_rs::hnswio::HnswIo;
+use hnsw_rs::hnswio::ReloadOptions;
 use hnsw_rs::prelude::DistCosine;
 use hnsw_rs::prelude::Distance;
 use serde::{Deserialize, Serialize};
@@ -554,8 +555,15 @@ impl SearchEngine {
         // `chunks.hnsw.*` files a prior generation left behind and map fresh ids onto
         // those stale vectors. Gating on the id map treats that manifest as empty and
         // rebuilds from the DB instead.
+        let lock_held = _lock_guard.is_some();
+        let chunk_use_mmap = should_mmap_generation(
+            dir,
+            &manifest.chunk_basename,
+            &default_chunk_basename(),
+            lock_held,
+        );
         let mut chunk_io = (!manifest.chunk_id_map.is_empty())
-            .then(|| PendingHnswIo::new(dir, &manifest.chunk_basename));
+            .then(|| PendingHnswIo::new(dir, &manifest.chunk_basename, chunk_use_mmap));
         let chunk_hnsw = if let Some(io) = chunk_io.as_mut() {
             match io.load() {
                 Ok(hnsw) => hnsw,
@@ -576,8 +584,14 @@ impl SearchEngine {
 
         // Same reasoning as the chunk index above: gate on the persisted id map, which
         // is what `dump_to_disk` keyed the generation write on, not the DB count.
+        let refl_use_mmap = should_mmap_generation(
+            dir,
+            &manifest.reflection_basename,
+            &default_reflection_basename(),
+            lock_held,
+        );
         let mut refl_io = (!manifest.reflection_id_map.is_empty())
-            .then(|| PendingHnswIo::new(dir, &manifest.reflection_basename));
+            .then(|| PendingHnswIo::new(dir, &manifest.reflection_basename, refl_use_mmap));
         let refl_hnsw = if let Some(io) = refl_io.as_mut() {
             match io.load() {
                 Ok(hnsw) => hnsw,
@@ -684,13 +698,125 @@ fn write_manifest_atomically(dir: &Path, manifest: &IndexManifest) -> Result<()>
     Ok(())
 }
 
+/// Decide whether a HNSW generation is safe to mmap rather than heap-load.
+///
+/// Two conditions, both required:
+///
+/// 1. **Not the legacy canonical basename.** A dump from a pre-9.5.4 process
+///    (before numbered generations) writes the canonical `chunks.hnsw.data` /
+///    `reflections.hnsw.data` in place with `overwrite=true`, truncating it. If
+///    this process had that file mapped, the truncation would SIGBUS it. Numbered
+///    generations (`chunks-<pid>-<n>`) are written once to a unique name and never
+///    overwritten or truncated, so only they are safe to map while other processes
+///    (possibly older builds) share the directory. A canonical generation is loaded
+///    heap-backed; the mmap win arrives once any dump migrates the index to a
+///    numbered generation (every post-9.5.4 dump does).
+///
+/// 2. **The files are actually mappable.** `hnsw_rs`'s `from_hnswdump` calls
+///    `std::process::exit(1)` — not a recoverable error — if the graph file cannot
+///    be opened, the data file cannot be stat'd/opened, or the data file cannot be
+///    mapped. Turning mmap on would therefore let a transient mapping failure kill
+///    the MCP server or a hook instead of falling back to a heap rebuild. Probing
+///    the exact operations here (open the graph, map the data, unmap) means a
+///    failure returns `false` and the caller heap-loads, preserving the pre-mmap
+///    fallback behaviour.
+fn should_mmap_generation(
+    dir: &Path,
+    basename: &str,
+    default_basename: &str,
+    lock_held: bool,
+) -> bool {
+    // Only map with the shared load lock held. Without it, a concurrent dump could
+    // publish a new generation and unlink these files between hnsw_rs's `init()` and
+    // `from_hnswdump` reopening them, reaching a `process::exit(1)` path. The lock is
+    // present in normal operation (dump/startup create `index.lock`); a copied cache
+    // that lacks it is loaded heap-backed, which is always safe.
+    if !lock_held {
+        return false;
+    }
+    // Only map a NUMBERED generation (`<prefix>-...`), never the legacy canonical
+    // `<prefix>.hnsw.data`: a pre-9.5.4 process can truncate the canonical file in
+    // place, which would SIGBUS a process mapping it. Engine-written manifests only
+    // ever name `<prefix>` or `<prefix>-<pid>-<n>`, so this prefix check is exact for
+    // real inputs; it is not a general alias validator (a hand-crafted `<prefix>-x`
+    // pointing elsewhere would pass), which real manifests never produce.
+    let numbered_prefix = format!("{default_basename}-");
+    if !basename.starts_with(&numbered_prefix) {
+        return false;
+    }
+    // The graph file must open (from_hnswdump exits if it cannot) and the data file
+    // must be mappable (else from_hnswdump exits). Probing up front lets a failure
+    // fall back to a heap rebuild instead of killing the process. This narrows but
+    // cannot fully close the exit window: hnsw_rs reopens the files during the real
+    // load, so a resource failure that appears only then (e.g. EMFILE) can still hit
+    // its exit path — `raise_fd_limit` removes that specific trigger at startup.
+    if std::fs::File::open(dir.join(format!("{basename}.hnsw.graph"))).is_err() {
+        return false;
+    }
+    data_file_is_mmappable(&dir.join(format!("{basename}.hnsw.data")))
+}
+
+/// Probe that a file can be memory-mapped read-only, then unmap it. Returns false
+/// on any failure (missing, empty, unmappable filesystem, resource limit) so the
+/// caller can heap-load instead of handing an un-mappable file to `hnsw_rs`, which
+/// would `process::exit(1)`.
+#[cfg(unix)]
+fn data_file_is_mmappable(path: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let len = meta.len();
+    if len == 0 {
+        return false;
+    }
+    let Ok(len) = usize::try_from(len) else {
+        return false;
+    };
+    // SAFETY: a read-only probe map of an open regular file at offset 0. We never
+    // dereference the returned pointer and unmap it immediately; on failure `mmap`
+    // returns MAP_FAILED, which we check before calling `munmap`.
+    unsafe {
+        let addr = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
+        if addr == libc::MAP_FAILED {
+            return false;
+        }
+        libc::munmap(addr, len);
+    }
+    true
+}
+
+/// Non-unix has no reliable unlink-under-mmap guarantee (Windows can deny or defer
+/// deletion of a mapped file), so never mmap there — heap-load is always correct.
+#[cfg(not(unix))]
+fn data_file_is_mmappable(_path: &Path) -> bool {
+    false
+}
+
 struct PendingHnswIo {
     io: NonNull<HnswIo>,
 }
 
 impl PendingHnswIo {
-    fn new(dir: &Path, basename: &str) -> Self {
-        let io = Box::new(HnswIo::new(dir, basename));
+    /// `use_mmap` maps the `.hnsw.data` vectors instead of reading them into the
+    /// heap. The returned `Hnsw` then borrows point slices from this `HnswIo`'s
+    /// mapping, which is why a fully successful load leaks the `HnswIo` (see `leak`)
+    /// so the mapping outlives the process's use of the index. It must only be set
+    /// for a numbered generation the caller has already confirmed is mappable — see
+    /// `should_mmap_generation`.
+    fn new(dir: &Path, basename: &str, use_mmap: bool) -> Self {
+        let options = ReloadOptions::new(use_mmap);
+        let io = Box::new(HnswIo::new_with_options(dir, basename, options));
         Self {
             io: NonNull::new(Box::into_raw(io)).expect("Box::into_raw never returns null"),
         }
@@ -1169,5 +1295,250 @@ mod tests {
     #[test]
     fn test_cleanup_no_panic_on_nonexistent_dir() {
         cleanup_stale_index_files(Path::new("/nonexistent/path")); // should not panic
+    }
+
+    // Build `n` deterministic 384-dim unit-ish vectors keyed by index.
+    fn synthetic_vectors(n: usize) -> Vec<Vec<f32>> {
+        (0..n)
+            .map(|i| {
+                (0..384)
+                    .map(|j| (((i * 384 + j) as f32) * 0.001).sin())
+                    .collect()
+            })
+            .collect()
+    }
+
+    // The canonical (legacy, pre-9.5.4) basename must NOT be mmapped, because an old
+    // process can truncate it in place. `should_mmap_generation` returns false for it,
+    // true for a numbered generation with real files, and false when the files are
+    // missing. A canonical index still loads and searches correctly (heap-backed).
+    #[test]
+    fn canonical_generation_is_never_mmapped_but_still_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Canonical basename is refused regardless of whether files exist.
+        assert!(!should_mmap_generation(
+            dir,
+            &default_chunk_basename(),
+            &default_chunk_basename(),
+            true
+        ));
+        // A numbered basename with no files on disk is refused (would exit in hnsw_rs).
+        assert!(!should_mmap_generation(
+            dir,
+            "chunks-1-2",
+            &default_chunk_basename(),
+            true
+        ));
+
+        // Build an index, dump it, then rewrite the manifest to the LEGACY canonical
+        // layout (as a pre-9.5.4 dump would have left it) and rename the files to match.
+        let vecs = synthetic_vectors(300);
+        let mut writer = SearchEngine::new(400);
+        for (i, v) in vecs.iter().enumerate() {
+            writer.insert_chunk(format!("c{i}"), v.clone());
+        }
+        writer.dump_to_disk(dir, 300, 0).unwrap();
+        let manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let numbered = manifest.chunk_basename.clone();
+        std::fs::rename(
+            dir.join(format!("{numbered}.hnsw.data")),
+            dir.join("chunks.hnsw.data"),
+        )
+        .unwrap();
+        std::fs::rename(
+            dir.join(format!("{numbered}.hnsw.graph")),
+            dir.join("chunks.hnsw.graph"),
+        )
+        .unwrap();
+        let mut legacy = serde_json::to_value(&manifest).unwrap();
+        legacy["chunk_basename"] = serde_json::json!("chunks");
+        legacy["version"] = serde_json::json!(1);
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        // Now the numbered generation is refused (files gone), the canonical layout is
+        // refused by basename, and the index still loads heap-backed and searches.
+        assert!(!should_mmap_generation(
+            dir,
+            "chunks",
+            &default_chunk_basename(),
+            true
+        ));
+        // A numbered generation with a missing lock is refused (no unlink protection).
+        assert!(!should_mmap_generation(
+            dir,
+            "chunks-9-9",
+            &default_chunk_basename(),
+            false
+        ));
+        let loaded = SearchEngine::load_from_disk(dir, 300, 0).expect("canonical index loads");
+        assert_eq!(
+            loaded
+                .search_chunks(&vecs[42], 3, 0.1)
+                .first()
+                .map(|r| r.id.as_str()),
+            Some("c42"),
+            "canonical (heap-backed) index must search correctly"
+        );
+    }
+
+    // The core PR2 safety property: a process holding an mmap-backed generation keeps
+    // serving correct results after ANOTHER process publishes a new generation and
+    // `cleanup_stale_index_files` unlinks the older one. On unix the inode and its
+    // pages survive until the last mapping is dropped, so the mapped reads stay valid.
+    // This is what makes turning mmap on safe under concurrent csr-engine processes.
+    #[cfg(unix)]
+    #[test]
+    fn mmap_backed_index_survives_concurrent_generation_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Generation 1: 300 chunks (> EXACT_SCAN_THRESHOLD, so search walks the HNSW
+        // graph and reads vectors through the mmap rather than exact-scanning).
+        let vecs = synthetic_vectors(300);
+        let mut writer = SearchEngine::new(400);
+        for (i, v) in vecs.iter().enumerate() {
+            writer.insert_chunk(format!("c{i}"), v.clone());
+        }
+        writer.dump_to_disk(dir, 300, 0).unwrap();
+
+        // A reader loads generation 1 mmap-backed (leaks an HnswIo holding the map).
+        let reader = SearchEngine::load_from_disk(dir, 300, 0).expect("load generation 1");
+        let gen1_data = {
+            let manifest: IndexManifest =
+                serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+            dir.join(format!("{}.hnsw.data", manifest.chunk_basename))
+        };
+        assert!(gen1_data.exists(), "generation 1 data file should exist");
+        // The generation must be numbered so `should_mmap_generation` mapped it (a
+        // canonical basename would be heap-loaded and this test would not exercise mmap).
+        let gen1_basename = gen1_data
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .trim_end_matches(".hnsw.data")
+            .to_string();
+        assert!(
+            gen1_basename.starts_with("chunks-"),
+            "expected a numbered generation, got {gen1_basename}"
+        );
+        assert!(
+            should_mmap_generation(dir, &gen1_basename, &default_chunk_basename(), true),
+            "generation 1 should be mmap-backed"
+        );
+
+        // Sanity: the mmap-backed reader returns the self-match with a near-1.0 score.
+        let before = reader.search_chunks(&vecs[142], 5, 0.1);
+        assert_eq!(before.first().map(|r| r.id.as_str()), Some("c142"));
+
+        // Another process publishes generation 2 (500 chunks). dump_to_disk commits the
+        // new manifest and runs cleanup, which unlinks generation 1's numbered files.
+        let vecs2 = synthetic_vectors(500);
+        let mut publisher = SearchEngine::new(600);
+        for (i, v) in vecs2.iter().enumerate() {
+            publisher.insert_chunk(format!("c{i}"), v.clone());
+        }
+        publisher.dump_to_disk(dir, 500, 0).unwrap();
+        assert!(
+            !gen1_data.exists(),
+            "cleanup should have unlinked generation 1's data file"
+        );
+
+        // The still-mapped reader must keep returning correct results after the unlink.
+        let after = reader.search_chunks(&vecs[142], 5, 0.1);
+        assert_eq!(
+            after.first().map(|r| r.id.as_str()),
+            Some("c142"),
+            "mmap-backed reads must survive the file being unlinked by another process"
+        );
+        // A vector that only differs slightly should still resolve to its own id.
+        let after_7 = reader.search_chunks(&vecs[7], 3, 0.1);
+        assert_eq!(after_7.first().map(|r| r.id.as_str()), Some("c7"));
+
+        // And a fresh load now picks up generation 2, including the newer ids.
+        let reloaded = SearchEngine::load_from_disk(dir, 500, 0).expect("load generation 2");
+        assert!(reloaded.has_chunk("c499"));
+        assert!(reloaded.has_chunk("c142"));
+        assert_eq!(
+            reloaded
+                .search_chunks(&vecs2[499], 3, 0.1)
+                .first()
+                .map(|r| r.id.as_str()),
+            Some("c499"),
+            "generation 2 must search correctly after reload"
+        );
+    }
+
+    // Additive backfill into an mmap-backed index: newly inserted points are heap-owned
+    // Vecs while the loaded points remain mmap slices. Both must be searchable, and a
+    // subsequent dump (which writes a fresh generation, never truncating the mapped
+    // file) must round-trip every id.
+    #[cfg(unix)]
+    #[test]
+    fn mmap_backed_index_accepts_new_inserts_and_redumps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let vecs = synthetic_vectors(300);
+        let mut writer = SearchEngine::new(400);
+        for (i, v) in vecs.iter().enumerate() {
+            writer.insert_chunk(format!("c{i}"), v.clone());
+        }
+        writer.dump_to_disk(dir, 300, 0).unwrap();
+
+        let mut reader = SearchEngine::load_from_disk(dir, 300, 0).expect("load generation 1");
+
+        // Insert a new point (heap-owned) alongside the mmap-backed ones.
+        let newv: Vec<f32> = (0..384).map(|j| ((j as f32) * 0.002).cos()).collect();
+        reader.insert_chunk("c_new".into(), newv.clone());
+
+        assert_eq!(
+            reader
+                .search_chunks(&newv, 3, 0.1)
+                .first()
+                .map(|r| r.id.as_str()),
+            Some("c_new"),
+            "newly inserted heap-owned point must be searchable"
+        );
+        assert_eq!(
+            reader
+                .search_chunks(&vecs[10], 3, 0.1)
+                .first()
+                .map(|r| r.id.as_str()),
+            Some("c10"),
+            "mmap-backed points must remain searchable after a new insert"
+        );
+
+        // Re-dump: writes a new generation, must not truncate the mapped file, and the
+        // result must round-trip both the mmap-origin ids and the new one.
+        reader.dump_to_disk(dir, 301, 0).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 301, 0).expect("reload after redump");
+        assert!(reloaded.has_chunk("c_new"));
+        assert!(reloaded.has_chunk("c0"));
+        assert!(reloaded.has_chunk("c299"));
+        // Search must return the right vectors after the re-dump/reload, for both a
+        // mmap-origin point and the point that was inserted heap-side before the dump.
+        assert_eq!(
+            reloaded
+                .search_chunks(&vecs[0], 3, 0.1)
+                .first()
+                .map(|r| r.id.as_str()),
+            Some("c0"),
+            "mmap-origin vector must search correctly after redump/reload"
+        );
+        assert_eq!(
+            reloaded
+                .search_chunks(&newv, 3, 0.1)
+                .first()
+                .map(|r| r.id.as_str()),
+            Some("c_new"),
+            "inserted vector must search correctly after redump/reload"
+        );
     }
 }
