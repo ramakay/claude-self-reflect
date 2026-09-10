@@ -55,6 +55,7 @@ axum = { version = "0.8", default-features = false, features = [
     "tokio",
     "tracing",
 ] }
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
