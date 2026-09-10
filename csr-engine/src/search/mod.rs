@@ -1299,10 +1299,21 @@ mod tests {
 
     // Build `n` deterministic 384-dim unit-ish vectors keyed by index.
     fn synthetic_vectors(n: usize) -> Vec<Vec<f32>> {
+        // Well-separated deterministic vectors: a per-(i,j) hash decorrelates each
+        // vector from every other one, so a query's exact self-match is an unambiguous
+        // nearest neighbour. The earlier smooth-sinusoid scheme made consecutive
+        // vectors near-collinear; approximate HNSW recall for a self-query then hinged
+        // on float-summation order, which differs across platforms (top-1 self-match
+        // held on macOS but not Linux CI). Values are zero-mean so the cosine
+        // similarity between distinct vectors sits near 0.
         (0..n)
             .map(|i| {
                 (0..384)
-                    .map(|j| (((i * 384 + j) as f32) * 0.001).sin())
+                    .map(|j| {
+                        let h = ((i as f32 + 1.0) * 12.9898 + (j as f32 + 1.0) * 78.233).sin()
+                            * 43758.5453;
+                        (h - h.floor()) - 0.5
+                    })
                     .collect()
             })
             .collect()
