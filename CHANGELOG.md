@@ -5,6 +5,34 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.5.6] - 2026-09-09
+
+### Changed
+
+- **HNSW vectors are memory-mapped from the on-disk index instead of read into
+  every process's heap.** Previously each `csr-engine` process — one per MCP
+  client, plus every hook fire — held its own ~370 MB private, dirty copy of the
+  vector table. They are now clean, reclaimable file-backed pages, and processes
+  that map the same on-disk generation share one physical copy. Live-measured on
+  the maintainer's machine, per-process physical footprint drops from ~982 MB to
+  ~557 MB (about 425 MB/process), and the mapped pages are evictable under memory
+  pressure instead of pinned as dirty heap.
+
+  mmap turns on only when provably safe (`should_mmap_generation`): a numbered
+  generation (never the legacy canonical file a pre-9.5.4 process could truncate
+  in place and `SIGBUS` a mapper), the shared load lock held, and a pre-flight
+  probe passing. `RLIMIT_NOFILE` is raised at startup to remove the one
+  reproducible `EMFILE` crash trigger, and macOS `malloc_zone_pressure_relief`
+  after load tightens allocator slack. A canonical index still loads heap-backed
+  exactly as before; the win arrives once any dump migrates it to a numbered
+  generation.
+
+  Cross-process sharing is generation-scoped: long-lived processes that dump
+  their own generation on import fragment across generations, so full single-copy
+  sharing holds right after a simultaneous restart and degrades with uptime. The
+  durable win is the per-process footprint drop and reclaimability; cross-process
+  dedup is an additional, uptime-dependent bonus.
+
 ## [9.5.5] - 2026-09-09
 
 ### Fixed
