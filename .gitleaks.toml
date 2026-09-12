@@ -11,18 +11,53 @@ id = "openai-api-key"
 [rules.allowlist]
 commits = ["39b40d74", "d21f2d07", "0003ad17", "cd159bde"]
 
-# Allow test Voyage key in old Python script
 [[rules]]
 id = "generic-api-key"
-[rules.allowlist]
-commits = ["0003ad17", "4ff652ae"]
+
+# Allow test Voyage key in old Python script
+[[rules.allowlists]]
+condition = "AND"
+commits = [
+    "0003ad17a84eec1dd43e224f6a16f32cd63d2901",
+    "4ff652ae49908e863c4b83f506e2a6e9aff89dac"
+]
 paths = ['''scripts/import-live-conversation\.py''']
 
-# Allow false positive sourcegraph tokens in SARIF file (commit 0b77b64)
+# Frozen T3 eval data: the four flagged columns are Claude session UUIDs and
+# agent ids, not credentials. Pinned to commit AND path, so a real key added
+# to the same file in a later commit still fails the scan.
+[[rules.allowlists]]
+condition = "AND"
+commits = ["24b865cf7de3b738694a4fee7170b81ca2b8fdd6"]
+paths = ['''^csr-engine/eval-kit/t3/mech_pairs\.frozen\.csv$''']
+
+# Historical `pa-`-prefixed Voyage-shaped string in tool_usage_sample.json.
+# Not a live credential -- it never authenticated against Voyage AI -- but it
+# matches generic-api-key. The file was deleted from the tree in af3e299, so
+# the string survives only in history, which cannot be scrubbed without
+# rewriting published commits. Pinned to commit AND path so the other 27
+# files in each of those two commits stay under full detection.
+[[rules.allowlists]]
+condition = "AND"
+commits = [
+    "5c771160096fecab46b8df07a3dadf5feccf741f",
+    "f6bd3f640b0de07148ef3d435109959c75a40ae5"
+]
+paths = ['''^tool_usage_sample\.json$''']
+
+# gitleaks' own SARIF output: the 40-char commit SHAs it records in
+# partialFingerprints match the sourcegraph-access-token pattern. Scan output,
+# not source. The same blob (579a73f) is reachable from both commits, so both
+# are listed; dropping either re-exposes 15 findings.
 [[rules]]
 id = "sourcegraph-access-token"
-[rules.allowlist]
-commits = ["0b77b64e29e5b8a899e723341947f7ebf44217fa"]
+[[rules.allowlists]]
+condition = "AND"
+commits = [
+    "0b77b64e29e5b8a899e723341947f7ebf44217fa",
+    "7e0701f9659077842bd7410b96fc4148b981f562"
+]
+paths = ['''^work/claude-self-reflect/claude-self-reflect/results\.sarif$''']
 
 [allowlist]
 # Global allowlist configuration
