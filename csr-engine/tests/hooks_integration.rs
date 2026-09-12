@@ -1518,3 +1518,80 @@ fn test_episode_struct_serialization() {
     assert_eq!(roundtrip.session_id, "integration-test-123");
     assert_eq!(roundtrip.tools_used.len(), 2);
 }
+
+// ─── MCP protocol negotiation: real initialize + tools/list handshake ───
+//
+// Guards the fix in src/mcp/mod.rs: rmcp 3.1 defaults its supported-version list
+// to KNOWN_VERSIONS, which includes 2026-07-28 — a revision whose tools/list
+// requires ttlMs/cacheScope metadata the crate never emits. Claude Code >= 2.1.234
+// requests 2026-07-28, so an uncapped server would echo it and then have its
+// (metadata-less) tools/list rejected, leaving a connected but tool-less server.
+// The CsrServer override caps negotiation below that revision. This drives a real
+// in-process client that ASKS for 2026-07-28 and asserts the server negotiates down
+// to 2025-11-25 and still serves the full tool list — a live handshake, not just a
+// check of the constant.
+#[tokio::test]
+// ClientInfo is #[non_exhaustive], so it can only be built via Default and then
+// mutated — the reassign-with-default pattern is unavoidable here.
+#[allow(clippy::field_reassign_with_default)]
+async fn mcp_negotiation_caps_protocol_and_still_serves_tools() {
+    use rmcp::model::{ClientInfo, ProtocolVersion};
+    use rmcp::ServiceExt;
+    use std::sync::Arc;
+
+    let tmp = TempDir::new().unwrap();
+    let storage = Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+    let server = csr_engine::mcp::CsrServer::new(
+        storage,
+        embeddings,
+        search,
+        tmp.path().to_path_buf(),
+        tmp.path().to_path_buf(),
+    );
+
+    // In-process duplex: one end serves CsrServer, the other drives a client.
+    let (server_end, client_end) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_end).await {
+            let _ = running.waiting().await;
+        }
+    });
+
+    // The client requests the exact revision that triggered the incident.
+    // ClientInfo is #[non_exhaustive], so build the default and set the field.
+    let mut client_info = ClientInfo::default();
+    client_info.protocol_version = ProtocolVersion::V_2026_07_28;
+    let client = client_info
+        .serve(client_end)
+        .await
+        .expect("client initialize handshake should succeed");
+
+    // Negotiation must cap at the last revision rmcp can actually serve, not echo
+    // the client's 2026-07-28 request.
+    let negotiated = client
+        .peer_info()
+        .expect("server info present")
+        .protocol_version
+        .clone();
+    assert_eq!(
+        negotiated,
+        ProtocolVersion::V_2025_11_25,
+        "server must negotiate down to the highest revision rmcp serves"
+    );
+    assert_ne!(negotiated, ProtocolVersion::V_2026_07_28);
+
+    // The capped session must still return every tool over the wire.
+    let tools = client
+        .list_all_tools()
+        .await
+        .expect("tools/list should succeed");
+    assert_eq!(tools.len(), csr_engine::mcp::CsrServer::tool_count());
+    assert!(tools.iter().any(|t| t.name == "csr_reflect_on_past"));
+
+    let _ = client.cancel().await;
+    server_task.abort();
+}
