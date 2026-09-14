@@ -249,6 +249,24 @@ pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: 
 }
 
 /// Main hook dispatcher. Parses stdin, routes to handler.
+/// Whether a hook can run on an import-only engine that skips loading and
+/// persisting the HNSW index (see [`crate::engine::Engine::new_import_only`]).
+///
+/// `precompact` and `session-end` only import a transcript (and, for
+/// session-end, write reflections to SQLite); neither queries the HNSW, so
+/// skipping the load is safe and the new chunks are reconciled on the next
+/// search-time load.
+///
+/// Everything else stays on the full engine. `session-start` and
+/// `prompt-submit` query the index (recap, predictive injection) and genuinely
+/// need it loaded. `stop` and `post-tool-use` do not query the index either
+/// (stop matches resolutions via SQLite fts5 and *inserts* a reflection it
+/// expects persisted), but they are left out deliberately to keep this
+/// optimization's scope small — not because they search.
+pub fn is_import_only_hook(hook_name: &str) -> bool {
+    matches!(hook_name, "precompact" | "session-end")
+}
+
 pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     // Recursive-hook guard. The session-briefing hook spawns a nested `claude -p`
     // with CSR_DISABLE_RECURSIVE_HOOKS=1 in its env. That nested session inherits
@@ -326,6 +344,24 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn only_write_only_hooks_skip_the_index() {
+        // Write-only importers may run on the import-only engine.
+        assert!(is_import_only_hook("precompact"));
+        assert!(is_import_only_hook("session-end"));
+        // Everything else stays on the full engine. session-start/prompt-submit
+        // query the index and MUST keep it loaded; stop/post-tool-use are kept
+        // out to bound this optimization's scope. A regression that added
+        // session-start or prompt-submit here would make it search an empty
+        // index and silently return nothing.
+        for full in ["stop", "session-start", "prompt-submit", "post-tool-use"] {
+            assert!(
+                !is_import_only_hook(full),
+                "{full} must not be treated as import-only"
+            );
+        }
+    }
 
     #[test]
     fn read_bounded_gives_up_instead_of_hanging() {
