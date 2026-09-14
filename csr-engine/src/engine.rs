@@ -17,6 +17,11 @@ fn log_timing(line: &str) {
     crate::telemetry::append_timing_line(line);
 }
 
+/// Initial HNSW capacity for an import-only engine's empty in-memory index.
+/// Only a construction hint — hnsw_rs grows as needed — sized to comfortably
+/// hold one session's worth of new chunks without reallocation.
+const IMPORT_ONLY_INDEX_CAPACITY: usize = 4096;
+
 /// Orchestrates all subsystems: storage, embeddings, search, import, and MCP.
 #[derive(Clone)]
 pub struct Engine {
@@ -25,6 +30,22 @@ pub struct Engine {
     search: Arc<RwLock<SearchEngine>>,
     projects_dir: PathBuf,
     index_dir: PathBuf,
+    /// When true, the engine never loads the on-disk HNSW cache at construction
+    /// and `flush_index` is a no-op. Used by write-only hooks (precompact,
+    /// session-end) that import a transcript but never search: they pay neither
+    /// the ~O(corpus) `HnswIo::load_hnsw` at startup nor a full re-dump. New
+    /// embeddings still land in SQLite; the next search-constructing process
+    /// reconciles them via the additive-backfill path in `Engine::new`.
+    ///
+    /// The flush guard is the critical invariant: without it, dispatch_hook's
+    /// unconditional `flush_index` would dump the near-empty in-memory index
+    /// with a manifest count equal to the FULL DB count, which the next
+    /// `load_from_disk` accepts as current — replacing the real many-node graph
+    /// with a handful of points. Recall is not permanently lost (the next
+    /// `Engine::new` compares DB ids against the cache and backfills the missing
+    /// ones), but recovery costs a full re-insert of the corpus, which defeats
+    /// the entire point of the import-only path.
+    skip_index_persistence: bool,
 }
 
 impl Engine {
@@ -43,6 +64,7 @@ impl Engine {
             search,
             projects_dir,
             index_dir,
+            skip_index_persistence: false,
         }
     }
 
@@ -201,6 +223,34 @@ impl Engine {
             search: Arc::new(RwLock::new(search)),
             projects_dir: projects_dir.to_path_buf(),
             index_dir,
+            skip_index_persistence: false,
+        })
+    }
+
+    /// Construct an engine for write-only hooks (precompact, session-end) that
+    /// import a transcript but never search.
+    ///
+    /// Unlike [`Engine::new`], this skips loading the on-disk HNSW cache
+    /// entirely — the `HnswIo::load_hnsw` that walks every point in the graph
+    /// (the "setting number of points …" pass, ~O(corpus)). The in-memory index
+    /// starts empty and, together with the `flush_index` guard, is never dumped,
+    /// so the on-disk cache is left untouched. New embeddings are written to
+    /// SQLite; the next search-constructing process picks them up via the
+    /// additive-backfill path in [`Engine::new`].
+    pub fn new_import_only(db_path: &Path, projects_dir: &Path) -> Result<Self> {
+        let storage = Arc::new(Storage::open(db_path)?);
+        let embeddings = Arc::new(EmbeddingEngine::new()?);
+        let index_dir = db_path.parent().unwrap_or(Path::new(".")).join("index");
+        // Small empty index: import inserts land here and are discarded on
+        // process exit. Never dumped, so no on-disk cache is touched.
+        let search = SearchEngine::new(IMPORT_ONLY_INDEX_CAPACITY);
+        Ok(Self {
+            storage,
+            embeddings,
+            search: Arc::new(RwLock::new(search)),
+            projects_dir: projects_dir.to_path_buf(),
+            index_dir,
+            skip_index_persistence: true,
         })
     }
 
@@ -524,6 +574,16 @@ impl Engine {
     /// Maintenance commands use this so they cannot report success while the
     /// durable index still contains stale vectors.
     pub async fn flush_index_checked(&self) -> Result<()> {
+        // Write-only engines (import-only hooks) never persist the index. The
+        // in-memory index holds at most this session's chunks against an empty
+        // base; dumping it would overwrite the real on-disk cache with a
+        // near-empty graph carrying a full-count manifest. The next load would
+        // accept it as current and (via the id-backfill in `Engine::new`)
+        // recover only by re-inserting the whole corpus — the expensive rebuild
+        // this path exists to avoid. See `skip_index_persistence`.
+        if self.skip_index_persistence {
+            return Ok(());
+        }
         let mut idx = self.search.write().await;
         if idx.is_dirty() {
             // Query current DB counts for staleness-correct manifest

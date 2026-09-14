@@ -1761,3 +1761,161 @@ fn test_episode_struct_serialization() {
     assert_eq!(roundtrip.session_id, "integration-test-123");
     assert_eq!(roundtrip.tools_used.len(), 2);
 }
+
+// ─── Import-only engine: write-only hooks skip the HNSW index ───
+//
+// Regression cover for the perf fix where precompact/session-end stopped
+// loading and re-dumping the entire HNSW graph just to append a session's
+// chunks. The invariant that matters for correctness is that these hooks never
+// overwrite the on-disk index cache.
+
+fn read_manifest_chunk_count(index_dir: &std::path::Path) -> Option<u64> {
+    let raw = std::fs::read_to_string(index_dir.join("manifest.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("chunk_embeddings_expected").and_then(|n| n.as_u64())
+}
+
+/// Dump a chunk index of `n` chunks (ids `seed-0..n`) to `index_dir` with a
+/// manifest claiming `n`, matching what `seed_db` writes to SQLite.
+fn dump_seed_index(index_dir: &std::path::Path, n: usize) {
+    let mut seed = csr_engine::search::SearchEngine::new(n.max(16));
+    for i in 0..n {
+        seed.insert_chunk(format!("seed-{i}"), vec![0.1f32; 384]);
+    }
+    seed.dump_to_disk(index_dir, n, 0).unwrap();
+}
+
+/// Seed the SQLite DB at `db_path` with `n` chunk embeddings whose ids match
+/// `dump_seed_index`, so a normal engine's load/backfill has real rows to load
+/// (and `count_chunk_embeddings` == n, i.e. the cache is considered current).
+fn seed_db(db_path: &std::path::Path, n: usize) {
+    let storage = csr_engine::storage::Storage::open(db_path).unwrap();
+    for i in 0..n {
+        let chunk = csr_engine::import::ConversationChunk {
+            id: format!("seed-{i}"),
+            conversation_id: "seed-conv".into(),
+            project_name: "seed".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            content: format!("seed chunk {i}"),
+            message_count: 1,
+            summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
+            seq: i,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.1f32; 384]).unwrap();
+    }
+}
+
+#[test]
+fn import_only_engine_does_not_load_the_disk_cache() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("csr-engine.db");
+    // Engine derives index_dir from db_path.parent(); seed BOTH the DB and a
+    // matching on-disk cache so a normal engine would genuinely load them.
+    let index_dir = tmp.path().join("index");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    seed_db(&db_path, 50);
+    dump_seed_index(&index_dir, 50);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Positive control: a normal engine loads the seeded cache (DB count 50 ==
+    // manifest 50), so this is NOT a case where any constructor yields an empty
+    // index — the difference below is real.
+    let normal = csr_engine::engine::Engine::new(&db_path, tmp.path()).unwrap();
+    rt.block_on(async {
+        let idx = normal.search().read().await;
+        assert!(
+            idx.has_chunk("seed-0") && idx.chunk_count() >= 50,
+            "control: a normal engine must load the seeded 50-chunk cache (got {} chunks)",
+            idx.chunk_count()
+        );
+    });
+
+    // Import-only engine skips the load entirely against the same DB + cache.
+    let import_only = csr_engine::engine::Engine::new_import_only(&db_path, tmp.path()).unwrap();
+    rt.block_on(async {
+        let idx = import_only.search().read().await;
+        assert_eq!(
+            idx.chunk_count(),
+            0,
+            "import-only engine must start with an empty in-memory index (no load)"
+        );
+        assert!(
+            !idx.has_chunk("seed-0"),
+            "import-only engine must not have loaded the seeded cache"
+        );
+    });
+}
+
+#[test]
+fn import_only_flush_preserves_the_on_disk_cache() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("csr-engine.db");
+    let index_dir = tmp.path().join("index");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    dump_seed_index(&index_dir, 50);
+    assert_eq!(read_manifest_chunk_count(&index_dir), Some(50));
+
+    let eng = csr_engine::engine::Engine::new_import_only(&db_path, tmp.path()).unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Simulate an import marking the in-memory index dirty.
+        eng.search()
+            .write()
+            .await
+            .insert_chunk("fresh-1".to_string(), vec![0.2f32; 384]);
+        eng.flush_index().await;
+    });
+
+    // The guard must have skipped the dump; the 50-chunk cache is intact.
+    assert_eq!(
+        read_manifest_chunk_count(&index_dir),
+        Some(50),
+        "import-only flush must not overwrite the on-disk index cache"
+    );
+}
+
+/// Control: a normal (non import-only) engine's flush DOES rewrite the manifest.
+/// This is the clobber the import-only guard exists to prevent — proving the
+/// test above is meaningful and not vacuously passing.
+#[test]
+fn full_engine_flush_rewrites_the_manifest() {
+    let tmp = TempDir::new().unwrap();
+    let index_dir = tmp.path().join("index");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    dump_seed_index(&index_dir, 50);
+    assert_eq!(read_manifest_chunk_count(&index_dir), Some(50));
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+    // from_parts derives index_dir = projects_dir.join("index"), so point
+    // projects_dir at tmp to reuse the seeded cache dir.
+    let eng = csr_engine::engine::Engine::from_parts(
+        storage,
+        embeddings,
+        search,
+        tmp.path().to_path_buf(),
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        eng.search()
+            .write()
+            .await
+            .insert_chunk("fresh-1".to_string(), vec![0.2f32; 384]);
+        eng.flush_index().await;
+    });
+
+    // Un-guarded flush overwrote the manifest with the (empty) DB's count.
+    assert_ne!(
+        read_manifest_chunk_count(&index_dir),
+        Some(50),
+        "a normal engine's flush is expected to rewrite the cache (control)"
+    );
+}
