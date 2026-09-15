@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
@@ -17,6 +18,32 @@ const DEBOUNCE_SECS: u64 = 5;
 
 /// Batch size for embedding during auto-import.
 const BATCH_SIZE: usize = 10;
+
+/// Minimum wall-clock gap between HNSW dumps in the watcher.
+///
+/// The watcher used to dump the whole index after every debounced batch. On a
+/// live corpus that is ~270 dumps/hour of ~475MB data + ~167MB graph + ~15MB
+/// manifest, roughly 3GB/min of writes, and it held the daemon near 30% CPU
+/// indefinitely.
+///
+/// Deferring is safe because the dump is pure cache. `import_file` writes each
+/// embedding to SQLite *before* inserting it into the in-memory index, and
+/// `Engine::new` additively backfills any id present in the DB but missing from
+/// the on-disk cache, in bounded batches, without a full rebuild. So a deferred
+/// dump costs a slightly longer startup backfill, never data. This is the same
+/// durability contract `precompact` and `session-end` already rely on.
+const MIN_FLUSH_INTERVAL_SECS: u64 = 300;
+
+/// Whether a dirty index is due to be dumped, given the last dump time.
+///
+/// `None` means nothing has been dumped yet this run, so dump immediately —
+/// a fresh watcher should not sit on its first batch for five minutes.
+fn flush_is_due(last_flush: Option<Instant>, now: Instant) -> bool {
+    match last_flush {
+        None => true,
+        Some(last) => now.duration_since(last) >= Duration::from_secs(MIN_FLUSH_INTERVAL_SECS),
+    }
+}
 
 /// Watches the Claude projects directory for new JSONL files and auto-imports them.
 pub struct FileWatcher {
@@ -93,6 +120,7 @@ impl FileWatcher {
         tracing::info!(dir = %self.projects_dir.display(), "file watcher started");
 
         // Debounce loop: collect changed files over DEBOUNCE_SECS, then process
+        let mut last_flush: Option<Instant> = None;
         loop {
             let mut pending: HashSet<PathBuf> = HashSet::new();
 
@@ -144,18 +172,41 @@ impl FileWatcher {
                     }
                 }
 
-                // Flush HNSW index to disk after processing batch
-                let mut idx = self.search.write().await;
-                if idx.is_dirty() {
-                    let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
-                    let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
-                    if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
-                        tracing::warn!(error = %e, "failed to flush HNSW index after watcher batch");
+                // Flush the HNSW index at most once per MIN_FLUSH_INTERVAL_SECS.
+                // See the const for why deferring the dump is safe.
+                let now = Instant::now();
+                if flush_is_due(last_flush, now) {
+                    let mut idx = self.search.write().await;
+                    if idx.is_dirty() {
+                        let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
+                        let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
+                        if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
+                            tracing::warn!(
+                                error = %e,
+                                "failed to flush HNSW index after watcher batch"
+                            );
+                        }
+                        // Recorded even when the dump failed: the index stays
+                        // dirty and will retry at the next interval, but a
+                        // failing dump must not reinstate the per-batch storm.
+                        last_flush = Some(now);
                     }
+                    drop(idx);
                 }
-                drop(idx);
             }
         }
+
+        // Channel closed. Dump once on the way out so a deferred batch is not
+        // left for the next startup to backfill.
+        let mut idx = self.search.write().await;
+        if idx.is_dirty() {
+            let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
+            let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
+            if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
+                tracing::warn!(error = %e, "failed to flush HNSW index on watcher shutdown");
+            }
+        }
+        drop(idx);
 
         Ok(())
     }
@@ -374,6 +425,39 @@ pub(crate) async fn acquire_heavy_work_permit(heavy_work: Arc<Semaphore>) -> Own
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn first_batch_flushes_immediately() {
+        assert!(flush_is_due(None, Instant::now()));
+    }
+
+    #[test]
+    fn second_batch_inside_the_interval_is_skipped() {
+        let now = Instant::now();
+        let last = now
+            .checked_sub(Duration::from_secs(MIN_FLUSH_INTERVAL_SECS - 1))
+            .expect("instant underflow");
+        assert!(!flush_is_due(Some(last), now));
+    }
+
+    #[test]
+    fn batch_at_the_interval_boundary_flushes() {
+        let now = Instant::now();
+        let last = now
+            .checked_sub(Duration::from_secs(MIN_FLUSH_INTERVAL_SECS))
+            .expect("instant underflow");
+        assert!(flush_is_due(Some(last), now));
+    }
+
+    #[test]
+    fn batch_well_past_the_interval_flushes() {
+        let now = Instant::now();
+        let last = now
+            .checked_sub(Duration::from_secs(MIN_FLUSH_INTERVAL_SECS * 4))
+            .expect("instant underflow");
+        assert!(flush_is_due(Some(last), now));
+    }
+
     use super::*;
     use crate::provenance::Speaker;
 
