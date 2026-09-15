@@ -32,9 +32,10 @@ cycle runs on live capture.
 - **`scripts/launchd/com.ramakay.csr-engine.daemon.plist`** keeps the
   daemon (watcher, enrichment, dream cycle) alive under the logged-in user.
 - **`CSR_DREAM_CONSUMPTION` documented as it behaves:** unset resolves to
-  `annotate` (notes with commit receipts, no rank demotion); `off` hides
-  every verdict-derived surface; `full` adds rank demotion. Two comments
-  still said "default OFF".
+  `annotate` (search notes with commit receipts and status counters, no
+  rank change); `full` adds the rank sink and the recap
+  "Learnt-then-retired while away:" clause; `off` hides notes, clause and
+  counters. Two comments still said "default OFF".
 - **Experimental: `mods/csr-recall`**, CSR recall as a Claude Mod (function
   hook): a `prompt.submit` hook calls the `claude-self-reflect` MCP server
   in-process and attaches the top hits as context. Not installed by
@@ -49,6 +50,18 @@ existence data, not accuracy; the demote channel is unmeasured and off by
 default; CRLF/Windows stamp divergence untested; 747 historical
 conversations remain self-contaminated; strategy dreams (`dream backfill`)
 are below their kill bar.
+
+Open findings from the Codex xhigh review of this build (2026-09-14):
+- `hnsw_rs 0.3.4` calls `process::exit(1)` on truncated heap-loaded point
+  data, which `catch_unwind` cannot intercept; a torn canonical cache can
+  still take a hook or the daemon down instead of rebuilding (inherited
+  with the 9.5 torn-cache fix; launchd's 30 s throttle bounds the loop).
+- `CSR_DREAM_CONSUMPTION=off` does not yet gate the static report, the live
+  journal feeds or the unread badge.
+- The three ablation examples pass `TrustTier::Unknown`, which keeps their
+  historical (pre-provenance) ranking policy rather than production's stored
+  floors; carry stored floors through when those harnesses are next run.
+- `status` has no field for the `CSR_NO_CODEX_IMPORT` state.
 
 ### Dream journal: fused ask->outcome sentence replaces the two-line headline
 

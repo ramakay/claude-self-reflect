@@ -1230,13 +1230,13 @@ async fn run() -> Result<()> {
         } else {
             csr_engine::dream::run_dream(&eng, repo.as_deref(), dry_run)?
         };
-        // CSR_DREAM_CONSUMPTION (default `annotate`; `off` hides every
-        // verdict-derived surface, `full` adds rank demotion). The cycle runs
-        // and the witness ledger updates for real either way — the switch is
-        // about consumption/exposure, not about whether dreaming happens —
-        // so under `off` the verdict-derived summary text (obsolete/
-        // superseded/reinstated counts, events written) must not print.
-        // Same shared switch as mcp::tools/status/dream::report.
+        // CSR_DREAM_CONSUMPTION (default `annotate`: search notes + status
+        // counters; `full` adds the rank sink and the recap clause; `off`
+        // hides the notes, clause and counters). The cycle runs and the
+        // witness ledger updates for real either way — the switch is about
+        // consumption/exposure, not about whether dreaming happens — so under
+        // `off` the verdict-derived summary text (obsolete/superseded/
+        // reinstated counts, events written) must not print.
         match csr_engine::storage::recap_feeds::dream_consumption_mode() {
             csr_engine::storage::recap_feeds::ConsumptionMode::Off => {
                 let mode = if dry_run { " (dry-run)" } else { "" };

@@ -29,8 +29,10 @@
   <dict>
     <key>CSR_NO_CODEX_IMPORT</key>
     <string>1</string>
+    <!-- launchd starts with a bare PATH; the claude CLI (narratives, ratification,
+         strategy dreams) lives under ~/.local/bin on this machine. -->
     <key>PATH</key>
-    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <string>/Users/ramakrishnanannaswamy/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
