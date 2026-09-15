@@ -270,14 +270,25 @@ pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: 
 /// skipping the load is safe and the new chunks are reconciled on the next
 /// search-time load.
 ///
+/// `stop` and `post-tool-use` are here for the same reason. `post-tool-use`
+/// never touches the index at all; `stop` matches resolutions via SQLite fts5
+/// and its single index interaction is an *insert* whose durable copy already
+/// went to SQLite via `insert_derived_reflection_ranges` — the additive
+/// backfill in [`Engine::new`] replays it into the next search-constructing
+/// process. They were held out of the original write-only split to bound its
+/// scope, not because they search, and they are the two hottest hooks on the
+/// bus: `stop` fires on every response and `post-tool-use` after every
+/// Edit/Write. On a 300k-chunk corpus each invocation was paying a full
+/// `HnswIo::load_hnsw` walk plus a ~644MB dump of the graph and data files.
+///
 /// Everything else stays on the full engine. `session-start` and
 /// `prompt-submit` query the index (recap, predictive injection) and genuinely
-/// need it loaded. `stop` and `post-tool-use` do not query the index either
-/// (stop matches resolutions via SQLite fts5 and *inserts* a reflection it
-/// expects persisted), but they are left out deliberately to keep this
-/// optimization's scope small — not because they search.
+/// need it loaded.
 pub fn is_import_only_hook(hook_name: &str) -> bool {
-    matches!(hook_name, "precompact" | "session-end")
+    matches!(
+        hook_name,
+        "precompact" | "session-end" | "stop" | "post-tool-use"
+    )
 }
 
 pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
@@ -364,12 +375,15 @@ mod tests {
         // Write-only importers may run on the import-only engine.
         assert!(is_import_only_hook("precompact"));
         assert!(is_import_only_hook("session-end"));
-        // Everything else stays on the full engine. session-start/prompt-submit
-        // query the index and MUST keep it loaded; stop/post-tool-use are kept
-        // out to bound this optimization's scope. A regression that added
-        // session-start or prompt-submit here would make it search an empty
+        // stop and post-tool-use never query the HNSW either: post-tool-use
+        // does not touch it, and stop's only interaction is an insert whose
+        // durable copy went to SQLite first.
+        assert!(is_import_only_hook("stop"));
+        assert!(is_import_only_hook("post-tool-use"));
+        // session-start/prompt-submit query the index and MUST keep it loaded.
+        // A regression that added either here would make it search an empty
         // index and silently return nothing.
-        for full in ["stop", "session-start", "prompt-submit", "post-tool-use"] {
+        for full in ["session-start", "prompt-submit"] {
             assert!(
                 !is_import_only_hook(full),
                 "{full} must not be treated as import-only"
