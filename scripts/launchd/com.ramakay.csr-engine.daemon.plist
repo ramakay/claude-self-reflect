@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keeps `csr-engine daemon` running under the logged-in user so the file
+  watcher, enrichment loops and the v10 dream cycle run without a terminal.
+
+  Install (macOS):
+    mkdir -p ~/.claude-self-reflect/logs
+    cp scripts/launchd/com.ramakay.csr-engine.daemon.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist
+  Stop / remove:
+    launchctl bootout gui/$(id -u)/com.ramakay.csr-engine.daemon
+
+  CSR_NO_CODEX_IMPORT=1 keeps the daemon from doing the hours-long one-time
+  ~/.codex/sessions import on its first start; remove the key once that
+  corpus is wanted. Every other kill switch (CSR_NO_DREAMING, CSR_NO_RECAP,
+  CSR_NO_AI_NARRATIVES, ...) can be added under EnvironmentVariables too.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ramakay.csr-engine.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/csr-engine</string>
+    <string>daemon</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CSR_NO_CODEX_IMPORT</key>
+    <string>1</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/ramakrishnanannaswamy/.claude-self-reflect/logs/daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ramakrishnanannaswamy/.claude-self-reflect/logs/daemon.err.log</string>
+</dict>
+</plist>

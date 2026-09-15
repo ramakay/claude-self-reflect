@@ -32,6 +32,18 @@ use crate::import;
 use crate::search::SearchEngine;
 use crate::storage::Storage;
 
+/// `CSR_NO_CODEX_IMPORT` kill switch — same "1"/"true" (case-insensitive) idiom
+/// as `memory_registry_disabled`. Skips the optional `~/.codex/sessions` rollout
+/// import in both the daemon loop and the `setup` one-shot: the first pass over
+/// a large Codex history takes hours and holds the daemon's heavy-work permit,
+/// which is the one thing a user starting the daemon for dreaming did not ask for.
+/// Every other subsystem already had a switch; this was the last one without.
+pub fn codex_import_disabled() -> bool {
+    std::env::var("CSR_NO_CODEX_IMPORT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// `CSR_NO_MEMORY_REGISTRY` kill switch — same "1"/"true" (case-insensitive) idiom
 /// as `crate::daemon::dream_cadence::dreaming_disabled`.
 pub fn memory_registry_disabled() -> bool {
@@ -471,6 +483,11 @@ impl Daemon {
         // Optional Codex rollout loop. It runs once immediately and then every
         // 30 minutes. Missing ~/.codex/sessions is deliberately silent, and the
         // directory is re-checked each cycle so a later installation is detected.
+        // `CSR_NO_CODEX_IMPORT=1` keeps the loop alive but idle, so flipping the
+        // switch off needs a daemon restart, nothing else.
+        if codex_import_disabled() {
+            tracing::info!("Codex rollout import disabled via CSR_NO_CODEX_IMPORT");
+        }
         let codex_rollout_handle = {
             let engine = Arc::new(crate::engine::Engine::from_parts(
                 self.storage.clone(),
@@ -485,7 +502,11 @@ impl Daemon {
                     if shutdown.load(Ordering::SeqCst) {
                         return;
                     }
-                    let codex_root = dirs::home_dir().map(|home| home.join(".codex/sessions"));
+                    let codex_root = if codex_import_disabled() {
+                        None
+                    } else {
+                        dirs::home_dir().map(|home| home.join(".codex/sessions"))
+                    };
                     if let Some(root) = codex_root.filter(|root| root.exists()) {
                         let permit = match heavy_work.clone().acquire_owned().await {
                             Ok(permit) => permit,

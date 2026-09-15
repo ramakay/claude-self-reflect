@@ -22,6 +22,13 @@ pub enum ConsumptionMode {
     Full,
 }
 
+/// `CSR_DREAM_CONSUMPTION`, the one switch every dream-verdict consumer honours
+/// (the search rank sink and its `[evolved]`/`[stale anchor]` notes, the recap
+/// "Learnt-then-retired while away:" clause, the dream journal, the status
+/// counters): `off`/`0`/`false` shows nothing verdict-derived; unset or
+/// `annotate` (the default) shows annotations with commit receipts and never
+/// demotes rank; `full`/`1`/`true` also enables rank demotion. Unrecognised
+/// values read as `annotate`.
 pub fn dream_consumption_mode_from(value: Option<&str>) -> ConsumptionMode {
     match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("0" | "false" | "off") => ConsumptionMode::Off,
@@ -211,10 +218,10 @@ impl Storage {
 
     /// Negative dream verdicts recorded strictly after `since_ts`, scoped by
     /// the project carried directly on their witness ledger rows.
-    /// `CSR_DREAM_CONSUMPTION` (default OFF — see `dream_consumption_enabled`)
-    /// gates this feed: ships the witness ledger as experimental derived
-    /// data, so the "Learnt-then-retired while away:" recap clause never
-    /// reaches a user who hasn't explicitly opted in.
+    /// `CSR_DREAM_CONSUMPTION` gates this feed (see `dream_consumption_mode`):
+    /// `off` drops the "Learnt-then-retired while away:" recap clause entirely,
+    /// unset or `annotate` (the default) emits it with commit receipts, `full`
+    /// changes nothing here (rank demotion lives in search).
     pub fn recap_retired_since(&self, project: &str, since_ts: &str) -> Result<Vec<RetiredLine>> {
         self.recap_retired_since_with(project, since_ts, dream_consumption_mode())
     }

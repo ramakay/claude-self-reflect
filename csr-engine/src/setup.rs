@@ -64,8 +64,11 @@ pub async fn handle(
     let imported = eng.import_conversations(None).await?;
     eprintln!("  Imported {} chunks", imported);
 
-    // Optional vendor corpus: absence is intentionally silent/inert.
-    if let Some(codex_root) = dirs::home_dir().map(|home| home.join(".codex/sessions")) {
+    // Optional vendor corpus: absence is intentionally silent/inert, and
+    // CSR_NO_CODEX_IMPORT=1 skips it on purpose (first import can take hours).
+    if crate::daemon::codex_import_disabled() {
+        eprintln!("  Codex rollout import skipped (CSR_NO_CODEX_IMPORT is set)");
+    } else if let Some(codex_root) = dirs::home_dir().map(|home| home.join(".codex/sessions")) {
         if codex_root.exists() {
             let adapter_engine = eng.clone();
             let stats = tokio::task::spawn_blocking(move || {
