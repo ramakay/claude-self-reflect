@@ -1030,9 +1030,9 @@ mod tests {
         // touching the retired symbol.
         conn.execute(
             "INSERT INTO reflections (id, content, tags, timestamp) VALUES ('ep-old', ?1, '[]', '2020-01-01T00:00:00Z')",
-            params![format!(
-                r#"{{"schema":"v2","session_id":"s1","project":"p","timestamp":"2020-01-01T00:00:00Z","request":"r","completed":"c","outcome":"partial","todos":[{{"content":"t","status":"pending"}}],"files_modified":[],"anchors":[{{"file":"a.rs","node_kind":"function","name":"foo","body_hash":"h1"}}]}}"#
-            )],
+            params![
+                r#"{"schema":"v2","session_id":"s1","project":"p","timestamp":"2020-01-01T00:00:00Z","request":"r","completed":"c","outcome":"partial","todos":[{"content":"t","status":"pending"}],"files_modified":[],"anchors":[{"file":"a.rs","node_kind":"function","name":"foo","body_hash":"h1"}]}"#
+            ],
         )
         .unwrap();
         // Episode after the verdict, touching the same file. The verdict
@@ -1046,9 +1046,9 @@ mod tests {
         // actually runs.
         conn.execute(
             "INSERT INTO reflections (id, content, tags, timestamp) VALUES ('ep-new', ?1, '[]', '2099-01-01T00:00:00Z')",
-            params![format!(
-                r#"{{"schema":"v2","session_id":"s2","project":"p","timestamp":"2099-01-01T00:00:00Z","request":"r","completed":"c","outcome":"completed","todos":[],"files_modified":[],"anchors":[{{"file":"a.rs","node_kind":"function","name":"bar","body_hash":"h2"}}]}}"#
-            )],
+            params![
+                r#"{"schema":"v2","session_id":"s2","project":"p","timestamp":"2099-01-01T00:00:00Z","request":"r","completed":"c","outcome":"completed","todos":[],"files_modified":[],"anchors":[{"file":"a.rs","node_kind":"function","name":"bar","body_hash":"h2"}]}"#
+            ],
         )
         .unwrap();
         crate::storage::dream_backfill::materialize_episode_index(&conn).unwrap();

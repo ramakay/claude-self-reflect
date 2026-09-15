@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Dev build 2026-09-14: the 10.x line integrated, dreaming on (annotate)
+
+Not a release. 10.x stays in development until dreams are proven. This
+build makes `main` (10.1.0, never published) and the 10.x line
+(`fix/v10.1-release-gate` → `feat/memory-registry-spine` →
+`feat/provenance-non-amplification` → `fix/engine-memory-hygiene`) one
+branch again and is installed as the maintainer's daily driver so the dream
+cycle runs on live capture.
+
+- **Merge** of the 10.x line into main (133 commits). Four hand-resolved
+  conflicts on the narrator spawn sites and a test module; both sides kept.
+- **Forward-ports from the 9.5 line**, cherry-picked with their history:
+  torn HNSW cache survival (b56b051), HNSW load gated on the persisted id
+  map rather than the DB count (623f8de), mmap'd HNSW vectors so processes
+  share one copy (4561464), platform-stable self-match test (885c780).
+  The `as_chunks` clippy fix was already on the line.
+- **Import-only hooks skip the HNSW load and dump** (precompact,
+  session-end; 0df9e69): a compaction no longer pays an O(corpus) index
+  load to append a handful of chunks.
+- **`CSR_NO_CODEX_IMPORT=1`** skips the optional `~/.codex/sessions` import
+  in the daemon loop and the setup one-shot. The first pass over a large
+  Codex history takes hours; it was the last subsystem without a switch.
+- **`scripts/launchd/com.ramakay.csr-engine.daemon.plist`** keeps the
+  daemon (watcher, enrichment, dream cycle) alive under the logged-in user.
+- **`CSR_DREAM_CONSUMPTION` documented as it behaves:** unset resolves to
+  `annotate` (notes with commit receipts, no rank demotion); `off` hides
+  every verdict-derived surface; `full` adds rank demotion. Two comments
+  still said "default OFF".
+- **Experimental: `mods/csr-recall`**, CSR recall as a Claude Mod (function
+  hook): a `prompt.submit` hook calls the `claude-self-reflect` MCP server
+  in-process and attaches the top hits as context. Not installed by
+  `setup`; loaded only with `--plugin-dir` under
+  `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`.
+- Fixed on the line: `RankCandidate.min_trust` missing from three ablation
+  examples; two `clippy -D warnings` failures under rust 1.98
+  (`chunks_exact_to_as_chunks`, `result_large_err`).
+
+Knowingly unproven, carried from the 2026-08-08 gate: verdict quality is
+existence data, not accuracy; the demote channel is unmeasured and off by
+default; CRLF/Windows stamp divergence untested; 747 historical
+conversations remain self-contaminated; strategy dreams (`dream backfill`)
+are below their kill bar.
+
 ### Dream journal: fused ask->outcome sentence replaces the two-line headline
 
 `csr-engine dream --report`'s index row used to show a curated headline plus

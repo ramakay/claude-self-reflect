@@ -1636,12 +1636,12 @@ mod tests {
                 conn.execute(
                     "INSERT INTO reflections (id, content, tags, timestamp)
                      VALUES ('ep-1-c', ?1, '[]', '2020-03-01T00:00:00Z')",
-                    params![format!(
-                        r#"{{"schema":"v2","session_id":"ep-1-c","project":"p",
+                    params![
+                        r#"{"schema":"v2","session_id":"ep-1-c","project":"p",
                             "timestamp":"2020-03-01T00:00:00Z","request":"approach three",
                             "completed":"c","outcome":"completed","todos":[],
-                            "files_modified":[],"anchors":[]}}"#
-                    )],
+                            "files_modified":[],"anchors":[]}"#
+                    ],
                 )?;
                 crate::storage::dream_backfill::materialize_episode_index(conn)?;
                 conn.execute(

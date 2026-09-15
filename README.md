@@ -228,6 +228,25 @@ All hooks use catch-all error handling. They never block Claude Code.
 </details>
 
 <details>
+<summary><strong>Experimental: Claude Mods</strong> — CSR recall as an in-process function hook</summary>
+
+Claude Code is adding "Claude Mods" (function hooks, anthropics/claude-code#91870):
+plugin TypeScript that runs in-process with a typed `$` instead of a shell command per
+event. `mods/csr-recall/` is a spike of CSR recall on that surface: one `prompt.submit`
+hook calls the `claude-self-reflect` MCP server through `$.mcp.call` and attaches the top
+hits as a context block. Nothing installs it; load it explicitly:
+
+```bash
+CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir /abs/path/claude-self-reflect/mods/csr-recall
+```
+
+Observed on Claude Code 2.1.270: MCP answered in 95 ms, block attached in 99 ms, hook
+settled in 997 ms. The six shell hooks keep running underneath. Receipts and caveats in
+`mods/csr-recall/README.md`.
+
+</details>
+
+<details>
 <summary><strong>AI Narratives</strong> — optional 9.3x quality boost</summary>
 
 Transform raw conversations into rich, searchable narratives. Requires an Anthropic API key.

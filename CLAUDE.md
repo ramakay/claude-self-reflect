@@ -2,8 +2,8 @@
 
 ## Version reality — read before claiming anything is shipped
 
-**Shipped/live series is 9.5.x. As of 2026-08-19 the latest published version is `9.5.3`**
-(npm `claude-self-reflect`, highest git tag `v9.5.3`). **10.x has never been released — zero
+**Shipped/live series is 9.5.x. As of 2026-09-14 the latest published version is `9.5.6`**
+(npm `claude-self-reflect`, highest git tag `v9.5.6`, cut from `release/v9.5.6`). **10.x has never been released — zero
 `v10*` tags exist.** `csr-engine/Cargo.toml` reads `10.1.0` because that is the *in-development*
 version on unreleased feature branches, NOT a shipped product.
 
@@ -14,7 +14,7 @@ Rules that follow from this:
    documents under a "(v10)" / "(v10.1)" heading is unreleased work-in-progress on branches.
    When you describe them, say "in development for 10.x", not "CSR does X".
 2. **This guide documents the 10.x development target, not the shipped 9.5.x binary.** The
-   binary a user has installed via npm is 9.5.3 and does not have these features unless they
+   binary a user has installed via npm is 9.5.6 and does not have these features unless they
    built from a feature branch. Check `csr-engine --version` / `npm view claude-self-reflect
    version` before telling a user what their install can do — pulled fresh, never from memory.
 3. Do not conflate the two series in user-facing text, release notes, or status claims. If you
@@ -55,7 +55,7 @@ csr-engine (44MB)
 | `~/.claude/projects/<proj>/<session>/subagents/agent-*.jsonl` | import (watcher, recursive) | `source='sidechain'`, real project from first path component (canonicalized), parent session via `chunk_provenance.source_conv_id`; parent beats child in search dedupe; legacy mis-scoped rows repaired import-side |
 | `~/.claude/tasks/<session>/` | Stop hook | authoritative task state → episode todos/outcome; completed tasks matching still-open verdicts → `resolution_proposals` (human promotes via `csr_resolve`) |
 | `~/.claude/plans/*.md` | daemon (30min) | `source='plan'`, `conversation_id=plan:<slug>`; margin-verified correlation, ambiguous → `_unscoped`; origin conversation always beats plan in search dedupe; decays via mtime timestamp |
-| `~/.codex/sessions/**/rollout-*.jsonl` | daemon (30min) + setup | optional vendor adapter, auto-detected; `source='codex_rollout'`; streaming batched ingest; capture-on-appearance (files deleted often); CSR tool payloads filtered via shared predicate |
+| `~/.codex/sessions/**/rollout-*.jsonl` | daemon (30min) + setup | optional vendor adapter, auto-detected; `source='codex_rollout'`; streaming batched ingest; capture-on-appearance (files deleted often); CSR tool payloads filtered via shared predicate; kill switch `CSR_NO_CODEX_IMPORT=1` (first pass over a large history takes hours) |
 | `~/.claude/history.jsonl` | daemon (10min) | `session_registry` spine — never embedded/injected; coverage in `status` |
 | `~/.claude/projects/<proj>/memory/*.md` | daemon (30min) | `memory_registry` spine — bodies NOT embedded/injected, metadata only (slug, description, `type`, `origin_session_id`, mtime, `[[links]]`); `MEMORY.md` skipped; hand-rolled frontmatter parser, `aux_schema_miss:memory_frontmatter` tripwire; feeds a read-only `csr_why` "distilled into memory" hop via `origin_session_id`; kill switch `CSR_NO_MEMORY_REGISTRY=1` |
 | memory bodies / paste-cache | NOT indexed | circularity / privacy — deliberate non-goals (memory *metadata* is registered, see row above) |
@@ -77,7 +77,7 @@ csr-engine                     # Start MCP server (default)
 csr-engine setup               # Import + register MCP + install hooks
 csr-engine status              # System status (JSON)
 csr-engine status --compact    # Statusline output
-csr-engine daemon              # Background enrichment (AI narratives)
+csr-engine daemon              # Background enrichment + dream cycle; keep it alive with scripts/launchd/com.ramakay.csr-engine.daemon.plist
 csr-engine hook install --apply # Install/update hooks
 csr-engine eval                # Quick eval (5 tests, ~7ms)
 csr-engine eval --full         # Full eval (20 tests, ~200ms)
