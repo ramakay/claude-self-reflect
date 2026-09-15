@@ -1,0 +1,8 @@
+{
+  "name": "csr-recall",
+  "version": "0.0.1",
+  "description": "Spike: Claude Self-Reflect recall as a Claude Mod. A prompt.submit function hook calls the claude-self-reflect MCP server in-process and attaches the top hits as a context block. Needs CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 and the claude-self-reflect MCP server registered.",
+  "author": { "name": "ramakay" },
+  "license": "MIT",
+  "keywords": ["memory", "recall", "function-hooks", "claude-self-reflect"]
+}

@@ -1,0 +1,4 @@
+{
+  "description": "csr-recall: on prompt.submit, search past conversations through the claude-self-reflect MCP server and attach the hits as context. Needs CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1; builds without function hooks ignore the modules key.",
+  "modules": ["./register.ts"]
+}
