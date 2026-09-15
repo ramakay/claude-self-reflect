@@ -3,6 +3,7 @@ pub mod cross_project;
 pub mod decay;
 pub mod reinstatement;
 pub mod rerank;
+pub mod trained_rerank;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -222,6 +223,9 @@ impl SearchEngine {
         limit: usize,
         min_score: f32,
     ) -> Vec<SearchResult> {
+        if limit == 0 {
+            return Vec::new();
+        }
         if id_map.len() <= EXACT_SCAN_THRESHOLD {
             return Self::exact_scan(index, id_map, query_vec, limit, min_score, None);
         }
@@ -297,7 +301,7 @@ impl SearchEngine {
     }
 
     pub fn chunk_count(&self) -> usize {
-        self.chunk_id_map.len()
+        self.chunk_id_set.len()
     }
 
     pub fn reflection_count(&self) -> usize {
@@ -318,7 +322,7 @@ impl SearchEngine {
         min_score: f32,
         allowed_ids: &HashSet<String>,
     ) -> Vec<SearchResult> {
-        if self.chunk_id_map.is_empty() || allowed_ids.is_empty() {
+        if self.chunk_id_map.is_empty() || allowed_ids.is_empty() || limit == 0 {
             return Vec::new();
         }
         if self.chunk_id_map.len() <= EXACT_SCAN_THRESHOLD {
@@ -653,6 +657,23 @@ pub fn cleanup_stale_index_files(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_count_tracks_active_ids_across_vector_replacement() {
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("chunk".into(), vec![0.1; 384]);
+        assert_eq!(engine.chunk_count(), 1);
+
+        engine.remove_chunk("chunk");
+        assert_eq!(engine.chunk_count(), 0, "blanked slots are not live chunks");
+
+        engine.insert_chunk("chunk".into(), vec![0.9; 384]);
+        assert_eq!(
+            engine.chunk_count(),
+            1,
+            "remove then insert replaces one live vector; it does not add a chunk"
+        );
+    }
 
     #[test]
     fn tiny_index_search_never_empty() {

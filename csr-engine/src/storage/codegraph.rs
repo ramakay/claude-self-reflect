@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 
 /// A graph node row (a symbol seen in code). Used for both writes and reads.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -204,6 +205,17 @@ pub fn upsert_node(conn: &Connection, n: &NodeRow) -> Result<()> {
     Ok(())
 }
 
+/// Record the exact transcript chunk containing the latest tool edit that
+/// produced this node. Kept outside [`NodeRow`] so historical/backfill graph
+/// writers cannot accidentally overwrite live transcript attribution.
+pub fn set_last_chunk_id(conn: &Connection, node_id: &str, chunk_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE code_nodes SET last_chunk_id = ?2 WHERE id = ?1",
+        params![node_id, chunk_id],
+    )?;
+    Ok(())
+}
+
 /// Per-file edge replace (Codex #3): delete every edge extracted from `src_file`,
 /// then bulk-insert the fresh set. Single transaction — no stale fan-out.
 ///
@@ -287,6 +299,67 @@ pub fn upsert_repo_defs(
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Retire `code_nodes` rows for `(project, file)` whose id is not in
+/// `seen_ids` after a fresh extraction. Extraction has REPLACE
+/// semantics per file (D6): a node absent from the current fragment
+/// (renamed, deleted, or its `kind` changed) must not survive as a
+/// stale row with a stale span. No retired/tombstone column exists on
+/// `code_nodes` (checked `migrations.rs`), so this hard-deletes — but
+/// ONLY rows scoped to this exact (project, file), and ONLY ids absent
+/// from `seen_ids`. `code_node_rank` FK-references `code_nodes.id`
+/// with no cascade, so its row for each retired id is deleted first,
+/// in the same transaction; `code_node_attribution` has no FK but is
+/// cleaned up too so it never dangles.
+pub fn retire_missing_nodes(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    seen_ids: &[String],
+) -> Result<usize> {
+    // Fail-open on an empty observation. A re-extraction that yielded no nodes
+    // is far more likely a parse failure — a file caught mid-edit in a
+    // syntactically broken state, an unsupported construct, an ast-grep miss —
+    // than a file that genuinely lost every symbol it had. Retiring against an
+    // empty set would treat every existing node as stale and hard-delete the
+    // whole file's `code_node_attribution` provenance, which is the memory this
+    // system exists to keep. A stale span is a far cheaper failure than erased
+    // provenance, so an empty extraction retires nothing.
+    if seen_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let seen: std::collections::HashSet<&str> = seen_ids.iter().map(String::as_str).collect();
+
+    let mut stmt = conn.prepare("SELECT id FROM code_nodes WHERE project = ?1 AND file = ?2")?;
+    let existing: Vec<String> = stmt
+        .query_map(params![project, file], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let stale_ids: Vec<String> = existing
+        .into_iter()
+        .filter(|id| !seen.contains(id.as_str()))
+        .collect();
+
+    if stale_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    for id in &stale_ids {
+        tx.execute("DELETE FROM code_node_rank WHERE node_id = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM code_node_attribution WHERE node_id = ?1",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_nodes WHERE id = ?1 AND project = ?2 AND file = ?3",
+            params![id, project, file],
+        )?;
+    }
+    tx.commit()?;
+    Ok(stale_ids.len())
 }
 
 /// Definition sites for `name` within `project`: `(file, kind)`, deterministic order.
@@ -399,15 +472,60 @@ pub fn nodes_by_name(
         .map_err(Into::into)
 }
 
+/// Distinct stored code-graph project namespaces, ordered for determinism.
+pub fn project_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT project FROM code_nodes ORDER BY project")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// Resolve a `symbol or id` to candidate node ids: exact id match first, else by name.
-fn resolve_target_ids(conn: &Connection, name_or_id: &str, project: &str) -> Result<Vec<String>> {
+fn family_projects(conn: &Connection, project: &str) -> Result<Vec<String>> {
+    let mut projects = project_names(conn)?;
+    if !project.is_empty() {
+        projects.retain(|candidate| {
+            crate::search::cross_project::same_project_family(project, candidate)
+        });
+        if !projects.iter().any(|candidate| candidate == project) {
+            projects.push(project.to_string());
+        }
+    }
+    Ok(projects)
+}
+
+fn project_is_in(projects: &[String], candidate: &str) -> bool {
+    projects.is_empty() || projects.iter().any(|project| project == candidate)
+}
+
+fn nodes_by_name_in_projects(
+    conn: &Connection,
+    name: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<NodeRow>> {
+    let nodes = nodes_by_name(conn, name, "", i64::MAX as usize)?;
+    Ok(nodes
+        .into_iter()
+        .filter(|node| project_is_in(projects, &node.project))
+        .take(limit)
+        .collect())
+}
+
+fn resolve_target_ids_in_projects(
+    conn: &Connection,
+    name_or_id: &str,
+    projects: &[String],
+) -> Result<Vec<String>> {
     if get_node(conn, name_or_id)?.is_some() {
         return Ok(vec![name_or_id.to_string()]);
     }
-    Ok(nodes_by_name(conn, name_or_id, project, 50)?
-        .into_iter()
-        .map(|n| n.id)
-        .collect())
+    Ok(
+        nodes_by_name_in_projects(conn, name_or_id, projects, i64::MAX as usize)?
+            .into_iter()
+            .map(|n| n.id)
+            .collect(),
+    )
 }
 
 /// Who calls `name_or_id` — inbound `calls` edges (resolved id match OR the
@@ -423,7 +541,21 @@ pub fn query_callers(
     project: &str,
     limit: usize,
 ) -> Result<Vec<NodeRow>> {
-    let mut targets = resolve_target_ids(conn, name_or_id, project)?;
+    let projects = family_projects(conn, project)?;
+    query_callers_in_projects(conn, name_or_id, &projects, limit)
+}
+
+/// Family-scoped variant used by code-graph queries and regression fixtures.
+pub fn query_callers_in_projects(
+    conn: &Connection,
+    name_or_id: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<NodeRow>> {
+    if get_node(conn, name_or_id)?.is_some_and(|node| !project_is_in(projects, &node.project)) {
+        return Ok(Vec::new());
+    }
+    let mut targets = resolve_target_ids_in_projects(conn, name_or_id, projects)?;
     // Also match the unresolved placeholder form keyed on the bare name.
     let bare = name_or_id.rsplit("::").next().unwrap_or(name_or_id);
     let placeholder = format!("name:{bare}");
@@ -434,8 +566,7 @@ pub fn query_callers(
         targets.push(placeholder);
     }
 
-    let placeholders: Vec<String> = (0..targets.len()).map(|i| format!("?{}", i + 2)).collect();
-    let project_idx = targets.len() + 2;
+    let placeholders: Vec<String> = (0..targets.len()).map(|i| format!("?{}", i + 1)).collect();
     let cols = NODE_COLS
         .split(", ")
         .map(|c| format!("s.{c}"))
@@ -446,32 +577,54 @@ pub fn query_callers(
         "SELECT {cols}, MAX(e.resolved) AS any_resolved FROM code_edges e
          JOIN code_nodes s ON s.id = e.src_id
          WHERE e.kind = 'calls' AND e.dst_id IN ({})
-           AND (?{project_idx} = '' OR s.project = ?{project_idx})
          GROUP BY s.id
-         ORDER BY s.id LIMIT ?1",
+         ORDER BY s.id",
         placeholders.join(", ")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut p: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(targets.len() + 2);
-    let lim = limit as i64;
-    p.push(&lim);
-    for t in &targets {
-        p.push(t);
-    }
-    p.push(&project);
+    let p: Vec<&dyn rusqlite::types::ToSql> = targets
+        .iter()
+        .map(|target| target as &dyn rusqlite::types::ToSql)
+        .collect();
     let rows = stmt.query_map(p.as_slice(), |row| {
         let mut node = row_to_node(row)?;
         let any_resolved: i64 = row.get(node_col_count)?;
         node.name_only = any_resolved == 0;
         Ok(node)
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|node| project_is_in(projects, &node.project))
+        .take(limit)
+        .collect())
 }
 
 /// What `node_id` calls — outbound `calls` edges. Resolved edges return the real
 /// dst node; unresolved `name:<x>` placeholders return a synthetic node.
 pub fn query_callees(conn: &Connection, node_id: &str, limit: usize) -> Result<Vec<NodeRow>> {
+    let projects = match get_node(conn, node_id)? {
+        Some(node) => family_projects(conn, &node.project)?,
+        None => Vec::new(),
+    };
+    query_callees_in_projects(conn, node_id, &projects, limit)
+}
+
+/// Return callees of the selected definition, filtering resolved destinations
+/// to the supplied project family.
+pub fn query_callees_in_projects(
+    conn: &Connection,
+    node_id: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<NodeRow>> {
+    if get_node(conn, node_id)?.is_some_and(|node| !project_is_in(projects, &node.project)) {
+        return Ok(Vec::new());
+    }
+    let source_ids = [node_id.to_string()];
+    let placeholders: Vec<String> = (0..source_ids.len())
+        .map(|index| format!("?{}", index + 1))
+        .collect();
     let cols = NODE_COLS
         .split(", ")
         .map(|c| format!("d.{c}"))
@@ -480,11 +633,16 @@ pub fn query_callees(conn: &Connection, node_id: &str, limit: usize) -> Result<V
     let sql = format!(
         "SELECT e.dst_id, e.resolved, {cols} FROM code_edges e
          LEFT JOIN code_nodes d ON d.id = e.dst_id
-         WHERE e.kind = 'calls' AND e.src_id = ?1
-         ORDER BY e.dst_id LIMIT ?2"
+         WHERE e.kind = 'calls' AND e.src_id IN ({})
+         ORDER BY e.dst_id",
+        placeholders.join(", ")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![node_id, limit as i64], |row| {
+    let params: Vec<&dyn rusqlite::types::ToSql> = source_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
         let dst_id: String = row.get(0)?;
         let resolved: i64 = row.get(1)?;
         // Columns 2.. are the joined node (may be all NULL if unresolved).
@@ -524,8 +682,16 @@ pub fn query_callees(conn: &Connection, node_id: &str, limit: usize) -> Result<V
             })
         }
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut seen = HashSet::new();
+    Ok(rows
+        .into_iter()
+        .filter(|node| {
+            (node.kind == "unresolved" || project_is_in(projects, &node.project))
+                && seen.insert(node.id.clone())
+        })
+        .take(limit)
+        .collect())
 }
 
 /// 1-hop neighbours (both directions) of `node_id`, optional edge-kind filter.
@@ -535,8 +701,46 @@ pub fn query_neighbors(
     kind_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<NeighborEdge>> {
+    let projects = match get_node(conn, node_id)? {
+        Some(node) => family_projects(conn, &node.project)?,
+        None => Vec::new(),
+    };
+    query_neighbors_in_projects(conn, node_id, &projects, kind_filter, limit)
+}
+
+/// Return one-hop edges for a selected definition within a project family.
+/// Outbound edges stay anchored to that exact definition. Inbound edges also
+/// include same-named definitions from alias namespaces, but never other
+/// same-named definitions from the selected definition's own project.
+pub fn query_neighbors_in_projects(
+    conn: &Connection,
+    node_id: &str,
+    projects: &[String],
+    kind_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<NeighborEdge>> {
+    if get_node(conn, node_id)?.is_some_and(|node| !project_is_in(projects, &node.project)) {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     let kf = kind_filter.unwrap_or("");
+    let selected = get_node(conn, node_id)?;
+    let inbound_target_ids = match selected.as_ref() {
+        Some(node) => {
+            let mut ids = vec![node.id.clone()];
+            ids.extend(
+                nodes_by_name_in_projects(conn, &node.name, projects, i64::MAX as usize)?
+                    .into_iter()
+                    .filter(|candidate| candidate.project != node.project)
+                    .map(|candidate| candidate.id),
+            );
+            ids
+        }
+        None => vec![node_id.to_string()],
+    };
+    let inbound_placeholders: Vec<String> = (0..inbound_target_ids.len())
+        .map(|index| format!("?{}", index + 2))
+        .collect();
 
     // Outbound: node_id -> other (only resolved edges have a real other node).
     let out_cols = NODE_COLS
@@ -547,12 +751,12 @@ pub fn query_neighbors(
     let out_sql = format!(
         "SELECT e.kind, e.resolved, {out_cols} FROM code_edges e
          JOIN code_nodes d ON d.id = e.dst_id
-         WHERE e.src_id = ?1 AND (?2 = '' OR e.kind = ?2)
-         ORDER BY e.kind, d.id LIMIT ?3"
+         WHERE (?1 = '' OR e.kind = ?1) AND e.src_id = ?2
+         ORDER BY e.kind, d.id",
     );
     {
         let mut stmt = conn.prepare(&out_sql)?;
-        let rows = stmt.query_map(params![node_id, kf, limit as i64], |row| {
+        let rows = stmt.query_map(params![kf, node_id], |row| {
             let edge_kind: String = row.get(0)?;
             let resolved: i64 = row.get(1)?;
             let node = shift2_node(row)?;
@@ -564,7 +768,13 @@ pub fn query_neighbors(
             })
         })?;
         for r in rows {
-            out.push(r?);
+            let edge = r?;
+            if project_is_in(projects, &edge.node.project) {
+                out.push(edge);
+            }
+            if out.len() == limit {
+                break;
+            }
         }
     }
 
@@ -577,12 +787,21 @@ pub fn query_neighbors(
     let in_sql = format!(
         "SELECT e.kind, e.resolved, {in_cols} FROM code_edges e
          JOIN code_nodes s ON s.id = e.src_id
-         WHERE e.dst_id = ?1 AND (?2 = '' OR e.kind = ?2)
-         ORDER BY e.kind, s.id LIMIT ?3"
+         WHERE (?1 = '' OR e.kind = ?1) AND e.dst_id IN ({})
+         ORDER BY e.kind, s.id",
+        inbound_placeholders.join(", ")
     );
     {
         let mut stmt = conn.prepare(&in_sql)?;
-        let rows = stmt.query_map(params![node_id, kf, limit as i64], |row| {
+        let mut params: Vec<&dyn rusqlite::types::ToSql> =
+            Vec::with_capacity(inbound_target_ids.len() + 1);
+        params.push(&kf);
+        params.extend(
+            inbound_target_ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::types::ToSql),
+        );
+        let rows = stmt.query_map(params.as_slice(), |row| {
             let edge_kind: String = row.get(0)?;
             let resolved: i64 = row.get(1)?;
             let node = shift2_node(row)?;
@@ -593,11 +812,27 @@ pub fn query_neighbors(
                 node,
             })
         })?;
+        let mut inbound = 0;
         for r in rows {
-            out.push(r?);
+            let edge = r?;
+            if project_is_in(projects, &edge.node.project) {
+                out.push(edge);
+                inbound += 1;
+            }
+            if inbound == limit {
+                break;
+            }
         }
     }
 
+    let mut seen = HashSet::new();
+    out.retain(|edge| {
+        seen.insert((
+            edge.direction.clone(),
+            edge.edge_kind.clone(),
+            edge.node.id.clone(),
+        ))
+    });
     Ok(out)
 }
 
@@ -1155,6 +1390,268 @@ mod tests {
     }
 
     #[test]
+    fn query_callers_includes_callers_of_every_family_definition() {
+        let conn = mem();
+        let base = "claude-self-reflect";
+        let alias = "claude-self-reflect-csr-engine";
+
+        let mut base_def = node(
+            "target_base",
+            "src/hooks/session_start.rs",
+            "function",
+            "is_csr_emission",
+            "conv_T1",
+        );
+        base_def.project = base.into();
+        upsert_node(&conn, &base_def).unwrap();
+
+        let mut alias_def = node(
+            "target_alias",
+            "src/hooks/mod.rs",
+            "function",
+            "is_csr_emission",
+            "conv_T2",
+        );
+        alias_def.project = alias.into();
+        upsert_node(&conn, &alias_def).unwrap();
+
+        let mut base_caller = node(
+            "caller_base",
+            "src/hooks/stop.rs",
+            "function",
+            "base_caller",
+            "conv_C1",
+        );
+        base_caller.project = base.into();
+        upsert_node(&conn, &base_caller).unwrap();
+        replace_file_edges(
+            &conn,
+            base,
+            &base_caller.file,
+            &[EdgeRow {
+                src_id: base_caller.id.clone(),
+                dst_id: base_def.id.clone(),
+                kind: "calls".into(),
+                src_file: base_caller.file.clone(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+
+        let mut alias_caller = node(
+            "caller_alias",
+            "src/search/rerank.rs",
+            "function",
+            "is_scaffold_text",
+            "conv_C2",
+        );
+        alias_caller.project = alias.into();
+        upsert_node(&conn, &alias_caller).unwrap();
+        replace_file_edges(
+            &conn,
+            alias,
+            &alias_caller.file,
+            &[EdgeRow {
+                src_id: alias_caller.id.clone(),
+                dst_id: alias_def.id.clone(),
+                kind: "calls".into(),
+                src_file: alias_caller.file.clone(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+
+        let family = vec![base.to_string(), alias.to_string()];
+        let callers = query_callers_in_projects(&conn, "is_csr_emission", &family, 20).unwrap();
+        let ids: Vec<&str> = callers.iter().map(|node| node.id.as_str()).collect();
+        assert_eq!(ids, vec!["caller_alias", "caller_base"]);
+
+        let neighbors =
+            query_neighbors_in_projects(&conn, "target_base", &family, Some("calls"), 20).unwrap();
+        let inbound_ids: Vec<&str> = neighbors
+            .iter()
+            .filter(|edge| edge.direction == "in")
+            .map(|edge| edge.node.id.as_str())
+            .collect();
+        assert_eq!(inbound_ids, vec!["caller_alias", "caller_base"]);
+    }
+
+    #[test]
+    fn selected_definition_does_not_merge_unrelated_same_name_callees_or_neighbors() {
+        let conn = mem();
+        let family = vec!["proj".to_string(), "proj-subdir".to_string()];
+
+        for mut definition in [
+            node(
+                "selected",
+                "src/selected.rs",
+                "function",
+                "duplicate",
+                "conv_S",
+            ),
+            node(
+                "unrelated",
+                "src/unrelated.rs",
+                "function",
+                "duplicate",
+                "conv_U",
+            ),
+        ] {
+            definition.project = "proj".into();
+            upsert_node(&conn, &definition).unwrap();
+        }
+        for callee in [
+            node("wanted", "src/wanted.rs", "function", "wanted", "conv_W"),
+            node("wrong", "src/wrong.rs", "function", "wrong", "conv_X"),
+        ] {
+            upsert_node(&conn, &callee).unwrap();
+        }
+        replace_file_edges(
+            &conn,
+            "proj",
+            "src/selected.rs",
+            &[EdgeRow {
+                src_id: "selected".into(),
+                dst_id: "wanted".into(),
+                kind: "calls".into(),
+                src_file: "src/selected.rs".into(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+        replace_file_edges(
+            &conn,
+            "proj",
+            "src/unrelated.rs",
+            &[EdgeRow {
+                src_id: "unrelated".into(),
+                dst_id: "wrong".into(),
+                kind: "calls".into(),
+                src_file: "src/unrelated.rs".into(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+
+        let callees = query_callees_in_projects(&conn, "selected", &family, 20).unwrap();
+        assert_eq!(
+            callees
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wanted"]
+        );
+
+        let neighbors =
+            query_neighbors_in_projects(&conn, "selected", &family, Some("calls"), 20).unwrap();
+        let outbound = neighbors
+            .iter()
+            .filter(|edge| edge.direction == "out")
+            .map(|edge| edge.node.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(outbound, vec!["wanted"]);
+    }
+
+    #[test]
+    fn explicit_family_queries_reject_out_of_family_exact_anchor_ids() {
+        let conn = mem();
+        let family = vec!["family-root".to_string()];
+
+        for mut row in [
+            node(
+                "outside-target",
+                "src/outside_target.rs",
+                "function",
+                "outside_target",
+                "conv-O1",
+            ),
+            node(
+                "outside-source",
+                "src/outside_source.rs",
+                "function",
+                "outside_source",
+                "conv-O2",
+            ),
+        ] {
+            row.project = "other-project".into();
+            upsert_node(&conn, &row).unwrap();
+        }
+        for mut row in [
+            node(
+                "family-caller",
+                "src/family_caller.rs",
+                "function",
+                "family_caller",
+                "conv-F1",
+            ),
+            node(
+                "family-callee",
+                "src/family_callee.rs",
+                "function",
+                "family_callee",
+                "conv-F2",
+            ),
+        ] {
+            row.project = "family-root".into();
+            upsert_node(&conn, &row).unwrap();
+        }
+        replace_file_edges(
+            &conn,
+            "family-root",
+            "src/family_caller.rs",
+            &[EdgeRow {
+                src_id: "family-caller".into(),
+                dst_id: "outside-target".into(),
+                kind: "calls".into(),
+                src_file: "src/family_caller.rs".into(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+        replace_file_edges(
+            &conn,
+            "other-project",
+            "src/outside_source.rs",
+            &[EdgeRow {
+                src_id: "outside-source".into(),
+                dst_id: "family-callee".into(),
+                kind: "calls".into(),
+                src_file: "src/outside_source.rs".into(),
+                resolved: 1,
+                weight: 1.0,
+                ..EdgeRow::default()
+            }],
+        )
+        .unwrap();
+
+        assert!(
+            query_callers_in_projects(&conn, "outside-target", &family, 20)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            query_callees_in_projects(&conn, "outside-source", &family, 20)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            query_neighbors_in_projects(&conn, "outside-source", &family, None, 20)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn query_callees_marks_unresolved_name_only() {
         let conn = mem();
         upsert_node(
@@ -1359,5 +1856,163 @@ mod tests {
         let conn = mem();
         upsert_node(&conn, &node("n1", "a.rs", "function", "foo", "conv_A")).unwrap();
         assert_eq!(attribution_for_node(&conn, "n1").unwrap(), "unattributed");
+    }
+
+    /// D6 safety guard: an extraction that yielded nothing must retire nothing.
+    /// A file saved mid-edit parses to zero nodes; retiring against that empty
+    /// set would hard-delete the file's whole attribution provenance.
+    #[test]
+    fn retire_missing_nodes_empty_extraction_retires_nothing() {
+        use crate::extraction::ast_analysis::lang_from_path_str;
+        use crate::extraction::codegraph::extract_graph_fragment;
+
+        let conn = mem();
+        let lang = lang_from_path_str("a.rs").expect("rust");
+        let source = "fn alpha() {\n    let x = 1;\n    let _ = x;\n}\n";
+        let fragment = extract_graph_fragment(source, lang, "a.rs", "repo", "proj", "c1", "s1");
+        for n in &fragment.nodes {
+            upsert_node(&conn, n).unwrap();
+        }
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_nodes WHERE project = 'proj' AND file = 'a.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(before > 0, "fixture must seed nodes or the test is vacuous");
+
+        // Simulate a parse failure: zero observed nodes.
+        let retired = retire_missing_nodes(&conn, "proj", "a.rs", &[]).unwrap();
+
+        assert_eq!(retired, 0, "an empty extraction must retire nothing");
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_nodes WHERE project = 'proj' AND file = 'a.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "no node may be deleted on an empty extraction"
+        );
+    }
+
+    /// D6 regression guard: moving a function within a file must refresh span
+    /// and leave exactly one `code_nodes` row (id is stable; upsert updates span).
+    #[test]
+    fn retire_missing_nodes_span_updates_on_move_no_duplicate() {
+        use crate::extraction::ast_analysis::lang_from_path_str;
+        use crate::extraction::codegraph::extract_graph_fragment;
+
+        let conn = mem();
+        let lang = lang_from_path_str("a.rs").expect("rust");
+        let source1 = "fn extractable() {\n    let x = 1;\n    let y = x + 1;\n    let _ = y;\n}\n";
+        let fragment1 = extract_graph_fragment(source1, lang, "a.rs", "repo", "proj", "c1", "s1");
+        for n in &fragment1.nodes {
+            upsert_node(&conn, n).unwrap();
+        }
+        let ids1: Vec<String> = fragment1.nodes.iter().map(|n| n.id.clone()).collect();
+        retire_missing_nodes(&conn, "proj", "a.rs", &ids1).unwrap();
+
+        // Same function, pushed down ~50 blank lines so span_start increases.
+        let pad = "\n".repeat(50);
+        let source2 = format!(
+            "{pad}fn extractable() {{\n    let x = 1;\n    let y = x + 1;\n    let _ = y;\n}}\n"
+        );
+        let fragment2 = extract_graph_fragment(&source2, lang, "a.rs", "repo", "proj", "c2", "s2");
+        for n in &fragment2.nodes {
+            upsert_node(&conn, n).unwrap();
+        }
+        let ids2: Vec<String> = fragment2.nodes.iter().map(|n| n.id.clone()).collect();
+        retire_missing_nodes(&conn, "proj", "a.rs", &ids2).unwrap();
+
+        let rows = nodes_by_name(&conn, "extractable", "proj", 10).unwrap();
+        let extractable: Vec<_> = rows
+            .into_iter()
+            .filter(|n| n.file == "a.rs" && n.kind == "function")
+            .collect();
+        assert_eq!(
+            extractable.len(),
+            1,
+            "exactly one extractable row after move: {:?}",
+            extractable
+                .iter()
+                .map(|n| (n.id.clone(), n.span_start, n.span_end))
+                .collect::<Vec<_>>()
+        );
+        let span_start = extractable[0].span_start;
+        assert!(
+            span_start > 40,
+            "span_start must reflect the padded source 2 position, got {span_start}"
+        );
+    }
+
+    /// D6: a deleted function must be retired (FK-safe: rank row deleted first).
+    /// Uses `Storage::open_memory()` so `PRAGMA foreign_keys=ON` is active.
+    #[test]
+    fn retire_missing_nodes_deletes_absent_function_fk_safe() {
+        use crate::extraction::ast_analysis::lang_from_path_str;
+        use crate::extraction::codegraph::{extract_graph_fragment, node_id};
+
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let lang = lang_from_path_str("a.rs").expect("rust");
+        let source1 = "fn alpha() {\n    let a = 1;\n}\n\nfn beta() {\n    let b = 2;\n}\n";
+        let fragment1 = extract_graph_fragment(source1, lang, "a.rs", "repo", "proj", "c1", "s1");
+        for n in &fragment1.nodes {
+            storage.upsert_code_node(n).unwrap();
+        }
+        let ids1: Vec<String> = fragment1.nodes.iter().map(|n| n.id.clone()).collect();
+        storage
+            .retire_missing_code_nodes("proj", "a.rs", &ids1)
+            .unwrap();
+
+        let beta_id = node_id("repo", "a.rs", "function", "beta");
+        let alpha_id = node_id("repo", "a.rs", "function", "alpha");
+        assert!(
+            storage.get_code_node(&beta_id).unwrap().is_some(),
+            "beta present after first extract"
+        );
+        assert!(
+            storage.get_code_node(&alpha_id).unwrap().is_some(),
+            "alpha present after first extract"
+        );
+
+        // Seed a rank row so FK ON would fail if we delete code_nodes first.
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO code_node_rank (node_id, rank, in_degree, out_degree)
+                 VALUES (?1, 1.0, 0, 0)",
+                rusqlite::params![beta_id],
+            )
+            .unwrap();
+        }
+
+        // Source 2: beta deleted.
+        let source2 = "fn alpha() {\n    let a = 1;\n}\n";
+        let fragment2 = extract_graph_fragment(source2, lang, "a.rs", "repo", "proj", "c2", "s2");
+        for n in &fragment2.nodes {
+            storage.upsert_code_node(n).unwrap();
+        }
+        let ids2: Vec<String> = fragment2.nodes.iter().map(|n| n.id.clone()).collect();
+        storage
+            .retire_missing_code_nodes("proj", "a.rs", &ids2)
+            .unwrap();
+
+        assert!(
+            storage.get_code_node(&beta_id).unwrap().is_none(),
+            "beta must be retired after deletion from source"
+        );
+        assert!(
+            storage.get_code_node(&alpha_id).unwrap().is_some(),
+            "alpha must survive retirement of beta"
+        );
+        // Rank row for beta must also be gone (hygiene + FK ordering).
+        assert!(
+            storage.code_get_node_rank(&beta_id).unwrap().is_none(),
+            "code_node_rank for beta must be deleted with the node"
+        );
     }
 }

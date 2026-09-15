@@ -1,9 +1,21 @@
 pub mod ancestry;
+pub mod artifact_backfill;
+pub mod artifact_provenance;
 pub mod chunk_binding;
 pub mod codegraph;
+pub mod dream_attribution;
+pub mod dream_backfill;
+pub mod dream_clusters;
+pub mod dream_delivery;
+pub mod dream_items;
+pub mod dream_report;
+pub mod intent_events;
 pub mod migrations;
 pub mod queries;
 pub mod recap_feeds;
+pub mod sidechain_provenance;
+pub mod trained_rerank;
+pub mod usage_reservation;
 pub mod witness_ledger;
 pub mod witness_verdicts;
 
@@ -15,9 +27,10 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::import::{ConversationChunk, CsrSuppressionStats};
+use crate::provenance::ChunkProvenance;
 
 /// SQLite storage with FTS5 for full-text search.
 /// Thread-safe via Mutex around the Connection.
@@ -25,7 +38,39 @@ pub struct Storage {
     conn: Mutex<Connection>,
 }
 
+const CONTAMINATION_META_KEY: &str = "contamination_measurement_v1";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ContaminationMeasurement {
+    pub conversations: usize,
+    pub total_conversations: usize,
+    pub pct: f64,
+    pub last_measured: String,
+}
+
 impl Storage {
+    pub fn insert_resolutions_with_confirmation(
+        &self,
+        chunk_ids: &[String],
+        status: &str,
+        evidence: &str,
+        claim: Option<&str>,
+        confirmation: Option<&crate::provenance::ResolutionConfirmation>,
+    ) -> Result<(usize, &'static str)> {
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let result = queries::append_resolutions_with_confirmation(
+                &tx,
+                chunk_ids,
+                status,
+                evidence,
+                claim,
+                confirmation,
+            )?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
     /// Run an internal read or write operation while holding the SQLite mutex.
     ///
     /// Kept crate-private so diagnostics can take consistent multi-table
@@ -43,10 +88,29 @@ impl Storage {
         let conn = Connection::open(path)?;
         // foreign_keys=ON is explicit, not build-flag-dependent (Codex MEDIUM):
         // makes the declared chunk_provenance FK enforced deterministically.
+        //
+        // recursive_triggers=ON is what keeps `chunks_fts` honest under REPLACE.
+        // The index is external-content and maintained by AFTER INSERT/UPDATE/DELETE
+        // triggers on `chunks`; SQLite fires the DELETE trigger for the row that
+        // REPLACE conflict-resolution removes ONLY when this pragma is on. With it
+        // off, an `INSERT OR REPLACE INTO chunks` strands the old document in the
+        // index at a rowid nothing owns — the exact defect that grew this index to
+        // 10.4M orphan rows, and one that `integrity-check` does not report. The
+        // production write path is an upsert and no longer does that; this pragma is
+        // the guard against the next writer that reaches for REPLACE.
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;",
         )?;
         migrations::run(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Open an existing database without running migrations or permitting writes.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -55,11 +119,71 @@ impl Storage {
     /// Open an in-memory database (for tests).
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;")?;
         migrations::run(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    pub fn insert_intent_events(
+        &self,
+        events: &[crate::transcript::intent_events::IntentEvent],
+    ) -> Result<usize> {
+        let inputs = artifact_backfill::prepare_intent_inputs(self, events);
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let savepoint = conn.unchecked_transaction()?;
+        let count = intent_events::insert_with_inputs(&savepoint, events, &inputs)?;
+        savepoint.commit()?;
+        Ok(count)
+    }
+
+    pub fn list_intent_events(
+        &self,
+        project: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<crate::transcript::intent_events::IntentEvent>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        intent_events::list(&conn, project, since)
+    }
+
+    pub fn count_intent_events(&self, project: Option<&str>, since: Option<&str>) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        intent_events::count(&conn, project, since)
+    }
+
+    pub fn count_correction_redirect_events_since(&self, since: &str) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM intent_events
+             WHERE kind IN ('correction', 'redirect')
+               AND julianday(ts) >= julianday(?1)",
+            [since],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn dream_counts_by_category(&self) -> Result<(i64, i64, i64)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN category = 'unfinished' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN category = 'strategy' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN category = 'supersession' THEN 1 ELSE 0 END), 0)
+             FROM dreams_v1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn count_session_intent_events(
+        &self,
+        session_id: &str,
+        kind: crate::transcript::intent_events::IntentEventKind,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        intent_events::count_session_kind(&conn, session_id, kind)
     }
 
     // ─── Chunk operations ───
@@ -82,6 +206,88 @@ impl Storage {
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::insert_chunk_provenance(&conn, chunk_id, prov)
+    }
+
+    pub fn replace_chunk_evidence(
+        &self,
+        evidence: &crate::provenance::ChunkEvidence,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::replace_chunk_evidence(&conn, evidence)
+    }
+
+    pub fn replace_chunk_evidence_batch(
+        &self,
+        evidence: &[crate::provenance::ChunkEvidence],
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::replace_chunk_evidence_batch(&conn, evidence)
+    }
+
+    pub fn insert_provenance_event(
+        &self,
+        event: &crate::provenance::ProvenanceEvent,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::insert_provenance_event(&conn, event)
+    }
+
+    pub(crate) fn parent_provenance_context(
+        &self,
+        conversation_id: &str,
+        message_key: Option<&str>,
+    ) -> Result<crate::import::ParentContext> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::parent_provenance_context(&conn, conversation_id, message_key)
+    }
+
+    /// Read only the cached chunk floor. Retrieval must never join the event
+    /// tables on its hot path.
+    pub fn get_chunk_min_trust(&self, chunk_id: &str) -> Result<crate::provenance::TrustTier> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_min_trust(&conn, chunk_id)
+    }
+
+    pub fn list_chunks_missing_spans(
+        &self,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<queries::ProvenanceBackfillRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::list_chunks_missing_spans(&conn, after_id, limit)
+    }
+
+    pub fn provenance_coverage(&self) -> Result<(i64, i64, i64, Option<f64>)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::provenance_coverage(&conn)
+    }
+
+    pub(crate) fn list_provenance_backfill_candidates(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: usize,
+        retry: bool,
+    ) -> Result<Vec<queries::ProvenanceBackfillRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::list_provenance_backfill_candidates(&conn, after, limit, retry)
+    }
+
+    pub(crate) fn replace_backfill_evidence_batch(
+        &self,
+        evidence: &[crate::provenance::ChunkEvidence],
+    ) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::replace_backfill_evidence_batch(&conn, evidence)
+    }
+
+    pub fn provenance_tier_histogram(&self) -> Result<Vec<(crate::provenance::TrustTier, i64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::provenance_tier_histogram(&conn)
+    }
+
+    pub fn provenance_failure_counts(&self) -> Result<[i64; 3]> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::provenance_failure_counts(&conn)
     }
 
     /// Fetch provenance for a chunk, if recorded.
@@ -144,7 +350,13 @@ impl Storage {
         embedding: &[f32],
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::insert_reflection(&conn, id, content, tags, embedding)
+        let tx = conn.unchecked_transaction()?;
+        queries::insert_reflection(&tx, id, content, tags, embedding)?;
+        // A replaced body invalidates every snapshot of this row; a fresh id
+        // has no dependents and this is a single indexed lookup.
+        artifact_provenance::lower_from(&tx, &[("reflection", id)], &[])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn load_all_chunk_ids(&self) -> Result<Vec<String>> {
@@ -235,7 +447,7 @@ impl Storage {
         query: &str,
         limit: usize,
         project: Option<&str>,
-    ) -> Result<Vec<ConversationChunk>> {
+    ) -> Result<Vec<(ConversationChunk, usize, f64)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::fts5_search(&conn, query, limit, project)
     }
@@ -338,7 +550,11 @@ impl Storage {
 
     pub fn delete_reflection(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::delete_reflection(&conn, id)
+        let tx = conn.unchecked_transaction()?;
+        queries::delete_reflection(&tx, id)?;
+        artifact_provenance::lower_from(&tx, &[("reflection", id)], &[])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get_enrichment_reflection_id(
@@ -408,6 +624,58 @@ impl Storage {
     pub fn count_conversations(&self) -> Result<usize> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::count_conversations(&conn)
+    }
+
+    /// Return each distinct conversation whose persisted chunk content matches
+    /// the shared CSR-contamination predicate, with the first matching reason.
+    pub fn contaminated_conversations(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut statement = conn.prepare(
+            "SELECT conversation_id, content FROM chunks ORDER BY conversation_id, rowid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut contaminated = Vec::new();
+        let mut last_contaminated: Option<String> = None;
+        for row in rows {
+            let (conversation_id, content) = row?;
+            if last_contaminated.as_deref() == Some(&conversation_id) {
+                continue;
+            }
+            if let Some(reason) = crate::import::contamination_reason(&content) {
+                last_contaminated = Some(conversation_id.clone());
+                contaminated.push((conversation_id, reason.to_string()));
+            }
+        }
+        Ok(contaminated)
+    }
+
+    pub fn refresh_contamination_cache(&self) -> Result<ContaminationMeasurement> {
+        let conversations = self.contaminated_conversations()?.len();
+        let total_conversations = self.count_conversations()?;
+        let pct = if total_conversations == 0 {
+            0.0
+        } else {
+            conversations as f64 / total_conversations as f64 * 100.0
+        };
+        let measurement = ContaminationMeasurement {
+            conversations,
+            total_conversations,
+            pct,
+            last_measured: chrono::Utc::now().to_rfc3339(),
+        };
+        self.set_meta(
+            CONTAMINATION_META_KEY,
+            &serde_json::to_string(&measurement)?,
+        )?;
+        Ok(measurement)
+    }
+
+    pub fn cached_contamination(&self) -> Result<Option<ContaminationMeasurement>> {
+        self.get_meta(CONTAMINATION_META_KEY)?
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .transpose()
     }
 
     pub fn count_projects(&self) -> Result<usize> {
@@ -547,6 +815,25 @@ impl Storage {
         queries::insert_chunk_with_source(&conn, chunk, embedding, source)
     }
 
+    /// Atomically replace every persisted chunk for one conversation. Embeddings
+    /// must be prepared before calling this method, so an embedding failure cannot
+    /// leave the conversation deleted or partially rebuilt.
+    pub fn replace_conversation_chunks_atomic(
+        &self,
+        conversation_id: &str,
+        rows: &[(ConversationChunk, Vec<f32>, ChunkProvenance, String)],
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.unchecked_transaction()?;
+        queries::delete_chunks_for_conversation(&tx, conversation_id)?;
+        for (chunk, embedding, provenance, source) in rows {
+            queries::insert_chunk_with_source(&tx, chunk, embedding, source)?;
+            queries::insert_chunk_provenance(&tx, &chunk.id, provenance)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Record a task-derived resolution proposal. Proposals are NOT verdicts:
     /// they live in their own table, invisible to search annotation, until a
     /// human promotes one via csr_resolve (Codex adversarial review — automatic
@@ -580,6 +867,20 @@ impl Storage {
     pub fn count_resolution_verdicts(&self) -> Result<i64> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         Ok(conn.query_row("SELECT COUNT(*) FROM resolution_ledger", [], |r| r.get(0))?)
+    }
+
+    /// Resolution-ledger row counts as `(agent, user_confirmed)`.
+    pub fn count_resolution_verdicts_by_source(&self) -> Result<(i64, i64)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.query_row(
+            "SELECT
+                COALESCE(SUM(source = 'agent'), 0),
+                COALESCE(SUM(source = 'user_confirmed'), 0)
+             FROM resolution_ledger",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(Into::into)
     }
 
     /// Plan-corpus counts: (docs, chunks, unscoped_docs). Plan chunks are
@@ -628,9 +929,25 @@ impl Storage {
         queries::delete_chunks_for_conversation(&conn, conversation_id)
     }
 
+    pub fn delete_chunk(&self, chunk_id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::delete_chunk(&conn, chunk_id)
+    }
+
     pub fn record_narrative_usage(&self, row: &NarrativeUsageRow) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::record_narrative_usage(&conn, row)
+    }
+
+    /// Record usage tagged with the convergence hash that caused it — the
+    /// evidence a per-dream spend figure is summed from (Journal v4 P4).
+    pub fn record_narrative_usage_for(
+        &self,
+        row: &NarrativeUsageRow,
+        ref_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::record_narrative_usage_for(&conn, row, ref_id)
     }
 
     pub fn narrative_usage_summary(&self) -> Result<NarrativeUsageSummary> {
@@ -933,6 +1250,11 @@ impl Storage {
         queries::get_chunk_vectors_by_ids(&conn, ids)
     }
 
+    pub fn get_reflection_vectors_by_ids(&self, ids: &[String]) -> Result<Vec<(String, Vec<f32>)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_reflection_vectors_by_ids(&conn, ids)
+    }
+
     pub fn files_for_session(&self, session_id: &str, limit: usize) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::files_for_session(&conn, session_id, limit)
@@ -1002,6 +1324,26 @@ impl Storage {
         codegraph::upsert_node(&conn, node)
     }
 
+    pub fn set_code_node_last_chunk(&self, node_id: &str, chunk_id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::set_last_chunk_id(&conn, node_id, chunk_id)
+    }
+
+    pub fn latest_chunk_id_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.query_row(
+            "SELECT id FROM chunks WHERE conversation_id = ?1
+             ORDER BY COALESCE(seq, -1) DESC, rowid DESC LIMIT 1",
+            rusqlite::params![conversation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn replace_code_file_edges(
         &self,
         project: &str,
@@ -1010,6 +1352,38 @@ impl Storage {
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         codegraph::replace_file_edges(&conn, project, src_file, edges)
+    }
+
+    /// Retire `code_nodes` rows for `(project, file)` absent from `seen_ids`
+    /// after a fresh extraction (D6 — per-file extraction has REPLACE
+    /// semantics, a symbol renamed/deleted/re-kinded must not survive as a
+    /// stale row with a stale span).
+    pub fn retire_missing_code_nodes(
+        &self,
+        project: &str,
+        file: &str,
+        seen_ids: &[String],
+    ) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::retire_missing_nodes(&conn, project, file, seen_ids)
+    }
+
+    /// Count `code_nodes` rows for a file, across every project. Used by the
+    /// retirement-safety tests to assert that a destructive path did not fire.
+    pub fn count_code_nodes_for_file(&self, file: &str) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM code_nodes WHERE file = ?1",
+            rusqlite::params![file],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Fetch a single `code_nodes` row by id (thin wrapper for tests / tools).
+    pub fn get_code_node(&self, id: &str) -> Result<Option<codegraph::NodeRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::get_node(&conn, id)
     }
 
     /// Distinct `code_nodes.file` values still missing `repo_root` (WP2 Stage 1 backfill).
@@ -1226,7 +1600,7 @@ impl Storage {
         queries::insert_resolutions(&conn, chunk_ids, status, evidence, claim, source)
     }
 
-    /// Batch-fetch latest resolution entries keyed by chunk_id.
+    /// Batch-fetch latest user-confirmed resolution entries keyed by chunk id.
     pub fn get_resolutions_batch(
         &self,
         chunk_ids: &[String],
@@ -1250,6 +1624,117 @@ impl Storage {
     ) -> Result<std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         chunk_binding::witness_verdict_for_chunks(&conn, conversation_ids)
+    }
+
+    /// Resolve verdict hits to stable chunk ids before returning them to a
+    /// ranking consumer. Exact chunk ids pass through unchanged. Legacy
+    /// conversation-keyed hits are rebound only when the supplied batch has
+    /// exactly one chunk for that conversation; ambiguous bindings abstain.
+    pub fn witness_verdicts_for_chunks(
+        &self,
+        chunks: &[(String, String)],
+    ) -> Result<std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>>> {
+        use std::collections::{HashMap, HashSet};
+
+        let mut conversation_ids: Vec<String> = chunks
+            .iter()
+            .map(|(_, conversation_id)| conversation_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        conversation_ids.sort();
+        let grouped = self.witness_verdicts_for_conversations(&conversation_ids)?;
+        let candidate_owners: HashMap<&str, &str> = chunks
+            .iter()
+            .map(|(chunk_id, conversation_id)| (chunk_id.as_str(), conversation_id.as_str()))
+            .collect();
+        let mut persisted_by_conversation: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            const BATCH: usize = 400;
+            for batch in conversation_ids.chunks(BATCH) {
+                let placeholders: Vec<String> =
+                    (1..=batch.len()).map(|i| format!("?{i}")).collect();
+                let sql = format!(
+                    "SELECT id, conversation_id FROM chunks
+                     WHERE conversation_id IN ({}) ORDER BY conversation_id, id",
+                    placeholders.join(", ")
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (chunk_id, conversation_id) = row?;
+                    persisted_by_conversation
+                        .entry(conversation_id)
+                        .or_default()
+                        .push(chunk_id);
+                }
+            }
+        }
+
+        Ok(Self::rebind_verdict_hits(
+            grouped,
+            chunks,
+            &candidate_owners,
+            &persisted_by_conversation,
+        ))
+    }
+
+    /// Pure rebinding step of [`Self::witness_verdicts_for_chunks`], split
+    /// out so the drop/attach rules are directly testable. Exact chunk ids
+    /// pass through. Conversation-keyed hits (empty `chunk_id`): an
+    /// annotation is conversation-level truth ("code discussed here later
+    /// evolved") and attaches to EVERY candidate chunk of that conversation
+    /// — without this, any multi-chunk conversation silently dropped the
+    /// hit (measured live: all 545 legacy verdicts user-invisible, DoD
+    /// review blocker 1, 2026-08-09). Demote changes ranking, so it keeps
+    /// the strict rule: bind only when the conversation has exactly one
+    /// persisted chunk; ambiguous bindings abstain.
+    fn rebind_verdict_hits(
+        grouped: std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>>,
+        chunks: &[(String, String)],
+        candidate_owners: &std::collections::HashMap<&str, &str>,
+        persisted_by_conversation: &std::collections::HashMap<String, Vec<String>>,
+    ) -> std::collections::BTreeMap<String, Vec<chunk_binding::ChunkWitnessVerdict>> {
+        let mut by_chunk = std::collections::BTreeMap::new();
+        for (conversation_id, hits) in grouped {
+            for hit in hits {
+                let bound_chunk_ids: Vec<String> = if candidate_owners.get(hit.chunk_id.as_str())
+                    == Some(&conversation_id.as_str())
+                {
+                    vec![hit.chunk_id.clone()]
+                } else if hit.chunk_id.is_empty() {
+                    match hit.channel {
+                        witness_verdicts::VerdictChannel::Annotate => chunks
+                            .iter()
+                            .filter(|(_, conv)| conv == &conversation_id)
+                            .map(|(chunk_id, _)| chunk_id.clone())
+                            .collect(),
+                        witness_verdicts::VerdictChannel::Demote => persisted_by_conversation
+                            .get(&conversation_id)
+                            .and_then(|ids| (ids.len() == 1).then(|| ids[0].clone()))
+                            .filter(|id| {
+                                candidate_owners.get(id.as_str()) == Some(&conversation_id.as_str())
+                            })
+                            .into_iter()
+                            .collect(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                for bound_chunk_id in bound_chunk_ids {
+                    let mut bound_hit = hit.clone();
+                    bound_hit.chunk_id = bound_chunk_id.clone();
+                    by_chunk
+                        .entry(bound_chunk_id)
+                        .or_insert_with(Vec::new)
+                        .push(bound_hit);
+                }
+            }
+        }
+        by_chunk
     }
 
     // ─── Session registry / aux coverage ───
@@ -1414,6 +1899,429 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_without_spans_reads_as_unknown_and_evidence_updates_cached_floor() {
+        use crate::provenance::{ChunkEvidence, ChunkSpan, ProvenanceEvent, TrustTier};
+
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO chunks
+                        (id, conversation_id, project_name, timestamp, content, message_count)
+                     VALUES ('chunk-1', 'conv', 'project', '2026-09-04T00:00:00Z',
+                             'user confirmed: quoted tool text', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            storage.get_chunk_min_trust("chunk-1").unwrap(),
+            TrustTier::Unknown
+        );
+
+        let event = ProvenanceEvent {
+            event_id: "event-1".into(),
+            conversation_id: "conv".into(),
+            message_key: "message-1".into(),
+            seq: 0,
+            channel: "tool_result:Read".into(),
+            trust_tier: TrustTier::TrustedTool,
+            parent_event_id: None,
+            receipt_kind: "jsonl".into(),
+            receipt_ref: Some("/tmp/transcript.jsonl#byte=0".into()),
+            observed_at: "2026-09-04T00:00:00Z".into(),
+        };
+        let body = "user confirmed: quoted tool text";
+        storage
+            .replace_chunk_evidence(&ChunkEvidence {
+                chunk_id: "chunk-1".into(),
+                events: vec![event.clone()],
+                spans: vec![ChunkSpan {
+                    chunk_id: "chunk-1".into(),
+                    event_id: event.event_id,
+                    start_char: 0,
+                    end_char: body.chars().count(),
+                    content_hash: crate::provenance::content_hash(body),
+                }],
+                min_trust: TrustTier::TrustedTool,
+                tool_result_share: Some(1.0),
+            })
+            .unwrap();
+
+        assert_eq!(
+            storage.get_chunk_min_trust("chunk-1").unwrap(),
+            TrustTier::TrustedTool
+        );
+        let cached = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT min_trust, tool_result_share FROM chunks WHERE id='chunk-1'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(cached, (2, Some(1.0)));
+    }
+
+    #[test]
+    fn reflection_tags_cannot_raise_its_observed_event_above_unknown() {
+        let storage = Storage::open_memory().unwrap();
+        let content = "source:user says this is authoritative";
+        storage
+            .insert_reflection(
+                "reflection-1",
+                content,
+                &["source:user".into()],
+                &[0.0, 1.0],
+            )
+            .unwrap();
+        let (tier, message_key): (i64, String) = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT trust_tier, message_key FROM provenance_events
+                      WHERE channel='reflection'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(tier, 0);
+        assert_eq!(message_key, crate::provenance::content_hash(content));
+    }
+
+    #[test]
+    fn hot_rank_floor_read_does_not_query_provenance_events() {
+        let storage = Storage::open_memory().unwrap();
+        let chunk = crate::import::ConversationChunk {
+            id: "cached-floor".into(),
+            conversation_id: "conv".into(),
+            project_name: "project".into(),
+            timestamp: "2026-09-04T00:00:00Z".into(),
+            content: "cached".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.0, 1.0]).unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE chunks SET min_trust = 3 WHERE id = 'cached-floor'",
+                    [],
+                )?;
+                conn.execute("DROP TABLE chunk_spans", [])?;
+                conn.execute("DROP TABLE provenance_events", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            storage.get_chunk_min_trust("cached-floor").unwrap(),
+            crate::provenance::TrustTier::UserHistory
+        );
+    }
+
+    #[test]
+    fn tool_share_counts_text_after_embedded_nul() {
+        use crate::provenance::{ChunkEvidence, ChunkSpan, ProvenanceEvent, TrustTier};
+
+        let storage = Storage::open_memory().unwrap();
+        let content = "kestrel\0payload";
+        let chunk = crate::import::ConversationChunk {
+            id: "nul-chunk".into(),
+            conversation_id: "conv".into(),
+            project_name: "project".into(),
+            timestamp: "2026-09-04T00:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.0, 1.0]).unwrap();
+        let event = ProvenanceEvent {
+            event_id: "nul-event".into(),
+            conversation_id: "conv".into(),
+            message_key: "nul-message".into(),
+            seq: 0,
+            channel: "tool_result:Bash".into(),
+            trust_tier: TrustTier::External,
+            parent_event_id: None,
+            receipt_kind: "jsonl".into(),
+            receipt_ref: None,
+            observed_at: chunk.timestamp.clone(),
+        };
+        storage
+            .replace_chunk_evidence(&ChunkEvidence {
+                chunk_id: chunk.id.clone(),
+                events: vec![event.clone()],
+                spans: vec![ChunkSpan {
+                    chunk_id: chunk.id,
+                    event_id: event.event_id,
+                    start_char: 0,
+                    end_char: content.chars().count(),
+                    content_hash: crate::provenance::content_hash(content),
+                }],
+                min_trust: TrustTier::External,
+                tool_result_share: Some(1.0),
+            })
+            .unwrap();
+
+        let share = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT tool_result_share FROM chunks WHERE id='nul-chunk'",
+                    [],
+                    |row| row.get::<_, f64>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(share, 1.0);
+    }
+
+    #[test]
+    fn reobserving_an_event_can_only_lower_its_persisted_floor() {
+        use crate::provenance::{ChunkEvidence, ChunkSpan, ProvenanceEvent, TrustTier};
+
+        let storage = Storage::open_memory().unwrap();
+        let chunk = crate::import::ConversationChunk {
+            id: "monotone-chunk".into(),
+            conversation_id: "conv".into(),
+            project_name: "project".into(),
+            timestamp: "2026-09-04T00:00:00Z".into(),
+            content: "assistant observation".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.0, 1.0]).unwrap();
+        let evidence = |tier| ChunkEvidence {
+            chunk_id: chunk.id.clone(),
+            events: vec![ProvenanceEvent {
+                event_id: "stable-event".into(),
+                conversation_id: chunk.conversation_id.clone(),
+                message_key: "stable-message".into(),
+                seq: 0,
+                channel: "assistant_message".into(),
+                trust_tier: tier,
+                parent_event_id: None,
+                receipt_kind: "jsonl".into(),
+                receipt_ref: None,
+                observed_at: chunk.timestamp.clone(),
+            }],
+            spans: vec![ChunkSpan {
+                chunk_id: chunk.id.clone(),
+                event_id: "stable-event".into(),
+                start_char: 0,
+                end_char: chunk.content.chars().count(),
+                content_hash: crate::provenance::content_hash(&chunk.content),
+            }],
+            min_trust: tier,
+            tool_result_share: Some(0.0),
+        };
+
+        storage
+            .replace_chunk_evidence(&evidence(TrustTier::UserHistory))
+            .unwrap();
+        storage
+            .replace_chunk_evidence(&evidence(TrustTier::External))
+            .unwrap();
+        assert_eq!(
+            storage.get_chunk_min_trust(&chunk.id).unwrap(),
+            TrustTier::External
+        );
+
+        storage
+            .replace_chunk_evidence(&evidence(TrustTier::UserHistory))
+            .expect("a later higher observation must remain at the stored floor");
+        assert_eq!(
+            storage.get_chunk_min_trust(&chunk.id).unwrap(),
+            TrustTier::External
+        );
+    }
+
+    #[test]
+    fn contaminated_conversations_uses_shared_content_predicate_and_caches_measurement() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                for (id, conversation_id, content) in [
+                    ("clean-1", "clean", "ordinary user-authored work"),
+                    (
+                        "recap-1",
+                        "recap",
+                        "[[CSR:RECAP]] generated recap paragraph",
+                    ),
+                    (
+                        "wrapper-1",
+                        "wrapper",
+                        "<system-reminder>CSR PICKUP — old context</system-reminder>",
+                    ),
+                ] {
+                    conn.execute(
+                        "INSERT INTO chunks
+                         (id, conversation_id, project_name, timestamp, content, message_count)
+                         VALUES (?1, ?2, 'project', '2026-09-01T00:00:00Z', ?3, 1)",
+                        rusqlite::params![id, conversation_id, content],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(storage.cached_contamination().unwrap().is_none());
+        assert_eq!(
+            storage.contaminated_conversations().unwrap(),
+            vec![
+                ("recap".to_string(), "machine_sentinel".to_string()),
+                ("wrapper".to_string(), "system_reminder".to_string()),
+            ]
+        );
+
+        let measured = storage.refresh_contamination_cache().unwrap();
+        assert_eq!(measured.conversations, 2);
+        assert_eq!(measured.total_conversations, 3);
+        assert!((measured.pct - 66.666_666).abs() < 0.001);
+        assert!(!measured.last_measured.is_empty());
+        assert_eq!(storage.cached_contamination().unwrap(), Some(measured));
+    }
+
+    /// A raw `INSERT OR REPLACE INTO chunks` must not strand the replaced row's
+    /// document in the FTS index.
+    ///
+    /// REPLACE deletes the conflicting row and inserts a fresh one, which takes a
+    /// NEW implicit rowid (`chunks.id` is TEXT, so the rowid is unconstrained).
+    /// `chunks_fts` is addressed by that rowid. Without `recursive_triggers=ON`
+    /// SQLite skips the AFTER DELETE trigger for the row REPLACE removed, so the
+    /// old document survives at a rowid no chunk owns — invisible to
+    /// `integrity-check`, and 98.5% of the reference database's index by row count.
+    #[test]
+    fn insert_or_replace_on_chunks_leaves_no_orphan_fts_document() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                for content in ["orphanedtoken payload", "survivingtoken payload"] {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO chunks
+                             (id, conversation_id, project_name, timestamp, content, message_count)
+                         VALUES ('c1', 'conv', 'proj', '2026-08-12T00:00:00Z', ?1, 1)",
+                        rusqlite::params![content],
+                    )?;
+                }
+                let documents: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM chunks_fts_docsize", [], |r| r.get(0))?;
+                assert_eq!(documents, 1, "REPLACE must not append an orphan document");
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            storage
+                .fts5_search("orphanedtoken", 10, None)
+                .unwrap()
+                .is_empty(),
+            "the replaced text must leave the index"
+        );
+        assert_eq!(
+            storage.fts5_search("survivingtoken", 10, None).unwrap()[0]
+                .0
+                .id,
+            "c1"
+        );
+
+        // Negative control, so the assertions above cannot pass vacuously: the same
+        // writes on a connection that did NOT enable the pragma strand the orphan.
+        // If SQLite ever fires delete triggers for REPLACE unconditionally, this
+        // fails and the pragma becomes redundant rather than silently load-bearing.
+        let unguarded = Connection::open_in_memory().unwrap();
+        unguarded
+            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=OFF;")
+            .unwrap();
+        migrations::run(&unguarded).unwrap();
+        for content in ["orphanedtoken payload", "survivingtoken payload"] {
+            unguarded
+                .execute(
+                    "INSERT OR REPLACE INTO chunks
+                         (id, conversation_id, project_name, timestamp, content, message_count)
+                     VALUES ('c1', 'conv', 'proj', '2026-08-12T00:00:00Z', ?1, 1)",
+                    rusqlite::params![content],
+                )
+                .unwrap();
+        }
+        let orphaned: i64 = unguarded
+            .query_row("SELECT COUNT(*) FROM chunks_fts_docsize", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            orphaned, 2,
+            "control: without the pragma REPLACE orphans a document"
+        );
+    }
+
+    #[test]
+    fn conversation_keyed_annotation_attaches_to_every_candidate_chunk() {
+        use chunk_binding::ChunkWitnessVerdict;
+        use std::collections::{BTreeMap, HashMap};
+
+        // Multi-chunk conversation, hit keyed at conversation level (empty
+        // chunk_id) — the exact live shape in which all 545 legacy verdicts
+        // were silently dropped (DoD review blocker 1).
+        let chunks = vec![
+            ("chunk-1".to_string(), "conv-a".to_string()),
+            ("chunk-2".to_string(), "conv-a".to_string()),
+            ("chunk-x".to_string(), "conv-other".to_string()),
+        ];
+        let candidate_owners: HashMap<&str, &str> = chunks
+            .iter()
+            .map(|(c, v)| (c.as_str(), v.as_str()))
+            .collect();
+        let persisted: HashMap<String, Vec<String>> = HashMap::from([(
+            "conv-a".to_string(),
+            vec![
+                "chunk-1".to_string(),
+                "chunk-2".to_string(),
+                "chunk-3-unretrieved".to_string(),
+            ],
+        )]);
+        let annotate_hit = ChunkWitnessVerdict {
+            chunk_id: String::new(),
+            file: "/repo/src/lib.rs".to_string(),
+            symbol: Some("foo".to_string()),
+            channel: witness_verdicts::VerdictChannel::Annotate,
+            verdict: "superseded_by",
+            receipt_oid: Some("receiptoid".to_string()),
+        };
+        let demote_hit = ChunkWitnessVerdict {
+            channel: witness_verdicts::VerdictChannel::Demote,
+            ..annotate_hit.clone()
+        };
+        let grouped: BTreeMap<String, Vec<ChunkWitnessVerdict>> =
+            BTreeMap::from([("conv-a".to_string(), vec![annotate_hit, demote_hit])]);
+
+        let by_chunk =
+            Storage::rebind_verdict_hits(grouped, &chunks, &candidate_owners, &persisted);
+
+        // Annotate: reaches BOTH candidate chunks of the conversation, with
+        // its receipt — never the other conversation's chunk.
+        for id in ["chunk-1", "chunk-2"] {
+            let hits = by_chunk
+                .get(id)
+                .unwrap_or_else(|| panic!("annotation must reach {id}"));
+            assert_eq!(hits.len(), 1, "demote must NOT rebind on multi-chunk");
+            assert_eq!(hits[0].channel, witness_verdicts::VerdictChannel::Annotate);
+            assert_eq!(hits[0].receipt_oid.as_deref(), Some("receiptoid"));
+        }
+        assert!(!by_chunk.contains_key("chunk-x"));
+        assert!(!by_chunk.contains_key("chunk-3-unretrieved"));
+    }
 
     #[test]
     fn episode_anchors_roundtrip() {
@@ -1640,6 +2548,64 @@ mod tests {
     }
 
     #[test]
+    fn get_reflection_vectors_by_ids_returns_exactly_the_requested_ids() {
+        use std::collections::HashMap;
+
+        let storage = Storage::open_memory().unwrap();
+        let id1 = "vec-refl-1".to_string();
+        let id2 = "vec-refl-2".to_string();
+        let id3 = "vec-refl-3".to_string();
+        storage
+            .insert_reflection(&id1, "one", &[], &[0.1; 384])
+            .unwrap();
+        storage
+            .insert_reflection(&id2, "two", &[], &[0.2; 384])
+            .unwrap();
+        storage
+            .insert_reflection(&id3, "three", &[], &[0.3; 384])
+            .unwrap();
+
+        // Ask for a strict subset plus a nonexistent id — must get back
+        // exactly the requested-and-present ids, not the whole table.
+        let got = storage
+            .get_reflection_vectors_by_ids(&[id1.clone(), id3.clone(), "nonexistent".to_string()])
+            .unwrap();
+        assert_eq!(
+            got.len(),
+            2,
+            "must return exactly the requested-and-present ids"
+        );
+        let map: HashMap<String, Vec<f32>> = got.into_iter().collect();
+        assert!((map[&id1][0] - 0.1).abs() < 1e-6);
+        assert!((map[&id3][0] - 0.3).abs() < 1e-6);
+        assert!(
+            !map.contains_key(&id2),
+            "id2 was not requested and must not be returned"
+        );
+        assert!(!map.contains_key("nonexistent"));
+    }
+
+    #[test]
+    fn get_reflection_vectors_by_ids_crosses_the_sql_parameter_batch_boundary() {
+        // queries::get_reflection_vectors_by_ids binds at most 500 ids per
+        // statement; 1,001 requested ids force three statements and must
+        // still come back complete and correctly paired.
+        let storage = Storage::open_memory().unwrap();
+        let ids: Vec<String> = (0..1001).map(|i| format!("boundary-refl-{i}")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let mut v = [0.0_f32; 384];
+            v[0] = i as f32;
+            storage.insert_reflection(id, "content", &[], &v).unwrap();
+        }
+        let got = storage.get_reflection_vectors_by_ids(&ids).unwrap();
+        assert_eq!(got.len(), 1001);
+        for (id, vec) in got {
+            let i: usize = id.trim_start_matches("boundary-refl-").parse().unwrap();
+            assert_eq!(vec[0], i as f32, "vector paired with the wrong id");
+        }
+    }
+
+    #[test]
     fn derivation_ledger_roundtrip_and_reuse() {
         use crate::ledger::{CostBucket, LedgerEntry, Scope};
         let storage = Storage::open_memory().unwrap();
@@ -1779,7 +2745,7 @@ mod tests {
                 "resolved",
                 "test evidence",
                 None,
-                "agent",
+                "user_confirmed",
             )
             .unwrap();
         assert_eq!(n, 2);
@@ -1794,16 +2760,95 @@ mod tests {
     }
 
     #[test]
+    fn agent_resolution_is_not_authoritative_but_user_confirmation_is() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .insert_resolutions(
+                &["agent-only".to_string()],
+                "resolved",
+                "agent assertion",
+                None,
+                "agent",
+            )
+            .unwrap();
+        storage
+            .insert_resolutions(
+                &["confirmed".to_string()],
+                "resolved",
+                "user accepted exact payload",
+                None,
+                "user_confirmed",
+            )
+            .unwrap();
+        storage
+            .insert_resolutions(
+                &["confirmed".to_string()],
+                "regressed",
+                "later agent assertion",
+                None,
+                "agent",
+            )
+            .unwrap();
+
+        let map = storage
+            .get_resolutions_batch(&["agent-only".to_string(), "confirmed".to_string()])
+            .unwrap();
+        assert!(!map.contains_key("agent-only"));
+        assert_eq!(map.get("confirmed").unwrap().source, "user_confirmed");
+        assert_eq!(map.get("confirmed").unwrap().status, "resolved");
+    }
+
+    #[test]
+    fn resolution_verdict_counts_are_split_by_source() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .insert_resolutions(&["a".to_string()], "resolved", "a", None, "agent")
+            .unwrap();
+        storage
+            .insert_resolutions(
+                &["b".to_string(), "c".to_string()],
+                "still_open",
+                "confirmed",
+                None,
+                "user_confirmed",
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage.count_resolution_verdicts_by_source().unwrap(),
+            (1, 2)
+        );
+    }
+
+    #[test]
     fn resolution_ledger_latest_wins() {
         let storage = Storage::open_memory().unwrap();
         storage
-            .insert_resolutions(&["c1".to_string()], "resolved", "first", None, "agent")
+            .insert_resolutions(
+                &["c1".to_string()],
+                "resolved",
+                "first",
+                None,
+                "user_confirmed",
+            )
             .unwrap();
         storage
-            .insert_resolutions(&["c1".to_string()], "regressed", "later", None, "agent")
+            .insert_resolutions(
+                &["c1".to_string()],
+                "regressed",
+                "later",
+                None,
+                "user_confirmed",
+            )
             .unwrap();
         storage
-            .insert_resolutions(&["c2".to_string()], "resolved", "ok", None, "agent")
+            .insert_resolutions(
+                &["c2".to_string()],
+                "resolved",
+                "ok",
+                None,
+                "user_confirmed",
+            )
             .unwrap();
 
         let map = storage
@@ -1817,7 +2862,13 @@ mod tests {
     fn resolution_ledger_unknown_id_absent() {
         let storage = Storage::open_memory().unwrap();
         storage
-            .insert_resolutions(&["c1".to_string()], "resolved", "evidence", None, "agent")
+            .insert_resolutions(
+                &["c1".to_string()],
+                "resolved",
+                "evidence",
+                None,
+                "user_confirmed",
+            )
             .unwrap();
 
         let map = storage

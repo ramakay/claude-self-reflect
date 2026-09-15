@@ -82,21 +82,25 @@ fn head_tail(text: &str, char_cap: usize) -> String {
     format!("{head}\n... [{omitted} chars omitted] ...\n{tail}")
 }
 
-/// v2: operator-turn-prioritized digest. Dialog-acts live in user-authored
-/// chunks (chunk author = genuine user prose, per import provenance); v1's
+/// v2: operator-turn-prioritized digest. The caller supplies chunk ids whose
+/// cached row-level floor reaches UserHistory; the legacy display author is
+/// deliberately not an authority signal. v1's
 /// undifferentiated head+tail sampled mostly assistant/tool text and starved
 /// the extractor of operator turns (Gate A' failure, 2026-07-19).
-pub fn build_digest(chunks: &[ConversationChunk], char_cap: usize) -> String {
-    use crate::provenance::Speaker;
+pub fn build_digest(
+    chunks: &[ConversationChunk],
+    trusted_user_chunk_ids: &std::collections::HashSet<String>,
+    char_cap: usize,
+) -> String {
     let user_text: String = chunks
         .iter()
-        .filter(|c| c.author == Speaker::User)
+        .filter(|c| trusted_user_chunk_ids.contains(&c.id))
         .map(|c| c.content.as_str())
         .collect::<Vec<_>>()
         .join("\n---\n");
     let other_text: String = chunks
         .iter()
-        .filter(|c| c.author != Speaker::User)
+        .filter(|c| !trusted_user_chunk_ids.contains(&c.id))
         .map(|c| c.content.as_str())
         .collect::<Vec<_>>()
         .join("\n---\n");
@@ -153,7 +157,10 @@ async fn call_claude_for_acts(prompt: &str) -> Option<crate::narrative::ParsedNa
             if let Some(model) = &candidate {
                 cmd.args(["--model", model]);
             }
-            cmd.args(["-p", "-", "--output-format", "json"]);
+            // `--tools ""`: a print-mode child otherwise inherits every
+            // built-in tool (Bash, Edit, Write, Agent) under the user's
+            // permission mode; this call is a pure text extraction.
+            cmd.args(["-p", "-", "--output-format", "json", "--tools", ""]);
             // Must come LAST: --mcp-config is variadic in the claude CLI and would
             // consume any positional arg that followed it.
             if let Some(path) = &mcp_config_path {
@@ -426,13 +433,17 @@ pub async fn process_ratification(storage: &Arc<Storage>, conv_id: &str) -> Resu
         storage.mark_enrichment_completed(conv_id, "ratification", "")?;
         return Ok(());
     }
-    // Must use the provenance-joined path: get_chunks_by_ids alone always
-    // defaults author to ToolResult (author lives in chunk_provenance, not the
-    // chunks table), which silently starves build_digest's operator-turn
-    // filter (author == Speaker::User) and degrades the v2 extractor to plain
-    // head/tail sampling. See get_chunks_by_ids_with_provenance.
-    let chunks = storage.get_chunks_by_ids_with_provenance(&chunk_ids)?;
-    let digest = build_digest(&chunks, DIGEST_CHAR_CAP);
+    let chunks = storage.get_chunks_by_ids(&chunk_ids)?;
+    let trusted_user_chunk_ids = chunks
+        .iter()
+        .filter(|chunk| {
+            storage
+                .get_chunk_min_trust(&chunk.id)
+                .is_ok_and(|tier| tier >= crate::provenance::TrustTier::UserHistory)
+        })
+        .map(|chunk| chunk.id.clone())
+        .collect();
+    let digest = build_digest(&chunks, &trusted_user_chunk_ids, DIGEST_CHAR_CAP);
     let prompt = format!(
         "{}\n\nCONVERSATION DIGEST:\n{}",
         load_ratification_prompt(),
@@ -467,13 +478,19 @@ pub async fn process_ratification(storage: &Arc<Storage>, conv_id: &str) -> Resu
                     Some(serde_json::to_string(&shas)?)
                 };
 
-                storage.upsert_ratification_score(&RatificationScoreRow {
-                    conversation_id: conv_id.into(),
-                    score,
-                    acts_json,
-                    ledger_refs,
-                    extractor_version: EXTRACTOR_VERSION.into(),
-                })?;
+                // Model output over the conversation digest: every chunk that
+                // fed the digest is one row-level input, read from cached floors.
+                let inputs = storage.conversation_chunk_inputs(&chunk_ids);
+                storage.upsert_ratification_score_with_inputs(
+                    &RatificationScoreRow {
+                        conversation_id: conv_id.into(),
+                        score,
+                        acts_json,
+                        ledger_refs,
+                        extractor_version: EXTRACTOR_VERSION.into(),
+                    },
+                    &inputs,
+                )?;
                 storage.mark_enrichment_completed(conv_id, "ratification", conv_id)?;
                 Ok(())
             }
@@ -530,6 +547,52 @@ fn conversation_time_span(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ratification_floor_is_the_minimum_of_its_conversation_chunks() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::ArtifactKind;
+        use crate::storage::queries::RatificationScoreRow;
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        storage
+            .with_connection(|c| {
+                for (id, tier) in [("c-user", 3), ("c-tool", 1)] {
+                    c.execute(
+                        "INSERT INTO chunks(id,conversation_id,project_name,timestamp,content,message_count,min_trust)
+                         VALUES(?1,'conv','p','now','text',1,?2)",
+                        rusqlite::params![id, tier],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let inputs = storage.conversation_chunk_inputs(&["c-user".into(), "c-tool".into()]);
+        assert_eq!(inputs.floor(), TrustTier::External);
+        let floor = storage
+            .upsert_ratification_score_with_inputs(
+                &RatificationScoreRow {
+                    conversation_id: "conv".into(),
+                    score: 0.5,
+                    acts_json: "[]".into(),
+                    ledger_refs: None,
+                    extractor_version: "test".into(),
+                },
+                &inputs,
+            )
+            .unwrap();
+        assert_eq!(floor, TrustTier::External);
+        assert_eq!(
+            storage
+                .get_artifact_min_trust(ArtifactKind::Ratification, "conv")
+                .unwrap(),
+            TrustTier::External
+        );
+        // A conversation with no chunks has no observable support.
+        assert_eq!(
+            storage.conversation_chunk_inputs(&[]).floor(),
+            TrustTier::Unknown
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -608,7 +671,7 @@ mod tests {
             seq: 0,
             is_sidechain: false,
         };
-        let digest = build_digest(&[chunk], 40);
+        let digest = build_digest(&[chunk], &["c1".to_string()].into_iter().collect(), 40);
         assert!(digest.contains("chars omitted"));
         // v2: user-authored content leads under the operator-turn header,
         // truncated to the 3/4 user budget (head+tail of 30 chars).
@@ -639,7 +702,7 @@ mod tests {
             mk("c2", "fix the import bug", crate::provenance::Speaker::User),
             mk("c3", "tool output", crate::provenance::Speaker::ToolResult),
         ];
-        let digest = build_digest(&chunks, 8000);
+        let digest = build_digest(&chunks, &["c2".to_string()].into_iter().collect(), 8000);
         let op = digest.find("OPERATOR-TURN EXCERPTS").unwrap();
         let user_pos = digest.find("fix the import bug").unwrap();
         let other = digest.find("OTHER CONTEXT").unwrap();
@@ -647,22 +710,11 @@ mod tests {
         assert!(digest.find("assistant explanation text").unwrap() > other);
     }
 
-    /// Regression (CodeRabbit PR #245 finding, pre-confirmed): the unit tests
-    /// above pass only because they build `ConversationChunk`s in memory with
-    /// `author` set directly. In production, `process_ratification` fetches
-    /// chunks via storage — and `get_chunks_by_ids` always defaults `author`
-    /// to `ToolResult` because the `chunks` table has no author column (it
-    /// lives in `chunk_provenance`). That meant `build_digest`'s
-    /// `author == Speaker::User` filter always saw an empty `user_text` in
-    /// production, silently degrading the v2 extractor to plain head/tail
-    /// sampling and never emitting the operator-turn excerpts section. This
-    /// test goes through the real storage path — insert chunks +
-    /// chunk_provenance rows into a temp DB, fetch via
-    /// `get_chunks_by_ids_with_provenance`, and confirm `build_digest` emits
-    /// the operator-turn section.
+    /// The aggregate display author must never mint an operator-turn signal.
+    /// Only the cached row-level trust floor supplied by the caller can do so.
     #[test]
     fn ratification_digest_via_storage_emits_operator_turns() {
-        use crate::provenance::{ChunkProvenance, Speaker};
+        use crate::provenance::Speaker;
 
         let storage = Storage::open_memory().unwrap();
         let mk = |id: &str, content: &str| ConversationChunk {
@@ -685,46 +737,19 @@ mod tests {
         let asst_chunk = mk("rc2", "done, added an advisory lock before dump_to_disk");
         storage.insert_chunk(&user_chunk, &[0.0; 4]).unwrap();
         storage.insert_chunk(&asst_chunk, &[0.0; 4]).unwrap();
-        storage
-            .insert_chunk_provenance(
-                "rc1",
-                &ChunkProvenance {
-                    author: Speaker::User,
-                    source_conv_id: "conv-real".into(),
-                    supersedes: None,
-                },
-            )
-            .unwrap();
-        storage
-            .insert_chunk_provenance(
-                "rc2",
-                &ChunkProvenance {
-                    author: Speaker::Assistant,
-                    source_conv_id: "conv-real".into(),
-                    supersedes: None,
-                },
-            )
-            .unwrap();
-
         let ids = vec!["rc1".to_string(), "rc2".to_string()];
-
-        // Old path (what process_ratification used before this fix): every
-        // chunk defaults to ToolResult, so build_digest never sees a user turn.
-        let plain_chunks = storage.get_chunks_by_ids(&ids).unwrap();
-        let plain_digest = build_digest(&plain_chunks, DIGEST_CHAR_CAP);
+        let chunks = storage.get_chunks_by_ids(&ids).unwrap();
+        let plain_digest = build_digest(&chunks, &Default::default(), DIGEST_CHAR_CAP);
         assert!(
             !plain_digest.contains("OPERATOR-TURN EXCERPTS"),
-            "sanity check: unjoined path must NOT surface operator turns (that's the bug)"
+            "display authors must not create authority"
         );
 
-        // New path: provenance-joined fetch recovers the true author, so
-        // build_digest correctly emits the operator-turn section.
-        let joined_chunks = storage.get_chunks_by_ids_with_provenance(&ids).unwrap();
-        let digest = build_digest(&joined_chunks, DIGEST_CHAR_CAP);
+        let trusted = ["rc1".to_string()].into_iter().collect();
+        let digest = build_digest(&chunks, &trusted, DIGEST_CHAR_CAP);
         assert!(
             digest.contains("=== OPERATOR-TURN EXCERPTS ==="),
-            "build_digest must emit the operator-turn section when fetched via \
-             get_chunks_by_ids_with_provenance; got: {digest}"
+            "cached UserHistory floor must emit the operator-turn section; got: {digest}"
         );
         assert!(digest.contains("please fix the flaky HNSW persistence test"));
     }

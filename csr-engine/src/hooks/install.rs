@@ -77,6 +77,9 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
             "Stop": [{
                 "hooks": [{"type": "command", "command": format!("{} hook stop", binary_path)}]
             }],
+            "SubagentStop": [{
+                "hooks": [{"type": "command", "command": format!("{} hook subagent-stop", binary_path)}]
+            }],
             "PostToolUse": [{
                 "matcher": "Edit|Write|MultiEdit|NotebookEdit",
                 "hooks": [{"type": "command", "command": format!("{} hook post-tool-use", binary_path)}]
@@ -295,6 +298,10 @@ mod tests {
         let stop = hooks.get("Stop").unwrap();
         let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("csr-engine hook stop"));
+
+        let subagent_stop = hooks.get("SubagentStop").unwrap();
+        let cmd = subagent_stop[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("csr-engine hook subagent-stop"));
 
         let post_tool_use = hooks.get("PostToolUse").unwrap();
         let cmd = post_tool_use[0]["hooks"][0]["command"].as_str().unwrap();

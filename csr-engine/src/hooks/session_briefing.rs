@@ -178,7 +178,7 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
     }
 
     // Store briefing as a tagged reflection — replace any prior briefing for this project
-    store_briefing(engine, project_name, &parsed.text)?;
+    store_briefing(engine, project_name, &parsed.text, &window.episode_ids)?;
     let _ = engine.storage().set_meta(&hash_key, &episode_digest);
 
     Ok(())
@@ -191,8 +191,11 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
 /// The episodes are embedded in `prompt`, so Haiku needs NO tools. We pass an
 /// empty MCP config with `--strict-mcp-config` so the subprocess loads ZERO MCP
 /// servers (not even csr-engine) — fastest possible `claude -p` startup and no
-/// recursive csr-engine spawn.
-fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNarrative> {
+/// recursive csr-engine spawn — and `--tools ""` so the built-in set (Bash, Edit,
+/// Write, Agent, ...) is empty too. Without that flag a print-mode child inherits
+/// every built-in tool under the user's permission mode; one such narrator ran
+/// `git commit` in the live worktree on 2026-09-01.
+pub(crate) fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNarrative> {
     let mcp_config_path = crate::narrative::minimal_mcp_config()?;
     let mut last_err: Option<anyhow::Error> = None;
 
@@ -211,10 +214,15 @@ fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNar
             .arg("--strict-mcp-config")
             .arg("--mcp-config")
             .arg(&mcp_config_path)
+            // Disable every built-in tool: the empty MCP config alone leaves Bash,
+            // Edit, Write and Agent available. Must come after the variadic
+            // --mcp-config so the flag terminates that list.
+            .arg("--tools")
+            .arg("")
             // No --dangerously-skip-permissions: episodes are session-derived text and
-            // the empty MCP config means zero tools, so this is a pure text summary.
-            // Skipping permissions would only widen the blast radius if an episode
-            // contained adversarial content. Print mode won't prompt interactively.
+            // with zero tools this is a pure text summary. Skipping permissions would
+            // only widen the blast radius if an episode contained adversarial content.
+            // Print mode won't prompt interactively.
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -260,7 +268,12 @@ fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNar
 
 /// Store briefing as a tagged reflection. Replaces any previous briefing
 /// for the same project (delete + insert).
-fn store_briefing(engine: &Engine, project: &str, briefing: &str) -> Result<()> {
+fn store_briefing(
+    engine: &Engine,
+    project: &str,
+    briefing: &str,
+    episode_ids: &[String],
+) -> Result<()> {
     let project_tag = format!("project_{}", project);
     let tags = vec![
         "session_briefing".to_string(),
@@ -280,12 +293,28 @@ fn store_briefing(engine: &Engine, project: &str, briefing: &str) -> Result<()> 
         }
     }
 
+    // The briefing is model output over exactly the episodes that were in its
+    // prompt; each episode row is one row-level input, and an empty window is
+    // Unknown rather than an empty-set maximum.
+    let mut inputs = crate::storage::artifact_provenance::InputEnvelope::default();
+    for episode_id in episode_ids {
+        inputs.push(engine.storage().artifact_input_or_unknown(
+            crate::storage::artifact_provenance::ArtifactKind::Reflection,
+            episode_id,
+        ));
+    }
+    if inputs.inputs().is_empty() {
+        inputs.push(crate::storage::artifact_provenance::ArtifactInput::unknown(
+            "briefing without recorded episode inputs",
+        ));
+    }
+
     // Embed and store
     let embedding = engine.embeddings().embed_single(briefing)?;
     let id = uuid::Uuid::new_v4().to_string();
     engine
         .storage()
-        .insert_reflection(&id, briefing, &tags, &embedding)?;
+        .insert_derived_reflection(&id, briefing, &tags, &embedding, &inputs)?;
 
     Ok(())
 }
@@ -298,6 +327,9 @@ struct EpisodeWindow {
     /// (timestamp, content) pairs for included episodes, BEFORE age formatting —
     /// used only for the stable digest.
     stable_entries: Vec<(String, String)>,
+    /// Reflection ids of the included episodes, in prompt order — the
+    /// briefing's recorded support set.
+    episode_ids: Vec<String>,
 }
 
 /// Digest of the stable (time-independent) precursor of an episode window:
@@ -345,14 +377,16 @@ fn recent_episodes_for_project(engine: &Engine, project: &str) -> EpisodeWindow 
             return EpisodeWindow {
                 rendered: String::new(),
                 stable_entries: Vec::new(),
+                episode_ids: Vec::new(),
             };
         }
     };
 
     let mut out = String::new();
     let mut stable_entries = Vec::new();
+    let mut episode_ids = Vec::new();
     let mut n = 0;
-    for (_, content, tags, ts) in &rows {
+    for (id, content, tags, ts) in &rows {
         if n >= MAX_EPISODES_IN_BRIEFING {
             break;
         }
@@ -372,6 +406,7 @@ fn recent_episodes_for_project(engine: &Engine, project: &str) -> EpisodeWindow 
         // Full untruncated content: truncation is time-independent, but full content
         // is simpler and strictly safer for uniqueness.
         stable_entries.push((ts.clone(), content.clone()));
+        episode_ids.push(id.clone());
         // Relative age (e.g. "2h ago") so Haiku reports timing without citing the
         // raw UTC timestamp, which reads as a future date in the user's timezone.
         let age = crate::temporal::parse_timestamp(ts)
@@ -393,6 +428,7 @@ fn recent_episodes_for_project(engine: &Engine, project: &str) -> EpisodeWindow 
     EpisodeWindow {
         rendered: out,
         stable_entries,
+        episode_ids,
     }
 }
 
@@ -409,7 +445,14 @@ fn is_meta_episode(content: &str) -> bool {
             return crate::extraction::provenance::extractable(req).is_none();
         }
     }
-    // Fallback for non-JSON content: scan only the leading window.
+    // Fallback for non-JSON content. The machine-owned sentinel is scanned
+    // across the FULL text first: a recap trails its sentinel after the header
+    // clause, so any recap longer than the window below would otherwise carry
+    // its sentinel outside it and read as genuine content. Only the grammar
+    // heuristics are window-limited.
+    if crate::extraction::provenance::contains_recap_sentinel(content) {
+        return true;
+    }
     let head_end = content.floor_char_boundary(400);
     crate::extraction::provenance::is_csr_emission(&content[..head_end])
 }
@@ -452,6 +495,72 @@ fn briefing_exists(engine: &Engine, project: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn briefing_floor_is_the_minimum_of_its_episodes_and_unknown_without_any() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::ArtifactKind;
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let embeddings = std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap());
+        let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::search::SearchEngine::new(crate::embeddings::EmbeddingEngine::dimension()),
+        ));
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings,
+            search,
+            std::path::PathBuf::from("/tmp"),
+        );
+        for (id, channel, tier) in [
+            ("ep-user", "user_message", TrustTier::UserHistory),
+            ("ep-tool", "tool_result:WebFetch", TrustTier::External),
+        ] {
+            storage
+                .insert_derived_reflection(
+                    id,
+                    r#"{"schema":"v2","request":"r"}"#,
+                    &["session_episode".into(), "project_proj".into()],
+                    &[0.0; 384],
+                    &crate::storage::artifact_provenance::InputEnvelope::new(vec![
+                        crate::storage::artifact_provenance::test_observed_input(
+                            channel, tier, "source",
+                        ),
+                    ]),
+                )
+                .unwrap();
+            assert_eq!(
+                storage
+                    .get_artifact_min_trust(ArtifactKind::Reflection, id)
+                    .unwrap(),
+                tier
+            );
+        }
+        let briefing_floor = |storage: &crate::storage::Storage| {
+            let rows = storage
+                .get_reflections_by_tag("session_briefing", 5)
+                .unwrap();
+            assert_eq!(rows.len(), 1, "store_briefing replaces prior briefings");
+            storage
+                .get_artifact_min_trust(ArtifactKind::Reflection, &rows[0].0)
+                .unwrap()
+        };
+
+        store_briefing(
+            &engine,
+            "proj",
+            "## Session Intelligence\nbriefing",
+            &["ep-user".into(), "ep-tool".into()],
+        )
+        .unwrap();
+        assert_eq!(briefing_floor(&storage), TrustTier::External);
+
+        store_briefing(&engine, "proj", "## Session Intelligence\nagain", &[]).unwrap();
+        assert_eq!(
+            briefing_floor(&storage),
+            TrustTier::Unknown,
+            "an empty episode window is Unknown, never an empty-set maximum"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -487,6 +596,30 @@ mod tests {
         assert!(is_meta_episode(analyst));
         assert!(is_meta_episode(summarizer));
         assert!(!is_meta_episode(real));
+    }
+
+    #[test]
+    fn test_is_meta_episode_catches_sentinel_past_the_grammar_window() {
+        // A recap trails its sentinel after the header clause. Anything longer
+        // than the 400-char grammar window pushes the sentinel out of it, so a
+        // window-limited check alone would read this as genuine user content.
+        // The `- ` prefix is the documented legacy bypass: it defeats the
+        // header grammar, so only the sentinel can catch this one. ASCII-only,
+        // so byte slicing is safe.
+        let filler = "shipped the resolver rewrite and the ledger backfill. ".repeat(12);
+        let recap = format!(
+            "- recap [2h ago]: {filler} {}",
+            crate::extraction::provenance::RECAP_SENTINEL
+        );
+        assert!(
+            recap.len() > 400,
+            "fixture must exceed the window to exercise the gap"
+        );
+        assert!(
+            !crate::extraction::provenance::is_csr_emission(&recap[..400]),
+            "window-limited check must miss it — otherwise this test proves nothing"
+        );
+        assert!(is_meta_episode(&recap));
     }
 
     #[test]

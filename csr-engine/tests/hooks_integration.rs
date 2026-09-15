@@ -446,6 +446,198 @@ fn code_evolution_keys_by_transcript_stem_not_session_id() {
     );
 }
 
+/// D5: a file edited inside a linked git worktree must be recorded under the
+/// canonical main-repo path, not the throwaway worktree path — otherwise a
+/// search against the real repo path returns nothing.
+#[test]
+fn code_evolution_stores_canonical_path_not_worktree_path() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let main = tmp.path().join("main");
+    let wt = tmp.path().join("wt");
+
+    std::fs::create_dir_all(main.join("src")).unwrap();
+    std::fs::create_dir_all(main.join(".git").join("worktrees").join("wt")).unwrap();
+    std::fs::create_dir_all(wt.join("src")).unwrap();
+
+    // Main-repo file the worktree path must canonicalize onto.
+    let main_file = main.join("src").join("evolved.rs");
+    std::fs::write(&main_file, "fn old() {}\n").unwrap();
+
+    // Linked worktree marker: `.git` is a file pointing at the main repo's gitdir.
+    let gitdir_line = format!("gitdir: {}/.git/worktrees/wt\n", main.display());
+    std::fs::write(wt.join(".git"), gitdir_line).unwrap();
+
+    let wt_file = wt.join("src").join("evolved.rs");
+    let wt_file_str = wt_file.to_string_lossy().to_string();
+    // Same resolved spelling `canonical_repo_path` stores (macOS /var → /private/var).
+    let main_file_str = std::fs::canonicalize(&main_file)
+        .unwrap_or(main_file.clone())
+        .to_string_lossy()
+        .to_string();
+
+    let transcript = tmp.path().join("session.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"user","message":{"content":[{"type":"text","text":"Add a function"}]},"timestamp":"2026-02-22T16:00:00Z"}
+"#,
+    )
+    .unwrap();
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage.clone(),
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
+    );
+
+    let input = csr_engine::hooks::HookInput {
+        transcript_path: Some(transcript.to_string_lossy().to_string()),
+        session_id: Some("33333333-4444-5555-6666-777777777777".into()),
+        cwd: Some(wt.to_string_lossy().to_string()),
+        tool_name: Some("Write".into()),
+        tool_input: Some(serde_json::json!({
+            "file_path": wt_file_str,
+            "content": "fn new_function() { }"
+        })),
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(csr_engine::hooks::post_tool_use::handle(
+        &input,
+        &engine,
+        wt.as_path(),
+    ));
+    assert!(result.is_ok());
+
+    let rows_by_main = storage
+        .get_recent_code_evolution(&main_file_str, "", 10)
+        .unwrap();
+    assert!(
+        !rows_by_main.is_empty(),
+        "code_evolution must be keyed by the canonical main-repo path"
+    );
+
+    let rows_by_worktree = storage
+        .get_recent_code_evolution(&wt_file_str, "", 10)
+        .unwrap();
+    assert!(
+        rows_by_worktree.is_empty(),
+        "no row should remain keyed under the throwaway worktree path: {:?}",
+        rows_by_worktree
+    );
+}
+
+/// A file observed mid-edit parses partially: `parse_clean == false` while some
+/// definitions still extract. Retiring against that truncated view would delete
+/// every symbol it failed to see, along with its attribution provenance. Drives
+/// the real hook so the gate in `update_code_graph` is what is under test.
+#[test]
+fn partial_parse_must_not_retire_previously_stored_nodes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let file = repo.join("src").join("partial.rs");
+    let file_str = file.to_string_lossy().to_string();
+
+    let transcript = tmp.path().join("session.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"user","message":{"content":[{"type":"text","text":"edit"}]},"timestamp":"2026-02-22T16:00:00Z"}
+"#,
+    )
+    .unwrap();
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage.clone(),
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
+    );
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let fire = |content: &str| {
+        std::fs::write(&file, content).unwrap();
+        let input = csr_engine::hooks::HookInput {
+            transcript_path: Some(transcript.to_string_lossy().to_string()),
+            session_id: Some("88888888-9999-aaaa-bbbb-cccccccccccc".into()),
+            cwd: Some(repo.to_string_lossy().to_string()),
+            tool_name: Some("Write".into()),
+            tool_input: Some(serde_json::json!({ "file_path": file_str, "content": content })),
+            ..Default::default()
+        };
+        rt.block_on(csr_engine::hooks::post_tool_use::handle(
+            &input,
+            &engine,
+            repo.as_path(),
+        ))
+        .unwrap();
+    };
+
+    // Clean parse: two functions land in the graph.
+    fire("fn alpha() {\n    let _ = 1;\n}\n\nfn beta() {\n    let _ = 2;\n}\n");
+    // Nodes are stored under the resolved spelling (macOS /var → /private/var),
+    // so look them up the same way rather than by the raw fixture path.
+    let stored_str = std::fs::canonicalize(&file)
+        .unwrap_or(file.clone())
+        .to_string_lossy()
+        .to_string();
+    let after_clean = storage.count_code_nodes_for_file(&stored_str).unwrap();
+    assert!(
+        after_clean >= 2,
+        "fixture must seed at least two nodes or the test is vacuous (got {after_clean})"
+    );
+
+    // Same file caught mid-edit: `alpha` survives, `beta` is truncated to an
+    // unclosed body, so the parse is dirty but still yields a definition.
+    let partial_src = "fn alpha() {\n    let _ = 1;\n}\n\nfn beta() {\n    let _ = 2;\n";
+
+    // Pin WHY this fixture exercises the parse_clean gate specifically. If the
+    // partial source extracted zero nodes, the empty-set guard in
+    // `retire_missing_nodes` would be what saves it and the gate under test
+    // would never run — the test would pass for the wrong reason.
+    {
+        let lang = csr_engine::extraction::ast_analysis::lang_from_path_str("partial.rs")
+            .expect("rust is a supported language");
+        let frag = csr_engine::extraction::codegraph::extract_graph_fragment(
+            partial_src,
+            lang,
+            &file_str,
+            "repo",
+            "proj",
+            "c1",
+            "s1",
+        );
+        assert!(
+            !frag.parse_clean,
+            "fixture must produce a DIRTY parse, else the parse_clean gate is not what is under test"
+        );
+        assert!(
+            !frag.nodes.is_empty(),
+            "fixture must still yield nodes, else the empty-set guard is what protects the data, not parse_clean"
+        );
+    }
+
+    fire(partial_src);
+    let after_partial = storage.count_code_nodes_for_file(&stored_str).unwrap();
+
+    assert_eq!(
+        after_partial, after_clean,
+        "a partial parse must retire nothing — {after_clean} nodes before, {after_partial} after"
+    );
+}
+
 // ─── Install Config with All Hooks ───
 
 #[test]
@@ -514,6 +706,30 @@ fn test_hook_input_stop_hook_active_missing() {
     assert_eq!(input.stop_hook_active, None);
 }
 
+#[test]
+fn test_hook_input_subagent_stop_fields() {
+    let json = r#"{
+        "session_id":"parent-1",
+        "transcript_path":"/tmp/parent-1.jsonl",
+        "agent_id":"child-7",
+        "agent_type":"general-purpose",
+        "agent_transcript_path":"/tmp/parent-1/subagents/agent-child-7.jsonl",
+        "last_assistant_message":"finished the task"
+    }"#;
+    let input: csr_engine::hooks::HookInput = serde_json::from_str(json).unwrap();
+    assert_eq!(input.session_id.as_deref(), Some("parent-1"));
+    assert_eq!(input.agent_id.as_deref(), Some("child-7"));
+    assert_eq!(input.agent_type.as_deref(), Some("general-purpose"));
+    assert_eq!(
+        input.agent_transcript_path.as_deref(),
+        Some("/tmp/parent-1/subagents/agent-child-7.jsonl")
+    );
+    assert_eq!(
+        input.last_assistant_message.as_deref(),
+        Some("finished the task")
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Predictive Injection Tests
 // ═══════════════════════════════════════════════════════════════
@@ -577,6 +793,8 @@ fn test_predictor_semantic_only() {
     let results = vec![
         RawResult {
             content: "high".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.9,
             source: "chunk".into(),
             timestamp: None,
@@ -588,6 +806,8 @@ fn test_predictor_semantic_only() {
         },
         RawResult {
             content: "low".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.4,
             source: "chunk".into(),
             timestamp: None,
@@ -615,6 +835,8 @@ fn test_predictor_recency_boost() {
     let results = vec![
         RawResult {
             content: "recent".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: Some(now),
@@ -626,6 +848,8 @@ fn test_predictor_recency_boost() {
         },
         RawResult {
             content: "old".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: Some(old),
@@ -648,6 +872,8 @@ fn test_predictor_file_overlap() {
     let results = vec![
         RawResult {
             content: "with overlap".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: None,
@@ -659,6 +885,8 @@ fn test_predictor_file_overlap() {
         },
         RawResult {
             content: "no overlap".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: None,
@@ -681,6 +909,8 @@ fn test_predictor_cross_project() {
 
     let results = vec![RawResult {
         content: "cross-project insight".into(),
+        author: None,
+        min_trust: csr_engine::provenance::TrustTier::Unknown,
         score: 0.8,
         source: "reflection".into(),
         timestamp: None,
@@ -991,6 +1221,12 @@ fn test_explore_prompt_never_fails() {
         todos: vec![],
         approved_plan: None,
         prev_episode_id: None,
+        error_count: None,
+        top_errors: vec![],
+        steer_count: None,
+        steers: vec![],
+        instrumentation_version: None,
+        correction_count: None,
         anchors: vec![],
     };
 
@@ -1174,9 +1410,9 @@ fn test_import_current_transcript_helper() {
     assert!(chunk_count > 0, "transcript should be indexed after import");
 }
 
-/// Test: stop hook imports transcript for all sessions.
+/// Test: stop hook imports transcript even when recursive intent capture is gated.
 #[test]
-fn test_stop_hook_imports_for_all_sessions() {
+fn test_stop_hook_active_still_imports_transcript() {
     let tmp = tempfile::TempDir::new().unwrap();
     let transcript = tmp.path().join("non-ralph-session.jsonl");
     std::fs::write(
@@ -1202,6 +1438,7 @@ fn test_stop_hook_imports_for_all_sessions() {
     let input = csr_engine::hooks::HookInput {
         transcript_path: Some(transcript.to_string_lossy().to_string()),
         cwd: Some(tmp.path().to_string_lossy().to_string()),
+        stop_hook_active: Some(true),
         ..Default::default()
     };
 
@@ -1499,6 +1736,12 @@ fn test_episode_struct_serialization() {
         todos: vec![],
         approved_plan: None,
         prev_episode_id: None,
+        error_count: None,
+        top_errors: vec![],
+        steer_count: None,
+        steers: vec![],
+        instrumentation_version: None,
+        correction_count: None,
         anchors: vec![],
     };
 

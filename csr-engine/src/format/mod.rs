@@ -35,12 +35,16 @@ pub fn truncate_chars(s: &str, max: usize) -> &str {
 /// ones (a floor at 0.605 would lose 4 of 12 genuine topics). 0.45 is therefore
 /// the highest floor that misses no verified-genuine probe; it suppresses only
 /// the clearly-hopeless tail. The overlap band above it is handled by the `weak`
-/// label plus an explicit spurious-match warning, not by silent confidence.
+/// label plus an honest calibration warning and a top1-top2 margin signal, not
+/// by silent confidence.
 pub const QUICK_CHECK_FLOOR: f32 = 0.45;
 
 /// Top of the measured fabrication-overlap band (highest fabricated probe: 0.605,
 /// rounded up). At or above this, a match is at least `partial`; below it a match
-/// is `weak` and scores indistinguishable from never-discussed topics.
+/// is `weak` — absolute cosine is weakly calibrated in this band on this corpus
+/// and does not reliably separate genuine matches from noise by score alone.
+/// `format_quick_check` surfaces a top1-top2 margin alongside the score as a
+/// cheap discriminating signal instead of pretending the score settles it.
 pub const WEAK_BAND_TOP: f32 = 0.62;
 
 /// Band a similarity score into the relevance vocabulary shared by every result
@@ -72,6 +76,18 @@ pub struct EnrichedResult {
     /// flag is never set, so output is byte-identical to pre-partition
     /// behavior.
     pub validity_demoted: bool,
+    /// Cached row-level provenance floor (chunks.min_trust or
+    /// reflections.min_trust), read from the cache column only and always
+    /// rendered: Unknown is a label, never an omission.
+    pub trust: crate::provenance::TrustTier,
+}
+
+/// Effective rerank score for a result whose position differs from raw-score
+/// order. Kept separate from [`EnrichedResult`] so other search surfaces retain
+/// their existing result model.
+pub(crate) struct DisplayRankScore {
+    pub chunk_id: String,
+    pub adjusted_score: f32,
 }
 
 /// Drop multi-route and near-duplicate results, keeping first occurrence.
@@ -172,6 +188,19 @@ pub fn format_search_results(
     search_ms: u64,
     embed_ms: u64,
 ) -> String {
+    format_search_results_with_rank_scores(results, query, project_scope, search_ms, embed_ms, &[])
+}
+
+/// Format search results with the effective rerank scores for candidates whose
+/// position differs from pure raw-score order.
+pub(crate) fn format_search_results_with_rank_scores(
+    results: &[EnrichedResult],
+    query: &str,
+    project_scope: &str,
+    search_ms: u64,
+    embed_ms: u64,
+    display_rank_scores: &[DisplayRankScore],
+) -> String {
     let mut out = String::new();
 
     // Upfront summary
@@ -181,7 +210,10 @@ pub fn format_search_results(
             query
         ));
     } else {
-        let top_score = results[0].score;
+        let top_score = results
+            .iter()
+            .map(|result| result.score)
+            .fold(f32::NEG_INFINITY, f32::max);
         let relevance = relevance_label(top_score);
         out.push_str(&format!(
             "🎯 RESULTS: {} matches ({} relevance, top score: {:.3})\n",
@@ -199,7 +231,10 @@ pub fn format_search_results(
 
     // Summary
     if !results.is_empty() {
-        let top_score = results[0].score;
+        let top_score = results
+            .iter()
+            .map(|result| result.score)
+            .fold(f32::NEG_INFINITY, f32::max);
         let relevance = relevance_label(top_score);
 
         let preview = &results[0].chunk.content;
@@ -231,10 +266,17 @@ pub fn format_search_results(
     ));
     out.push_str(&format!("    <count>{}</count>\n", results.len()));
     if !results.is_empty() {
-        let last_score = results.last().unwrap().score;
+        let min_score = results
+            .iter()
+            .map(|result| result.score)
+            .fold(f32::INFINITY, f32::min);
+        let max_score = results
+            .iter()
+            .map(|result| result.score)
+            .fold(f32::NEG_INFINITY, f32::max);
         out.push_str(&format!(
             "    <range>{:.3}-{:.3}</range>\n",
-            last_score, results[0].score,
+            min_score, max_score,
         ));
     }
     out.push_str("    <perf>\n");
@@ -249,7 +291,17 @@ pub fn format_search_results(
     out.push_str("  <results>\n");
     for (i, r) in results.iter().enumerate() {
         out.push_str(&format!("    <r rank=\"{}\">\n", i + 1));
-        out.push_str(&format!("      <s>{:.3}</s>\n", r.score));
+        if let Some(rank_score) = display_rank_scores
+            .iter()
+            .find(|rank_score| rank_score.chunk_id == r.chunk.id)
+        {
+            out.push_str(&format!(
+                "      <s adj=\"{:.3}\">{:.3}</s>\n",
+                rank_score.adjusted_score, r.score
+            ));
+        } else {
+            out.push_str(&format!("      <s>{:.3}</s>\n", r.score));
+        }
         out.push_str(&format!(
             "      <p>{}</p>\n",
             xml_escape(&r.chunk.project_name)
@@ -275,6 +327,7 @@ pub fn format_search_results(
                 xml_escape(note)
             ));
         }
+        out.push_str(&format!("      <trust>{}</trust>\n", r.trust));
 
         out.push_str("    </r>\n");
     }
@@ -323,8 +376,12 @@ pub fn format_search_results(
 /// — including topics that were never discussed — into an apparent confirmation.
 /// Below [`QUICK_CHECK_FLOOR`] the answer is a negative existence claim with no
 /// preview (weak-match preview text is exactly how fabrication presents); in the
-/// measured overlap band it is labelled `weak` and carries an explicit
-/// may-be-spurious warning.
+/// measured overlap band it is labelled `weak` and carries an honest calibration
+/// warning — absolute cosine is weakly calibrated on this corpus, not that the
+/// topic was probably never discussed (genuine topics measure inside the same
+/// band). Every `found=true` response also carries a top1-top2 margin alongside
+/// the score: a cheap, already-computed signal for whether the top hit actually
+/// beat the field, since the score alone cannot be trusted to say so here.
 pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
     let mut out = String::new();
 
@@ -356,20 +413,34 @@ pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
 
     let relevance = relevance_label(top.score);
 
+    // Cheap discriminating signal: how far the top hit sits above the runner-up.
+    // A wide margin says "this beat the field"; a near-zero margin says "this is
+    // indistinguishable from the next candidate" — useful whether or not the top
+    // score itself lands in the weakly-calibrated band. `results` is assumed
+    // sorted descending by score (same assumption `dedupe_results` documents),
+    // so `results[1]` is the runner-up whenever it exists.
+    let margin = results.get(1).map(|second| top.score - second.score);
+
     out.push_str("  <found>true</found>\n");
-    out.push_str(&format!("  <count>{}</count>\n", results.len()));
+    // The runner-up is fetched only to calculate the margin. Keep the public
+    // quick-check surface at one rendered match, as promised by the tool.
+    out.push_str("  <count>1</count>\n");
     out.push_str(&format!("  <relevance>{}</relevance>\n", relevance));
     out.push_str("  <collections_with_matches>1</collections_with_matches>\n");
 
     if relevance == "weak" {
         out.push_str(&format!(
-            "  <warning>weak match — may be spurious. Scores in {:.2}–{:.2} are not distinguishable from topics that were never discussed (fabricated probes measured 0.456–0.605). Read the preview before treating this as evidence the topic came up.</warning>\n",
+            "  <warning>weak match — may be spurious. Absolute cosine similarity is weakly calibrated in the {:.2}-{:.2} range on this corpus: genuine and fabricated-probe scores overlap here and the score alone cannot tell them apart. Check the margin below and read the preview before treating this as evidence the topic came up.</warning>\n",
             QUICK_CHECK_FLOOR, WEAK_BAND_TOP,
         ));
     }
 
     out.push_str("  <top_result>\n");
     out.push_str(&format!("    <score>{:.3}</score>\n", top.score));
+    match margin {
+        Some(m) => out.push_str(&format!("    <margin>{:.3}</margin>\n", m)),
+        None => out.push_str("    <margin>n/a</margin>\n"),
+    }
     out.push_str(&format!(
         "    <timestamp>{}</timestamp>\n",
         age_stamp(&top.chunk.timestamp)
@@ -544,6 +615,7 @@ pub fn format_recency_results(
                 xml_escape(note)
             ));
         }
+        out.push_str(&format!("    <trust>{}</trust>\n", r.trust));
         out.push_str("  </result>\n");
     }
 
@@ -633,6 +705,7 @@ pub fn format_more_results(
                 xml_escape(note)
             ));
         }
+        out.push_str(&format!("    <trust>{}</trust>\n", r.trust));
         out.push_str("  </result>\n");
     }
 
@@ -696,10 +769,11 @@ pub fn format_full_conversation(
 ) -> String {
     if let Some(path) = file_path {
         format!(
-            "<conversation_file>\n<conversation_id>{}</conversation_id>\n<file_path>{}</file_path>\n<project>{}</project>\n<message>Use the Read tool with this file path to read the complete conversation.</message>\n</conversation_file>",
+            "<conversation_file>\n<conversation_id>{}</conversation_id>\n<file_path>{}</file_path>\n<project>{}</project>\n<message>Use the Read tool with this file path to read the complete conversation. For structured facts (stats/prompts/tools/files/errors/slice/grep) without reading the raw file, use csr_transcript or `csr-engine transcript {} <view>` instead.</message>\n</conversation_file>",
             conversation_id,
             path,
             project.unwrap_or("unknown"),
+            conversation_id,
         )
     } else {
         format!(
@@ -790,18 +864,26 @@ pub fn age_stamp(timestamp: &str) -> String {
 /// `created_at` is an RFC3339 timestamp; only the date portion (first 10
 /// chars, `YYYY-MM-DD`) is shown — falls back to the full string if shorter
 /// than 10 chars.
-pub fn resolution_note(entry_status: &str, evidence: &str, created_at: &str) -> String {
+pub fn resolution_note(
+    entry_status: &str,
+    evidence: &str,
+    created_at: &str,
+    source: &str,
+) -> Option<String> {
+    if source != crate::storage::queries::RESOLUTION_SOURCE_USER_CONFIRMED {
+        return None;
+    }
     let date = if created_at.len() >= 10 {
         &created_at[..10]
     } else {
         created_at
     };
-    match entry_status {
+    Some(match entry_status {
         "resolved" => format!("resolved — {} (verified {})", evidence, date),
         "still_open" => format!("still open — verified {}", date),
         "regressed" => format!("regressed — {} ({})", evidence, date),
         other => format!("{} — {} ({})", other, evidence, date),
-    }
+    })
 }
 
 // ─── v9.4 code property graph formatters ───
@@ -1007,6 +1089,7 @@ mod tests {
             score: 0.9,
             chunk: make_chunk(id, conv, "shared decision text"),
             resolution: None,
+            trust: crate::provenance::TrustTier::Unknown,
             validity_demoted: false,
         };
         // Correlated plan + its origin conversation both matched: plan drops.
@@ -1037,6 +1120,7 @@ mod tests {
                 score: 0.9,
                 chunk,
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             }
         };
@@ -1091,12 +1175,14 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("same-id", "conv-a", "content A"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.5,
                 chunk: make_chunk("same-id", "conv-b", "content B"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
         ];
@@ -1114,12 +1200,14 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("id-1", "conv-1", content),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.7,
                 chunk: make_chunk("id-2", "conv-1", content),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
         ];
@@ -1136,12 +1224,14 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("id-1", "conv-1", content),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.8,
                 chunk: make_chunk("id-2", "conv-2", content),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
         ];
@@ -1156,12 +1246,14 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("id-1", "conv-1", "Hello   World"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.7,
                 chunk: make_chunk("id-2", "conv-1", "hello world"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
         ];
@@ -1172,7 +1264,13 @@ mod tests {
 
     #[test]
     fn resolution_note_formats_resolved() {
-        let note = resolution_note("resolved", "shipped commit abc123", "2026-07-20T10:00:00Z");
+        let note = resolution_note(
+            "resolved",
+            "shipped commit abc123",
+            "2026-07-20T10:00:00Z",
+            "user_confirmed",
+        )
+        .unwrap();
         assert!(note.starts_with("resolved —"), "got: {note}");
         assert!(note.contains("shipped commit abc123"));
         assert!(note.contains("2026-07-20"));
@@ -1180,17 +1278,74 @@ mod tests {
 
     #[test]
     fn resolution_note_formats_still_open() {
-        let note = resolution_note("still_open", "unused evidence", "2026-07-20T10:00:00Z");
+        let note = resolution_note(
+            "still_open",
+            "unused evidence",
+            "2026-07-20T10:00:00Z",
+            "user_confirmed",
+        )
+        .unwrap();
         assert!(note.starts_with("still open —"), "got: {note}");
         assert!(note.contains("2026-07-20"));
     }
 
     #[test]
     fn resolution_note_formats_regressed() {
-        let note = resolution_note("regressed", "broke again in v9.4", "2026-07-20T10:00:00Z");
+        let note = resolution_note(
+            "regressed",
+            "broke again in v9.4",
+            "2026-07-20T10:00:00Z",
+            "user_confirmed",
+        )
+        .unwrap();
         assert!(note.starts_with("regressed —"), "got: {note}");
         assert!(note.contains("broke again in v9.4"));
         assert!(note.contains("2026-07-20"));
+    }
+
+    #[test]
+    fn agent_resolution_never_receives_verified_annotation() {
+        assert_eq!(
+            resolution_note(
+                "resolved",
+                "agent assertion",
+                "2026-07-20T10:00:00Z",
+                "agent",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn search_results_render_the_cached_floor_for_every_result() {
+        use crate::provenance::TrustTier;
+        let results = vec![
+            EnrichedResult {
+                score: 0.9,
+                chunk: make_chunk("id-user", "conv-1", "a user line"),
+                resolution: None,
+                trust: TrustTier::UserHistory,
+                validity_demoted: false,
+            },
+            EnrichedResult {
+                score: 0.8,
+                chunk: make_chunk("id-unknown", "conv-2", "a legacy line"),
+                resolution: None,
+                trust: TrustTier::Unknown,
+                validity_demoted: false,
+            },
+        ];
+        let rendered = format_search_results(&results, "query", "all", 1, 1);
+        assert!(
+            rendered.contains("<trust>user_history</trust>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("<trust>unknown</trust>"),
+            "Unknown is rendered, never omitted:\n{rendered}"
+        );
+        let more = format_more_results(&results, "query", 0, 2);
+        assert_eq!(more.matches("<trust>").count(), 2, "{more}");
     }
 
     #[test]
@@ -1200,16 +1355,19 @@ mod tests {
                 score: 0.9,
                 chunk: make_chunk("id-open", "conv-1", "open item"),
                 resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
             EnrichedResult {
                 score: 0.8,
                 chunk: make_chunk("id-resolved", "conv-1", "resolved item"),
-                resolution: Some(resolution_note(
+                resolution: resolution_note(
                     "resolved",
                     "verified in prod",
                     "2026-07-20T10:00:00Z",
-                )),
+                    "user_confirmed",
+                ),
+                trust: crate::provenance::TrustTier::Unknown,
                 validity_demoted: false,
             },
         ];
@@ -1230,11 +1388,81 @@ mod tests {
             score: 0.9,
             chunk: make_chunk("id-1", "conv-1", "plain item"),
             resolution: None,
+            trust: crate::provenance::TrustTier::Unknown,
             validity_demoted: false,
         }];
         let xml = format_search_results(&results, "q", "all", 1, 1);
         assert!(!xml.contains("<resolution>"), "got: {xml}");
         assert!(!xml.contains("<note>"), "got: {xml}");
+    }
+
+    #[test]
+    fn format_search_results_explains_reranked_order_with_raw_extrema() {
+        let results = vec![
+            EnrichedResult {
+                score: 0.474,
+                chunk: make_chunk("boosted", "conv-1", "boosted result"),
+                resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
+                validity_demoted: false,
+            },
+            EnrichedResult {
+                score: 0.765,
+                chunk: make_chunk("demoted", "conv-2", "demoted result"),
+                resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
+                validity_demoted: false,
+            },
+            EnrichedResult {
+                score: 0.200,
+                chunk: make_chunk("validity-tail", "conv-3", "validity-demoted tail"),
+                resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
+                validity_demoted: true,
+            },
+        ];
+
+        let display_rank_scores = vec![
+            DisplayRankScore {
+                chunk_id: "boosted".to_string(),
+                adjusted_score: 1.124,
+            },
+            DisplayRankScore {
+                chunk_id: "demoted".to_string(),
+                adjusted_score: 0.265,
+            },
+        ];
+        let xml = format_search_results_with_rank_scores(
+            &results,
+            "rerank",
+            "all",
+            5,
+            3,
+            &display_rank_scores,
+        );
+
+        assert!(
+            xml.contains("top score: 0.765"),
+            "upfront summary must use the maximum raw score: {xml}"
+        );
+        assert!(
+            xml.contains("top-score=\"0.765\""),
+            "XML summary must use the maximum raw score: {xml}"
+        );
+        assert!(
+            xml.contains("<range>0.200-0.765</range>"),
+            "range must use raw min..max even after partitioning: {xml}"
+        );
+        let boosted = xml.find("<id>boosted</id>").unwrap();
+        let demoted = xml.find("<id>demoted</id>").unwrap();
+        let validity_tail = xml.find("<id>validity-tail</id>").unwrap();
+        assert!(boosted < demoted && demoted < validity_tail, "{xml}");
+        assert!(xml.contains("<s adj=\"1.124\">0.474</s>"), "got: {xml}");
+        assert!(xml.contains("<s adj=\"0.265\">0.765</s>"), "got: {xml}");
+        assert!(
+            xml.contains("<s>0.200</s>"),
+            "validity-only tail movement must not gain an adjusted score: {xml}"
+        );
     }
 
     #[test]
@@ -1266,6 +1494,7 @@ mod tests {
                 "resolved — evidence cites [stale anchor] old_fn wording (verified 2026-01-01)"
                     .to_string(),
             ),
+            trust: crate::provenance::TrustTier::Unknown,
             validity_demoted: false, // kill switch on: the partition never set it
         }];
         let xml = format_search_results(&results, "q", "all", 5, 3);
@@ -1297,6 +1526,7 @@ mod tests {
 \x20     <cid>conv-1</cid>\n\
 \x20     <id>c-1</id>\n\
 \x20     <resolution>resolved \u{2014} evidence cites [stale anchor] old_fn wording (verified 2026-01-01)</resolution>\n\
+\x20     <trust>unknown</trust>\n\
 \x20   </r>\n\
 \x20 </results>\n\
 \x20 <note>1 resolved item(s) demoted within page \u{2014} matched but verified addressed</note>\n\
@@ -1423,6 +1653,7 @@ mod tests {
             score,
             chunk: make_chunk("qc1", "conv-qc", content),
             resolution: None,
+            trust: crate::provenance::TrustTier::Unknown,
             validity_demoted: false,
         }
     }
@@ -1482,6 +1713,67 @@ mod tests {
             assert!(xml.contains("<found>true</found>"), "{score}: {xml}");
             assert!((QUICK_CHECK_FLOOR..WEAK_BAND_TOP).contains(&score));
         }
+    }
+
+    #[test]
+    fn quick_check_warning_no_longer_claims_indistinguishable_from_never_discussed() {
+        // D4: the old wording ("not distinguishable from topics that were never
+        // discussed") told users a weak score meant "probably never happened",
+        // but real matches land in this exact band too. The honest claim is that
+        // absolute cosine is weakly calibrated here — not a verdict on the topic.
+        let results = vec![quick_result(0.50, "borderline content")];
+        let xml = format_quick_check(&results, "borderline probe");
+        assert!(xml.contains("<warning>"), "got: {xml}");
+        assert!(
+            !xml.contains("never discussed"),
+            "warning must not claim indistinguishability from never-discussed topics: {xml}"
+        );
+        assert!(
+            xml.contains("weakly calibrated"),
+            "warning should honestly describe weak calibration instead: {xml}"
+        );
+    }
+
+    #[test]
+    fn quick_check_margin_signal_differs_with_top1_top2_gap() {
+        // D4 part 2: a cheap discriminating signal (top1-top2 margin) must render
+        // differently for a decisive win vs. a near-tie, even when both top scores
+        // land in the same relevance band.
+        let decisive = vec![
+            quick_result(0.70, "clear top match"),
+            quick_result(0.20, "distant runner-up"),
+        ];
+        let near_tie = vec![
+            quick_result(0.70, "clear top match"),
+            quick_result(0.69, "near-tied runner-up"),
+        ];
+
+        let xml_decisive = format_quick_check(&decisive, "probe");
+        let xml_tie = format_quick_check(&near_tie, "probe");
+
+        assert!(
+            xml_decisive.contains("<margin>0.500</margin>"),
+            "got: {xml_decisive}"
+        );
+        assert!(xml_tie.contains("<margin>0.010</margin>"), "got: {xml_tie}");
+        assert!(
+            xml_decisive.contains("<count>1</count>"),
+            "the runner-up is margin evidence, not a rendered result: {xml_decisive}"
+        );
+        assert!(
+            !xml_decisive.contains("distant runner-up"),
+            "the runner-up preview must remain hidden: {xml_decisive}"
+        );
+    }
+
+    #[test]
+    fn quick_check_margin_is_na_with_no_second_candidate() {
+        // This slice represents the complete candidate corpus: n/a is valid
+        // only because the corpus genuinely contains no runner-up.
+        let results = vec![quick_result(0.80, "only candidate")];
+        assert_eq!(results.len(), 1);
+        let xml = format_quick_check(&results, "probe");
+        assert!(xml.contains("<margin>n/a</margin>"), "got: {xml}");
     }
 
     #[test]

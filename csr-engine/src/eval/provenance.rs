@@ -6,8 +6,9 @@
 //! `reinstatement::reinstate` with defaults. Ground truth = distinct
 //! `code_evolution.session_id`s whose `file_path` matches the query's target file
 //! suffix. Graceful on missing/empty DB (never a hard failure for a machine with no
-//! saga history yet); regression (exit 1) only when both arms actually ran and B's
-//! summed coverage is lower than A's.
+//! saga history yet). Once ground truth exists, the gate fails closed if arm B
+//! underperforms, structural graph or episode engagement is zero, or rendered
+//! receipt counts disagree with the actual `reached_by` fields.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -99,6 +100,86 @@ async fn arm_a_convs(
     Ok(cands.into_iter().map(|(_, c)| c).collect())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn provenance_gate_failed(
+    ran_any: bool,
+    total_a: usize,
+    total_b: usize,
+    structural_graph_engagement: usize,
+    episode_engagement: usize,
+    receipts_valid: bool,
+    gt_queries: usize,
+    gt_queries_engaged: usize,
+    catastrophic_regressions: usize,
+) -> bool {
+    // Aggregate sums alone are theatre: one engaged query can mask every
+    // other query running inert. Every query with reachable ground truth
+    // must engage at least one machinery route on its own — measured on the
+    // RENDERED output the user would see, not pre-truncation trace counters
+    // (a route accepted internally but cut before display never happened).
+    // A per-query coverage collapse (A found sessions, B found none) is a
+    // regression no aggregate win may mask.
+    !ran_any
+        || total_b < total_a
+        || structural_graph_engagement == 0
+        || episode_engagement == 0
+        || !receipts_valid
+        || gt_queries_engaged < gt_queries
+        || catastrophic_regressions > 0
+}
+
+/// Zero reachable ground truth while a corpus is present means the
+/// machinery is UNVERIFIABLE, not fine — fail closed. Only a genuinely
+/// empty database (fresh install, nothing imported) may skip.
+fn zero_gt_is_regression(total_chunks: usize, gt_possible: usize) -> bool {
+    gt_possible == 0 && total_chunks > 0
+}
+
+fn rendered_route_counts(output: &str) -> (usize, usize, usize) {
+    let mut seeds = 0;
+    let mut graph = 0;
+    let mut episodes = 0;
+    for line in output.lines() {
+        let Some(routes) = line
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("reached_by="))
+        else {
+            continue;
+        };
+        let routes: HashSet<&str> = routes.split('+').collect();
+        seeds += usize::from(routes.contains("seed") || routes.contains("seed-low-confidence"));
+        graph += usize::from(routes.contains("graph"));
+        episodes += usize::from(routes.contains("episode"));
+    }
+    (seeds, graph, episodes)
+}
+
+fn surfaced_from_section(section: &str) -> Option<usize> {
+    section
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("surfaced="))?
+        .trim_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .ok()
+}
+
+fn rendered_why_receipt_is_honest(output: &str) -> bool {
+    let reached = rendered_route_counts(output);
+    let Some(receipt) = output.lines().find(|line| line.starts_with("receipt: ")) else {
+        return false;
+    };
+    let sections: Vec<&str> = receipt.split(" | ").collect();
+    if sections.len() != 5 {
+        return false;
+    }
+    let footer = (
+        surfaced_from_section(sections[1]),
+        surfaced_from_section(sections[3]),
+        surfaced_from_section(sections[4]),
+    );
+    footer == (Some(reached.0), Some(reached.1), Some(reached.2))
+}
+
 /// Run the provenance benchmark against the live engine. Graceful on an empty/near-
 /// empty DB: returns a "skipped" report with `regression: false` rather than erroring.
 pub async fn run_provenance(
@@ -120,7 +201,13 @@ pub async fn run_provenance(
     let mut gt_possible = 0usize;
     let mut total_a = 0usize;
     let mut total_b = 0usize;
+    let mut structural_graph_engagement = 0usize;
+    let mut episode_engagement = 0usize;
+    let mut receipts_valid = true;
     let mut ran_any = false;
+    let mut gt_queries = 0usize;
+    let mut gt_queries_engaged = 0usize;
+    let mut catastrophic_regressions = 0usize;
 
     for (qi, q) in QUERIES.iter().enumerate() {
         let gt = storage
@@ -132,6 +219,12 @@ pub async fn run_provenance(
             Ok(v) => v,
             Err(e) => {
                 lines.push_str(&format!("Q{} embed error: {e}\n", qi + 1));
+                // A GT-bearing query that never ran stays in the per-query
+                // denominator with zero engagement — an embed failure must
+                // not shrink the gate's requirements.
+                if !gt.is_empty() {
+                    gt_queries += 1;
+                }
                 continue;
             }
         };
@@ -142,42 +235,103 @@ pub async fn run_provenance(
         let a_cov = a_convs.iter().filter(|c| gt.contains(*c)).count();
 
         let cfg = ReinstateConfig::default();
-        let b_items = reinstate(storage, embeddings, search, q.text, None, &cfg)
+        let b_result = reinstate(storage, embeddings, search, q.text, None, &cfg)
             .await
             .with_context(|| format!("reinstate() failed for Q{}", qi + 1))?;
-        let b_convs: HashSet<String> = b_items.iter().map(|i| i.conversation_id.clone()).collect();
+        let b_convs: HashSet<String> = b_result
+            .items
+            .iter()
+            .map(|item| item.conversation_id.clone())
+            .collect();
         let b_cov = b_convs.iter().filter(|c| gt.contains(*c)).count();
+        let rendered = crate::mcp::tools::format_why(
+            q.text,
+            &b_result.items,
+            &HashSet::new(),
+            &b_result.trace,
+        );
+        let receipt_valid = rendered_why_receipt_is_honest(&rendered);
+        let receipt = rendered
+            .lines()
+            .find(|line| line.starts_with("receipt: "))
+            .unwrap_or("receipt: missing");
+
+        // Engagement is judged on the RENDERED output — a route accepted
+        // internally but truncated before display never reached the user.
+        let (_, rendered_graph, rendered_episodes) = rendered_route_counts(&rendered);
 
         ran_any = true;
         total_a += a_cov;
         total_b += b_cov;
+        structural_graph_engagement += rendered_graph;
+        episode_engagement += rendered_episodes;
+        receipts_valid &= receipt_valid;
+        if !gt.is_empty() {
+            gt_queries += 1;
+            if rendered_graph > 0 || rendered_episodes > 0 {
+                gt_queries_engaged += 1;
+            }
+            if a_cov > 0 && b_cov == 0 {
+                catastrophic_regressions += 1;
+            }
+        }
 
         lines.push_str(&format!(
-            "Q{} A={} B={} gt={}\n",
+            "Q{} A={} B={} gt={} rendered_graph={} rendered_episodes={} (trace accepted: graph={} episodes={}) receipt_ok={}\n{}\n",
             qi + 1,
             a_cov,
             b_cov,
-            gt.len()
+            gt.len(),
+            rendered_graph,
+            rendered_episodes,
+            b_result.trace.structural_graph_accepted,
+            b_result.trace.episode_accepted,
+            receipt_valid,
+            receipt,
         ));
     }
 
     if gt_possible == 0 {
+        let regression = zero_gt_is_regression(total_chunks, gt_possible);
         return Ok(ProvenanceReport {
             text: format!(
-                "{lines}\nprovenance eval skipped: zero GT sessions reachable across {} queries\n",
-                QUERIES.len()
+                "{lines}\nprovenance eval: zero GT sessions reachable across {} queries with {} chunks present — {}\n",
+                QUERIES.len(),
+                total_chunks,
+                if regression {
+                    "machinery unverifiable, FAILING CLOSED"
+                } else {
+                    "empty corpus, skipped"
+                }
             ),
-            regression: false,
+            regression,
         });
     }
 
-    let regression = ran_any && total_b < total_a;
+    // A blend-only no-op is a regression even when its coverage ties arm A.
+    // The fixture must engage both structural-symbol graph provenance and a
+    // resolvable episode chain, and the rendered receipt must agree with the
+    // final reached_by route sets.
+    let regression = provenance_gate_failed(
+        ran_any,
+        total_a,
+        total_b,
+        structural_graph_engagement,
+        episode_engagement,
+        receipts_valid,
+        gt_queries,
+        gt_queries_engaged,
+        catastrophic_regressions,
+    );
     lines.push_str(&format!(
-        "\n================ SUMMARY ================\nqueries: {} | total GT sessions reachable: {}\nGT coverage A={} B={}\n",
+        "\n================ SUMMARY ================\nqueries: {} | total GT sessions reachable: {}\nGT coverage A={} B={} | rendered graph engagement={} | rendered episode engagement={} | receipts valid={}\nGT-bearing queries engaged: {gt_queries_engaged}/{gt_queries} (each must engage on its own — sums alone are theatre)\ncatastrophic per-query regressions (A>0, B=0): {catastrophic_regressions}\n",
         QUERIES.len(),
         gt_possible,
         total_a,
-        total_b
+        total_b,
+        structural_graph_engagement,
+        episode_engagement,
+        receipts_valid,
     ));
 
     Ok(ProvenanceReport {
@@ -237,6 +391,53 @@ mod tests {
         let storage = Storage::open_memory().unwrap();
         let gt = storage.ground_truth_sessions_for_target("").unwrap();
         assert!(gt.is_empty());
+    }
+
+    #[test]
+    fn blend_only_coverage_tie_fails_the_provenance_gate() {
+        assert!(provenance_gate_failed(false, 0, 0, 0, 0, true, 0, 0, 0));
+        assert!(provenance_gate_failed(true, 4, 4, 0, 0, true, 2, 2, 0));
+        assert!(provenance_gate_failed(true, 4, 4, 1, 0, true, 2, 2, 0));
+        assert!(provenance_gate_failed(true, 4, 4, 1, 1, false, 2, 2, 0));
+        assert!(!provenance_gate_failed(true, 4, 4, 1, 1, true, 2, 2, 0));
+    }
+
+    #[test]
+    fn one_engaged_query_cannot_mask_inert_gt_queries() {
+        // Sums look healthy (graph=3, episodes=2) but only 1 of 3 GT-bearing
+        // queries engaged any route — the aggregate-masking escape must fail.
+        assert!(provenance_gate_failed(true, 4, 4, 3, 2, true, 3, 1, 0));
+        assert!(!provenance_gate_failed(true, 4, 4, 3, 2, true, 3, 3, 0));
+    }
+
+    #[test]
+    fn per_query_coverage_collapse_fails_even_when_aggregate_wins() {
+        // Aggregate B=17 beats A=11 (the live 2026-08-09 shape), but one
+        // query where A found sessions and B found none is a masked
+        // regression — the gate must fail on it.
+        assert!(provenance_gate_failed(true, 11, 17, 3, 7, true, 10, 10, 1));
+        assert!(!provenance_gate_failed(true, 11, 17, 3, 7, true, 10, 10, 0));
+    }
+
+    #[test]
+    fn zero_gt_with_corpus_present_fails_closed_but_empty_db_skips() {
+        assert!(zero_gt_is_regression(151_744, 0));
+        assert!(!zero_gt_is_regression(0, 0));
+    }
+
+    #[test]
+    fn rendered_why_gate_recomputes_footer_from_reached_by_lines() {
+        let honest = "WHY: why\n\n\
+conv_a:\n\
+  best_via=blend reached_by=seed+blend+graph score=0.8\n\
+conv_b:\n\
+  best_via=episode reached_by=episode score=0.7\n\
+receipt: scope=p | seeds selected=1 conversations=1 surfaced=1 | symbols matched=1 [x] | graph walks=2 accepted=1 surfaced=1 | episodes links=1 resolved=1 accepted=1 surfaced=1 (below-cut=0, below-threshold=0, dangling=0, out-of-scope=0, unembedded=0)\n";
+        assert!(rendered_why_receipt_is_honest(honest));
+        assert!(!rendered_why_receipt_is_honest(&honest.replace(
+            "accepted=1 surfaced=1 | episodes",
+            "accepted=1 surfaced=0 | episodes"
+        )));
     }
 
     /// Storage does not expose raw SQL (private `conn`), so we cannot DROP

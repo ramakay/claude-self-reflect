@@ -4,12 +4,16 @@
 //! `csr-engine status --compact`  — One-line for statusline
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::import;
 use crate::storage::Storage;
+
+#[path = "dream_state.rs"]
+pub(crate) mod dream_state;
 
 /// Status data gathered from SQLite and disk.
 #[derive(Serialize)]
@@ -25,6 +29,8 @@ pub struct StatusReport {
     pub csr_self_suppressed: i64,
     pub csr_tool_blocks_suppressed: i64,
     pub csr_hook_wrappers_scrubbed: i64,
+    pub contamination: ContaminationStatus,
+    pub provenance_coverage: ProvenanceCoverageStatus,
     pub enrichment: EnrichmentBreakdown,
     pub narratives: NarrativeStatus,
     pub ratification: RatificationStatus,
@@ -32,11 +38,108 @@ pub struct StatusReport {
     pub db_size_bytes: u64,
     pub db_path: String,
     pub healthy: bool,
+    /// True when a live MCP server is running an older build than the binary now
+    /// on disk — the connection must be re-established for the upgrade to apply.
+    pub mcp_binary_stale: bool,
     /// Aux corpus coverage (session_registry vs chunks) — never injected into search.
     pub aux: AuxStatus,
-    /// v10 "dreaming" summary (`crate::dream`) — witness_verdicts totals and
-    /// current demoted-symbol count. See `gather_dream`.
+    /// Native memory-file spine (`~/.claude/projects/*/memory/*.md`) — metadata
+    /// only; bodies are never embedded or injected. See `gather_memory_registry`.
+    pub memory_registry: MemoryRegistryStatus,
+    /// v10 "dreaming" summary (`crate::dream`) — actual `dreams_v1` output,
+    /// recent corrections, compatibility verdict totals, and demotions.
     pub dream: DreamStatus,
+    /// Journal v3 Phase 1.5 "dream threads" summary (`crate::dream::threads`)
+    /// — night-pass propose-verify extraction. See `gather_dream_threads`.
+    pub dream_threads: DreamThreadStatus,
+    /// Latest chronological trained re-ranker gate and runtime activation.
+    pub trained_rerank: TrainedRerankStatus,
+    /// Dream backfill pipeline (`.plans/dream-backfill-design.md`) — stage
+    /// cursors, adjudication spend/discard rate, and drain queue depth.
+    /// See `gather_backfill`.
+    pub backfill: BackfillStatus,
+    pub dreaming: Option<DreamingView>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct DreamingView {
+    pub elapsed_secs: u64,
+}
+
+/// One `backfill_state` checkpoint row (design §3 "Crash safety /
+/// idempotency"). Only the `adjudicate` stage writes one today — Stages
+/// 0-3 are cheap, idempotent full-rescans with nothing to checkpoint.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct BackfillStageCursor {
+    pub stage: String,
+    pub project: String,
+    /// Opaque, stage-owned JSON payload (`backfill_state.cursor`).
+    pub cursor: Option<String>,
+    pub updated_at: String,
+}
+
+/// Dream backfill status block (design §4 / §8 D11: "Status: `backfill`
+/// block in `csr-engine status` (stage cursors, calls spent, discard rate,
+/// backlog count, dreams queued, canary flag)").
+#[derive(Serialize, Debug, Default, PartialEq)]
+pub struct BackfillStatus {
+    pub stage_cursors: Vec<BackfillStageCursor>,
+    /// Adjudication (`claude -p`) calls spent to date across every backfill
+    /// run, from `narrative_usage` (`call_site = 'dream_backfill_adjudicate'`).
+    pub calls_spent: i64,
+    /// `backfill_discards` rows / (discards + ever-witnessed relations).
+    /// `None` until at least one candidate has ever been adjudicated — a
+    /// rate computed from a zero denominator would read as a real 0%,
+    /// which is not the same as "no adjudication has happened yet".
+    pub discard_rate: Option<f64>,
+    /// Candidates still awaiting adjudication (`dream_relations` rows with
+    /// `status = 'queued' AND tier = 'unverified'`) — the resumable backlog
+    /// [`crate::dream::backfill::adjudicate::queue_depth`] reports.
+    pub backlog: usize,
+    /// Verified relations ready to drain right now (`status = 'queued' AND
+    /// tier = 'witnessed'`) — cheap SQL only; unlike `dream backfill
+    /// --report`, this deliberately does NOT also re-run the Queue U scan
+    /// (`unfinished::scan_unfinished`) on every `status` call, since that
+    /// scan's cosine/tau-fit work is too heavy for a call meant to stay
+    /// fast without an `EmbeddingEngine` — see this module's own doc.
+    pub dreams_queued: usize,
+    /// D5's canary: the last adjudication run's UNRELATED rate landed
+    /// outside the healthy 10-40% band. `false` when no run has ever
+    /// recorded a verdict.
+    pub adjudicator_suspect: bool,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Default)]
+pub struct TrainedRerankStatus {
+    pub requested: bool,
+    pub active: bool,
+    pub feature_schema: i64,
+    pub model_id: Option<String>,
+    pub active_model_id: Option<String>,
+    pub gate_status: String,
+    pub gate_reason: String,
+    pub baseline_ndcg5: Option<f64>,
+    pub trained_ndcg5: Option<f64>,
+    pub baseline_mrr: Option<f64>,
+    pub trained_mrr: Option<f64>,
+    pub curated_baseline_score: Option<f64>,
+    pub curated_trained_score: Option<f64>,
+    pub curated_case_count: i64,
+    pub curated_veto_epsilon: f64,
+    pub train_impressions: i64,
+    pub train_rows: i64,
+    pub eval_impressions: i64,
+    pub eval_rows: i64,
+    pub eval_clusters: i64,
+    pub cluster_wins: i64,
+    pub cluster_losses: i64,
+    pub cluster_ties: i64,
+    pub cluster_receipts: Vec<crate::storage::trained_rerank::GateClusterReceipt>,
+    pub cutoff_ts: Option<String>,
+    pub train_window: Option<[String; 2]>,
+    pub eval_window: Option<[String; 2]>,
+    pub trained_at: Option<String>,
+    pub model_age_days: Option<f64>,
 }
 
 /// Totals by verdict kind across every `witness_verdicts` event ever
@@ -49,6 +152,38 @@ pub struct DreamVerdictTotals {
     pub reinstated: i64,
 }
 
+#[derive(Serialize, Debug, Default, PartialEq)]
+pub struct ContaminationStatus {
+    pub conversations: usize,
+    pub total_conversations: usize,
+    pub pct: f64,
+    pub last_measured: Option<String>,
+}
+
+impl From<crate::storage::ContaminationMeasurement> for ContaminationStatus {
+    fn from(measurement: crate::storage::ContaminationMeasurement) -> Self {
+        Self {
+            conversations: measurement.conversations,
+            total_conversations: measurement.total_conversations,
+            pct: measurement.pct,
+            last_measured: Some(measurement.last_measured),
+        }
+    }
+}
+
+#[derive(Serialize, Debug, Default, PartialEq, Eq)]
+pub struct DreamCategoryTotals {
+    pub unfinished: i64,
+    pub strategy: i64,
+    pub supersession: i64,
+}
+
+impl DreamCategoryTotals {
+    fn total(&self) -> i64 {
+        self.unfinished + self.strategy + self.supersession
+    }
+}
+
 /// v10 "dreaming" summary block. `last_run` is the `created_at` timestamp of
 /// the globally newest `witness_verdicts` event (`None` if `dream` has never
 /// run). `demoted_symbols` is the count on the `Demote` channel right now —
@@ -59,13 +194,17 @@ pub struct DreamVerdictTotals {
 /// daemon cycle that runs and writes zero new events (re-running at an
 /// unchanged HEAD) still counts as "the daemon acted" and moves cadence
 /// forward, but would leave `last_run` frozen since no event was written.
-#[derive(Serialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Debug, PartialEq)]
 pub struct DreamStatus {
     /// Whether daemon dreaming is enabled by configuration.
     pub daemon_enabled: bool,
     pub last_run: Option<String>,
+    /// Backward-compatible alias for `verdict_events_total`.
     pub events_total: i64,
+    pub verdict_events_total: i64,
     pub by_verdict: DreamVerdictTotals,
+    pub dreams: DreamCategoryTotals,
+    pub corrections_7d: i64,
     pub demoted_symbols: i64,
     /// Total durable witnesses available for a first dream cycle.
     pub witnesses_ledgered: i64,
@@ -82,6 +221,140 @@ pub struct DreamStatus {
     /// depends on daemon process-start state a stateless status read doesn't
     /// have (see `daemon::dream_cadence::first_cycle_due_at`).
     pub next_due: Option<String>,
+    /// Journal v4 P5 cadence, spend policy and delivery state.
+    pub cadence: DreamCadenceStatus,
+    pub effort: DreamEffortStatus,
+    pub badge: DreamBadgeStatus,
+    /// Spend across every dreaming call site to date. `None` when no usage
+    /// row exists — never a zero, which would read as "dreaming is free".
+    pub spend: Option<DreamSpendStatus>,
+    pub server: DreamServerStatus,
+}
+
+/// Cadence state (locked decision 5): idle trigger plus nightly floor.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DreamCadenceStatus {
+    /// Idleness required before an idle-triggered pass may start.
+    pub idle_threshold_secs: u64,
+    /// Local hour of the guaranteed nightly floor pass.
+    pub floor_hour: u32,
+    /// Newest session/transcript write CSR has observed. `None` when neither
+    /// `import_state` nor `session_registry` holds a parseable timestamp.
+    pub last_activity: Option<String>,
+    /// Whether the machine is quiet enough for an idle pass right now.
+    /// `false` when `last_activity` is `None` — unobserved is not idle.
+    pub idle_now: bool,
+    /// Which trigger started the last COMPLETED pass — `"idle"` or
+    /// `"nightly_floor"`. `None` before any pass has completed.
+    pub last_trigger: Option<String>,
+    /// Whether the nightly floor pass is currently owed.
+    pub floor_due: bool,
+    /// The floor pass is owed AND the machine has not been witnessed idle,
+    /// so it is deferred rather than started underneath a live session. This
+    /// is the overdue state: the pass is still owed and runs at the next idle
+    /// window. `idle_now = false` includes "no activity has been observed at
+    /// all" — unobserved is never read as quiet, so a machine CSR cannot see
+    /// defers rather than assuming it is safe to start work.
+    pub floor_deferred_awaiting_idle: bool,
+}
+
+/// Effort tier and budget (locked decisions 8 and 14).
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DreamEffortStatus {
+    pub tier: String,
+    pub reasoning_effort: String,
+    pub episodes_per_pass: usize,
+    /// Model the night actor runs at for this tier, unless
+    /// `CSR_DREAM_THREAD_MODEL` overrides it.
+    pub model: String,
+    /// Invocation cap a pass starting now would get.
+    pub budget_cap: usize,
+    /// The last completed pass's measured budget usage. `None` before any
+    /// pass has recorded one.
+    pub last_pass: Option<DreamBudgetUsage>,
+    /// Budget left over in that last pass (`cap - used`). `None` when there
+    /// is no recorded pass to subtract from.
+    pub last_pass_remaining: Option<usize>,
+    /// How many invalid `CSR_DREAM_EFFORT` values have been seen. `None`
+    /// when the counter was never written (not the same as zero observed).
+    pub invalid_values: Option<i64>,
+    /// Tonight's durable spend ledger (locked decision 8 — the cap is per
+    /// NIGHT). `used` is what passes have debited from `cap` tonight.
+    /// `None` when the ledger could not be read — an unreadable ledger is
+    /// not the same as a night with nothing spent.
+    pub night: Option<DreamNightBudget>,
+    /// Invocations that started and whose spend was never measured — open
+    /// usage reservations. `None` when the table could not be read; a
+    /// non-zero value is a known unknown, never rounded to zero spend.
+    pub unaccounted_invocations: Option<i64>,
+    /// How many usage-accounting writes have failed. `None` when the counter
+    /// was never written (not the same as zero observed).
+    pub accounting_failures: Option<i64>,
+}
+
+/// Tonight's invocation allowance and what is left of it.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DreamNightBudget {
+    /// The local-night bucket these numbers belong to.
+    pub night: String,
+    /// The nightly cap a pass starting now would draw from.
+    pub cap: usize,
+    /// Invocations already claimed tonight, from the durable ledger.
+    pub used: usize,
+    /// `cap - used`.
+    pub remaining: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
+pub struct DreamBudgetUsage {
+    pub cap: usize,
+    pub used: usize,
+    /// Candidates left for the next pass because the cap was reached.
+    pub queued: usize,
+}
+
+impl DreamBudgetUsage {
+    /// Budget still available in the last pass — a subtraction of two
+    /// measured numbers, not an estimate.
+    pub fn remaining(&self) -> usize {
+        self.cap.saturating_sub(self.used)
+    }
+}
+
+/// Statusline badge state (delivery channel (a)).
+#[derive(Serialize, Debug, PartialEq, Eq, Default)]
+pub struct DreamBadgeStatus {
+    /// Dreams measured as undelivered by the last pass, minus those
+    /// delivered since. `None` until a pass has measured a baseline — the
+    /// statusline then shows no badge at all rather than a fabricated zero.
+    pub unread: Option<i64>,
+    /// When that baseline was measured.
+    pub measured_at: Option<String>,
+}
+
+/// Spend to date across dreaming's model call sites.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct DreamSpendStatus {
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    /// List-price US$, or `None` when any contributing model has no
+    /// published price (a partial total would understate it).
+    pub cost_usd: Option<f64>,
+    pub unpriced_models: Vec<String>,
+}
+
+/// The journal server (locked decision 7) — where it is and whether anything
+/// answers there.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DreamServerStatus {
+    /// `None` when `CSR_NO_JOURNAL_SERVER` disables it.
+    pub url: Option<String>,
+    /// Whether a loopback TCP connect to the configured port succeeded just
+    /// now. This proves something is listening there — it does not prove it
+    /// is this binary's journal, so the field is named for what was
+    /// measured.
+    pub port_reachable: bool,
 }
 
 impl Default for DreamStatus {
@@ -90,12 +363,100 @@ impl Default for DreamStatus {
             daemon_enabled: true,
             last_run: None,
             events_total: 0,
+            verdict_events_total: 0,
             by_verdict: DreamVerdictTotals::default(),
+            dreams: DreamCategoryTotals::default(),
+            corrections_7d: 0,
             demoted_symbols: 0,
             witnesses_ledgered: 0,
             ancestry_cached_conversations: 0,
             last_daemon_run: None,
             next_due: None,
+            cadence: DreamCadenceStatus {
+                idle_threshold_secs: crate::daemon::dream_cadence::DEFAULT_IDLE_MINS * 60,
+                floor_hour: crate::daemon::dream_cadence::DEFAULT_FLOOR_HOUR,
+                last_activity: None,
+                idle_now: false,
+                last_trigger: None,
+                floor_due: true,
+                // Consistent with the two fields above it: owed, and not
+                // witnessed idle.
+                floor_deferred_awaiting_idle: true,
+            },
+            effort: DreamEffortStatus::default(),
+            badge: DreamBadgeStatus::default(),
+            spend: None,
+            server: DreamServerStatus {
+                url: None,
+                port_reachable: false,
+            },
+        }
+    }
+}
+
+impl Default for DreamEffortStatus {
+    fn default() -> Self {
+        let tier = crate::dream::policy::effort_tier();
+        Self {
+            tier: tier.as_str().to_string(),
+            reasoning_effort: tier.reasoning_effort().to_string(),
+            episodes_per_pass: tier.episodes_per_pass(),
+            model: crate::dream::threads::primary_thread_model(),
+            budget_cap: crate::dream::policy::budget_cap(tier),
+            last_pass: None,
+            last_pass_remaining: None,
+            invalid_values: None,
+            night: Some(DreamNightBudget {
+                night: crate::dream::policy::current_night_key(),
+                cap: crate::dream::policy::budget_cap(tier),
+                used: 0,
+                remaining: crate::dream::policy::budget_cap(tier),
+            }),
+            unaccounted_invocations: None,
+            accounting_failures: None,
+        }
+    }
+}
+
+/// Per-tier counts of stored (non-sentinel) `dream_threads` rows.
+#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+pub struct DreamThreadTierCounts {
+    pub verdict: i64,
+    pub witnessed: i64,
+    pub unverified: i64,
+}
+
+/// Journal v3 Phase 1.5 status block. `enabled` mirrors the
+/// `CSR_DREAM_THREADS` opt-in gate (default off — this is a NEW spend
+/// surface layered on the zero-LLM `dream` pass). `converged` is `None`
+/// until a pass has ever completed; `Some(true)` means the last pass added
+/// zero new rows (real threads or sentinels) — a frozen corpus costing zero
+/// further spend, per `dream::threads`'s convergence-by-construction design.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DreamThreadStatus {
+    pub enabled: bool,
+    pub total: i64,
+    pub by_tier: DreamThreadTierCounts,
+    pub last_run: Option<String>,
+    pub converged: Option<bool>,
+    /// The configured target model (`CSR_DREAM_THREAD_MODEL` override or the
+    /// default) — see `dream::threads::primary_thread_model`.
+    pub model: String,
+    /// Whether a non-Claude night actor is configured via
+    /// `CSR_NIGHT_ACTOR_CMD`.
+    pub actor_cmd_configured: bool,
+}
+
+impl Default for DreamThreadStatus {
+    fn default() -> Self {
+        Self {
+            enabled: crate::dream::threads::threads_enabled(),
+            total: 0,
+            by_tier: DreamThreadTierCounts::default(),
+            last_run: None,
+            converged: None,
+            model: crate::dream::threads::primary_thread_model(),
+            actor_cmd_configured: crate::dream::threads::night_actor_cmd_configured(),
         }
     }
 }
@@ -105,6 +466,43 @@ pub struct CoverageStats {
     pub sessions_seen: i64,
     pub sessions_imported: i64,
     pub gap: i64,
+}
+
+#[derive(Serialize, Default, Debug, PartialEq)]
+pub struct ProvenanceCoverageStatus {
+    pub chunks_with_spans: i64,
+    pub chunks_unknown: i64,
+    pub chunks_total: i64,
+    pub tool_result_share_mean: Option<f64>,
+    pub source_missing: i64,
+    pub source_unparsed: i64,
+    pub source_unmatched: i64,
+    /// Per-family tier histogram over cached artifact floors. Empty only when
+    /// the histogram query failed; a family with no rows still appears with
+    /// zero counts so the Unknown share is visible rather than assumed.
+    pub artifacts: Vec<ArtifactTierCounts>,
+}
+
+#[derive(Serialize, Default, Debug, PartialEq, Eq, Clone)]
+pub struct ArtifactTierCounts {
+    pub kind: String,
+    pub unknown: i64,
+    pub external: i64,
+    pub trusted_tool: i64,
+    pub user_history: i64,
+    pub user_confirmed: i64,
+    pub system: i64,
+}
+
+impl ArtifactTierCounts {
+    pub fn total(&self) -> i64 {
+        self.unknown
+            + self.external
+            + self.trusted_tool
+            + self.user_history
+            + self.user_confirmed
+            + self.system
+    }
 }
 
 #[derive(Serialize, Default, Debug, PartialEq, Eq)]
@@ -125,6 +523,8 @@ pub struct SourceCounts {
     pub task_sessions_on_disk: usize,
     pub resolution_proposals: i64,
     pub resolution_verdicts: i64,
+    pub resolution_verdicts_agent: i64,
+    pub resolution_verdicts_user_confirmed: i64,
 }
 
 #[derive(Serialize, Default, Debug, PartialEq, Eq)]
@@ -134,6 +534,18 @@ pub struct AuxStatus {
     pub transcripts_unindexed: usize,
     pub schema_misses: SchemaMissCounts,
     pub sources: SourceCounts,
+}
+
+/// Native harness file-based memory spine (`~/.claude/projects/*/memory/*.md`) —
+/// metadata only, bodies are never embedded or injected. See
+/// `crate::import::memory_registry::scan_memory_dirs`.
+#[derive(Serialize, Default, Debug, PartialEq, Eq)]
+pub struct MemoryRegistryStatus {
+    pub files: i64,
+    pub projects: i64,
+    pub with_origin_session: i64,
+    pub last_scan_ts: Option<String>,
+    pub schema_misses: i64,
 }
 
 #[derive(Serialize, Default)]
@@ -197,12 +609,17 @@ pub fn gather_status_public(db_path: &Path, projects_dir: &Path) -> Result<Statu
 
 /// Gather status data from SQLite and disk.
 fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<StatusReport> {
+    let now = chrono::Utc::now();
+    let dreaming = dream_state::read_active_marker(now).map(|marker| DreamingView {
+        elapsed_secs: (now - marker.started_at).num_seconds().max(0) as u64,
+    });
     // Count total JSONL files on disk
     let total_jsonl = count_jsonl_files(projects_dir);
 
     // If DB doesn't exist yet, return empty report
     if !db_path.exists() {
         return Ok(StatusReport {
+            mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
             conversations: 0,
             projects: 0,
             chunks: 0,
@@ -213,6 +630,8 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             csr_self_suppressed: 0,
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
+            contamination: ContaminationStatus::default(),
+            provenance_coverage: ProvenanceCoverageStatus::default(),
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus {
                 disabled: crate::narrative::narratives_disabled(),
@@ -224,7 +643,12 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             db_path: db_path.to_string_lossy().to_string(),
             healthy: false,
             aux: AuxStatus::default(),
+            memory_registry: MemoryRegistryStatus::default(),
             dream: DreamStatus::default(),
+            dream_threads: DreamThreadStatus::default(),
+            trained_rerank: empty_trained_rerank_status(),
+            backfill: BackfillStatus::default(),
+            dreaming,
         });
     }
 
@@ -240,6 +664,48 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let csr_self_suppressed = storage.get_csr_self_suppressed().unwrap_or(0);
     let csr_tool_blocks_suppressed = storage.get_csr_tool_blocks_suppressed().unwrap_or(0);
     let csr_hook_wrappers_scrubbed = storage.get_csr_hook_wrappers_scrubbed().unwrap_or(0);
+    let contamination = if deep {
+        storage.refresh_contamination_cache().ok()
+    } else {
+        storage.cached_contamination().unwrap_or(None)
+    }
+    .map(ContaminationStatus::from)
+    .unwrap_or_default();
+    let [source_missing, source_unparsed, source_unmatched] =
+        storage.provenance_failure_counts().unwrap_or_default();
+    let artifacts: Vec<ArtifactTierCounts> = storage
+        .artifact_tier_histograms()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(kind, c)| ArtifactTierCounts {
+                    kind: kind.as_str().to_string(),
+                    unknown: c[0],
+                    external: c[1],
+                    trusted_tool: c[2],
+                    user_history: c[3],
+                    user_confirmed: c[4],
+                    system: c[5],
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let provenance_coverage = storage
+        .provenance_coverage()
+        .map(
+            |(chunks_with_spans, chunks_unknown, chunks_total, tool_result_share_mean)| {
+                ProvenanceCoverageStatus {
+                    chunks_with_spans,
+                    chunks_unknown,
+                    chunks_total,
+                    tool_result_share_mean,
+                    source_missing,
+                    source_unparsed,
+                    artifacts: artifacts.clone(),
+                    source_unmatched,
+                }
+            },
+        )
+        .unwrap_or_default();
     let newest_chunk = storage.get_newest_chunk_timestamp().unwrap_or(None);
     let db_size_bytes = storage.get_db_size().unwrap_or(0);
     // Cached verdict (24h TTL, refreshed by the daemon or --deep). A full
@@ -277,8 +743,13 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
 
     let aux = gather_aux(&storage, projects_dir);
     let dream = gather_dream(&storage);
+    let dream_threads = gather_dream_threads(&storage);
+    let memory_registry = gather_memory_registry(&storage);
+    let trained_rerank = gather_trained_rerank(&storage);
+    let backfill = gather_backfill(&storage);
 
     Ok(StatusReport {
+        mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
         conversations,
         projects,
         chunks,
@@ -289,6 +760,8 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         csr_self_suppressed,
         csr_tool_blocks_suppressed,
         csr_hook_wrappers_scrubbed,
+        contamination,
+        provenance_coverage,
         enrichment,
         narratives,
         ratification,
@@ -297,26 +770,327 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         db_path: db_path.to_string_lossy().to_string(),
         healthy,
         aux,
+        memory_registry,
         dream,
+        dream_threads,
+        trained_rerank,
+        backfill,
+        dreaming,
     })
+}
+
+fn empty_trained_rerank_status() -> TrainedRerankStatus {
+    TrainedRerankStatus {
+        requested: crate::search::trained_rerank::trained_rerank_requested(),
+        feature_schema: crate::search::trained_rerank::FEATURE_SCHEMA,
+        gate_status: "never_run".into(),
+        gate_reason: "no persisted training attempt".into(),
+        curated_veto_epsilon: crate::storage::trained_rerank::CURATED_VETO_EPSILON,
+        ..Default::default()
+    }
+}
+
+fn model_age_days_at(trained_at: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+    let trained_at = crate::temporal::parse_timestamp(trained_at)?;
+    Some((now - trained_at).num_seconds().max(0) as f64 / 86_400.0)
+}
+
+fn gather_trained_rerank(storage: &Storage) -> TrainedRerankStatus {
+    let mut status = empty_trained_rerank_status();
+    let attempt = match storage.latest_rerank_model_attempt() {
+        Ok(Some(attempt)) => attempt,
+        Ok(None) => return status,
+        Err(error) => {
+            status.gate_status = "error".into();
+            status.gate_reason = format!("gate read failed: {error}");
+            return status;
+        }
+    };
+    status.model_id = Some(attempt.model_id.clone());
+    status.gate_status = attempt.gate_status.clone();
+    status.gate_reason = attempt.gate_reason.clone();
+    status.baseline_ndcg5 = attempt.baseline_ndcg5;
+    status.trained_ndcg5 = attempt.trained_ndcg5;
+    status.baseline_mrr = attempt.baseline_mrr;
+    status.trained_mrr = attempt.trained_mrr;
+    status.curated_baseline_score = attempt.curated_baseline_score;
+    status.curated_trained_score = attempt.curated_trained_score;
+    status.curated_case_count = attempt.curated_case_count;
+    status.curated_veto_epsilon = attempt.curated_veto_epsilon;
+    status.train_impressions = attempt.train_impressions;
+    status.train_rows = attempt.train_rows;
+    status.eval_impressions = attempt.eval_impressions;
+    status.eval_rows = attempt.eval_rows;
+    status.eval_clusters = attempt.eval_clusters;
+    status.cluster_wins = attempt.cluster_wins;
+    status.cluster_losses = attempt.cluster_losses;
+    status.cluster_ties = attempt.cluster_ties;
+    match storage.rerank_gate_clusters(&attempt.model_id) {
+        Ok(receipts) => status.cluster_receipts = receipts,
+        Err(error) => {
+            status.active = false;
+            status.gate_status = "error".into();
+            status.gate_reason = format!("cluster receipt read failed: {error}");
+            return status;
+        }
+    }
+    status.cutoff_ts = attempt.cutoff_ts.clone();
+    status.train_window = attempt
+        .train_start_ts
+        .clone()
+        .zip(attempt.train_end_ts.clone())
+        .map(|(start, end)| [start, end]);
+    status.eval_window = attempt
+        .eval_start_ts
+        .clone()
+        .zip(attempt.eval_end_ts.clone())
+        .map(|(start, end)| [start, end]);
+    status.trained_at = Some(attempt.trained_at.clone());
+    match crate::search::trained_rerank::latest_compatible_model(storage) {
+        Ok(Some((active_attempt, _))) => {
+            status.model_age_days =
+                model_age_days_at(&active_attempt.trained_at, chrono::Utc::now());
+            status.active_model_id = Some(active_attempt.model_id);
+            status.active = status.requested;
+        }
+        Ok(None) => {}
+        Err(error) if attempt.gate_status == "passed" => {
+            status.gate_reason = format!("{}; model load failed: {error}", status.gate_reason);
+        }
+        Err(_) => {}
+    }
+    status
+}
+
+/// Assemble the memory-registry status block. Fail-soft to defaults — must
+/// never fail on a pre-migration schema gap (mirrors `gather_dream_threads`).
+/// `schema_misses` reads the same `aux_schema_miss:memory_frontmatter` counter
+/// that `crate::import::memory_registry::scan_memory_dirs` bumps via
+/// `Storage::bump_aux_counter_by` — see that convention via `grep aux_schema_miss`.
+fn gather_memory_registry(storage: &Storage) -> MemoryRegistryStatus {
+    let (files, projects, with_origin_session) = storage
+        .with_connection(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT project),
+                        COALESCE(SUM(CASE WHEN origin_session_id IS NOT NULL THEN 1 ELSE 0 END), 0)
+                 FROM memory_registry",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(Into::into)
+        })
+        .unwrap_or((0, 0, 0));
+
+    let last_scan_ts = storage
+        .get_meta(crate::import::memory_registry::META_LAST_SCAN_TS)
+        .unwrap_or(None);
+
+    let schema_misses = storage
+        .get_aux_counters()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(source, _)| source == "memory_frontmatter")
+        .map(|(_, count)| count)
+        .unwrap_or(0);
+
+    MemoryRegistryStatus {
+        files,
+        projects,
+        with_origin_session,
+        last_scan_ts,
+        schema_misses,
+    }
+}
+
+/// Assemble the Journal v3 Phase 1.5 "dream threads" status block. Fail-soft
+/// to defaults — must never fail on a pre-migration schema gap (mirrors
+/// `gather_dream`).
+fn gather_dream_threads(storage: &Storage) -> DreamThreadStatus {
+    let (total, verdict, witnessed, unverified) = storage
+        .with_connection(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN receipt_tier = 'verdict' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN receipt_tier = 'witnessed' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN receipt_tier = 'unverified' THEN 1 ELSE 0 END), 0)
+                 FROM dream_threads WHERE thread != ''",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(Into::into)
+        })
+        .unwrap_or((0, 0, 0, 0));
+
+    let last_run = storage
+        .get_meta(crate::dream::threads::META_LAST_RUN_AT)
+        .unwrap_or(None);
+    let converged = storage
+        .get_meta(crate::dream::threads::META_LAST_CONVERGED)
+        .unwrap_or(None)
+        .map(|v| v == "1");
+
+    DreamThreadStatus {
+        enabled: crate::dream::threads::threads_enabled(),
+        total,
+        by_tier: DreamThreadTierCounts {
+            verdict,
+            witnessed,
+            unverified,
+        },
+        last_run,
+        converged,
+        model: crate::dream::threads::primary_thread_model(),
+        actor_cmd_configured: crate::dream::threads::night_actor_cmd_configured(),
+    }
+}
+
+/// Assemble the dream backfill status block (design §4 / §8 D11). Fail-soft
+/// to defaults — must never fail on a pre-migration schema gap (mirrors
+/// `gather_dream_threads`).
+fn gather_backfill(storage: &Storage) -> BackfillStatus {
+    let stage_cursors = storage
+        .with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT stage, project, cursor, updated_at FROM backfill_state ORDER BY stage, project",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(BackfillStageCursor {
+                    stage: r.get(0)?,
+                    project: r.get(1)?,
+                    cursor: r.get(2)?,
+                    updated_at: r.get(3)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap_or_default();
+
+    let calls_spent = storage
+        .with_connection(|conn| {
+            crate::storage::queries::narrative_usage_for_call_sites(
+                conn,
+                &[crate::dream::backfill::adjudicate::ADJUDICATE_CALL_SITE],
+            )
+        })
+        .unwrap_or_default()
+        .iter()
+        .map(|m| m.calls)
+        .sum();
+
+    let (discards, witnessed) = storage
+        .with_connection(|conn| {
+            let discards: i64 =
+                conn.query_row("SELECT COUNT(*) FROM backfill_discards", [], |r| r.get(0))?;
+            let witnessed: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM dream_relations WHERE tier = 'witnessed'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((discards, witnessed))
+        })
+        .unwrap_or((0, 0));
+    let discard_rate = if discards + witnessed == 0 {
+        None
+    } else {
+        Some(discards as f64 / (discards + witnessed) as f64)
+    };
+
+    let backlog = storage
+        .with_connection(crate::dream::backfill::adjudicate::queue_depth)
+        .unwrap_or(0);
+
+    let dreams_queued: i64 = storage
+        .with_connection(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM dream_relations WHERE status = 'queued' AND tier = 'witnessed'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .unwrap_or(0);
+
+    let adjudicator_suspect = storage
+        .with_connection(crate::dream::backfill::adjudicate::read_backfill_state)
+        .unwrap_or(None)
+        .and_then(|cursor| serde_json::from_str::<serde_json::Value>(&cursor).ok())
+        .and_then(|v| v.get("adjudicator_suspect").and_then(|b| b.as_bool()))
+        .unwrap_or(false);
+
+    BackfillStatus {
+        stage_cursors,
+        calls_spent,
+        discard_rate,
+        backlog,
+        dreams_queued: dreams_queued.max(0) as usize,
+        adjudicator_suspect,
+    }
 }
 
 /// Assemble the v10 "dreaming" status block. Fail-soft to defaults —
 /// `status` opens SQLite directly and must never fail on a pre-migration
 /// schema gap (mirrors `gather_narratives`).
 fn gather_dream(storage: &Storage) -> DreamStatus {
+    gather_dream_with(
+        storage,
+        crate::storage::recap_feeds::dream_consumption_mode(),
+    )
+}
+
+fn gather_dream_with(
+    storage: &Storage,
+    consumption_mode: crate::storage::recap_feeds::ConsumptionMode,
+) -> DreamStatus {
     let last_run = storage
         .last_dream_run()
         .unwrap_or(None)
         .map(|(_head_oid, created_at)| created_at);
-    let (obsolete, superseded, reinstated) = storage.dream_event_totals().unwrap_or((0, 0, 0));
-    let demoted_symbols = storage
-        .all_demoted_symbols()
-        .map(|v| v.len() as i64)
+    // I6: ConsumptionMode defaults to AnnotateOnly — verdict counts are
+    // user-facing by default; only an explicit Off suppresses them, and the
+    // Demote-channel forgotten count additionally requires Full. The
+    // daemon's own operational bookkeeping below (whether it's enabled, when
+    // it last ran, when it's next due) is NOT verdict content and stays
+    // visible in every mode; gating skips the underlying queries entirely
+    // rather than computing real totals and hiding them.
+    let (obsolete, superseded, reinstated) =
+        if consumption_mode != crate::storage::recap_feeds::ConsumptionMode::Off {
+            storage.dream_event_totals().unwrap_or((0, 0, 0))
+        } else {
+            (0, 0, 0)
+        };
+    let demoted_symbols = if consumption_mode == crate::storage::recap_feeds::ConsumptionMode::Full
+    {
+        storage
+            .all_demoted_symbols()
+            .map(|v| v.len() as i64)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let (unfinished, strategy, supersession_dreams) =
+        storage.dream_counts_by_category().unwrap_or((0, 0, 0));
+    let corrections_since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+    let corrections_7d = storage
+        .count_correction_redirect_events_since(&corrections_since)
         .unwrap_or(0);
     let last_daemon_run_dt = crate::daemon::dream_cadence::read_last_run(storage);
     let last_daemon_run = last_daemon_run_dt.map(|t| t.to_rfc3339());
-    let daemon_enabled = !crate::daemon::dream_cadence::dreaming_disabled();
+    let daemon_enabled = !crate::daemon::dream_cadence::dreaming_disabled()
+        && !crate::daemon::dream_cadence::consent_declined(storage);
     // The TUI only renders this count for the enabled/never-run state, so keep
     // the extra COUNT query off the steady-state refresh path.
     let witnesses_ledgered = if daemon_enabled && last_daemon_run_dt.is_none() {
@@ -336,20 +1110,140 @@ fn gather_dream(storage: &Storage) -> DreamStatus {
         .flatten()
         .map(|t| t.to_rfc3339());
 
+    let verdict_events_total = obsolete + superseded + reinstated;
     DreamStatus {
         daemon_enabled,
         last_run,
-        events_total: obsolete + superseded + reinstated,
+        events_total: verdict_events_total,
+        verdict_events_total,
         by_verdict: DreamVerdictTotals {
             obsolete,
             superseded,
             reinstated,
         },
+        dreams: DreamCategoryTotals {
+            unfinished,
+            strategy,
+            supersession: supersession_dreams,
+        },
+        corrections_7d,
         demoted_symbols,
         witnesses_ledgered,
         ancestry_cached_conversations: storage.ancestry_cache_count().unwrap_or(0),
         last_daemon_run,
         next_due,
+        cadence: gather_cadence(storage, last_daemon_run_dt),
+        effort: gather_effort(storage),
+        badge: DreamBadgeStatus {
+            unread: crate::storage::dream_delivery::badge_unread(storage),
+            measured_at: crate::storage::dream_delivery::badge_measured_at(storage),
+        },
+        spend: gather_dream_spend(storage),
+        server: gather_journal_server(),
+    }
+}
+
+/// Journal v4 P5 cadence block. Every field is either a configured value or
+/// something measured from storage; nothing is inferred from absence.
+fn gather_cadence(
+    storage: &Storage,
+    last_daemon_run: Option<chrono::DateTime<chrono::Utc>>,
+) -> DreamCadenceStatus {
+    use crate::daemon::dream_cadence as cadence;
+    let now = chrono::Utc::now();
+    let idle_threshold_secs = cadence::idle_secs();
+    let floor_hour = cadence::floor_hour();
+    let last_activity = cadence::last_activity_at(storage);
+    let last_run_local = last_daemon_run.map(|t| t.with_timezone(&chrono::Local).naive_local());
+    let now_local = now.with_timezone(&chrono::Local).naive_local();
+    DreamCadenceStatus {
+        idle_threshold_secs,
+        floor_hour,
+        idle_now: cadence::is_idle(last_activity, now, idle_threshold_secs),
+        last_activity: last_activity.map(|t| t.to_rfc3339()),
+        last_trigger: storage.get_meta(cadence::META_LAST_TRIGGER).unwrap_or(None),
+        floor_due: cadence::floor_due(last_run_local, now_local, floor_hour),
+        floor_deferred_awaiting_idle: cadence::floor_deferred_for_activity(
+            last_activity,
+            last_run_local,
+            now,
+            now_local,
+            cadence::CadenceConfig::from_env(),
+        ),
+    }
+}
+
+/// Effort tier + budget block. `last_pass` is parsed from the meta row the
+/// last completed cycle wrote; an unparseable row reads as `None` rather
+/// than as zeros.
+fn gather_effort(storage: &Storage) -> DreamEffortStatus {
+    let tier = crate::dream::policy::effort_tier();
+    let last_pass = storage
+        .get_meta(crate::daemon::dream_cadence::META_LAST_BUDGET)
+        .unwrap_or(None)
+        .and_then(|raw| serde_json::from_str::<DreamBudgetUsage>(&raw).ok());
+    let night = crate::dream::policy::current_night_key();
+    let nightly_cap = crate::dream::policy::budget_cap(tier);
+    DreamEffortStatus {
+        night: crate::dream::policy::night_claimed(storage, &night)
+            .ok()
+            .map(|used| DreamNightBudget {
+                cap: nightly_cap,
+                used,
+                remaining: nightly_cap.saturating_sub(used),
+                night,
+            }),
+        unaccounted_invocations: crate::dream::policy::unaccounted_invocations(storage),
+        accounting_failures: crate::dream::policy::accounting_failure_count(storage),
+        tier: tier.as_str().to_string(),
+        reasoning_effort: tier.reasoning_effort().to_string(),
+        episodes_per_pass: tier.episodes_per_pass(),
+        model: crate::dream::threads::primary_thread_model(),
+        budget_cap: crate::dream::policy::budget_cap(tier),
+        last_pass_remaining: last_pass.as_ref().map(DreamBudgetUsage::remaining),
+        last_pass,
+        invalid_values: crate::dream::policy::invalid_effort_count(storage),
+    }
+}
+
+/// Spend to date across dreaming's model call sites (`dream_threads`,
+/// `dream_plan`). `None` when nothing was ever recorded.
+fn gather_dream_spend(storage: &Storage) -> Option<DreamSpendStatus> {
+    let rows = storage
+        .with_connection(|conn| {
+            crate::storage::queries::narrative_usage_for_call_sites(
+                conn,
+                &["dream_threads", "dream_plan"],
+            )
+        })
+        .unwrap_or_default();
+    let spend = crate::journal::composer::DreamSpend::from_rows(&rows)?;
+    Some(DreamSpendStatus {
+        calls: spend.calls,
+        input_tokens: spend.input_tokens,
+        output_tokens: spend.output_tokens,
+        cost_usd: spend.cost_usd,
+        unpriced_models: spend.unpriced_models.clone(),
+    })
+}
+
+/// Where the journal server is, and whether anything answers there right
+/// now. The probe is a bounded loopback TCP connect — it proves a listener
+/// exists, which is why the field is `port_reachable` and not `serving`.
+fn gather_journal_server() -> DreamServerStatus {
+    use std::net::TcpStream;
+    if crate::journal::server_disabled() {
+        return DreamServerStatus {
+            url: None,
+            port_reachable: false,
+        };
+    }
+    let addr = crate::journal::loopback_addr(crate::journal::configured_port());
+    let port_reachable =
+        TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(150)).is_ok();
+    DreamServerStatus {
+        url: Some(crate::journal::url_for(addr)),
+        port_reachable,
     }
 }
 
@@ -394,6 +1288,9 @@ fn gather_aux(storage: &Storage, projects_dir: &Path) -> AuxStatus {
                 .count()
         })
         .unwrap_or(0);
+    let (resolution_verdicts_agent, resolution_verdicts_user_confirmed) = storage
+        .count_resolution_verdicts_by_source()
+        .unwrap_or((0, 0));
 
     AuxStatus {
         coverage: CoverageStats {
@@ -411,7 +1308,9 @@ fn gather_aux(storage: &Storage, projects_dir: &Path) -> AuxStatus {
             registry_sessions: seen,
             task_sessions_on_disk,
             resolution_proposals: storage.count_resolution_proposals().unwrap_or(0),
-            resolution_verdicts: storage.count_resolution_verdicts().unwrap_or(0),
+            resolution_verdicts: resolution_verdicts_agent + resolution_verdicts_user_confirmed,
+            resolution_verdicts_agent,
+            resolution_verdicts_user_confirmed,
         },
     }
 }
@@ -539,6 +1438,15 @@ fn print_swiftbar(report: &StatusReport) {
     println!("--Reflections: {} | font=Menlo", report.reflections);
     println!("--Conversations: {} | font=Menlo", report.conversations);
     println!("--Projects: {} | font=Menlo", report.projects);
+    println!(
+        "--Provenance: {}/{} spans, {} unknown; missing={} unparsed={} unmatched={} | font=Menlo",
+        report.provenance_coverage.chunks_with_spans,
+        report.provenance_coverage.chunks_total,
+        report.provenance_coverage.chunks_unknown,
+        report.provenance_coverage.source_missing,
+        report.provenance_coverage.source_unparsed,
+        report.provenance_coverage.source_unmatched,
+    );
 
     // Section: Import Progress
     let bar_filled = (report.import_percent / 10.0).round() as usize;
@@ -657,13 +1565,17 @@ fn format_age(timestamp: &str) -> String {
 
 /// Print compact one-line status for statusline integration.
 fn print_compact(report: &StatusReport) {
-    print!("{}", format_compact(report));
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    print!("{}", format_compact(report, now_ms));
 }
 
 /// Pure formatter for the compact one-line statusline — separated from
 /// `print_compact` so tests can assert on the string directly (same split
 /// `format_narrative_segment` uses).
-fn format_compact(report: &StatusReport) -> String {
+fn format_compact(report: &StatusReport, now_ms: u128) -> String {
     // Format: [████████░░ 82%] [✓ 909c 54r] [3 projects]
     let bar_filled = (report.import_percent / 10.0).round() as usize;
     let bar_empty = 10_usize.saturating_sub(bar_filled);
@@ -681,12 +1593,79 @@ fn format_compact(report: &StatusReport) -> String {
         report.projects,
         format_narrative_segment(&report.narratives),
     );
-    // v10 "dreaming": only speak up when there's something to forget —
-    // terse by design, matching the rest of this line's style.
+    if report.provenance_coverage.chunks_total > 0 {
+        out.push_str(&format!(
+            " | prov {}/{} ?{} missing={} unparsed={} unmatched={}",
+            report.provenance_coverage.chunks_with_spans,
+            report.provenance_coverage.chunks_total,
+            report.provenance_coverage.chunks_unknown,
+            report.provenance_coverage.source_missing,
+            report.provenance_coverage.source_unparsed,
+            report.provenance_coverage.source_unmatched,
+        ));
+    }
+    let dream_total = report.dream.dreams.total();
+    if dream_total > 0 || report.dream.corrections_7d > 0 {
+        out.push_str(&format!(" | ☾ {dream_total} dreams"));
+        if report.dream.corrections_7d > 0 {
+            out.push_str(&format!(" · {} corrections", report.dream.corrections_7d));
+        }
+    } else if report.dream.daemon_enabled
+        && report
+            .dream
+            .next_due
+            .as_deref()
+            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+            .is_some_and(|due| due.timestamp_millis() < now_ms.min(i64::MAX as u128) as i64)
+    {
+        out.push_str(" | ☾ due");
+    }
+    // Journal v4 P5 delivery channel (a): unread dreams and where to read
+    // them. `None` (no pass has ever measured a baseline) prints nothing at
+    // all — a `0` here would claim "nothing new" on evidence nobody
+    // gathered. A measured 0 is also silent: the badge exists to point at
+    // something unread.
+    if let Some(unread) = report.dream.badge.unread.filter(|&count| count > 0) {
+        match report.dream.server.url.as_deref() {
+            Some(url) => out.push_str(&format!(" | ☾ {unread} unread {url}")),
+            None => out.push_str(&format!(" | ☾ {unread} unread")),
+        }
+    }
+    // v10 "dreaming" Full channel: only speak up when there's something to
+    // forget — terse by design, matching the rest of this line's style.
     if report.dream.demoted_symbols > 0 {
         out.push_str(&format!(" | ☾ {} forgotten", report.dream.demoted_symbols));
     }
+    if let Some(dreaming) = &report.dreaming {
+        const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let frame = ((now_ms / 100) % 10) as usize;
+        out.push_str(&format!(
+            " | ☾ dreaming {} {}",
+            SPINNER[frame],
+            format_dreaming_elapsed(dreaming.elapsed_secs)
+        ));
+    }
+    if report.contamination.conversations > 0 {
+        out.push_str(&format!(
+            " | ⚠ {} contaminated",
+            report.contamination.conversations
+        ));
+    }
+    // A newer binary is installed but the live MCP server predates it. Say so
+    // on the statusline the user already watches, rather than leaving them to
+    // discover it from stale behaviour.
+    if report.mcp_binary_stale {
+        out.push_str(" | ⟳ reconnect mcp");
+    }
     out
+}
+
+fn format_dreaming_elapsed(elapsed_secs: u64) -> String {
+    if elapsed_secs < 60 {
+        format!("{elapsed_secs}s")
+    } else {
+        format!("{}m{:02}s", elapsed_secs / 60, elapsed_secs % 60)
+    }
 }
 
 #[cfg(test)]
@@ -733,6 +1712,7 @@ mod tests {
 
     fn base_report() -> StatusReport {
         StatusReport {
+            mcp_binary_stale: false,
             conversations: 909,
             projects: 3,
             chunks: 5000,
@@ -743,6 +1723,8 @@ mod tests {
             csr_self_suppressed: 0,
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
+            contamination: ContaminationStatus::default(),
+            provenance_coverage: ProvenanceCoverageStatus::default(),
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus::default(),
             ratification: RatificationStatus::default(),
@@ -751,7 +1733,12 @@ mod tests {
             db_path: "/tmp/test.db".to_string(),
             healthy: true,
             aux: AuxStatus::default(),
+            memory_registry: MemoryRegistryStatus::default(),
             dream: DreamStatus::default(),
+            dream_threads: DreamThreadStatus::default(),
+            trained_rerank: empty_trained_rerank_status(),
+            backfill: BackfillStatus::default(),
+            dreaming: None,
         }
     }
 
@@ -762,14 +1749,208 @@ mod tests {
     }
 
     #[test]
+    fn compact_renders_provenance_coverage() {
+        let mut report = base_report();
+        report.provenance_coverage = ProvenanceCoverageStatus {
+            chunks_with_spans: 80,
+            chunks_unknown: 25,
+            chunks_total: 100,
+            tool_result_share_mean: Some(0.2),
+            ..Default::default()
+        };
+        assert!(format_compact(&report, 0).contains("prov 80/100 ?25"));
+    }
+
+    #[test]
+    fn status_reports_per_family_artifact_tier_histograms() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::{test_observed_input, InputEnvelope};
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .insert_derived_reflection(
+                "r-ext",
+                "derived",
+                &[],
+                &[0.0; 4],
+                &InputEnvelope::new(vec![test_observed_input(
+                    "tool_result:Bash",
+                    TrustTier::External,
+                    "src",
+                )]),
+            )
+            .unwrap();
+        storage
+            .insert_reflection("r-unknown", "plain", &[], &[0.0; 4])
+            .unwrap();
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        let reflections = report
+            .provenance_coverage
+            .artifacts
+            .iter()
+            .find(|f| f.kind == "reflection")
+            .expect("reflection family present");
+        assert_eq!((reflections.external, reflections.unknown), (1, 1));
+        assert!(report
+            .provenance_coverage
+            .artifacts
+            .iter()
+            .any(|f| f.kind == "witness_verdict" && f.total() == 0));
+        let json = serde_json::to_value(&report.provenance_coverage).unwrap();
+        assert!(json["artifacts"].is_array());
+    }
+
+    #[test]
+    fn status_reports_distinct_provenance_failure_reasons() {
+        let json = serde_json::to_value(ProvenanceCoverageStatus::default()).unwrap();
+        assert_eq!(json["source_missing"], 0);
+        assert_eq!(json["source_unparsed"], 0);
+        assert_eq!(json["source_unmatched"], 0);
+    }
+
+    #[test]
+    fn status_json_contains_trained_rerank_gate_receipts() {
+        let mut report = base_report();
+        report.trained_rerank.gate_status = "failed".into();
+        report.trained_rerank.cluster_wins = 4;
+        report.trained_rerank.cluster_losses = 5;
+        report.trained_rerank.cluster_ties = 2;
+        report.trained_rerank.curated_baseline_score = Some(0.60);
+        report.trained_rerank.curated_trained_score = Some(0.61);
+        report.trained_rerank.curated_case_count = 8;
+        report.trained_rerank.curated_veto_epsilon = 1e-9;
+        report.trained_rerank.cluster_receipts =
+            vec![crate::storage::trained_rerank::GateClusterReceipt {
+                model_id: "model".into(),
+                cluster_id: "cluster".into(),
+                impression_count: 3,
+                distinct_session_count: 2,
+                candidate_count: 5,
+                baseline_ndcg5: 0.4,
+                trained_ndcg5: 0.5,
+                outcome: "win".into(),
+            }];
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["trained_rerank"]["gate_status"], "failed");
+        assert_eq!(value["trained_rerank"]["cluster_wins"], 4);
+        assert_eq!(value["trained_rerank"]["cluster_losses"], 5);
+        assert_eq!(value["trained_rerank"]["cluster_ties"], 2);
+        assert_eq!(value["trained_rerank"]["curated_baseline_score"], 0.60);
+        assert_eq!(value["trained_rerank"]["curated_trained_score"], 0.61);
+        assert_eq!(value["trained_rerank"]["curated_case_count"], 8);
+        assert_eq!(value["trained_rerank"]["curated_veto_epsilon"], 1e-9);
+        assert!(value["trained_rerank"].get("model_age_days").is_some());
+        assert_eq!(
+            value["trained_rerank"]["cluster_receipts"][0]["candidate_count"],
+            5
+        );
+        assert_eq!(
+            value["trained_rerank"]["cluster_receipts"][0]["distinct_session_count"],
+            2
+        );
+    }
+
+    #[test]
+    fn status_json_distinguishes_contamination_dreams_and_verdict_events() {
+        let mut report = base_report();
+        report.contamination = ContaminationStatus {
+            conversations: 2,
+            total_conversations: 10,
+            pct: 20.0,
+            last_measured: Some("2026-09-01T12:00:00Z".into()),
+        };
+        report.dream.dreams = DreamCategoryTotals {
+            unfinished: 3,
+            strategy: 2,
+            supersession: 1,
+        };
+        report.dream.corrections_7d = 4;
+        report.dream.verdict_events_total = 99;
+        report.dream.events_total = 99;
+
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["contamination"]["conversations"], 2);
+        assert_eq!(value["contamination"]["total_conversations"], 10);
+        assert_eq!(value["contamination"]["pct"], 20.0);
+        assert_eq!(value["dream"]["dreams"]["unfinished"], 3);
+        assert_eq!(value["dream"]["dreams"]["strategy"], 2);
+        assert_eq!(value["dream"]["dreams"]["supersession"], 1);
+        assert_eq!(value["dream"]["corrections_7d"], 4);
+        assert_eq!(value["dream"]["verdict_events_total"], 99);
+        assert_eq!(value["dream"]["events_total"], 99);
+    }
+
+    #[test]
+    fn compact_contamination_badge_only_appears_for_a_measured_nonzero_count() {
+        let mut report = base_report();
+        assert!(!format_compact(&report, 0).contains("contaminated"));
+
+        report.contamination = ContaminationStatus {
+            conversations: 7,
+            total_conversations: 100,
+            pct: 7.0,
+            last_measured: Some("2026-09-01T12:00:00Z".into()),
+        };
+        assert!(format_compact(&report, 0).contains("⚠ 7 contaminated"));
+
+        report.contamination.conversations = 0;
+        assert!(!format_compact(&report, 0).contains("contaminated"));
+    }
+
+    #[test]
+    fn trained_rerank_model_age_is_derived_from_the_active_model_timestamp() {
+        let now = crate::temporal::parse_timestamp("2026-08-24T12:00:00Z").unwrap();
+
+        assert_eq!(model_age_days_at("2026-08-22T00:00:00Z", now), Some(2.5));
+    }
+
+    #[test]
+    fn trained_rerank_status_reports_database_read_errors() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch("DROP TABLE rerank_models")?;
+                Ok(())
+            })
+            .unwrap();
+
+        let status = gather_trained_rerank(&storage);
+
+        assert_eq!(status.gate_status, "error");
+        assert!(status.gate_reason.contains("gate read failed"));
+    }
+
+    #[test]
     fn test_compact_omits_dream_suffix_when_nothing_forgotten() {
         let report = base_report();
         assert_eq!(report.dream.demoted_symbols, 0);
-        let line = format_compact(&report);
+        let line = format_compact(&report, 0);
         assert!(
             !line.contains('☾'),
             "no demoted symbols means no dream suffix: {line:?}"
         );
+        assert!(!line.contains("dreaming"));
+    }
+
+    #[test]
+    fn compact_dreaming_segment_advances_spinner_with_time() {
+        let mut report = base_report();
+        report.dreaming = Some(DreamingView { elapsed_secs: 4 });
+
+        assert!(format_compact(&report, 0).contains("☾ dreaming ⠋ 4s"));
+        assert!(format_compact(&report, 300).contains("☾ dreaming ⠸ 4s"));
+    }
+
+    #[test]
+    fn dreaming_elapsed_is_humanized() {
+        assert_eq!(format_dreaming_elapsed(4), "4s");
+        assert_eq!(format_dreaming_elapsed(63), "1m03s");
     }
 
     #[test]
@@ -779,21 +1960,89 @@ mod tests {
             daemon_enabled: true,
             last_run: Some("2026-08-05 10:00:00".into()),
             events_total: 3,
+            verdict_events_total: 3,
             by_verdict: DreamVerdictTotals {
                 obsolete: 2,
                 superseded: 1,
                 reinstated: 0,
+            },
+            dreams: DreamCategoryTotals {
+                unfinished: 2,
+                strategy: 1,
+                supersession: 0,
             },
             demoted_symbols: 3,
             witnesses_ledgered: 0,
             ancestry_cached_conversations: 0,
             last_daemon_run: None,
             next_due: None,
+            ..DreamStatus::default()
         };
-        let line = format_compact(&report);
+        let line = format_compact(&report, 0);
         assert!(
             line.contains("☾ 3 forgotten"),
             "must surface the demoted count: {line:?}"
+        );
+        assert!(
+            line.contains("☾ 3 dreams"),
+            "stored dreams must surface independently of verdict events: {line:?}"
+        );
+    }
+
+    #[test]
+    fn test_compact_shows_dreams_segment_without_demotion() {
+        let mut report = base_report();
+        report.dream.events_total = 545;
+        report.dream.verdict_events_total = 545;
+        report.dream.dreams.unfinished = 4;
+        report.dream.dreams.supersession = 2;
+        report.dream.corrections_7d = 3;
+        let line = format_compact(&report, 0);
+        assert!(
+            line.contains("☾ 6 dreams · 3 corrections"),
+            "the compact line must count dreams_v1 and recent corrections: {line:?}"
+        );
+        assert!(
+            !line.contains("545 dreams"),
+            "verdicts are not dreams: {line:?}"
+        );
+        assert!(
+            !line.contains("forgotten"),
+            "no demotion, no forgotten segment: {line:?}"
+        );
+    }
+
+    #[test]
+    fn test_compact_shows_due_when_daemon_overdue_and_no_events() {
+        let mut report = base_report();
+        report.dream.daemon_enabled = true;
+        report.dream.next_due = Some("2020-01-01T00:00:00+00:00".into());
+        let line = format_compact(&report, 1_800_000_000_000);
+        assert!(
+            line.contains("☾ due"),
+            "overdue daemon with zero events must say due: {line:?}"
+        );
+
+        // Future due date -> silent.
+        report.dream.next_due = Some("2099-01-01T00:00:00+00:00".into());
+        let line = format_compact(&report, 1_800_000_000_000);
+        assert!(
+            !line.contains('☾'),
+            "not yet due must stay silent: {line:?}"
+        );
+    }
+
+    #[test]
+    fn test_compact_dream_segment_coexists_with_stale_marker() {
+        let mut report = base_report();
+        report.dream.dreams.unfinished = 2;
+        report.mcp_binary_stale = true;
+        let line = format_compact(&report, 0);
+        let dreams = line.find("☾ 2 dreams").expect("dreams segment present");
+        let stale = line.find("⟳ reconnect mcp").expect("stale marker present");
+        assert!(
+            dreams < stale,
+            "dreams renders before stale marker: {line:?}"
         );
     }
 
@@ -832,6 +2081,36 @@ mod tests {
     }
 
     #[test]
+    fn status_splits_resolution_verdicts_by_source() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .insert_resolutions(&["agent".into()], "resolved", "agent", None, "agent")
+            .unwrap();
+        storage
+            .insert_resolutions(
+                &["confirmed-1".into(), "confirmed-2".into()],
+                "resolved",
+                "confirmed",
+                None,
+                "user_confirmed",
+            )
+            .unwrap();
+
+        let sources = gather_status(&db_path, &projects_dir, false)
+            .unwrap()
+            .aux
+            .sources;
+        assert_eq!(sources.resolution_verdicts, 3);
+        assert_eq!(sources.resolution_verdicts_agent, 1);
+        assert_eq!(sources.resolution_verdicts_user_confirmed, 2);
+    }
+
+    #[test]
     fn status_surfaces_split_csr_suppression_counters_and_sum() {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
@@ -862,9 +2141,213 @@ mod tests {
 
         let _storage = Storage::open(&db_path).unwrap();
         let report = gather_status(&db_path, &projects_dir, false).unwrap();
-        assert_eq!(report.dream, DreamStatus::default());
+        // The journal-server block is the one environment-dependent field:
+        // whether a listener answers on the loopback port depends on whether
+        // this machine happens to be running the daemon. Carry it across and
+        // assert its contract separately, so the rest of the block is still
+        // compared exactly.
+        let expected = DreamStatus {
+            server: DreamServerStatus {
+                url: report.dream.server.url.clone(),
+                port_reachable: report.dream.server.port_reachable,
+            },
+            effort: DreamEffortStatus {
+                // Measured from a table that exists on a fresh DB, so it is a
+                // real zero here — unlike the `None` default, which means
+                // "never read". Asserted on its own contract below.
+                unaccounted_invocations: report.dream.effort.unaccounted_invocations,
+                ..DreamEffortStatus::default()
+            },
+            ..DreamStatus::default()
+        };
+        assert_eq!(report.dream, expected);
+        assert_eq!(
+            report.dream.effort.unaccounted_invocations,
+            Some(0),
+            "a fresh database has no invocation in flight"
+        );
+        assert!(
+            report.dream.cadence.floor_deferred_awaiting_idle,
+            "a never-dreamed machine with no observed activity owes the floor pass and defers it"
+        );
+        assert_eq!(
+            report.dream.server.url.is_some(),
+            !crate::journal::server_disabled(),
+            "a URL is offered exactly when the server is not killed"
+        );
         assert_eq!(report.dream.demoted_symbols, 0);
         assert!(report.dream.last_run.is_none());
+    }
+
+    // ── Journal v4 P5: badge, cadence, effort, spend, server ──
+
+    #[test]
+    fn compact_shows_no_badge_until_a_pass_has_measured_one() {
+        let mut report = base_report();
+        report.dream.badge.unread = None;
+        assert!(
+            !format_compact(&report, 0).contains("unread"),
+            "an unmeasured badge must print nothing, never a zero"
+        );
+        report.dream.badge.unread = Some(0);
+        assert!(
+            !format_compact(&report, 0).contains("unread"),
+            "a measured zero has nothing to point at"
+        );
+    }
+
+    #[test]
+    fn compact_badge_shows_the_count_and_the_journal_url() {
+        let mut report = base_report();
+        report.dream.badge.unread = Some(3);
+        report.dream.server.url = Some("http://127.0.0.1:7373/".into());
+        let line = format_compact(&report, 0);
+        assert!(line.contains("☾ 3 unread http://127.0.0.1:7373/"), "{line}");
+    }
+
+    #[test]
+    fn compact_badge_omits_a_url_it_does_not_have() {
+        let mut report = base_report();
+        report.dream.badge.unread = Some(2);
+        report.dream.server.url = None;
+        let line = format_compact(&report, 0);
+        assert!(line.contains("☾ 2 unread"), "{line}");
+        assert!(!line.contains("http"), "{line}");
+    }
+
+    #[test]
+    fn status_effort_block_reports_the_tier_and_its_budget() {
+        let storage = Storage::open_memory().unwrap();
+        let effort = gather_effort(&storage);
+        let tier = crate::dream::policy::effort_tier();
+        assert_eq!(effort.tier, tier.as_str());
+        assert_eq!(effort.reasoning_effort, tier.reasoning_effort());
+        assert_eq!(effort.episodes_per_pass, tier.episodes_per_pass());
+        assert_eq!(effort.budget_cap, crate::dream::policy::budget_cap(tier));
+        assert_eq!(
+            effort.last_pass, None,
+            "a pass that never ran reports no budget usage, not a zeroed one"
+        );
+        assert_eq!(effort.invalid_values, None);
+    }
+
+    #[test]
+    fn status_effort_block_reads_the_last_pass_budget_and_counts_invalid_tiers() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .set_meta(
+                crate::daemon::dream_cadence::META_LAST_BUDGET,
+                r#"{"cap":25,"used":7,"queued":4}"#,
+            )
+            .unwrap();
+        crate::dream::policy::record_invalid_effort(&storage);
+        let effort = gather_effort(&storage);
+        let usage = effort
+            .last_pass
+            .expect("a recorded budget must be read back");
+        assert_eq!(usage.cap, 25);
+        assert_eq!(usage.used, 7);
+        assert_eq!(usage.queued, 4);
+        assert_eq!(usage.remaining(), 18);
+        assert_eq!(
+            effort.last_pass_remaining,
+            Some(18),
+            "remaining budget must be reported, not left to the reader"
+        );
+        assert_eq!(effort.invalid_values, Some(1));
+    }
+
+    #[test]
+    fn status_effort_block_reports_no_budget_for_an_unparseable_record() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .set_meta(crate::daemon::dream_cadence::META_LAST_BUDGET, "not json")
+            .unwrap();
+        assert_eq!(gather_effort(&storage).last_pass, None);
+    }
+
+    #[test]
+    fn status_cadence_block_reports_measured_activity_and_the_floor() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let storage = Storage::open_memory().unwrap();
+        let fresh = gather_cadence(&storage, None);
+        assert_eq!(fresh.last_activity, None);
+        assert!(!fresh.idle_now, "no observed activity is not idleness");
+        assert!(
+            fresh.floor_due,
+            "a machine that never dreamed is owed a pass"
+        );
+        assert_eq!(fresh.last_trigger, None);
+
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO import_state (file_path, conversation_id, chunks_imported, file_mtime)
+                     VALUES ('/tmp/a.jsonl', 'conv-a', 1, '2020-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .set_meta(crate::daemon::dream_cadence::META_LAST_TRIGGER, "idle")
+            .unwrap();
+        let aged = gather_cadence(&storage, None);
+        assert_eq!(
+            aged.last_activity.as_deref(),
+            Some("2020-01-01T00:00:00+00:00")
+        );
+        assert!(
+            aged.idle_now,
+            "a five-year-old transcript is idle by any threshold"
+        );
+        assert_eq!(aged.last_trigger.as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn status_spend_is_none_until_a_dreaming_call_was_recorded() {
+        let storage = Storage::open_memory().unwrap();
+        assert!(
+            gather_dream_spend(&storage).is_none(),
+            "no recorded usage must render nothing, never a zero"
+        );
+        storage
+            .record_narrative_usage_for(
+                &crate::storage::NarrativeUsageRow {
+                    call_site: "dream_threads".into(),
+                    model: "sonnet-5".into(),
+                    input_tokens: 1_000,
+                    output_tokens: 200,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    duration_ms: 0,
+                    success: true,
+                },
+                Some("hash-1"),
+            )
+            .unwrap();
+        // A non-dreaming call site must not be counted as dreaming spend.
+        storage
+            .record_narrative_usage_for(
+                &crate::storage::NarrativeUsageRow {
+                    call_site: "briefing".into(),
+                    model: "sonnet-5".into(),
+                    input_tokens: 9_999,
+                    output_tokens: 9_999,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    duration_ms: 0,
+                    success: true,
+                },
+                None,
+            )
+            .unwrap();
+        let spend = gather_dream_spend(&storage).expect("recorded usage must surface");
+        assert_eq!(spend.calls, 1);
+        assert_eq!(spend.input_tokens, 1_000);
+        assert_eq!(spend.output_tokens, 200);
+        assert!(spend.cost_usd.is_some());
+        assert!(spend.unpriced_models.is_empty());
     }
 
     #[test]
@@ -896,7 +2379,118 @@ mod tests {
     }
 
     #[test]
-    fn status_dream_block_reflects_recorded_events_and_demotions() {
+    fn status_backfill_block_defaults_to_empty_on_fresh_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        Storage::open(&db_path).unwrap();
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert_eq!(report.backfill, BackfillStatus::default());
+        assert!(report.backfill.stage_cursors.is_empty());
+        assert_eq!(report.backfill.calls_spent, 0);
+        assert_eq!(report.backfill.discard_rate, None);
+        assert_eq!(report.backfill.backlog, 0);
+        assert_eq!(report.backfill.dreams_queued, 0);
+        assert!(!report.backfill.adjudicator_suspect);
+    }
+
+    #[test]
+    fn status_backfill_block_surfaces_stage_cursor_spend_discard_rate_and_canary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                // A checkpoint from a completed adjudicate run, canary tripped.
+                conn.execute(
+                    "INSERT INTO backfill_state (stage, project, cursor)
+                     VALUES ('adjudicate', '', '{\"adjudicator_suspect\": true}')",
+                    [],
+                )?;
+                // Two decided candidates: one witnessed, one discarded ->
+                // discard_rate = 1 / (1 + 1) = 0.5.
+                conn.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp)
+                     VALUES ('ea', '{\"schema\":\"v2\",\"session_id\":\"ea\",\"project\":\"p\",
+                              \"timestamp\":\"2020-01-01T00:00:00Z\",\"request\":\"r\",
+                              \"completed\":\"c\",\"outcome\":\"completed\",\"todos\":[],
+                              \"files_modified\":[],\"anchors\":[]}', '[]', '2020-01-01T00:00:00Z')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp)
+                     VALUES ('eb', '{\"schema\":\"v2\",\"session_id\":\"eb\",\"project\":\"p\",
+                              \"timestamp\":\"2020-02-01T00:00:00Z\",\"request\":\"r\",
+                              \"completed\":\"c\",\"outcome\":\"completed\",\"todos\":[],
+                              \"files_modified\":[],\"anchors\":[]}', '[]', '2020-02-01T00:00:00Z')",
+                    [],
+                )?;
+                crate::storage::dream_backfill::materialize_episode_index(conn)?;
+                conn.execute(
+                    "INSERT INTO dream_relations
+                        (project, ep_a, ep_b, relation, generator, topic_key, tier, status)
+                     VALUES ('p', 'ea', 'eb', 'replaced_by', 'ledger', 'symbol:witnessed_one',
+                             'witnessed', 'queued')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO dream_relations
+                        (project, ep_a, ep_b, relation, generator, topic_key, tier, status)
+                     VALUES ('p', 'ea', 'eb', 'extended_by', 'ledger', 'symbol:awaiting_one',
+                             'unverified', 'queued')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO backfill_discards (pair_key, reason, raw_json)
+                     VALUES ('p:ea:eb', 'fabricated_quote_a', '{}')",
+                    [],
+                )?;
+                crate::storage::queries::record_narrative_usage(
+                    conn,
+                    &crate::storage::queries::NarrativeUsageRow {
+                        call_site: crate::dream::backfill::adjudicate::ADJUDICATE_CALL_SITE
+                            .to_string(),
+                        model: "haiku".to_string(),
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                        duration_ms: 100,
+                        success: true,
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert_eq!(report.backfill.stage_cursors.len(), 1);
+        assert_eq!(report.backfill.stage_cursors[0].stage, "adjudicate");
+        assert_eq!(report.backfill.calls_spent, 1);
+        assert_eq!(report.backfill.discard_rate, Some(0.5));
+        assert_eq!(
+            report.backfill.backlog, 1,
+            "the still-unverified queued row is the backlog"
+        );
+        assert_eq!(
+            report.backfill.dreams_queued, 1,
+            "the witnessed+queued row is ready to drain"
+        );
+        assert!(report.backfill.adjudicator_suspect);
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["backfill"]["calls_spent"], 1);
+        assert_eq!(json["backfill"]["adjudicator_suspect"], true);
+    }
+
+    #[test]
+    fn status_dream_block_shows_verdict_counts_by_default_and_suppresses_when_off() {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
         use crate::storage::witness_ledger::WitnessLedgerRow;
         use crate::storage::witness_verdicts::{VerdictKind, WitnessVerdictRow};
@@ -937,15 +2531,90 @@ mod tests {
                 observed_head_oid: "headoid".into(),
             })
             .unwrap();
+        storage
+            .with_connection(|conn| {
+                for (dream_id, category) in [
+                    ("dream-u", "unfinished"),
+                    ("dream-s", "strategy"),
+                    ("dream-x", "supersession"),
+                ] {
+                    conn.execute(
+                        "INSERT INTO dreams_v1
+                         (dream_id, project, category, revision_hash, prose)
+                         VALUES (?1, 'proj', ?2, ?1, 'prose')",
+                        rusqlite::params![dream_id, category],
+                    )?;
+                }
+                let now = chrono::Utc::now().to_rfc3339();
+                for (session, kind) in [
+                    ("correction-session", "correction"),
+                    ("redirect-session", "redirect"),
+                    ("abandoned-session", "abandoned"),
+                ] {
+                    conn.execute(
+                        "INSERT INTO intent_events
+                         (session_id, project, turn, kind, quote, transcript_path,
+                          byte_start, byte_end, classifier_hash, ts)
+                         VALUES (?1, 'proj', 1, ?2, 'quote', '/tmp/test.jsonl', 0, 1,
+                                 'fixture-classifier', ?3)",
+                        rusqlite::params![session, kind, now],
+                    )?;
+                }
+                conn.execute(
+                    "INSERT INTO intent_events
+                     (session_id, project, turn, kind, quote, transcript_path,
+                      byte_start, byte_end, classifier_hash, ts)
+                     VALUES ('old-correction', 'proj', 1, 'correction', 'quote',
+                             '/tmp/test.jsonl', 0, 1, 'fixture-classifier', ?1)",
+                    [(chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         drop(storage);
 
+        // CSR_DREAM_CONSUMPTION is unset in this test process — the real
+        // default, which since I6 is AnnotateOnly: verdict COUNTS are
+        // visible (dreams are user-facing by default) while the Demote
+        // channel stays dark. `gather_status` is the actual `csr-engine
+        // status` production path with no test-only parameter seam, so this
+        // drives it exactly as a real user would see it today.
         let report = gather_status(&db_path, &projects_dir, false).unwrap();
-        assert_eq!(report.dream.events_total, 1);
+        assert_eq!(
+            report.dream.events_total, 1,
+            "verdict totals must be visible under the AnnotateOnly default"
+        );
         assert_eq!(report.dream.by_verdict.obsolete, 1);
         assert_eq!(report.dream.by_verdict.superseded, 0);
-        assert_eq!(report.dream.demoted_symbols, 1);
-        assert_eq!(report.dream.witnesses_ledgered, 1);
+        assert_eq!(report.dream.verdict_events_total, 1);
+        assert_eq!(report.dream.dreams.unfinished, 1);
+        assert_eq!(report.dream.dreams.strategy, 1);
+        assert_eq!(report.dream.dreams.supersession, 1);
+        assert_eq!(report.dream.corrections_7d, 2);
+        assert_eq!(
+            report.dream.demoted_symbols, 0,
+            "forgotten-symbol count is Full-channel only and must stay 0 under the default"
+        );
+        // Daemon/ledger bookkeeping stays visible in every mode.
+        assert_eq!(
+            report.dream.witnesses_ledgered, 1,
+            "raw ledger stamp count is not verdict content and must stay visible"
+        );
         assert!(report.dream.last_run.is_some());
+
+        // Explicit opt-out suppresses the verdict-derived counts entirely.
+        std::env::set_var("CSR_DREAM_CONSUMPTION", "0");
+        let report_off = gather_status(&db_path, &projects_dir, false).unwrap();
+        std::env::remove_var("CSR_DREAM_CONSUMPTION");
+        assert_eq!(
+            report_off.dream.events_total, 0,
+            "verdict totals must be suppressed when consumption is Off"
+        );
+        assert_eq!(report_off.dream.by_verdict.obsolete, 0);
+        assert_eq!(
+            report_off.dream.witnesses_ledgered, 1,
+            "ledger bookkeeping stays visible even when Off"
+        );
     }
 
     #[test]
@@ -1021,5 +2690,100 @@ mod tests {
         assert!(!dream.daemon_enabled);
         assert!(dream.next_due.is_none());
         assert!(dream.last_daemon_run.is_some());
+    }
+
+    #[test]
+    fn gather_dream_hides_verdict_counts_when_consumption_is_off() {
+        // This test does NOT set CSR_DREAM_CONSUMPTION (matching the real
+        // default), so `gather_dream`'s verdict-derived fields must all read
+        // zero. This is a light smoke test; the "never queries witness_verdicts"
+        // proof lives in mcp::tools and storage::recap_feeds.
+        let storage = Storage::open_memory().unwrap();
+        let dream = gather_dream(&storage);
+        assert_eq!(dream.events_total, 0);
+        assert_eq!(dream.by_verdict.obsolete, 0);
+        assert_eq!(dream.by_verdict.superseded, 0);
+        assert_eq!(dream.by_verdict.reinstated, 0);
+        assert_eq!(dream.demoted_symbols, 0);
+    }
+
+    #[test]
+    fn test_memory_registry_default_is_empty() {
+        let storage = Storage::open_memory().unwrap();
+        let status = gather_memory_registry(&storage);
+        assert_eq!(status.files, 0);
+        assert_eq!(status.projects, 0);
+        assert_eq!(status.with_origin_session, 0);
+        assert!(status.last_scan_ts.is_none());
+        assert_eq!(status.schema_misses, 0);
+
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let report = gather_status(
+            Path::new("/tmp/nonexistent-csr-memory-registry-test.db"),
+            Path::new("/tmp/nonexistent-projects"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.memory_registry, MemoryRegistryStatus::default());
+    }
+
+    #[test]
+    fn test_memory_registry_counts_from_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path().join("proj1").join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(
+            mem.join("reference_x.md"),
+            r#"---
+name: reference-email-sending-domain-dns
+description: "Email sending domain email.anukriti.ai — DNS legs"
+metadata:
+  node_type: memory
+  type: reference
+  originSessionId: 723f8a5e-341b-4e41-b2eb-dffd02ef440e
+  modified: 2026-08-19T15:05:51.330Z
+---
+Body text with a [[some-slug]] wikilink and more prose.
+"#,
+        )
+        .unwrap();
+
+        let storage = Storage::open_memory().unwrap();
+        let stats = crate::import::memory_registry::scan_memory_dirs(&storage, dir.path()).unwrap();
+        assert_eq!(stats.files_seen, 1);
+        assert_eq!(stats.schema_misses, 0);
+
+        let status = gather_memory_registry(&storage);
+        assert_eq!(status.files, 1);
+        assert_eq!(status.projects, 1);
+        assert_eq!(status.with_origin_session, 1);
+        assert!(
+            status
+                .last_scan_ts
+                .as_ref()
+                .is_some_and(|ts| !ts.is_empty()),
+            "last_scan_ts should be a non-empty RFC3339 string after scan"
+        );
+        assert_eq!(status.schema_misses, 0);
+    }
+
+    #[test]
+    fn test_memory_registry_schema_miss_reflected_in_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path().join("proj1").join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(
+            mem.join("plain_note.md"),
+            "Just plain text, no fences at all.\n",
+        )
+        .unwrap();
+
+        let storage = Storage::open_memory().unwrap();
+        let stats = crate::import::memory_registry::scan_memory_dirs(&storage, dir.path()).unwrap();
+        assert_eq!(stats.schema_misses, 1);
+
+        let status = gather_memory_registry(&storage);
+        assert_eq!(status.schema_misses, 1);
+        assert_eq!(status.files, 1);
     }
 }

@@ -19,6 +19,187 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
+// ─── Trained re-ranker persistence ───
+
+#[test]
+fn trained_rerank_persistence_is_auditable_and_batched() {
+    use csr_engine::storage::trained_rerank::{
+        ExposureImpression, ExposureItem, GateClusterReceipt, ModelAttempt, ReactionLabel,
+    };
+
+    let storage = Storage::open_memory().unwrap();
+    storage
+        .record_rerank_exposure(&ExposureImpression {
+            impression_id: "imp-1".into(),
+            session_id: "session-1".into(),
+            project: "project-1".into(),
+            surface: "prompt_submit".into(),
+            query_hash: Some("query-hash".into()),
+            query_embedding: Some(vec![1.0, 0.0]),
+            intent: "explore".into(),
+            shown_at: "2026-08-01T10:00:00Z".into(),
+            feature_schema: csr_engine::search::trained_rerank::FEATURE_SCHEMA,
+            legacy: false,
+            items: vec![ExposureItem {
+                rank: 0,
+                memory_id: "memory-1".into(),
+                conversation_id: Some("source-1".into()),
+                source_type: "chunk".into(),
+                baseline_score: Some(0.8),
+                cosine: Some(0.7),
+                recency: Some(0.6),
+                graph_proximity: Some(0.0),
+                author: Some("user".into()),
+                is_scaffold: false,
+                is_mechanic: false,
+                supersedes: false,
+            }],
+        })
+        .unwrap();
+
+    storage
+        .upsert_rerank_reaction_label(&ReactionLabel {
+            session_id: "session-1".into(),
+            assistant_turn: 2,
+            next_user_turn: 3,
+            assistant_ts: Some("2026-08-01T10:00:01Z".into()),
+            next_user_ts: Some("2026-08-01T10:00:02Z".into()),
+            reaction: "acceptance".into(),
+            proposed_reaction: Some("acceptance".into()),
+            confidence: 0.91,
+            runner_up_score: 0.20,
+            margin: 0.71,
+            pickup_similarity: Some(0.30),
+            next_user_text: "Yes, that is exactly right.".into(),
+            near_miss: false,
+            classifier_hash: "classifier-1".into(),
+            transcript_mtime: 42,
+            harvested_at: "2026-08-01T11:00:00Z".into(),
+        })
+        .unwrap();
+    storage
+        .upsert_rerank_reaction_label(&ReactionLabel {
+            session_id: "session-2".into(),
+            assistant_turn: 4,
+            next_user_turn: 5,
+            assistant_ts: Some("2026-08-02T10:00:01Z".into()),
+            next_user_ts: Some("2026-08-02T10:00:02Z".into()),
+            reaction: "abstain".into(),
+            proposed_reaction: Some("correction".into()),
+            confidence: 0.69,
+            runner_up_score: 0.64,
+            margin: 0.05,
+            pickup_similarity: Some(0.40),
+            next_user_text: "Maybe, but let us inspect one more file.".into(),
+            near_miss: true,
+            classifier_hash: "classifier-1".into(),
+            transcript_mtime: 43,
+            harvested_at: "2026-08-02T11:00:00Z".into(),
+        })
+        .unwrap();
+
+    let counts = storage
+        .rerank_reaction_label_counts("classifier-1")
+        .unwrap();
+    assert_eq!(counts.acceptance, 1);
+    assert_eq!(counts.abstain, 1);
+    assert_eq!(counts.near_miss, 1);
+
+    let audit = storage
+        .audit_rerank_reaction_labels("classifier-1", 1, 1)
+        .unwrap();
+    assert_eq!(audit.len(), 2);
+    assert!(audit
+        .iter()
+        .any(|row| row.next_user_text == "Yes, that is exactly right."));
+    assert!(audit.iter().any(|row| row.near_miss));
+
+    let stats = storage
+        .get_rerank_reaction_stats_batch("classifier-1", &["memory-1", "missing"])
+        .unwrap();
+    assert_eq!(stats.get("memory-1").unwrap().acceptance, 1);
+    assert!(!stats.contains_key("missing"));
+    let labeled = storage
+        .load_labeled_rerank_exposures("classifier-1")
+        .unwrap();
+    assert_eq!(labeled.len(), 1);
+    assert_eq!(labeled[0].items.len(), 1);
+    assert_eq!(labeled[0].reaction, "acceptance");
+
+    let attempt = ModelAttempt {
+        model_id: "model-1".into(),
+        feature_schema: csr_engine::search::trained_rerank::FEATURE_SCHEMA,
+        classifier_hash: "classifier-1".into(),
+        seed: 7,
+        cutoff_ts: Some("2026-08-02T00:00:00Z".into()),
+        train_start_ts: Some("2026-08-01T00:00:00Z".into()),
+        train_end_ts: Some("2026-08-01T23:59:59Z".into()),
+        eval_start_ts: Some("2026-08-02T00:00:00Z".into()),
+        eval_end_ts: Some("2026-08-03T00:00:00Z".into()),
+        train_impressions: 200,
+        train_rows: 500,
+        eval_impressions: 50,
+        eval_rows: 120,
+        eval_clusters: 3,
+        cluster_wins: 2,
+        cluster_losses: 1,
+        cluster_ties: 0,
+        excluded_contaminated: 58,
+        abstained_reactions: 10,
+        acceptance_labels: 100,
+        correction_labels: 20,
+        reask_labels: 15,
+        redirect_labels: 5,
+        near_miss_labels: 4,
+        baseline_ndcg5: Some(0.40),
+        trained_ndcg5: Some(0.45),
+        baseline_mrr: Some(0.50),
+        trained_mrr: Some(0.55),
+        curated_baseline_score: Some(0.60),
+        curated_trained_score: Some(0.61),
+        curated_case_count: 5,
+        curated_veto_epsilon: 1e-9,
+        gate_status: "passed".into(),
+        gate_reason: "strict mean and cluster win".into(),
+        weights_json: Some("[0.1]".into()),
+        normalization_json: Some("{\"means\":[0.0],\"scales\":[1.0]}".into()),
+        trained_at: "2026-08-03T01:00:00Z".into(),
+    };
+    storage
+        .insert_rerank_model_attempt(
+            &attempt,
+            &[GateClusterReceipt {
+                model_id: "model-1".into(),
+                cluster_id: "cluster-1".into(),
+                impression_count: 4,
+                distinct_session_count: 3,
+                candidate_count: 7,
+                baseline_ndcg5: 0.40,
+                trained_ndcg5: 0.50,
+                outcome: "win".into(),
+            }],
+        )
+        .unwrap();
+
+    let latest = storage.latest_rerank_model_attempt().unwrap().unwrap();
+    assert_eq!(latest.model_id, "model-1");
+    assert_eq!(latest.cluster_wins, 2);
+    assert_eq!(latest.curated_baseline_score, Some(0.60));
+    assert_eq!(latest.curated_trained_score, Some(0.61));
+    assert_eq!(latest.curated_case_count, 5);
+    assert_eq!(latest.curated_veto_epsilon, 1e-9);
+    let receipts = storage.rerank_gate_clusters("model-1").unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].distinct_session_count, 3);
+    assert_eq!(receipts[0].trained_ndcg5, 0.50);
+    let eval = csr_engine::eval::trained_rerank::latest_gate_result(&storage);
+    assert!(!eval.passed);
+    assert!(eval.detail.contains("model load failed"));
+    assert!(eval.detail.contains("curated_baseline=0.6000"));
+    assert!(eval.detail.contains("curated_trained=0.6100"));
+    assert!(eval.detail.contains("curated_epsilon=0.000000001"));
+}
+
 // ─── Test 1: JSONL parsing ───
 
 #[test]
@@ -196,12 +377,12 @@ fn test_fts5_search() {
     // Search for docker-compose
     let results = storage.fts5_search("docker-compose", 10, None).unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].id, "fts-1");
+    assert_eq!(results[0].0.id, "fts-1");
 
     // Search for JWT
     let results = storage.fts5_search("JWT", 10, None).unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].id, "fts-2");
+    assert_eq!(results[0].0.id, "fts-2");
 }
 
 // ─── Test 6: Reflection store + retrieve ───
@@ -387,6 +568,7 @@ fn test_format_search_results_structure() {
             is_sidechain: false,
         },
         resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
         validity_demoted: false,
     }];
 
@@ -421,6 +603,7 @@ fn test_format_recency_results_includes_age_stamp() {
             is_sidechain: false,
         },
         resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
         validity_demoted: false,
     }];
 
@@ -451,6 +634,7 @@ fn test_dedupe_results_collapses_same_conversation_duplicate() {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: csr_engine::provenance::TrustTier::Unknown,
             validity_demoted: false,
         },
         EnrichedResult {
@@ -468,6 +652,7 @@ fn test_dedupe_results_collapses_same_conversation_duplicate() {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: csr_engine::provenance::TrustTier::Unknown,
             validity_demoted: false,
         },
     ];
@@ -506,6 +691,7 @@ fn test_format_quick_check_structure() {
             is_sidechain: false,
         },
         resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
         validity_demoted: false,
     }];
 
@@ -543,6 +729,7 @@ fn test_xml_escaping_in_output() {
             is_sidechain: false,
         },
         resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
         validity_demoted: false,
     }];
 
@@ -564,7 +751,7 @@ fn test_resolve_and_annotate() {
             "resolved",
             "shipped and verified",
             None,
-            "agent",
+            "user_confirmed",
         )
         .unwrap();
 
@@ -584,6 +771,7 @@ fn test_resolve_and_annotate() {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: csr_engine::provenance::TrustTier::Unknown,
             validity_demoted: false,
         },
         EnrichedResult {
@@ -601,6 +789,7 @@ fn test_resolve_and_annotate() {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: csr_engine::provenance::TrustTier::Unknown,
             validity_demoted: false,
         },
     ];
@@ -633,6 +822,7 @@ fn test_resolve_chunks_invalid_status_errors() {
         vec!["c1".to_string()],
         "bogus".to_string(),
         "some evidence".to_string(),
+        None,
         None,
     ));
     assert!(result.is_err());
@@ -846,6 +1036,7 @@ fn test_full_pipeline_storage_search_format() {
                     score: r.score,
                     chunk: c.clone(),
                     resolution: None,
+                    trust: csr_engine::provenance::TrustTier::Unknown,
                     validity_demoted: false,
                 })
         })
@@ -1392,6 +1583,8 @@ fn test_lapi_phase_aware_scoring() {
     let results = vec![
         RawResult {
             content: "docker container fix".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "chunk".into(),
             timestamp: None,
@@ -1403,6 +1596,8 @@ fn test_lapi_phase_aware_scoring() {
         },
         RawResult {
             content: "session strategy for docker".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "reflection".into(),
             timestamp: None,
@@ -1443,6 +1638,8 @@ fn test_lapi_stop_phase_prefers_anti_patterns() {
     let results = vec![
         RawResult {
             content: "regular chunk content".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "chunk".into(),
             timestamp: None,
@@ -1454,6 +1651,8 @@ fn test_lapi_stop_phase_prefers_anti_patterns() {
         },
         RawResult {
             content: "failed approach for this problem".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "anti_pattern".into(),
             timestamp: None,
@@ -1716,6 +1915,116 @@ fn episode_v2_full_cycle_with_anchors() {
     assert_eq!(
         csr_engine::extraction::anchors::verify_anchor(&anchors[0], dir.path()),
         csr_engine::extraction::anchors::AnchorVerdict::Modified
+    );
+}
+
+/// Regression: memory-registry file bodies are metadata-only.
+///
+/// `scan_memory_dirs` must upsert rows into `memory_registry` and never write
+/// file bodies into `chunks`, `chunks_fts`, or the vector/HNSW index. This
+/// locks the cross-table isolation invariant found in code review — unit tests
+/// cover frontmatter/upsert lifecycle, but not that chunks/FTS stay untouched.
+#[test]
+fn test_memory_registry_bodies_never_reach_chunks_or_fts() {
+    const MARKER: &str = "MEMORY_BODY_SENTINEL_9f3a";
+
+    let dir = tempfile::tempdir().unwrap();
+    let mem_dir = dir.path().join("demo-project").join("memory");
+    std::fs::create_dir_all(&mem_dir).unwrap();
+
+    let reference_body = format!(
+        r#"---
+name: reference-marker-isolation
+description: "Memory registry body isolation probe"
+metadata:
+  node_type: memory
+  type: reference
+  originSessionId: 00000000-0000-4000-8000-000000000001
+  modified: 2026-08-19T15:05:51.330Z
+---
+Body paragraph carrying the unique marker {MARKER} so we can prove it never
+lands in chunks or chunks_fts.
+"#
+    );
+    std::fs::write(mem_dir.join("reference_marker.md"), reference_body).unwrap();
+    std::fs::write(mem_dir.join("MEMORY.md"), "# index\n").unwrap();
+
+    let storage = Storage::open_memory().unwrap();
+    let stats =
+        csr_engine::import::memory_registry::scan_memory_dirs(&storage, dir.path()).unwrap();
+    assert_eq!(
+        stats.files_seen, 1,
+        "only the real memory file should count; MEMORY.md is skipped"
+    );
+    assert_eq!(
+        stats.upserted, 1,
+        "exactly one memory_registry upsert expected"
+    );
+
+    let (
+        registry_count,
+        memory_md_count,
+        chunks_count,
+        fts_count,
+        marker_in_chunks,
+        fts_match_count,
+    ) = storage
+        .with_transaction(|tx| {
+            let registry_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE project = ?1",
+                ["demo-project"],
+                |r| r.get(0),
+            )?;
+            let memory_md_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE file_path LIKE '%MEMORY.md'",
+                [],
+                |r| r.get(0),
+            )?;
+            let chunks_count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+            let fts_count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))?;
+            let marker_in_chunks: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM chunks WHERE content LIKE ?1",
+                [format!("%{MARKER}%")],
+                |r| r.get(0),
+            )?;
+            let fts_match_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+                [format!("\"{MARKER}\"")],
+                |r| r.get(0),
+            )?;
+            Ok((
+                registry_count,
+                memory_md_count,
+                chunks_count,
+                fts_count,
+                marker_in_chunks,
+                fts_match_count,
+            ))
+        })
+        .unwrap();
+
+    assert_eq!(
+        registry_count, 1,
+        "exactly one memory_registry row for demo-project"
+    );
+    assert_eq!(
+        memory_md_count, 0,
+        "MEMORY.md must not produce a memory_registry row"
+    );
+    assert_eq!(
+        chunks_count, 0,
+        "scan_memory_dirs must not insert any chunks rows"
+    );
+    assert_eq!(fts_count, 0, "scan_memory_dirs must leave chunks_fts empty");
+    assert_eq!(
+        marker_in_chunks, 0,
+        "marker must not appear in any chunks.content value"
+    );
+    assert_eq!(
+        fts_match_count, 0,
+        "FTS5 MATCH for body marker must return zero rows"
     );
 }
 

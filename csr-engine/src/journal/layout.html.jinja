@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{% block title %}CSR Dream Journal{% endblock %}</title>
+<style>
+  /* Green journal surface — deep-green ground, cream content cards.
+     Two surfaces, one token set:
+       - GROUND (dark green): light text. The default :root aliases below.
+       - CARD (cream): dark text. `.card`/`.panel` re-scope the same
+         semantic aliases so every descendant inverts automatically — no
+         per-rule edits. CSS custom properties inherit; that carries it.
+     A committed single look in both OS themes ("cream stays the content
+     surface"), so there are no dark-mode overrides.
+     No @font-face and no network request of any kind. */
+  :root {
+    /* ground tokens — light on deep green */
+    --ground: #151C13;
+    --on-ground: #E9E6DB;
+    --on-ground-muted: #AAB1A2;
+    --on-ground-faint: #8B9282;
+    --hairline-dark: #2B3729;
+    /* card tokens — dark on cream */
+    --card: #F2F0E6;
+    --ink: #1A201A;
+    --ink-muted: #545B4E;
+    --ink-faint: #6E756A;
+    --hairline: #DAD8CC;
+    /* accents */
+    --receipt: #3D5470;            /* slate — receipts/links on cream */
+    --accent-ground: #9FB4C6;      /* lighter slate — links on green */
+    --panel-dark: #1E2A1C;         /* code/copy sub-panel on ground */
+    --highlight: rgba(233, 230, 219, 0.06);
+    --radius-pane: 10px;
+    --radius-tile: 8px;
+    --serif: 'Playfair Display', Georgia, 'Times New Roman', serif;
+    --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+    /* semantic aliases — GROUND context (most chrome). Card selectors
+       below override these to the cream/ink variants. */
+    --bg: var(--ground);
+    --bg-card: var(--card);
+    --fg: var(--on-ground);
+    --fg-muted: var(--on-ground-muted);
+    --label: var(--on-ground-faint);
+    --border: var(--hairline-dark);
+    --accent: var(--accent-ground);
+    /* verdict hues — tuned to read on cream cards */
+    --red: #A64B43;                /* obsolete rose */
+    --red-bg: rgba(166, 75, 67, 0.08);
+    --amber: #986A16;              /* superseded gold */
+    --amber-bg: rgba(152, 106, 22, 0.08);
+    --green: #4E7355;              /* reinstated sage */
+    --green-bg: rgba(78, 115, 85, 0.08);
+    --neutral: #7C8377;            /* unverified — never a semantic hue */
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  /* Ban 3: no outer frame. The page IS the surface — no margin, no rounded
+     sheet, no shadow around anything. */
+  body {
+    margin: 0;
+    padding: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--fg);
+    font: 400 0.9375rem/1.6 -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  }
+  a { color: var(--accent); }
+
+  /* Card surfaces: re-scope the semantic aliases so every descendant
+     (which reads --fg/--fg-muted/--label/--border/--accent) inverts to
+     dark-on-cream automatically. Custom properties inherit, so scoping
+     on the container carries the whole subtree. */
+  .card, .panel {
+    --fg: var(--ink);
+    --fg-muted: var(--ink-muted);
+    --label: var(--ink-faint);
+    --border: var(--hairline);
+    --accent: var(--receipt);
+    color: var(--ink);
+  }
+  /* The copy/code block is a dark sub-panel on the ground even inside a
+     cream panel — restore light-on-dark tokens for it. */
+  .copy-block {
+    --fg-muted: var(--on-ground-muted);
+    --border: var(--hairline-dark);
+    background: var(--panel-dark);
+    color: var(--on-ground);
+  }
+
+  .masthead {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem 1rem;
+    padding: 1.1rem 1.5rem; border-bottom: 1px solid var(--border);
+  }
+  .wordmark {
+    font-family: var(--serif); font-size: 1.25rem; font-weight: 700;
+    color: var(--fg); text-decoration: none; letter-spacing: -0.01em;
+  }
+  .wordmark span { color: var(--fg-muted); }
+  .masthead-meta {
+    margin: 0; margin-left: auto; font-family: var(--mono);
+    font-size: 0.75rem; color: var(--label);
+  }
+  .masthead-meta span + span::before { content: " · "; }
+
+  /* Inline SVG icon set (sprite below <body>). No emoji, no icon font,
+     no network request — one <symbol> per glyph, referenced by <use>. */
+  .icon { width: 1em; height: 1em; fill: none; stroke: currentColor;
+    stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round;
+    vertical-align: -0.125em; flex: none; }
+  .icon-moon { fill: currentColor; stroke: none; }
+  .wordmark .icon { width: 1.05em; height: 1.05em; color: var(--fg);
+    vertical-align: -0.14em; margin-right: 0.4rem; }
+  .evidence .icon, .brief-lines .icon { color: var(--accent); opacity: 0.85;
+    margin-right: 0.4rem; }
+
+  /* Two zones, meeting at one hairline, both bleeding to the edges. */
+  .shell { display: grid; grid-template-columns: 14rem minmax(0, 1fr); }
+  .sidebar { border-right: 1px solid var(--border); padding: 1.25rem 1.25rem 3rem; }
+  .main { padding: 1.25rem 1.5rem 4rem; min-width: 0; }
+  @media (max-width: 60rem) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    .sidebar { border-right: 0; border-bottom: 1px solid var(--border); }
+  }
+
+  .rail-title {
+    margin: 1.4rem 0 0.5rem; font-family: var(--mono); font-size: 0.6875rem;
+    font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--label);
+  }
+  .sidebar > .rail-title:first-child { margin-top: 0; }
+  /* Ban 2: the ONLY marker of the current item is brighter text plus a small
+     leading dot. No bar, no pill, no tab, no background block — anywhere. */
+  .nav { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; }
+  .nav a { color: var(--fg-muted); text-decoration: none; font-size: 0.875rem; }
+  .nav a:hover { color: var(--fg); }
+  .nav a.current { color: var(--fg); font-weight: 600; }
+  .nav a.current::before { content: "· "; color: var(--fg); }
+  .nav .count { color: var(--label); font-family: var(--mono); font-size: 0.75rem; }
+  .projects { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.25rem; }
+  .projects li {
+    font-family: var(--mono); font-size: 0.75rem; color: var(--fg-muted);
+    word-break: break-all;
+  }
+
+  /* --- board ----------------------------------------------------------- */
+  .board { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; }
+  .column { border-left: 1px solid var(--border); padding: 0 1rem 1.5rem; min-width: 0; }
+  .column:first-child { border-left: 0; padding-left: 0; }
+  @media (max-width: 60rem) {
+    .board { grid-template-columns: minmax(0, 1fr); }
+    .column { border-left: 0; border-top: 1px solid var(--border); padding: 1rem 0 1.5rem; }
+    .column:first-child { border-top: 0; padding-top: 0; }
+  }
+  .column-title {
+    margin: 0; font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg);
+  }
+  .column-count { color: var(--label); font-weight: 400; }
+  .column-gate {
+    margin: 0.35rem 0 0.9rem; font-size: 0.75rem; line-height: 1.5; color: var(--label);
+  }
+  .cards { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.75rem; }
+
+  /* Three-line index card. Everything else lives on the detail page. */
+  .card {
+    position: relative;
+    display: grid; grid-template-columns: 2.25rem minmax(0, 1fr);
+    gap: 0 0.6rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--neutral);
+    border-radius: var(--radius-tile);
+    padding: 0.7rem 2rem 0.7rem 0.75rem;
+  }
+  /* Session-grade gets NO saturated rail: a rail identical to item-grade
+     would imply the conclusion is anchored to specific items. */
+  .card.session-grade { border-left-width: 1px; border-left-color: var(--border); }
+  .card.hue-obsolete { border-left-color: var(--red); }
+  .card.hue-superseded { border-left-color: var(--amber); }
+  .card.hue-reinstated { border-left-color: var(--green); }
+  .card.hue-neutral { border-left-color: var(--neutral); }
+  /* Unverified evidence: neutral, dashed, NOT LIVE, no rank numeral. Never
+     amber/rose/sage — those assert a deterministic verdict exists. */
+  .card.not-live { border-style: dashed; border-left-color: var(--neutral); }
+  .card-rank {
+    grid-row: 1 / span 3; align-self: start;
+    font-family: var(--mono); font-size: 1.125rem; color: var(--label);
+    font-variant-numeric: tabular-nums;
+  }
+  .card-caps {
+    font-family: var(--mono); font-size: 0.6875rem; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--label);
+  }
+  .card-caps .verdict.hue-obsolete { color: var(--red); }
+  .card-caps .verdict.hue-superseded { color: var(--amber); }
+  .card-caps .verdict.hue-reinstated { color: var(--green); }
+  .card-caps .verdict.hue-neutral { color: var(--neutral); }
+  .card-caps .grade { color: var(--label); }
+  .card-caps span + span::before { content: " · "; color: var(--label); }
+  .card-conclusion {
+    margin: 0.25rem 0 0; font-family: var(--serif); font-size: 1rem; line-height: 1.35;
+    /* two lines, then ellipsis — the full sentence is on the detail page */
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .card-conclusion a { color: var(--fg); text-decoration: none; }
+  .card-conclusion a:hover { text-decoration: underline; }
+  .card-meta {
+    margin: 0.35rem 0 0; font-family: var(--mono); font-size: 0.6875rem; color: var(--label);
+  }
+  /* The card's ONLY action: one micro copy icon, top right. No worded
+     button on the index. */
+  .card-copy {
+    position: absolute; top: 0.5rem; right: 0.55rem;
+    font-family: var(--mono); font-size: 0.8125rem; line-height: 1;
+    color: var(--label); text-decoration: none;
+  }
+  .card-copy:hover { color: var(--fg); }
+
+  .lane-note, .column-empty {
+    margin: 0.35rem 0 0.9rem; font-size: 0.8125rem; line-height: 1.5; color: var(--label);
+  }
+  .section { margin: 2.25rem 0 0; padding-top: 1.1rem; border-top: 1px solid var(--border); }
+  .section h2 {
+    margin: 0 0 0.5rem; font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg);
+  }
+  .ledger { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
+  .ledger li {
+    border: 1px solid var(--border); border-radius: var(--radius-tile);
+    padding: 0.55rem 0.7rem;
+  }
+  /* Settled/archived rows drop the live rail entirely; the original verdict
+     survives only as an outlined label, and the receipt carries the proof. */
+  .outline-label {
+    display: inline-block; padding: 0 0.35rem; border: 1px solid var(--border);
+    border-radius: var(--radius-tile); font-family: var(--mono); font-size: 0.625rem;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--label);
+  }
+  .ledger-line { margin: 0.25rem 0 0; font-family: var(--mono); font-size: 0.6875rem; color: var(--label); }
+  .ledger-conclusion { margin: 0.3rem 0 0; font-size: 0.875rem; color: var(--fg-muted); }
+  .unexamined { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.4rem; }
+  .unexamined li {
+    border: 1px dashed var(--border); border-radius: var(--radius-tile);
+    padding: 0.5rem 0.7rem; font-size: 0.875rem; color: var(--fg-muted);
+  }
+
+  /* --- detail ---------------------------------------------------------- */
+  .wrap { max-width: 62rem; }
+  .panel {
+    border: 1px solid var(--border); border-radius: var(--radius-tile);
+    padding: 1rem 1.1rem; margin: 1rem 0 0; background: var(--bg-card);
+  }
+  .panel h2 {
+    margin: 0 0 0.75rem; font-family: var(--mono); font-size: 0.75rem;
+    font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--label);
+  }
+  .contract { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.4rem; }
+  .contract li { font-family: var(--mono); font-size: 0.8125rem; color: var(--fg-muted); }
+  .contract b { color: var(--fg); font-weight: 600; }
+  .touch-next {
+    font-family: var(--serif); font-size: 1.25rem; line-height: 1.35;
+    font-weight: 700; margin: 0;
+  }
+  .prose { margin: 0.6rem 0 0; color: var(--fg-muted); }
+  .evidence { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.35rem; }
+  .evidence li { font-family: var(--mono); font-size: 0.8125rem; color: var(--fg-muted); }
+
+  .chip {
+    display: inline-block; padding: 0.1rem 0.4rem; border-radius: var(--radius-tile);
+    font-family: var(--mono); font-size: 0.6875rem; letter-spacing: 0.02em;
+    border: 1px solid var(--border); color: var(--fg-muted); background: transparent;
+  }
+  .chip.item-grade { color: var(--fg); }
+  .chip.session-grade { color: var(--label); }
+
+  .sub {
+    margin: 1.1rem 0 0.5rem; font-family: var(--mono); font-size: 0.6875rem;
+    font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--label);
+  }
+  .panel > .sub:first-of-type { margin-top: 0; }
+  .marker {
+    margin: 0.4rem 0 0; font-family: var(--mono); font-size: 0.6875rem; color: var(--label);
+  }
+
+  /* The brief gets its own scroll context so a long one never pushes the
+     rest of the page out of reach; the truncation marker below it reports
+     the measured total either way. */
+  .brief { max-height: 16rem; overflow-y: auto; overscroll-behavior: contain; }
+  .brief-lines { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.45rem; }
+  .brief-lines li { font-size: 0.875rem; color: var(--fg-muted);
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    overflow: hidden; }
+  .brief-lines b {
+    display: block; font-family: var(--mono); font-size: 0.6875rem;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--label); font-weight: 600;
+  }
+
+  .copy-block {
+    margin: 0.5rem 0 0; padding: 0.9rem 1rem; max-height: 26rem; overflow: auto;
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-tile);
+    font-family: var(--mono); font-size: 0.75rem; line-height: 1.55;
+    color: var(--fg-muted); white-space: pre-wrap; word-break: break-word;
+  }
+
+  .plan-steps { margin: 0.6rem 0 0; padding-left: 1.2rem; display: grid; gap: 0.75rem; }
+  .step-action { margin: 0; color: var(--fg); }
+  .step-receipt {
+    margin: 0.2rem 0 0; font-family: var(--mono); font-size: 0.6875rem; color: var(--label);
+    word-break: break-word;
+  }
+  .spend { margin: 0.4rem 0 0; font-family: var(--mono); font-size: 0.8125rem; color: var(--fg-muted); }
+
+  /* Write forms. Loopback only, same-origin only, CSRF-token gated — the
+     server enforces all three; this is just the affordance. */
+  .actions { display: flex; flex-wrap: wrap; gap: 0.6rem; margin: 0.4rem 0 0; }
+  .actions form { margin: 0; }
+  .actions button {
+    font: inherit; font-size: 0.8125rem; padding: 0.3rem 0.7rem; cursor: pointer;
+    color: var(--fg); background: transparent;
+    border: 1px solid var(--border); border-radius: var(--radius-tile);
+  }
+  .actions button:hover { border-color: var(--fg-muted); }
+
+  .ast-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+    gap: 1rem; margin-top: 0.6rem;
+  }
+  .ast-tree { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; }
+  .ast-tree li {
+    font-family: var(--mono); font-size: 0.75rem; color: var(--fg-muted);
+    padding: 0.25rem 0.5rem; border-radius: var(--radius-tile);
+  }
+  /* Solid = witnessed by the ledger. Dotted = deterministically resolved
+     only. Neither borrows a semantic verdict hue: an AST row is geometry,
+     not a verdict. */
+  .ast-tree li.witnessed { border: 1px solid var(--border); }
+  .ast-tree li.resolved { border: 1px dotted var(--border); }
+  .ast-kind { color: var(--label); }
+  .ast-receipt { color: var(--accent); }
+  .abstained {
+    margin: 0; padding: 1rem; border: 1px dotted var(--border);
+    border-radius: var(--radius-tile); color: var(--fg-muted);
+  }
+
+  /* Churn is neutral grey only — no warm bars, which would borrow adverse
+     semantics and read as justifying priority. */
+  .churn { list-style: none; margin: 0.6rem 0 0; padding: 0; display: grid; gap: 0.35rem; }
+  .churn li {
+    position: relative; display: flex; gap: 0.6rem; align-items: baseline;
+    font-family: var(--mono); font-size: 0.75rem; color: var(--fg-muted);
+    padding: 0.25rem 0.5rem; border-radius: var(--radius-tile); overflow: hidden;
+  }
+  .churn-bar { position: absolute; inset: 0 auto 0 0; background: var(--highlight); z-index: 0; }
+  .churn-file, .churn-count { position: relative; z-index: 1; }
+  .churn-file { word-break: break-all; }
+  .churn-count { margin-left: auto; color: var(--label); white-space: nowrap; }
+
+  .next-move { padding: 1.5rem 0 0.5rem; }
+  .next-move h1 { margin: 0.2rem 0 0.6rem; font-family: var(--serif); font-size: 2rem; font-weight: 500; }
+  .runners-up h2 { margin: 2rem 0 0; font-size: 0.85rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--fg-muted); }
+  .week-runner { margin: 0.1rem 0 0; font-family: var(--serif); font-size: 1.1rem; }
+  .week-dreams { list-style: none; margin: 0; padding: 1rem 0; display: grid; gap: 1.1rem; }
+  .week-dream h2 { margin: 0.2rem 0 0.5rem; font-family: var(--serif); font-size: 1.5rem; font-weight: 500; }
+  .week-kicker {
+    margin: 0; font-family: var(--mono); font-size: 0.6875rem;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--label);
+  }
+  .week-hypothesis { margin: 0 0 0.6rem; color: var(--fg); }
+  .week-how { margin: 0; padding-left: 1.2rem; color: var(--fg-muted); display: grid; gap: 0.25rem; }
+
+  .empty {
+    margin: 1.5rem 0 0; padding: 2rem 1.25rem;
+    border: 1px dashed var(--border); border-radius: var(--radius-tile);
+  }
+  .empty p { margin: 0.35rem 0; color: var(--fg-muted); }
+  .empty .lead { font-family: var(--serif); font-size: 1.25rem; color: var(--fg); }
+
+  /* Disclosure fold: machine payloads (copy block, raw plan/acceptance
+     JSON, spend, churn) collapse so the memo reads as narrative, with the
+     raw rows one click away. Native <details>, no JS. */
+  .fold { margin: 0.9rem 0 0; padding-top: 0.7rem; border-top: 1px solid var(--border); }
+  .fold > summary {
+    cursor: pointer; list-style: none; display: flex; align-items: center;
+    font-family: var(--mono); font-size: 0.6875rem; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--label);
+  }
+  .fold > summary::-webkit-details-marker { display: none; }
+  .fold > summary .icon { width: 0.8em; height: 0.8em; margin-right: 0.4rem;
+    color: var(--label); transition: transform 0.15s ease; }
+  .fold[open] > summary .icon { transform: rotate(90deg); }
+  .fold > summary .fold-note { margin-left: 0.5rem; font-weight: 400;
+    text-transform: none; letter-spacing: 0; color: var(--label); }
+  .fold > *:not(summary) { margin-top: 0.7rem; }
+
+  .pager { display: flex; gap: 1rem; margin: 1.75rem 0 0; font-family: var(--mono); font-size: 0.8125rem; }
+
+  .colophon {
+    padding: 1rem 1.5rem 2rem; border-top: 1px solid var(--border);
+    font-family: var(--mono); font-size: 0.6875rem; color: var(--label);
+  }
+  .colophon p { margin: 0.2rem 0; }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-moon" viewBox="0 0 32 32"><path d="M25.7 22.8A12 12 0 0 1 11.2 5.1a12.5 12.5 0 1 0 14.5 17.7Z"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+</svg>
+<header class="masthead">
+  <a class="wordmark" href="/"><svg class="icon icon-moon"><use href="#i-moon"/></svg>CSR <span>Dream Journal</span></a>
+  <p class="masthead-meta">{% block masthead_meta %}{% endblock %}</p>
+</header>
+{% block shell %}
+<div class="shell">
+  <aside class="sidebar">
+    <p class="rail-title">Journal</p>
+    <ul class="nav"><li><a class="current" href="/">Dreams</a></li><li><a href="/board">Board</a></li></ul>
+  </aside>
+  <main class="main"><div class="wrap">{% block main %}{% endblock %}</div></main>
+</div>
+{% endblock %}
+<footer class="colophon">
+  <p>Served on 127.0.0.1 only — this page is not reachable from any other machine, and it makes no network requests.</p>
+  <p>Read-only except the resolve and dismiss forms, which write same-origin, CSRF-gated verdicts tagged <code>journal_ui</code>.</p>
+  <p>A verdict row proves a past state, never a current one.</p>
+</footer>
+</body>
+</html>

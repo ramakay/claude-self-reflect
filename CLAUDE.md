@@ -1,4 +1,36 @@
-# Claude Self-Reflect v10.1 — Action Guide
+# Claude Self-Reflect — Action Guide (10.x in development)
+
+## Version reality — read before claiming anything is shipped
+
+**Shipped/live series is 9.5.x. As of 2026-08-19 the latest published version is `9.5.3`**
+(npm `claude-self-reflect`, highest git tag `v9.5.3`). **10.x has never been released — zero
+`v10*` tags exist.** `csr-engine/Cargo.toml` reads `10.1.0` because that is the *in-development*
+version on unreleased feature branches, NOT a shipped product.
+
+Rules that follow from this:
+
+1. **Never present a 10.x feature as current, live, or available to users.** Dreaming, recap
+   paragraph, memory-registry spine, csr_transcript, `--as-of`, and everything else this guide
+   documents under a "(v10)" / "(v10.1)" heading is unreleased work-in-progress on branches.
+   When you describe them, say "in development for 10.x", not "CSR does X".
+2. **This guide documents the 10.x development target, not the shipped 9.5.x binary.** The
+   binary a user has installed via npm is 9.5.3 and does not have these features unless they
+   built from a feature branch. Check `csr-engine --version` / `npm view claude-self-reflect
+   version` before telling a user what their install can do — pulled fresh, never from memory.
+3. Do not conflate the two series in user-facing text, release notes, or status claims. If you
+   are unsure whether something shipped, it did not; verify against the tag list.
+
+## Release strategy — target release branches, never main
+
+**Work targets a release branch. Never offer, suggest, or perform a push to `main`.** `main` is
+protected and moves only through reviewed PRs merged by the maintainer.
+
+- Feature work lives on `feat/*` / `fix/*` branches; a release is assembled on its own release
+  branch and tagged from there.
+- When work is ready, the deliverable is a **PR against the target branch** — opening it is a
+  publish action, so it waits for explicit maintainer approval (see GOAL-SEEKING rule 5).
+- Do not propose `git push origin main`, direct commits to `main`, or "I'll just push this up"
+  to any shared branch. State which branch the work sits on and stop there.
 
 ## Architecture
 
@@ -25,17 +57,18 @@ csr-engine (44MB)
 | `~/.claude/plans/*.md` | daemon (30min) | `source='plan'`, `conversation_id=plan:<slug>`; margin-verified correlation, ambiguous → `_unscoped`; origin conversation always beats plan in search dedupe; decays via mtime timestamp |
 | `~/.codex/sessions/**/rollout-*.jsonl` | daemon (30min) + setup | optional vendor adapter, auto-detected; `source='codex_rollout'`; streaming batched ingest; capture-on-appearance (files deleted often); CSR tool payloads filtered via shared predicate |
 | `~/.claude/history.jsonl` | daemon (10min) | `session_registry` spine — never embedded/injected; coverage in `status` |
-| memories / paste-cache | NOT indexed | circularity / privacy — deliberate non-goals |
+| `~/.claude/projects/<proj>/memory/*.md` | daemon (30min) | `memory_registry` spine — bodies NOT embedded/injected, metadata only (slug, description, `type`, `origin_session_id`, mtime, `[[links]]`); `MEMORY.md` skipped; hand-rolled frontmatter parser, `aux_schema_miss:memory_frontmatter` tripwire; feeds a read-only `csr_why` "distilled into memory" hop via `origin_session_id`; kill switch `CSR_NO_MEMORY_REGISTRY=1` |
+| memory bodies / paste-cache | NOT indexed | circularity / privacy — deliberate non-goals (memory *metadata* is registered, see row above) |
 
-`aux_schema_miss:*` counters in `csr-engine status` flag adapter parse failures — check them when Claude Code renames internal formats (TodoWrite→TaskCreate precedent). All reflection-producing pipelines share one sanitizer that suppresses CSR's own tool payloads and hook-injected blocks (`csr_tool_blocks_suppressed` + `csr_hook_wrappers_scrubbed` in status) — the self-contamination loop closed in v10.
+`aux_schema_miss:*` counters in `csr-engine status` flag adapter parse failures — check them when Claude Code renames internal formats (TodoWrite→TaskCreate precedent). All reflection-producing pipelines share one sanitizer that suppresses CSR's own tool payloads and hook-injected blocks (`csr_tool_blocks_suppressed` + `csr_hook_wrappers_scrubbed` in status); recap output additionally carries a machine-owned sentinel checked ahead of grammar-based detection, but `is_csr_emission` has documented bypasses (non-whitespace prefix on `recap [`, case-sensitive field tokens a real recap paragraph matches none of, four call sites that skip quote-stripping) — it narrows, not closes, new self-contamination, and does not retroactively clean the corpus. 58 of 1,330 embedded conversations (4.4%) in the maintainer's corpus remain self-contaminated — measured, not estimated; source transcripts carry far more (5,465 of 7,003 files) but the sanitizer strips those before embedding (known open debt, see CHANGELOG.md's "Known unproven in this release").
 
 ## Dreaming (v10)
 
-Evidence-grounded forgetting: append-only `witness_ledger` (span-level BLAKE3 stamps at commit OIDs) + `witness_generations` publication manifests; deterministic abstention-first verdicts (no LLM); demote+annotate consumption (`[stale anchor]`/`[evolved]` with commit receipts in search). Daemon dream cadence 6h (`CSR_DREAM_INTERVAL_SECS` override), kill switch `CSR_NO_DREAMING=1`; TAD v2 decays by release ancestry (`conversation_ancestry_cache`, hourly refresh, fail-open to neutral). Benchmark: `codewitness labels` + `codewitness bench` (eval-kit/t4) — deterministic, provenance-stamped. Supersession receipts carry their basis (`GraphOrdered` vs `ContentOnly`) — a squash/rebase successor is never read as graph-proven.
+Evidence-grounded forgetting: append-preferring event log (`witness_ledger` — no SQL trigger enforces immutability; span-level BLAKE3 stamps at commit OIDs) + `witness_generations` publication manifests; deterministic abstention-first verdicts (no LLM); demote+annotate consumption gated behind `CSR_DREAM_CONSUMPTION=1` (opt-in, off by default — this one flag gates all verdict consumption, not just demote; no demote-only switch exists), `[stale anchor]`/`[evolved]` with commit receipts in search when enabled. Daemon dream cadence 6h (`CSR_DREAM_INTERVAL_SECS` override), kill switch `CSR_NO_DREAMING=1`; TAD v2 decays by release ancestry (`conversation_ancestry_cache`, hourly refresh, fail-open to neutral). Benchmark: `codewitness labels` + `codewitness bench` (eval-kit/t4) — deterministic and provenance-stamped, but it does not execute the production dream algorithm (`dream::find_successor`); it predicts from sampled tag maps only. The `codewitness` crate's `Auditor::audit_against_successor` — not the production `dream::find_successor` path, which never emits this field — tags supersession receipts with their basis (`GraphOrdered` vs `ContentOnly`); a squash/rebase successor's receipt there is labeled `ContentOnly`, not presented as graph-proven. Dogfood corpus: 482 anchors observed at 2 HEAD commits — existence evidence, not accuracy.
 
 ## Recap (v10.1)
 
-SessionStart injects one causal paragraph instead of the fragment pile: `recap [<age>]: <intent>: <completed>. Settled: <claim> (<receipt>). Now: <blockers|still-open|proposals|todos>. Learnt-then-retired while away: <label> (superseded <date>, <oid>). Next: <evidenced next step>.` Composer `src/hooks/recap.rs` + feeds `src/storage/recap_feeds.rs`, zero LLM. Every clause drops independently without evidence; `Next:` is never fabricated; receipts mandatory. Feeds fail open to the byte-identical fragment fallback. Suppressed from re-import by exact emitted grammar in `provenance::is_csr_emission` (the self-contamination guard). Kill switch `CSR_NO_RECAP=1`.
+SessionStart injects one causal paragraph instead of the fragment pile: `recap [<age>]: <intent>: <completed>. Settled: <claim> (<receipt>). Now: <blockers|still-open|proposals|todos>. Learnt-then-retired while away: <label> (superseded <date>, <oid>). Next: <evidenced next step>.` Composer `src/hooks/recap.rs` + feeds `src/storage/recap_feeds.rs`, zero LLM. Every clause drops independently without evidence; `Next:` is never fabricated; receipts mandatory. Feeds fail open to the byte-identical fragment fallback. Suppressed from re-import via a machine-owned sentinel (`RECAP_SENTINEL` = `[[CSR:RECAP]]`, emitted inside the 700-char budget) scanned across the full text in two places: `extractable`'s own precheck, which runs *before* `strip_quoted` so a blockquoted recap cannot shed its sentinel along with its quoted lines, and inside `is_csr_emission` ahead of its window-limited grammar branches. All five call sites — `extractable`, `rerank.rs`, `session_briefing.rs`, `prompt_submit.rs`, `session_start.rs` — therefore reject sentinel-bearing recaps regardless of quoting or window size. This narrows, not closes: the residual bypasses are legacy pre-sentinel recaps only (a non-whitespace prefix on `recap [` defeats the header match; the case-sensitive field tokens a real recap paragraph matches none of), and it does not clean transcripts already embedded (58 of 1,330 conversations, 4.4%, known open debt), and it rejects any text containing the sentinel — including source, grep output and design discussion of the sentinel itself, which is a live recall hole for work on CSR but unreachable for ordinary users. Kill switch `CSR_NO_RECAP=1`.
 
 ## Key Commands
 
@@ -85,7 +118,7 @@ csr_resolve           — Record verified verdicts (resolved/still_open/regresse
 # Build
 cd csr-engine && cargo build --release
 
-# Test (615 unit + 45 hooks integration + 61 integration)
+# Test suite — 1150+ lib tests (verified at commit ff4ad3f), plus separate hooks and integration suites
 cargo test
 cargo test --test hooks_integration
 cargo test --test integration

@@ -6,11 +6,34 @@ use anyhow::Result;
 use regex::Regex;
 use rusqlite::params;
 
+use super::dream_delivery::{self, DeliveryChannel, DreamHeadline};
 use super::Storage;
-use crate::hooks::recap::{RetiredLine, SettledFact};
+use crate::hooks::recap::{
+    CorrectionIdentity, CorrectionLine, DreamClause, RetiredLine, SettledFact,
+};
 
 const LEDGER_FEED_LIMIT: i64 = 5;
 const RETIRED_FEED_LIMIT: i64 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumptionMode {
+    Off,
+    AnnotateOnly,
+    Full,
+}
+
+pub fn dream_consumption_mode_from(value: Option<&str>) -> ConsumptionMode {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("0" | "false" | "off") => ConsumptionMode::Off,
+        Some("1" | "true" | "full") => ConsumptionMode::Full,
+        Some("annotate") | None => ConsumptionMode::AnnotateOnly,
+        Some(_) => ConsumptionMode::AnnotateOnly,
+    }
+}
+
+pub fn dream_consumption_mode() -> ConsumptionMode {
+    dream_consumption_mode_from(std::env::var("CSR_DREAM_CONSUMPTION").ok().as_deref())
+}
 
 static RECEIPT_OID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -38,8 +61,73 @@ fn shorten_receipt(evidence: &str) -> String {
 }
 
 impl Storage {
-    /// Resolution ledger evidence for the previous conversation and current
-    /// project. The highest ledger id is the current verdict for a chunk.
+    /// Newest correction/redirect receipts for the project since `since_ts`.
+    pub fn recap_corrections(
+        &self,
+        project: &str,
+        since_ts: &str,
+        limit: usize,
+    ) -> Result<Vec<CorrectionLine>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock: {error}"))?;
+        let mut statement = conn.prepare(
+            "SELECT quote, session_id, turn, SUBSTR(datetime(ts), 1, 10)
+             FROM intent_events
+             WHERE project = ?1
+               AND kind IN ('correction', 'redirect')
+               AND julianday(ts) >= julianday(?2)
+             ORDER BY julianday(ts) DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement
+            .query_map(params![project, since_ts, i64::try_from(limit)?], |row| {
+                let quote: String = row.get(0)?;
+                let session_id: String = row.get(1)?;
+                let turn: i64 = row.get(2)?;
+                Ok(CorrectionLine {
+                    quote: quote.chars().take(90).collect(),
+                    session8: session_id.chars().take(8).collect(),
+                    turn: u32::try_from(turn).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
+                    date: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Record correction entries selected structurally by the recap composer.
+    pub fn record_correction_deliveries(
+        &self,
+        target_session_id: &str,
+        corrections: &[CorrectionIdentity],
+    ) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock: {error}"))?;
+        let mut recorded = 0;
+        for line in corrections {
+            recorded += conn.execute(
+                "INSERT OR IGNORE INTO correction_deliveries
+                        (source_session8, source_turn, source_date, target_session_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                params![line.session8, line.turn, line.date, target_session_id],
+            )?;
+        }
+        Ok(recorded)
+    }
+
+    /// User-confirmed resolution evidence for the previous conversation and
+    /// current project. The highest confirmed ledger id is current; agent
+    /// observations are suppressed under the recap's abstention-first policy.
     pub fn recap_ledger_feeds(
         &self,
         project: &str,
@@ -56,31 +144,35 @@ impl Storage {
         // via chunk_provenance.source_conv_id — the second UNION arm credits
         // them through idx_chunk_provenance_source_conv (no scans either way).
         let mut settled_statement = conn.prepare(
-            "SELECT claim, evidence, status FROM (
+            "SELECT claim, evidence, status, source FROM (
                  SELECT COALESCE(r.claim, '') AS claim, r.evidence AS evidence,
-                        r.status AS status, r.id AS rid
+                        r.status AS status, r.source AS source, r.id AS rid
                  FROM chunks c INDEXED BY idx_chunks_conversation
                  JOIN resolution_ledger r ON r.chunk_id = c.id
                  WHERE c.conversation_id = ?1
                    AND c.project_name = ?2
                    AND r.status = 'resolved'
+                   AND r.source = 'user_confirmed'
                    AND r.id = (
                        SELECT MAX(latest.id)
                        FROM resolution_ledger latest
                        WHERE latest.chunk_id = r.chunk_id
+                         AND latest.source = 'user_confirmed'
                    )
                  UNION
-                 SELECT COALESCE(r.claim, ''), r.evidence, r.status, r.id
+                 SELECT COALESCE(r.claim, ''), r.evidence, r.status, r.source, r.id
                  FROM chunk_provenance p INDEXED BY idx_chunk_provenance_source_conv
                  JOIN chunks c ON c.id = p.chunk_id
                  JOIN resolution_ledger r ON r.chunk_id = c.id
                  WHERE p.source_conv_id = ?1
                    AND c.project_name = ?2
                    AND r.status = 'resolved'
+                   AND r.source = 'user_confirmed'
                    AND r.id = (
                        SELECT MAX(latest.id)
                        FROM resolution_ledger latest
                        WHERE latest.chunk_id = r.chunk_id
+                         AND latest.source = 'user_confirmed'
                    )
              )
              ORDER BY rid DESC
@@ -94,15 +186,17 @@ impl Storage {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut open_statement = conn.prepare(
-            "SELECT COALESCE(r.claim, ''), r.evidence, r.status
+            "SELECT COALESCE(r.claim, ''), r.evidence, r.status, r.source
              FROM resolution_ledger r INDEXED BY idx_resolution_open_recent
              JOIN chunks c ON c.id = r.chunk_id
              WHERE r.status IN ('still_open', 'regressed')
+               AND r.source = 'user_confirmed'
                AND c.project_name = ?1
                AND NOT EXISTS (
                    SELECT 1
                    FROM resolution_ledger latest
                    WHERE latest.chunk_id = r.chunk_id
+                     AND latest.source = 'user_confirmed'
                      AND latest.id > r.id
                )
              ORDER BY r.id DESC
@@ -117,7 +211,32 @@ impl Storage {
 
     /// Negative dream verdicts recorded strictly after `since_ts`, scoped by
     /// the project carried directly on their witness ledger rows.
+    /// `CSR_DREAM_CONSUMPTION` (default OFF — see `dream_consumption_enabled`)
+    /// gates this feed: ships the witness ledger as experimental derived
+    /// data, so the "Learnt-then-retired while away:" recap clause never
+    /// reaches a user who hasn't explicitly opted in.
     pub fn recap_retired_since(&self, project: &str, since_ts: &str) -> Result<Vec<RetiredLine>> {
+        self.recap_retired_since_with(project, since_ts, dream_consumption_mode())
+    }
+
+    /// Core of [`recap_retired_since`] with the dream-consumption opt-in
+    /// passed in as a parameter — mirrors `active_forgetting_enabled_from`'s
+    /// pattern in `mcp::tools` (tests drive this directly instead of
+    /// mutating the process env). `consumption_enabled = false` returns an
+    /// empty vector WITHOUT ever touching `witness_verdicts` (the early
+    /// return below is before the connection lock and the query) — the
+    /// recap composer already drops the "Learnt-then-retired while away:"
+    /// clause when its feed is empty, so no composer/grammar change is
+    /// needed anywhere.
+    pub fn recap_retired_since_with(
+        &self,
+        project: &str,
+        since_ts: &str,
+        consumption_mode: ConsumptionMode,
+    ) -> Result<Vec<RetiredLine>> {
+        if consumption_mode != ConsumptionMode::Full {
+            return Ok(Vec::new());
+        }
         let conn = self
             .conn
             .lock()
@@ -147,6 +266,76 @@ impl Storage {
         Ok(rows)
     }
 
+    /// The top **undelivered** dream for `project`, ready for the recap's
+    /// `Dreamt:` clause (Journal v4 P5, delivery channel (b)).
+    ///
+    /// Gating, in order:
+    ///
+    /// 1. `CSR_DREAM_CONSUMPTION=off` suppresses it entirely, like every
+    ///    other verdict-derived surface.
+    /// 2. A cheap existence probe short-circuits a project with no
+    ///    receipt-bearing verdict at all, so the common case costs one
+    ///    indexed count.
+    /// 3. Only conclusions carrying a receipt are candidates
+    ///    (`dream_delivery::receipted_conclusions` cannot return others).
+    /// 4. The first candidate not already delivered on the recap channel is
+    ///    returned. Nothing is returned when every candidate has been shown
+    ///    before — the clause then drops rather than repeating itself.
+    ///
+    /// This does **not** record the delivery: the composer may still drop
+    /// the clause for its character budget, and a delivery must only be
+    /// recorded for a clause that actually reached the user. The caller
+    /// records it after checking the composed text (see
+    /// `hooks::recap::DREAM_CLAUSE_PREFIX`).
+    ///
+    /// Deliberately NOT the `dream_clusters` ranking: that feed parses every
+    /// v2 episode in the corpus, which is far more than a SessionStart hook
+    /// can spend. This is the same tier-2 ordering (adverse before
+    /// restorative, newest first) applied to single receipt-bearing rows.
+    pub fn recap_top_dream(&self, project: &str) -> Result<Option<DreamClause>> {
+        self.recap_top_dream_with(project, dream_consumption_mode())
+    }
+
+    /// Core of [`Storage::recap_top_dream`] with the consumption mode passed
+    /// in — same testing idiom as [`Storage::recap_retired_since_with`].
+    pub fn recap_top_dream_with(
+        &self,
+        project: &str,
+        consumption_mode: ConsumptionMode,
+    ) -> Result<Option<DreamClause>> {
+        if consumption_mode == ConsumptionMode::Off {
+            return Ok(None);
+        }
+        Ok(self
+            .top_undelivered_dream(project, DeliveryChannel::Recap)?
+            .map(|headline| DreamClause {
+                label: headline.label().to_string(),
+                verdict: headline.verdict_phrase().to_string(),
+                receipt: shorten_receipt(&headline.receipt_oid),
+                date: headline.witnessed_date.clone(),
+            }))
+    }
+
+    /// The newest receipt-bearing conclusion for `project` that has not been
+    /// delivered on `channel`. Shared by the recap clause and the
+    /// prompt-time match.
+    pub fn top_undelivered_dream(
+        &self,
+        project: &str,
+        channel: DeliveryChannel,
+    ) -> Result<Option<DreamHeadline>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock: {error}"))?;
+        if !dream_delivery::has_receipted_conclusion(&conn, project)? {
+            return Ok(None);
+        }
+        Ok(dream_delivery::receipted_conclusions(&conn, project)?
+            .into_iter()
+            .find(|headline| !dream_delivery::already_delivered(&conn, &headline.id, channel)))
+    }
+
     /// Count project proposals that have not received any promoted ledger
     /// verdict. Project scope is resolved through the proposal's chunk id.
     pub fn recap_open_proposals(&self, project: &str) -> Result<usize> {
@@ -163,6 +352,7 @@ impl Storage {
                    SELECT 1
                    FROM resolution_ledger r
                    WHERE r.chunk_id = p.chunk_id
+                     AND r.source = 'user_confirmed'
                      AND julianday(r.created_at) > julianday(p.created_at)
                )",
             [project],
@@ -178,6 +368,7 @@ fn settled_fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SettledFac
         claim: row.get(0)?,
         receipt: shorten_receipt(&evidence),
         status: row.get(2)?,
+        source: row.get(3)?,
     })
 }
 
@@ -185,6 +376,95 @@ fn settled_fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SettledFac
 mod tests {
     use super::*;
     use crate::storage::Storage;
+    use crate::transcript::intent_events::{IntentEvent, IntentEventKind};
+    use std::path::PathBuf;
+
+    fn intent_event(
+        session: &str,
+        project: &str,
+        turn: u32,
+        kind: IntentEventKind,
+        quote: &str,
+        ts: &str,
+    ) -> IntentEvent {
+        IntentEvent {
+            session_id: session.into(),
+            project: project.into(),
+            turn,
+            kind,
+            quote: quote.into(),
+            transcript_path: PathBuf::from(format!("/tmp/{session}.jsonl")),
+            byte_start: 1,
+            byte_end: 2,
+            prior_claim: String::new(),
+            symbol: None,
+            file: None,
+            classifier_hash: "v1".into(),
+            detector: None,
+            classifier_score: None,
+            marker: None,
+            ts: ts.into(),
+        }
+    }
+
+    #[test]
+    fn correction_feed_is_project_scoped_recent_bounded_and_newest_first() {
+        let storage = Storage::open_memory().unwrap();
+        let events = vec![
+            intent_event(
+                "aaaaaaaa-old",
+                "p",
+                1,
+                IntentEventKind::Correction,
+                "old",
+                "2026-08-20T00:00:00Z",
+            ),
+            intent_event(
+                "bbbbbbbb-new",
+                "p",
+                2,
+                IntentEventKind::Redirect,
+                &"q".repeat(120),
+                "2026-09-01T12:00:00Z",
+            ),
+            intent_event(
+                "cccccccc-next",
+                "p",
+                3,
+                IntentEventKind::Correction,
+                "second",
+                "2026-08-31T12:00:00Z",
+            ),
+            intent_event(
+                "dddddddd-drop",
+                "p",
+                4,
+                IntentEventKind::Abandoned,
+                "abandoned",
+                "2026-09-01T13:00:00Z",
+            ),
+            intent_event(
+                "eeeeeeee-other",
+                "other",
+                5,
+                IntentEventKind::Correction,
+                "other",
+                "2026-09-01T14:00:00Z",
+            ),
+        ];
+        storage.insert_intent_events(&events).unwrap();
+
+        let got = storage
+            .recap_corrections("p", "2026-08-25T00:00:00Z", 2)
+            .unwrap();
+
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].session8, "bbbbbbbb");
+        assert_eq!(got[0].turn, 2);
+        assert_eq!(got[0].date, "2026-09-01");
+        assert_eq!(got[0].quote.chars().count(), 90);
+        assert_eq!(got[1].session8, "cccccccc");
+    }
 
     fn seed_chunk(storage: &Storage, id: &str, conversation: &str, project: &str) {
         storage
@@ -211,8 +491,9 @@ mod tests {
             .with_connection(|conn| {
                 conn.execute(
                     "INSERT INTO resolution_ledger
-                        (chunk_id, status, evidence, claim, created_at)
-                     VALUES (?1, ?2, ?3, ?4, '2026-08-02T00:00:00Z')",
+                        (chunk_id, status, evidence, claim, source, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'user_confirmed',
+                             '2026-08-02T00:00:00Z')",
                     rusqlite::params![chunk_id, status, evidence, claim],
                 )?;
                 Ok(())
@@ -337,6 +618,47 @@ mod tests {
     }
 
     #[test]
+    fn recap_suppresses_agent_rows_and_carries_user_confirmed_source() {
+        let storage = Storage::open_memory().unwrap();
+        seed_chunk(&storage, "agent-settled", "current", "alpha");
+        seed_chunk(&storage, "agent-open", "older", "alpha");
+        seed_chunk(&storage, "confirmed", "current", "alpha");
+        storage
+            .with_connection(|conn| {
+                for (chunk_id, status, source) in [
+                    ("agent-settled", "resolved", "agent"),
+                    ("agent-open", "still_open", "agent"),
+                    ("confirmed", "resolved", "user_confirmed"),
+                ] {
+                    conn.execute(
+                        "INSERT INTO resolution_ledger
+                            (chunk_id, status, evidence, claim, source, created_at)
+                         VALUES (?1, ?2, 'receipt abcdef1', ?1, ?3,
+                                 '2026-08-02T00:00:00Z')",
+                        rusqlite::params![chunk_id, status, source],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .insert_resolutions(
+                &["confirmed".to_string()],
+                "regressed",
+                "later agent assertion",
+                Some("confirmed"),
+                "agent",
+            )
+            .unwrap();
+
+        let (settled, still_open) = storage.recap_ledger_feeds("alpha", "current").unwrap();
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].claim, "confirmed");
+        assert_eq!(settled[0].source, "user_confirmed");
+        assert!(still_open.is_empty());
+    }
+
+    #[test]
     fn settled_feed_credits_sidechain_chunks_via_provenance_parent() {
         let storage = Storage::open_memory().unwrap();
         // Sidechain chunk: own conversation_id, parented to "current" via provenance.
@@ -444,7 +766,7 @@ mod tests {
         }
 
         let retired = storage
-            .recap_retired_since("alpha", "2026-08-01T00:00:00Z")
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", ConsumptionMode::Full)
             .unwrap();
 
         assert_eq!(retired.len(), 3);
@@ -471,7 +793,7 @@ mod tests {
         );
 
         let retired = storage
-            .recap_retired_since("alpha", "2026-08-02T00:00:00Z")
+            .recap_retired_since_with("alpha", "2026-08-02T00:00:00Z", ConsumptionMode::Full)
             .unwrap();
 
         assert_eq!(retired.len(), 1);
@@ -492,7 +814,7 @@ mod tests {
         );
 
         let retired = storage
-            .recap_retired_since("alpha", "2026-08-02T00:00:00.100Z")
+            .recap_retired_since_with("alpha", "2026-08-02T00:00:00.100Z", ConsumptionMode::Full)
             .unwrap();
 
         assert_eq!(retired.len(), 1);
@@ -522,10 +844,148 @@ mod tests {
         );
 
         let retired = storage
-            .recap_retired_since("alpha", "2026-08-01T00:00:00Z")
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", ConsumptionMode::Full)
             .unwrap();
 
         assert_eq!(retired[0].label, "newer_by_time");
+    }
+
+    #[test]
+    fn dream_consumption_mode_parsing_matrix() {
+        for (value, expected) in [
+            (None, ConsumptionMode::AnnotateOnly),
+            (Some("0"), ConsumptionMode::Off),
+            (Some("false"), ConsumptionMode::Off),
+            (Some("FALSE"), ConsumptionMode::Off),
+            (Some("OFF"), ConsumptionMode::Off),
+            (Some("1"), ConsumptionMode::Full),
+            (Some("true"), ConsumptionMode::Full),
+            (Some("full"), ConsumptionMode::Full),
+            (Some("FULL"), ConsumptionMode::Full),
+            (Some("annotate"), ConsumptionMode::AnnotateOnly),
+            (Some("ANNOTATE"), ConsumptionMode::AnnotateOnly),
+            (Some("garbage"), ConsumptionMode::AnnotateOnly),
+        ] {
+            assert_eq!(
+                dream_consumption_mode_from(value),
+                expected,
+                "value {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_feed_off_returns_empty_without_touching_witness_verdicts() {
+        let storage = Storage::open_memory().unwrap();
+        seed_witness_verdict(
+            &storage,
+            "alpha",
+            "/repo/src/file.rs",
+            Some("retired_symbol"),
+            "anchor_obsolete",
+            "abcdef1",
+            "2026-08-05T00:00:00Z",
+        );
+
+        let retired = storage
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", ConsumptionMode::Off)
+            .unwrap();
+
+        assert!(
+            retired.is_empty(),
+            "CSR_DREAM_CONSUMPTION default OFF must suppress the feed even \
+             with a populated witness_verdicts table"
+        );
+    }
+
+    #[test]
+    fn retired_feed_off_never_queries_witness_verdicts_table_at_all() {
+        // Stronger than the sibling test above: proves the query itself never
+        // fires, not just that its result happens to be empty. If
+        // `recap_retired_since_with(..., false)` executed the real query
+        // against a DB missing `witness_verdicts` entirely, it would return
+        // `Err`, not `Ok(vec![])` — the early return in the function must
+        // land before the connection lock / query, exactly as documented.
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch("DROP TABLE witness_verdicts")?;
+                Ok(())
+            })
+            .unwrap();
+
+        let retired = storage
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", ConsumptionMode::Off)
+            .unwrap();
+        assert!(retired.is_empty());
+    }
+
+    #[test]
+    fn retired_feed_off_empties_the_composer_clause_with_no_grammar_change() {
+        use crate::hooks::recap::{compose_recap, RecapFeeds};
+        use crate::hooks::stop::Episode;
+
+        let storage = Storage::open_memory().unwrap();
+        seed_witness_verdict(
+            &storage,
+            "alpha",
+            "/repo/src/file.rs",
+            Some("retired_symbol"),
+            "anchor_obsolete",
+            "abcdef1",
+            "2026-08-05T00:00:00Z",
+        );
+        let retired_while_away = storage
+            .recap_retired_since_with(
+                "alpha",
+                "2026-08-01T00:00:00Z",
+                ConsumptionMode::AnnotateOnly,
+            )
+            .unwrap();
+        assert!(retired_while_away.is_empty());
+
+        let ep = Episode {
+            schema: "session_episode/v2".into(),
+            session_id: "session-1".into(),
+            project: "alpha".into(),
+            timestamp: "2026-08-07T10:00:00Z".into(),
+            request: "Fix the recap composer".into(),
+            investigated: vec![],
+            completed: "Implemented deterministic recap output".into(),
+            next_steps: None,
+            blockers: None,
+            outcome: "partial".into(),
+            error_signatures: vec![],
+            tools_used: vec![],
+            files_modified: vec![],
+            message_count: 4,
+            duration_minutes: 12,
+            todos: vec![],
+            approved_plan: None,
+            prev_episode_id: None,
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
+            instrumentation_version: None,
+            correction_count: None,
+            anchors: vec![],
+        };
+        let feeds = RecapFeeds {
+            settled: vec![],
+            still_open: vec![],
+            retired_while_away,
+            corrections: vec![],
+            open_proposals: 0,
+            top_dream: None,
+        };
+
+        let got = compose_recap(&ep, &feeds, "1h ago").unwrap();
+        assert!(
+            !got.contains("Learnt-then-retired while away:"),
+            "clause must drop when its feed is empty (composer grammar \
+             untouched): {got}"
+        );
     }
 
     #[test]
@@ -587,8 +1047,26 @@ mod tests {
             .with_connection(|conn| {
                 conn.execute(
                     "INSERT INTO resolution_ledger
-                        (chunk_id, status, evidence, claim, created_at)
-                     VALUES ('proposal', 'resolved', 'promoted', 'claim',
+                        (chunk_id, status, evidence, claim, source, created_at)
+                     VALUES ('proposal', 'resolved', 'agent assertion', 'claim', 'agent',
+                             '2026-08-02T12:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            storage.recap_open_proposals("alpha").unwrap(),
+            1,
+            "an agent observation must not promote or hide a proposal"
+        );
+
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO resolution_ledger
+                        (chunk_id, status, evidence, claim, source, created_at)
+                     VALUES ('proposal', 'resolved', 'promoted', 'claim', 'user_confirmed',
                              '2026-08-03T00:00:00Z')",
                     [],
                 )?;
@@ -631,10 +1109,12 @@ mod tests {
                          FROM resolution_ledger r INDEXED BY idx_resolution_open_recent
                          JOIN chunks c ON c.id = r.chunk_id
                          WHERE r.status IN ('still_open', 'regressed')
+                           AND r.source = 'user_confirmed'
                            AND c.project_name = ?1
                            AND NOT EXISTS (
                                SELECT 1 FROM resolution_ledger latest
                                WHERE latest.chunk_id = r.chunk_id
+                                 AND latest.source = 'user_confirmed'
                                  AND latest.id > r.id
                            )
                          ORDER BY r.id DESC
@@ -656,6 +1136,7 @@ mod tests {
                            AND NOT EXISTS (
                                SELECT 1 FROM resolution_ledger r
                                WHERE r.chunk_id = p.chunk_id
+                                 AND r.source = 'user_confirmed'
                                  AND julianday(r.created_at) > julianday(p.created_at)
                            )",
                     )?

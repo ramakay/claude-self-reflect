@@ -72,6 +72,7 @@
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 
 /// The three deterministic conclusions the `dream` successor join can draw
 /// about a witness. There is no "unknown" variant — every witness with more
@@ -215,6 +216,7 @@ pub fn insert_verdict_if_changed(conn: &Connection, row: &WitnessVerdictRow) -> 
             row.observed_head_oid,
         ],
     )?;
+    super::artifact_backfill::record_witness(&tx, &tx.last_insert_rowid().to_string())?;
     tx.commit()?;
     Ok(changed > 0)
 }
@@ -233,12 +235,124 @@ pub enum VerdictChannel {
     Annotate,
 }
 
+/// One storage-resolved verdict bound to a stable search chunk identity.
+/// Consumers must key ranking and annotation decisions by `chunk_id`; the
+/// conversation grouping used by batched reads is transport only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkWitnessVerdict {
+    pub chunk_id: String,
+    pub file: String,
+    pub symbol: Option<String>,
+    pub channel: VerdictChannel,
+    pub verdict: &'static str,
+    pub receipt_oid: Option<String>,
+}
+
+/// Persist an exact witness-to-chunk attribution. This relation is separate
+/// from the append-only verdict event stream because one witness may support
+/// multiple historical chunks, while verdict state continues to evolve.
+pub fn bind_witness_to_chunk(conn: &Connection, witness_id: i64, chunk_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO witness_chunk_bindings (witness_id, chunk_id) VALUES (?1, ?2)",
+        params![witness_id, chunk_id],
+    )?;
+    Ok(())
+}
+
+/// Publish the exact chunk attribution captured by the live code-graph hook
+/// for a newly inserted (or deduplicated) witness row. Historical nodes that
+/// predate chunk attribution safely leave no binding.
+pub fn bind_witness_row_to_node_chunk(
+    conn: &Connection,
+    row: &super::witness_ledger::WitnessLedgerRow,
+    node_id: &str,
+) -> Result<()> {
+    let witness_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM witness_ledger
+             WHERE project = ?1 AND file = ?2
+               AND COALESCE(symbol, '') = COALESCE(?3, '')
+               AND COALESCE(span_start, -1) = COALESCE(?4, -1)
+               AND COALESCE(span_end, -1) = COALESCE(?5, -1)
+               AND stamp = ?6 AND tier = ?7
+               AND COALESCE(at_oid, '') = COALESCE(?8, '')
+               AND source_kind = ?9
+               AND COALESCE(source_id, '') = COALESCE(?10, '')",
+            params![
+                row.project,
+                row.file,
+                row.symbol,
+                row.span_start,
+                row.span_end,
+                row.stamp,
+                row.tier,
+                row.at_oid,
+                row.source_kind,
+                row.source_id,
+            ],
+            |result| result.get(0),
+        )
+        .optional()?;
+    let chunk_id: Option<String> = conn
+        .query_row(
+            "SELECT n.last_chunk_id
+             FROM code_nodes n JOIN chunks c ON c.id = n.last_chunk_id
+             WHERE n.id = ?1 AND n.last_chunk_id IS NOT NULL",
+            params![node_id],
+            |result| result.get(0),
+        )
+        .optional()?;
+    if let (Some(witness_id), Some(chunk_id)) = (witness_id, chunk_id) {
+        bind_witness_to_chunk(conn, witness_id, &chunk_id)?;
+    }
+    Ok(())
+}
+
+/// Exact persisted `(chunk_id, conversation_id)` bindings for the supplied
+/// witnesses. Orphaned chunk ids abstain through the inner join.
+pub fn chunk_bindings_for_witnesses(
+    conn: &Connection,
+    witness_ids: &[i64],
+) -> Result<HashMap<i64, Vec<(String, String)>>> {
+    let mut out: HashMap<i64, Vec<(String, String)>> = HashMap::new();
+    const BATCH: usize = 400;
+    for batch in witness_ids.chunks(BATCH) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders: Vec<String> = (1..=batch.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT b.witness_id, b.chunk_id, c.conversation_id
+             FROM witness_chunk_bindings b
+             JOIN chunks c ON c.id = b.chunk_id
+             WHERE b.witness_id IN ({})
+             ORDER BY b.witness_id, b.chunk_id",
+            placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        for row in rows {
+            let (witness_id, chunk_id, conversation_id) = row?;
+            out.entry(witness_id)
+                .or_default()
+                .push((chunk_id, conversation_id));
+        }
+    }
+    Ok(out)
+}
+
 /// Order-independent CURRENT state of a `(project, file, symbol)` anchor —
 /// the resolved [`VerdictChannel`] plus a deterministic representative
 /// negative event for surfacing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SymbolVerdictState {
     pub channel: VerdictChannel,
+    /// Every witness whose latest event is negative. Exact chunk attribution
+    /// may have been recorded on an older witness than the representative,
+    /// so binding must consult the complete current negative set.
+    pub negative_witness_ids: Vec<i64>,
     /// The newest (highest event `id`) negative latest-event among the
     /// symbol's witnesses — the source of `verdict` and `receipt_oid` for
     /// surfacing; never a claim that global insertion order is meaningful
@@ -321,6 +435,11 @@ pub fn symbol_verdict_state(
         } else {
             VerdictChannel::Demote
         },
+        negative_witness_ids: latest_per_witness
+            .iter()
+            .filter(|event| event.verdict.is_negative())
+            .map(|event| event.witness_id)
+            .collect(),
         representative: representative.clone(),
     }))
 }
@@ -374,6 +493,78 @@ pub fn all_events_with_anchor(conn: &Connection) -> Result<Vec<DreamEventRow>> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Conversation provenance for exact `(project, file, symbol)` anchors.
+///
+/// Sourced EXCLUSIVELY from the trusted transcript channel of
+/// `code_node_attribution`. `code_nodes.first_conv_id`/`last_conv_id` are
+/// file-level projections measured at ~50.7% per-symbol accuracy and are
+/// forbidden on consumer surfaces (see the two-channel attribution work);
+/// an anchor with no transcript attribution is absent from the returned map
+/// so callers can distinguish it honestly from a linked anchor.
+pub(crate) fn conversation_ids_for_anchors(
+    conn: &Connection,
+    anchors: &[(String, String, String)],
+) -> Result<std::collections::BTreeMap<(String, String, String), Vec<String>>> {
+    let mut out = std::collections::BTreeMap::new();
+    if anchors.is_empty() {
+        return Ok(out);
+    }
+
+    let mut unique = anchors.to_vec();
+    unique.sort();
+    unique.dedup();
+
+    // Three bind variables per anchor; stay below SQLite's conservative
+    // default 999-variable ceiling.
+    const BATCH: usize = 300;
+    for batch in unique.chunks(BATCH) {
+        let filters: Vec<String> = (0..batch.len())
+            .map(|i| {
+                let base = 3 * i + 1;
+                format!(
+                    "(project = ?{base} AND file = ?{} AND name = ?{})",
+                    base + 1,
+                    base + 2
+                )
+            })
+            .collect();
+        let sql = format!(
+            "SELECT n.project, n.file, n.name, a.source_id
+             FROM code_nodes n
+             JOIN code_node_attribution a
+               ON a.node_id = n.id AND a.channel = 'transcript'
+             WHERE {}
+             ORDER BY n.project, n.file, n.name, n.id",
+            filters.join(" OR ")
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = batch
+            .iter()
+            .flat_map(|(project, file, symbol)| {
+                [
+                    project as &dyn rusqlite::types::ToSql,
+                    file as &dyn rusqlite::types::ToSql,
+                    symbol as &dyn rusqlite::types::ToSql,
+                ]
+            })
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                (row.get(0)?, row.get(1)?, row.get(2)?),
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (key, source_id) = row?;
+            let ids = out.entry(key).or_insert_with(Vec::new);
+            if !source_id.is_empty() && !ids.contains(&source_id) {
+                ids.push(source_id);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The most recent dream cycle observed anywhere in the ledger: the globally
@@ -594,6 +785,11 @@ pub fn symbol_verdict_states_for_files(
                     } else {
                         VerdictChannel::Demote
                     },
+                    negative_witness_ids: events
+                        .iter()
+                        .filter(|(event, _)| event.verdict.is_negative())
+                        .map(|(event, _)| event.witness_id)
+                        .collect(),
                     representative: representative.clone(),
                 },
             );
@@ -700,12 +896,192 @@ pub(crate) fn symbol_verdict_states_for_lineages(
                     } else {
                         VerdictChannel::Demote
                     },
+                    negative_witness_ids: events
+                        .iter()
+                        .filter(|(event, _)| event.verdict.is_negative())
+                        .map(|(event, _)| event.witness_id)
+                        .collect(),
                     representative: representative.clone(),
                 },
             );
         }
     }
     Ok(out)
+}
+
+// --- SINCE THEN payback panel (journal v2 Phase 5) --------------------------
+//
+// The panel renders the dream's RE-DELIBERATION about a symbol, not the
+// two-channel demote/annotate calculus `symbol_verdict_state` resolves for
+// chunk ranking (that answers "how should search treat this chunk today";
+// this answers "what did the dream conclude, last, in plain language" for a
+// human reading the journal — dreaming-subconscious-principles.md's "double
+// deliberation" frame).
+
+/// The dream's most recent conclusion about one `(project, file, symbol)`
+/// anchor: the single latest `witness_verdicts` event across every witness
+/// of the symbol (not latest-per-witness — SINCE THEN is a human-readable
+/// journal entry, not a ranking input).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SinceThenConclusion {
+    /// `None` when no verdict event has ever been recorded for this symbol
+    /// — see `witnessed` to distinguish "dream never looked at this" from
+    /// "dream looked, found it intact."
+    pub verdict: Option<VerdictKind>,
+    pub receipt_oid: Option<String>,
+    /// `witness_verdicts.created_at`; set only alongside `verdict`.
+    pub event_date: Option<String>,
+    /// `true` when at least one `witness_ledger` row exists for this
+    /// anchor — i.e. codewitness has actually observed it, even if no
+    /// verdict event ever followed. `false` combined with `verdict: None`
+    /// is the UNVERIFIED case: no evidence exists at all, and per the
+    /// dreaming principles doc ("honest forgetting") absence of evidence is
+    /// never rendered as "live."
+    pub witnessed: bool,
+    /// `MAX(witness_ledger.created_at)` for this anchor when `witnessed` is
+    /// `true` and no verdict event exists — the date to show alongside
+    /// "witnessed ... unverified since" (F1: a witness at commit A is NOT
+    /// evidence the symbol is still intact at HEAD; we can only honestly
+    /// report *when* it was last witnessed, never that it is "still live").
+    /// `None` whenever `witnessed` is `false`, or a verdict event exists
+    /// (that event's own `event_date` is authoritative in that case).
+    pub witnessed_at: Option<String>,
+}
+
+/// Resolve [`SinceThenConclusion`] for one symbol. Deliberately a plain
+/// "what happened last" read, not `symbol_verdict_state`'s current-state
+/// resolution — a symbol that was superseded and later reinstated shows as
+/// `reinstated` here (the dream's LATEST word on it), while
+/// `symbol_verdict_state` would fold that same history into "not demoted."
+/// Both are correct for their own question; SINCE THEN asks the human's
+/// question ("what's the last thing the dream concluded"), not the ranker's.
+pub fn since_then_conclusion(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    symbol: &str,
+) -> Result<SinceThenConclusion> {
+    let event = conn
+        .query_row(
+            "SELECT v.verdict, v.receipt_oid, v.created_at
+             FROM witness_verdicts v
+             JOIN witness_ledger wl ON wl.id = v.witness_id
+             WHERE wl.project = ?1 AND wl.file = ?2 AND wl.symbol = ?3
+             ORDER BY v.id DESC LIMIT 1",
+            params![project, file, symbol],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((verdict_str, receipt_oid, event_date)) = event {
+        return Ok(SinceThenConclusion {
+            verdict: VerdictKind::parse(&verdict_str),
+            receipt_oid,
+            event_date: Some(event_date),
+            witnessed: true,
+            witnessed_at: None,
+        });
+    }
+    let witnessed_at: Option<String> = conn.query_row(
+        "SELECT MAX(created_at) FROM witness_ledger
+             WHERE project = ?1 AND file = ?2 AND symbol = ?3",
+        params![project, file, symbol],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    let witnessed = witnessed_at.is_some();
+    Ok(SinceThenConclusion {
+        verdict: None,
+        receipt_oid: None,
+        event_date: None,
+        witnessed,
+        witnessed_at,
+    })
+}
+
+/// The claim of an OPEN (not yet promoted to `resolution_ledger`) proposal
+/// bound to one of a symbol's witnesses — the SINCE THEN panel's "so"
+/// evidence source #2 (a `resolution_proposals` row awaiting `csr_resolve`).
+/// `None` when the symbol has no witness at all, or no chunk bound to one of
+/// its witnesses carries a still-open proposal. Same "not yet promoted"
+/// predicate as `Storage::recap_open_proposals`.
+pub fn open_proposal_claim_for_symbol(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    symbol: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT p.claim
+         FROM witness_ledger wl
+         JOIN witness_chunk_bindings b ON b.witness_id = wl.id
+         JOIN resolution_proposals p ON p.chunk_id = b.chunk_id
+         WHERE wl.project = ?1 AND wl.file = ?2 AND wl.symbol = ?3
+           AND NOT EXISTS (
+               SELECT 1 FROM resolution_ledger r
+               WHERE r.chunk_id = p.chunk_id
+                 AND r.source = 'user_confirmed'
+                 AND julianday(r.created_at) > julianday(p.created_at)
+           )
+         ORDER BY p.id DESC LIMIT 1",
+        params![project, file, symbol],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// One calendar day's (`YYYY-MM-DD`, UTC) dream activity — the journal
+/// index's optional day-header digest: "while away: N anchors retired, M
+/// proposals open."
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DayDigest {
+    pub retired_count: i64,
+    pub proposal_count: i64,
+    /// Full commit oids of every retirement that day, newest first — for the
+    /// digest line's `title` attribute (receipts, not the visible chip
+    /// text).
+    pub receipts: Vec<String>,
+}
+
+/// Resolve [`DayDigest`] for one calendar day. Unscoped by project — the
+/// journal report itself groups sessions across every project in one
+/// timeline, so the digest matches that same corpus-wide scope (consistent
+/// with `DreamReportData::totals`, which is also corpus-wide).
+pub fn day_digest(conn: &Connection, day: &str) -> Result<DayDigest> {
+    let mut stmt = conn.prepare(
+        "SELECT receipt_oid FROM witness_verdicts
+         WHERE verdict IN ('superseded_by', 'anchor_obsolete')
+           AND SUBSTR(datetime(created_at), 1, 10) = ?1
+         ORDER BY id DESC",
+    )?;
+    let receipt_rows: Vec<Option<String>> = stmt
+        .query_map(params![day], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let retired_count = receipt_rows.len() as i64;
+    let receipts: Vec<String> = receipt_rows.into_iter().flatten().collect();
+
+    let proposal_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resolution_proposals p
+         WHERE SUBSTR(datetime(p.created_at), 1, 10) = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM resolution_ledger r
+               WHERE r.chunk_id = p.chunk_id
+                 AND r.source = 'user_confirmed'
+                 AND julianday(r.created_at) > julianday(p.created_at)
+           )",
+        params![day],
+        |row| row.get(0),
+    )?;
+    Ok(DayDigest {
+        retired_count,
+        proposal_count,
+        receipts,
+    })
 }
 
 #[cfg(test)]
@@ -1150,6 +1526,84 @@ mod tests {
     }
 
     #[test]
+    fn conversation_ids_for_anchors_uses_transcript_attribution_never_projections() {
+        let conn = open();
+        // node-a: transcript attribution AND (different) projection endpoints.
+        // The projections must never leak into the linkage.
+        conn.execute(
+            "INSERT INTO code_nodes
+                (id, project, file, kind, name, first_conv_id, last_conv_id)
+             VALUES ('node-a', 'proj', '/repo/src/lib.rs', 'function', 'foo',
+                     'projection-first', 'projection-last')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_node_attribution (node_id, channel, source_id)
+             VALUES ('node-a', 'transcript', 'conversation-attributed')",
+            [],
+        )
+        .unwrap();
+        // node-b: same anchor name via a second kind, its own attribution —
+        // deduplicated into the same anchor's list. A git-channel row must
+        // not count as conversation linkage.
+        conn.execute(
+            "INSERT INTO code_nodes
+                (id, project, file, kind, name, first_conv_id, last_conv_id)
+             VALUES ('node-b', 'proj', '/repo/src/lib.rs', 'method', 'foo',
+                     'projection-first', 'projection-last')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_node_attribution (node_id, channel, source_id)
+             VALUES ('node-b', 'transcript', 'conversation-attributed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_node_attribution (node_id, channel, source_id)
+             VALUES ('node-b', 'git', 'abc123def')",
+            [],
+        )
+        .unwrap();
+        // projection-only node: endpoints recorded, NO transcript attribution
+        // -> must be absent from the map, not linked via projections.
+        conn.execute(
+            "INSERT INTO code_nodes
+                (id, project, file, kind, name, first_conv_id, last_conv_id)
+             VALUES ('node-c', 'proj', '/repo/src/lib.rs', 'function', 'bar',
+                     'projection-only-conv', 'projection-only-conv')",
+            [],
+        )
+        .unwrap();
+
+        let anchors = vec![
+            (
+                "proj".to_string(),
+                "/repo/src/lib.rs".to_string(),
+                "foo".to_string(),
+            ),
+            (
+                "proj".to_string(),
+                "/repo/src/lib.rs".to_string(),
+                "bar".to_string(),
+            ),
+        ];
+        let links = conversation_ids_for_anchors(&conn, &anchors).unwrap();
+
+        assert_eq!(
+            links.get(&anchors[0]).unwrap(),
+            &vec!["conversation-attributed".to_string()],
+            "transcript attribution only: no projections, no git channel, deduped"
+        );
+        assert!(
+            !links.contains_key(&anchors[1]),
+            "projection-only anchor must read as 'no linked conversations'"
+        );
+    }
+
+    #[test]
     fn last_dream_run_reports_the_globally_newest_event() {
         let conn = open();
         assert!(
@@ -1282,5 +1736,140 @@ mod tests {
         let conn = open();
         witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
         assert!(all_demoted_symbols(&conn).unwrap().is_empty());
+    }
+
+    // ---- SINCE THEN (journal v2 Phase 5) -----------------------------------
+
+    #[test]
+    fn since_then_conclusion_unverified_when_never_witnessed() {
+        let conn = open();
+        let conclusion =
+            since_then_conclusion(&conn, "proj", "/repo/src/lib.rs", "never_seen").unwrap();
+        assert_eq!(conclusion.verdict, None);
+        assert!(!conclusion.witnessed);
+        assert_eq!(conclusion.receipt_oid, None);
+    }
+
+    #[test]
+    fn since_then_conclusion_witnessed_unverified_when_no_verdict() {
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        let conclusion = since_then_conclusion(&conn, "proj", "/repo/src/lib.rs", "foo").unwrap();
+        assert_eq!(conclusion.verdict, None);
+        assert!(
+            conclusion.witnessed,
+            "a ledger row exists — absence of a verdict must not read the same as absence of evidence"
+        );
+        assert!(
+            conclusion.witnessed_at.is_some(),
+            "F1: a witness with no verdict is 'witnessed <date> · unverified since', never a \
+             fabricated 'still live' claim — the date must come from the ledger row, not from HEAD"
+        );
+    }
+
+    #[test]
+    fn since_then_conclusion_reports_the_latest_event() {
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        let witness_id: i64 = conn
+            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id,
+                verdict: VerdictKind::SupersededBy,
+                successor_witness_id: None,
+                receipt_oid: Some("1234567890abcdef".into()),
+                observed_head_oid: "head1".into(),
+            },
+        )
+        .unwrap();
+        let conclusion = since_then_conclusion(&conn, "proj", "/repo/src/lib.rs", "foo").unwrap();
+        assert_eq!(conclusion.verdict, Some(VerdictKind::SupersededBy));
+        assert_eq!(conclusion.receipt_oid.as_deref(), Some("1234567890abcdef"));
+        assert!(conclusion.event_date.is_some());
+    }
+
+    #[test]
+    fn open_proposal_claim_ignores_promoted_and_absent_bindings() {
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        let witness_id: i64 = conn
+            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            open_proposal_claim_for_symbol(&conn, "proj", "/repo/src/lib.rs", "foo").unwrap(),
+            None,
+            "no chunk binding at all -> no proposal"
+        );
+        conn.execute(
+            "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES ('chunk-1', 'conv-1', 'proj', '2026-01-01T00:00:00Z', 'text', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO witness_chunk_bindings (witness_id, chunk_id) VALUES (?1, 'chunk-1')",
+            params![witness_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_proposals (chunk_id, claim, evidence, session_id, created_at)
+             VALUES ('chunk-1', 'foo looks resolved', 'task done', 'sess-1', '2026-01-02 00:00:00')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            open_proposal_claim_for_symbol(&conn, "proj", "/repo/src/lib.rs", "foo")
+                .unwrap()
+                .as_deref(),
+            Some("foo looks resolved")
+        );
+        conn.execute(
+            "INSERT INTO resolution_ledger
+                (chunk_id, status, evidence, claim, source, created_at)
+             VALUES ('chunk-1', 'resolved', 'promoted', 'foo looks resolved',
+                     'user_confirmed', '2026-01-03 00:00:00')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            open_proposal_claim_for_symbol(&conn, "proj", "/repo/src/lib.rs", "foo").unwrap(),
+            None,
+            "a later promotion must retire the proposal as open evidence"
+        );
+    }
+
+    #[test]
+    fn day_digest_counts_only_the_given_day_and_carries_receipts() {
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        let witness_id: i64 = conn
+            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO witness_verdicts
+                (witness_id, verdict, receipt_oid, observed_head_oid, created_at)
+             VALUES (?1, 'superseded_by', 'deadbeef', 'head', '2026-02-10 09:00:00')",
+            params![witness_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO witness_verdicts
+                (witness_id, verdict, receipt_oid, observed_head_oid, created_at)
+             VALUES (?1, 'anchor_obsolete', NULL, 'head', '2026-02-11 09:00:00')",
+            params![witness_id],
+        )
+        .unwrap();
+
+        let digest = day_digest(&conn, "2026-02-10").unwrap();
+        assert_eq!(digest.retired_count, 1);
+        assert_eq!(digest.receipts, vec!["deadbeef".to_string()]);
+
+        let empty = day_digest(&conn, "2026-02-09").unwrap();
+        assert_eq!(empty.retired_count, 0);
+        assert_eq!(empty.proposal_count, 0);
+        assert!(empty.receipts.is_empty());
     }
 }

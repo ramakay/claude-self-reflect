@@ -70,7 +70,7 @@ enum Commands {
     },
     /// Handle Claude Code hook events
     Hook {
-        /// Hook name: session-start, session-end, precompact, stop, post-tool-use, prompt-submit, install
+        /// Hook name: session-start, session-end, precompact, stop, subagent-stop, post-tool-use, prompt-submit, install
         name: String,
 
         /// For install: auto-apply to settings.json
@@ -96,12 +96,80 @@ enum Commands {
         /// File path to analyze
         path: PathBuf,
     },
+    /// Structured facts from a session transcript JSONL — stats, prompts,
+    /// tool calls, touched files, errors, a turn-range slice, or a text
+    /// grep — without hand-rolling a jq/Python parser over raw JSONL.
+    Transcript {
+        /// Session id (substring match against files under --projects-dir)
+        /// or an explicit path to a transcript JSONL file.
+        session: String,
+
+        /// View to render: stats|prompts|tools|files|errors|slice|grep
+        view: String,
+
+        /// Narrow the session-id search to a project directory name
+        /// containing this substring (ignored when `session` is a path).
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Role filter shared by every view: user|assistant|system|all
+        #[arg(long, default_value = "all")]
+        role: String,
+
+        /// Turn range, inclusive: "40..120" or open-ended "340.."
+        #[arg(long)]
+        turns: Option<String>,
+
+        /// `slice` view only: show the last N turns (ignored if --turns given)
+        #[arg(long)]
+        last: Option<usize>,
+
+        /// `grep` view: regex to match against each turn's text
+        #[arg(long)]
+        grep: Option<String>,
+
+        /// `tools`/`files` view: filter to this tool name only
+        #[arg(long)]
+        tool: Option<String>,
+
+        /// Emit structured JSON instead of compact text
+        #[arg(long)]
+        json: bool,
+
+        /// Character budget before an honest truncation marker is emitted
+        #[arg(long, default_value_t = csr_engine::transcript::DEFAULT_BUDGET_CHARS)]
+        budget_chars: usize,
+
+        /// Reserved for v2 (subagent sidechain inclusion) — rejected with a
+        /// clear message in v1, never silently ignored.
+        #[arg(long)]
+        sidechains: bool,
+    },
     /// Run ratification extraction for specific conversation IDs (one-off,
     /// bypasses the daemon queue ordering)
     Ratify {
         /// Conversation IDs to score
         #[arg(required = true)]
         conversation_ids: Vec<String>,
+    },
+    /// Headless dream generation over this week's evidence: zero-or-one
+    /// dream per project, printed to stdout. No journal HTML/routes, no
+    /// browser surface.
+    Dreams {
+        /// Limit to one project (matches the stored project name exactly)
+        #[arg(long)]
+        project: Option<String>,
+        /// Emit structured JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+        /// Skip the strategy (LLM-authored) category entirely; only the
+        /// deterministic unfinished category runs
+        #[arg(long = "no-llm")]
+        no_llm: bool,
+        /// Anchor "now" at a past instant (RFC3339 or YYYY-MM-DD, UTC) so the
+        /// rolling 7-day evidence window covers an earlier week — replay/eval
+        #[arg(long = "as-of")]
+        as_of: Option<String>,
     },
     /// Run evaluation tests
     Eval {
@@ -114,8 +182,9 @@ enum Commands {
         /// Run the LIVE north-star probe against the real index (no fixture)
         #[arg(long = "continuity-live")]
         continuity_live: bool,
-        /// Provenance regression benchmark: reinstatement walk vs one-shot kNN (Saga
-        /// Phase 1 WS2). LOCAL opt-in only — never part of default eval/--full, never CI.
+        /// Provenance regression benchmark: reinstatement walk vs one-shot kNN.
+        /// Also runs as part of `--full` (no-op-killer gate: `csr_why` machinery
+        /// must genuinely engage — exit 1 on regression).
         #[arg(long)]
         provenance: bool,
         /// Run the deterministic code-graph release gate
@@ -124,6 +193,36 @@ enum Commands {
         /// Measure the code-graph gate against the live database
         #[arg(long)]
         live: bool,
+    },
+    /// Run a reproducible retrieval benchmark in a scratch in-memory store.
+    Bench {
+        /// Input shape: agentmemory or longmemeval.
+        #[arg(long)]
+        format: String,
+        /// agentmemory directory (sessions.json + queries.json) or LongMemEval JSON file.
+        #[arg(long)]
+        data: PathBuf,
+        /// Override the agentmemory queries.json path.
+        #[arg(long)]
+        queries: Option<PathBuf>,
+        /// Retrieval cutoff.
+        #[arg(long, default_value_t = 5)]
+        k: usize,
+        /// Search ablation: vector, fts, or hybrid.
+        #[arg(long, default_value = "hybrid")]
+        mode: String,
+        /// Output directory for scores.ndjson, summary.json, and table.md.
+        #[arg(long, default_value = "target/csr-bench")]
+        out: PathBuf,
+        /// Exclude LongMemEval's four *_abs question types (enabled by default).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+        drop_abstention: bool,
+        /// Maximum number of scored questions after filtering/stratification.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keep at most N questions of each question type.
+        #[arg(long)]
+        stratify: Option<usize>,
     },
     /// Backfill session stories from V3/heuristic data (zero cost)
     BackfillStories {
@@ -138,10 +237,28 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Historical deterministic capture operations.
+    Backfill {
+        #[command(subcommand)]
+        action: BackfillAction,
+    },
+    /// Structural memory provenance operations.
+    Provenance {
+        #[command(subcommand)]
+        action: ProvenanceAction,
+    },
     /// Code-graph operations (v9.4 conversation-provenance graph)
     Codegraph {
         #[command(subcommand)]
         action: CodegraphAction,
+    },
+    /// Dream journal server (v10.1 journal v4) — a read-only, loopback-only
+    /// live surface over the witness ledger. The background daemon already
+    /// hosts this on the same port; this subcommand is the standalone host
+    /// for a machine that isn't running `csr-engine daemon`.
+    Journal {
+        #[command(subcommand)]
+        action: JournalAction,
     },
     /// Show aggregated telemetry: hook latencies, startup stats, enrichment health
     Telemetry {
@@ -155,12 +272,47 @@ enum Commands {
         #[arg(long)]
         tui: bool,
     },
+    /// Dump a deterministic, stratified sample of persisted reaction labels.
+    AuditRerankLabels {
+        /// Maximum audited rows for each non-abstained reaction class.
+        #[arg(long, default_value_t = 20)]
+        per_class: usize,
+        /// Maximum abstain-adjacent near misses to include.
+        #[arg(long, default_value_t = 20)]
+        near_misses: usize,
+        /// Emit the audit rows and counts as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Distill repeated user corrections into CLAUDE.md candidate lines.
+    Lessons {
+        /// Restrict candidates to this normalized project name.
+        #[arg(long)]
+        project: String,
+        /// Ignore events older than this UTC date (YYYY-MM-DD).
+        #[arg(long)]
+        since: Option<String>,
+        /// Minimum number of distinct sessions represented by a group.
+        #[arg(long, default_value_t = 2)]
+        min_sessions: usize,
+        /// Emit structured groups and all byte receipts as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run one v10 "dreaming" cycle: HEAD stamp-spans, then the
     /// deterministic successor join over the witness ledger, emitting
     /// `witness_verdicts` events (anchor_obsolete / superseded_by /
     /// anchor_reinstated). Idempotent: re-running at an unchanged HEAD with
     /// unchanged conclusions writes nothing new.
     Dream {
+        /// Dream BACKFILL pipeline (`.plans/dream-backfill-design.md`):
+        /// `backfill` mines historical episodes for forgotten-but-consequential
+        /// supersessions; `drain` composes the ranked queue into `dreams_v1`.
+        /// When omitted, the flags below run the ORIGINAL v10 witness-ledger
+        /// dream cycle unchanged.
+        #[command(subcommand)]
+        action: Option<DreamAction>,
+
         /// Compute and print the summary without writing verdict events.
         /// The prerequisite HEAD stamp-spans pass still runs FOR REAL
         /// (append-only witness_ledger evidence, harmless and idempotent) —
@@ -190,6 +342,13 @@ enum Commands {
         /// only) after writing the file.
         #[arg(long)]
         no_open: bool,
+
+        /// Advertise the live "dreaming" statusline marker for this cycle,
+        /// labelled with this trigger name (e.g. `compact`), and self-skip if
+        /// a dream is already in flight. Set by the PreCompact hook so a
+        /// compaction lights the statusline; harmless to pass by hand.
+        #[arg(long)]
+        mark: Option<String>,
     },
     /// Generate a Haiku-curated session story (fire-and-forget from SessionEnd)
     GenerateStory {
@@ -200,6 +359,137 @@ enum Commands {
         /// Current working directory (for project resolution)
         #[arg(long)]
         cwd: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BackfillAction {
+    /// Capture corrections, redirects, and explicit abandoned approaches from transcripts.
+    Intent {
+        /// Ignore events older than this UTC date (YYYY-MM-DD).
+        #[arg(long)]
+        since: Option<String>,
+        /// Restrict to one normalized Claude project name.
+        #[arg(long)]
+        project: Option<String>,
+        /// Print counts without inserting intent_events rows.
+        #[arg(long)]
+        dry_run: bool,
+        /// Compare deterministic events with verified narrator-ledger quotes.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
+    },
+    /// Remove persisted CSR emissions and replace their stale search vectors.
+    Scrub {
+        /// Print per-conversation actions without changing SQLite or HNSW.
+        #[arg(long)]
+        dry_run: bool,
+        /// Restrict remediation to one contaminated conversation.
+        #[arg(long)]
+        conversation: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProvenanceAction {
+    /// Re-derive deterministic artifact floors; model-produced legacy rows remain unknown.
+    BackfillArtifacts {
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Populate structural provenance for chunks that do not have spans yet.
+    Backfill {
+        /// Override the SQLite database path for this operation.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Inspect and reconstruct without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Maximum chunks per write transaction.
+        #[arg(long, default_value_t = csr_engine::import::provenance_backfill::DEFAULT_BATCH_SIZE)]
+        batch: usize,
+        /// Re-examine chunks with only non-JSONL receipts. Real JSONL spans are never replaced.
+        #[arg(long)]
+        retry_unknown: bool,
+    },
+}
+
+/// `csr-engine dream backfill` / `csr-engine dream drain`
+/// (`.plans/dream-backfill-design.md` §4). A nested subcommand of `Dream`
+/// rather than new flags directly on it: `backfill`'s own `--dry-run`/
+/// `--report` mean something entirely different from the witness-ledger
+/// `dream` command's flags of the same name, and clap subcommand namespaces
+/// keep the two from colliding.
+#[derive(Subcommand, Debug)]
+enum DreamAction {
+    /// Deterministic supersession mining over historical episodes, with a
+    /// single budgeted LLM adjudication stage. See
+    /// `dream::backfill::cli::handle_backfill`'s doc for `--stage`'s exact
+    /// semantics.
+    Backfill {
+        /// Restrict to one project (matches the stored project name exactly).
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Hard cap on adjudication (`claude -p`) calls this run may spend.
+        #[arg(long, default_value_t = csr_engine::dream::backfill::adjudicate::DEFAULT_BUDGET_CALLS)]
+        budget_calls: usize,
+
+        /// Stages 0-3 only (materialize, unfinished scan, pair generation +
+        /// rank/gate): prints candidate counts and the top queue heads.
+        /// Zero LLM spend; this is the eyeball checkpoint the acceptance
+        /// protocol runs before `--budget-calls` ever spends anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Bypass the nightly drain and render the FULL post-verification
+        /// ranked queue (verified relations + queue-U), unrestricted by the
+        /// per-night cap.
+        #[arg(long)]
+        report: bool,
+
+        /// Run through this pipeline stage only and stop (0-3; omit for a
+        /// full run through adjudication). A resumability/debug aid.
+        #[arg(long)]
+        stage: Option<u8>,
+
+        /// Print the SQL-stage funnel (episodes -> funeral symbols ->
+        /// anchor overlap -> negative verdicts -> reinstated) per family
+        /// and exit. Read-only corpus counts — no git, no LLM, ignores
+        /// `--dry-run`/`--report`/`--stage`.
+        #[arg(long)]
+        funnel: bool,
+    },
+
+    /// Drain the ranked backfill queue (verified relations + queue-U) into
+    /// `dreams_v1`, capped at `--n` and enforcing one open dream per
+    /// (project, topic) within 30 days.
+    Drain {
+        /// How many dreams to compose this run (design default: 3/night).
+        #[arg(long, default_value_t = csr_engine::dream::backfill::compose::DEFAULT_DRAIN_N)]
+        n: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum JournalAction {
+    /// Serve the dream journal on 127.0.0.1 until Ctrl-C.
+    ///
+    /// The bind interface is not configurable — the corpus behind this
+    /// surface is private conversation data, so the listener is loopback by
+    /// construction (`journal::loopback_addr` is the only bind-address
+    /// constructor and takes a port, nothing else). `CSR_NO_JOURNAL_SERVER=1`
+    /// disables it here and in the daemon.
+    Serve {
+        /// Loopback port. Defaults to `CSR_JOURNAL_PORT`, then the fixed
+        /// bookmarkable default. `0` asks for an ephemeral port. If the
+        /// chosen port is busy, an ephemeral one is used and printed.
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Open the served URL in the system browser (macOS `open`).
+        #[arg(long)]
+        open: bool,
     },
 }
 
@@ -270,8 +560,16 @@ fn default_projects_dir() -> PathBuf {
         .join("projects")
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let workers = csr_engine::runtime::resolve_tokio_workers();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?;
+    runtime.block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -301,8 +599,154 @@ async fn main() -> Result<()> {
         );
     }
 
+    if let Some(Commands::Provenance {
+        action: ProvenanceAction::BackfillArtifacts { db },
+    }) = &args.command
+    {
+        let storage = csr_engine::storage::Storage::open(db.as_ref().unwrap_or(&args.db_path))?;
+        let written = csr_engine::storage::artifact_backfill::backfill(&storage)?;
+        let lowered = storage.relink_sidechains()?;
+        println!(
+            "{}",
+            serde_json::json!({"artifacts_written":written,"lowered":lowered})
+        );
+        return Ok(());
+    }
+
+    if let Some(Commands::Provenance {
+        action:
+            ProvenanceAction::Backfill {
+                db,
+                dry_run,
+                batch,
+                retry_unknown,
+            },
+    }) = &args.command
+    {
+        let db_path = db.as_ref().unwrap_or(&args.db_path);
+        let storage = csr_engine::storage::Storage::open(db_path)?;
+        let stats = csr_engine::import::provenance_backfill::backfill_with_retry(
+            &storage,
+            &args.projects_dir,
+            *batch,
+            *dry_run,
+            *retry_unknown,
+        )?;
+        let (chunks_with_spans, chunks_unknown, chunks_total, tool_result_share_mean) =
+            storage.provenance_coverage()?;
+        let [source_missing, source_unparsed, source_unmatched] =
+            storage.provenance_failure_counts()?;
+        let tier_histogram = storage
+            .provenance_tier_histogram()?
+            .into_iter()
+            .map(|(tier, count)| (tier.to_string(), count))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "backfill": stats,
+                "dry_run": dry_run,
+                "provenance_coverage": {
+                    "chunks_with_spans": chunks_with_spans,
+                    "chunks_unknown": chunks_unknown,
+                    "chunks_total": chunks_total,
+                    "tool_result_share_mean": tool_result_share_mean,
+                    "source_missing": source_missing,
+                    "source_unparsed": source_unparsed,
+                    "source_unmatched": source_unmatched,
+                },
+                "tier_histogram": tier_histogram,
+            }))?
+        );
+        return Ok(());
+    }
+
     if let Some(Commands::Telemetry { since, json, tui }) = args.command {
         return csr_engine::telemetry::handle(&args.db_path, &args.projects_dir, since, json, tui);
+    }
+
+    if let Some(Commands::Lessons {
+        project,
+        since,
+        min_sessions,
+        json,
+    }) = args.command
+    {
+        let storage = csr_engine::storage::Storage::open_read_only(&args.db_path)?;
+        print!(
+            "{}",
+            csr_engine::eval::lessons::handle(
+                &storage,
+                &project,
+                since.as_deref(),
+                min_sessions,
+                json,
+            )?
+        );
+        if json {
+            println!();
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::AuditRerankLabels {
+        per_class,
+        near_misses,
+        json,
+    }) = args.command
+    {
+        let storage = csr_engine::storage::Storage::open(&args.db_path)?;
+        let Some(classifier_hash) = storage.latest_reaction_classifier_hash()? else {
+            if json {
+                println!("{{\"classifier_hash\":null,\"counts\":null,\"labels\":[]}}");
+            } else {
+                println!("No harvested reaction labels are available.");
+            }
+            return Ok(());
+        };
+        let counts = storage.rerank_reaction_label_counts(&classifier_hash)?;
+        let labels =
+            storage.audit_rerank_reaction_labels(&classifier_hash, per_class, near_misses)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "classifier_hash": classifier_hash,
+                    "counts": counts,
+                    "labels": labels,
+                }))?
+            );
+        } else {
+            println!("classifier_hash: {classifier_hash}");
+            println!(
+                "counts: acceptance={} correction={} reask={} redirect={} abstain={} near_miss={}",
+                counts.acceptance,
+                counts.correction,
+                counts.reask,
+                counts.redirect,
+                counts.abstain,
+                counts.near_miss
+            );
+            for label in labels {
+                println!(
+                    "\n[{}] session={} assistant_turn={} next_user_turn={} proposed={} confidence={:.4} runner_up={:.4} margin={:.4} pickup_similarity={} near_miss={}\n{}",
+                    label.reaction,
+                    label.session_id,
+                    label.assistant_turn,
+                    label.next_user_turn,
+                    label.proposed_reaction.as_deref().unwrap_or("none"),
+                    label.confidence,
+                    label.runner_up_score,
+                    label.margin,
+                    label
+                        .pickup_similarity
+                        .map_or_else(|| "none".to_string(), |value| format!("{value:.4}")),
+                    label.near_miss,
+                    label.next_user_text
+                );
+            }
+        }
+        return Ok(());
     }
 
     if let Some(Commands::Daemon {
@@ -315,6 +759,11 @@ async fn main() -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        // The daemon embeds on its very first extraction tick (no initial
+        // sleep) — warm the model now, synchronously, instead of paying
+        // the load on that first tick with no log line to explain the
+        // stall.
+        eng.embeddings().warm()?;
         let config = csr_engine::daemon::DaemonConfig {
             extraction_interval_secs: 30,
             batch_size_trigger: batch_size,
@@ -351,9 +800,118 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(Commands::Dreams {
+        ref project,
+        json,
+        no_llm,
+        ref as_of,
+    }) = args.command
+    {
+        return csr_engine::dream::cli::handle(
+            &args.db_path,
+            project.as_deref(),
+            json,
+            no_llm,
+            as_of.as_deref(),
+        );
+    }
+
     if let Some(Commands::Quality { ref path }) = args.command {
         let report = csr_engine::extraction::quality::analyze_file(path)?;
         print!("{}", report.format_text());
+        return Ok(());
+    }
+
+    if let Some(Commands::Transcript {
+        ref session,
+        ref view,
+        ref project,
+        ref role,
+        ref turns,
+        last,
+        ref grep,
+        ref tool,
+        json,
+        budget_chars,
+        sidechains,
+    }) = args.command
+    {
+        use csr_engine::transcript::{parse_turns_spec, RoleFilter, TranscriptRequest, ViewKind};
+
+        let Some(view_kind) = ViewKind::parse(view) else {
+            eprintln!(
+                "error: unknown view '{view}' — expected one of: stats, prompts, tools, files, errors, slice, grep"
+            );
+            std::process::exit(2);
+        };
+        let Some(role_filter) = RoleFilter::parse(role) else {
+            eprintln!(
+                "error: unknown --role '{role}' — expected one of: user, assistant, system, all"
+            );
+            std::process::exit(2);
+        };
+        let parsed_turns = match turns {
+            Some(spec) => match parse_turns_spec(spec) {
+                Ok(range) => Some(range),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            },
+            None => None,
+        };
+
+        let req = TranscriptRequest {
+            session: session.clone(),
+            view: view_kind,
+            project: project.clone(),
+            role: role_filter,
+            turns: parsed_turns,
+            last,
+            grep: grep.clone(),
+            tool: tool.clone(),
+            json,
+            budget_chars,
+            sidechains,
+        };
+        let out = csr_engine::transcript::run(&args.projects_dir, &req);
+        print!("{out}");
+        if !out.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::Bench {
+        format,
+        data,
+        queries,
+        k,
+        mode,
+        out,
+        drop_abstention,
+        limit,
+        stratify,
+    }) = &args.command
+    {
+        let format = csr_engine::eval::bench::BenchFormat::parse(format)?;
+        if !matches!(mode.as_str(), "hybrid" | "vector" | "fts") {
+            anyhow::bail!("unknown --mode {mode:?}; expected hybrid, vector, or fts");
+        }
+        let mode = csr_engine::mcp::tools::search_mode_from(Some(mode));
+        let table = csr_engine::eval::bench::run(csr_engine::eval::bench::BenchConfig {
+            format,
+            data: data.clone(),
+            queries: queries.clone(),
+            k: *k,
+            mode,
+            out: out.clone(),
+            drop_abstention: *drop_abstention,
+            limit: *limit,
+            stratify: *stratify,
+        })
+        .await?;
+        print!("{table}");
         return Ok(());
     }
 
@@ -370,6 +928,14 @@ async fn main() -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        // quick/full/continuity/provenance embed on their first step and fold
+        // embedding errors into failed report rows, so load the model up front
+        // and let a broken model cache fail the command loudly. The codegraph
+        // modes only read storage; when codegraph is the selected branch
+        // (nothing above it in this if-chain is set) the model stays unloaded.
+        if continuity_live || continuity || provenance || !codegraph {
+            eng.embeddings().warm()?;
+        }
         if continuity_live {
             let out = csr_engine::eval::continuity::run_continuity_live(
                 eng.storage(),
@@ -428,6 +994,21 @@ async fn main() -> Result<()> {
             .await
         };
         print!("{}", report.format_text());
+        if full {
+            // No-op-killer gate: the reinstatement machinery must genuinely
+            // engage. Part of --full so it cannot silently rot as a local
+            // opt-in nobody runs.
+            let prov = csr_engine::eval::provenance::run_provenance(
+                eng.storage(),
+                eng.embeddings(),
+                eng.search(),
+            )
+            .await?;
+            print!("{}", prov.text);
+            if prov.regression {
+                std::process::exit(1);
+            }
+        }
         return Ok(());
     }
 
@@ -450,6 +1031,76 @@ async fn main() -> Result<()> {
             dry_run,
         )?;
         print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
+    if let Some(Commands::Backfill {
+        action:
+            BackfillAction::Intent {
+                since,
+                project,
+                dry_run,
+                ledger,
+            },
+    }) = &args.command
+    {
+        if std::env::var("CSR_NO_INTENT_CAPTURE").as_deref() == Ok("1") {
+            println!("intent backfill: disabled (CSR_NO_INTENT_CAPTURE)");
+            return Ok(());
+        }
+        let stats = if *dry_run {
+            let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new()?);
+            csr_engine::transcript::intent_events::backfill_intent_events(
+                None,
+                &embeddings,
+                &args.projects_dir,
+                since.as_deref(),
+                project.as_deref(),
+                true,
+            )
+            .await?
+        } else {
+            if let Some(parent) = args.db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+            csr_engine::transcript::intent_events::backfill_intent_events(
+                Some(eng.storage()),
+                eng.embeddings(),
+                &args.projects_dir,
+                since.as_deref(),
+                project.as_deref(),
+                false,
+            )
+            .await?
+        };
+        print!("{}", stats.format_text(*dry_run));
+        if let Some(ledger) = ledger {
+            let agreement =
+                csr_engine::transcript::intent_events::agreement_report(ledger, stats.events())?;
+            print!("{}", agreement.format_text());
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::Backfill {
+        action: BackfillAction::Scrub {
+            dry_run,
+            conversation,
+        },
+    }) = &args.command
+    {
+        let report = if *dry_run {
+            let storage = csr_engine::storage::Storage::open_read_only(&args.db_path)?;
+            csr_engine::import::scrub::dry_run_scrub(&storage, conversation.as_deref())?
+        } else {
+            let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+            csr_engine::import::scrub::run_scrub(&eng, false, conversation.as_deref()).await?
+        };
+        print!("{}", report.format_text(*dry_run));
+        if !dry_run {
+            println!("restart Claude Code: the running MCP server holds its own index");
+        }
         return Ok(());
     }
 
@@ -515,25 +1166,99 @@ async fn main() -> Result<()> {
     }
 
     if let Some(Commands::Dream {
+        ref action,
         dry_run,
         ref repo,
         report,
         ref out,
         no_open,
+        ref mark,
+    }) = args.command
+    {
+        if let Some(action) = action {
+            return match action {
+                DreamAction::Backfill {
+                    project,
+                    budget_calls,
+                    dry_run: backfill_dry_run,
+                    report: backfill_report,
+                    stage,
+                    funnel,
+                } => csr_engine::dream::backfill::cli::handle_backfill(
+                    &args.db_path,
+                    project.as_deref(),
+                    *budget_calls,
+                    *backfill_dry_run,
+                    *backfill_report,
+                    *stage,
+                    *funnel,
+                ),
+                DreamAction::Drain { n } => {
+                    csr_engine::dream::backfill::cli::handle_drain(&args.db_path, *n)
+                }
+            };
+        }
+
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        if report {
+            let path = csr_engine::dream::report::run_report(
+                eng.storage(),
+                eng.projects_dir(),
+                out.clone(),
+                no_open,
+            )?;
+            println!("CSR dream journal written to {}", path.display());
+            return Ok(());
+        }
+        let stats = if let Some(label) = mark {
+            match csr_engine::dream::run_dream_marked(&eng, repo.as_deref(), dry_run, label)? {
+                Some(stats) => stats,
+                None => {
+                    println!(
+                        "CSR dream: another dream is in flight (marker active); \
+                         skipping {label}-triggered cycle"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            csr_engine::dream::run_dream(&eng, repo.as_deref(), dry_run)?
+        };
+        // v10.1: CSR_DREAM_CONSUMPTION default OFF. The cycle still runs and
+        // the witness ledger still updates for real either way — this
+        // switch is about consumption/exposure, not about whether dreaming
+        // happens — but the verdict-derived summary text (obsolete/
+        // superseded/reinstated counts, events written) must not print
+        // unless explicitly opted in, same shared switch as
+        // mcp::tools/status/dream::report.
+        match csr_engine::storage::recap_feeds::dream_consumption_mode() {
+            csr_engine::storage::recap_feeds::ConsumptionMode::Off => {
+                let mode = if dry_run { " (dry-run)" } else { "" };
+                println!(
+                    "CSR dream{mode}: cycle complete — verdict summary suppressed; witness ledger \
+                     updated regardless."
+                );
+            }
+            csr_engine::storage::recap_feeds::ConsumptionMode::AnnotateOnly
+            | csr_engine::storage::recap_feeds::ConsumptionMode::Full => {
+                print!("{}", stats.format_text(dry_run));
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::Journal {
+        action: JournalAction::Serve { port, open },
     }) = args.command
     {
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-        if report {
-            let path = csr_engine::dream::report::run_report(eng.storage(), out.clone(), no_open)?;
-            println!("CSR dream journal written to {}", path.display());
-            return Ok(());
-        }
-        let stats = csr_engine::dream::run_dream(&eng, repo.as_deref(), dry_run)?;
-        print!("{}", stats.format_text(dry_run));
-        return Ok(());
+        return csr_engine::journal::run_cli(eng.storage().clone(), port, open).await;
     }
 
     if let Some(Commands::GenerateStory {
@@ -605,6 +1330,13 @@ async fn main() -> Result<()> {
     }
 
     let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+
+    if args.import || args.enrich {
+        // Both paths embed heavily and immediately — warm eagerly instead
+        // of paying the load cost inside the first batch with no log line
+        // to explain it. `--serve`/hooks never hit this branch.
+        eng.embeddings().warm()?;
+    }
 
     if args.import {
         let count = eng.import_conversations(args.limit).await?;

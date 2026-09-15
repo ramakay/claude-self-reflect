@@ -60,6 +60,31 @@ pub struct Episode {
     pub prev_episode_id: Option<String>,
     #[serde(default)]
     pub anchors: Vec<crate::extraction::anchors::FunctionAnchor>,
+
+    // Journal v2 instrumentation feeds (plan `.plans/journal-v2-mailbox-plan.md`
+    // §3.3/§4.1). `Option<u32>`, not `u32`: `None` means "never measured"
+    // (no transcript pass ran — old episode, oversized transcript, read
+    // failure); `Some(0)` means "measured, and there were none". This
+    // distinction is the entire honest-degradation story and must survive to
+    // the renderer unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_count: Option<u32>,
+    #[serde(default)]
+    pub top_errors: Vec<crate::transcript::instrumentation::ErrorEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_count: Option<u32>,
+    #[serde(default)]
+    pub steers: Vec<crate::transcript::instrumentation::SteerEvent>,
+    /// Which steer-filter generation measured `steer_count`/`steers`.
+    /// `None` (legacy episodes) means the stored total may include harness
+    /// noise the current filter would reject — the renderer must then derive
+    /// the displayed count from surviving quotes only, never trust this total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instrumentation_version: Option<u32>,
+    /// Number of deterministic Correction events measured in this transcript.
+    /// `None` means intent capture was disabled or could not be measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction_count: Option<u32>,
 }
 
 /// Extract a structured episode from JSONL transcript lines.
@@ -389,6 +414,12 @@ fn extract_episode_from_messages(
         approved_plan,
         prev_episode_id: None,
         anchors: Vec::new(),
+        error_count: None,
+        top_errors: Vec::new(),
+        steer_count: None,
+        steers: Vec::new(),
+        instrumentation_version: None,
+        correction_count: None,
     }
 }
 
@@ -449,6 +480,21 @@ pub fn episode_tags(episode: &Episode) -> Vec<String> {
 
 /// Store an episode as a reflection, replacing any existing episode for the same session.
 pub async fn store_episode(engine: &Engine, episode: &Episode) -> Result<()> {
+    store_episode_supported(
+        engine,
+        episode,
+        crate::storage::artifact_provenance::InputEnvelope::default(),
+        None,
+    )
+    .await
+}
+
+async fn store_episode_supported(
+    engine: &Engine,
+    episode: &Episode,
+    inputs: crate::storage::artifact_provenance::InputEnvelope,
+    ranges: Option<Vec<(usize, usize)>>,
+) -> Result<()> {
     let tags = episode_tags(episode);
     let conv_tag = format!("conv_{}", episode.session_id);
 
@@ -474,9 +520,14 @@ pub async fn store_episode(engine: &Engine, episode: &Episode) -> Result<()> {
 
     // Generate a new ID and insert
     let id = uuid::Uuid::new_v4().to_string();
-    engine
-        .storage()
-        .insert_reflection(&id, &content, &tags, &embedding)?;
+    engine.storage().insert_derived_reflection_ranges(
+        &id,
+        &content,
+        &tags,
+        &embedding,
+        &inputs,
+        &ranges.unwrap_or_else(|| vec![(0, content.chars().count()); inputs.inputs().len()]),
+    )?;
 
     // Also insert into the in-memory search index
     {
@@ -485,6 +536,86 @@ pub async fn store_episode(engine: &Engine, episode: &Episode) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn episode_support(
+    episode: &Episode,
+    content: &str,
+    mut inputs: crate::storage::artifact_provenance::InputEnvelope,
+    transcript_path: &Path,
+    tasks: Option<crate::storage::artifact_provenance::InputEnvelope>,
+) -> (
+    crate::storage::artifact_provenance::InputEnvelope,
+    Vec<(usize, usize)>,
+) {
+    use crate::storage::artifact_provenance::ArtifactInput;
+    let mut ranges = vec![(0, content.chars().count()); inputs.inputs().len()];
+    let field_range = |field: &str| {
+        let value = serde_json::to_value(episode)
+            .ok()
+            .and_then(|v| v.get(field).cloned())
+            .unwrap_or_default();
+        let needle = format!("\"{field}\":{value}");
+        content
+            .find(&needle)
+            .map(|at| {
+                let start = content[..at].chars().count() + field.chars().count() + 3;
+                (start, start + value.to_string().chars().count())
+            })
+            .unwrap_or((0, content.chars().count()))
+    };
+    for (field, text, channel) in [
+        ("request", episode.request.as_str(), "user_message"),
+        ("completed", episode.completed.as_str(), "assistant_message"),
+    ] {
+        if text.is_empty() {
+            continue;
+        }
+        let quoted = inputs
+            .inputs()
+            .iter()
+            .filter(|i| i.channel() == channel)
+            .find_map(|i| i.quoted_span(text, None))
+            .unwrap_or_else(|| ArtifactInput::unknown(text));
+        inputs.push(quoted);
+        ranges.push(field_range(field));
+    }
+    if let Some(plan) = &episode.approved_plan {
+        // `extract_episode` observed an ExitPlanMode tool call. This records
+        // that local observation, never an approval or user confirmation.
+        inputs.push(crate::storage::artifact_backfill::local_observation(
+            "observed_exit_plan_mode",
+            "jsonl_tool_call",
+            &transcript_path.to_string_lossy(),
+            plan,
+        ));
+        ranges.push(field_range("approved_plan"));
+    }
+    if let Some(tasks) = tasks {
+        for field in ["todos", "next_steps", "outcome"] {
+            for input in tasks.inputs() {
+                inputs.push(input.clone());
+                ranges.push(field_range(field));
+            }
+        }
+    }
+    (inputs, ranges)
+}
+
+/// Best-effort instrumentation scan over the transcript at `transcript_path`.
+/// Returns `None` on ANY failure — oversized file, the file having vanished
+/// between the caller's existence check and this scan, or a parse error —
+/// so the caller can leave the episode's instrumentation fields at `None`
+/// ("never measured") without the Stop hook itself ever failing.
+fn scan_instrumentation(
+    transcript_path: &Path,
+) -> Option<crate::transcript::instrumentation::SessionInstrumentation> {
+    let metadata = std::fs::metadata(transcript_path).ok()?;
+    if metadata.len() > crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES {
+        return None;
+    }
+    let parsed = crate::transcript::parse_transcript(transcript_path).ok()?;
+    Some(crate::transcript::instrumentation::from_parsed(&parsed))
 }
 
 /// Read transcript, extract episode, and store it. Non-fatal wrapper.
@@ -514,7 +645,79 @@ pub async fn extract_and_store_episode(
     let raw = std::fs::read_to_string(&tp)?;
     let lines: Vec<&str> = raw.lines().collect();
 
+    let mut provenance_inputs = crate::import::transcript_inputs(engine.storage(), &tp, session_id)
+        .unwrap_or_else(|_| {
+            crate::storage::artifact_provenance::InputEnvelope::new(vec![
+                crate::storage::artifact_provenance::ArtifactInput::unknown(&raw),
+            ])
+        });
+    let mut task_inputs = None;
+
     let mut episode = extract_episode(&lines, session_id, project_name);
+
+    // Journal v2 instrumentation feeds (plan `.plans/journal-v2-mailbox-plan.md`
+    // §3.3/§4.1): one extra streaming pass over the same transcript file
+    // (already in page cache from the `read_to_string` above for anything
+    // under the size cap). Wrapped so ANY failure — oversized file,
+    // transcript deleted between the existence check above and this scan,
+    // malformed content — leaves the fields `None` ("never measured")
+    // rather than ever failing the hook (repo CLAUDE.md: hooks must never
+    // block Claude Code; plan §8 R4).
+    if let Some(instrumentation) = scan_instrumentation(&tp) {
+        episode.error_count = Some(instrumentation.error_count);
+        episode.top_errors = instrumentation.top_errors;
+        episode.steer_count = Some(instrumentation.steer_count);
+        episode.steers = instrumentation.steers;
+        episode.instrumentation_version =
+            Some(crate::transcript::instrumentation::STEER_FILTER_VERSION);
+    }
+
+    let intent_size_allowed = std::fs::metadata(&tp).is_ok_and(|metadata| {
+        metadata.len() <= crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES
+    });
+    if std::env::var("CSR_NO_INTENT_CAPTURE").as_deref() != Ok("1")
+        && !stop_hook_is_active(input)
+        && intent_size_allowed
+    {
+        let high_water_key = format!("intent_high_water:{session_id}");
+        let high_water = engine
+            .storage()
+            .get_meta(&high_water_key)?
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        match crate::transcript::intent_events::extract_intent_events_incremental(
+            &tp,
+            session_id,
+            project_name,
+            engine.embeddings(),
+            &high_water,
+        )
+        .await
+        {
+            Ok(extraction) => {
+                if let Err(error) = engine.storage().insert_intent_events(&extraction.events) {
+                    eprintln!("CSR: intent event persist error (non-fatal): {error}");
+                } else {
+                    let high_water =
+                        crate::transcript::intent_events::IntentHighWater::from(&extraction);
+                    engine
+                        .storage()
+                        .set_meta(&high_water_key, &serde_json::to_string(&high_water)?)?;
+                    episode.correction_count = Some(
+                        engine
+                            .storage()
+                            .count_session_intent_events(
+                                session_id,
+                                crate::transcript::intent_events::IntentEventKind::Correction,
+                            )?
+                            .try_into()
+                            .unwrap_or(u32::MAX),
+                    );
+                }
+            }
+            Err(error) => eprintln!("CSR: intent extraction error (non-fatal): {error}"),
+        }
+    }
 
     // Authoritative on-disk task directory overrides transcript-mined todos
     // when present and non-empty (Claude Code's ~/.claude/tasks/<session_id>/).
@@ -542,6 +745,7 @@ pub async fn extract_and_store_episode(
         // than let them set next_steps and cap the outcome (Codex). A dir with
         // zero task files carries no signal; transcript state stands.
         if state.files_seen > state.parse_failures {
+            task_inputs = Some(state.inputs);
             episode.todos = state.todos;
             episode.next_steps = episode
                 .todos
@@ -578,6 +782,18 @@ pub async fn extract_and_store_episode(
         episode
             .anchors
             .extend(crate::extraction::anchors::capture_file_anchors(&path));
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            provenance_inputs.push(crate::storage::artifact_backfill::local_observation(
+                "local_file",
+                "file_content",
+                &path.to_string_lossy(),
+                &text,
+            ));
+        } else {
+            provenance_inputs.push(crate::storage::artifact_provenance::ArtifactInput::unknown(
+                &path.to_string_lossy(),
+            ));
+        }
     }
 
     // Chain link: most recent episode for this project, excluding this session.
@@ -596,9 +812,24 @@ pub async fn extract_and_store_episode(
             })
             .collect();
         episode.prev_episode_id = pick_prev_episode(&candidates, session_id);
+        if let Some(parent) = &episode.prev_episode_id {
+            for (id, content, _, _) in &existing {
+                if serde_json::from_str::<serde_json::Value>(content)
+                    .ok()
+                    .is_some_and(|v| v["session_id"].as_str() == Some(parent.as_str()))
+                {
+                    provenance_inputs.push(engine.storage().artifact_input(
+                        crate::storage::artifact_provenance::ArtifactKind::Reflection,
+                        id,
+                    )?);
+                }
+            }
+        }
     }
 
-    store_episode(engine, &episode).await?;
+    let content = serde_json::to_string(&episode)?;
+    let (inputs, ranges) = episode_support(&episode, &content, provenance_inputs, &tp, task_inputs);
+    store_episode_supported(engine, &episode, inputs, Some(ranges)).await?;
 
     // Persist anchors for fast birth-time symbol join (non-fatal)
     if let Err(e) =
@@ -643,6 +874,7 @@ fn propose_task_resolutions(
         let Ok(hits) = storage.fts5_search(&todo.content, 3, Some(project_name)) else {
             continue;
         };
+        let hits: Vec<_> = hits.into_iter().map(|(chunk, _, _)| chunk).collect();
         // fts5_search OR-joins terms, so a hit can rank on one shared word.
         // Require most of the subject's significant tokens verbatim in the hit
         // before proposing — identity, not similarity (Codex: single-word
@@ -703,6 +935,7 @@ struct TaskDirState {
     todos: Vec<TodoItem>,
     files_seen: usize,
     parse_failures: usize,
+    inputs: crate::storage::artifact_provenance::InputEnvelope,
 }
 
 /// Read numeric `N.json` task files from a directory. Testable helper used by
@@ -733,11 +966,21 @@ fn load_task_state_from_dir(dir: &Path) -> Option<TaskDirState> {
     let files_seen = files.len();
     let mut parse_failures = 0usize;
     let mut todos = Vec::new();
+    let mut inputs = crate::storage::artifact_provenance::InputEnvelope::default();
     for (_, path) in files {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             parse_failures += 1;
+            inputs.push(crate::storage::artifact_provenance::ArtifactInput::unknown(
+                &path.to_string_lossy(),
+            ));
             continue;
         };
+        inputs.push(crate::storage::artifact_backfill::local_observation(
+            "task_file",
+            "file_content",
+            &path.to_string_lossy(),
+            &raw,
+        ));
         let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
             parse_failures += 1;
             continue;
@@ -762,6 +1005,7 @@ fn load_task_state_from_dir(dir: &Path) -> Option<TaskDirState> {
         todos,
         files_seen,
         parse_failures,
+        inputs,
     })
 }
 
@@ -782,6 +1026,10 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     }
 
     Ok(())
+}
+
+fn stop_hook_is_active(input: &HookInput) -> bool {
+    input.stop_hook_active == Some(true)
 }
 
 /// Write a rolling "session_latest" reflection with current session state.
@@ -911,7 +1159,7 @@ mod tests {
             storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
             if let Some(s) = status {
                 storage
-                    .insert_resolutions(&[id.to_string()], s, "seed", None, "agent")
+                    .insert_resolutions(&[id.to_string()], s, "seed", None, "user_confirmed")
                     .unwrap();
             }
         };
@@ -1243,6 +1491,12 @@ mod tests {
             approved_plan: None,
             prev_episode_id: None,
             anchors: vec![],
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
+            instrumentation_version: None,
+            correction_count: None,
         };
 
         let json = serde_json::to_string(&ep).unwrap();
@@ -1289,6 +1543,12 @@ mod tests {
             approved_plan: None,
             prev_episode_id: None,
             anchors: vec![],
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
+            instrumentation_version: None,
+            correction_count: None,
         };
 
         let tags = episode_tags(&ep);
@@ -1317,6 +1577,45 @@ mod tests {
         assert!(plan.contains("Fix validate_token"));
         assert!(ep.prev_episode_id.is_none());
         assert!(ep.anchors.is_empty());
+    }
+
+    #[test]
+    fn episode_support_keeps_intent_span_and_observed_plan_below_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let raw = concat!(
+            r#"{"type":"user","uuid":"u","message":{"content":"fix auth"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a","message":{"content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"Fix auth then test"}}]}}"#,
+            "\n"
+        );
+        std::fs::write(&path, raw).unwrap();
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let episode = extract_episode(&raw.lines().collect::<Vec<_>>(), "session", "project");
+        let inputs = crate::import::transcript_inputs(&storage, &path, "session").unwrap();
+        let content = serde_json::to_string(&episode).unwrap();
+        let (support, ranges) = episode_support(&episode, &content, inputs, &path, None);
+        let plan = support
+            .inputs()
+            .iter()
+            .position(|i| i.channel() == "observed_exit_plan_mode")
+            .unwrap();
+        assert_eq!(
+            support.inputs()[plan].trust(),
+            crate::provenance::TrustTier::TrustedTool
+        );
+        assert!(content
+            .chars()
+            .skip(ranges[plan].0)
+            .take(ranges[plan].1 - ranges[plan].0)
+            .collect::<String>()
+            .contains("Fix auth"));
+        assert!(support
+            .inputs()
+            .iter()
+            .zip(&ranges)
+            .any(|(i, r)| i.channel() == "user_message" && i.text() == "fix auth" && r.0 > 0));
+        assert!(support.floor() <= crate::provenance::TrustTier::TrustedTool);
     }
 
     #[test]
@@ -1351,7 +1650,9 @@ mod tests {
     }
 
     #[test]
-    fn episode_v1_json_still_deserializes() {
+    fn episode_v1_and_v2_without_instrumentation_still_deserialize() {
+        // v1: no todos/approved_plan/prev_episode_id/anchors, and (this
+        // extension) no instrumentation fields either.
         let v1 = r#"{"schema":"v1","session_id":"s","project":"p","timestamp":"t",
             "request":"r","investigated":[],"completed":"c","next_steps":null,
             "blockers":null,"outcome":"partial","error_signatures":[],"tools_used":[],
@@ -1359,6 +1660,284 @@ mod tests {
         let ep: Episode = serde_json::from_str(v1).expect("v1 compat");
         assert!(ep.todos.is_empty());
         assert!(ep.approved_plan.is_none());
+        assert!(ep.error_count.is_none());
+        assert!(ep.top_errors.is_empty());
+        assert!(ep.steer_count.is_none());
+        assert!(ep.steers.is_empty());
+
+        // v2: has the working-state fields but predates instrumentation
+        // (plan §4.1) — must still deserialize, with the four new fields
+        // defaulting to "never measured", not a deserialize error.
+        let v2 = r#"{"schema":"v2","session_id":"s","project":"p","timestamp":"t",
+            "request":"r","investigated":[],"completed":"c","next_steps":null,
+            "blockers":null,"outcome":"success","error_signatures":[],"tools_used":[],
+            "files_modified":[],"message_count":1,"duration_minutes":0,
+            "todos":[{"content":"x","status":"completed"}],"approved_plan":null,
+            "prev_episode_id":null,"anchors":[]}"#;
+        let ep2: Episode = serde_json::from_str(v2).expect("v2 (pre-instrumentation) compat");
+        assert_eq!(ep2.todos.len(), 1);
+        assert!(ep2.error_count.is_none());
+        assert!(ep2.top_errors.is_empty());
+        assert!(ep2.steer_count.is_none());
+        assert!(ep2.steers.is_empty());
+        assert!(ep2.correction_count.is_none());
+    }
+
+    // --- extract_and_store_episode instrumentation wiring (plan §4.1) ---
+
+    fn instrumentation_test_engine() -> (Engine, std::sync::Arc<crate::storage::Storage>) {
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let embeddings = std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap());
+        let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::search::SearchEngine::new(100),
+        ));
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings,
+            search,
+            std::path::PathBuf::from("/tmp"),
+        );
+        (engine, storage)
+    }
+
+    /// Fetch and deserialize the stored `session_episode` reflection for
+    /// `session_id`, panicking with a descriptive message if none was
+    /// stored — tests call this only after asserting `extract_and_store_episode`
+    /// returned `Ok`.
+    fn stored_episode(storage: &crate::storage::Storage, session_id: &str) -> Episode {
+        let rows = storage
+            .get_reflections_by_tag(&format!("conv_{session_id}"), 10)
+            .unwrap();
+        let (_, content, _, _) = rows
+            .into_iter()
+            .find(|(_, _, tags, _)| tags.iter().any(|t| t == "session_episode"))
+            .expect("episode reflection must have been stored");
+        serde_json::from_str(&content).expect("stored episode must deserialize")
+    }
+
+    #[tokio::test]
+    async fn episode_carries_instrumentation_when_transcript_is_readable() {
+        let (engine, storage) = instrumentation_test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let transcript = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","message":{"content":"make the podcast episode"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ffmpeg"}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","is_error":true,"content":"ffmpeg exit 1"}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":"no — hindi, not english"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Retried with the hindi voice id."}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let session_id = "aaaaaaaa-1111-2222-3333-444444444444";
+        let input = HookInput {
+            transcript_path: Some(transcript.to_string_lossy().to_string()),
+            session_id: Some(session_id.to_string()),
+            cwd: Some(tmp.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        extract_and_store_episode(&input, &engine, tmp.path())
+            .await
+            .expect("readable transcript must store an episode");
+
+        let ep = stored_episode(&storage, session_id);
+        assert_eq!(ep.error_count, Some(1));
+        assert_eq!(ep.top_errors.len(), 1);
+        assert_eq!(ep.top_errors[0].tool, "Bash");
+        assert_eq!(ep.steer_count, Some(1));
+        assert_eq!(ep.steers.len(), 1);
+        assert!(ep.steers[0].text.contains("hindi"));
+    }
+
+    #[tokio::test]
+    async fn stop_capture_persists_a_correction_with_an_exact_byte_receipt() {
+        let (engine, storage) = instrumentation_test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let transcript = tmp.path().join("correction.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","timestamp":"2026-09-01T10:00:00Z","message":{"content":"Implement the parser"}}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-09-01T10:01:00Z","message":{"content":"I changed `old_parser`."}}"#,
+                "\n",
+                r#"{"type":"user","timestamp":"2026-09-01T10:02:00Z","message":{"content":"no, that is not what I asked for"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let session_id = "cccccccc-1111-2222-3333-444444444444";
+        let input = HookInput {
+            transcript_path: Some(transcript.to_string_lossy().to_string()),
+            session_id: Some(session_id.to_string()),
+            cwd: Some(tmp.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        extract_and_store_episode(&input, &engine, tmp.path())
+            .await
+            .unwrap();
+
+        let episode = stored_episode(&storage, session_id);
+        assert_eq!(episode.correction_count, Some(1));
+        let mut events = storage.list_intent_events(None, None).unwrap();
+        assert_eq!(events.len(), 1);
+        let bytes = std::fs::read(&transcript).unwrap();
+        assert_eq!(
+            &bytes[events[0].byte_start..events[0].byte_end],
+            events[0].quote.as_bytes()
+        );
+
+        let first_high_water: crate::transcript::intent_events::IntentHighWater =
+            serde_json::from_str(
+                &storage
+                    .get_meta(&format!("intent_high_water:{session_id}"))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(first_high_water.last_turn, 3);
+        assert_eq!(
+            first_high_water.byte_offset,
+            std::fs::metadata(&transcript).unwrap().len() as usize
+        );
+        extract_and_store_episode(&input, &engine, tmp.path())
+            .await
+            .unwrap();
+        assert_eq!(storage.list_intent_events(None, None).unwrap().len(), 1);
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2026-09-01T10:03:00Z","message":{{"content":"I used the root config."}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2026-09-01T10:04:00Z","message":{{"content":"wrong file. use `config/app.toml`."}}}}"#
+        )
+        .unwrap();
+        extract_and_store_episode(&input, &engine, tmp.path())
+            .await
+            .unwrap();
+        events = storage.list_intent_events(None, None).unwrap();
+        assert_eq!(events.len(), 2);
+        let second_high_water: crate::transcript::intent_events::IntentHighWater =
+            serde_json::from_str(
+                &storage
+                    .get_meta(&format!("intent_high_water:{session_id}"))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(second_high_water.last_turn, 5);
+        assert!(second_high_water.byte_offset > first_high_water.byte_offset);
+    }
+
+    #[test]
+    fn active_stop_hook_is_skipped() {
+        let input = HookInput {
+            stop_hook_active: Some(true),
+            ..Default::default()
+        };
+        assert!(stop_hook_is_active(&input));
+    }
+
+    #[tokio::test]
+    async fn oversized_transcript_is_skipped_without_error() {
+        let (engine, storage) = instrumentation_test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let transcript = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"content":"make the podcast episode"}}"#,
+        )
+        .unwrap();
+        // Stub an over-cap size without writing 64 MiB of real bytes: a
+        // sparse `set_len` bump makes `metadata().len()` read as huge while
+        // the file's real content — and disk usage — stay tiny.
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&transcript)
+                .unwrap();
+            f.set_len(crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES + 1)
+                .unwrap();
+        }
+        assert!(
+            std::fs::metadata(&transcript).unwrap().len()
+                > crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES,
+            "fixture must actually exceed the cap for this test to mean anything"
+        );
+
+        let session_id = "bbbbbbbb-1111-2222-3333-444444444444";
+        let input = HookInput {
+            transcript_path: Some(transcript.to_string_lossy().to_string()),
+            session_id: Some(session_id.to_string()),
+            cwd: Some(tmp.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        extract_and_store_episode(&input, &engine, tmp.path())
+            .await
+            .expect("an oversized transcript must not fail the hook");
+
+        let ep = stored_episode(&storage, session_id);
+        assert!(
+            ep.error_count.is_none(),
+            "oversized scan must leave error_count None"
+        );
+        assert!(ep.top_errors.is_empty());
+        assert!(
+            ep.steer_count.is_none(),
+            "oversized scan must leave steer_count None"
+        );
+        assert_eq!(
+            storage
+                .get_meta(&format!("intent_high_water:{session_id}"))
+                .unwrap(),
+            None,
+            "oversized Stop transcript must not enter intent extraction"
+        );
+        assert!(ep.steers.is_empty());
+    }
+
+    #[test]
+    fn missing_transcript_never_fails_the_hook() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let transcript = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"content":"do the work"}}"#,
+        )
+        .unwrap();
+
+        // File present at the point the caller would normally scan it.
+        assert!(scan_instrumentation(&transcript).is_some());
+
+        // The transcript vanishes between the hook's initial existence
+        // check/read and a later instrumentation scan attempt (real-world
+        // race: session rotation, watcher move, Ctrl+C mid-write).
+        // `scan_instrumentation` must degrade to `None` — never panic, never
+        // propagate an I/O error — which is exactly what lets its caller
+        // (`extract_and_store_episode`) leave the instrumentation fields at
+        // `None` while still storing the rest of the episode. Hooks must
+        // never block Claude Code (repo CLAUDE.md).
+        std::fs::remove_file(&transcript).unwrap();
+        assert!(scan_instrumentation(&transcript).is_none());
     }
 
     /// Assistant tool_use line with an explicit block id and free-form input.

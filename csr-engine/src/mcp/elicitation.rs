@@ -1,4 +1,4 @@
-//! MCP Elicitation — confirmation flow for store_reflection.
+//! MCP elicitation flows with separate authority semantics.
 //!
 //! When `store_reflection` receives content >2000 chars, it asks the client
 //! to confirm before storing. Uses rmcp's form-based elicitation with a
@@ -8,12 +8,15 @@
 //! reflections. Only truly large content (paste accidents, verbose dumps)
 //! triggers the dialog.
 //!
-//! Graceful fallback: if the client doesn't support elicitation, proceeds
-//! without confirmation (the tool still works, just no guard rail).
+//! The reflection size guard remains non-blocking: unsupported clients proceed
+//! without confirmation. Resolution elicitation is different: every failure
+//! still permits the append-only write but records only `source='agent'`.
 
 use rmcp::model::{ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationSchema};
 use rmcp::service::RequestContext;
 use rmcp::RoleServer;
+
+use crate::storage::queries::{RESOLUTION_SOURCE_AGENT, RESOLUTION_SOURCE_USER_CONFIRMED};
 
 /// Content length threshold that triggers confirmation.
 /// Set to 2000 to avoid noise on normal reflections — only fires for
@@ -60,6 +63,86 @@ pub async fn request_confirmation(content: &str, context: &RequestContext<RoleSe
     }
 }
 
+pub use crate::provenance::ResolutionConfirmationPayload;
+
+/// Classify an elicitation response conservatively. This records a local
+/// authority event for this exact resolution-ledger payload only. It does not
+/// bind a principal, action target, risk, or broader scope.
+fn resolution_source_from_response<E>(
+    payload: &ResolutionConfirmationPayload,
+    response: Result<ElicitResult, E>,
+) -> &'static str {
+    let Ok(response) = response else {
+        return RESOLUTION_SOURCE_AGENT;
+    };
+    if response.action != ElicitationAction::Accept {
+        return RESOLUTION_SOURCE_AGENT;
+    }
+    let Some(content) = response
+        .content
+        .as_ref()
+        .and_then(|value| value.as_object())
+    else {
+        return RESOLUTION_SOURCE_AGENT;
+    };
+    let exact_match = content.get("confirm").and_then(|value| value.as_bool()) == Some(true)
+        && content
+            .get("canonical_payload")
+            .and_then(|value| value.as_str())
+            == Some(payload.canonical_json())
+        && content
+            .get("payload_digest")
+            .and_then(|value| value.as_str())
+            == Some(payload.digest());
+    if exact_match {
+        RESOLUTION_SOURCE_USER_CONFIRMED
+    } else {
+        RESOLUTION_SOURCE_AGENT
+    }
+}
+
+/// Ask the client to confirm an exact resolution-ledger payload. Every failure
+/// mode returns `agent`; callers still append the ledger row and never block
+/// the write indefinitely.
+pub async fn request_resolution_confirmation(
+    payload: &ResolutionConfirmationPayload,
+    context: &RequestContext<RoleServer>,
+) -> Option<crate::provenance::ResolutionConfirmation> {
+    let canonical_json = payload.canonical_json().to_string();
+    let digest = payload.digest().to_string();
+    let message = format!(
+        "Confirm this exact local resolution-ledger payload:\n\n{canonical_json}\n\nSHA-256: {digest}"
+    );
+    let schema = ElicitationSchema::builder()
+        .required_bool_with("confirm", |value| value.with_default(false))
+        .required_string_with("canonical_payload", |value| {
+            value.with_default(canonical_json)
+        })
+        .required_string_with("payload_digest", |value| value.with_default(digest))
+        .build();
+    let Ok(schema) = schema else {
+        return None;
+    };
+    let params = ElicitRequestParams::FormElicitationParams {
+        meta: None,
+        message,
+        requested_schema: schema,
+    };
+    let response = context
+        .peer
+        .create_elicitation_with_timeout(params, Some(std::time::Duration::from_secs(30)))
+        .await;
+    resolution_confirmation_from_response(payload, response)
+}
+
+fn resolution_confirmation_from_response<E>(
+    payload: &ResolutionConfirmationPayload,
+    response: Result<ElicitResult, E>,
+) -> Option<crate::provenance::ResolutionConfirmation> {
+    (resolution_source_from_response(payload, response) == RESOLUTION_SOURCE_USER_CONFIRMED)
+        .then(|| crate::provenance::ResolutionConfirmation::elicited(payload.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +163,127 @@ mod tests {
     #[test]
     fn test_threshold_constant() {
         assert_eq!(CONFIRMATION_THRESHOLD, 2000);
+    }
+
+    fn sample_resolution_payload() -> ResolutionConfirmationPayload {
+        ResolutionConfirmationPayload::new(
+            &["chunk-2".into(), "chunk-1".into()],
+            "resolved",
+            Some("the claim"),
+            "commit abc",
+        )
+    }
+
+    #[test]
+    fn confirmation_persists_a_new_immutable_event_and_mismatch_stays_agent() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let payload = sample_resolution_payload();
+        for _ in 0..2 {
+            let accepted=ElicitResult::new(ElicitationAction::Accept).with_content(serde_json::json!({"confirm":true,"canonical_payload":payload.canonical_json(),"payload_digest":payload.digest()}));
+            let receipt =
+                resolution_confirmation_from_response(&payload, Ok::<_, &str>(accepted)).unwrap();
+            let (count, source) = storage
+                .insert_resolutions_with_confirmation(
+                    &["chunk-2".into(), "chunk-1".into()],
+                    "resolved",
+                    "commit abc",
+                    Some("the claim"),
+                    Some(&receipt),
+                )
+                .unwrap();
+            assert_eq!((count, source), (2, RESOLUTION_SOURCE_USER_CONFIRMED));
+            let (_, source) = storage
+                .insert_resolutions_with_confirmation(
+                    &["changed".into()],
+                    "resolved",
+                    "commit abc",
+                    Some("the claim"),
+                    Some(&receipt),
+                )
+                .unwrap();
+            assert_eq!(source, RESOLUTION_SOURCE_AGENT);
+        }
+        storage.with_connection(|c| {
+            let events:i64=c.query_row("SELECT COUNT(*) FROM provenance_events WHERE channel='user_confirmation' AND trust_tier=4 AND receipt_kind='elicitation_digest' AND receipt_ref=?1",[payload.digest()],|r|r.get(0))?;
+            assert_eq!(events,2,"later confirmations append new immutable events");
+            let supported:i64=c.query_row("SELECT COUNT(*) FROM resolution_ledger r JOIN provenance_events e ON e.event_id=r.event_id WHERE r.min_trust=4 AND r.source='user_confirmed'",[],|r|r.get(0))?;
+            assert_eq!(supported,4);
+            let unsupported:i64=c.query_row("SELECT COUNT(*) FROM resolution_ledger WHERE source='agent' AND min_trust=0 AND event_id IS NULL",[],|r|r.get(0))?;
+            assert_eq!(unsupported,2);
+            assert!(c.execute("UPDATE provenance_events SET receipt_ref='changed' WHERE channel='user_confirmation'",[]).is_err());
+            Ok(())
+        }).unwrap();
+        assert!(resolution_confirmation_from_response(
+            &payload,
+            Err::<ElicitResult, _>("unsupported client")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn resolution_payload_is_canonical_and_digest_bound() {
+        let payload = sample_resolution_payload();
+        assert_eq!(
+            payload.canonical_json(),
+            r#"{"chunk_ids":["chunk-2","chunk-1"],"status":"resolved","claim":"the claim","evidence":"commit abc"}"#
+        );
+        assert_eq!(
+            payload.digest(),
+            "2db459422f7fa3e1e5b669cd2b2eb33be2f75791460a56082a5629601fe23419"
+        );
+    }
+
+    #[test]
+    fn only_exact_accepted_resolution_payload_is_user_confirmed() {
+        let payload = sample_resolution_payload();
+        let accepted =
+            ElicitResult::new(ElicitationAction::Accept).with_content(serde_json::json!({
+                "confirm": true,
+                "canonical_payload": payload.canonical_json(),
+                "payload_digest": payload.digest(),
+            }));
+
+        assert_eq!(
+            resolution_source_from_response(&payload, Ok::<_, &str>(accepted)),
+            RESOLUTION_SOURCE_USER_CONFIRMED
+        );
+    }
+
+    #[test]
+    fn unsupported_client_and_payload_mismatch_stay_agent_sourced() {
+        let payload = sample_resolution_payload();
+        assert_eq!(
+            resolution_source_from_response(
+                &payload,
+                Err::<ElicitResult, _>("client does not support elicitation"),
+            ),
+            RESOLUTION_SOURCE_AGENT
+        );
+
+        let mismatched =
+            ElicitResult::new(ElicitationAction::Accept).with_content(serde_json::json!({
+                "confirm": true,
+                "canonical_payload": "{}",
+                "payload_digest": payload.digest(),
+            }));
+        assert_eq!(
+            resolution_source_from_response(&payload, Ok::<_, &str>(mismatched)),
+            RESOLUTION_SOURCE_AGENT
+        );
+    }
+
+    #[test]
+    fn decline_cancel_and_incomplete_accept_stay_agent_sourced() {
+        let payload = sample_resolution_payload();
+        for response in [
+            ElicitResult::new(ElicitationAction::Decline),
+            ElicitResult::new(ElicitationAction::Cancel),
+            ElicitResult::new(ElicitationAction::Accept),
+        ] {
+            assert_eq!(
+                resolution_source_from_response(&payload, Ok::<_, &str>(response)),
+                RESOLUTION_SOURCE_AGENT
+            );
+        }
     }
 }

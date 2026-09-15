@@ -1,13 +1,16 @@
 //! Evaluation framework for csr-engine.
 //!
-//! Quick mode: 5 core tests (<30s)
-//! Full mode: 20 tests (~2 min)
+//! Quick mode: 5 core tests plus the persisted trained-reranker gate (<30s)
+//! Full mode: 20 tests plus the persisted trained-reranker gate (~2 min)
 //! Continuity mode: the North Star gate — CSR must recall its own vision with
 //! provenance, beating a grep baseline (`csr-engine eval --continuity`).
 
+pub mod bench;
 pub mod codegraph;
 pub mod continuity;
+pub mod lessons;
 pub mod provenance;
+pub mod trained_rerank;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -90,7 +93,7 @@ impl EvalReport {
     }
 }
 
-/// Run quick evaluation (5 tests).
+/// Run quick evaluation (5 core tests plus the trained-reranker gate).
 pub async fn run_quick(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
@@ -105,6 +108,7 @@ pub async fn run_quick(
     results.push(test_performance(embeddings, search).await);
     results.push(test_cache_status(index_dir));
     results.push(test_tool_count());
+    results.push(trained_rerank::latest_gate_result(storage));
 
     EvalReport {
         results,
@@ -112,7 +116,7 @@ pub async fn run_quick(
     }
 }
 
-/// Run full evaluation (20 tests).
+/// Run full evaluation (20 core tests plus the trained-reranker gate).
 pub async fn run_full(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
@@ -122,12 +126,13 @@ pub async fn run_full(
     let start = Instant::now();
     let mut results = Vec::new();
 
-    // Quick tests (5)
+    // Quick tests (5 core + trained-reranker gate)
     results.push(test_db_connectivity(storage));
     results.push(test_search_accuracy(storage, embeddings, search).await);
     results.push(test_performance(embeddings, search).await);
     results.push(test_cache_status(index_dir));
     results.push(test_tool_count());
+    results.push(trained_rerank::latest_gate_result(storage));
 
     // Semantic search tests (5)
     results.push(
@@ -353,11 +358,21 @@ fn test_tool_count() -> EvalResult {
     let t = Instant::now();
     // Counted from the live rmcp router, not a constant — a hardcoded expectation
     // sat at 14 while the server shipped 15 tools (silently-inert eval).
-    let actual = crate::mcp::CsrServer::tool_count();
-    let expected = 15;
-    let detail = format!("{actual} MCP tools defined (expected {expected})");
+    // 16 as of csr_transcript (transcript-query-tool-design.md phase 3).
+    //
+    // A bare count only proves *some* 16 tools exist — it would still pass
+    // if csr_transcript were silently dropped and replaced by a duplicate
+    // of another tool. Assert the specific named tool is present too
+    // (adversarial review finding 6).
+    let names = crate::mcp::CsrServer::tool_names();
+    let actual = names.len();
+    let expected = 16;
+    let has_transcript = names.iter().any(|n| n == "csr_transcript");
+    let detail = format!(
+        "{actual} MCP tools defined (expected {expected}); csr_transcript present={has_transcript}"
+    );
     let ms = t.elapsed().as_secs_f64() * 1000.0;
-    if actual == expected {
+    if actual == expected && has_transcript {
         EvalResult::pass("Tool Count", "infrastructure", ms, detail)
     } else {
         EvalResult::fail("Tool Count", "infrastructure", ms, detail)
@@ -739,7 +754,7 @@ async fn test_search_latency_p95(
         .unwrap_or(0.0);
     let ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    if p95 < 10.0 {
+    if search_latency_passes(p95) {
         EvalResult::pass(
             "Search Latency P95",
             "performance",
@@ -751,14 +766,24 @@ async fn test_search_latency_p95(
             "Search Latency P95",
             "performance",
             ms,
-            format!("p95: {p95:.2}ms (target <10ms)"),
+            format!("p95: {p95:.2}ms (target <1ms)"),
         )
     }
+}
+
+fn search_latency_passes(p95_ms: f64) -> bool {
+    p95_ms < 1.0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_latency_gate_enforces_sub_millisecond_p95() {
+        assert!(search_latency_passes(0.999));
+        assert!(!search_latency_passes(1.0));
+    }
 
     #[test]
     fn test_eval_result_formatting() {
@@ -801,5 +826,49 @@ mod tests {
             "Quality analysis should pass: {}",
             result.detail
         );
+    }
+
+    // ─── adversarial review finding 6: tool-count gate must name csr_transcript ───
+
+    #[test]
+    fn test_tool_count_gate_asserts_csr_transcript_present() {
+        let result = test_tool_count();
+        assert!(
+            result.passed,
+            "tool count gate should pass: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("csr_transcript present=true"),
+            "gate detail must name csr_transcript explicitly, got: {}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn test_csr_transcript_tool_schema_and_annotations() {
+        let tool = crate::mcp::CsrServer::find_tool("csr_transcript")
+            .expect("csr_transcript must be registered in the rmcp tool router");
+
+        // Schema generation actually ran (not a degenerate/empty schema):
+        // the two required params show up as real object-schema properties.
+        let props = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("csr_transcript input_schema must have a properties object");
+        assert!(
+            props.contains_key("session"),
+            "schema missing 'session' property"
+        );
+        assert!(props.contains_key("view"), "schema missing 'view' property");
+
+        let annotations = tool
+            .annotations
+            .as_ref()
+            .expect("csr_transcript must declare tool annotations");
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert_eq!(annotations.idempotent_hint, Some(true));
     }
 }

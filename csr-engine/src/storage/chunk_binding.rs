@@ -20,15 +20,11 @@
 //!    where `receipt_oid` is the receipt of the most recent negative event
 //!    for the symbol.
 //!
-//! Rationale: symbol-level binding cannot attribute staleness to individual
-//! chunk COHORTS — chunks minted in the A era and chunks minted in the B
-//! era share the same `(conversation -> symbol)` binding, so demoting on
-//! evolution would punish current-truth chunks alongside stale ones. v10
-//! therefore never demotes on evolution — it annotates with the receipt and
-//! lets the reader decide. (Corollary: a fully-reverted A -> B -> A still
-//! surfaces as Annotate, because B's witness keeps an uncancelled negative
-//! event while the A witnesses are intact at HEAD — "the symbol carries
-//! history of a rejected change".)
+//! Exact `witness_chunk_bindings` carry the stable chunk id to consumers.
+//! Legacy witnesses without that relation surface a conversation-only hit;
+//! the storage facade may safely recover it only when the complete persisted
+//! conversation has one chunk. Ambiguous multi-chunk legacy evidence abstains
+//! instead of guessing from chunk text or demoting siblings.
 //!
 //! # The actual link: `code_nodes.first_conv_id` / `last_conv_id`
 //!
@@ -89,10 +85,12 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::codegraph::{self, NodeRow};
-use super::witness_verdicts::{self, VerdictChannel};
+use super::witness_verdicts;
+#[cfg(test)]
+use super::witness_verdicts::VerdictChannel;
 
 use super::witness_ledger::WITNESS_EXTRACTOR_VERSION as CURRENT_EXTRACTOR_VERSION;
 
@@ -333,25 +331,7 @@ fn selected_lineage(
     Ok(selection)
 }
 
-/// One verdict hit surfaced for a chunk's conversation — carries the
-/// two-channel contract's `channel` (see the module doc's "Two-channel
-/// consumption") alongside the raw verdict and receipt.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ChunkWitnessVerdict {
-    pub file: String,
-    /// `None` only if a future caller ever binds against a whole-file
-    /// witness; `nodes_for_conversations` only returns symbol-level nodes
-    /// today, so this is always `Some` in practice.
-    pub symbol: Option<String>,
-    /// `Demote` (rank-affecting: symbol gone/fully stale at HEAD) or
-    /// `Annotate` (no rank effect: "symbol evolved since earlier evidence;
-    /// current as of `receipt_oid`").
-    pub channel: VerdictChannel,
-    /// `"anchor_obsolete"` | `"superseded_by"` — always negative (reinstated
-    /// verdicts are filtered out before a row is ever constructed).
-    pub verdict: &'static str,
-    pub receipt_oid: Option<String>,
-}
+pub use super::witness_verdicts::ChunkWitnessVerdict;
 
 /// The two known container separators `import::backfill::container_spans`
 /// mints (`"::"` for Rust, `"."` for the rest) — see this module's doc
@@ -454,7 +434,8 @@ fn resolve_bound_symbol(witness_symbols: &[String], bare_name: &str) -> Option<S
 
 /// Given conversation/chunk identifiers appearing in search results, resolve
 /// their bound witnesses via the code graph and return, per conversation, a
-/// `Vec` of `{file, symbol, channel: Demote|Annotate, verdict, receipt_oid}`
+/// `Vec` of `{chunk_id, file, symbol, channel: Demote|Annotate, verdict,
+/// receipt_oid}`
 /// hits per `witness_verdicts::symbol_verdict_state`'s order-independent
 /// two-channel rule (see the module doc's "Two-channel consumption" and
 /// that module's "Symbol-level current state"). Conversation ids whose
@@ -554,7 +535,39 @@ pub fn witness_verdict_for_chunks(
         resolved.push((*idx, convs, bound_symbol));
     }
 
-    let states = witness_verdicts::symbol_verdict_states_for_lineages(&tx, &state_anchors)?;
+    let mut states = witness_verdicts::symbol_verdict_states_for_lineages(&tx, &state_anchors)?;
+    // Legacy-lineage fallback (annotate channel only): when a file has a
+    // rederived-v2 generation, the anchor filter above restricts verdicts to
+    // that lineage — silently hiding every verdict recorded on the file's
+    // pre-rederivation witnesses (observed live: 545/545 verdicts invisible
+    // in search, 2026-08-09). A negative latest event on the SAME
+    // (project,file,symbol) in the legacy lineage is still true history for
+    // the conversations that produced that code, so it surfaces as an
+    // annotation with its receipt — but it is forced onto the Annotate
+    // channel: only strictly-current-lineage states may ever demote.
+    {
+        let missing: Vec<(String, String, String, Option<String>)> = state_anchors
+            .iter()
+            .filter(|(project, file, symbol, source_id)| {
+                source_id.is_some()
+                    && !states.contains_key(&(project.clone(), file.clone(), symbol.clone()))
+            })
+            .map(|(project, file, symbol, _)| (project.clone(), file.clone(), symbol.clone(), None))
+            .collect();
+        if !missing.is_empty() {
+            let legacy = witness_verdicts::symbol_verdict_states_for_lineages(&tx, &missing)?;
+            for (key, mut state) in legacy {
+                state.channel = witness_verdicts::VerdictChannel::Annotate;
+                states.entry(key).or_insert(state);
+            }
+        }
+    }
+    let negative_witness_ids: Vec<i64> = states
+        .values()
+        .flat_map(|state| state.negative_witness_ids.iter().copied())
+        .collect();
+    let chunk_bindings =
+        witness_verdicts::chunk_bindings_for_witnesses(&tx, &negative_witness_ids)?;
 
     for (idx, convs, bound_symbol) in resolved {
         let node = &nodes[idx];
@@ -572,6 +585,7 @@ pub fn witness_verdict_for_chunks(
         );
 
         let hit = ChunkWitnessVerdict {
+            chunk_id: String::new(),
             file: node.file.clone(),
             symbol: Some(bound_symbol.clone()),
             channel: state.channel,
@@ -579,7 +593,27 @@ pub fn witness_verdict_for_chunks(
             receipt_oid: state.representative.receipt_oid.clone(),
         };
         for conv in convs {
-            out.entry(conv.clone()).or_default().push(hit.clone());
+            let mut exact_chunk_ids = BTreeSet::new();
+            let mut has_exact_binding = false;
+            for witness_id in &state.negative_witness_ids {
+                if let Some(bindings) = chunk_bindings.get(witness_id) {
+                    has_exact_binding = true;
+                    for (chunk_id, conversation_id) in bindings {
+                        if conversation_id == conv {
+                            exact_chunk_ids.insert(chunk_id.clone());
+                        }
+                    }
+                }
+            }
+            if has_exact_binding {
+                for chunk_id in exact_chunk_ids {
+                    let mut bound_hit = hit.clone();
+                    bound_hit.chunk_id = chunk_id;
+                    out.entry(conv.clone()).or_default().push(bound_hit);
+                }
+            } else {
+                out.entry(conv.clone()).or_default().push(hit.clone());
+            }
         }
     }
 
@@ -1493,6 +1527,98 @@ mod tests {
         assert!(
             out.is_empty(),
             "newer HEAD's two candidates must abstain; late older HEAD must not win by row id"
+        );
+    }
+
+    #[test]
+    fn legacy_lineage_verdict_surfaces_as_annotation_when_rederived_lineage_is_clean() {
+        // Live-corpus shape (2026-08-09): a file has a complete rederived-v2
+        // generation with NO verdicts, while the superseded_by verdict sits on
+        // an older legacy `backfill` witness. The lineage-restricted lookup
+        // alone hides all such verdicts (observed: 545/545 invisible in
+        // search). The legacy fallback must surface it — Annotate channel
+        // only, never demote.
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_COMMON_DIR")
+                .env("GIT_AUTHOR_NAME", "CSR Test")
+                .env("GIT_AUTHOR_EMAIL", "csr@example.invalid")
+                .env("GIT_COMMITTER_NAME", "CSR Test")
+                .env("GIT_COMMITTER_EMAIL", "csr@example.invalid")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        std::fs::write(repo.join("history.txt"), "one\n").unwrap();
+        assert!(git(&["add", "history.txt"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "one"]).status.success());
+        let old_head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        std::fs::write(repo.join("history.txt"), "two\n").unwrap();
+        assert!(git(&["add", "history.txt"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "two"]).status.success());
+        let new_head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let conn = open();
+        upsert_node(&conn, &node("shared", "conv-1", "conv-1")).unwrap();
+        let repo_root = repo.to_string_lossy();
+
+        // Selected lineage: complete rederived generation at HEAD, clean.
+        let mut current = ledger_row("Outer::shared", &new_head, "b3:new");
+        current.source_kind = "backfill_rederived_v2".into();
+        current.source_id = Some("run-new".into());
+        witness_ledger::insert_witness(&conn, &current).unwrap();
+        generation(&conn, "run-new", &new_head, "complete", Some(&repo_root));
+
+        // Legacy witness (plain backfill) carrying the only verdict.
+        let legacy = ledger_row("Outer::shared", &old_head, "b3:old");
+        witness_ledger::insert_witness(&conn, &legacy).unwrap();
+        let legacy_id = witness_ledger::latest_witness_for_symbol(
+            &conn,
+            "proj",
+            "/repo/src/lib.rs",
+            Some("Outer::shared"),
+        )
+        .unwrap()
+        .unwrap()
+        .id;
+        witness_verdicts::insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id: legacy_id,
+                verdict: VerdictKind::SupersededBy,
+                successor_witness_id: None,
+                receipt_oid: Some("receiptoid".into()),
+                observed_head_oid: new_head.clone(),
+            },
+        )
+        .unwrap();
+
+        let out = witness_verdict_for_chunks(&conn, &["conv-1".to_string()]).unwrap();
+        let hits = out
+            .get("conv-1")
+            .expect("legacy verdict must annotate the conversation");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].verdict, "superseded_by");
+        assert_eq!(hits[0].receipt_oid.as_deref(), Some("receiptoid"));
+        assert_eq!(
+            hits[0].channel,
+            witness_verdicts::VerdictChannel::Annotate,
+            "legacy-lineage fallback may only annotate, never demote"
         );
     }
 

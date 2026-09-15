@@ -20,6 +20,22 @@ pub struct SettledFact {
     pub claim: String,
     pub receipt: String,
     pub status: String,
+    pub source: String,
+}
+
+/// The one dream clause the recap may carry (Journal v4 P5, delivery channel
+/// (b)). Constructed only from a stored, receipt-bearing conclusion — there
+/// is no constructor that can produce one without a receipt, which is why
+/// the clause cannot be emitted unreceipted.
+pub struct DreamClause {
+    /// Symbol or file basename the conclusion is about.
+    pub label: String,
+    /// Plain-English phrasing of the stored verdict.
+    pub verdict: String,
+    /// Commit receipt proving it. Mandatory.
+    pub receipt: String,
+    /// `YYYY-MM-DD` the verdict was witnessed.
+    pub date: String,
 }
 
 /// A previously held line invalidated while the user was away.
@@ -27,6 +43,36 @@ pub struct RetiredLine {
     pub label: String,
     pub receipt_oid: String,
     pub date: String,
+}
+
+/// A recent user correction with its transcript receipt.
+pub struct CorrectionLine {
+    pub quote: String,
+    pub session8: String,
+    pub turn: u32,
+    pub date: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectionIdentity {
+    pub session8: String,
+    pub turn: u32,
+    pub date: String,
+}
+
+impl From<&CorrectionLine> for CorrectionIdentity {
+    fn from(line: &CorrectionLine) -> Self {
+        Self {
+            session8: line.session8.clone(),
+            turn: line.turn,
+            date: line.date.clone(),
+        }
+    }
+}
+
+pub struct ComposedRecap {
+    pub text: String,
+    pub corrections: Vec<CorrectionIdentity>,
 }
 
 /// Evidence feeds supplied by storage.
@@ -38,8 +84,20 @@ pub struct RecapFeeds {
     pub settled: Vec<SettledFact>,
     pub still_open: Vec<SettledFact>,
     pub retired_while_away: Vec<RetiredLine>,
+    pub corrections: Vec<CorrectionLine>,
     pub open_proposals: usize,
+    /// The top undelivered dream for this project, or `None`. `None` drops
+    /// the `Dreamt:` clause entirely — the clause is never emitted with a
+    /// placeholder, a hedge, or a receiptless label.
+    pub top_dream: Option<DreamClause>,
 }
+
+/// The clause prefix the dream delivery uses. Exposed so the caller can
+/// verify the clause actually survived the recap's character budget before
+/// recording a delivery — recording one for a clause that got dropped would
+/// claim the user was shown something they were not.
+pub const DREAM_CLAUSE_PREFIX: &str = "Dreamt: ";
+pub const CORRECTION_CLAUSE_PREFIX: &str = "Corrected: ";
 
 /// Compose an evidence-backed recap without reading external state.
 pub fn compose_recap(
@@ -47,9 +105,17 @@ pub fn compose_recap(
     feeds: &RecapFeeds,
     age: &str,
 ) -> Option<String> {
+    compose_recap_with_deliveries(ep, feeds, age).map(|composed| composed.text)
+}
+
+pub fn compose_recap_with_deliveries(
+    ep: &crate::hooks::stop::Episode,
+    feeds: &RecapFeeds,
+    age: &str,
+) -> Option<ComposedRecap> {
     const MAX_CHARS: usize = 700;
 
-    use crate::extraction::provenance::extractable;
+    use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
 
     let intent = extractable(&ep.request)
         .map(|text| compact_preview(&text, 80))
@@ -71,11 +137,17 @@ pub fn compose_recap(
         (None, Some(completed)) => format!("recap [{age}]: {}", terminate_clause(completed)),
         (None, None) => unreachable!("empty episodes abstain above"),
     };
+    // Machine-owned sentinel, accounted for INSIDE the MAX_CHARS budget below
+    // (not appended after trimming) — every downstream clause-drop decision
+    // already sees its true cost via `recap.chars().count()`.
+    recap.push(' ');
+    recap.push_str(RECAP_SENTINEL);
 
     let settled_entries: Vec<String> = feeds
         .settled
         .iter()
         .filter(|fact| fact.status == "resolved")
+        .filter(|fact| fact.source == "user_confirmed")
         .filter(|fact| !normalize_feed_text(&fact.receipt).is_empty())
         .take(3)
         .map(format_fact)
@@ -95,9 +167,10 @@ pub fn compose_recap(
         feeds
             .still_open
             .iter()
-            .take(STILL_OPEN_LIMIT)
             .filter(|fact| fact.status != "resolved")
+            .filter(|fact| fact.source == "user_confirmed")
             .filter(|fact| !normalize_feed_text(&fact.receipt).is_empty())
+            .take(STILL_OPEN_LIMIT)
             .map(format_fact),
     );
     if feeds.open_proposals > 0 {
@@ -111,9 +184,9 @@ pub fn compose_recap(
         .iter()
         .filter(|todo| todo.status != "completed")
         .count();
-    if open_todos > 0 {
-        now_parts.push(format!("{open_todos} todos open"));
-    }
+    let todo_entry = (open_todos > 0).then(|| format!("{open_todos} todos open"));
+    let priority_now_entries = usize::from(!now_parts.is_empty());
+    now_parts.extend(todo_entry);
     let next = ep.next_steps.as_deref().and_then(next_preview).or_else(|| {
         ep.todos
             .iter()
@@ -137,43 +210,79 @@ pub fn compose_recap(
         .collect();
     let next_line = next.map(|next| format!("Next: {next}."));
 
-    // Reserve one whole entry for every eligible evidence-list clause before
-    // using any residual budget for extras. If the minimum set itself cannot
-    // fit, drop its largest list clause rather than truncating an entry.
+    let correction_entries: Vec<String> = feeds
+        .corrections
+        .iter()
+        .take(2)
+        .map(|line| {
+            format!(
+                "{} ({}:{}, {})",
+                compact_preview(&normalize_feed_text(&line.quote), 90),
+                normalize_feed_text(&line.session8),
+                line.turn,
+                normalize_feed_text(&line.date)
+            )
+        })
+        .collect();
+
+    // Journal v4 P5 delivery channel (b): one clause naming the top dream and
+    // its receipt. Same evidence gating as every other clause — no feed, no
+    // clause; and the feed itself cannot carry a receiptless conclusion.
+    let dream_entries: Vec<String> = feeds
+        .top_dream
+        .iter()
+        .filter(|dream| !normalize_feed_text(&dream.receipt).is_empty())
+        .filter(|dream| has_substance(&normalize_feed_text(&dream.label)))
+        .map(|dream| {
+            format!(
+                "{} {} ({}, {})",
+                normalize_feed_text(&dream.label),
+                normalize_feed_text(&dream.verdict),
+                normalize_feed_text(&dream.date),
+                normalize_feed_text(&dream.receipt)
+            )
+        })
+        .collect();
+
     let mut clauses = [
         ListClause::new("Settled: ", "; ", settled_entries),
         ListClause::new("Now: ", " | ", now_parts),
+        ListClause::new(CORRECTION_CLAUSE_PREFIX, "; ", correction_entries),
         ListClause::new("Learnt-then-retired while away: ", "; ", retired_entries),
+        ListClause::new(DREAM_CLAUSE_PREFIX, "; ", dream_entries),
     ];
-    let mut used = recap.chars().count()
+    const SETTLED: usize = 0;
+    const NOW: usize = 1;
+    const CORRECTED: usize = 2;
+    const RETIRED: usize = 3;
+    const DREAMT: usize = 4;
+
+    // Explicit evidence priority: Next is reserved above every list clause;
+    // substantive Now entries precede the first Settled fact, then Corrected.
+    // Lower-value extras consume only the residual budget.
+    let used = recap.chars().count()
         + next_line
             .as_ref()
-            .map_or(0, |line| line.chars().count() + 1)
-        + clauses
-            .iter()
-            .map(ListClause::reserved_chars)
-            .sum::<usize>();
-
-    while used > MAX_CHARS {
-        let Some((index, chars)) = clauses
-            .iter()
-            .enumerate()
-            .filter_map(|(index, clause)| {
-                let chars = clause.reserved_chars();
-                (chars > 0).then_some((index, chars))
-            })
-            .max_by_key(|(_, chars)| *chars)
-        else {
-            break;
-        };
-        clauses[index].drop_entries();
-        used -= chars;
-    }
-
+            .map_or(0, |line| line.chars().count() + 1);
     let mut remaining = MAX_CHARS.saturating_sub(used);
-    for clause in &mut clauses {
-        clause.add_entries_within(&mut remaining);
+    for _ in 0..priority_now_entries {
+        if !clauses[NOW].add_one_within(&mut remaining) {
+            break;
+        }
     }
+    clauses[SETTLED].add_one_within(&mut remaining);
+    while clauses[CORRECTED].add_one_within(&mut remaining) {}
+    while clauses[SETTLED].add_one_within(&mut remaining) {}
+    while clauses[RETIRED].add_one_within(&mut remaining) {}
+    while clauses[DREAMT].add_one_within(&mut remaining) {}
+    while clauses[NOW].add_one_within(&mut remaining) {}
+
+    let rendered_corrections = feeds
+        .corrections
+        .iter()
+        .take(clauses[CORRECTED].selected)
+        .map(CorrectionIdentity::from)
+        .collect();
 
     for line in clauses
         .iter()
@@ -184,7 +293,10 @@ pub fn compose_recap(
         recap.push_str(&line);
     }
 
-    Some(recap)
+    Some(ComposedRecap {
+        text: recap,
+        corrections: rendered_corrections,
+    })
 }
 
 struct ListClause {
@@ -196,35 +308,29 @@ struct ListClause {
 
 impl ListClause {
     fn new(prefix: &'static str, separator: &'static str, entries: Vec<String>) -> Self {
-        let selected = usize::from(!entries.is_empty());
         Self {
             prefix,
             separator,
             entries,
-            selected,
+            selected: 0,
         }
     }
 
-    fn reserved_chars(&self) -> usize {
-        self.render().map_or(0, |line| line.chars().count() + 1)
-    }
-
-    fn drop_entries(&mut self) {
-        self.selected = 0;
-    }
-
-    fn add_entries_within(&mut self, remaining: &mut usize) {
-        if self.selected == 0 {
-            return;
+    fn add_one_within(&mut self, remaining: &mut usize) -> bool {
+        let Some(entry) = self.entries.get(self.selected) else {
+            return false;
+        };
+        let needed = if self.selected == 0 {
+            self.prefix.chars().count() + entry.chars().count() + 2
+        } else {
+            self.separator.chars().count() + entry.chars().count()
+        };
+        if needed > *remaining {
+            return false;
         }
-        while let Some(entry) = self.entries.get(self.selected) {
-            let needed = self.separator.chars().count() + entry.chars().count();
-            if needed > *remaining {
-                break;
-            }
-            *remaining -= needed;
-            self.selected += 1;
-        }
+        *remaining -= needed;
+        self.selected += 1;
+        true
     }
 
     fn render(&self) -> Option<String> {
@@ -476,6 +582,7 @@ fn sanitize_preview(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
     use crate::hooks::stop::{Episode, TodoItem};
 
     fn episode() -> Episode {
@@ -507,6 +614,12 @@ mod tests {
             ],
             approved_plan: None,
             prev_episode_id: None,
+            error_count: None,
+            top_errors: vec![],
+            steer_count: None,
+            steers: vec![],
+            instrumentation_version: None,
+            correction_count: None,
             anchors: vec![],
         }
     }
@@ -518,24 +631,29 @@ mod tests {
                     claim: "schema is stable".into(),
                     receipt: "810283b".into(),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 },
                 SettledFact {
                     claim: "queries are indexed".into(),
                     receipt: "T2 2026-07-27".into(),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 },
             ],
             still_open: vec![SettledFact {
                 claim: "Windows path behavior".into(),
                 receipt: "91abcde".into(),
                 status: "still_open".into(),
+                source: "user_confirmed".into(),
             }],
             retired_while_away: vec![RetiredLine {
                 label: "old schema assumption".into(),
                 receipt_oid: "77fedca".into(),
                 date: "2026-08-06".into(),
             }],
+            corrections: vec![],
             open_proposals: 2,
+            top_dream: None,
         }
     }
 
@@ -544,7 +662,7 @@ mod tests {
         let got = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
         assert_eq!(
             got,
-            "recap [28m ago]: Fix the recap composer: Implemented deterministic recap output.\n\
+            "recap [28m ago]: Fix the recap composer: Implemented deterministic recap output. [[CSR:RECAP]]\n\
              Settled: schema is stable (810283b); queries are indexed (T2 2026-07-27).\n\
              Now: waiting for storage migration | Windows path behavior (91abcde) | 2 proposals awaiting csr_resolve | 1 todos open.\n\
              Learnt-then-retired while away: old schema assumption (superseded 2026-08-06, 77fedca).\n\
@@ -653,11 +771,13 @@ mod tests {
                     claim: "unreceipted".into(),
                     receipt: "".into(),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 },
                 SettledFact {
                     claim: "receipted".into(),
                     receipt: "abc1234".into(),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 },
             ],
             ..RecapFeeds::empty()
@@ -675,11 +795,13 @@ mod tests {
                     claim: "actually resolved".into(),
                     receipt: "abc1234".into(),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 },
                 SettledFact {
                     claim: "still open in settled feed".into(),
                     receipt: "def5678".into(),
                     status: "still_open".into(),
+                    source: "user_confirmed".into(),
                 },
             ],
             still_open: vec![
@@ -687,11 +809,13 @@ mod tests {
                     claim: "actually open".into(),
                     receipt: "fed4321".into(),
                     status: "regressed".into(),
+                    source: "user_confirmed".into(),
                 },
                 SettledFact {
                     claim: "resolved in open feed".into(),
                     receipt: "cba8765".into(),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 },
             ],
             ..RecapFeeds::empty()
@@ -705,6 +829,39 @@ mod tests {
     }
 
     #[test]
+    fn agent_resolution_never_renders_as_settled_or_user_open_state() {
+        let feeds = RecapFeeds {
+            settled: vec![SettledFact {
+                claim: "agent claimed completion".into(),
+                receipt: "agent123".into(),
+                status: "resolved".into(),
+                source: "agent".into(),
+            }],
+            still_open: vec![
+                SettledFact {
+                    claim: "agent claimed blocker".into(),
+                    receipt: "agent456".into(),
+                    status: "still_open".into(),
+                    source: "agent".into(),
+                },
+                SettledFact {
+                    claim: "confirmed blocker".into(),
+                    receipt: "user789".into(),
+                    status: "still_open".into(),
+                    source: "user_confirmed".into(),
+                },
+            ],
+            ..RecapFeeds::empty()
+        };
+
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        assert!(!got.contains("Settled:"));
+        assert!(!got.contains("agent claimed completion"));
+        assert!(!got.contains("agent claimed blocker"));
+        assert!(got.contains("confirmed blocker"));
+    }
+
+    #[test]
     fn bounds_still_open_facts_to_shared_query_limit() {
         let feeds = RecapFeeds {
             still_open: (0..=STILL_OPEN_LIMIT)
@@ -712,6 +869,7 @@ mod tests {
                     claim: format!("open fact {index}"),
                     receipt: format!("oid{index:04}"),
                     status: "still_open".into(),
+                    source: "user_confirmed".into(),
                 })
                 .collect(),
             ..RecapFeeds::empty()
@@ -752,6 +910,7 @@ mod tests {
                 claim: "done".into(),
                 receipt: "abc1234".into(),
                 status: "resolved".into(),
+                source: "user_confirmed".into(),
             }],
             ..RecapFeeds::empty()
         };
@@ -782,6 +941,7 @@ mod tests {
                     claim: format!("{}-{n}", "settled".repeat(30)),
                     receipt: format!("receipt{n}"),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 })
                 .collect(),
             still_open: (0..4)
@@ -789,6 +949,7 @@ mod tests {
                     claim: format!("{}-{n}", "open".repeat(30)),
                     receipt: format!("openoid{n}"),
                     status: "still_open".into(),
+                    source: "user_confirmed".into(),
                 })
                 .collect(),
             retired_while_away: vec![RetiredLine {
@@ -796,7 +957,9 @@ mod tests {
                 receipt_oid: "retired-receipt".into(),
                 date: "2026-08-07".into(),
             }],
+            corrections: vec![],
             open_proposals: 8,
+            top_dream: None,
         };
         let got = compose_recap(&ep, &feeds, "now").unwrap();
         assert!(got.chars().count() <= 700);
@@ -815,6 +978,7 @@ mod tests {
                 claim: "CSR CONTINUUM retained evidence".into(),
                 receipt: "abc1234".into(),
                 status: "resolved".into(),
+                source: "user_confirmed".into(),
             }],
             ..RecapFeeds::empty()
         };
@@ -848,7 +1012,10 @@ mod tests {
         ep.todos.clear();
         ep.blockers = None;
         let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
-        assert_eq!(got, "recap [now]: Implemented deterministic recap output.");
+        assert_eq!(
+            got,
+            "recap [now]: Implemented deterministic recap output. [[CSR:RECAP]]"
+        );
     }
 
     #[test]
@@ -885,6 +1052,7 @@ mod tests {
                     claim: format!("{}-{n}", "settled evidence ".repeat(10)),
                     receipt: format!("settled{n}"),
                     status: "resolved".into(),
+                    source: "user_confirmed".into(),
                 })
                 .collect(),
             still_open: (0..4)
@@ -892,6 +1060,7 @@ mod tests {
                     claim: format!("{}-{n}", "open evidence ".repeat(10)),
                     receipt: format!("openoid{n}"),
                     status: "still_open".into(),
+                    source: "user_confirmed".into(),
                 })
                 .collect(),
             retired_while_away: vec![RetiredLine {
@@ -899,7 +1068,9 @@ mod tests {
                 receipt_oid: "77fedca".into(),
                 date: "2026-08-06".into(),
             }],
+            corrections: vec![],
             open_proposals: 3,
+            top_dream: None,
         };
         let got = compose_recap(&episode(), &feeds, "28m ago").unwrap();
         assert!(got.contains("\nSettled:"));
@@ -917,6 +1088,7 @@ mod tests {
                 claim: "CSR CONTINUUM\nretained\tevidence".into(),
                 receipt: "abc\n1234".into(),
                 status: "resolved".into(),
+                source: "user_confirmed".into(),
             }],
             retired_while_away: vec![RetiredLine {
                 label: "old\nline".into(),
@@ -938,7 +1110,9 @@ mod tests {
                 settled: vec![],
                 still_open: vec![],
                 retired_while_away: vec![],
+                corrections: vec![],
                 open_proposals: 0,
+                top_dream: None,
             }
         }
     }
@@ -1014,5 +1188,295 @@ mod tests {
         assert!(!got.contains(",..."), "comma against ellipsis: {got:?}");
         assert!(!got.contains(": - "), "flattened bullet: {got:?}");
         assert!(!got.contains("Next:"), "next was fabricated: {got:?}");
+    }
+
+    // ---- Journal v4 P5: the dream clause (delivery channel (b)) ----------
+
+    fn dream() -> DreamClause {
+        DreamClause {
+            label: "parse_config".into(),
+            verdict: "went stale".into(),
+            receipt: "abc1234".into(),
+            date: "2026-08-11".into(),
+        }
+    }
+
+    #[test]
+    fn dream_clause_names_the_conclusion_with_its_receipt() {
+        let feeds = RecapFeeds {
+            top_dream: Some(dream()),
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        assert!(
+            got.contains("Dreamt: parse_config went stale (2026-08-11, abc1234)."),
+            "clause missing or unreceipted: {got}"
+        );
+    }
+
+    #[test]
+    fn correction_clause_follows_now_with_bounded_quote_and_receipt() {
+        let feeds = RecapFeeds {
+            corrections: vec![CorrectionLine {
+                quote: "Never bypass verification, even when the quote is deliberately made much longer than ninety characters for this regression".into(),
+                session8: "abcdef12".into(),
+                turn: 9,
+                date: "2026-09-01".into(),
+            }],
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        let now = got.find("Now: ").unwrap();
+        let corrected = got.find("Corrected: ").unwrap();
+        assert!(now < corrected, "{got}");
+        assert!(got.contains("(abcdef12:9, 2026-09-01)."), "{got}");
+        let entry = got
+            .split("Corrected: ")
+            .nth(1)
+            .unwrap()
+            .split(" (")
+            .next()
+            .unwrap();
+        assert!(entry.chars().count() <= 90, "{entry:?}");
+        assert!(got.chars().count() <= 700);
+    }
+
+    #[test]
+    fn correction_cannot_evict_first_settled_entry_at_701_chars() {
+        let feeds = RecapFeeds {
+            settled: vec![SettledFact {
+                claim: "s".repeat(393),
+                receipt: "abc1234".into(),
+                status: "resolved".into(),
+                source: "user_confirmed".into(),
+            }],
+            corrections: vec![CorrectionLine {
+                quote: "q".repeat(90),
+                session8: "abcdef12".into(),
+                turn: 9,
+                date: "2026-09-01".into(),
+            }],
+            ..RecapFeeds::empty()
+        };
+
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+
+        assert!(got.chars().count() <= 700, "budget exceeded: {got}");
+        assert!(got.contains("Settled: "), "first settled entry was evicted");
+        assert!(!got.contains(CORRECTION_CLAUSE_PREFIX), "{got}");
+        assert!(got.contains("Next: Run the integration suite."), "{got}");
+    }
+
+    #[test]
+    fn structured_deliveries_exclude_a_dropped_correction_even_when_body_echoes_marker() {
+        let mut ep = episode();
+        ep.request = "Corrected: note (abcdef12:9, 2026-09-01)".into();
+        let feeds = RecapFeeds {
+            settled: vec![SettledFact {
+                claim: "s".repeat(393),
+                receipt: "abc1234".into(),
+                status: "resolved".into(),
+                source: "user_confirmed".into(),
+            }],
+            corrections: vec![CorrectionLine {
+                quote: "q".repeat(90),
+                session8: "abcdef12".into(),
+                turn: 9,
+                date: "2026-09-01".into(),
+            }],
+            ..RecapFeeds::empty()
+        };
+
+        let composed = compose_recap_with_deliveries(&ep, &feeds, "now").unwrap();
+
+        assert!(composed
+            .text
+            .contains("Corrected: note (abcdef12:9, 2026-09-01)"));
+        assert!(!composed.text.contains("\nCorrected: "));
+        assert!(composed.corrections.is_empty());
+    }
+
+    #[test]
+    fn dream_clause_drops_entirely_without_a_feed() {
+        let got = compose_recap(&episode(), &RecapFeeds::empty(), "now").unwrap();
+        assert!(
+            !got.contains(DREAM_CLAUSE_PREFIX),
+            "no evidence must mean no clause: {got}"
+        );
+    }
+
+    #[test]
+    fn dream_clause_drops_when_the_receipt_is_missing() {
+        let feeds = RecapFeeds {
+            top_dream: Some(DreamClause {
+                receipt: "   ".into(),
+                ..dream()
+            }),
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        assert!(
+            !got.contains(DREAM_CLAUSE_PREFIX),
+            "a receiptless conclusion must never be named: {got}"
+        );
+    }
+
+    #[test]
+    fn dream_clause_drops_when_the_label_carries_no_substance() {
+        let feeds = RecapFeeds {
+            top_dream: Some(DreamClause {
+                label: "\u{2026}".into(),
+                ..dream()
+            }),
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        assert!(!got.contains(DREAM_CLAUSE_PREFIX), "{got}");
+    }
+
+    #[test]
+    fn dream_clause_obeys_the_same_character_budget_as_every_other_clause() {
+        let mut ep = episode();
+        ep.request = "r".repeat(200);
+        ep.completed = "c".repeat(250);
+        let feeds = RecapFeeds {
+            settled: (0..4)
+                .map(|n| SettledFact {
+                    claim: format!("{}-{n}", "settled".repeat(30)),
+                    receipt: format!("receipt{n}"),
+                    status: "resolved".into(),
+                    source: "user_confirmed".into(),
+                })
+                .collect(),
+            top_dream: Some(dream()),
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&ep, &feeds, "now").unwrap();
+        assert!(got.chars().count() <= 700);
+    }
+
+    // ---- T3: machine-owned recap sentinel — metamorphic wrapper tests ----
+    //
+    // These compose a REAL recap via the canonical producer (not a
+    // hand-built string) so coverage tracks what actually ships, then apply
+    // each adversarial wrapper transformation and assert the full
+    // extractable() pipeline still rejects the result. Non-tautological:
+    // this exercises extractable()'s prose-extraction grammar end to end,
+    // not is_csr_emission alone on the composer's raw output.
+
+    fn wrap_bullet(text: &str) -> String {
+        text.lines()
+            .map(|l| format!("- {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn wrap_blockquote(text: &str) -> String {
+        text.lines()
+            .map(|l| format!("> {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn wrap_emphasis(text: &str) -> String {
+        format!("**{text}**")
+    }
+
+    fn wrap_html(text: &str) -> String {
+        format!("<div class=\"recap\"><p>{text}</p></div>")
+    }
+
+    fn wrap_zero_width(text: &str) -> String {
+        text.chars().flat_map(|c| [c, '\u{200B}']).collect()
+    }
+
+    fn wrap_confusable_brackets(text: &str) -> String {
+        text.replace('[', "\u{FF3B}").replace(']', "\u{FF3D}")
+    }
+
+    fn wrap_long_preamble(text: &str) -> String {
+        format!(
+            "{}\n{text}",
+            "filler text that reads like real prose ".repeat(40)
+        )
+    }
+
+    #[test]
+    fn composed_recap_survives_bullet_wrapping() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(extractable(&wrap_bullet(&recap)).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_blockquote_wrapping() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(extractable(&wrap_blockquote(&recap)).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_emphasis_wrapping() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(extractable(&wrap_emphasis(&recap)).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_html_wrapping() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(extractable(&wrap_html(&recap)).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_zero_width_noise() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(extractable(&wrap_zero_width(&recap)).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_confusable_bracket_substitution() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(extractable(&wrap_confusable_brackets(&recap)).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_preamble_past_header_window() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        let wrapped = wrap_long_preamble(&recap);
+        assert!(wrapped.len() > 400, "preamble must exceed HEADER_WINDOW");
+        assert!(extractable(&wrapped).is_none());
+    }
+
+    #[test]
+    fn composed_recap_survives_stacked_wrapping() {
+        // Bullet + blockquote + zero-width noise + a long preamble, combined
+        // — the sentinel must survive all of it at once, not just one
+        // transformation at a time.
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        let stacked = wrap_long_preamble(&wrap_zero_width(&wrap_blockquote(&wrap_bullet(&recap))));
+        assert!(extractable(&stacked).is_none());
+    }
+
+    #[test]
+    fn composed_recap_always_carries_the_sentinel_within_budget() {
+        let recap = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
+        assert!(recap.contains(RECAP_SENTINEL));
+        assert!(recap.chars().count() <= 700);
+    }
+
+    // ---- negative corpus: genuine prose about recaps must stay extractable ----
+
+    #[test]
+    fn genuine_prose_mentioning_recaps_is_not_rejected() {
+        let samples = [
+            "Let's recap what we discussed: the login bug is fixed and deployed.",
+            "The recap feature works great, though it's verbose in the Now: clause sometimes.",
+            "I want to recap [the auth changes], then prioritize them.",
+            "Can you write a quick recap of yesterday's session for the standup?",
+        ];
+        for sample in samples {
+            assert!(
+                extractable(sample).is_some(),
+                "genuine prose wrongly rejected: {sample:?}"
+            );
+        }
     }
 }

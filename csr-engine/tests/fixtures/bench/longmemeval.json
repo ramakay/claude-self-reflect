@@ -1,0 +1,17 @@
+[
+  {
+    "question_id":"lm-1","question_type":"single-session-user","question":"What color was alpha?","question_date":"2026-01-03","answer":"cobalt","answer_session_ids":["lm-s1"],
+    "haystack_dates":["2026-01-01","2026-01-02"],"haystack_session_ids":["lm-s1","lm-s2"],
+    "haystack_sessions":[[{"role":"user","content":"alpha color"},{"role":"assistant","content":"cobalt"}],[{"role":"user","content":"beta color"},{"role":"assistant","content":"amber"}]]
+  },
+  {
+    "question_id":"lm-2","question_type":"multi-session","question":"Which sessions mention a color?","question_date":"2026-01-04","answer":"both","answer_session_ids":["lm-s1","lm-s2"],
+    "haystack_dates":["2026-01-01","2026-01-02"],"haystack_session_ids":["lm-s1","lm-s2"],
+    "haystack_sessions":[[{"role":"user","content":"alpha color"},{"role":"assistant","content":"cobalt"}],[{"role":"user","content":"beta color"},{"role":"assistant","content":"amber"}]]
+  },
+  {
+    "question_id":"lm-abs","question_type":"temporal-reasoning_abs","question":"What cannot be answered?","question_date":"2026-01-05","answer":"unknown","answer_session_ids":[],
+    "haystack_dates":["2026-01-01"],"haystack_session_ids":["lm-s1"],
+    "haystack_sessions":[[{"role":"user","content":"alpha color"},{"role":"assistant","content":"cobalt"}]]
+  }
+]

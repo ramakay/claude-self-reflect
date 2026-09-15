@@ -79,6 +79,90 @@ const EMISSION_FIELD_TOKENS: [&str; 8] = [
     "csr_reflect_on_past(",
 ];
 
+/// Sentinel embedded in every non-abstained `compose_recap` output (see
+/// `hooks::recap`), inside its MAX_CHARS budget. The header/token detection
+/// above depends on prose grammar an adversarial re-paste can disturb
+/// (bullets, blockquotes, HTML, zero-width noise, confusable brackets, or
+/// simply a long preamble pushing it past HEADER_WINDOW); the sentinel does
+/// not — it is scanned across the FULL text, normalized, before any of that
+/// grammar-dependent logic runs. Any new recap-composing formatter MUST emit
+/// this sentinel inside its own char budget.
+pub const RECAP_SENTINEL: &str = "[[CSR:RECAP]]";
+
+/// Machine-owned sentinel carried by every prompt-time dream injection
+/// (`hooks::dream_match`, Journal v4 P5 delivery channel (c)). Distinct token
+/// from [`RECAP_SENTINEL`] so the two channels stay separately attributable,
+/// but the same contract: scanned across the FULL text, normalized, before
+/// any grammar-dependent branch, so an injected dream line can never be
+/// re-imported as user content no matter how it is quoted, bulleted or
+/// re-pasted.
+///
+/// **Not** the Journal v4 P4b *attribution* marker. That marker (a short
+/// dream id appended to a copy block the user pastes into a NEW session) must
+/// be RETAINED and indexed; this one causes rejection. They must never share
+/// a token.
+pub const DREAM_SENTINEL: &str = "[[CSR:DREAM]]";
+
+/// Marks machine-generated `csr-engine lessons` candidate blocks so pasted
+/// output cannot become new transcript evidence.
+pub const LESSONS_SENTINEL: &str = "[[CSR:LESSONS]]";
+
+/// Every machine-owned sentinel whose presence rejects the text outright.
+pub(crate) const MACHINE_SENTINELS: [&str; 3] = [RECAP_SENTINEL, DREAM_SENTINEL, LESSONS_SENTINEL];
+
+/// Code points that render as zero-width/invisible. An adversarial re-paste
+/// can interleave these around or inside the sentinel to defeat a naive
+/// substring search; stripping them first restores contiguity regardless of
+/// where they were inserted.
+const ZERO_WIDTH_CHARS: [char; 6] = [
+    '\u{200B}', // ZERO WIDTH SPACE
+    '\u{200C}', // ZERO WIDTH NON-JOINER
+    '\u{200D}', // ZERO WIDTH JOINER
+    '\u{2060}', // WORD JOINER
+    '\u{FEFF}', // ZERO WIDTH NO-BREAK SPACE / BOM
+    '\u{00AD}', // SOFT HYPHEN
+];
+
+/// Fold bracket code points visually confusable with ASCII `[`/`]` to their
+/// ASCII form. Hand-rolled rather than pulling in a full Unicode-
+/// normalization crate (out of scope here) — the sentinel only needs its own
+/// two bracket characters protected.
+fn fold_confusable_bracket(c: char) -> char {
+    match c {
+        '\u{FF3B}' | '\u{27E6}' | '\u{2E28}' => '[', // fullwidth / math white / stacked LEFT
+        '\u{FF3D}' | '\u{27E7}' | '\u{2E29}' => ']', // fullwidth / math white / stacked RIGHT
+        other => other,
+    }
+}
+
+/// Normalize `text` for sentinel scanning: drop zero-width characters, fold
+/// confusable brackets to ASCII. Allocates once; no external dependency.
+fn normalize_for_sentinel_scan(text: &str) -> String {
+    text.chars()
+        .filter(|c| !ZERO_WIDTH_CHARS.contains(c))
+        .map(fold_confusable_bracket)
+        .collect()
+}
+
+/// True if `text` — after stripping zero-width noise and folding confusable
+/// brackets — contains the machine-owned recap sentinel anywhere. Scans the
+/// FULL text, not a HEADER_WINDOW-limited head: a sentinel can sit behind an
+/// arbitrarily long preamble and must still be caught.
+pub fn contains_recap_sentinel(text: &str) -> bool {
+    normalize_for_sentinel_scan(text).contains(RECAP_SENTINEL)
+}
+
+/// True if `text` carries ANY machine-owned sentinel ([`RECAP_SENTINEL`] or
+/// [`DREAM_SENTINEL`]) — same normalization, same full-text scan. Every
+/// rejection path uses this; [`contains_recap_sentinel`] stays recap-specific
+/// so callers that mean "a recap, specifically" keep saying so.
+pub fn contains_machine_sentinel(text: &str) -> bool {
+    let normalized = normalize_for_sentinel_scan(text);
+    MACHINE_SENTINELS
+        .iter()
+        .any(|sentinel| normalized.contains(sentinel))
+}
+
 /// Claude Code transcript wrapper tags. Their contents are command plumbing or
 /// hook output — never session content authored by the user or assistant.
 const PLUMBING_TAGS: [&str; 6] = [
@@ -159,6 +243,12 @@ pub fn strip_quoted(text: &str) -> String {
 /// True if `text` is CSR's own emitted output (or an echo of it): an emission
 /// header in the leading window, or ≥2 distinct emission field tokens anywhere.
 pub fn is_csr_emission(text: &str) -> bool {
+    // Machine-owned sentinels, scanned across the FULL text before any
+    // window-limited or grammar-based heuristic below runs.
+    if contains_machine_sentinel(text) {
+        return true;
+    }
+
     let head_end = text.floor_char_boundary(HEADER_WINDOW.min(text.len()));
     let head = &text[..head_end];
     if EMISSION_HEADERS.iter().any(|h| head.contains(h)) {
@@ -200,6 +290,16 @@ pub fn is_substantive(text: &str) -> bool {
 /// Returns the cleaned text safe to carry forward as session content.
 pub fn extractable(text: &str) -> Option<String> {
     let unplumbed = strip_plumbing(text);
+    // Recap sentinel only (not full is_csr_emission) runs before strip_quoted:
+    // a blockquote-wrapped recap ("> recap [...]: ... [[CSR:RECAP]]") would
+    // otherwise have every quoted line erased before the sentinel is ever
+    // seen, letting an unquoted preamble alongside it survive as if it were
+    // genuine content. Historical header/field-token branches still apply
+    // after strip_quoted on cleaned prose — quoted echoes alone must not
+    // reject genuine unquoted content co-occurring with them.
+    if contains_machine_sentinel(&unplumbed) {
+        return None;
+    }
     let prose = strip_quoted(&unplumbed);
     let cleaned = prose.trim();
     if cleaned.is_empty() || is_csr_emission(cleaned) {
@@ -366,6 +466,84 @@ mod tests {
         assert_eq!(
             out.as_deref(),
             Some("Fix the authentication bug in the login handler")
+        );
+    }
+
+    // --- RECAP_SENTINEL ---
+
+    #[test]
+    fn sentinel_detected_regardless_of_position_or_preamble() {
+        let long_preamble = "a".repeat(HEADER_WINDOW + 200);
+        let text = format!("{long_preamble} trailing note {RECAP_SENTINEL} more text");
+        assert!(is_csr_emission(&text));
+    }
+
+    #[test]
+    fn lessons_sentinel_rejects_machine_generated_candidates() {
+        let text = "human-looking preamble\n[[CSR:LESSONS]]\n- Never bypass checks";
+        assert!(is_csr_emission(text));
+        assert!(extractable(text).is_none());
+    }
+
+    #[test]
+    fn sentinel_survives_zero_width_noise() {
+        let noisy: String = format!("preamble {RECAP_SENTINEL} tail")
+            .chars()
+            .flat_map(|c| [c, '\u{200B}'])
+            .collect();
+        assert!(is_csr_emission(&noisy));
+    }
+
+    #[test]
+    fn sentinel_survives_confusable_bracket_substitution() {
+        let swapped = RECAP_SENTINEL
+            .replace('[', "\u{FF3B}")
+            .replace(']', "\u{FF3D}");
+        let text = format!("some prose then {swapped} more prose");
+        assert!(is_csr_emission(&text));
+    }
+
+    #[test]
+    fn sentinel_absent_from_genuine_prose_about_recaps() {
+        assert!(!is_csr_emission(
+            "Let's recap what we discussed: the login bug is fixed and deployed."
+        ));
+        assert!(!is_csr_emission(
+            "The recap feature works great, though sometimes it's a bit verbose."
+        ));
+        assert!(!is_csr_emission(
+            "I want to recap [the auth changes], then prioritize them."
+        ));
+    }
+
+    // --- extractable ordering: sentinel must be seen before strip_quoted ---
+
+    #[test]
+    fn extractable_rejects_blockquoted_recap_alongside_unquoted_preamble() {
+        // Regression: if strip_quoted ran first, it would erase every
+        // blockquoted line (including the sentinel), leaving the unquoted
+        // preamble looking like genuine session content and leaking it
+        // through as Some(..).
+        let quoted_recap = format!(
+            "> recap [2h ago]: fixed the bug: shipped it. {RECAP_SENTINEL}\n> Next: ship it."
+        );
+        let text = format!(
+            "some unrelated preamble text that reads like genuine session content\n{quoted_recap}"
+        );
+        assert!(extractable(&text).is_none());
+    }
+
+    #[test]
+    fn extractable_keeps_unquoted_prose_alongside_quoted_historical_header() {
+        // Regression: full is_csr_emission before strip_quoted over-rejected
+        // genuine unquoted content that merely co-occurred with a quoted
+        // historical EMISSION_HEADERS echo (no sentinel present).
+        let text = "> SESSION CONTINUITY DETECTED: old injected context\n\
+                    I actually fixed the login bug today, deployed and verified.";
+        let got = extractable(text).expect("unquoted genuine prose must survive");
+        assert_eq!(
+            got.trim(),
+            "I actually fixed the login bug today, deployed and verified."
         );
     }
 }

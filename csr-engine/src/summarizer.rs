@@ -120,7 +120,10 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
             if let Some(model) = &candidate {
                 cmd.args(["--model", model]);
             }
-            cmd.args(["-p", "-", "--output-format", "json"]);
+            // `--tools ""`: a print-mode child otherwise inherits every
+            // built-in tool (Bash, Edit, Write, Agent) under the user's
+            // permission mode; this call is a pure text summary.
+            cmd.args(["-p", "-", "--output-format", "json", "--tools", ""]);
             // Must come LAST: --mcp-config is variadic in the claude CLI and would
             // consume any positional arg that followed it.
             if let Some(path) = &mcp_config_path {

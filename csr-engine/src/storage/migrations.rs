@@ -1,5 +1,258 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+
+const CHUNKS_FTS_COMPACTION_KEY: &str = "chunks_fts_external_content_v1";
+const CHUNKS_FTS_PENDING_VACUUM: &str = "pending_vacuum";
+const CHUNKS_FTS_PENDING_REBUILD: &str = "pending_rebuild";
+const CHUNKS_FTS_COMPLETE: &str = "complete";
+
+const CREATE_EXTERNAL_CHUNKS_FTS: &str = "
+    CREATE VIRTUAL TABLE chunks_fts USING fts5(
+        content,
+        content='chunks',
+        content_rowid='rowid',
+        tokenize='porter unicode61'
+    );
+";
+
+const CREATE_CHUNKS_FTS_TRIGGERS: &str = "
+    CREATE TRIGGER chunks_fts_ai AFTER INSERT ON chunks BEGIN
+        INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+    CREATE TRIGGER chunks_fts_ad AFTER DELETE ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+    END;
+    CREATE TRIGGER chunks_fts_au AFTER UPDATE ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+        INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+";
+
+const DROP_CHUNKS_FTS_TRIGGERS: &str = "
+    DROP TRIGGER IF EXISTS chunks_fts_ai;
+    DROP TRIGGER IF EXISTS chunks_fts_ad;
+    DROP TRIGGER IF EXISTS chunks_fts_au;
+";
+
+fn fts_migration_state(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        [CHUNKS_FTS_COMPACTION_KEY],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn set_fts_migration_state(conn: &Connection, state: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [CHUNKS_FTS_COMPACTION_KEY, state],
+    )?;
+    Ok(())
+}
+
+fn chunks_fts_schema(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn is_external_chunks_fts(schema: &str) -> bool {
+    let compact: String = schema
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    compact.contains("content='chunks'") && compact.contains("content_rowid='rowid'")
+}
+
+fn chunks_fts_trigger_count(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'trigger'
+           AND name IN ('chunks_fts_ai', 'chunks_fts_ad', 'chunks_fts_au')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn verify_chunks_fts(conn: &Connection) -> Result<()> {
+    let schema = chunks_fts_schema(conn)?
+        .ok_or_else(|| anyhow::anyhow!("chunks_fts migration left no FTS table"))?;
+    if !is_external_chunks_fts(&schema) {
+        anyhow::bail!("chunks_fts migration did not install external-content schema");
+    }
+    if chunks_fts_trigger_count(conn)? != 3 {
+        anyhow::bail!("chunks_fts migration did not install all three synchronization triggers");
+    }
+    conn.execute(
+        "INSERT INTO chunks_fts(chunks_fts, rank) VALUES('integrity-check', 1)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Replace the legacy internal-content index atomically. The legacy table,
+/// all orphan documents and its duplicate content store disappear together;
+/// a failure before RELEASE rolls the whole schema change back.
+fn migrate_chunks_fts(conn: &Connection) -> Result<()> {
+    let existing_schema = chunks_fts_schema(conn)?;
+    let already_external = existing_schema
+        .as_deref()
+        .is_some_and(is_external_chunks_fts);
+    let triggers_complete = chunks_fts_trigger_count(conn)? == 3;
+    if already_external && triggers_complete {
+        return Ok(());
+    }
+
+    conn.execute_batch("SAVEPOINT csr_chunks_fts_external_content")?;
+    let applied = (|| -> Result<()> {
+        conn.execute_batch(DROP_CHUNKS_FTS_TRIGGERS)?;
+        if !already_external {
+            if existing_schema.is_some() {
+                conn.execute_batch("DROP TABLE chunks_fts")?;
+            }
+            conn.execute_batch(CREATE_EXTERNAL_CHUNKS_FTS)?;
+        }
+        conn.execute_batch(CREATE_CHUNKS_FTS_TRIGGERS)?;
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')", [])?;
+        verify_chunks_fts(conn)?;
+        set_fts_migration_state(
+            conn,
+            if existing_schema.is_some() && !already_external {
+                CHUNKS_FTS_PENDING_VACUUM
+            } else {
+                CHUNKS_FTS_COMPLETE
+            },
+        )?;
+        Ok(())
+    })();
+    match applied {
+        Ok(()) => conn.execute_batch("RELEASE csr_chunks_fts_external_content")?,
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO csr_chunks_fts_external_content;
+                 RELEASE csr_chunks_fts_external_content",
+            );
+            return Err(error);
+        }
+    }
+
+    verify_chunks_fts(conn)
+}
+
+fn main_database_path(conn: &Connection) -> Result<Option<std::path::PathBuf>> {
+    let path: String = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((!path.is_empty()).then(|| std::path::PathBuf::from(path)))
+}
+
+/// Free bytes VACUUM needs before it is worth starting.
+///
+/// VACUUM writes a compacted copy and then transfers it back, so what it needs
+/// is space for the *result*, not for a second copy of the file on disk. Sizing
+/// the check off the current file length would demand ~21 GB from the database
+/// this migration exists to shrink — whose owner has just watched an index eat
+/// their disk — and defer the reclaim forever on exactly the machines that need
+/// it. The result is bounded by the pages still in use (VACUUM packs them
+/// tighter, never looser), which at this point in the state machine is a small
+/// fraction of the file: the legacy index's pages are already on the freelist.
+///
+/// The margin covers the rewritten b-tree structure and the journal.
+fn vacuum_free_space_required(conn: &Connection) -> Result<u64> {
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    Ok(vacuum_free_space_required_from(
+        page_size.max(0) as u64,
+        page_count.max(0) as u64,
+        free_pages.max(0) as u64,
+    ))
+}
+
+fn vacuum_free_space_required_from(page_size: u64, page_count: u64, free_pages: u64) -> u64 {
+    let in_use_bytes = page_count.saturating_sub(free_pages) * page_size;
+    // 25% headroom plus a 64 MiB floor, so tiny databases still get a sane check.
+    in_use_bytes
+        .saturating_mul(5)
+        .saturating_div(4)
+        .saturating_add(64 * 1024 * 1024)
+}
+
+/// Physically reclaim the pages released by the legacy FTS table. VACUUM may
+/// renumber implicit rowids, so the durable state machine always rebuilds and
+/// verifies the external index after VACUUM and before startup may serve reads.
+fn finish_chunks_fts_compaction(conn: &Connection) -> Result<()> {
+    let Some(mut state) = fts_migration_state(conn)? else {
+        return Ok(());
+    };
+    if state == CHUNKS_FTS_COMPLETE || !conn.is_autocommit() {
+        return Ok(());
+    }
+
+    if state == CHUNKS_FTS_PENDING_VACUUM {
+        if let Some(path) = main_database_path(conn)? {
+            let database_bytes = std::fs::metadata(&path)?.len();
+            let available_bytes = fs2::available_space(path.parent().unwrap_or(&path))?;
+            let required_bytes = vacuum_free_space_required(conn)?;
+            if available_bytes < required_bytes {
+                tracing::warn!(
+                    database_bytes,
+                    available_bytes,
+                    required_bytes,
+                    "deferring chunks_fts compaction: insufficient free disk space"
+                );
+                return Ok(());
+            }
+        }
+
+        if let Err(error) = conn.execute_batch("VACUUM") {
+            // The external index created in the preceding transaction remains
+            // correct. Keep the pending marker and serve search; a later open
+            // retries physical compaction.
+            tracing::warn!(%error, "deferring chunks_fts compaction after VACUUM failure");
+            return Ok(());
+        }
+        // VACUUM itself is atomic, but it may renumber chunks.rowid. Persist a
+        // repair marker before attempting the FTS rebuild so a killed process
+        // can never serve the potentially stale index on the next open.
+        set_fts_migration_state(conn, CHUNKS_FTS_PENDING_REBUILD)?;
+        state = CHUNKS_FTS_PENDING_REBUILD.to_string();
+    }
+
+    if state == CHUNKS_FTS_PENDING_REBUILD {
+        conn.execute_batch("SAVEPOINT csr_chunks_fts_post_vacuum_rebuild")?;
+        let rebuilt = (|| -> Result<()> {
+            conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')", [])?;
+            verify_chunks_fts(conn)?;
+            set_fts_migration_state(conn, CHUNKS_FTS_COMPLETE)?;
+            Ok(())
+        })();
+        match rebuilt {
+            Ok(()) => conn.execute_batch("RELEASE csr_chunks_fts_post_vacuum_rebuild")?,
+            Err(error) => {
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO csr_chunks_fts_post_vacuum_rebuild;
+                     RELEASE csr_chunks_fts_post_vacuum_rebuild",
+                );
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Run all database migrations.
 pub fn run(conn: &Connection) -> Result<()> {
@@ -178,7 +431,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS code_nodes (
-            id          TEXT PRIMARY KEY,          -- sha1(repo|file|kind|name)
+            id          TEXT PRIMARY KEY,          -- sha256(repo|file|kind|name), truncated to 40 hex chars
             repo        TEXT NOT NULL DEFAULT '',
             project     TEXT NOT NULL DEFAULT '',
             file        TEXT NOT NULL,
@@ -337,6 +590,12 @@ pub fn run(conn: &Connection) -> Result<()> {
             .is_ok();
         if !has_repo_root_nodes {
             let _ = conn.execute_batch("ALTER TABLE code_nodes ADD COLUMN repo_root TEXT;");
+        }
+        let has_last_chunk_id: bool = conn
+            .prepare("SELECT last_chunk_id FROM code_nodes LIMIT 0")
+            .is_ok();
+        if !has_last_chunk_id {
+            let _ = conn.execute_batch("ALTER TABLE code_nodes ADD COLUMN last_chunk_id TEXT;");
         }
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_code_nodes_repo_root ON code_nodes(repo_root);",
@@ -513,17 +772,15 @@ pub fn run(conn: &Connection) -> Result<()> {
         );
     }
 
-    // FTS5 for hybrid search — CREATE VIRTUAL TABLE doesn't support IF NOT EXISTS
-    // so we check manually
-    let has_fts: bool = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='chunks_fts'")?
-        .exists([])?;
+    migrate_provenance_substrate(conn)?;
 
-    if !has_fts {
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE chunks_fts USING fts5(content, tokenize='porter unicode61');",
-        )?;
-    }
+    // The FTS migration records its durable compaction state in meta. Create
+    // this small table before the larger metadata block below so the schema
+    // replacement and its pending marker can commit atomically.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+    )?;
+    migrate_chunks_fts(conn)?;
 
     // Engine metadata KV — caches expensive computed state (e.g. integrity_check
     // results, which cost ~10s on multi-GB DBs and must not run per status call).
@@ -541,6 +798,14 @@ pub fn run(conn: &Connection) -> Result<()> {
             duration_ms INTEGER NOT NULL DEFAULT 0,
             success INTEGER NOT NULL DEFAULT 1
          );
+         CREATE TABLE IF NOT EXISTS journal_headlines (
+            session_id TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
+            headline TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         );
          CREATE TABLE IF NOT EXISTS ratification_scores (
             conversation_id TEXT PRIMARY KEY,
             score REAL NOT NULL,
@@ -548,8 +813,64 @@ pub fn run(conn: &Connection) -> Result<()> {
             ledger_refs TEXT,
             extractor_version TEXT NOT NULL,
             extracted_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS session_instrumentation (
+             session_id       TEXT PRIMARY KEY,
+             transcript_size  INTEGER NOT NULL DEFAULT 0,
+             transcript_mtime INTEGER NOT NULL DEFAULT 0,
+             error_count      INTEGER NOT NULL DEFAULT 0,
+             steer_count      INTEGER NOT NULL DEFAULT 0,
+             turn_count       INTEGER NOT NULL DEFAULT 0,
+             errors_json      TEXT NOT NULL DEFAULT '[]',
+             steers_json      TEXT NOT NULL DEFAULT '[]',
+             computed_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
          );",
     )?;
+
+    // One-time cache invalidation (steer-noise fix, `transcript::instrumentation::
+    // is_noisy_steer_text`): rows cached under the pre-fix steer filter may carry
+    // harness noise (`<task-notification>` blocks, `[SYSTEM NOTIFICATION` wrappers)
+    // that no human ever typed. `run()` executes on every `Storage::open`, so an
+    // unconditional DELETE here would wipe the cache on every process start instead
+    // of once — guarded by `meta` so it fires exactly once per database. The table
+    // self-heals: `dream::report`'s backfill refills it in ~1.3s at the next report.
+    {
+        let already_purged =
+            crate::storage::queries::get_meta(conn, "steer_noise_filter_v1")?.is_some();
+        if !already_purged {
+            conn.execute_batch("DELETE FROM session_instrumentation;")?;
+            crate::storage::queries::set_meta(conn, "steer_noise_filter_v1", "1")?;
+        }
+    }
+
+    // Second purge, same pattern: the steer filter changed again after v1
+    // (queued-prefix normalization, F3 of the certification review), so rows
+    // cached between the two fixes may hold `[queued] [SYSTEM NOTIFICATION`
+    // noise. One wipe makes every surviving cache row a product of the
+    // current filter generation — which is what lets the renderer trust
+    // cache-sourced steer totals without a per-row version column.
+    {
+        let already_purged =
+            crate::storage::queries::get_meta(conn, "steer_noise_filter_v2")?.is_some();
+        if !already_purged {
+            conn.execute_batch("DELETE FROM session_instrumentation;")?;
+            crate::storage::queries::set_meta(conn, "steer_noise_filter_v2", "1")?;
+        }
+    }
+
+    // Migration: journal_headlines gained `description` after first ship on
+    // 2026-08-10; DBs created between the two shapes lack the column. Same
+    // idempotent ALTER-guard pattern as the code_edges columns above.
+    {
+        let has_description: bool = conn
+            .prepare("SELECT description FROM journal_headlines LIMIT 0")
+            .is_ok();
+        if !has_description {
+            let _ = conn.execute_batch(
+                "ALTER TABLE journal_headlines ADD COLUMN description TEXT NOT NULL DEFAULT '';",
+            );
+        }
+    }
 
     // Migration: resolution ledger (v9.4+) — append-only verdicts per chunk_id;
     // latest row wins on read. No FK on chunk_id (may reference reflections too).
@@ -560,10 +881,23 @@ pub fn run(conn: &Connection) -> Result<()> {
             status TEXT NOT NULL CHECK(status IN ('resolved','still_open','regressed')),
             evidence TEXT NOT NULL,
             claim TEXT,
-            source TEXT NOT NULL DEFAULT 'agent',
+            source TEXT NOT NULL DEFAULT 'agent'
+                CHECK(source IN ('agent','user_confirmed')),
             created_at TEXT DEFAULT (datetime('now'))
          );
-         CREATE INDEX IF NOT EXISTS idx_resolution_chunk ON resolution_ledger(chunk_id, id);",
+         CREATE INDEX IF NOT EXISTS idx_resolution_chunk ON resolution_ledger(chunk_id, id);
+         CREATE TRIGGER IF NOT EXISTS resolution_source_insert_guard
+         BEFORE INSERT ON resolution_ledger
+         WHEN NEW.source NOT IN ('agent','user_confirmed')
+         BEGIN
+             SELECT RAISE(ABORT, 'invalid resolution source');
+         END;
+         CREATE TRIGGER IF NOT EXISTS resolution_source_immutable_guard
+         BEFORE UPDATE OF source ON resolution_ledger
+         WHEN NEW.source <> OLD.source
+         BEGIN
+             SELECT RAISE(ABORT, 'resolution source is immutable');
+         END;",
     )?;
 
     // v9.4 multi-source corpus: session registry (history.jsonl spine — never embedded,
@@ -838,7 +1172,15 @@ pub fn run(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_witness_verdicts_witness ON witness_verdicts(witness_id);
-        DROP INDEX IF EXISTS idx_witness_verdicts_identity;",
+        DROP INDEX IF EXISTS idx_witness_verdicts_identity;
+
+        CREATE TABLE IF NOT EXISTS witness_chunk_bindings (
+            witness_id INTEGER NOT NULL REFERENCES witness_ledger(id),
+            chunk_id TEXT NOT NULL,
+            PRIMARY KEY (witness_id, chunk_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_witness_chunk_bindings_chunk
+            ON witness_chunk_bindings(chunk_id);",
     )?;
 
     // Recap normalizes SQLite and RFC3339 timestamps through julianday(). This
@@ -885,12 +1227,1348 @@ pub fn run(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_code_nodes_last_conv ON code_nodes(last_conv_id);",
     )?;
 
+    // Journal v3 Phase 1.5 — night-pass thread extraction (`dream::threads`).
+    // `UNIQUE(episode_hash, thread)` is the convergence key: a re-run over an
+    // unchanged episode (same content-hash) either hits the same row again
+    // (a real thread, `INSERT OR IGNORE` no-ops) or the sentinel row
+    // (`thread = ''`, cached when a run produced zero acceptable threads) —
+    // either way, zero further LLM spend. `receipt_tier` is a CHECK, not a
+    // free-form column, so a bad write fails loudly instead of silently
+    // widening the tier vocabulary the renderer switches on.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dream_threads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_hash TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            thread TEXT NOT NULL,
+            evidence_quote TEXT NOT NULL,
+            files_json TEXT NOT NULL,
+            receipt_tier TEXT NOT NULL CHECK (receipt_tier IN ('verdict','witnessed','unverified')),
+            receipts_json TEXT NOT NULL,
+            model TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(episode_hash, thread)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dream_threads_session ON dream_threads(session_id);
+        CREATE INDEX IF NOT EXISTS idx_dream_threads_project ON dream_threads(project);",
+    )?;
+
+    // Journal v4 Phase 4 — verified structured plans (`journal::composer`).
+    // `plan_hash` is the convergence key, computed exactly like
+    // `dream::threads::episode_hash`: a re-run over unchanged evidence either
+    // finds the stored plan or the sentinel row (`context = ''` with
+    // `steps_json = '[]'`, written when verification kept nothing), so a
+    // frozen corpus costs zero further spend. `dropped` is the measured
+    // count of steps the deterministic verifier removed — it is rendered as
+    // a number, never inferred from the difference between two vectors.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dream_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_hash TEXT NOT NULL UNIQUE,
+            item_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            context TEXT NOT NULL,
+            steps_json TEXT NOT NULL,
+            files_json TEXT NOT NULL,
+            acceptance TEXT,
+            dropped INTEGER NOT NULL DEFAULT 0,
+            model TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_dream_plans_item ON dream_plans(item_id);",
+    )?;
+
+    // Journal v4 Phase 4 — per-dream spend attribution (locked decision 13).
+    // `narrative_usage` had no key tying a row to the dream that caused it,
+    // so a per-dream figure could only ever have been inferred from a
+    // timestamp window. `ref_id` makes it evidence instead: the producer
+    // writes the convergence hash it was working under, and the composer
+    // sums only rows carrying that exact hash. Legacy rows stay NULL and are
+    // therefore never attributed to any dream — a dream with no recorded
+    // usage renders NOTHING, never a zero that would read as free.
+    //
+    // Errors PROPAGATE (codex X5 finding 12). The previous form discarded the
+    // ALTER/CREATE INDEX result with `let _ =`, so a partial prerelease
+    // schema, an interrupted migration or a disk error was accepted as
+    // "migrated" while every subsequent `ref_id` insert failed — accounting
+    // could disappear without anything refusing to start.
+    migrate_narrative_usage_ref_id(conn)?;
+
+    // Journal v4 Phase 4b — dream → outcome attribution (the marker loop).
+    //
+    // Two row shapes live here, distinguished by `bound_session_id`:
+    //
+    // * **emission** (`bound_session_id IS NULL`) — a copy block carrying
+    //   this dream's marker was rendered, and of which kind. Written by the
+    //   surface that rendered it.
+    // * **binding** (`bound_session_id IS NOT NULL`) — a transcript
+    //   containing the marker was imported. THIS is the evidence: no marker,
+    //   no binding, ever. `outcome*` columns are only ever filled on a
+    //   binding row, so an unbound dream can render nothing about outcomes.
+    //
+    // The CHECK keeps an emission row from existing without its kind (the
+    // renderer always knows it), while a binding row may legitimately carry
+    // `kind IS NULL` — the marker carries a dream id and nothing else, so a
+    // binding whose emission row was never recorded genuinely does not know
+    // which prompt kind was pasted, and must say so rather than guess.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dream_attributions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dream_id TEXT NOT NULL,
+            kind TEXT,
+            emitted_at TEXT,
+            bound_session_id TEXT,
+            bound_at TEXT,
+            outcome_episode_id TEXT,
+            outcome TEXT,
+            receipts_json TEXT NOT NULL DEFAULT '[]',
+            CHECK (bound_session_id IS NOT NULL OR kind IS NOT NULL)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dream_attributions_binding
+            ON dream_attributions(dream_id, bound_session_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dream_attributions_emission
+            ON dream_attributions(dream_id, kind) WHERE bound_session_id IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_dream_attributions_dream
+            ON dream_attributions(dream_id);",
+    )?;
+
+    // Journal v4 Wave 3 — durable usage reservations.
+    //
+    // `narrative_usage` is written AFTER a model call returns. A process that
+    // dies mid-call, or a producer that discards the insert error, therefore
+    // spends real tokens that no row ever records, and the spend figure fails
+    // OPEN (reads low, or reads as "unmeasured" when it should read "spent").
+    // A reservation is written BEFORE the invocation and finalised after, so
+    // the gap between "we are about to spend" and "we know what we spent" is
+    // itself a durable row:
+    //
+    // * `state = 'reserved'` — invocation started, outcome unknown. A row
+    //   left in this state is evidence of an unaccounted call, NOT evidence
+    //   of zero spend.
+    // * `state = 'finalised'` — `usage_id` points at the `narrative_usage`
+    //   row that measured it.
+    // * `state = 'abandoned'` — the invocation provably never happened
+    //   (gate refused, budget exhausted before the call).
+    //
+    // `attempt_key` is the caller's own idempotency key, so a retried
+    // reservation reuses its row instead of double-counting.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS narrative_reservations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attempt_key TEXT NOT NULL UNIQUE,
+            ref_id TEXT,
+            call_site TEXT NOT NULL,
+            model TEXT,
+            state TEXT NOT NULL DEFAULT 'reserved'
+                CHECK (state IN ('reserved','finalised','abandoned')),
+            usage_id INTEGER,
+            reserved_at TEXT NOT NULL DEFAULT (datetime('now')),
+            settled_at TEXT,
+            note TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_narrative_reservations_state
+            ON narrative_reservations(state);
+        CREATE INDEX IF NOT EXISTS idx_narrative_reservations_ref
+            ON narrative_reservations(ref_id);",
+    )?;
+
+    // Journal v4 Phase 5 — delivery ledger (`storage::dream_delivery`). One
+    // row per (conclusion, channel) that was actually shown to the user, so
+    // the SessionStart recap clause and the prompt-time match never repeat
+    // themselves. The UNIQUE index is what makes "claim it or do not inject"
+    // a single atomic step rather than a check-then-write race. A row proves
+    // the user was shown something; its absence proves nothing.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dream_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dream_id TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            session_id TEXT,
+            delivered_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dream_deliveries_unique
+            ON dream_deliveries(dream_id, channel);
+        CREATE INDEX IF NOT EXISTS idx_dream_deliveries_at
+            ON dream_deliveries(delivered_at);",
+    )?;
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS correction_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_session8 TEXT NOT NULL,
+            source_turn INTEGER NOT NULL,
+            source_date TEXT NOT NULL,
+            target_session_id TEXT NOT NULL,
+            delivered_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(source_session8, source_turn, source_date, target_session_id)
+        );",
+    )?;
+
+    // D5 one-shot backfill: rewrite worktree-local paths already stored in
+    // code_evolution.file_path / code_nodes.file to canonical main-repo form.
+    // Gated by `meta` so it runs exactly once per database, never on every
+    // open (canonicalization does a filesystem walk per row).
+    if crate::storage::queries::get_meta(conn, "worktree_path_backfill_v1")?.is_none() {
+        backfill_worktree_paths(conn)?;
+        crate::storage::queries::set_meta(conn, "worktree_path_backfill_v1", "done")?;
+    }
+
+    // `csr-engine dreams` (headless CLI) — spend-control cache, NOT an
+    // identity hash. `dream_id` is opaque (blake3 of
+    // project|category|subject_key|created_at, truncated); the row it names
+    // is looked up for reuse by (project, category, revision_hash) — a hit
+    // means the underlying receipt set hasn't changed since the prose was
+    // authored, so the caller reuses `prose` verbatim and spends nothing.
+    // `subject_key` is NULL for the `strategy` category (no deterministic
+    // subject exists there — one-shot, no escalation). `status` defaults to
+    // 'open' for a future verdict-recording tool to update.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dreams_v1 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dream_id TEXT NOT NULL UNIQUE,
+            project TEXT NOT NULL,
+            category TEXT NOT NULL CHECK (category IN ('unfinished','strategy','supersession')),
+            subject_key TEXT,
+            revision_hash TEXT NOT NULL,
+            prose TEXT NOT NULL,
+            evidence_provenance TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            status TEXT NOT NULL DEFAULT 'open'
+        );
+        CREATE INDEX IF NOT EXISTS idx_dreams_v1_lookup
+            ON dreams_v1(project, category, revision_hash);",
+    )?;
+
+    // Dream backfill Stage 6 (`.plans/dream-backfill-design.md` §3 Stage 6):
+    // the composer needs a THIRD `dreams_v1` category, 'supersession', added
+    // to a table that may already hold real rows from `csr-engine dreams`.
+    // SQLite cannot ALTER a CHECK constraint in place, and `CREATE TABLE IF
+    // NOT EXISTS` above is a no-op on a pre-existing table — so a DB created
+    // before this migration would silently keep the OLD 2-value constraint
+    // forever, rejecting every `supersession` insert. Rebuild ONLY when the
+    // on-disk constraint doesn't already allow it (shape-probed via
+    // `sqlite_master.sql`, same idiom `chunks_fts_schema`/`has_column` use
+    // elsewhere in this file) — never unconditionally, since this table can
+    // hold real dream rows a user has already read/verdicted and an
+    // unconditional drop+recreate would destroy them.
+    if !dreams_v1_allows_supersession(conn)? {
+        let provenance_copy = if has_column(conn, "dreams_v1", "evidence_provenance")? {
+            "evidence_provenance"
+        } else {
+            "NULL"
+        };
+        conn.execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE dreams_v1 RENAME TO dreams_v1_pre_supersession;
+             CREATE TABLE dreams_v1 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dream_id TEXT NOT NULL UNIQUE,
+                project TEXT NOT NULL,
+                category TEXT NOT NULL CHECK (category IN ('unfinished','strategy','supersession')),
+                subject_key TEXT,
+                revision_hash TEXT NOT NULL,
+                prose TEXT NOT NULL,
+                evidence_provenance TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                status TEXT NOT NULL DEFAULT 'open'
+             );
+             INSERT INTO dreams_v1 (id, dream_id, project, category, subject_key, revision_hash,
+                                    prose, evidence_provenance, created_at, status)
+                SELECT id, dream_id, project, category, subject_key, revision_hash,
+                       prose, {provenance_copy}, created_at, status
+                FROM dreams_v1_pre_supersession;
+             DROP TABLE dreams_v1_pre_supersession;
+             CREATE INDEX IF NOT EXISTS idx_dreams_v1_lookup
+                ON dreams_v1(project, category, revision_hash);
+             COMMIT;"
+        ))?;
+    }
+
+    // Build 1 subagent citations: additive and nullable by design. Existing
+    // dreams remain valid historical rows; only newly composed backfill
+    // dreams carry the deterministic transcript receipts.
+    if !has_column(conn, "dreams_v1", "evidence_provenance")? {
+        conn.execute_batch("ALTER TABLE dreams_v1 ADD COLUMN evidence_provenance TEXT")?;
+    }
+
+    // Memory registry (harness file-based memory spine — never embedded, never
+    // injected). One row per on-disk memory .md file; scanned by a later-stage
+    // importer. content_hash + file_mtime drive change detection; last_seen_scan
+    // enables project-scoped stale deletion without touching unscanned projects.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_registry (
+            file_path        TEXT PRIMARY KEY,
+            project           TEXT NOT NULL,
+            slug              TEXT NOT NULL,
+            description       TEXT,
+            mem_type          TEXT,
+            origin_session_id TEXT,
+            modified_ts       TEXT,
+            file_mtime        INTEGER NOT NULL,
+            content_hash      TEXT NOT NULL,
+            links_json        TEXT NOT NULL DEFAULT '[]',
+            last_seen_scan    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_registry_origin ON memory_registry(origin_session_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_registry_project ON memory_registry(project);",
+    )?;
+
+    // Trained re-ranker: exact hook impressions, auditable reaction labels,
+    // append-only model attempts, and per-cluster gate receipts. The runtime
+    // remains deterministic unless the latest model row carries a passing gate.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS rerank_exposure_impressions (
+            impression_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            surface TEXT NOT NULL,
+            query_hash TEXT,
+            query_embedding BLOB,
+            intent TEXT NOT NULL,
+            shown_at TEXT NOT NULL,
+            feature_schema INTEGER NOT NULL,
+            item_count INTEGER NOT NULL,
+            legacy INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_rerank_impressions_session_time
+            ON rerank_exposure_impressions(session_id, shown_at);
+        CREATE INDEX IF NOT EXISTS idx_rerank_impressions_time
+            ON rerank_exposure_impressions(shown_at);
+
+        CREATE TABLE IF NOT EXISTS rerank_exposure_items (
+            impression_id TEXT NOT NULL REFERENCES rerank_exposure_impressions(impression_id)
+                ON DELETE CASCADE,
+            rank INTEGER NOT NULL,
+            memory_id TEXT NOT NULL,
+            conversation_id TEXT,
+            source_type TEXT NOT NULL,
+            baseline_score REAL,
+            cosine REAL,
+            recency REAL,
+            graph_proximity REAL,
+            author TEXT,
+            is_scaffold INTEGER NOT NULL DEFAULT 0,
+            is_mechanic INTEGER NOT NULL DEFAULT 0,
+            supersedes INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (impression_id, rank),
+            UNIQUE (impression_id, memory_id, source_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_rerank_exposure_items_memory
+            ON rerank_exposure_items(memory_id);
+
+        CREATE TABLE IF NOT EXISTS rerank_reaction_labels (
+            session_id TEXT NOT NULL,
+            assistant_turn INTEGER NOT NULL,
+            next_user_turn INTEGER NOT NULL,
+            assistant_ts TEXT,
+            next_user_ts TEXT,
+            reaction TEXT NOT NULL CHECK (reaction IN
+                ('acceptance','correction','reask','redirect','abstain')),
+            proposed_reaction TEXT,
+            confidence REAL NOT NULL,
+            runner_up_score REAL NOT NULL,
+            margin REAL NOT NULL,
+            pickup_similarity REAL,
+            next_user_text TEXT NOT NULL,
+            near_miss INTEGER NOT NULL DEFAULT 0,
+            classifier_hash TEXT NOT NULL,
+            transcript_mtime INTEGER NOT NULL,
+            harvested_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, assistant_turn, classifier_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_rerank_reactions_session_time
+            ON rerank_reaction_labels(session_id, assistant_ts);
+        CREATE INDEX IF NOT EXISTS idx_rerank_reactions_audit
+            ON rerank_reaction_labels(classifier_hash, reaction, near_miss);
+
+        CREATE TABLE IF NOT EXISTS rerank_harvest_state (
+            session_id TEXT NOT NULL,
+            classifier_hash TEXT NOT NULL,
+            transcript_mtime INTEGER NOT NULL,
+            label_count INTEGER NOT NULL,
+            contaminated INTEGER NOT NULL DEFAULT 0,
+            harvested_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, classifier_hash)
+        );
+
+        CREATE TABLE IF NOT EXISTS rerank_models (
+            model_id TEXT PRIMARY KEY,
+            feature_schema INTEGER NOT NULL,
+            classifier_hash TEXT NOT NULL,
+            seed INTEGER NOT NULL,
+            cutoff_ts TEXT,
+            train_start_ts TEXT,
+            train_end_ts TEXT,
+            eval_start_ts TEXT,
+            eval_end_ts TEXT,
+            train_impressions INTEGER NOT NULL,
+            train_rows INTEGER NOT NULL,
+            eval_impressions INTEGER NOT NULL,
+            eval_rows INTEGER NOT NULL,
+            eval_clusters INTEGER NOT NULL,
+            cluster_wins INTEGER NOT NULL,
+            cluster_losses INTEGER NOT NULL,
+            cluster_ties INTEGER NOT NULL,
+            excluded_contaminated INTEGER NOT NULL,
+            abstained_reactions INTEGER NOT NULL,
+            acceptance_labels INTEGER NOT NULL,
+            correction_labels INTEGER NOT NULL,
+            reask_labels INTEGER NOT NULL,
+            redirect_labels INTEGER NOT NULL,
+            near_miss_labels INTEGER NOT NULL,
+            baseline_ndcg5 REAL,
+            trained_ndcg5 REAL,
+            baseline_mrr REAL,
+            trained_mrr REAL,
+            curated_baseline_score REAL,
+            curated_trained_score REAL,
+            curated_case_count INTEGER NOT NULL DEFAULT 0,
+            curated_veto_epsilon REAL NOT NULL,
+            gate_status TEXT NOT NULL CHECK (gate_status IN
+                ('passed','failed','insufficient_data','error')),
+            gate_reason TEXT NOT NULL,
+            weights_json TEXT,
+            normalization_json TEXT,
+            trained_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rerank_models_latest
+            ON rerank_models(trained_at DESC, model_id DESC);
+
+        CREATE TABLE IF NOT EXISTS rerank_gate_clusters (
+            model_id TEXT NOT NULL REFERENCES rerank_models(model_id),
+            cluster_id TEXT NOT NULL,
+            impression_count INTEGER NOT NULL,
+            distinct_session_count INTEGER NOT NULL,
+            candidate_count INTEGER NOT NULL,
+            baseline_ndcg5 REAL NOT NULL,
+            trained_ndcg5 REAL NOT NULL,
+            outcome TEXT NOT NULL CHECK (outcome IN ('win','loss','tie')),
+            PRIMARY KEY (model_id, cluster_id)
+        );",
+    )?;
+
+    // Curated-eval veto receipt. These columns were added after the first
+    // trained-reranker implementation was reviewable, so prerelease databases
+    // may already carry rerank_models without them.
+    if !has_column(conn, "rerank_models", "curated_baseline_score")? {
+        conn.execute_batch("ALTER TABLE rerank_models ADD COLUMN curated_baseline_score REAL;")?;
+    }
+    if !has_column(conn, "rerank_models", "curated_trained_score")? {
+        conn.execute_batch("ALTER TABLE rerank_models ADD COLUMN curated_trained_score REAL;")?;
+    }
+    if !has_column(conn, "rerank_models", "curated_veto_epsilon")? {
+        conn.execute_batch("ALTER TABLE rerank_models ADD COLUMN curated_veto_epsilon REAL;")?;
+    }
+    if !has_column(conn, "rerank_models", "curated_case_count")? {
+        conn.execute_batch(
+            "ALTER TABLE rerank_models ADD COLUMN curated_case_count INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !has_column(conn, "rerank_gate_clusters", "distinct_session_count")? {
+        conn.execute_batch(
+            "ALTER TABLE rerank_gate_clusters
+             ADD COLUMN distinct_session_count INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    conn.execute(
+        "UPDATE rerank_models SET curated_veto_epsilon = ?1
+         WHERE curated_veto_epsilon IS NULL",
+        [super::trained_rerank::CURATED_VETO_EPSILON],
+    )?;
+
+    // Dream backfill (`.plans/dream-backfill-design.md`, Stage 0 + the D3/D4
+    // round-2 deltas in its §8, which bind over §3-6 wherever they conflict)
+    // — deterministic episode materialization + relation staging for the
+    // (future) supersession-detection pipeline. `episode_index` is a
+    // REFRESHABLE projection over `reflections` rows carrying schema-v2
+    // episode JSON — never the writer of record for episode content
+    // (`hooks::stop::store_episode` remains that); it exists so later
+    // pipeline stages scan one flat table instead of re-parsing every
+    // reflection's JSON on every pass. `storage::dream_backfill::
+    // materialize_episode_index` fully replaces every row's base columns on
+    // each run (`INSERT OR REPLACE` keyed by `episode_id`), so aliveness
+    // (below) is always recomputed alongside a base refresh, never preserved
+    // stale against a base row that has moved on.
+    //
+    // D3 (round-2 finding F3): the aliveness columns replace the design's
+    // originally drafted `live_file_ratio REAL`. `present_at_head` /
+    // `days_since_last_touch` are NULL — never `false` / `0` — when the
+    // episode's project has no git-resolvable repo locally, or when none of
+    // its touched files resolve to one: absence of evidence is not
+    // deadness, and a NULL here must be excluded and the aliveness term
+    // renormalized by the reader (see `storage::dream_backfill::
+    // fill_aliveness`'s doc comment), never treated as a zero.
+    //
+    // `dream_relations` / `backfill_state` / `backfill_discards` are created
+    // here so every later build stage (pair generators, adjudicate, verify,
+    // compose — design §3 Stages 2-6) has its landing tables from the
+    // start; this migration and `storage::dream_backfill` only create and
+    // document the three, and write to none of them.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS episode_index (
+            episode_id             TEXT PRIMARY KEY,     -- reflections.id
+            session_id             TEXT NOT NULL,
+            project                TEXT NOT NULL,
+            ts                     TEXT NOT NULL,
+            outcome                TEXT NOT NULL,
+            request                TEXT NOT NULL DEFAULT '',
+            completed              TEXT NOT NULL DEFAULT '',
+            next_steps             TEXT,
+            blockers               TEXT,
+            todo_count             INTEGER NOT NULL DEFAULT 0,
+            files_json             TEXT NOT NULL DEFAULT '[]',
+            anchors_json           TEXT NOT NULL DEFAULT '[]',
+            prev_episode_id        TEXT,
+            present_at_head        INTEGER,
+            days_since_last_touch  INTEGER,
+            refreshed_at           TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_episode_index_project_ts ON episode_index(project, ts);
+        CREATE INDEX IF NOT EXISTS idx_episode_index_session ON episode_index(session_id);
+        CREATE INDEX IF NOT EXISTS idx_episode_index_prev ON episode_index(prev_episode_id);
+
+        -- Stage 6 verified relations. `UNIQUE(project, ep_a, ep_b, relation)`
+        -- is the design's own idempotency key (§3 Stage 6); `topic_key` is
+        -- D7's stable diversity key (project,symbol) for ledger/relapse,
+        -- hash of the shared-anchor-symbol set for era). `generator`/`tier`
+        -- vocabularies follow D2 (G-relapse added) and D5 (LLM tier can
+        -- never exceed the generator's evidence ceiling) respectively.
+        CREATE TABLE IF NOT EXISTS dream_relations (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            project          TEXT NOT NULL,
+            ep_a             TEXT NOT NULL,   -- episode_index.episode_id, superseded side
+            ep_b             TEXT NOT NULL,   -- episode_index.episode_id, superseding side
+            relation         TEXT NOT NULL CHECK (relation IN ('replaced_by','extended_by')),
+            generator        TEXT NOT NULL CHECK (generator IN ('ledger','era','relapse')),
+            topic_key        TEXT NOT NULL,
+            tier             TEXT NOT NULL CHECK (tier IN ('verdict','witnessed','unverified')),
+            quote_a          TEXT NOT NULL DEFAULT '',
+            quote_b          TEXT NOT NULL DEFAULT '',
+            load_bearing_oid TEXT,
+            aux_oid          TEXT,
+            oid_provenance   TEXT NOT NULL DEFAULT 'git_derived'
+                CHECK (oid_provenance IN ('git_derived','created_at_fallback')),
+            gate_score       REAL,
+            now_hook         TEXT,
+            status           TEXT NOT NULL DEFAULT 'queued'
+                CHECK (status IN ('queued','drained','archived')),
+            dream_id         TEXT,
+            created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project, ep_a, ep_b, relation)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dream_relations_queue
+            ON dream_relations(project, status, gate_score DESC);
+        CREATE INDEX IF NOT EXISTS idx_dream_relations_topic
+            ON dream_relations(project, topic_key);
+
+        -- Crash-safety checkpoint (design §3 'Crash safety / idempotency').
+        -- `project = ''` means an all-projects run; `cursor` is an opaque
+        -- resume marker private to whichever stage owns it.
+        CREATE TABLE IF NOT EXISTS backfill_state (
+            stage      TEXT NOT NULL,
+            project    TEXT NOT NULL DEFAULT '',
+            cursor     TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (stage, project)
+        );
+
+        -- Stage 5 verify-failure audit log (design §3 Stage 5 / §6). Every
+        -- discarded LLM candidate lands here with its reason and raw output,
+        -- so the discard rate is a measurable run-quality metric rather than
+        -- a number nothing backs.
+        CREATE TABLE IF NOT EXISTS backfill_discards (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair_key   TEXT NOT NULL,
+            reason     TEXT NOT NULL,
+            raw_json   TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_backfill_discards_pair ON backfill_discards(pair_key);
+        CREATE INDEX IF NOT EXISTS idx_backfill_discards_reason ON backfill_discards(reason);
+
+        -- Stage 1 unfinished-scan negative-receipt audit trail (design §3
+        -- Stage 1 + §8 D10): one row per currently-'never picked up' seed,
+        -- `INSERT OR REPLACE` keyed by `seed_episode_id` so a re-scan always
+        -- reflects the latest pass — `dream::backfill::unfinished::
+        -- scan_unfinished` also deletes any row here for a seed that no
+        -- longer qualifies as 'never picked up' on the current corpus (chain-
+        -- picked, score-picked, obsolescence-converted, or dropped out of the
+        -- seed set entirely), so this table never accumulates stale claims.
+        -- `confusion_matrix_json` is the GLOBAL tau-fit's own confusion
+        -- matrix at the time of the run, denormalized onto every row so the
+        -- receipt is fully self-contained (D10: 'publish confusion matrix in
+        -- the negative receipt JSON').
+        CREATE TABLE IF NOT EXISTS backfill_unfinished_receipts (
+            seed_episode_id       TEXT PRIMARY KEY,  -- episode_index.episode_id
+            project               TEXT NOT NULL,
+            corpus_scanned        INTEGER NOT NULL,
+            max_score             REAL NOT NULL,
+            argmax_episode        TEXT,
+            confusion_matrix_json TEXT NOT NULL,
+            created_at            TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_backfill_unfinished_receipts_project
+            ON backfill_unfinished_receipts(project);",
+    )?;
+
+    // B2 intent channel v1: immutable, receipted human corrections/redirects
+    // and explicit assistant abandonment statements. Idempotency is the
+    // transcript identity tuple; later observations append, never rewrite.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS intent_events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id      TEXT NOT NULL,
+            project         TEXT NOT NULL,
+            turn            INTEGER NOT NULL,
+            kind            TEXT NOT NULL CHECK (kind IN ('correction','redirect','abandoned')),
+            quote           TEXT NOT NULL,
+            transcript_path TEXT NOT NULL,
+            byte_start      INTEGER NOT NULL,
+            byte_end        INTEGER NOT NULL,
+            prior_claim     TEXT NOT NULL DEFAULT '',
+            symbol          TEXT,
+            file            TEXT,
+            classifier_hash TEXT NOT NULL,
+            ts              TEXT NOT NULL,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(session_id, turn, kind, byte_start)
+        );
+        CREATE INDEX IF NOT EXISTS idx_intent_events_project_ts
+            ON intent_events(project, ts);
+        CREATE INDEX IF NOT EXISTS idx_intent_events_project_symbol
+            ON intent_events(project, symbol);
+        CREATE TRIGGER IF NOT EXISTS intent_events_no_update
+            BEFORE UPDATE ON intent_events
+            BEGIN SELECT RAISE(ABORT, 'intent_events is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS intent_events_no_delete
+            BEFORE DELETE ON intent_events
+            BEGIN SELECT RAISE(ABORT, 'intent_events is append-only'); END;",
+    )?;
+    migrate_intent_events_identity_v2(conn)?;
+    migrate_intent_events_detector_v3(conn)?;
+    migrate_artifact_provenance(conn)?;
+
+    finish_chunks_fts_compaction(conn)?;
+
+    Ok(())
+}
+
+/// `intent_events_v2`: make the transcript part of an event's identity.  A
+/// parent session may have many child transcripts whose turns and byte
+/// offsets overlap, so the v1 key lost all but the first child event.
+fn migrate_intent_events_identity_v2(conn: &Connection) -> Result<()> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'intent_events'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    let compact: String = sql.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if compact.contains("UNIQUE(session_id,transcript_path,turn,kind,byte_start)") {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS intent_events_no_update;
+         DROP TRIGGER IF EXISTS intent_events_no_delete;
+         DROP INDEX IF EXISTS idx_intent_events_project_ts;
+         DROP INDEX IF EXISTS idx_intent_events_project_symbol;
+         ALTER TABLE intent_events RENAME TO intent_events_v1_old;
+         CREATE TABLE intent_events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id      TEXT NOT NULL,
+            project         TEXT NOT NULL,
+            turn            INTEGER NOT NULL,
+            kind            TEXT NOT NULL CHECK (kind IN ('correction','redirect','abandoned')),
+            quote           TEXT NOT NULL,
+            transcript_path TEXT NOT NULL,
+            byte_start      INTEGER NOT NULL,
+            byte_end        INTEGER NOT NULL,
+            prior_claim     TEXT NOT NULL DEFAULT '',
+            symbol          TEXT,
+            file            TEXT,
+            classifier_hash TEXT NOT NULL,
+            ts              TEXT NOT NULL,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(session_id, transcript_path, turn, kind, byte_start)
+         );
+         INSERT INTO intent_events
+            (id, session_id, project, turn, kind, quote, transcript_path,
+             byte_start, byte_end, prior_claim, symbol, file, classifier_hash,
+             ts, created_at)
+         SELECT id, session_id, project, turn, kind, quote, transcript_path,
+                byte_start, byte_end, prior_claim, symbol, file, classifier_hash,
+                ts, created_at
+           FROM intent_events_v1_old;
+         DROP TABLE intent_events_v1_old;
+         CREATE INDEX idx_intent_events_project_ts ON intent_events(project, ts);
+         CREATE INDEX idx_intent_events_project_symbol ON intent_events(project, symbol);
+         CREATE TRIGGER intent_events_no_update
+            BEFORE UPDATE ON intent_events
+            BEGIN SELECT RAISE(ABORT, 'intent_events is append-only'); END;
+         CREATE TRIGGER intent_events_no_delete
+            BEFORE DELETE ON intent_events
+            BEGIN SELECT RAISE(ABORT, 'intent_events is append-only'); END;",
+    )?;
+    Ok(())
+}
+
+/// `intent_events_v3`: detector provenance and abandonment-marker receipts.
+/// These are deliberately additive ALTERs so an interrupted upgrade is
+/// repaired one missing column at a time without rebuilding immutable rows.
+fn migrate_intent_events_detector_v3(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "intent_events", "detector")? {
+        conn.execute("ALTER TABLE intent_events ADD COLUMN detector TEXT", [])?;
+    }
+    if !has_column(conn, "intent_events", "classifier_score")? {
+        conn.execute(
+            "ALTER TABLE intent_events ADD COLUMN classifier_score TEXT",
+            [],
+        )?;
+    }
+    if !has_column(conn, "intent_events", "marker")? {
+        conn.execute("ALTER TABLE intent_events ADD COLUMN marker TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Does the on-disk `dreams_v1` CHECK constraint already allow the
+/// `supersession` category? Answered from `sqlite_master.sql` itself (the
+/// literal `CREATE TABLE` text SQLite stores), not from a probe insert —
+/// same shape-probe idiom `chunks_fts_schema` uses for `chunks_fts`. A
+/// missing table (fresh DB, not yet created) reads as "already allows it":
+/// the `CREATE TABLE IF NOT EXISTS` immediately above this call already
+/// wrote the 3-value constraint on a fresh DB, so there is nothing to
+/// rebuild.
+fn dreams_v1_allows_supersession(conn: &Connection) -> Result<bool> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'dreams_v1'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(sql.is_none_or(|s| s.contains("supersession")))
+}
+
+/// Does `table` have `column`? Answered from `pragma_table_info`, i.e. from
+/// the schema itself — not from whether a probe `SELECT` happened to parse.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        rusqlite::params![table, column],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Expand the schema with message-bound provenance coordinates. Existing
+/// chunks retain an Unknown floor until a structural import or backfill can
+/// attach evidence; the migration never infers trust from legacy authorship.
+fn migrate_provenance_substrate(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "chunks", "min_trust")? {
+        conn.execute(
+            "ALTER TABLE chunks ADD COLUMN min_trust INTEGER NOT NULL DEFAULT 0
+                 CHECK (min_trust BETWEEN 0 AND 5)",
+            [],
+        )?;
+    }
+    if !has_column(conn, "chunks", "tool_result_share")? {
+        conn.execute(
+            "ALTER TABLE chunks ADD COLUMN tool_result_share REAL
+                 CHECK (tool_result_share IS NULL OR
+                        (tool_result_share >= 0.0 AND tool_result_share <= 1.0))",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_chunks_min_trust ON chunks(min_trust);
+
+         CREATE TABLE IF NOT EXISTS provenance_events (
+            event_id        TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            message_key     TEXT NOT NULL,
+            seq             INTEGER NOT NULL,
+            channel         TEXT NOT NULL,
+            trust_tier      INTEGER NOT NULL DEFAULT 0
+                CHECK (trust_tier BETWEEN 0 AND 5),
+            parent_event_id TEXT REFERENCES provenance_events(event_id),
+            receipt_kind    TEXT NOT NULL,
+            receipt_ref     TEXT,
+            observed_at     TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_provenance_events_conversation_seq
+            ON provenance_events(conversation_id, seq);
+
+         CREATE TABLE IF NOT EXISTS chunk_spans (
+            chunk_id    TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+            event_id    TEXT NOT NULL REFERENCES provenance_events(event_id),
+            start_char  INTEGER NOT NULL CHECK (start_char >= 0),
+            end_char    INTEGER NOT NULL CHECK (end_char >= start_char),
+            content_hash TEXT NOT NULL,
+            PRIMARY KEY (chunk_id, event_id, start_char, end_char)
+         );
+         CREATE INDEX IF NOT EXISTS idx_chunk_spans_chunk ON chunk_spans(chunk_id);",
+    )?;
+    Ok(())
+}
+
+/// Additive cached floors: legacy content and agent-writable tags supply no
+/// evidence. Keep this after all artifact tables and intent identity migrations.
+fn migrate_artifact_provenance(conn: &Connection) -> Result<()> {
+    for table in [
+        "reflections",
+        "witness_verdicts",
+        "dream_threads",
+        "dream_plans",
+        "dreams_v1",
+        "intent_events",
+        "resolution_ledger",
+        "resolution_proposals",
+        "episode_index",
+        "dream_relations",
+        "derivation_ledger",
+        "journal_headlines",
+        "session_instrumentation",
+        "ratification_scores",
+    ] {
+        if !has_column(conn, table, "min_trust")? {
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN min_trust INTEGER NOT NULL DEFAULT 0 CHECK(min_trust BETWEEN 0 AND 5)"), [])?;
+        }
+    }
+    if !has_column(conn, "resolution_ledger", "event_id")? {
+        conn.execute("ALTER TABLE resolution_ledger ADD COLUMN event_id TEXT REFERENCES provenance_events(event_id)", [])?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_provenance_events_parent ON provenance_events(parent_event_id);
+         CREATE TABLE IF NOT EXISTS artifact_derivations (
+            artifact_kind TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            artifact_start_char INTEGER NOT NULL CHECK(artifact_start_char >= 0),
+            artifact_end_char INTEGER NOT NULL CHECK(artifact_end_char >= artifact_start_char),
+            support_event_id TEXT REFERENCES provenance_events(event_id),
+            -- Keep the receipt when an importer replaces/deletes a chunk.
+            -- Cold-path validation treats a missing/version-mismatched parent
+            -- as Unknown; a restrictive FK would block ordinary reimports.
+            support_chunk_id TEXT,
+            support_start_char INTEGER NOT NULL CHECK(support_start_char >= 0),
+            support_end_char INTEGER NOT NULL CHECK(support_end_char >= support_start_char),
+            CHECK(support_event_id IS NOT NULL OR support_chunk_id IS NOT NULL)
+         );
+         CREATE INDEX IF NOT EXISTS idx_artifact_derivations_artifact
+            ON artifact_derivations(artifact_kind,artifact_id);
+         CREATE INDEX IF NOT EXISTS idx_artifact_derivations_support_event
+            ON artifact_derivations(support_event_id);
+         CREATE INDEX IF NOT EXISTS idx_provenance_events_snapshot
+            ON provenance_events(json_extract(receipt_ref,'$.kind'), json_extract(receipt_ref,'$.id'))
+            WHERE receipt_kind='artifact_input';
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_artifact_derivations_identity
+            ON artifact_derivations(artifact_kind,artifact_id,artifact_start_char,artifact_end_char,
+                COALESCE(support_event_id,''),COALESCE(support_chunk_id,''),support_start_char,support_end_char);
+         CREATE TRIGGER IF NOT EXISTS confirmation_event_no_update
+            BEFORE UPDATE ON provenance_events WHEN OLD.channel='user_confirmation'
+            BEGIN SELECT RAISE(ABORT,'confirmation events are immutable'); END;
+         CREATE TRIGGER IF NOT EXISTS confirmation_event_no_delete
+            BEFORE DELETE ON provenance_events WHEN OLD.channel='user_confirmation'
+            BEGIN SELECT RAISE(ABORT,'confirmation events are immutable'); END;"
+    )?;
+    // Only this cache may change. The complete preexisting intent payload and
+    // its transcript identity remain append-only, including nullable fields.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS intent_events_no_update;
+        CREATE TRIGGER intent_events_no_update BEFORE UPDATE ON intent_events
+        WHEN NEW.id IS NOT OLD.id OR NEW.session_id IS NOT OLD.session_id
+          OR NEW.project IS NOT OLD.project OR NEW.turn IS NOT OLD.turn
+          OR NEW.kind IS NOT OLD.kind OR NEW.quote IS NOT OLD.quote
+          OR NEW.transcript_path IS NOT OLD.transcript_path
+          OR NEW.byte_start IS NOT OLD.byte_start OR NEW.byte_end IS NOT OLD.byte_end
+          OR NEW.prior_claim IS NOT OLD.prior_claim OR NEW.symbol IS NOT OLD.symbol
+          OR NEW.file IS NOT OLD.file OR NEW.classifier_hash IS NOT OLD.classifier_hash
+          OR NEW.ts IS NOT OLD.ts OR NEW.created_at IS NOT OLD.created_at
+          OR NEW.detector IS NOT OLD.detector OR NEW.classifier_score IS NOT OLD.classifier_score
+          OR NEW.marker IS NOT OLD.marker
+        BEGIN SELECT RAISE(ABORT,'intent_events is append-only'); END;",
+    )?;
+    Ok(())
+}
+
+/// Does `table` carry an index named `index_name`? Answered from
+/// `pragma_index_list`, so a column that exists without its index — the exact
+/// shape a half-applied migration leaves behind — is *detected*, not assumed
+/// complete because the column probe succeeded.
+fn has_index(conn: &Connection, table: &str, index_name: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_index_list(?1) WHERE name = ?2",
+        rusqlite::params![table, index_name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Add `narrative_usage.ref_id` and its index, checking each half
+/// independently and verifying the result.
+///
+/// Three properties the previous `let _ = execute_batch(...)` did not have:
+///
+/// 1. **Errors propagate.** A failed ALTER or CREATE INDEX aborts startup
+///    instead of leaving every later `ref_id` insert to fail silently.
+/// 2. **The two halves are checked separately.** A database that already has
+///    the column but lost the index (partial prerelease schema, interrupted
+///    migration) is *repaired*; the old code skipped the whole block the
+///    moment the column probe succeeded.
+/// 3. **The result is verified.** After the writes, both objects are read
+///    back out of the schema; if either is still missing the migration
+///    returns an error rather than reporting success.
+///
+/// Wrapped in a SAVEPOINT so a failure half-way leaves no partial state.
+/// SAVEPOINTs nest, so this is safe whether or not the caller already holds a
+/// transaction.
+fn migrate_narrative_usage_ref_id(conn: &Connection) -> Result<()> {
+    const TABLE: &str = "narrative_usage";
+    const COLUMN: &str = "ref_id";
+    const INDEX: &str = "idx_narrative_usage_ref";
+
+    let column_present = has_column(conn, TABLE, COLUMN)?;
+    let index_present = has_index(conn, TABLE, INDEX)?;
+    if column_present && index_present {
+        return Ok(());
+    }
+
+    conn.execute_batch("SAVEPOINT csr_narrative_usage_ref_id")?;
+    let applied = (|| -> Result<()> {
+        if !column_present {
+            // Deliberately NOT `IF NOT EXISTS` (SQLite has no such form for
+            // ADD COLUMN): the pragma above already established absence, and
+            // a duplicate-column error here means the schema moved under us
+            // and must surface.
+            conn.execute_batch("ALTER TABLE narrative_usage ADD COLUMN ref_id TEXT")?;
+        }
+        if !index_present {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_narrative_usage_ref ON narrative_usage(ref_id)",
+            )?;
+        }
+        Ok(())
+    })();
+    match applied {
+        Ok(()) => conn.execute_batch("RELEASE csr_narrative_usage_ref_id")?,
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO csr_narrative_usage_ref_id; RELEASE csr_narrative_usage_ref_id",
+            );
+            return Err(error);
+        }
+    }
+
+    // Verify, from the schema, that both halves actually landed. Reporting
+    // "migrated" on the strength of a statement that returned Ok is exactly
+    // the assumption this finding is about.
+    if !has_column(conn, TABLE, COLUMN)? {
+        anyhow::bail!("migration failed: narrative_usage.ref_id missing after ALTER TABLE");
+    }
+    if !has_index(conn, TABLE, INDEX)? {
+        anyhow::bail!("migration failed: idx_narrative_usage_ref missing after CREATE INDEX");
+    }
+    Ok(())
+}
+
+/// One-shot backfill (D5): rewrite already-stored worktree-local paths in
+/// `code_evolution.file_path` / `code_nodes.file` to their canonical main-repo
+/// form. Companion to the `track_code_evolution` fix in `hooks::post_tool_use`
+/// (which now canonicalizes on every new write) — this corrects rows written
+/// before that fix landed. Never deletes anything. `pub(crate)` so tests can
+/// call it directly, independent of the one-shot `meta` gate in `run()`.
+pub(crate) fn backfill_worktree_paths(conn: &Connection) -> Result<()> {
+    const WORKTREE_MARKER: &str = "%/.claude/worktrees/%";
+
+    // code_evolution: `id` is never derived from `file_path` — plain rewrite,
+    // no collision possible, no logical-duplicate concern (append-only ledger).
+    {
+        let mut stmt =
+            conn.prepare("SELECT id, file_path FROM code_evolution WHERE file_path LIKE ?1")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([WORKTREE_MARKER], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        for (id, file_path) in rows {
+            let canonical =
+                crate::extraction::repo_path::canonical_repo_path(std::path::Path::new(&file_path));
+            let canonical_str = canonical.to_string_lossy().to_string();
+            if canonical_str != file_path {
+                conn.execute(
+                    "UPDATE code_evolution SET file_path = ?1 WHERE id = ?2",
+                    rusqlite::params![canonical_str, id],
+                )?;
+            }
+        }
+    }
+
+    // code_nodes is deliberately NOT rewritten here.
+    //
+    // `id = sha256(repo|file|kind|name)` (extraction::codegraph::node_id), so
+    // rewriting `file` without recomputing `id` leaves a row whose stored path
+    // disagrees with its own identity. The next extraction of that file mints a
+    // second row under the correct canonical id, and `retire_missing_nodes` —
+    // which scopes by (project, file) — then sees the migrated legacy row as
+    // absent from the observed set and hard-deletes it together with its
+    // `code_node_attribution` provenance. The migration would manufacture
+    // exactly the data loss the rest of this branch is closing.
+    //
+    // Re-keying properly would mean rewriting `code_edges.src_id`/`dst_id`,
+    // `code_node_attribution.node_id` and `code_node_rank.node_id` in one
+    // transaction and merging into any pre-existing canonical row — a real
+    // migration, not a release-gate cleanup, and not worth the risk here.
+    //
+    // Leaving these rows untouched is a no-op against today's behaviour: they
+    // already sit under their worktree paths, and retirement never reaches them
+    // because it is scoped to the canonical (project, file). The forward fix in
+    // `hooks::post_tool_use::update_code_graph` stops new ones being written.
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    const DROP_CURRENT_FTS: &str = "
+        DROP TRIGGER IF EXISTS chunks_fts_ai;
+        DROP TRIGGER IF EXISTS chunks_fts_ad;
+        DROP TRIGGER IF EXISTS chunks_fts_au;
+        DROP TABLE chunks_fts;
+    ";
+
+    fn fts_schema(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn matching_live_ids(conn: &Connection, query: &str) -> BTreeSet<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id FROM chunks c
+                 JOIN chunks_fts fts ON fts.rowid = c.rowid
+                 WHERE chunks_fts MATCH ?1",
+            )
+            .unwrap();
+        stmt.query_map([query], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn vacuum_space_check_is_sized_off_live_pages_not_file_length() {
+        // Break caught: requiring 2x the file length defers the reclaim forever on
+        // the databases that need it most. Numbers are the measured state of the
+        // reference corpus at the moment VACUUM is reached: 11,665,166,336 bytes
+        // of file, of which 2,658,352 of 2,847,941 pages are already free, and a
+        // finished VACUUM produced 747,130,880 bytes.
+        let required = vacuum_free_space_required_from(4096, 2_847_941, 2_658_352);
+        assert!(
+            required >= 747_130_880,
+            "must cover the compacted result, asked {required}"
+        );
+        assert!(
+            required < 1_500_000_000,
+            "must not ask for the whole pre-VACUUM file, asked {required}"
+        );
+
+        // A database with nothing to reclaim still gets a real check.
+        let dense = vacuum_free_space_required_from(4096, 2_847_941, 0);
+        assert!(dense > 11_000_000_000);
+
+        // And an empty one never asks for zero.
+        assert_eq!(
+            vacuum_free_space_required_from(4096, 0, 0),
+            64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn fresh_databases_use_external_content_fts_with_all_sync_triggers() {
+        // Break caught: an internal-content FTS table creates chunks_fts_content
+        // and stores a second full copy of every chunk body.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let sql = fts_schema(&conn).to_ascii_lowercase();
+        assert!(sql.contains("content='chunks'"), "schema was: {sql}");
+        assert!(sql.contains("content_rowid='rowid'"), "schema was: {sql}");
+        let content_shadow: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'chunks_fts_content'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content_shadow, 0);
+        let trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name IN ('chunks_fts_ai', 'chunks_fts_ad', 'chunks_fts_au')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger_count, 3);
+    }
+
+    #[test]
+    fn legacy_fts_upgrade_purges_orphans_and_preserves_live_result_sets() {
+        // Break caught: merely changing future writes leaves historical orphan
+        // documents in the FTS corpus. Rebuild must derive the new index solely
+        // from live chunks, without changing which live ids match.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(DROP_CURRENT_FTS).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE chunks_fts
+                 USING fts5(content, tokenize='porter unicode61');
+             INSERT INTO chunks
+                 (rowid, id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES
+                 (10, 'live-a', 'conv-a', 'p', '2026-08-12T00:00:00Z', 'alpha beta', 1),
+                 (20, 'live-b', 'conv-b', 'p', '2026-08-12T00:00:00Z', 'beta gamma', 1);
+             INSERT INTO chunks_fts(rowid, content) VALUES
+                 (10, 'alpha beta'),
+                 (20, 'beta gamma'),
+                 (99, 'alpha orphanonly'),
+                 (100, 'beta stale duplicate');",
+        )
+        .unwrap();
+        let queries = ["alpha", "beta", "gamma", "orphanonly"];
+        let before: Vec<_> = queries
+            .iter()
+            .map(|query| matching_live_ids(&conn, query))
+            .collect();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM chunks_fts_docsize", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+
+        run(&conn).unwrap();
+
+        let after: Vec<_> = queries
+            .iter()
+            .map(|query| matching_live_ids(&conn, query))
+            .collect();
+        assert_eq!(
+            after, before,
+            "migration must preserve every live result set"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM chunks_fts_docsize", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2,
+            "rebuild must index exactly the two live chunks"
+        );
+        assert!(fts_schema(&conn)
+            .to_ascii_lowercase()
+            .contains("content='chunks'"));
+        assert_eq!(
+            fts_migration_state(&conn).unwrap().as_deref(),
+            Some(CHUNKS_FTS_COMPLETE),
+            "startup must not serve before post-VACUUM FTS verification completes"
+        );
+    }
+
+    #[test]
+    fn failed_legacy_fts_upgrade_rolls_back_to_the_searchable_old_index() {
+        // Break caught: a non-transactional DROP/CREATE migration can strand a
+        // killed or failed upgrade with neither a usable old nor new index.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(DROP_CURRENT_FTS).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE chunks RENAME COLUMN content TO body;
+             CREATE VIRTUAL TABLE chunks_fts
+                 USING fts5(content, tokenize='porter unicode61');
+             INSERT INTO chunks
+                 (rowid, id, conversation_id, project_name, timestamp, body, message_count)
+             VALUES (10, 'survivor', 'conv', 'p', '2026-08-12T00:00:00Z', 'stillsearchable', 1);
+             INSERT INTO chunks_fts(rowid, content) VALUES (10, 'stillsearchable');",
+        )
+        .unwrap();
+
+        run(&conn)
+            .expect_err("missing external content column must fail after the transactional DROP");
+
+        let schema = fts_schema(&conn).to_ascii_lowercase();
+        assert!(
+            !schema.contains("content='chunks'"),
+            "legacy schema must roll back: {schema}"
+        );
+        assert_eq!(
+            matching_live_ids(&conn, "stillsearchable"),
+            BTreeSet::from(["survivor".to_string()])
+        );
+    }
+
+    #[test]
+    fn interrupted_post_vacuum_rebuild_is_repaired_before_reopen_returns() {
+        // Break caught: after VACUUM, an implicit chunks.rowid may have moved.
+        // A durable pending-rebuild marker must force reconstruction before a
+        // restarted process can use the index.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO chunks
+                 (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES ('restart', 'conv', 'p', '2026-08-12T00:00:00Z', 'restarttoken', 1)",
+            [],
+        )
+        .unwrap();
+        let rowid: i64 = conn
+            .query_row("SELECT rowid FROM chunks WHERE id = 'restart'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO chunks_fts(chunks_fts, rowid, content)
+             VALUES ('delete', ?1, 'restarttoken')",
+            [rowid],
+        )
+        .unwrap();
+        assert!(matching_live_ids(&conn, "restarttoken").is_empty());
+        set_fts_migration_state(&conn, CHUNKS_FTS_PENDING_REBUILD).unwrap();
+
+        run(&conn).expect("reopen must finish the interrupted rebuild");
+
+        assert_eq!(
+            matching_live_ids(&conn, "restarttoken"),
+            BTreeSet::from(["restart".to_string()])
+        );
+        assert_eq!(
+            fts_migration_state(&conn).unwrap().as_deref(),
+            Some(CHUNKS_FTS_COMPLETE)
+        );
+    }
+
+    // ---- narrative_usage.ref_id (codex X5 finding 12) --------------------
+
+    #[test]
+    fn ref_id_migration_creates_both_the_column_and_its_index() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        assert!(has_column(&conn, "narrative_usage", "ref_id").unwrap());
+        assert!(has_index(&conn, "narrative_usage", "idx_narrative_usage_ref").unwrap());
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(has_column(&conn, "narrative_usage", "ref_id").unwrap());
+        assert!(has_index(&conn, "narrative_usage", "idx_narrative_usage_ref").unwrap());
+    }
+
+    #[test]
+    fn a_partial_ref_id_schema_is_detected_and_repaired_not_assumed_migrated() {
+        // The exact half-applied shape the old `let _ = execute_batch(...)`
+        // accepted as complete: the column landed, the index did not. The old
+        // code's probe (`SELECT ref_id FROM narrative_usage LIMIT 0`) succeeds
+        // here, so it skipped the block and left the index missing forever.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("migrations::run");
+        conn.execute_batch("DROP INDEX idx_narrative_usage_ref")
+            .expect("drop index to simulate an interrupted migration");
+        assert!(has_column(&conn, "narrative_usage", "ref_id").unwrap());
+        assert!(!has_index(&conn, "narrative_usage", "idx_narrative_usage_ref").unwrap());
+
+        migrate_narrative_usage_ref_id(&conn).expect("repair");
+        assert!(
+            has_index(&conn, "narrative_usage", "idx_narrative_usage_ref").unwrap(),
+            "a column-without-index schema must be repaired, not treated as migrated"
+        );
+    }
+
+    #[test]
+    fn a_missing_narrative_usage_table_fails_the_migration_instead_of_being_swallowed() {
+        // Disk failure / dropped table stands in for any reason the ALTER
+        // cannot apply. The point is that it is an Err, not a silent no-op
+        // that leaves every later ref_id insert failing.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let error = migrate_narrative_usage_ref_id(&conn)
+            .expect_err("no narrative_usage table — the migration must fail loudly");
+        assert!(
+            error.to_string().contains("narrative_usage"),
+            "the error must name what failed: {error}"
+        );
+    }
+
+    #[test]
+    fn ref_id_migration_leaves_no_open_savepoint_behind() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("migrations::run");
+        assert!(
+            conn.is_autocommit(),
+            "a released savepoint must leave the connection in autocommit"
+        );
+    }
+
+    // ---- Journal v4 P4b attribution + Wave 3 reservations -----------------
+
+    #[test]
+    fn dream_attributions_table_exists_with_every_documented_column() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare(
+                "SELECT dream_id, kind, emitted_at, bound_session_id, bound_at,
+                        outcome_episode_id, outcome, receipts_json
+                 FROM dream_attributions LIMIT 0"
+            )
+            .is_ok(),
+            "dream_attributions must carry every column the design names"
+        );
+    }
+
+    #[test]
+    fn an_attribution_row_with_neither_a_kind_nor_a_binding_is_rejected() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("migrations::run");
+        let result = conn.execute(
+            "INSERT INTO dream_attributions (dream_id) VALUES ('deadbeef')",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "a row that is neither an emission (kind) nor a binding (session) claims nothing"
+        );
+    }
+
+    #[test]
+    fn narrative_reservations_table_exists_and_constrains_its_states() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        conn.execute(
+            "INSERT INTO narrative_reservations (attempt_key, call_site) VALUES ('k1', 'dream_plan')",
+            [],
+        )
+        .expect("a reservation is writable before the call");
+        let bad = conn.execute(
+            "UPDATE narrative_reservations SET state = 'probably_fine' WHERE attempt_key = 'k1'",
+            [],
+        );
+        assert!(bad.is_err(), "the state vocabulary is closed");
+        let dup = conn.execute(
+            "INSERT INTO narrative_reservations (attempt_key, call_site) VALUES ('k1', 'dream_plan')",
+            [],
+        );
+        assert!(dup.is_err(), "attempt_key is the idempotency key");
+    }
 
     #[test]
     fn saga_columns_migration_idempotent() {
@@ -902,6 +2580,214 @@ mod tests {
                 .is_ok(),
             "seq and is_sidechain columns must exist after migration"
         );
+    }
+
+    #[test]
+    fn artifact_receipts_survive_replacement_of_source_chunks() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch("INSERT INTO chunks(id,conversation_id,project_name,timestamp,content,message_count) VALUES('c','s','p','now','old',1);
+            INSERT INTO artifact_derivations VALUES('reflection','r',0,3,NULL,'c',0,3);
+            DELETE FROM chunks WHERE id='c';").unwrap();
+        let support: String = conn
+            .query_row(
+                "SELECT support_chunk_id FROM artifact_derivations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            support, "c",
+            "a missing parent remains countable and can lower descendants to Unknown"
+        );
+    }
+
+    #[test]
+    fn artifact_floors_default_unknown_and_migrate_legacy_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE reflections (id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT NOT NULL, timestamp TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')));
+            INSERT INTO reflections(id,content,tags,timestamp) VALUES('old','unchanged','[\"source:user\"]','2026-01-01');").unwrap();
+        run(&conn).unwrap();
+        run(&conn).unwrap();
+        for table in [
+            "reflections",
+            "witness_verdicts",
+            "dream_threads",
+            "dream_plans",
+            "dreams_v1",
+            "intent_events",
+            "resolution_ledger",
+            "resolution_proposals",
+            "episode_index",
+            "dream_relations",
+            "derivation_ledger",
+            "journal_headlines",
+            "session_instrumentation",
+            "ratification_scores",
+        ] {
+            let column: (i64, String) = conn.query_row("SELECT \"notnull\", dflt_value FROM pragma_table_info(?1) WHERE name='min_trust'", [table], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(column, (1, "0".into()), "{table}");
+        }
+        let row: (String, i64) = conn
+            .query_row(
+                "SELECT content,min_trust FROM reflections WHERE id='old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("unchanged".into(), 0));
+        assert!(conn
+            .prepare("SELECT event_id FROM resolution_ledger")
+            .is_ok());
+        assert!(conn.prepare("SELECT artifact_kind,artifact_id,artifact_start_char,artifact_end_char,support_event_id,support_chunk_id,support_start_char,support_end_char FROM artifact_derivations").is_ok());
+    }
+
+    #[test]
+    fn artifact_floor_maintenance_preserves_intent_and_confirmation_immutability() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch("INSERT INTO intent_events(session_id,project,turn,kind,quote,transcript_path,byte_start,byte_end,classifier_hash,ts) VALUES('s','p',1,'correction','no','/a',0,2,'h','now');
+          INSERT INTO provenance_events VALUES('confirm','s','digest',0,'user_confirmation',4,NULL,'elicitation_digest','digest','now');").unwrap();
+        conn.execute("UPDATE intent_events SET min_trust=3", [])
+            .unwrap();
+        assert!(conn
+            .execute("UPDATE intent_events SET quote='yes'", [])
+            .is_err());
+        assert!(conn
+            .execute("UPDATE intent_events SET classifier_score='forged'", [])
+            .is_err());
+        assert!(conn.execute("DELETE FROM intent_events", []).is_err());
+        assert!(conn
+            .execute(
+                "UPDATE provenance_events SET trust_tier=5 WHERE event_id='confirm'",
+                []
+            )
+            .is_err());
+        assert!(conn
+            .execute("DELETE FROM provenance_events WHERE event_id='confirm'", [])
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO artifact_derivations VALUES('reflection','x',0,2,NULL,NULL,0,2)",
+                []
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO artifact_derivations VALUES('reflection','x',2,1,'confirm',NULL,0,2)",
+                []
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO artifact_derivations VALUES('reflection','x',0,2,'confirm',NULL,0,2)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn provenance_substrate_migration_is_idempotent_and_defaults_closed() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+
+        conn.execute(
+            "INSERT INTO chunks
+                (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES ('c1', 'conv', 'project', '2026-09-04T00:00:00Z', 'body', 1)",
+            [],
+        )
+        .unwrap();
+        let cached: (i64, Option<f64>) = conn
+            .query_row(
+                "SELECT min_trust, tool_result_share FROM chunks WHERE id='c1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cached, (0, None));
+
+        let objects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+                    'provenance_events', 'chunk_spans',
+                    'idx_chunks_min_trust', 'idx_provenance_events_conversation_seq',
+                    'idx_chunk_spans_chunk')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(objects, 5);
+    }
+
+    #[test]
+    fn provenance_substrate_migrates_legacy_chunks_without_rewriting_them() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chunks (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                project_name TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                content TEXT NOT NULL,
+                message_count INTEGER NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+             );
+             INSERT INTO chunks
+                (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES ('legacy', 'old-conv', 'old-project', '2026-01-02T03:04:05Z',
+                     'legacy text', 7);",
+        )
+        .unwrap();
+
+        run(&conn).expect("migrate legacy database");
+        let row: (String, String, i64, Option<f64>) = conn
+            .query_row(
+                "SELECT conversation_id, content, min_trust, tool_result_share
+                   FROM chunks WHERE id='legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("old-conv".into(), "legacy text".into(), 0, None));
+    }
+
+    #[test]
+    fn provenance_substrate_rejects_invalid_coordinates_and_tiers() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let bad_tier = conn.execute(
+            "INSERT INTO provenance_events
+                (event_id, conversation_id, message_key, seq, channel, trust_tier,
+                 receipt_kind, observed_at)
+             VALUES ('e1', 'conv', 'm1', 0, 'user_message', 99, 'jsonl', 'now')",
+            [],
+        );
+        assert!(bad_tier.is_err());
+
+        conn.execute(
+            "INSERT INTO chunks
+                (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES ('c1', 'conv', 'p', 'now', 'body', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provenance_events
+                (event_id, conversation_id, message_key, seq, channel, trust_tier,
+                 receipt_kind, observed_at)
+             VALUES ('e1', 'conv', 'm1', 0, 'user_message', 3, 'jsonl', 'now')",
+            [],
+        )
+        .unwrap();
+        let bad_span = conn.execute(
+            "INSERT INTO chunk_spans
+                (chunk_id, event_id, start_char, end_char, content_hash)
+             VALUES ('c1', 'e1', 4, 2, 'hash')",
+            [],
+        );
+        assert!(bad_span.is_err());
     }
 
     #[test]
@@ -943,6 +2829,22 @@ mod tests {
     }
 
     #[test]
+    fn session_instrumentation_table_exists_with_expected_columns() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        run(&conn).expect("second migrations::run (idempotent)");
+        assert!(
+            conn.prepare(
+                "SELECT session_id, transcript_size, transcript_mtime, error_count, \
+                 steer_count, turn_count, errors_json, steers_json, computed_at \
+                 FROM session_instrumentation LIMIT 0"
+            )
+            .is_ok(),
+            "session_instrumentation table must exist with the exact §3.3(a) columns"
+        );
+    }
+
+    #[test]
     fn resolution_ledger_migration_idempotent() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         run(&conn).expect("first migrations::run");
@@ -954,6 +2856,52 @@ mod tests {
             .is_ok(),
             "resolution_ledger table must exist after migration"
         );
+    }
+
+    #[test]
+    fn resolution_source_guard_preserves_legacy_agent_rows_without_upgrading_them() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE resolution_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chunk_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('resolved','still_open','regressed')),
+                evidence TEXT NOT NULL,
+                claim TEXT,
+                source TEXT NOT NULL DEFAULT 'agent',
+                created_at TEXT DEFAULT (datetime('now'))
+             );
+             INSERT INTO resolution_ledger
+                (chunk_id, status, evidence, claim, source)
+             VALUES ('legacy', 'resolved', 'old evidence', 'old claim', 'agent');",
+        )
+        .unwrap();
+        let legacy_id = conn.last_insert_rowid();
+
+        run(&conn).expect("migrate legacy ledger");
+
+        let legacy: (i64, String) = conn
+            .query_row(
+                "SELECT id, source FROM resolution_ledger WHERE chunk_id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (legacy_id, "agent".to_string()));
+        assert!(conn
+            .execute(
+                "UPDATE resolution_ledger SET source = 'user_confirmed' WHERE id = ?1",
+                [legacy_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO resolution_ledger
+                    (chunk_id, status, evidence, source)
+                 VALUES ('bad', 'resolved', 'bad source', 'journal_ui')",
+                [],
+            )
+            .is_err());
     }
 
     #[test]
@@ -1310,5 +3258,408 @@ mod tests {
             idx_count, 2,
             "both code_nodes conversation-attribution indexes must exist"
         );
+    }
+
+    #[test]
+    fn worktree_backfill_rewrites_stored_paths_to_canonical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        // Path must contain `/.claude/worktrees/` so the migration LIKE filter matches.
+        let wt = tmp.path().join(".claude").join("worktrees").join("wt");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::create_dir_all(main.join(".git").join("worktrees").join("wt")).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+
+        let main_file = main.join("src").join("a.rs");
+        std::fs::write(&main_file, "fn a() {}").unwrap();
+        let gitdir_line = format!("gitdir: {}/.git/worktrees/wt\n", main.display());
+        std::fs::write(wt.join(".git"), gitdir_line).unwrap();
+
+        let wt_file = wt.join("src").join("a.rs").to_string_lossy().to_string();
+        // Compare against the same resolved spelling `canonical_repo_path` stores
+        // (macOS /var → /private/var via canonicalize).
+        let main_file_str = std::fs::canonicalize(&main_file)
+            .unwrap_or(main_file.clone())
+            .to_string_lossy()
+            .to_string();
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+
+        conn.execute(
+            "INSERT INTO code_evolution (id, session_id, project_name, file_path, language, tool_name) \
+             VALUES ('evo_1', 'sess', 'proj', ?1, 'rust', 'Write')",
+            rusqlite::params![wt_file],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_nodes (id, repo, project, file, kind, name) \
+             VALUES ('node_1', 'repo', 'proj', ?1, 'function', 'foo')",
+            rusqlite::params![wt_file],
+        )
+        .unwrap();
+
+        backfill_worktree_paths(&conn).unwrap();
+
+        let evo_path: String = conn
+            .query_row(
+                "SELECT file_path FROM code_evolution WHERE id = 'evo_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let node_path: String = conn
+            .query_row("SELECT file FROM code_nodes WHERE id = 'node_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        assert_eq!(
+            evo_path, main_file_str,
+            "code_evolution.file_path must be rewritten to the canonical path"
+        );
+        assert_ne!(
+            evo_path, wt_file,
+            "must not remain keyed under the worktree path"
+        );
+        // code_nodes must be left ALONE. Rewriting `file` without recomputing
+        // the path-derived `id` would desynchronize a row from its own identity
+        // and hand it to `retire_missing_nodes` as a deletion target on the next
+        // extraction, destroying its attribution provenance. Asserting the
+        // non-rewrite is the safety property, not a relaxation of the old one.
+        assert_eq!(
+            node_path, wt_file,
+            "code_nodes.file must NOT be rewritten — id is derived from file, \
+             so rewriting the path alone makes the row a retirement target"
+        );
+        assert_ne!(
+            node_path, main_file_str,
+            "code_nodes must not be silently re-keyed to the canonical path"
+        );
+    }
+
+    #[test]
+    fn worktree_backfill_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main2");
+        // Path must contain `/.claude/worktrees/` so the migration LIKE filter matches.
+        let wt = tmp.path().join(".claude").join("worktrees").join("wt2");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::create_dir_all(main.join(".git").join("worktrees").join("wt2")).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+
+        let main_file = main.join("src").join("b.rs");
+        std::fs::write(&main_file, "fn b() {}").unwrap();
+        let gitdir_line = format!("gitdir: {}/.git/worktrees/wt2\n", main.display());
+        std::fs::write(wt.join(".git"), gitdir_line).unwrap();
+
+        let wt_file = wt.join("src").join("b.rs").to_string_lossy().to_string();
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+
+        conn.execute(
+            "INSERT INTO code_evolution (id, session_id, project_name, file_path, language, tool_name) \
+             VALUES ('evo_2', 'sess', 'proj', ?1, 'rust', 'Write')",
+            rusqlite::params![wt_file],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_nodes (id, repo, project, file, kind, name) \
+             VALUES ('node_2', 'repo', 'proj', ?1, 'function', 'bar')",
+            rusqlite::params![wt_file],
+        )
+        .unwrap();
+
+        backfill_worktree_paths(&conn).unwrap();
+
+        let count_evo_1: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_evolution", [], |r| r.get(0))
+            .unwrap();
+        let count_nodes_1: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_nodes", [], |r| r.get(0))
+            .unwrap();
+        let evo_path_1: String = conn
+            .query_row(
+                "SELECT file_path FROM code_evolution WHERE id = 'evo_2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let node_path_1: String = conn
+            .query_row("SELECT file FROM code_nodes WHERE id = 'node_2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        // Second pass, direct call (bypassing the one-shot `meta` gate on purpose,
+        // to prove the underlying rewrite logic itself is idempotent).
+        backfill_worktree_paths(&conn).unwrap();
+
+        let count_evo_2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_evolution", [], |r| r.get(0))
+            .unwrap();
+        let count_nodes_2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_nodes", [], |r| r.get(0))
+            .unwrap();
+        let evo_path_2: String = conn
+            .query_row(
+                "SELECT file_path FROM code_evolution WHERE id = 'evo_2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let node_path_2: String = conn
+            .query_row("SELECT file FROM code_nodes WHERE id = 'node_2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        assert_eq!(
+            count_evo_1, count_evo_2,
+            "row count must be stable across repeated backfill passes"
+        );
+        assert_eq!(
+            count_nodes_1, count_nodes_2,
+            "row count must be stable across repeated backfill passes"
+        );
+        assert_eq!(
+            evo_path_1, evo_path_2,
+            "path must be stable across repeated backfill passes"
+        );
+        assert_eq!(
+            node_path_1, node_path_2,
+            "path must be stable across repeated backfill passes"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // dreams_v1 'supersession' category widen (dream backfill Stage 6)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fresh_db_allows_supersession_category_immediately() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        conn.execute(
+            "INSERT INTO dreams_v1 (dream_id, project, category, revision_hash, prose)
+             VALUES ('id1', 'p', 'supersession', 'rev1', 'card text')",
+            [],
+        )
+        .expect("a fresh DB's dreams_v1 must accept 'supersession' without a rebuild");
+    }
+
+    #[test]
+    fn provenance_column_is_added_nullable_without_losing_current_schema_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dreams_v1 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dream_id TEXT NOT NULL UNIQUE,
+                project TEXT NOT NULL,
+                category TEXT NOT NULL CHECK (category IN ('unfinished','strategy','supersession')),
+                subject_key TEXT,
+                revision_hash TEXT NOT NULL,
+                prose TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                status TEXT NOT NULL DEFAULT 'open'
+             );
+             INSERT INTO dreams_v1 (dream_id, project, category, revision_hash, prose)
+             VALUES ('legacy-current', 'p', 'supersession', 'rev0', 'legacy card');",
+        )
+        .unwrap();
+
+        run(&conn).expect("additive provenance migration");
+
+        let (prose, provenance): (String, Option<String>) = conn
+            .query_row(
+                "SELECT prose, evidence_provenance FROM dreams_v1 WHERE dream_id = 'legacy-current'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy row and nullable provenance column must remain readable");
+        assert_eq!(prose, "legacy card");
+        assert!(provenance.is_none());
+    }
+
+    #[test]
+    fn preexisting_two_value_check_is_rebuilt_without_losing_rows() {
+        // Simulate a DB created before this migration: dreams_v1 with the
+        // OLD 2-value CHECK, carrying a real row a user may have already
+        // read/verdicted.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dreams_v1 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dream_id TEXT NOT NULL UNIQUE,
+                project TEXT NOT NULL,
+                category TEXT NOT NULL CHECK (category IN ('unfinished','strategy')),
+                subject_key TEXT,
+                revision_hash TEXT NOT NULL,
+                prose TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                status TEXT NOT NULL DEFAULT 'open'
+             );
+             CREATE INDEX IF NOT EXISTS idx_dreams_v1_lookup
+                 ON dreams_v1(project, category, revision_hash);
+             INSERT INTO dreams_v1 (dream_id, project, category, subject_key, revision_hash,
+                                    prose, status)
+             VALUES ('old-id', 'p', 'unfinished', 'item-1', 'rev0', 'legacy card', 'open');",
+        )
+        .unwrap();
+
+        run(&conn).expect("migrations::run over a pre-existing old-schema dreams_v1");
+
+        // The legacy row survived the rebuild, untouched.
+        let (project, category, subject_key, prose, status): (
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT project, category, subject_key, prose, status FROM dreams_v1 WHERE dream_id = 'old-id'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("legacy row must survive the rebuild");
+        assert_eq!(project, "p");
+        assert_eq!(category, "unfinished");
+        assert_eq!(subject_key.as_deref(), Some("item-1"));
+        assert_eq!(prose, "legacy card");
+        assert_eq!(status, "open");
+
+        // And the new category is now accepted.
+        conn.execute(
+            "INSERT INTO dreams_v1 (dream_id, project, category, revision_hash, prose)
+             VALUES ('new-id', 'p', 'supersession', 'rev1', 'new card')",
+            [],
+        )
+        .expect("'supersession' must be accepted after the rebuild");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dreams_v1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "no rows lost or duplicated by the rebuild");
+    }
+
+    #[test]
+    fn two_value_check_rebuild_preserves_prerelease_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dreams_v1 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dream_id TEXT NOT NULL UNIQUE,
+                project TEXT NOT NULL,
+                category TEXT NOT NULL CHECK (category IN ('unfinished','strategy')),
+                subject_key TEXT,
+                revision_hash TEXT NOT NULL,
+                prose TEXT NOT NULL,
+                evidence_provenance TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                status TEXT NOT NULL DEFAULT 'open'
+             );
+             INSERT INTO dreams_v1
+                (dream_id, project, category, revision_hash, prose, evidence_provenance)
+             VALUES ('old-id', 'p', 'unfinished', 'rev0', 'legacy card', '{\"receipt\":true}');",
+        )
+        .unwrap();
+
+        run(&conn).expect("rebuild prerelease table");
+
+        let provenance: String = conn
+            .query_row(
+                "SELECT evidence_provenance FROM dreams_v1 WHERE dream_id = 'old-id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("non-NULL prerelease provenance must survive");
+        assert_eq!(provenance, r#"{"receipt":true}"#);
+    }
+
+    #[test]
+    fn dreams_v1_rebuild_is_idempotent_on_rerun() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        conn.execute(
+            "INSERT INTO dreams_v1 (dream_id, project, category, revision_hash, prose)
+             VALUES ('id1', 'p', 'supersession', 'rev1', 'card text')",
+            [],
+        )
+        .unwrap();
+        run(&conn).expect("second migrations::run must not re-rebuild an already-current table");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dreams_v1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "row must survive a rerun that is already a no-op");
+    }
+
+    #[test]
+    fn intent_events_migration_is_idempotent_on_the_same_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        run(&conn).unwrap();
+
+        let objects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+                    'intent_events',
+                    'idx_intent_events_project_ts',
+                    'idx_intent_events_project_symbol',
+                    'intent_events_no_update',
+                    'intent_events_no_delete'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(objects, 5);
+        for column in ["detector", "classifier_score", "marker"] {
+            assert!(has_column(&conn, "intent_events", column).unwrap());
+        }
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='intent_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let compact: String = sql.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains("UNIQUE(session_id,transcript_path,turn,kind,byte_start)"));
+    }
+
+    #[test]
+    fn intent_events_identity_rebuild_preserves_v1_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE intent_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL, project TEXT NOT NULL, turn INTEGER NOT NULL,
+                kind TEXT NOT NULL, quote TEXT NOT NULL, transcript_path TEXT NOT NULL,
+                byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL,
+                prior_claim TEXT NOT NULL DEFAULT '', symbol TEXT, file TEXT,
+                classifier_hash TEXT NOT NULL, ts TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(session_id, turn, kind, byte_start));
+             INSERT INTO intent_events
+                (session_id, project, turn, kind, quote, transcript_path,
+                 byte_start, byte_end, classifier_hash, ts)
+             VALUES ('s', 'p', 3, 'correction', 'No.', '/tmp/child.jsonl',
+                     10, 13, 'old', '2026-09-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+        run(&conn).unwrap();
+
+        let row: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT quote, transcript_path, detector FROM intent_events WHERE session_id='s'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("No.".into(), "/tmp/child.jsonl".into(), None));
     }
 }

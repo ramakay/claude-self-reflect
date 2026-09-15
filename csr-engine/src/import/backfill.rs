@@ -248,9 +248,10 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
     files.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
     stats.files_scanned = files.len();
 
-    // Newest-wins per-file edge set + content hash (flushed once at the end).
+    // Newest-wins per-file edge set + content hash + node ids (flushed once at the end).
     let mut latest_edges: BTreeMap<(String, String), Vec<EdgeRow>> = BTreeMap::new();
     let mut latest_hash: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut latest_node_ids: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     let mut touched_projects: BTreeSet<String> = BTreeSet::new();
     // Cache of on-disk file contents (Some) / absence (None), keyed by path.
     let mut disk_cache: BTreeMap<String, Option<String>> = BTreeMap::new();
@@ -355,9 +356,13 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
                 stats.nodes_upserted += 1;
             }
 
-            // Edges: newest conversation wins — overwrite the per-file entry.
+            // Edges + node ids: newest conversation wins — overwrite the per-file entry.
             let key = (project_name.clone(), file_path.clone());
             latest_edges.insert(key.clone(), fragment.edges);
+            latest_node_ids.insert(
+                key.clone(),
+                fragment.nodes.iter().map(|n| n.id.clone()).collect(),
+            );
             latest_hash.insert(key, crate::extraction::anchors::hash_normalized(source));
             touched_projects.insert(project_name.clone());
         }
@@ -378,7 +383,7 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
     stats.files_from_disk = from_disk_files.len();
 
     if !dry_run {
-        // 3. Flush the newest edge set + file state per file.
+        // 3. Flush the newest edge set + file state + retire stale nodes per file.
         for ((project, file), edges) in &latest_edges {
             if let Err(e) = storage.replace_code_file_edges(project, file, edges) {
                 eprintln!("CSR backfill: edge replace error for {file} ({e})");
@@ -386,6 +391,22 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
             if let Some(hash) = latest_hash.get(&(project.clone(), file.clone())) {
                 if let Err(e) = storage.upsert_code_file_state(project, file, hash, false) {
                     eprintln!("CSR backfill: file state error for {file} ({e})");
+                }
+            }
+            // Retire ONLY from a complete on-disk observation. When the file is
+            // gone — routine for a pruned worktree — extraction above falls back
+            // to concatenated transcript edit snippets, which are fragments of a
+            // file, not a file. Their node ids are non-empty, so the empty-set
+            // guard in `retire_missing_nodes` does not help: every historical
+            // symbol the snippet happens not to contain would be hard-deleted
+            // along with its `code_node_attribution` provenance. Edge replacement
+            // and file state above are keyed to the same observation, but only
+            // retirement destroys history, so only it is gated here.
+            if from_disk_files.contains(&(project.clone(), file.clone())) {
+                if let Some(ids) = latest_node_ids.get(&(project.clone(), file.clone())) {
+                    if let Err(e) = storage.retire_missing_code_nodes(project, file, ids) {
+                        eprintln!("CSR backfill: node retire error for {file} ({e})");
+                    }
                 }
             }
         }
@@ -1264,7 +1285,7 @@ fn stamp_spans_into_cancellable_with(
             bool,
         ) = match rederived {
             Some((nodes, containers)) => (nodes, containers, "backfill_rederived_v2", true),
-            None => (file_nodes, Vec::new(), "backfill", false),
+            None => (file_nodes.clone(), Vec::new(), "backfill", false),
         };
         let defs: Vec<(String, String, i64, i64)> = stamp_nodes
             .iter()
@@ -1272,6 +1293,31 @@ fn stamp_spans_into_cancellable_with(
             .collect();
         let (qualified_symbols, disambiguated) = qualify_witness_symbols(&defs, &containers);
         stats.disambiguated_symbols += disambiguated;
+        let attribution_node_ids: Vec<Option<String>> = stamp_nodes
+            .iter()
+            .map(|node| {
+                if !is_rederived {
+                    return Some(node.id.clone());
+                }
+                let exact: Vec<&NodeRow> = file_nodes
+                    .iter()
+                    .filter(|stored| {
+                        stored.kind == node.kind
+                            && stored.name == node.name
+                            && stored.span_start == node.span_start
+                            && stored.span_end == node.span_end
+                    })
+                    .collect();
+                if exact.len() == 1 {
+                    return Some(exact[0].id.clone());
+                }
+                let same_anchor: Vec<&NodeRow> = file_nodes
+                    .iter()
+                    .filter(|stored| stored.kind == node.kind && stored.name == node.name)
+                    .collect();
+                (same_anchor.len() == 1).then(|| same_anchor[0].id.clone())
+            })
+            .collect();
 
         let generation_id = Uuid::new_v4().to_string();
         let generation = |status: &str| witness_ledger::WitnessGeneration {
@@ -1330,23 +1376,26 @@ fn stamp_spans_into_cancellable_with(
                     if dry_run {
                         continue;
                     }
-                    pending_rows.push(WitnessLedgerRow {
-                        id: 0,
-                        project: project.clone(),
-                        file: file.clone(),
-                        symbol: Some(symbol.clone()),
-                        span_start: Some(node.span_start),
-                        span_end: Some(node.span_end),
-                        stamp,
-                        tier: "committed".to_string(),
-                        at_oid: Some(at_oid_str.clone()),
-                        source_kind: source_kind.to_string(),
-                        source_id: Some(if is_rederived {
-                            generation_id.clone()
-                        } else {
-                            at_oid_str.clone()
-                        }),
-                    });
+                    pending_rows.push((
+                        WitnessLedgerRow {
+                            id: 0,
+                            project: project.clone(),
+                            file: file.clone(),
+                            symbol: Some(symbol.clone()),
+                            span_start: Some(node.span_start),
+                            span_end: Some(node.span_end),
+                            stamp,
+                            tier: "committed".to_string(),
+                            at_oid: Some(at_oid_str.clone()),
+                            source_kind: source_kind.to_string(),
+                            source_id: Some(if is_rederived {
+                                generation_id.clone()
+                            } else {
+                                at_oid_str.clone()
+                            }),
+                        },
+                        attribution_node_ids[idx].clone(),
+                    ));
                 }
                 Err(e) => {
                     stats.skipped_stamp_error += 1;
@@ -1370,8 +1419,13 @@ fn stamp_spans_into_cancellable_with(
             } else if !dry_run && !pending_rows.is_empty() {
                 if let Err(e) = storage.with_connection(|conn| {
                     let tx = conn.unchecked_transaction()?;
-                    for row in &pending_rows {
+                    for (row, node_id) in &pending_rows {
                         witness_ledger::insert_witness(&tx, row)?;
+                        if let Some(node_id) = node_id {
+                            crate::storage::witness_verdicts::bind_witness_row_to_node_chunk(
+                                &tx, row, node_id,
+                            )?;
+                        }
                     }
                     if is_rederived {
                         witness_ledger::insert_generation(&tx, &generation("complete"))?;
@@ -2614,14 +2668,36 @@ mod tests {
 
         let storage = Storage::open_memory().unwrap();
         storage
+            .insert_chunk(
+                &crate::import::ConversationChunk {
+                    id: "chunk-foo-edit".into(),
+                    conversation_id: "conv".into(),
+                    project_name: "proj".into(),
+                    timestamp: "2026-08-09T00:00:00Z".into(),
+                    content: "edited foo".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: crate::provenance::Speaker::Assistant,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                &[0.0; 4],
+            )
+            .unwrap();
+        storage
             .with_connection(|conn| {
-                let mut foo = attr_node("n-foo", &file_path, "foo");
+                let foo_id =
+                    crate::extraction::codegraph::node_id("proj", &file_path, "function", "foo");
+                let mut foo = attr_node(&foo_id, &file_path, "foo");
                 foo.repo_root = Some(repo_root.clone());
                 foo.span_start = 0;
                 foo.span_end = 2;
                 codegraph_upsert_node(conn, &foo).unwrap();
+                crate::storage::codegraph::set_last_chunk_id(conn, &foo_id, "chunk-foo-edit")?;
 
-                let mut bar = attr_node("n-bar", &file_path, "bar");
+                let bar_id =
+                    crate::extraction::codegraph::node_id("proj", &file_path, "function", "bar");
+                let mut bar = attr_node(&bar_id, &file_path, "bar");
                 bar.repo_root = Some(repo_root.clone());
                 bar.span_start = 4;
                 bar.span_end = 6;
@@ -2660,6 +2736,25 @@ mod tests {
         assert_eq!(foo_row.stamp, expected_foo.stamp().as_str());
         assert_eq!(foo_row.span_start, Some(0));
         assert_eq!(foo_row.span_end, Some(2));
+        storage
+            .with_connection(|conn| {
+                let bound_chunk: String = conn.query_row(
+                    "SELECT chunk_id FROM witness_chunk_bindings WHERE witness_id = ?1",
+                    rusqlite::params![foo_row.id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(bound_chunk, "chunk-foo-edit");
+                let bar_bindings: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM witness_chunk_bindings b
+                     JOIN witness_ledger w ON w.id = b.witness_id
+                     WHERE w.symbol = 'bar'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(bar_bindings, 0, "unattributed sibling must stay unbound");
+                Ok(())
+            })
+            .unwrap();
 
         // Idempotency plus cadence short-circuit: rerunning at the same HEAD
         // and extractor version must do no blob parsing or span stamping.

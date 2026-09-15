@@ -3168,6 +3168,11 @@ mod tests {
 
     #[test]
     fn fixture_codegraph_gate_passes_all_eleven_gates() {
+        // Serialize against env-mutating tests (CSR_NO_VALIDITY_PARTITION,
+        // CSR_DREAM_CONSUMPTION): the gates below run real search paths that
+        // read those vars, and a concurrent mutation flips gate behavior
+        // mid-run (observed live at ~25% full-suite flake rate, 2026-08-09).
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let storage = Arc::new(Storage::open_memory().unwrap());
 
         // VERIFIED CAUSE (2026-07-30): under `cargo test --lib` full-suite

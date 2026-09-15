@@ -1,6 +1,6 @@
 //! Daemon module — background processing for progressive enrichment.
 //!
-//! Runs six background tasks:
+//! Runs eight background tasks:
 //! 1. File watcher (existing) — auto-import new JSONL files
 //! 2. Extraction loop (Layer 2) — V3 extraction on imported conversations
 //! 3. Narrator loop (Layer 3) — AI batch narrative generation (if API key set)
@@ -8,10 +8,13 @@
 //! 5. Dream loop (v10) — periodic `dream_cadence::dream_loop` cycle over the
 //!    witness ledger (see that module for cadence/persistence/cost-discipline)
 //! 6. Release-ancestry loop — precomputes deterministic TAD v2 episode labels
+//! 7. Memory registry loop — periodic metadata-only scan of native memory files (`~/.claude/projects/*/memory/*.md`) into `memory_registry`; never embeds or injects memory content
+//! 8. Provenance backfill loop — one idle-gated structural batch at a time
 
 pub mod consolidation;
 pub mod dream_cadence;
 pub mod ratification;
+pub mod trained_rerank;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +31,20 @@ use crate::extraction;
 use crate::import;
 use crate::search::SearchEngine;
 use crate::storage::Storage;
+
+/// `CSR_NO_MEMORY_REGISTRY` kill switch — same "1"/"true" (case-insensitive) idiom
+/// as `crate::daemon::dream_cadence::dreaming_disabled`.
+pub fn memory_registry_disabled() -> bool {
+    std::env::var("CSR_NO_MEMORY_REGISTRY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+pub fn provenance_backfill_disabled() -> bool {
+    std::env::var("CSR_NO_PROVENANCE_BACKFILL")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 /// Configuration for the daemon loops.
 pub struct DaemonConfig {
@@ -246,6 +263,15 @@ impl Daemon {
                     }
                     let s = storage.clone();
                     let _ = tokio::task::spawn_blocking(move || {
+                        match s.refresh_contamination_cache() {
+                            Ok(measurement) => tracing::debug!(
+                                conversations = measurement.conversations,
+                                total_conversations = measurement.total_conversations,
+                                pct = measurement.pct,
+                                "contamination measurement refreshed"
+                            ),
+                            Err(e) => tracing::warn!("contamination refresh failed: {e}"),
+                        }
                         let Some(home) = dirs::home_dir() else { return };
                         let path = home.join(".claude/history.jsonl");
                         match crate::import::registry::ingest_history(&s, &path) {
@@ -328,6 +354,119 @@ impl Daemon {
             })
         };
         tracing::info!("plans loop started (~/.claude/plans → source='plan' chunks)");
+
+        // Memory registry loop: every 30 minutes, scan <projects_root>/*/memory/*.md
+        // and upsert metadata-only rows into memory_registry. Never embeds or
+        // injects memory file bodies — scan_memory_dirs already enforces that.
+        let memory_registry_handle = {
+            let storage = self.storage.clone();
+            let projects_root = self.projects_dir.clone();
+            let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
+            tokio::spawn(async move {
+                if memory_registry_disabled() {
+                    tracing::info!("memory registry loop disabled via CSR_NO_MEMORY_REGISTRY");
+                    return;
+                }
+                loop {
+                    for _ in 0..180 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    let s = storage.clone();
+                    let projects_root = projects_root.clone();
+                    let permit = match heavy_work.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        match crate::import::memory_registry::scan_memory_dirs(&s, &projects_root) {
+                            Ok(stats) => tracing::debug!(
+                                files_seen = stats.files_seen,
+                                upserted = stats.upserted,
+                                deleted = stats.deleted,
+                                schema_misses = stats.schema_misses,
+                                "memory registry scanned"
+                            ),
+                            Err(e) => tracing::warn!("memory registry scan failed: {e}"),
+                        }
+                    })
+                    .await;
+                }
+            })
+        };
+        if !memory_registry_disabled() {
+            tracing::info!(
+                "memory registry loop started (<projects_root>/*/memory/*.md → memory_registry)"
+            );
+        }
+
+        // Populate one structural-provenance batch per idle window. Parsing
+        // happens before the bounded write transaction and the shared permit
+        // keeps it out of the watch/import and dream critical sections.
+        let provenance_backfill_handle = {
+            let storage = self.storage.clone();
+            let projects_root = self.projects_dir.clone();
+            let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
+            tokio::spawn(async move {
+                loop {
+                    for _ in 0..30 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    if provenance_backfill_disabled()
+                        || !dream_cadence::is_idle(
+                            dream_cadence::last_activity_at(&storage),
+                            chrono::Utc::now(),
+                            dream_cadence::idle_secs(),
+                        )
+                    {
+                        continue;
+                    }
+                    let Some(permit) =
+                        acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref())
+                            .await
+                    else {
+                        return;
+                    };
+                    if provenance_backfill_disabled()
+                        || !dream_cadence::is_idle(
+                            dream_cadence::last_activity_at(&storage),
+                            chrono::Utc::now(),
+                            dream_cadence::idle_secs(),
+                        )
+                    {
+                        drop(permit);
+                        continue;
+                    }
+                    let storage = storage.clone();
+                    let projects_root = projects_root.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        match crate::import::provenance_backfill::backfill_incremental(
+                            &storage,
+                            &projects_root,
+                            crate::import::provenance_backfill::DEFAULT_BATCH_SIZE,
+                        ) {
+                            Ok(stats) => tracing::debug!(
+                                scanned = stats.chunks_scanned,
+                                reconstructed = stats.chunks_reconstructed,
+                                unknown = stats.chunks_unreconstructible,
+                                "provenance backfill batch completed"
+                            ),
+                            Err(error) => tracing::warn!(%error, "provenance backfill failed"),
+                        }
+                    })
+                    .await;
+                }
+            })
+        };
 
         // Optional Codex rollout loop. It runs once immediately and then every
         // 30 minutes. Missing ~/.codex/sessions is deliberately silent, and the
@@ -427,6 +566,35 @@ impl Daemon {
         };
         tracing::info!("release-ancestry refresh loop started (TAD v2)");
 
+        // Trained re-ranker: deterministic nightly label harvest, fit, and
+        // chronological gate. It shares the single heavy-work permit and does
+        // not invoke the narrative/LLM path.
+        let trained_rerank_handle = {
+            let storage = self.storage.clone();
+            let embeddings = self.embeddings.clone();
+            let search = self.search.clone();
+            let heavy_work = heavy_work.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                trained_rerank::nightly_loop(storage, embeddings, search, heavy_work, shutdown)
+                    .await;
+            })
+        };
+        tracing::info!("trained re-ranker nightly loop started");
+
+        // Journal v4 dream server (locked decision 7: daemon-hosted, always
+        // on, stable loopback port, bookmarkable). It binds 127.0.0.1 only
+        // and serves read-only routes. `spawn_for_daemon` returns `None`
+        // when `CSR_NO_JOURNAL_SERVER=1`, and the task it does spawn logs
+        // and returns on any bind/serve failure rather than propagating —
+        // a busy port must never take the daemon down. It shares the same
+        // `Arc<AtomicBool>` every other loop uses, so shutdown is one flag.
+        let journal_handle =
+            crate::journal::spawn_for_daemon(self.storage.clone(), shutdown.clone());
+        if journal_handle.is_some() {
+            tracing::info!("journal server started (v10.1 journal v4)");
+        }
+
         // Wait for Ctrl+C
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down daemon gracefully");
@@ -451,6 +619,10 @@ impl Daemon {
         let _ = plans_handle.await;
         // Same index-mutation contract as plans: never detach an in-flight import.
         let _ = codex_rollout_handle.await;
+        // Memory registry only upserts its own SQLite table transactionally —
+        // no HNSW mutation — so a timeout here cannot corrupt the search index.
+        let _ = tokio::time::timeout(timeout, memory_registry_handle).await;
+        let _ = tokio::time::timeout(timeout, provenance_backfill_handle).await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
         // The dream loop's tick awaits its `spawn_blocking` cycle directly
         // (see `dream_cadence::tick`) and checks the shutdown flag between
@@ -465,6 +637,16 @@ impl Daemon {
         // immediately when shutdown arrives while it waits for the permit;
         // if publication already began, await that bounded cycle fully.
         let _ = ancestry_handle.await;
+        // A cycle holds the shared heavy-work permit and appends its model row
+        // transactionally. Await it so shutdown cannot detach a half-harvested
+        // training attempt.
+        let _ = trained_rerank_handle.await;
+        // The journal server stops on the same flag (its graceful-shutdown
+        // future polls it). Bounded by the shared timeout: an in-flight
+        // request only reads, so a detached one cannot corrupt anything.
+        if let Some(h) = journal_handle {
+            let _ = tokio::time::timeout(timeout, h).await;
+        }
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
 
         // Flush HNSW index to disk before exit
@@ -690,6 +872,9 @@ async fn process_v3_extraction(
     }
 
     let result = extraction::extract_v3(&messages);
+    // Row-level support: the V3 index is a deterministic reduction of the whole
+    // transcript, so its floor is the transcript's floor (Unknown if unreadable).
+    let inputs = import::transcript_inputs_or_unknown(storage, file_path, conv_id);
 
     // Embed the search_index
     let search_index = result.search_index.clone();
@@ -720,8 +905,8 @@ async fn process_v3_extraction(
             format!("project_{}", project),
         ];
 
-        // Store the V3 reflection
-        storage.insert_reflection(&reflection_id, &content, &tags, &embedding)?;
+        // Store the V3 reflection with its support set
+        storage.insert_derived_reflection(&reflection_id, &content, &tags, &embedding, &inputs)?;
         {
             let mut idx = search.write().await;
             idx.insert_reflection(reflection_id.clone(), embedding);
@@ -756,11 +941,12 @@ async fn process_v3_extraction(
                 tokio::task::spawn_blocking(move || cache_emb.embed(&[cache_text.as_str()])).await
             {
                 if let Some(cache_vec) = cache_embedding.into_iter().next() {
-                    let _ = storage.insert_reflection(
+                    let _ = storage.insert_derived_reflection(
                         &cache_id,
                         &result.context_cache,
                         &cache_tags,
                         &cache_vec,
+                        &inputs,
                     );
                     {
                         let mut idx = search.write().await;
@@ -865,6 +1051,14 @@ async fn narrator_loop_inner(
             }
 
             let prompt = build_narrative_prompt(&skill_prompt, &messages);
+            // Freeze the support set now: the narrative is stored later from a
+            // batch result, when the transcript may have changed or vanished.
+            // A failed manifest write fails closed (the stored narrative reads
+            // an incomplete manifest and lands Unknown).
+            let inputs = import::transcript_inputs_or_unknown(storage, path, conv_id);
+            if let Err(e) = storage.record_narrative_request_inputs(conv_id, &inputs) {
+                tracing::warn!(conv = %conv_id, error = %e, "narrative request manifest not recorded");
+            }
             requests.push(BatchRequest {
                 custom_id: conv_id.clone(),
                 prompt,
@@ -1028,7 +1222,18 @@ async fn store_narrative(
         let reflection_id = format!("ai_narrative_{conv_id}");
         let tags = vec!["narrative_ai".to_string(), format!("conv_{conv_id}")];
 
-        storage.insert_reflection(&reflection_id, narrative, &tags, &embedding)?;
+        // Only the frozen request manifest supports this output; a missing or
+        // partial manifest is Unknown, never today's re-read of the transcript.
+        let inputs = storage
+            .load_narrative_request_inputs(conv_id)
+            .unwrap_or_else(|_| {
+                crate::storage::artifact_provenance::InputEnvelope::new(vec![
+                    crate::storage::artifact_provenance::ArtifactInput::unknown(
+                        "narrative request manifest unavailable",
+                    ),
+                ])
+            });
+        storage.insert_derived_reflection(&reflection_id, narrative, &tags, &embedding, &inputs)?;
         let mut idx = search.write().await;
         idx.insert_reflection(reflection_id.clone(), embedding);
 
@@ -1131,6 +1336,27 @@ async fn run_consolidation(
             .flatten()
             .unwrap_or_default();
 
+        // Facts are a deterministic reduction of the narrative they were cut
+        // from; the narrative row (preferring Layer 3, as the query does) is
+        // their whole support set.
+        let source_reflection = ["ai_narrative", "extracted_v3"].iter().find_map(|layer| {
+            storage
+                .get_enrichment_reflection_id(conv_id, layer)
+                .ok()
+                .flatten()
+        });
+        let fact_inputs = crate::storage::artifact_provenance::InputEnvelope::new(vec![
+            match &source_reflection {
+                Some(id) => storage.artifact_input_or_unknown(
+                    crate::storage::artifact_provenance::ArtifactKind::Reflection,
+                    id,
+                ),
+                None => crate::storage::artifact_provenance::ArtifactInput::unknown(
+                    "narrative source reflection not recorded",
+                ),
+            },
+        ]);
+
         // Store each fact as a tagged reflection with embedding (for HNSW search)
         let mut stored_ids = Vec::new();
         for (i, fact) in facts.iter().enumerate() {
@@ -1153,7 +1379,13 @@ async fn run_consolidation(
                     .await??;
 
             if let Some(embedding) = embeddings_vec.into_iter().next() {
-                storage.insert_reflection(&reflection_id, &content, &tags, &embedding)?;
+                storage.insert_derived_reflection(
+                    &reflection_id,
+                    &content,
+                    &tags,
+                    &embedding,
+                    &fact_inputs,
+                )?;
                 let mut idx = search.write().await;
                 idx.insert_reflection(reflection_id.clone(), embedding);
                 stored_ids.push(reflection_id);
@@ -1173,15 +1405,49 @@ async fn run_consolidation(
     Ok(())
 }
 
+/// Resolve the MCP-server enrichment loops' initial delay:
+/// `CSR_ENRICH_INITIAL_DELAY_SECS` if it parses as a non-negative `u64`,
+/// else the default 120s. Junk/unset falls back to the default rather than
+/// erroring — this is read once at server startup and must never fail.
+/// A value of `0` is honored (explicit opt-out of the delay).
+fn resolve_enrich_initial_delay() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 120;
+    let secs = std::env::var("CSR_ENRICH_INITIAL_DELAY_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Hold an MCP-side enrichment loop back for `delay` before its first tick.
+/// Every loop `spawn_enrichment_loops` starts goes through this — extraction,
+/// narration and consolidation all embed (consolidation runs before its
+/// first sleep), so gating only one of them would still load the model at
+/// t=0 whenever the others have queued work.
+async fn delayed<F: std::future::Future<Output = ()>>(delay: std::time::Duration, fut: F) {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    fut.await;
+}
+
 /// Spawn enrichment loops as background tokio tasks (for embedding in MCP server).
 /// Returns join handles that can be aborted on shutdown. Does NOT acquire the daemon lockfile
 /// (so the standalone `csr-engine daemon` can still run alongside if needed).
+///
+/// All three loops wait `CSR_ENRICH_INITIAL_DELAY_SECS` (default 120s)
+/// before their first tick: this function only runs inside `csr-engine serve`
+/// (src/engine.rs `serve_mcp`), where an MCP session that never calls a tool
+/// would otherwise start embedding at t=0 with no user request behind it.
+/// The standalone `csr-engine daemon` (`Daemon::run` above) spawns its loops
+/// directly and keeps its immediate-start behavior.
 pub fn spawn_enrichment_loops(
     storage: Arc<Storage>,
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let shutdown = Arc::new(AtomicBool::new(false));
+    let initial_delay = resolve_enrich_initial_delay();
 
     // Layer 2: V3 extraction (free, runs every 60s — less aggressive than standalone daemon)
     let ext_handle = {
@@ -1189,9 +1455,7 @@ pub fn spawn_enrichment_loops(
         let e = embeddings.clone();
         let idx = search.clone();
         let sd = shutdown.clone();
-        tokio::spawn(async move {
-            extraction_loop(s, e, idx, 60, sd).await;
-        })
+        tokio::spawn(delayed(initial_delay, extraction_loop(s, e, idx, 60, sd)))
     };
 
     // Layer 3: AI narrative (only if API key set)
@@ -1201,9 +1465,10 @@ pub fn spawn_enrichment_loops(
         let e = embeddings.clone();
         let idx = search.clone();
         let sd = shutdown.clone();
-        Some(tokio::spawn(async move {
-            narrator_loop(s, e, idx, client, 10, 1800, 60, sd).await;
-        }))
+        Some(tokio::spawn(delayed(
+            initial_delay,
+            narrator_loop(s, e, idx, client, 10, 1800, 60, sd),
+        )))
     } else {
         None
     };
@@ -1214,9 +1479,7 @@ pub fn spawn_enrichment_loops(
         let e = embeddings.clone();
         let idx = search.clone();
         let sd = shutdown;
-        tokio::spawn(async move {
-            consolidation_loop(s, e, idx, sd).await;
-        })
+        tokio::spawn(delayed(initial_delay, consolidation_loop(s, e, idx, sd)))
     };
 
     let mut handles = vec![ext_handle, consol_handle];
@@ -1237,6 +1500,305 @@ pub fn prompt_hash(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_registry_kill_switch_env() {
+        // Unique to this module — no cross-module env races — so no shared
+        // mutex. Keep all cases in one test so cargo's default parallel
+        // runners cannot interleave set_var/remove_var on this var.
+        std::env::remove_var("CSR_NO_MEMORY_REGISTRY");
+        assert!(!memory_registry_disabled());
+        std::env::set_var("CSR_NO_MEMORY_REGISTRY", "1");
+        assert!(memory_registry_disabled());
+        std::env::set_var("CSR_NO_MEMORY_REGISTRY", "true");
+        assert!(memory_registry_disabled());
+        std::env::set_var("CSR_NO_MEMORY_REGISTRY", "TRUE");
+        assert!(memory_registry_disabled());
+        std::env::set_var("CSR_NO_MEMORY_REGISTRY", "0");
+        assert!(!memory_registry_disabled());
+        std::env::remove_var("CSR_NO_MEMORY_REGISTRY");
+    }
+
+    #[test]
+    fn enrich_initial_delay_env() {
+        // Unique to this module — no shared mutex needed, same rationale as
+        // memory_registry_kill_switch_env above.
+        std::env::remove_var("CSR_ENRICH_INITIAL_DELAY_SECS");
+        assert_eq!(
+            resolve_enrich_initial_delay(),
+            std::time::Duration::from_secs(120)
+        );
+        std::env::set_var("CSR_ENRICH_INITIAL_DELAY_SECS", "5");
+        assert_eq!(
+            resolve_enrich_initial_delay(),
+            std::time::Duration::from_secs(5)
+        );
+        // 0 is a valid, explicit opt-out — must be honored, not treated as unset.
+        std::env::set_var("CSR_ENRICH_INITIAL_DELAY_SECS", "0");
+        assert_eq!(resolve_enrich_initial_delay(), std::time::Duration::ZERO);
+        std::env::set_var("CSR_ENRICH_INITIAL_DELAY_SECS", "not-a-number");
+        assert_eq!(
+            resolve_enrich_initial_delay(),
+            std::time::Duration::from_secs(120)
+        );
+        std::env::remove_var("CSR_ENRICH_INITIAL_DELAY_SECS");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_holds_the_loop_body_until_the_delay_elapses() {
+        use std::sync::Mutex;
+        let start = tokio::time::Instant::now();
+        let ran_at: Arc<Mutex<Option<tokio::time::Instant>>> = Arc::new(Mutex::new(None));
+        let slot = ran_at.clone();
+        let handle = tokio::spawn(delayed(std::time::Duration::from_secs(120), async move {
+            *slot.lock().unwrap() = Some(tokio::time::Instant::now());
+        }));
+        // Let the spawned wrapper poll once so its sleep timer is registered
+        // before the clock moves; otherwise advance() has nothing to fire.
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(119)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            ran_at.lock().unwrap().is_none(),
+            "body ran before the delay elapsed"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        let at = ran_at
+            .lock()
+            .unwrap()
+            .expect("body never ran after the delay");
+        let elapsed = at.duration_since(start);
+        assert!(
+            elapsed >= std::time::Duration::from_secs(120)
+                && elapsed <= std::time::Duration::from_secs(121),
+            "body ran at {elapsed:?}, expected ~120s"
+        );
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_aborted_before_the_deadline_never_runs_the_body() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let handle = tokio::spawn(delayed(std::time::Duration::from_secs(120), async move {
+            flag.store(true, Ordering::SeqCst);
+        }));
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        // serve_mcp aborts the enrichment handles on shutdown; an abort
+        // during the delay must drop the pending loop, not run it later.
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(!ran.load(Ordering::SeqCst), "aborted body still ran");
+    }
+
+    #[tokio::test]
+    async fn delayed_with_zero_delay_runs_immediately() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        delayed(std::time::Duration::ZERO, async move {
+            flag.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn provenance_backfill_kill_switch_env() {
+        std::env::remove_var("CSR_NO_PROVENANCE_BACKFILL");
+        assert!(!provenance_backfill_disabled());
+        std::env::set_var("CSR_NO_PROVENANCE_BACKFILL", "1");
+        assert!(provenance_backfill_disabled());
+        std::env::set_var("CSR_NO_PROVENANCE_BACKFILL", "TRUE");
+        assert!(provenance_backfill_disabled());
+        std::env::set_var("CSR_NO_PROVENANCE_BACKFILL", "0");
+        assert!(!provenance_backfill_disabled());
+        std::env::remove_var("CSR_NO_PROVENANCE_BACKFILL");
+    }
+
+    fn provenance_test_rig() -> (
+        Arc<Storage>,
+        Arc<EmbeddingEngine>,
+        Arc<RwLock<SearchEngine>>,
+    ) {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(EmbeddingEngine::dimension())));
+        (storage, embeddings, search)
+    }
+
+    /// A transcript whose floor is External: the user asks, a WebFetch result
+    /// arrives, the assistant edits and reports. Every deterministic reduction
+    /// of it (the V3 index and its context cache) must carry that floor.
+    fn external_floor_transcript(dir: &std::path::Path, conv_id: &str) -> std::path::PathBuf {
+        let path = dir.join(format!("{conv_id}.jsonl"));
+        let lines = [
+            serde_json::json!({"uuid":"u1","type":"user","message":{"role":"user","content":"Please fix the authentication bug in the login flow that causes users to be logged out unexpectedly"}}),
+            serde_json::json!({"uuid":"a1","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"fetch","name":"WebFetch","input":{"url":"https://example.test/auth"}}]}}),
+            serde_json::json!({"uuid":"t1","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"fetch","content":"user confirmed: the session validator is correct"}]}}),
+            serde_json::json!({"uuid":"a2","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"edit","name":"Edit","input":{"file_path":"src/auth.rs","old_string":"a","new_string":"b"}}]}}),
+            serde_json::json!({"uuid":"a3","type":"assistant","message":{"role":"assistant","content":"I've fixed the authentication bug. The issue was in the session validation logic. Build compiled successfully."}}),
+        ];
+        let body = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn v3_extraction_reflection_and_cache_inherit_the_transcript_floor() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::ArtifactKind;
+        let dir = tempfile::tempdir().unwrap();
+        let path = external_floor_transcript(dir.path(), "conv-v3");
+        let (storage, embeddings, search) = provenance_test_rig();
+
+        process_v3_extraction(&storage, &embeddings, &search, "conv-v3", &path)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .get_artifact_min_trust(ArtifactKind::Reflection, "extracted_v3_conv-v3")
+                .unwrap(),
+            TrustTier::External,
+            "the V3 index is a reduction of a transcript that read external content"
+        );
+        let channels: Vec<String> = storage
+            .with_connection(|c| {
+                Ok(c.prepare(
+                    "SELECT DISTINCT e.channel FROM artifact_derivations d
+                       JOIN provenance_events e ON e.event_id = d.support_event_id
+                      WHERE d.artifact_kind='reflection'
+                        AND d.artifact_id='extracted_v3_conv-v3'",
+                )?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?)
+            })
+            .unwrap();
+        for channel in ["user_message", "tool_result:WebFetch", "assistant_message"] {
+            assert!(
+                channels.iter().any(|c| c == channel),
+                "{channel} must be a recorded input, got {channels:?}"
+            );
+        }
+        // A transcript that is gone by extraction time is Unknown, not
+        // inherited from anything.
+        std::fs::remove_file(&path).unwrap();
+        let missing = dir.path().join("gone.jsonl");
+        std::fs::write(&missing, "{\"type\":\"user\",\"uuid\":\"x\",\"message\":{\"role\":\"user\",\"content\":\"Please fix the authentication bug in the login flow that causes users to be logged out unexpectedly\"}}\n").unwrap();
+        let inputs = import::transcript_inputs_or_unknown(&storage, &path, "conv-v3");
+        assert_eq!(inputs.floor(), TrustTier::Unknown);
+    }
+
+    #[tokio::test]
+    async fn stored_narrative_floor_comes_only_from_the_frozen_request_manifest() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::ArtifactKind;
+        let dir = tempfile::tempdir().unwrap();
+        let path = external_floor_transcript(dir.path(), "conv-nar");
+        let (storage, embeddings, search) = provenance_test_rig();
+
+        // Submit time: the manifest is frozen from the transcript as it was.
+        let inputs = import::transcript_inputs_or_unknown(&storage, &path, "conv-nar");
+        assert_eq!(inputs.floor(), TrustTier::External);
+        storage
+            .record_narrative_request_inputs("conv-nar", &inputs)
+            .unwrap();
+        // The transcript vanishes before the batch result lands.
+        std::fs::remove_file(&path).unwrap();
+
+        store_narrative(&storage, &embeddings, &search, "conv-nar", "A narrative.")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_artifact_min_trust(ArtifactKind::Reflection, "ai_narrative_conv-nar")
+                .unwrap(),
+            TrustTier::External
+        );
+
+        // No manifest at all: Unknown, never a fresh read of anything.
+        store_narrative(&storage, &embeddings, &search, "conv-none", "Another.")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_artifact_min_trust(ArtifactKind::Reflection, "ai_narrative_conv-none")
+                .unwrap(),
+            TrustTier::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidated_facts_inherit_their_narrative_floor_and_tags_cannot_raise_it() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::{ArtifactInput, ArtifactKind, InputEnvelope};
+        let (storage, embeddings, search) = provenance_test_rig();
+        let narrative = "## Solution Pattern\nWe decided to use the iterator parser instead of the callback parser because re-entrancy dropped frames under load.\n";
+        let external = InputEnvelope::new(vec![ArtifactInput::unknown("external context")]);
+        let vector = vec![0.0; EmbeddingEngine::dimension()];
+        storage
+            .insert_derived_reflection(
+                "ai_narrative_conv-c",
+                narrative,
+                &["narrative_ai".into(), "conv_conv-c".into()],
+                &vector,
+                &external,
+            )
+            .unwrap();
+        storage
+            .mark_enrichment_completed("conv-c", "ai_narrative", "ai_narrative_conv-c")
+            .unwrap();
+        // The narrative itself is Unknown-floored here (unobserved input), so
+        // every fact cut from it must be Unknown too, whatever its tags say.
+        run_consolidation(&storage, &embeddings, &search)
+            .await
+            .unwrap();
+        let facts: Vec<(String, i64)> = storage
+            .with_connection(|c| {
+                Ok(c.prepare(
+                    "SELECT id, min_trust FROM reflections WHERE tags LIKE '%consolidated_fact%'",
+                )?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?)
+            })
+            .unwrap();
+        assert!(!facts.is_empty(), "the fixture narrative must yield a fact");
+        for (id, tier) in &facts {
+            assert_eq!(TrustTier::from_db(Some(*tier)), TrustTier::Unknown, "{id}");
+            assert_eq!(
+                storage
+                    .get_artifact_min_trust(ArtifactKind::Reflection, id)
+                    .unwrap(),
+                TrustTier::Unknown
+            );
+        }
+        let edges: i64 = storage
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM artifact_derivations d
+                       JOIN provenance_events e ON e.event_id = d.support_event_id
+                      WHERE d.artifact_kind='reflection' AND d.artifact_id=?1
+                        AND e.channel='derived_artifact:reflection'",
+                    [&facts[0].0],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            edges, 1,
+            "a fact records its narrative row as its one input"
+        );
+    }
 
     #[test]
     fn test_prompt_hash_deterministic() {

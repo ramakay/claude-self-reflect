@@ -5,14 +5,59 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Dream journal: fused ask->outcome sentence replaces the two-line headline
+
+`csr-engine dream --report`'s index row used to show a curated headline plus
+a description, neither verb-first — reading a card's outcome meant reading
+the badge, the description, and the todo list. Curation now writes one
+verb-first sentence per session that fuses what was asked with how it ended
+("Failed at creating the Ekadashi podcast"), with the outcome slug passed to
+the model so its verb is checked before display — a reply whose first word
+disagrees with the outcome (e.g. "Shipped" over a `failed` session) is
+rejected and replaced with a deterministic fallback (`Failed: …`), and the
+disagreeing model line is never cached. The old description field is kept
+(no schema change) and now renders as a detail-pane subtitle under the fused
+sentence, omitted entirely when there is nothing beyond the first clause.
+
+- **One-time re-curation, disclosed.** The prompt/output contract changed,
+  so every cached row misses exactly once against the new content hash and
+  is re-curated on the next `dream --report`. On the maintainer's corpus
+  (50-card cap, chunk size 10) that cost 5 `claude -p` calls, one time; a
+  second run afterward added zero new calls and produced byte-identical
+  output. Cost is bounded by the card cap, not by corpus size — a rerun on
+  an unchanged corpus still costs nothing.
+- **Kill-switch regression, disclosed.** `CSR_NO_AI_NARRATIVES=1` still
+  applies previously cached rows, but every row cached under the old
+  headline/description prompt misses under the new content hash. Users
+  running with the kill switch set will see every card's sentence go from a
+  cached headline to a deterministic fallback (`Shipped: …` / `Partly done:
+  …` / `Failed: …` / `Noted: …`) after upgrading — correct behavior (a stale
+  headline is never silently presented as the new fused sentence), but a
+  visible one-time change for that path. `CSR_NO_AI_NARRATIVES` applies
+  previously cached sentences and forces fallbacks only for the misses —
+  it never invokes the model.
+- **AI-spend convergence fix.** A `claude -p` batch reply that came back
+  malformed, partial (missing some session ids), or verb-disagreeing for
+  some sessions used to leave those sessions uncached even though
+  `narrative_usage` had already recorded the spend for the whole batch —
+  every subsequent `dream --report` re-purchased the same misses forever.
+  Every card in an already-paid-for batch is now cached with either an
+  accepted model sentence or its deterministic fallback, so a run converges
+  to zero new `claude -p` calls on the next `dream --report` regardless of
+  how the model's reply parsed.
+
 ## [10.1.0] - 2026-08-08
 
 ### Dreaming and recap: memory that forgets on evidence and hands back one paragraph
 
-v10 folds into a single release. Two halves: the engine now retires its own
-claims when the code they described moves, and the session opens with one
-causal paragraph instead of a pile of fragments. 10.0.0 was never published —
-everything below ships together as 10.1.0.
+v10 folds into a single release. Two halves: the engine now generates
+deterministic supersession verdicts when the code an anchor described moves —
+consumption ships disabled by default and verdict accuracy is unproven (482
+anchors observed at 2 HEAD commits — existence evidence, not accuracy) — and
+the session opens with one causal paragraph instead of a pile of fragments.
+10.0.0 was never published — everything below ships together as 10.1.0.
 
 #### Recap at SessionStart (headline)
 
@@ -32,8 +77,12 @@ Next: <evidenced next step>.
   missing. `Next:` is never invented. Punctuation-only sentinels never become
   claims.
 - Receipts mandatory: a settled claim without a commit receipt is not emitted.
-- No self-contamination: emitted recaps re-enter the corpus through the
-  transcript, so the extraction sanitizer recognises the exact emitted grammar.
+- Self-contamination mitigation, not closure: emitted recaps carry a
+  machine-owned sentinel (`RECAP_SENTINEL`) that the extraction sanitizer
+  checks before quote-stripping, closing known bypass classes (bullet
+  prefix, blockquote, HTML wrapping, zero-width injection) for newly
+  emitted recaps specifically. This does not retroactively clean transcripts
+  already in the corpus — see "Known unproven in this release" below.
 - Feed errors fail open to the previous fragment output, byte for byte.
 - Kill switch: `CSR_NO_RECAP=1`.
 
@@ -46,32 +95,62 @@ context on resume; this fills the model-facing half.
   stamps pinned to commit OIDs, audited as intact, drifted, vanished, or
   explicitly superseded. Causal ordering via git ancestry, no LLM and no
   timestamps on the verdict path. Operational failures stay errors and never
-  collapse into verdicts. Every supersession receipt now records whether its
-  basis was graph ordering (`GraphOrdered`) or content re-derivation alone
-  (`ContentOnly`), so a squash/rebase successor is never mistaken for a
-  graph-proven one.
-- **Witness ledger.** Append-only `witness_ledger` plus `witness_generations`
-  publication manifests; `codegraph stamp-spans --at <rev>` mints witnesses at
-  historical revisions.
+  collapse into verdicts. The crate's `Auditor::audit_against_successor`
+  records whether a supersession receipt's basis was graph ordering
+  (`GraphOrdered`) or content re-derivation alone (`ContentOnly`) — the field
+  records the provenance of the match, not a correctness guarantee; a
+  squash/rebase successor's receipt there is labeled `ContentOnly`, not
+  presented as graph-proven. This applies to the crate API only: the
+  production supersession path (`dream::find_successor`) has no basis field
+  and does not emit one.
+- **Witness ledger.** Append-preferring event log (`witness_ledger` — no SQL
+  trigger enforces immutability) plus `witness_generations` publication
+  manifests; `codegraph stamp-spans --at <rev>` mints witnesses at historical
+  revisions.
 - **Deterministic supersession verdicts.** Successor join, event ledger, and
   two-channel consumption — demote and annotate rather than delete, with
   `[stale anchor]` / `[evolved]` markers carrying commit receipts into search
-  results.
-- **Validity partition in rerank**, consuming dream verdicts; active forgetting
-  applies accelerated decay to demoted symbols.
+  results, when consumption is enabled.
+- **Consumption is opt-in and ships disabled by default.** Set
+  `CSR_DREAM_CONSUMPTION=1` to let verdicts reach rerank, search-result
+  annotations, and the recap "Learnt-then-retired" clause. This one flag
+  gates all verdict consumption — there is no separate demote-only switch —
+  and the demote channel specifically is unmeasured (see "Known unproven in
+  this release" below).
+- **Validity partition in rerank** consumes dream verdicts once
+  `CSR_DREAM_CONSUMPTION=1` is set; active forgetting applies accelerated
+  decay to demoted symbols under the same gate.
 - **Daemon dream cadence** (6h, `CSR_DREAM_INTERVAL_SECS`, kill switch
   `CSR_NO_DREAMING=1`), dream summary in the telemetry dashboard, and
   `--report` HTML journal.
 - **T4 benchmark**, ported into `codewitness labels` / `codewitness bench` —
-  deterministic and provenance-stamped. H1 rematch on the corrected extractor:
-  1.000 / 1.000 over 13,626 beliefs.
+  deterministic and provenance-stamped, but it does not execute the
+  production dream algorithm (`dream::find_successor`); it predicts
+  staleness from sampled tag maps and scores against ground truth derived
+  from the final tag. H1 rematch on the corrected extractor: 1.000 / 1.000
+  over 13,626 beliefs — recall is 1.0 by construction for this rule, not a
+  measured result; the corpus contains zero revert commits, so precision
+  1.000 is unfalsified, not proven. Full derivation and caveats:
+  `csr-engine/eval-kit/t4/README.md`.
 
 #### Search and corpus
 
 - **TAD v2**: temporal decay driven by release ancestry rather than wall-clock
   age, with an hourly ancestry cache that fails open to neutral.
-- **Self-contamination closed**: the importer no longer indexes CSR's own tool
-  output. Counters for suppressed blocks and scrubbed hook wrappers appear in
+- **Self-contamination: a sentinel-based rejection, not a closed loop.**
+  `is_csr_emission` checks a machine-owned sentinel (`RECAP_SENTINEL`)
+  embedded in every composed recap, scanned across the full text before
+  any grammar-dependent header/field-token logic runs. This is a
+  detection improvement, not proof of closure: the header match is
+  defeated by any non-whitespace prefix on `recap [`, the field-token
+  fallback is case-sensitive and a real recap paragraph matches zero of
+  the eight tokens, and four call sites (`search/rerank.rs`,
+  `hooks/session_briefing.rs`, `hooks/prompt_submit.rs`,
+  `hooks/session_start.rs`) call it directly and never run
+  `strip_quoted` first. It also does not retroactively clean what is
+  already embedded — 58 of 1,330 conversations (4.4%) in the maintainer's
+  corpus remain self-contaminated (see "Known unproven in this release").
+  Counters for suppressed blocks and scrubbed hook wrappers appear in
   `status`.
 - **Corpus expansion**: sidechain attribution (real project and parent session
   recovered from provenance) and an optional Codex rollout adapter.
@@ -100,6 +179,46 @@ context on resume; this fills the model-facing half.
   spawning git — git exports those to hook subprocesses, which hijacked the
   tests' temp repositories and made seven of them fail only when run from inside
   `git commit`.
+
+#### Known unproven in this release
+
+- **Verdict quality is existence data, not accuracy data.** The dogfood
+  corpus shows 482 anchors observed at 2 HEAD commits — existence evidence,
+  not accuracy. No independent ground truth scores these verdicts as
+  correct or incorrect.
+- **Revert precision is unfalsified, not proven.** The T4 benchmark corpus
+  behind the recall/precision figures above contains zero revert commits,
+  so the confusion-matrix cell that would catch a false supersession has
+  never been exercised.
+- **The demote channel is unmeasured, and consumption ships disabled by
+  default.** `CSR_DREAM_CONSUMPTION` is opt-in and off by default; with it
+  unset, no verdict reaches rerank, search annotations, or the recap
+  clause. There is no separate demote-only switch.
+- **CRLF / Windows stamp divergence is untested.** Span stamping has not
+  been verified across line-ending or `.gitattributes` filter differences.
+- **Multi-repo witness attribution is unrecorded.** The witness ledger does
+  not currently record which repository a witness belongs to.
+- **Historical conversations remain self-contaminated, and the size of that
+  debt depends on where you measure.** On the maintainer's corpus:
+  **58 of 1,330 embedded conversations (4.4%)** carry a CSR-emitted block —
+  108 (8.1%) under a deliberately over-broad pattern set that also counts
+  ordinary prose mentioning `csr_reflect_on_past(`. In the *source*
+  transcripts the figure is far higher — 5,465 of 7,003 session JSONL files
+  contain an injected block — because the sanitizer strips those before
+  embedding, so source contamination is largely not corpus contamination.
+  Quote the embedded number, not the source number, when the claim is about
+  what search actually sees. The recap sentinel narrows — but does not close —
+  detection of newly emitted recaps (documented header-prefix and field-token
+  bypasses remain; see the self-contamination bullet above); it does not
+  retroactively clean transcripts that already carry CSR's own tool output.
+- **The sentinel rejects any text containing it, including text that merely
+  discusses it.** Sessions that quote `RECAP_SENTINEL`'s literal value — source
+  files, grep output, design discussion — are dropped from the corpus wholesale.
+  For ordinary users this is unreachable; for work *on CSR itself* it is a live
+  recall hole, and it is why this release's own engineering sessions are
+  partially unindexed. Separating a recap from a quotation of a recap is not
+  decidable at the string level, so the guard deliberately errs toward
+  rejecting. Measured, not modelled: 2 chunks in the maintainer's corpus.
 
 ## [9.5.0] - 2026-08-03
 
@@ -132,9 +251,17 @@ has none. No scalar confidence scores anywhere — ordinal evidence labels only.
   0.45–0.62 carry an explicit may-be-spurious warning quoting the measured
   fabricated-probe range. Floor re-derivable via `examples/quick_check_floor.rs`.
 - **NEW: repo-identity labels.** `code_nodes.repo_root` records the git
-  toplevel at write time, stable across cwd/session boundaries; linked
-  worktree paths canonicalize onto the main checkout so one logical file has
-  one key.
+  toplevel at write time, stable across cwd/session boundaries. Linked worktree
+  paths canonicalize onto the main checkout *going forward*, so newly recorded
+  edits converge on one key per logical file. Two limits, both deliberate:
+  canonicalization needs the worktree's `.git` marker still on disk, so rows
+  whose worktree was already pruned keep their original path rather than being
+  guessed at; and the one-shot backfill rewrites `code_evolution` only. It does
+  **not** rewrite `code_nodes.file`, because a node's id is derived from its
+  path — rewriting the path alone would desynchronize a row from its own
+  identity and make it a deletion target for node retirement. Pre-existing
+  worktree-keyed nodes therefore remain, and one logical file can still have
+  more than one key in historical data.
 - **NEW: `csr-engine backfill-coedit`** — rebuilds the session↔file co-edit
   ledger from the historical JSONL corpus (idempotent).
 - **FIX (review round): witness tables survived only until the next process

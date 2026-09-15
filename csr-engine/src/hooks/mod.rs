@@ -6,16 +6,20 @@
 //! 3. Writes text to stdout (injected into Claude's context)
 //! 4. Exits with code 0 (never blocks the session)
 
+pub mod dream_match;
+pub mod exposure;
 pub mod install;
 pub mod intent;
 pub mod post_tool_use;
 pub mod precompact;
 pub mod prompt_submit;
+pub mod reaction;
 pub mod recap;
 pub mod session_briefing;
 pub mod session_end;
 pub mod session_start;
 pub mod stop;
+pub mod subagent_stop;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -33,6 +37,8 @@ pub struct HookInput {
     pub session_id: Option<String>,
     #[serde(alias = "transcriptPath")]
     pub transcript_path: Option<String>,
+    #[serde(alias = "agentTranscriptPath")]
+    pub agent_transcript_path: Option<String>,
     pub cwd: Option<String>,
     pub reason: Option<String>,
     /// Tool name for PostToolUse hook
@@ -48,6 +54,13 @@ pub struct HookInput {
     pub prompt: Option<String>,
     /// Hook event source (e.g. "startup", "resume", "compact", "clear") for SessionStart
     pub source: Option<String>,
+    /// SubagentStop child identifier and metadata (Claude Code payload).
+    #[serde(alias = "agentId", alias = "agentName")]
+    pub agent_id: Option<String>,
+    #[serde(alias = "agentType", alias = "agentDisplayName")]
+    pub agent_type: Option<String>,
+    #[serde(alias = "lastAssistantMessage")]
+    pub last_assistant_message: Option<String>,
 }
 
 /// How long the hook waits for the piped JSON before giving up.
@@ -287,6 +300,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
         "session-end" => session_end::handle(&input, engine, &cwd).await,
         "precompact" => precompact::handle(&input, engine, &cwd).await,
         "stop" => stop::handle(&input, engine, &cwd).await,
+        "subagent-stop" => subagent_stop::handle(&input, engine, &cwd).await,
         "post-tool-use" => post_tool_use::handle(&input, engine, &cwd).await,
         "prompt-submit" => prompt_submit::handle(&input, engine, &cwd).await,
         _ => {

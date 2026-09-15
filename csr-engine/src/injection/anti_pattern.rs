@@ -16,6 +16,12 @@ use crate::injection::InjectionItem;
 use crate::search::SearchEngine;
 use crate::storage::Storage;
 
+#[derive(Debug, Clone)]
+pub struct AntiPatternMatch {
+    pub item: InjectionItem,
+    pub memory_id: String,
+}
+
 /// Search for anti-patterns relevant to the current prompt.
 ///
 /// Searches reflections tagged with `outcome_incomplete` or `outcome_abandoned`
@@ -28,8 +34,23 @@ pub async fn find_anti_patterns(
     min_score: f32,
     limit: usize,
 ) -> Vec<InjectionItem> {
+    find_anti_pattern_matches(storage, embeddings, search, prompt, min_score, limit)
+        .await
+        .into_iter()
+        .map(|matched| matched.item)
+        .collect()
+}
+
+pub async fn find_anti_pattern_matches(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    prompt: &str,
+    min_score: f32,
+    limit: usize,
+) -> Vec<AntiPatternMatch> {
     let query = format!("failed approach don't retry: {}", prompt);
-    let results = search_reflections_by_tag(
+    let results = search_reflections_by_tag_with_ids(
         storage,
         embeddings,
         search,
@@ -42,10 +63,13 @@ pub async fn find_anti_patterns(
 
     results
         .into_iter()
-        .map(|(content, score)| InjectionItem {
-            content,
-            score,
-            source: "anti_pattern".to_string(),
+        .map(|(memory_id, content, score)| AntiPatternMatch {
+            item: InjectionItem {
+                content,
+                score,
+                source: "anti_pattern".to_string(),
+            },
+            memory_id,
         })
         .collect()
 }
@@ -63,6 +87,22 @@ pub async fn search_reflections_by_tag(
     limit: usize,
     tags: &[&str],
 ) -> Vec<(String, f32)> {
+    search_reflections_by_tag_with_ids(storage, embeddings, search, query, min_score, limit, tags)
+        .await
+        .into_iter()
+        .map(|(_, content, score)| (content, score))
+        .collect()
+}
+
+async fn search_reflections_by_tag_with_ids(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query: &str,
+    min_score: f32,
+    limit: usize,
+    tags: &[&str],
+) -> Vec<(String, String, f32)> {
     let query_vec = match embed_query(embeddings, query).await {
         Ok(v) => v,
         Err(_) => return Vec::new(),
@@ -78,7 +118,7 @@ pub async fn search_reflections_by_tag(
         if let Ok(Some((_content, ref_tags, _ts))) = storage.get_reflection_by_id(&result.id) {
             let has_matching_tag = tags.iter().any(|t| ref_tags.iter().any(|rt| rt == t));
             if has_matching_tag {
-                filtered.push((_content, result.score));
+                filtered.push((result.id.clone(), _content, result.score));
                 if filtered.len() >= limit {
                     break;
                 }

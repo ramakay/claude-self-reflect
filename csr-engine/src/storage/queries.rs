@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::import::{ConversationChunk, CsrSuppressionStats};
-use crate::provenance::{ChunkProvenance, Speaker};
+use crate::provenance::{ChunkEvidence, ChunkProvenance, ProvenanceEvent, Speaker, TrustTier};
 
 /// Upsert provenance for a chunk (who authored it, source conv, supersession).
 pub fn insert_chunk_provenance(
@@ -25,6 +25,388 @@ pub fn insert_chunk_provenance(
         ],
     )?;
     Ok(())
+}
+
+pub fn insert_provenance_event(conn: &Connection, event: &ProvenanceEvent) -> Result<()> {
+    conn.execute(
+        "INSERT INTO provenance_events
+            (event_id, conversation_id, message_key, seq, channel, trust_tier,
+             parent_event_id, receipt_kind, receipt_ref, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(event_id) DO UPDATE SET
+            trust_tier = MIN(provenance_events.trust_tier, excluded.trust_tier),
+            parent_event_id = COALESCE(provenance_events.parent_event_id,
+                                       excluded.parent_event_id),
+            receipt_ref = COALESCE(provenance_events.receipt_ref,
+                                   excluded.receipt_ref),
+            receipt_kind = CASE WHEN provenance_events.receipt_kind = 'unreconstructible'
+                                THEN excluded.receipt_kind ELSE provenance_events.receipt_kind END,
+            observed_at = CASE WHEN excluded.receipt_kind IN ('source_missing', 'source_unparsed', 'source_unmatched', 'plan_file')
+                               THEN excluded.observed_at ELSE provenance_events.observed_at END",
+        params![
+            event.event_id,
+            event.conversation_id,
+            event.message_key,
+            event.seq as i64,
+            event.channel,
+            event.trust_tier.as_i64(),
+            event.parent_event_id,
+            event.receipt_kind,
+            event.receipt_ref,
+            event.observed_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn parent_provenance_context(
+    conn: &Connection,
+    conversation_id: &str,
+    message_key: Option<&str>,
+) -> Result<crate::import::ParentContext> {
+    if let Some(message_key) = message_key {
+        let matched = conn
+            .query_row(
+                "SELECT event_id, trust_tier
+                   FROM provenance_events
+                  WHERE conversation_id = ?1 AND message_key = ?2
+                  ORDER BY trust_tier, CASE WHEN channel IN ('assistant_message', 'codex_assistant')
+                                THEN 0 ELSE 1 END,
+                           event_id
+                  LIMIT 1",
+                params![conversation_id, message_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        if let Some((event_id, tier)) = matched {
+            return Ok(crate::import::ParentContext {
+                floor: TrustTier::from_db(tier),
+                event_id: Some(event_id),
+            });
+        }
+    }
+    let floor = conn.query_row(
+        "SELECT MIN(trust_tier) FROM provenance_events WHERE conversation_id = ?1",
+        [conversation_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    Ok(crate::import::ParentContext {
+        floor: TrustTier::from_db(floor),
+        event_id: None,
+    })
+}
+
+/// Replace one chunk's structural evidence and its cached trust fields in one
+/// transaction. Re-importing a growing final chunk cannot leave stale spans.
+pub fn replace_chunk_evidence(conn: &Connection, evidence: &ChunkEvidence) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let relink = evidence_needs_relink(&tx, evidence)?;
+    replace_chunk_evidence_inner(&tx, evidence)?;
+    if relink {
+        super::sidechain_provenance::relink_conversations(
+            &tx,
+            &evidence
+                .events
+                .iter()
+                .map(|e| e.conversation_id.clone())
+                .collect::<Vec<_>>(),
+        )?;
+    } else {
+        super::artifact_provenance::lower_from(&tx, &[("chunk", &evidence.chunk_id)], &[])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn evidence_needs_relink(conn: &Connection, evidence: &ChunkEvidence) -> Result<bool> {
+    for event in &evidence.events {
+        if event.parent_event_id.is_some() {
+            return Ok(true);
+        }
+        let (session,message):(Option<i64>,Option<i64>)=conn.query_row("SELECT MIN(trust_tier),MIN(CASE WHEN message_key=?2 THEN trust_tier END) FROM provenance_events WHERE conversation_id=?1",params![event.conversation_id,event.message_key],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        if session.is_none()
+            || session.is_some_and(|t| t > event.trust_tier.as_i64())
+            || message.is_some_and(|t| t > event.trust_tier.as_i64())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(conn
+        .query_row(
+            "SELECT is_sidechain FROM chunks WHERE id=?1",
+            [&evidence.chunk_id],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+pub fn replace_chunk_evidence_batch(conn: &Connection, evidence: &[ChunkEvidence]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for row in evidence {
+        replace_chunk_evidence_inner(&tx, row)
+            .with_context(|| format!("persisting provenance for chunk {}", row.chunk_id))?;
+    }
+    super::sidechain_provenance::relink(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Backfill cannot race a forward importer into replacing real JSONL receipts.
+/// Equality is checked inside the transaction; unchanged retries issue no writes.
+pub fn replace_backfill_evidence_batch(
+    conn: &Connection,
+    evidence: &[ChunkEvidence],
+) -> Result<usize> {
+    if evidence.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut written = 0;
+    for row in evidence {
+        let (count, real): (usize, bool) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(e.receipt_kind='jsonl'),0) FROM chunk_spans s JOIN provenance_events e USING(event_id) WHERE s.chunk_id=?1",
+            [&row.chunk_id], |r| Ok((r.get::<_, i64>(0)? as usize,r.get(1)?)))?;
+        if real {
+            continue;
+        }
+        let mut same = count == row.spans.len();
+        if same {
+            for (span, event) in row.spans.iter().zip(&row.events) {
+                same &= tx.query_row("SELECT EXISTS(SELECT 1 FROM chunk_spans s JOIN provenance_events e USING(event_id) WHERE s.chunk_id=?1 AND s.event_id=?2 AND s.start_char=?3 AND s.end_char=?4 AND s.content_hash=?5 AND e.receipt_kind=?6 AND e.receipt_ref IS ?7 AND e.observed_at=?8)",
+                    params![row.chunk_id,span.event_id,span.start_char as i64,span.end_char as i64,span.content_hash,event.receipt_kind,event.receipt_ref,event.observed_at], |r|r.get::<_,bool>(0))?;
+            }
+        }
+        if !same {
+            replace_chunk_evidence_inner(&tx, row)?;
+            written += 1;
+        }
+    }
+    if written > 0 {
+        super::sidechain_provenance::relink(&tx)?;
+    }
+    tx.commit()?;
+    Ok(written)
+}
+
+fn replace_chunk_evidence_inner(conn: &Connection, evidence: &ChunkEvidence) -> Result<()> {
+    for event in &evidence.events {
+        insert_provenance_event(conn, event)?;
+    }
+    conn.execute(
+        "DELETE FROM chunk_spans WHERE chunk_id = ?1",
+        [&evidence.chunk_id],
+    )?;
+    for span in &evidence.spans {
+        anyhow::ensure!(
+            span.chunk_id == evidence.chunk_id,
+            "span chunk id does not match evidence chunk id"
+        );
+        conn.execute(
+            "INSERT INTO chunk_spans
+                (chunk_id, event_id, start_char, end_char, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                span.chunk_id,
+                span.event_id,
+                span.start_char as i64,
+                span.end_char as i64,
+                span.content_hash,
+            ],
+        )?;
+    }
+
+    let (tier, tool_chars, span_count, unknown_share, chunk_content): (
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+        String,
+    ) = conn.query_row(
+        "SELECT MIN(pe.trust_tier),
+                    COALESCE(SUM(CASE
+                        WHEN pe.channel LIKE 'tool_result:%'
+                          OR pe.channel LIKE 'codex_tool:%'
+                        THEN cs.end_char - cs.start_char ELSE 0 END), 0),
+                    COUNT(cs.event_id),
+                    COALESCE(SUM(CASE WHEN pe.receipt_kind IN ('unreconstructible', 'source_missing', 'source_unparsed', 'source_unmatched')
+                                      THEN 1 ELSE 0 END), 0),
+                    c.content
+               FROM chunks c
+               LEFT JOIN chunk_spans cs ON cs.chunk_id = c.id
+               LEFT JOIN provenance_events pe ON pe.event_id = cs.event_id
+              WHERE c.id = ?1
+              GROUP BY c.id",
+        [&evidence.chunk_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let chunk_chars = chunk_content.chars().count() as i64;
+    let min_trust = TrustTier::from_db(tier);
+    let tool_result_share = if span_count == 0 || chunk_chars == 0 || unknown_share > 0 {
+        None
+    } else {
+        Some(tool_chars as f64 / chunk_chars as f64)
+    };
+    anyhow::ensure!(
+        min_trust <= evidence.min_trust,
+        "persisted chunk floor exceeds the structurally observed floor"
+    );
+    anyhow::ensure!(
+        match (tool_result_share, evidence.tool_result_share) {
+            (None, None) => true,
+            (Some(actual), Some(expected)) => (actual - expected).abs() < f64::EPSILON,
+            _ => false,
+        },
+        "provided tool-result share does not match persisted spans: actual={tool_result_share:?}, expected={:?}, spans={span_count}, chars={chunk_chars}, tool_chars={tool_chars}",
+        evidence.tool_result_share,
+    );
+    conn.execute(
+        "UPDATE chunks SET min_trust = ?2, tool_result_share = ?3 WHERE id = ?1",
+        params![evidence.chunk_id, min_trust.as_i64(), tool_result_share],
+    )?;
+    Ok(())
+}
+
+pub fn get_chunk_min_trust(conn: &Connection, chunk_id: &str) -> Result<TrustTier> {
+    let encoded = conn
+        .query_row(
+            "SELECT min_trust FROM chunks WHERE id = ?1",
+            [chunk_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(TrustTier::from_db(encoded))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenanceBackfillRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub project_name: String,
+    pub timestamp: String,
+    pub content: String,
+    pub source: String,
+    pub is_sidechain: bool,
+    pub source_path: Option<String>,
+    pub failure_observed_at: Option<String>,
+}
+
+pub fn list_chunks_missing_spans(
+    conn: &Connection,
+    after_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ProvenanceBackfillRow>> {
+    let mut statement = conn.prepare(
+        "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content,
+                c.source, c.is_sidechain,
+                (SELECT i.file_path FROM import_state i
+                  WHERE i.conversation_id = c.conversation_id
+                    AND i.file_path NOT LIKE 'plan:%'
+                  ORDER BY i.file_path LIMIT 1)
+           FROM chunks c
+          WHERE c.id > COALESCE(?1, '')
+            AND NOT EXISTS (SELECT 1 FROM chunk_spans s WHERE s.chunk_id = c.id)
+          ORDER BY c.id
+          LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![after_id, limit as i64], |row| {
+        Ok(ProvenanceBackfillRow {
+            id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            project_name: row.get(2)?,
+            timestamp: row.get(3)?,
+            content: row.get(4)?,
+            source: row.get(5)?,
+            is_sidechain: row.get::<_, i64>(6)? != 0,
+            source_path: row.get(7)?,
+            failure_observed_at: None,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub fn list_provenance_backfill_candidates(
+    conn: &Connection,
+    after: Option<(&str, &str)>,
+    limit: usize,
+    retry: bool,
+) -> Result<Vec<ProvenanceBackfillRow>> {
+    let mut statement = conn.prepare(
+        "SELECT c.id,c.conversation_id,c.project_name,c.timestamp,c.content,c.source,c.is_sidechain,
+           COALESCE((SELECT i.file_path FROM import_state i WHERE i.conversation_id=c.conversation_id AND i.file_path NOT LIKE 'plan:%' ORDER BY i.file_path LIMIT 1),
+                    (SELECT e.receipt_ref FROM chunk_spans s JOIN provenance_events e USING(event_id) WHERE s.chunk_id=c.id LIMIT 1)),
+           (SELECT MIN(e.observed_at) FROM chunk_spans s JOIN provenance_events e USING(event_id) WHERE s.chunk_id=c.id)
+         FROM chunks c
+         WHERE (c.conversation_id,c.id) > (?1,?2)
+           AND NOT EXISTS (SELECT 1 FROM chunk_spans s JOIN provenance_events e USING(event_id) WHERE s.chunk_id=c.id AND (?4=0 OR e.receipt_kind='jsonl'))
+         ORDER BY c.conversation_id,c.id LIMIT ?3")?;
+    let (conv, id) = after.unwrap_or(("", ""));
+    let rows = statement.query_map(params![conv, id, limit as i64, retry], |r| {
+        Ok(ProvenanceBackfillRow {
+            id: r.get(0)?,
+            conversation_id: r.get(1)?,
+            project_name: r.get(2)?,
+            timestamp: r.get(3)?,
+            content: r.get(4)?,
+            source: r.get(5)?,
+            is_sidechain: r.get(6)?,
+            source_path: r.get(7)?,
+            failure_observed_at: r.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn provenance_coverage(conn: &Connection) -> Result<(i64, i64, i64, Option<f64>)> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(CASE WHEN EXISTS (
+                    SELECT 1 FROM chunk_spans s WHERE s.chunk_id = c.id
+                ) THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN c.min_trust = 0 THEN 1 ELSE 0 END), 0),
+                COUNT(*), AVG(c.tool_result_share)
+           FROM chunks c",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+    .map_err(Into::into)
+}
+
+pub fn provenance_tier_histogram(conn: &Connection) -> Result<Vec<(TrustTier, i64)>> {
+    let mut statement = conn
+        .prepare("SELECT min_trust, COUNT(*) FROM chunks GROUP BY min_trust ORDER BY min_trust")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            TrustTier::from_db(row.get::<_, Option<i64>>(0)?),
+            row.get(1)?,
+        ))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub fn provenance_failure_counts(conn: &Connection) -> Result<[i64; 3]> {
+    let mut counts = [0; 3];
+    let mut statement = conn.prepare("SELECT e.receipt_kind, COUNT(DISTINCT s.chunk_id) FROM provenance_events e JOIN chunk_spans s USING(event_id) WHERE e.receipt_kind IN ('source_missing','source_unparsed','source_unmatched') GROUP BY e.receipt_kind")?;
+    for row in statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        let (kind, count) = row?;
+        match kind.as_str() {
+            "source_missing" => counts[0] = count,
+            "source_unparsed" => counts[1] = count,
+            "source_unmatched" => counts[2] = count,
+            _ => {}
+        }
+    }
+    Ok(counts)
 }
 
 /// Upsert a derivation-ledger entry (Pillar 1). `times_reused` is preserved on
@@ -167,8 +549,18 @@ pub fn insert_chunk_with_source(
     source: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary, seq, is_sidechain, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary, seq, is_sidechain, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(id) DO UPDATE SET
+             conversation_id = excluded.conversation_id,
+             project_name = excluded.project_name,
+             timestamp = excluded.timestamp,
+             content = excluded.content,
+             message_count = excluded.message_count,
+             summary = excluded.summary,
+             seq = excluded.seq,
+             is_sidechain = excluded.is_sidechain,
+             source = excluded.source",
         params![
             chunk.id,
             chunk.conversation_id,
@@ -184,16 +576,9 @@ pub fn insert_chunk_with_source(
     )?;
 
     conn.execute(
-        "INSERT OR REPLACE INTO chunk_embeddings (chunk_id, embedding) VALUES (?1, ?2)",
+        "INSERT INTO chunk_embeddings (chunk_id, embedding) VALUES (?1, ?2)
+         ON CONFLICT(chunk_id) DO UPDATE SET embedding = excluded.embedding",
         params![chunk.id, vec_to_bytes(embedding)],
-    )?;
-
-    // Insert into FTS index
-    conn.execute(
-        "INSERT OR REPLACE INTO chunks_fts (rowid, content) VALUES (
-            (SELECT rowid FROM chunks WHERE id = ?1), ?2
-        )",
-        params![chunk.id, chunk.content],
     )?;
 
     Ok(())
@@ -236,6 +621,9 @@ pub fn rescope_sidechain_conversation(
         |row| row.get::<_, i64>(0),
     )? != 0;
     if !needs_repair {
+        let tx = conn.transaction()?;
+        super::sidechain_provenance::relink_conversations(&tx, &[conversation_id.into()])?;
+        tx.commit()?;
         return Ok(());
     }
     let tx = conn.transaction()?;
@@ -252,6 +640,7 @@ pub fn rescope_sidechain_conversation(
          ON CONFLICT(chunk_id) DO UPDATE SET source_conv_id = excluded.source_conv_id",
         params![conversation_id, parent_conversation_id],
     )?;
+    super::sidechain_provenance::relink_conversations(&tx, &[conversation_id.into()])?;
     tx.commit()?;
     Ok(())
 }
@@ -269,12 +658,6 @@ pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) 
     drop(stmt);
 
     for id in &ids {
-        // chunks_fts has no FK on chunks.id (it's rowid-addressed), so its row must be
-        // dropped before the owning chunks row disappears and the rowid lookup goes stale.
-        conn.execute(
-            "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
-            params![id],
-        )?;
         conn.execute(
             "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
             params![id],
@@ -288,6 +671,19 @@ pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) 
         "DELETE FROM chunks WHERE conversation_id = ?1",
         params![conversation_id],
     )?;
+    Ok(())
+}
+
+pub fn delete_chunk(conn: &Connection, chunk_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
+        params![chunk_id],
+    )?;
+    conn.execute(
+        "DELETE FROM chunk_provenance WHERE chunk_id = ?1",
+        params![chunk_id],
+    )?;
+    conn.execute("DELETE FROM chunks WHERE id = ?1", params![chunk_id])?;
     Ok(())
 }
 
@@ -374,6 +770,26 @@ pub fn insert_reflection(
     conn.execute(
         "INSERT OR REPLACE INTO reflection_embeddings (reflection_id, embedding) VALUES (?1, ?2)",
         params![id, vec_to_bytes(embedding)],
+    )?;
+
+    let message_key = crate::provenance::content_hash(content);
+    let event_id = blake3::hash(format!("reflection\0{id}\0{message_key}").as_bytes())
+        .to_hex()
+        .to_string();
+    insert_provenance_event(
+        conn,
+        &ProvenanceEvent {
+            event_id: format!("reflection:{event_id}"),
+            conversation_id: format!("reflection:{id}"),
+            message_key,
+            seq: 0,
+            channel: "reflection".to_string(),
+            trust_tier: TrustTier::Unknown,
+            parent_event_id: None,
+            receipt_kind: "reflection_row".to_string(),
+            receipt_ref: Some(id.to_string()),
+            observed_at: now,
+        },
     )?;
 
     Ok(())
@@ -554,7 +970,7 @@ pub fn fts5_search(
     query: &str,
     limit: usize,
     project: Option<&str>,
-) -> Result<Vec<ConversationChunk>> {
+) -> Result<Vec<(ConversationChunk, usize, f64)>> {
     // Sanitize for FTS5: split into OR-joined quoted words
     // "Apify runaway cost" → '"apify" OR "runaway" OR "cost"' (matches any word)
     // Quoting prevents hyphens/special chars from being parsed as FTS5 operators
@@ -576,30 +992,40 @@ pub fn fts5_search(
         .collect::<Vec<_>>()
         .join(" OR ");
 
-    let chunks = if let Some(p) = project.filter(|p| *p != "all") {
+    let chunks_with_bm25 = if let Some(p) = project.filter(|p| *p != "all") {
         let mut stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain,
+                    bm25(chunks_fts)
              FROM chunks c
              JOIN chunks_fts fts ON fts.rowid = c.rowid
              WHERE chunks_fts MATCH ?1 AND c.project_name = ?2
              ORDER BY fts.rank
              LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![fts_query, p, limit as i64], row_to_chunk)?;
+        let rows = stmt.query_map(params![fts_query, p, limit as i64], |row| {
+            Ok((row_to_chunk(row)?, row.get::<_, f64>(8)?))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         let mut stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain
+            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain,
+                    bm25(chunks_fts)
              FROM chunks c
              JOIN chunks_fts fts ON fts.rowid = c.rowid
              WHERE chunks_fts MATCH ?1
              ORDER BY fts.rank
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![fts_query, limit as i64], row_to_chunk)?;
+        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+            Ok((row_to_chunk(row)?, row.get::<_, f64>(8)?))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    Ok(chunks)
+    Ok(chunks_with_bm25
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, (chunk, bm25))| (chunk, ordinal, bm25))
+        .collect())
 }
 
 // ─── Reflection tag queries ───
@@ -1499,11 +1925,28 @@ pub struct NarrativeUsageSummary {
 }
 
 pub fn record_narrative_usage(conn: &Connection, row: &NarrativeUsageRow) -> Result<()> {
+    record_narrative_usage_for(conn, row, None)
+}
+
+/// Record one usage row, optionally tagged with the convergence hash of the
+/// work that caused it (Journal v4 P4, locked decision 13).
+///
+/// `ref_id` is what makes a per-dream spend figure *evidence* rather than a
+/// timestamp-window guess: the producer writes the hash it is working under,
+/// and `narrative_usage_for_refs` sums only rows carrying that exact hash.
+/// Passing `None` (what every pre-existing call site does through
+/// [`record_narrative_usage`]) leaves the row unattributed forever — which
+/// is the honest outcome, since nothing recorded which dream it belonged to.
+pub fn record_narrative_usage_for(
+    conn: &Connection,
+    row: &NarrativeUsageRow,
+    ref_id: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO narrative_usage
          (call_site, model, input_tokens, output_tokens, cache_read_tokens,
-          cache_creation_tokens, duration_ms, success)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+          cache_creation_tokens, duration_ms, success, ref_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             row.call_site,
             row.model,
@@ -1513,9 +1956,106 @@ pub fn record_narrative_usage(conn: &Connection, row: &NarrativeUsageRow) -> Res
             row.cache_creation_tokens,
             row.duration_ms,
             row.success as i64,
+            ref_id,
         ],
     )?;
     Ok(())
+}
+
+/// One model's measured token totals under a set of `ref_id`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrativeUsageByModel {
+    pub model: String,
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+}
+
+/// Per-model token totals for every `narrative_usage` row tagged with one of
+/// `refs`. An empty `refs`, or refs that match no row, yields an empty vec —
+/// the caller renders nothing rather than a zero.
+///
+/// The `IN` list is built from bound parameters only; `refs` values are never
+/// interpolated into the SQL text.
+pub fn narrative_usage_for_refs(
+    conn: &Connection,
+    refs: &[String],
+) -> Result<Vec<NarrativeUsageByModel>> {
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; refs.len()].join(",");
+    let sql = format!(
+        "SELECT model, COUNT(*),
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0),
+                COALESCE(SUM(cache_creation_tokens), 0)
+         FROM narrative_usage
+         WHERE ref_id IN ({placeholders})
+         GROUP BY model
+         ORDER BY model"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params = rusqlite::params_from_iter(refs.iter());
+    let rows = stmt
+        .query_map(params, |row| {
+            Ok(NarrativeUsageByModel {
+                model: row.get(0)?,
+                calls: row.get(1)?,
+                input_tokens: row.get(2)?,
+                output_tokens: row.get(3)?,
+                cache_read_tokens: row.get(4)?,
+                cache_creation_tokens: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Per-model token totals for every `narrative_usage` row whose `call_site`
+/// is in `call_sites`. Used by `status` for dreaming's spend-to-date. An
+/// empty list, or call sites with no rows, yields an empty vec — the caller
+/// renders nothing rather than a zero it never measured.
+///
+/// The `IN` list is built from bound parameters only; values are never
+/// interpolated into the SQL text.
+pub fn narrative_usage_for_call_sites(
+    conn: &Connection,
+    call_sites: &[&str],
+) -> Result<Vec<NarrativeUsageByModel>> {
+    if call_sites.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; call_sites.len()].join(",");
+    let sql = format!(
+        "SELECT model, COUNT(*),
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0),
+                COALESCE(SUM(cache_creation_tokens), 0)
+         FROM narrative_usage
+         WHERE call_site IN ({placeholders})
+         GROUP BY model
+         ORDER BY model"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params = rusqlite::params_from_iter(call_sites.iter());
+    let rows = stmt
+        .query_map(params, |row| {
+            Ok(NarrativeUsageByModel {
+                model: row.get(0)?,
+                calls: row.get(1)?,
+                input_tokens: row.get(2)?,
+                output_tokens: row.get(3)?,
+                cache_read_tokens: row.get(4)?,
+                cache_creation_tokens: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 pub fn narrative_usage_summary(conn: &Connection) -> Result<NarrativeUsageSummary> {
@@ -2099,6 +2639,204 @@ pub fn get_chunk_ids_for_conversation(
         .map_err(Into::into)
 }
 
+/// Distinct project namespaces participating in reinstatement. The corpus can
+/// be split across chunk, co-edit, and code-graph tables, so resolving the
+/// family from only one table silently loses valid aliases.
+pub fn reinstatement_project_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT project_name FROM chunks WHERE project_name <> ''
+         UNION SELECT project_name FROM code_evolution WHERE project_name <> ''
+         UNION SELECT project FROM code_nodes WHERE project <> ''
+         ORDER BY 1",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn string_placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Chunk ids from every namespace in an already-resolved project family.
+/// An empty family means unscoped/all projects.
+pub fn get_chunk_ids_for_projects(conn: &Connection, projects: &[String]) -> Result<Vec<String>> {
+    if projects.is_empty() {
+        let mut stmt = conn.prepare("SELECT id FROM chunks ORDER BY rowid")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        return rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into);
+    }
+    let sql = format!(
+        "SELECT id FROM chunks WHERE project_name IN ({}) ORDER BY rowid",
+        string_placeholders(projects.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = projects
+        .iter()
+        .map(|project| project as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Conversation chunk ids constrained to an already-resolved project family.
+pub fn get_chunk_ids_for_conversation_in_projects(
+    conn: &Connection,
+    conversation_id: &str,
+    projects: &[String],
+) -> Result<Vec<String>> {
+    if projects.is_empty() {
+        return get_chunk_ids_for_conversation(conn, conversation_id);
+    }
+    let sql = format!(
+        "SELECT id FROM chunks WHERE conversation_id = ? AND project_name IN ({}) ORDER BY rowid",
+        string_placeholders(projects.len())
+    );
+    let mut values = Vec::with_capacity(projects.len() + 1);
+    values.push(conversation_id.to_string());
+    values.extend(projects.iter().cloned());
+    let params: Vec<&dyn rusqlite::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Lean exact-symbol row used by query-aware reinstatement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReinstatementSymbolNode {
+    pub id: String,
+    pub project: String,
+    pub name: String,
+    pub fqname: String,
+}
+
+/// Validate identifier candidates through exact node name/fqname matches in
+/// the already-resolved project family.
+pub fn exact_code_nodes_in_projects(
+    conn: &Connection,
+    identifiers: &[String],
+    projects: &[String],
+    preferred_project: &str,
+    limit: usize,
+) -> Result<Vec<ReinstatementSymbolNode>> {
+    if identifiers.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let identifiers_sql = string_placeholders(identifiers.len());
+    let project_clause = if projects.is_empty() {
+        String::new()
+    } else {
+        format!(" AND project IN ({})", string_placeholders(projects.len()))
+    };
+    let sql = format!(
+        "SELECT id, project, name, fqname
+         FROM code_nodes
+         WHERE (name IN ({identifiers_sql}) OR fqname IN ({identifiers_sql})){project_clause}
+         ORDER BY CASE WHEN project = ? THEN 0 ELSE 1 END, project, name, id
+         LIMIT ?"
+    );
+    let mut values = Vec::with_capacity(identifiers.len() * 2 + projects.len() + 1);
+    values.extend(identifiers.iter().cloned());
+    values.extend(identifiers.iter().cloned());
+    values.extend(projects.iter().cloned());
+    values.push(preferred_project.to_string());
+    let mut params: Vec<&dyn rusqlite::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let limit_value = limit as i64;
+    params.push(&limit_value);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok(ReinstatementSymbolNode {
+            id: row.get(0)?,
+            project: row.get(1)?,
+            name: row.get(2)?,
+            fqname: row.get(3)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Trusted transcript-channel symbol attribution. Legacy first/last node
+/// sightings are deliberately excluded: they are file-level projections, not
+/// per-symbol provenance.
+pub fn transcript_attribution_conversations(
+    conn: &Connection,
+    node_ids: &[String],
+) -> Result<Vec<String>> {
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT source_id FROM code_node_attribution
+         WHERE channel = 'transcript' AND node_id IN ({})
+         ORDER BY node_id",
+        string_placeholders(node_ids.len())
+    );
+    let params: Vec<&dyn rusqlite::ToSql> = node_ids
+        .iter()
+        .map(|node_id| node_id as &dyn rusqlite::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Conversation/session provenance carried by edges incident to matched
+/// symbols. The node ids are already family-scoped by
+/// [`exact_code_nodes_in_projects`].
+pub fn incident_edge_conversations(
+    conn: &Connection,
+    node_ids: &[String],
+    limit: usize,
+) -> Result<Vec<String>> {
+    if node_ids.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let placeholders = string_placeholders(node_ids.len());
+    let sql = format!(
+        "SELECT conv_id, session_id FROM code_edges
+         WHERE src_id IN ({placeholders}) OR dst_id IN ({placeholders})
+         ORDER BY src_id, dst_id, kind LIMIT ?"
+    );
+    let mut values = Vec::with_capacity(node_ids.len() * 2);
+    values.extend(node_ids.iter().cloned());
+    values.extend(node_ids.iter().cloned());
+    let mut params: Vec<&dyn rusqlite::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let limit_value = limit as i64;
+    params.push(&limit_value);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut conversations = Vec::new();
+    for row in rows {
+        let (conv_id, session_id) = row?;
+        if !conv_id.is_empty() {
+            conversations.push(conv_id);
+        }
+        if !session_id.is_empty() {
+            conversations.push(session_id);
+        }
+    }
+    Ok(conversations)
+}
+
 /// Embeddings for a specific set of chunk ids, chunked into ~500-id IN-clauses to stay
 /// under SQLite's default parameter limit. Decodes the same little-endian f32 blob format
 /// as `load_all_chunk_vectors`.
@@ -2133,6 +2871,41 @@ pub fn get_chunk_vectors_by_ids(
     Ok(results)
 }
 
+/// Reflection counterpart of [`get_chunk_vectors_by_ids`] — same chunked-IN-clause
+/// approach and blob decoding, scoped to `reflection_embeddings`. Lets the engine
+/// reconciliation path (engine.rs) fetch only the reflection ids missing from the
+/// HNSW cache instead of `load_all_reflection_vectors` (O(corpus)).
+pub fn get_reflection_vectors_by_ids(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<(String, Vec<f32>)>> {
+    const BATCH: usize = 500;
+    let mut results = Vec::new();
+    for batch in ids.chunks(BATCH) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT reflection_id, embedding FROM reflection_embeddings WHERE reflection_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let bound: Vec<&dyn rusqlite::ToSql> =
+            batch.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(bound.as_slice(), |row| {
+            let id: String = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((id, bytes_to_vec(&bytes)))
+        })?;
+        for row in rows {
+            results.push(row?);
+        }
+    }
+    Ok(results)
+}
+
 /// Most-touched files for a session (code_evolution), highest-frequency first. Lifted from
 /// the Phase 0 spike (examples/saga_spike.rs::files_for_session), now with a caller-supplied
 /// limit instead of a hardcoded 4.
@@ -2144,6 +2917,38 @@ pub fn files_for_session(conn: &Connection, session_id: &str, limit: usize) -> R
     let rows = stmt.query_map(params![session_id, limit as i64], |row| {
         row.get::<_, String>(0)
     })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Family-scoped variant for reinstatement. An empty family is the explicit
+/// all-project escape hatch.
+pub fn files_for_session_in_projects(
+    conn: &Connection,
+    session_id: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<String>> {
+    if projects.is_empty() {
+        return files_for_session(conn, session_id, limit);
+    }
+    let sql = format!(
+        "SELECT file_path FROM code_evolution
+         WHERE session_id = ? AND project_name IN ({})
+         GROUP BY file_path ORDER BY COUNT(*) DESC LIMIT ?",
+        string_placeholders(projects.len())
+    );
+    let mut values = Vec::with_capacity(projects.len() + 1);
+    values.push(session_id.to_string());
+    values.extend(projects.iter().cloned());
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let limit_value = limit as i64;
+    params.push(&limit_value);
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -2186,6 +2991,40 @@ pub fn sessions_for_file(
                 .map_err(Into::into)
         }
     }
+}
+
+/// Other sessions touching a file anywhere inside an already-resolved project
+/// family. An empty family is unscoped.
+pub fn sessions_for_file_in_projects(
+    conn: &Connection,
+    file_path: &str,
+    exclude_session: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<String>> {
+    if projects.is_empty() {
+        return sessions_for_file(conn, file_path, exclude_session, None, limit);
+    }
+    let sql = format!(
+        "SELECT DISTINCT session_id FROM code_evolution
+         WHERE file_path = ? AND session_id <> ? AND project_name IN ({}) LIMIT ?",
+        string_placeholders(projects.len())
+    );
+    let mut values = Vec::with_capacity(projects.len() + 2);
+    values.push(file_path.to_string());
+    values.push(exclude_session.to_string());
+    values.extend(projects.iter().cloned());
+    let params_strings: Vec<&dyn rusqlite::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let limit_value = limit as i64;
+    let mut params = params_strings;
+    params.push(&limit_value);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 /// Backfill UPDATE: set seq/is_sidechain on an existing chunk row by id.
@@ -2355,12 +3194,16 @@ pub fn list_session_ids(conn: &Connection, prefix: &str, limit: usize) -> Result
 
 // ─── Resolution ledger ───
 
+pub const RESOLUTION_SOURCE_AGENT: &str = "agent";
+pub const RESOLUTION_SOURCE_USER_CONFIRMED: &str = "user_confirmed";
+
 /// Latest explicit verdict for a chunk (or reflection) id.
 #[derive(Debug, Clone)]
 pub struct ResolutionEntry {
     pub status: String,
     pub evidence: String,
     pub claim: Option<String>,
+    pub source: String,
     pub created_at: String,
 }
 
@@ -2376,6 +3219,15 @@ pub fn insert_resolutions(
 ) -> Result<usize> {
     if chunk_ids.is_empty() {
         return Ok(0);
+    }
+    if !matches!(
+        source,
+        RESOLUTION_SOURCE_AGENT | RESOLUTION_SOURCE_USER_CONFIRMED
+    ) {
+        anyhow::bail!(
+            "invalid resolution source '{}': must be agent or user_confirmed",
+            source
+        );
     }
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -2393,8 +3245,75 @@ pub fn insert_resolutions(
     Ok(chunk_ids.len())
 }
 
-/// Batch-fetch the latest resolution entry per chunk_id (highest `id` wins).
-/// Chunk ids with no ledger rows are absent from the returned map.
+/// Caller owns the transaction containing the immutable local confirmation,
+/// ledger payload, derivation edges and (for the journal) UI audit row.
+pub(crate) fn append_resolutions_with_confirmation(
+    conn: &Connection,
+    chunk_ids: &[String],
+    status: &str,
+    evidence: &str,
+    claim: Option<&str>,
+    confirmation: Option<&crate::provenance::ResolutionConfirmation>,
+) -> Result<(usize, &'static str)> {
+    use crate::storage::artifact_provenance::{
+        record_inputs, ArtifactInput, ArtifactKind, InputEnvelope,
+    };
+    let payload =
+        crate::provenance::ResolutionConfirmationPayload::new(chunk_ids, status, claim, evidence);
+    let confirmation = confirmation.filter(|c| c.matches(&payload));
+    let source = if confirmation.is_some() {
+        RESOLUTION_SOURCE_USER_CONFIRMED
+    } else {
+        RESOLUTION_SOURCE_AGENT
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let event = confirmation
+        .filter(|_| !chunk_ids.is_empty())
+        .map(|confirmation| {
+            let id = format!("confirmation:{}", uuid::Uuid::new_v4());
+            ProvenanceEvent {
+                event_id: id.clone(),
+                conversation_id: id,
+                message_key: payload.digest().into(),
+                seq: 0,
+                channel: "user_confirmation".into(),
+                trust_tier: TrustTier::UserConfirmed,
+                parent_event_id: None,
+                receipt_kind: confirmation.receipt_kind().into(),
+                receipt_ref: Some(payload.digest().into()),
+                observed_at: now.clone(),
+            }
+        });
+    if let Some(event) = &event {
+        insert_provenance_event(conn, event)?;
+    }
+    for chunk_id in chunk_ids {
+        conn.execute("INSERT INTO resolution_ledger(chunk_id,status,evidence,claim,source,created_at,event_id) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![chunk_id,status,evidence,claim,source,now,event.as_ref().map(|e|&e.event_id)])?;
+        let id = conn.last_insert_rowid().to_string();
+        if let Some(event) = &event {
+            let input = ArtifactInput::observed(
+                event.clone(),
+                payload.canonical_json(),
+                0,
+                payload.canonical_json().chars().count(),
+                crate::provenance::content_hash(payload.canonical_json()),
+            );
+            let body = serde_json::json!([claim, evidence]).to_string();
+            record_inputs(
+                conn,
+                ArtifactKind::Resolution,
+                &id,
+                &body,
+                &InputEnvelope::new(vec![input]),
+            )?;
+        }
+    }
+    Ok((chunk_ids.len(), source))
+}
+
+/// Batch-fetch the latest user-confirmed resolution entry per chunk id.
+/// Agent observations remain in the append-only audit ledger but are not
+/// authoritative search state and are absent from the returned map.
 pub fn get_resolutions_batch(
     conn: &Connection,
     chunk_ids: &[String],
@@ -2407,8 +3326,11 @@ pub fn get_resolutions_batch(
     let sql = format!(
         "SELECT chunk_id, status, evidence, claim, source, created_at
          FROM resolution_ledger
-         WHERE id IN (
-             SELECT MAX(id) FROM resolution_ledger WHERE chunk_id IN ({}) GROUP BY chunk_id
+         WHERE source = 'user_confirmed'
+           AND id IN (
+             SELECT MAX(id) FROM resolution_ledger
+             WHERE chunk_id IN ({}) AND source = 'user_confirmed'
+             GROUP BY chunk_id
          )",
         placeholders.join(", ")
     );
@@ -2425,6 +3347,7 @@ pub fn get_resolutions_batch(
                 status: row.get(1)?,
                 evidence: row.get(2)?,
                 claim: row.get(3)?,
+                source: row.get(4)?,
                 created_at: row.get(5)?,
             },
         ))
@@ -2566,6 +3489,130 @@ pub fn known_session_ids(
     Ok(out)
 }
 
+// ─── Memory registry (harness file-based memory — never embedded / never injected) ───
+
+/// One memory_registry row to upsert. `file_path` is the stable primary key
+/// (absolute path to the .md file). All other fields are simply overwritten
+/// on conflict — unlike session_registry there is no earliest/latest merge
+/// logic, because a given file_path only ever describes one file: the most
+/// recent scan's read of it is authoritative.
+#[derive(Debug, Clone)]
+pub struct MemoryRegistryRow {
+    pub file_path: String,
+    pub project: String,
+    pub slug: String,
+    pub description: Option<String>,
+    pub mem_type: Option<String>,
+    pub origin_session_id: Option<String>,
+    pub modified_ts: Option<String>,
+    pub file_mtime: i64,
+    pub content_hash: String,
+    pub links_json: String,
+    pub last_seen_scan: i64,
+}
+
+/// Upsert memory_registry rows within an existing transaction. On conflict
+/// every field is overwritten from the incoming row — the latest scan is
+/// authoritative for a given file_path.
+///
+/// Does NOT open a new transaction — caller already holds one (see
+/// `Storage::with_transaction` for atomic upsert+stale-delete).
+pub fn upsert_memory_registry_batch(
+    conn: &Connection,
+    rows: &[MemoryRegistryRow],
+) -> Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare(
+        "INSERT INTO memory_registry (
+            file_path, project, slug, description, mem_type,
+            origin_session_id, modified_ts, file_mtime, content_hash,
+            links_json, last_seen_scan
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(file_path) DO UPDATE SET
+           project = excluded.project,
+           slug = excluded.slug,
+           description = excluded.description,
+           mem_type = excluded.mem_type,
+           origin_session_id = excluded.origin_session_id,
+           modified_ts = excluded.modified_ts,
+           file_mtime = excluded.file_mtime,
+           content_hash = excluded.content_hash,
+           links_json = excluded.links_json,
+           last_seen_scan = excluded.last_seen_scan",
+    )?;
+    for row in rows {
+        stmt.execute(params![
+            row.file_path,
+            row.project,
+            row.slug,
+            row.description,
+            row.mem_type,
+            row.origin_session_id,
+            row.modified_ts,
+            row.file_mtime,
+            row.content_hash,
+            row.links_json,
+            row.last_seen_scan,
+        ])?;
+    }
+    Ok(rows.len())
+}
+
+/// Delete memory_registry rows for `project` whose `last_seen_scan` is older
+/// than `current_scan_generation`. Scoped to ONE project per call by design —
+/// a project whose directory was unreadable during a scan pass must simply
+/// never have this function called for it that pass, so its rows are never
+/// touched (unreadable != deleted). This is how "never delete for unscanned
+/// projects" is enforced at the call-site level, not inside this function.
+pub fn delete_memory_registry_stale(
+    conn: &Connection,
+    project: &str,
+    current_scan_generation: i64,
+) -> Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM memory_registry WHERE project = ?1 AND last_seen_scan < ?2",
+        params![project, current_scan_generation],
+    )?;
+    Ok(deleted)
+}
+
+/// All memory_registry rows whose `origin_session_id` matches `session_id`.
+/// Lookup `csr_why` will use in a later stage.
+pub fn get_memory_registry_by_origin_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<MemoryRegistryRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT file_path, project, slug, description, mem_type,
+                origin_session_id, modified_ts, file_mtime, content_hash,
+                links_json, last_seen_scan
+         FROM memory_registry WHERE origin_session_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![session_id], |row| {
+        Ok(MemoryRegistryRow {
+            file_path: row.get(0)?,
+            project: row.get(1)?,
+            slug: row.get(2)?,
+            description: row.get(3)?,
+            mem_type: row.get(4)?,
+            origin_session_id: row.get(5)?,
+            modified_ts: row.get(6)?,
+            file_mtime: row.get(7)?,
+            content_hash: row.get(8)?,
+            links_json: row.get(9)?,
+            last_seen_scan: row.get(10)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2575,6 +3622,156 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrations::run(&conn).unwrap();
         conn
+    }
+
+    fn test_chunk(id: &str, content: &str) -> ConversationChunk {
+        ConversationChunk {
+            id: id.into(),
+            conversation_id: "conv-fts".into(),
+            project_name: "project-fts".into(),
+            timestamp: "2026-08-12T00:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        }
+    }
+
+    #[test]
+    fn fts5_search_returns_bm25_order_with_zero_based_ordinals() {
+        let conn = mem();
+        insert_chunk(
+            &conn,
+            &test_chunk("dense", "needle needle needle"),
+            &[0.1; 4],
+        )
+        .unwrap();
+        insert_chunk(
+            &conn,
+            &test_chunk("sparse", "needle with several unrelated filler words"),
+            &[0.2; 4],
+        )
+        .unwrap();
+
+        let hits = fts5_search(&conn, "needle", 10, None).unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0.id, "dense");
+        assert_eq!(hits[0].1, 0);
+        assert!(hits[0].2.is_finite());
+        assert_eq!(hits[1].0.id, "sparse");
+        assert_eq!(hits[1].1, 1);
+        assert!(hits[1].2.is_finite());
+        assert!(
+            hits[0].2 <= hits[1].2,
+            "FTS5 bm25 order must be ascending: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn chunk_reimport_preserves_rowids_and_replaces_one_fts_document() {
+        // Break caught: using INSERT OR REPLACE for either TEXT-keyed table
+        // deletes and reinserts its row, changing the implicit rowid. For
+        // chunks that also leaves the old rowid indexed in FTS.
+        let conn = mem();
+        insert_chunk(&conn, &test_chunk("stable", "legacytoken"), &[0.1; 4]).unwrap();
+        let chunk_rowid_before: i64 = conn
+            .query_row("SELECT rowid FROM chunks WHERE id = 'stable'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let embedding_rowid_before: i64 = conn
+            .query_row(
+                "SELECT rowid FROM chunk_embeddings WHERE chunk_id = 'stable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        insert_chunk(&conn, &test_chunk("stable", "replacementtoken"), &[0.2; 4]).unwrap();
+
+        let chunk_rowid_after: i64 = conn
+            .query_row("SELECT rowid FROM chunks WHERE id = 'stable'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let embedding_rowid_after: i64 = conn
+            .query_row(
+                "SELECT rowid FROM chunk_embeddings WHERE chunk_id = 'stable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_rowid_after, chunk_rowid_before);
+        assert_eq!(embedding_rowid_after, embedding_rowid_before);
+        assert!(fts5_search(&conn, "legacytoken", 10, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fts5_search(&conn, "replacementtoken", 10, None).unwrap()[0]
+                .0
+                .id,
+            "stable"
+        );
+        let indexed_documents: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts_docsize", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            indexed_documents, 1,
+            "reimport must not append an orphan FTS row"
+        );
+
+        delete_chunks_for_conversation(&conn, "conv-fts").unwrap();
+        assert!(fts5_search(&conn, "replacementtoken", 10, None)
+            .unwrap()
+            .is_empty());
+        let indexed_documents: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts_docsize", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            indexed_documents, 0,
+            "deleting the chunk must delete its FTS row"
+        );
+    }
+
+    #[test]
+    fn external_fts_tracks_direct_chunk_updates_and_deletes() {
+        // Break caught: external-content FTS has no automatic synchronization.
+        // A writer that bypasses insert_chunk must still be covered.
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO chunks
+                 (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES ('direct', 'conv-direct', 'project-fts',
+                     '2026-08-12T00:00:00Z', 'beforetoken', 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            fts5_search(&conn, "beforetoken", 10, None).unwrap()[0].0.id,
+            "direct"
+        );
+
+        conn.execute(
+            "UPDATE chunks SET content = 'aftertoken' WHERE id = 'direct'",
+            [],
+        )
+        .unwrap();
+        assert!(fts5_search(&conn, "beforetoken", 10, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fts5_search(&conn, "aftertoken", 10, None).unwrap()[0].0.id,
+            "direct"
+        );
+
+        conn.execute("DELETE FROM chunks WHERE id = 'direct'", [])
+            .unwrap();
+        assert!(fts5_search(&conn, "aftertoken", 10, None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2859,5 +4056,174 @@ mod tests {
             got.contains(&"sess_b".to_string()),
             "unscoped lookup must return other-project sessions: {got:?}"
         );
+    }
+
+    #[test]
+    fn sessions_for_file_accepts_every_namespace_in_resolved_family() {
+        let conn = mem();
+        seed_cross_project_shared_file(&conn);
+
+        let got = sessions_for_file_in_projects(
+            &conn,
+            "shared.rs",
+            "sess_a",
+            &["proj_a".to_string(), "proj_b".to_string()],
+            10,
+        )
+        .unwrap();
+        assert_eq!(got, vec!["sess_b"]);
+    }
+
+    fn sample_memory_row(
+        file_path: &str,
+        project: &str,
+        slug: &str,
+        origin_session_id: Option<&str>,
+        last_seen_scan: i64,
+    ) -> MemoryRegistryRow {
+        MemoryRegistryRow {
+            file_path: file_path.into(),
+            project: project.into(),
+            slug: slug.into(),
+            description: Some(format!("desc-{slug}")),
+            mem_type: Some("user".into()),
+            origin_session_id: origin_session_id.map(str::to_string),
+            modified_ts: Some("2026-08-19T00:00:00Z".into()),
+            file_mtime: 1_700_000_000,
+            content_hash: format!("hash-{slug}"),
+            links_json: "[]".into(),
+            last_seen_scan,
+        }
+    }
+
+    #[test]
+    fn memory_registry_upsert_and_lookup_by_origin_session() {
+        let conn = mem();
+        upsert_memory_registry_batch(
+            &conn,
+            &[
+                sample_memory_row("/mem/a.md", "proj", "a", Some("sess-1"), 1),
+                sample_memory_row("/mem/b.md", "proj", "b", None, 1),
+            ],
+        )
+        .unwrap();
+
+        let hit = get_memory_registry_by_origin_session(&conn, "sess-1").unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].file_path, "/mem/a.md");
+        assert_eq!(hit[0].origin_session_id.as_deref(), Some("sess-1"));
+
+        let miss = get_memory_registry_by_origin_session(&conn, "sess-missing").unwrap();
+        assert!(miss.is_empty());
+    }
+
+    #[test]
+    fn memory_registry_upsert_on_conflict_overwrites_all_fields() {
+        let conn = mem();
+        upsert_memory_registry_batch(
+            &conn,
+            &[sample_memory_row(
+                "/mem/a.md",
+                "proj",
+                "first",
+                Some("s1"),
+                1,
+            )],
+        )
+        .unwrap();
+
+        let mut second = sample_memory_row("/mem/a.md", "proj", "second", Some("s2"), 9);
+        second.description = Some("updated-desc".into());
+        second.content_hash = "hash-updated".into();
+        upsert_memory_registry_batch(&conn, &[second.clone()]).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE file_path = '/mem/a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let rows = get_memory_registry_by_origin_session(&conn, "s2").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slug, "second");
+        assert_eq!(rows[0].description.as_deref(), Some("updated-desc"));
+        assert_eq!(rows[0].content_hash, "hash-updated");
+        assert_eq!(rows[0].last_seen_scan, 9);
+        assert!(get_memory_registry_by_origin_session(&conn, "s1")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn memory_registry_delete_stale_removes_only_lower_generation_same_project() {
+        let conn = mem();
+        upsert_memory_registry_batch(
+            &conn,
+            &[
+                sample_memory_row("/mem/gone.md", "proj-a", "gone", None, 1),
+                sample_memory_row("/mem/keep1.md", "proj-a", "keep1", None, 2),
+                sample_memory_row("/mem/keep2.md", "proj-a", "keep2", None, 2),
+            ],
+        )
+        .unwrap();
+
+        let deleted = delete_memory_registry_stale(&conn, "proj-a", 2).unwrap();
+        assert_eq!(deleted, 1);
+
+        let gone: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE file_path = '/mem/gone.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0);
+
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE project = 'proj-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 2);
+    }
+
+    #[test]
+    fn memory_registry_delete_stale_never_touches_other_projects() {
+        let conn = mem();
+        upsert_memory_registry_batch(
+            &conn,
+            &[
+                sample_memory_row("/mem/a.md", "proj-a", "a", None, 1),
+                sample_memory_row("/mem/b.md", "proj-b", "b", None, 1),
+            ],
+        )
+        .unwrap();
+
+        // Only proj-a was scanned this pass; proj-b was unreadable → never call
+        // delete_memory_registry_stale for it.
+        let deleted = delete_memory_registry_stale(&conn, "proj-a", 5).unwrap();
+        assert_eq!(deleted, 1);
+
+        let a: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE project = 'proj-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let b: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE project = 'proj-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
     }
 }

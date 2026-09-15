@@ -29,6 +29,38 @@ pub mod text {
             t.status.imported_files,
             t.status.total_jsonl_files,
         );
+        println!(
+            "  Provenance {}/{} chunks with spans, {} unknown, tool share mean={}; missing={} unparsed={} unmatched={}",
+            t.status.provenance_coverage.chunks_with_spans,
+            t.status.provenance_coverage.chunks_total,
+            t.status.provenance_coverage.chunks_unknown,
+            t.status
+                .provenance_coverage
+                .tool_result_share_mean
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_else(|| "unknown".into()),
+            t.status.provenance_coverage.source_missing,
+            t.status.provenance_coverage.source_unparsed,
+            t.status.provenance_coverage.source_unmatched,
+        );
+        for family in t
+            .status
+            .provenance_coverage
+            .artifacts
+            .iter()
+            .filter(|family| family.total() > 0)
+        {
+            println!(
+                "    {:<24} unknown={} external={} trusted_tool={} user_history={} user_confirmed={} system={}",
+                family.kind,
+                family.unknown,
+                family.external,
+                family.trusted_tool,
+                family.user_history,
+                family.user_confirmed,
+                family.system,
+            );
+        }
         let e = &t.status.enrichment;
         println!(
             "  Enrich  heuristic={} v3={} ai={}  (v3_failed={} ai_failed={} ai_processing={})",
@@ -50,8 +82,14 @@ pub mod text {
             src.registry_sessions,
         );
         println!(
-            "          proposals={} verdicts={}  schema_miss: tasks={} plans={} history={}",
-            src.resolution_proposals, src.resolution_verdicts, miss.tasks, miss.plans, miss.history,
+            "          proposals={} verdicts={} (agent={} user_confirmed={})  schema_miss: tasks={} plans={} history={}",
+            src.resolution_proposals,
+            src.resolution_verdicts,
+            src.resolution_verdicts_agent,
+            src.resolution_verdicts_user_confirmed,
+            miss.tasks,
+            miss.plans,
+            miss.history,
         );
         println!();
 

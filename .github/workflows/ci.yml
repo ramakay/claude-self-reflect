@@ -21,7 +21,7 @@ jobs:
       - name: Format check
         run: cargo fmt --manifest-path csr-engine/Cargo.toml -- --check
       - name: Clippy
-        run: cargo clippy --manifest-path csr-engine/Cargo.toml --locked -- -D warnings
+        run: cargo clippy --manifest-path csr-engine/Cargo.toml --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --manifest-path csr-engine/Cargo.toml --locked
       - name: Verify npm package
