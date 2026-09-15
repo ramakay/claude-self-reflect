@@ -26,6 +26,20 @@ pub struct EmbeddingEngine {
 /// "Lock acquisition failed" instead of waiting.
 static MODEL_INIT_LOCK: Mutex<()> = Mutex::new(());
 
+/// ONNX Runtime batch cap for a single `embed` call.
+///
+/// fastembed defaults to `DEFAULT_BATCH_SIZE = 256` when the batch argument is
+/// `None`, and pads every doc in a batch to the longest one (up to
+/// `DEFAULT_MAX_LENGTH = 512`). A 256x512 run needs a ~3.2GB attention tensor,
+/// and ORT's CPU arena satisfies that with a 4GiB power-of-two extension that it
+/// never returns to the OS. The daemon has uncapped call sites
+/// (`daemon::trained_rerank`, `import::plans`, `import::scrub` all pass their
+/// whole text list), so one large pass permanently parked ~17GB of arena in the
+/// long-lived daemon process while short-lived MCP servers stayed at ~670MB.
+/// Capping here fixes every call site at once; 16 keeps the worst-case tensor
+/// near 200MB.
+const EMBED_BATCH_SIZE: usize = 16;
+
 /// Resolve the ONNX intra-op thread cap: `CSR_EMBED_THREADS` if it parses
 /// as `1..=runtime::MAX_THREAD_OVERRIDE`, else `min(4, available_parallelism)`.
 /// Junk, zero, or oversized values fall back to the default rather than
@@ -128,7 +142,7 @@ impl EmbeddingEngine {
         let model = guard
             .as_mut()
             .expect("ensure_loaded returned Ok, so the model is populated");
-        let embeddings = model.embed(docs, None)?;
+        let embeddings = model.embed(docs, Some(EMBED_BATCH_SIZE))?;
         Ok(embeddings)
     }
 
