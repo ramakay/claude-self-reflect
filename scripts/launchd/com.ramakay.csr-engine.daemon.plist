@@ -34,6 +34,13 @@
     <key>PATH</key>
     <string>/Users/ramakrishnanannaswamy/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
+  <!-- Without this launchd runs the daemon from `/`. Its headless `claude -p`
+       children inherit that cwd, so Claude Code's seatbelt profile is scoped at
+       the filesystem root and sandboxd asks TCC for every protected location
+       under it (Desktop, Documents, Photos, Media Library, Network Volumes).
+       Scoping cwd to the CSR data dir keeps the profile off personal data. -->
+  <key>WorkingDirectory</key>
+  <string>/Users/ramakrishnanannaswamy/.claude-self-reflect</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
