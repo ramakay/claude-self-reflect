@@ -510,7 +510,13 @@ async fn run() -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
 
-        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let eng = {
+            // Hook stdout is the injection channel. A stale or missing cache
+            // makes `Engine::new` rebuild through hnsw_rs, which prints to
+            // stdout; keep that off the channel until the handler owns it.
+            let _quiet = csr_engine::hooks::StdoutQuarantine::begin();
+            engine::Engine::new(&args.db_path, &args.projects_dir)?
+        };
         csr_engine::hooks::dispatch_hook(name, &eng).await?;
         return Ok(());
     }

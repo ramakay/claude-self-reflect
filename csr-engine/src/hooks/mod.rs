@@ -131,6 +131,74 @@ pub fn suppress_stdout() {
     }
 }
 
+/// Points stdout (fd 1) at stderr for as long as it is alive, then puts the real
+/// stdout back on drop.
+///
+/// [`suppress_stdout`] covers prints made *after* a hook has written its
+/// injection. This covers the ones made *before* it: `Engine::new` rebuilds or
+/// backfills an index whenever the on-disk cache is missing or stale, and that
+/// is the same `hnsw_rs` insert path with the same bare `println!`. Those lines
+/// reached the model ahead of the injection, e.g. `" setting number of points
+/// 50000 "` on every prompt that followed a reflection insert, because the
+/// ~59k-point reflection index was rebuilt in-process. `HnswIo::init` also
+/// prints to stdout when a cache file is missing.
+///
+/// Hold one across engine construction in the hook path, and drop it before the
+/// handler runs so the injection still reaches Claude Code.
+///
+/// Unix only, for the reason given on [`suppress_stdout`].
+pub struct StdoutQuarantine {
+    #[cfg(unix)]
+    target: libc::c_int,
+    #[cfg(unix)]
+    saved: libc::c_int,
+}
+
+impl StdoutQuarantine {
+    pub fn begin() -> Self {
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        #[cfg(unix)]
+        {
+            Self::begin_on(libc::STDOUT_FILENO, libc::STDERR_FILENO)
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    #[cfg(unix)]
+    fn begin_on(target: libc::c_int, sink: libc::c_int) -> Self {
+        // SAFETY: fcntl/dup2 on this process's own descriptors. CLOEXEC keeps the
+        // saved copy out of any child spawned while the guard is held. If the
+        // save fails nothing is redirected: a leak beats a lost injection.
+        let saved = unsafe { libc::fcntl(target, libc::F_DUPFD_CLOEXEC, 3) };
+        if saved >= 0 {
+            unsafe {
+                libc::dup2(sink, target);
+            }
+        }
+        Self { target, saved }
+    }
+}
+
+impl Drop for StdoutQuarantine {
+    fn drop(&mut self) {
+        // Whatever is still buffered was printed under quarantine; send it to the
+        // sink before the real stdout comes back.
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        #[cfg(unix)]
+        if self.saved >= 0 {
+            // SAFETY: restores the descriptor saved in `begin_on`, then closes
+            // the spare copy.
+            unsafe {
+                libc::dup2(self.saved, self.target);
+                libc::close(self.saved);
+            }
+        }
+    }
+}
+
 /// Main hook dispatcher. Parses stdin, routes to handler.
 pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     // Recursive-hook guard. The session-briefing hook spawns a nested `claude -p`
@@ -211,4 +279,46 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     crate::telemetry::append_timing_line(&timing_line);
 
     result
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// The guard must divert writes while held and hand the descriptor back
+    /// intact afterwards. Run on a pair of pipes so the test process's own
+    /// stdout is never touched.
+    #[test]
+    fn stdout_quarantine_diverts_then_restores() {
+        fn pipe() -> (libc::c_int, libc::c_int) {
+            let mut fds = [0 as libc::c_int; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            (fds[0], fds[1])
+        }
+        fn write_fd(fd: libc::c_int, bytes: &[u8]) {
+            let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            assert_eq!(n, bytes.len() as isize);
+        }
+        fn read_fd(fd: libc::c_int) -> String {
+            let mut buf = [0u8; 64];
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            assert!(n > 0, "nothing arrived on fd {fd}");
+            String::from_utf8_lossy(&buf[..n as usize]).into_owned()
+        }
+
+        let (out_r, out_w) = pipe();
+        let (sink_r, sink_w) = pipe();
+
+        let guard = StdoutQuarantine::begin_on(out_w, sink_w);
+        write_fd(out_w, b"library noise");
+        assert_eq!(read_fd(sink_r), "library noise");
+        drop(guard);
+
+        write_fd(out_w, b"injection");
+        assert_eq!(read_fd(out_r), "injection");
+
+        for fd in [out_r, out_w, sink_r, sink_w] {
+            unsafe { libc::close(fd) };
+        }
+    }
 }
