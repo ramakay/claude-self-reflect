@@ -1326,10 +1326,16 @@ async fn run() -> Result<()> {
         // never search, so build an import-only engine that skips loading and
         // re-dumping the whole HNSW graph — the dominant cost of these hooks on
         // a large corpus. Everyone else needs the loaded index.
-        let eng = if csr_engine::hooks::is_import_only_hook(name) {
-            engine::Engine::new_import_only(&args.db_path, &args.projects_dir)?
-        } else {
-            engine::Engine::new(&args.db_path, &args.projects_dir)?
+        let eng = {
+            // Hook stdout is the injection channel. A stale or missing cache
+            // makes `Engine::new` rebuild through hnsw_rs, which prints to
+            // stdout; keep that off the channel until the handler owns it.
+            let _quiet = csr_engine::hooks::StdoutQuarantine::begin();
+            if csr_engine::hooks::is_import_only_hook(name) {
+                engine::Engine::new_import_only(&args.db_path, &args.projects_dir)?
+            } else {
+                engine::Engine::new(&args.db_path, &args.projects_dir)?
+            }
         };
         csr_engine::hooks::dispatch_hook(name, &eng).await?;
         return Ok(());
