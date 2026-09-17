@@ -964,6 +964,7 @@ dependencies = [
  "fs2",
  "hnsw_rs",
  "ignore",
+ "libc",
  "minijinja",
  "notify",
  "ratatui",

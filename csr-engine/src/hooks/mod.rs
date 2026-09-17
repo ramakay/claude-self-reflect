@@ -248,6 +248,36 @@ pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: 
     }
 }
 
+/// Redirect this process's stdout (fd 1) onto stderr (fd 2) for the rest of the
+/// hook.
+///
+/// Hook stdout is Claude Code's context-injection channel on `UserPromptSubmit`
+/// and `SessionStart`, so a stray library print lands in the model's context as
+/// if it were retrieved memory. `hnsw_rs` 0.3.4 has a bare `println!` in
+/// `generate_new_point` (hnsw.rs:520) that fires on every 50,000th point insert,
+/// so any indexing performed *after* a hook has emitted its injection can leak
+/// `" setting number of points N "` into the prompt.
+///
+/// Call this once a hook has finished writing its intended output. There is no
+/// restore: the hook process exits immediately afterwards.
+///
+/// Unix only. On Windows Rust's stdout writes to the Win32 standard handle, not
+/// CRT fd 1, so `_dup2` would not redirect it; the call is a no-op there.
+pub fn suppress_stdout() {
+    // Anything still sitting in Rust's stdout buffer (a `print!` with no trailing
+    // newline) belongs to the injection. Push it out before fd 1 moves, or it
+    // would be flushed to stderr at exit and the injection would be lost.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    #[cfg(unix)]
+    // SAFETY: dup2 on this process's own standard descriptors. A failure here is
+    // non-fatal — the worst case is the pre-existing leak — so the result is
+    // deliberately ignored.
+    unsafe {
+        libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO);
+    }
+}
+
 /// Main hook dispatcher. Parses stdin, routes to handler.
 /// Whether a hook can run on an import-only engine that skips loading and
 /// persisting the HNSW index (see [`crate::engine::Engine::new_import_only`]).
@@ -315,6 +345,8 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     let t_hook = t0.elapsed();
 
     // Flush HNSW index if any hook modified it
+    // Nothing after the handler should reach stdout; see suppress_stdout.
+    suppress_stdout();
     engine.flush_index().await;
     let t_total = t0.elapsed();
 
