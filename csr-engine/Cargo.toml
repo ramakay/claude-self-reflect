@@ -38,7 +38,7 @@ ast-grep-language = { version = "0.42", default-features = false, features = [
 ratatui = "0.30"
 crossterm = "0.29"
 ignore = "0.4"
-toml = "0.9"
+toml = "1.1"
 codewitness = { path = "../codewitness" }
 minijinja = "2.22"
 
