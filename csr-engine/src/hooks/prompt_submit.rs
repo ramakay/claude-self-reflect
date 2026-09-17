@@ -796,12 +796,17 @@ async fn search_chunks_with_vec(
     // result set. Fetch once and index by id, preserving the original result
     // order (and therefore score order) when rebuilding.
     let chunk_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
-    let mut chunk_by_id: std::collections::HashMap<String, _> = storage
-        .get_chunks_by_ids(&chunk_ids)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|c| (c.id.clone(), c))
-        .collect();
+    // The batch fails as a unit, so one undecodable row would drop every hit.
+    // On error fall back to per-id lookups, which lose only the bad row.
+    let fetched = storage.get_chunks_by_ids(&chunk_ids).unwrap_or_else(|_| {
+        chunk_ids
+            .iter()
+            .filter_map(|id| storage.get_chunks_by_ids(std::slice::from_ref(id)).ok())
+            .flatten()
+            .collect()
+    });
+    let mut chunk_by_id: std::collections::HashMap<String, _> =
+        fetched.into_iter().map(|c| (c.id.clone(), c)).collect();
 
     for result in &results {
         {

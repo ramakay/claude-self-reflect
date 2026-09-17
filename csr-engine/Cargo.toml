@@ -8,7 +8,6 @@ description = "Claude Self-Reflect: Rust MCP server with embedded vector search"
 rmcp = { version = "3.1", features = ["server", "transport-io", "macros", "elicitation"] }
 fastembed = "5.9"
 hnsw_rs = "0.3"
-libc = "0.2"
 rusqlite = { version = "0.40", features = ["bundled", "vtab"] }
 notify = "8"
 tokio = { version = "1", features = ["full"] }
@@ -42,6 +41,9 @@ ignore = "0.4"
 toml = "0.9"
 codewitness = { path = "../codewitness" }
 minijinja = "2.22"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
