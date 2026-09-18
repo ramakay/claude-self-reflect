@@ -45,6 +45,11 @@ pub(crate) struct ParseCursor {
     pub scrubbed_hook_wrappers_at_cursor: usize,
 }
 
+/// Bump this whenever the meaning of any stored `ParseCursor` field changes,
+/// including the algorithm behind `head_fingerprint`: a cursor whose version
+/// does not match is rejected outright rather than compared against a value it
+/// cannot be compared to. `head_fingerprint_is_stable_across_releases` pins the
+/// algorithm so a change to it cannot pass without landing here too.
 pub(crate) const PARSE_CURSOR_VERSION: u32 = 1;
 
 /// Size of the head sample used for `head_fingerprint`.
@@ -73,15 +78,36 @@ pub(crate) fn resumes_on_a_line_boundary(path: &Path, offset: u64) -> bool {
     file.read_exact(&mut byte).is_ok() && byte[0] == b'\n'
 }
 
+/// Fingerprint of the file's first [`HEAD_FINGERPRINT_BYTES`].
+///
+/// Both halves of this have to be deterministic, because the value is persisted
+/// in a `ParseCursor` and compared against a value computed by some later
+/// process:
+///
+/// - `Read::read` is allowed to return fewer bytes than asked for, so a single
+///   call could hash a different prefix each time for byte-identical content.
+///   `take(N).read_to_end(..)` reads until the limit or EOF.
+/// - `DefaultHasher`'s algorithm is explicitly unspecified across Rust releases,
+///   so a toolchain upgrade would silently invalidate every stored cursor.
+///   Sha256 is already a dependency of this crate and is fixed forever. Only the
+///   first 8 bytes are kept; this is a change detector, not a security boundary.
 pub(crate) fn head_fingerprint(path: &Path) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut buf = vec![0u8; HEAD_FINGERPRINT_BYTES];
-    let read = fs::File::open(path)
-        .and_then(|mut f| f.read(&mut buf))
-        .unwrap_or(0);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    buf[..read].hash(&mut hasher);
-    hasher.finish()
+    use sha2::{Digest, Sha256};
+    let mut buf = Vec::with_capacity(HEAD_FINGERPRINT_BYTES);
+    if fs::File::open(path)
+        .and_then(|f| f.take(HEAD_FINGERPRINT_BYTES as u64).read_to_end(&mut buf))
+        .is_err()
+    {
+        // Unreadable. The caller's metadata check has already rejected a missing
+        // file, and a fingerprint that matches nothing forces a full parse.
+        return 0;
+    }
+    let digest = Sha256::digest(&buf);
+    u64::from_le_bytes(
+        digest[..8]
+            .try_into()
+            .expect("a sha256 digest is always 32 bytes"),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2031,6 +2057,52 @@ mod cursor_tests {
         assert_eq!(
             p2.suppression.csr_tool_blocks_suppressed, full.suppression.csr_tool_blocks_suppressed,
             "incremental suppression totals must match a single full parse"
+        );
+    }
+
+    /// The fingerprint is persisted in a cursor and compared by a later process,
+    /// possibly one built by a different toolchain. `DefaultHasher` gave no such
+    /// guarantee. This golden value is the contract: if it has to change, the
+    /// change belongs with a bump to `PARSE_CURSOR_VERSION`, which rejects old
+    /// cursors outright instead of comparing them against a value from a
+    /// different algorithm.
+    #[test]
+    fn head_fingerprint_is_stable_across_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("golden.jsonl");
+        std::fs::write(&path, b"csr head fingerprint golden vector\n").unwrap();
+        assert_eq!(
+            head_fingerprint(&path),
+            0x53d5_ac72_5a37_79da,
+            "the fingerprint algorithm changed — bump PARSE_CURSOR_VERSION with it"
+        );
+    }
+
+    /// Only the window is hashed, so appending past it cannot change the value.
+    /// That is what makes the fingerprint cheap on a multi-megabyte transcript,
+    /// and it is why a short read would have been a correctness bug rather than
+    /// a performance one.
+    #[test]
+    fn head_fingerprint_reads_exactly_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let window = dir.path().join("window.jsonl");
+        let longer = dir.path().join("longer.jsonl");
+
+        let head = vec![b'h'; HEAD_FINGERPRINT_BYTES];
+        std::fs::write(&window, &head).unwrap();
+        let mut grown = head.clone();
+        grown.extend(std::iter::repeat_n(b't', 100_000));
+        std::fs::write(&longer, &grown).unwrap();
+
+        assert_eq!(
+            head_fingerprint(&window),
+            head_fingerprint(&longer),
+            "bytes past the window must not reach the hash"
+        );
+        assert_eq!(
+            head_fingerprint(&longer),
+            head_fingerprint(&longer),
+            "repeated calls on one file must agree"
         );
     }
 
