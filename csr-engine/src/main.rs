@@ -526,6 +526,46 @@ async fn run() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // `--bench` never reaches `serve_mcp`, so it must not claim stdout: a
+    // claim that is dropped without `into_async_writer` ever being called
+    // leaks the saved descriptor and leaves fd 1 pointed at stderr for
+    // whatever's left of the process. Settling this ahead of the
+    // `should_serve`/claim below (rather than after `Engine::new`, where it
+    // used to sit) also means `--bench` no longer pays for building a whole
+    // `Engine` just to print this line.
+    if args.bench {
+        tracing::info!("benchmark mode not yet implemented in main — use `cargo bench`");
+        return Ok(());
+    }
+
+    // Whether this run serves MCP only depends on `args`, so it can be
+    // computed before `Engine::new` — which it now has to be: stdout has to
+    // be claimed for the JSON-RPC channel *before* `Engine::new` runs, since
+    // that call is what triggers the index rebuild/backfill that can print
+    // through hnsw_rs.
+    let should_serve = args.serve
+        || (!args.import && !args.bench && !args.watch && !args.enrich && !args.backfill_saga);
+
+    // MCP stdout is the JSON-RPC transport for the lifetime of this process,
+    // not just for the duration of `Engine::new`: the server also runs
+    // `spawn_enrichment_loops` and, with `--watch`, the file importer,
+    // in-process, and both insert into the same HNSW index that can print
+    // through hnsw_rs at any point in the session, not only at startup. A
+    // scoped guard around `Engine::new` alone (as the hook path uses) would
+    // not cover that. Claim fd 1 for the rest of the process up front; `None`
+    // when the claim fails or on non-unix falls back to the unmodified stdio
+    // transport inside `serve_mcp`. Once the claim succeeds, `serve_mcp` is
+    // reached unless the process instead exits on an error from `Engine::new`
+    // or one of `--import`/`--enrich`/`--backfill-saga` via `?` — and in that
+    // case the leaked descriptor dies with the process, since `--bench` (the
+    // one branch that would otherwise return early past this point) has
+    // already been handled above.
+    let jsonrpc_stdout = if should_serve {
+        csr_engine::hooks::ClaimedStdout::claim()
+    } else {
+        None
+    };
+
     let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
 
     if args.import || args.enrich {
@@ -550,12 +590,10 @@ async fn run() -> Result<()> {
 
     if args.backfill_saga {
         let stats = csr_engine::import::backfill::backfill_saga_columns(&eng)?;
+        // `--backfill-saga --serve` would now send this text to stderr (fd 1
+        // was already claimed for JSON-RPC above). That combination is not a
+        // meaningful invocation, so the redirected output is acceptable.
         print!("{}", stats.format_text());
-    }
-
-    if args.bench {
-        tracing::info!("benchmark mode not yet implemented in main — use `cargo bench`");
-        return Ok(());
     }
 
     // Start file watcher if requested (runs as background task)
@@ -565,11 +603,8 @@ async fn run() -> Result<()> {
         None
     };
 
-    // Start MCP stdio server if --serve or no explicit action
-    let should_serve = args.serve
-        || (!args.import && !args.bench && !args.watch && !args.enrich && !args.backfill_saga);
     if should_serve {
-        eng.serve_mcp().await?;
+        eng.serve_mcp(jsonrpc_stdout).await?;
     } else if args.watch {
         // If watching (with or without import), keep the process alive
         tracing::info!("watching for new conversations. Press Ctrl+C to stop.");
