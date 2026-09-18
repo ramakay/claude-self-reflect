@@ -442,6 +442,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
+        /// Write a transcript verbatim, for content no `String` can hold.
+        fn write_bytes(&self, bytes: &[u8]) {
+            std::fs::write(&self.path, bytes).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
         async fn import(&self, seal: SealPolicy) -> ImportOutcome {
             let attribution = ConversationAttribution {
                 project_name: "test".to_string(),
@@ -772,6 +778,97 @@ mod tests {
                 !after.contains("MSG"),
                 "a stale cursor must not leave old content behind"
             );
+        });
+    }
+
+    /// One invalid byte used to hide everything after it permanently: the pass
+    /// ended at that byte, the cursor it wrote pointed before the bad line, and
+    /// every later pass resumed there and stopped in the same place. Growth that
+    /// lands after the bad byte must still be imported, pass after pass.
+    #[test]
+    fn invalid_utf8_line_does_not_freeze_the_cursor() {
+        rt().block_on(async {
+            let h = Harness::new("bad-byte");
+
+            // Three clean messages, one carrying a lone 0xFF, then two more.
+            let mut bytes: Vec<u8> = Vec::new();
+            for (i, text) in msgs(3).iter().enumerate() {
+                bytes.extend_from_slice(
+                    serde_json::json!({
+                        "type": if i.is_multiple_of(2) { "user" } else { "assistant" },
+                        "timestamp": format!("2026-02-22T10:00:{:02}Z", i),
+                        "message": {"content": [{"type": "text", "text": text}]}
+                    })
+                    .to_string()
+                    .as_bytes(),
+                );
+                bytes.push(b'\n');
+            }
+            let bad_line_start = bytes.len() as u64;
+            bytes.extend_from_slice(
+                br#"{"type":"user","timestamp":"2026-02-22T10:00:03Z","message":{"content":[{"type":"text","text":"BADBYTE-"#,
+            );
+            bytes.push(0xFF);
+            bytes.extend_from_slice("y".repeat(380).as_bytes());
+            bytes.extend_from_slice(br#""}]}}"#);
+            bytes.push(b'\n');
+
+            let tail = |from: usize, to: usize| -> Vec<u8> {
+                let mut out = Vec::new();
+                for i in from..to {
+                    out.extend_from_slice(
+                        serde_json::json!({
+                            "type": if i.is_multiple_of(2) { "user" } else { "assistant" },
+                            "timestamp": format!("2026-02-22T10:00:{:02}Z", i),
+                            "message": {"content": [
+                                {"type": "text", "text": format!("MSG{i:03}-{}", "x".repeat(390))}
+                            ]}
+                        })
+                        .to_string()
+                        .as_bytes(),
+                    );
+                    out.push(b'\n');
+                }
+                out
+            };
+
+            let mut first = bytes.clone();
+            first.extend_from_slice(&tail(4, 6));
+            h.write_bytes(&first);
+            h.import(SealPolicy::SealAll).await;
+
+            let after_first = h.all_stored().join("\n");
+            for i in 4..6 {
+                assert!(
+                    after_first.contains(&format!("MSG{i:03}")),
+                    "MSG{i:03} follows the invalid byte and must be imported"
+                );
+            }
+            let stored_cursor: ParseCursor = serde_json::from_str(
+                &h.storage
+                    .get_parse_cursor(&h.path)
+                    .unwrap()
+                    .expect("a cursor must be stored"),
+            )
+            .unwrap();
+            assert!(
+                stored_cursor.byte_offset > bad_line_start,
+                "the stored cursor must sit past the invalid line, not on it"
+            );
+
+            // Append past the bad byte. A frozen cursor would never reach this.
+            let mut grown = bytes.clone();
+            grown.extend_from_slice(&tail(4, 10));
+            h.write_bytes(&grown);
+            h.import(SealPolicy::SealAll).await;
+
+            let after_second = h.all_stored().join("\n");
+            for i in 4..10 {
+                assert!(
+                    after_second.contains(&format!("MSG{i:03}")),
+                    "MSG{i:03} was appended after the invalid byte and must be imported"
+                );
+            }
         });
     }
 

@@ -377,18 +377,24 @@ pub(crate) fn parse_jsonl_file_from_cursor(
     }
 
     let mut offset = start_offset;
-    let mut line = String::new();
+    let mut raw: Vec<u8> = Vec::new();
     loop {
-        line.clear();
+        raw.clear();
         let line_start = offset;
-        // Deliberately not `continue` on error: with read_line a persistent decode
-        // failure would never advance the offset and would spin forever.
-        let read = match reader.read_line(&mut line) {
+        // Bytes, not `read_line`. `read_line` fails the whole call on a single
+        // invalid UTF-8 byte without telling us how far it got, so the loop could
+        // neither advance the offset nor skip the line: `continue` spun forever and
+        // `break` ended the pass at that byte, which the cursor then froze in place
+        // so every later pass stopped there too. `read_until` always reports the
+        // bytes it consumed, so the offset stays exact and one bad line costs one
+        // line.
+        let read = match reader.read_until(b'\n', &mut raw) {
             Ok(0) => break,
             Ok(n) => n,
             Err(_) => break,
         };
         offset += read as u64;
+        let line = String::from_utf8_lossy(&raw);
         if line.trim().is_empty() {
             continue;
         }
@@ -1730,6 +1736,72 @@ mod cursor_tests {
         (0..n)
             .map(|i| msg(i, &format!("MSG{i:03}-{}", "x".repeat(390))))
             .collect()
+    }
+
+    fn push_line(bytes: &mut Vec<u8>, value: &serde_json::Value) {
+        bytes.extend_from_slice(value.to_string().as_bytes());
+        bytes.push(b'\n');
+    }
+
+    /// One lone 0xFF used to end the pass at that byte: `read_line` rejects the
+    /// whole call on invalid UTF-8, and the loop broke out of it. The cursor
+    /// written afterwards pointed before the bad line, so every later pass
+    /// stopped in the same place and the rest of the transcript was hidden for
+    /// good. A bad byte must cost one line at most.
+    #[test]
+    fn invalid_utf8_line_does_not_end_the_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("badbyte.jsonl");
+
+        let mut bytes: Vec<u8> = Vec::new();
+        for i in 0..3 {
+            push_line(
+                &mut bytes,
+                &msg(i, &format!("MSG{i:03}-{}", "x".repeat(390))),
+            );
+        }
+        let bad_line_start = bytes.len() as u64;
+        bytes.extend_from_slice(
+            br#"{"type":"user","timestamp":"2026-02-22T10:00:03Z","message":{"content":[{"type":"text","text":"BADBYTE-"#,
+        );
+        bytes.push(0xFF);
+        bytes.extend_from_slice("y".repeat(380).as_bytes());
+        bytes.extend_from_slice(br#""}]}}"#);
+        bytes.push(b'\n');
+        for i in 4..8 {
+            push_line(
+                &mut bytes,
+                &msg(i, &format!("MSG{i:03}-{}", "x".repeat(390))),
+            );
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let parsed = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        let all = parsed
+            .chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for i in 4..8 {
+            assert!(
+                all.contains(&format!("MSG{i:03}")),
+                "MSG{i:03} follows the invalid byte and must still be imported"
+            );
+        }
+        assert!(
+            all.contains("BADBYTE-"),
+            "the damaged line itself is repaired lossily, not dropped"
+        );
+
+        let cursor = parsed.next_cursor.expect("a cursor must be produced");
+        assert!(
+            cursor.byte_offset > bad_line_start,
+            "the cursor must advance past the invalid line ({} <= {}), or every \
+             later pass stops on the same byte",
+            cursor.byte_offset,
+            bad_line_start
+        );
     }
 
     /// The core property: resuming from a cursor must reproduce exactly what a
