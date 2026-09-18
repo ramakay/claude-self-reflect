@@ -205,19 +205,50 @@ impl Drop for StdoutQuarantine {
 /// `println!`s would both land on the same real fd 1, corrupting the
 /// protocol stream, which is the exact failure this diversion exists to
 /// prevent. A half-applied diversion is worse than none, so on a failed
-/// `dup2` the saved copy is closed and the caller is told nothing happened.
+/// `dup2` the saved copy is closed and the caller is told nothing happened:
+/// the failure exit is a single unconditional `close` on the only path where
+/// `dup2` did not succeed, so there is nowhere for the saved descriptor to
+/// leak. The all-or-nothing contract, including that close-on-failure, is
+/// covered deterministically through [`divert_fd_with`]'s injected effects —
+/// what remains untestable is *observing* the leak from outside via the
+/// process's open-fd high-water mark, which is process-global state that
+/// other threads move arbitrarily under the parallel test harness.
 #[cfg(unix)]
 fn divert_fd(target: libc::c_int, sink: libc::c_int) -> libc::c_int {
     // SAFETY: fcntl/dup2 on this process's own descriptors. CLOEXEC keeps the
     // saved copy out of any child spawned while the guard is held.
-    let saved = unsafe { libc::fcntl(target, libc::F_DUPFD_CLOEXEC, 3) };
+    divert_fd_with(
+        target,
+        sink,
+        |fd| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) },
+        |s, t| unsafe { libc::dup2(s, t) },
+        |fd| unsafe {
+            libc::close(fd);
+        },
+    )
+}
+
+/// The all-or-nothing decision behind [`divert_fd`], with every syscall
+/// injected as a closure. Pure logic on top of the three effects — save,
+/// dup2, close — so the failure-path cleanup can be proven deterministically
+/// in a unit test without touching any real descriptor or depending on
+/// process-global allocation state.
+#[cfg(unix)]
+fn divert_fd_with(
+    target: libc::c_int,
+    sink: libc::c_int,
+    save: impl Fn(libc::c_int) -> libc::c_int,
+    dup2: impl Fn(libc::c_int, libc::c_int) -> libc::c_int,
+    close: impl Fn(libc::c_int),
+) -> libc::c_int {
+    let saved = save(target);
     if saved < 0 {
         return saved;
     }
-    if unsafe { libc::dup2(sink, target) } < 0 {
+    if dup2(sink, target) < 0 {
         // `target` is unchanged; the saved copy is now useless, close it
         // rather than leak it.
-        unsafe { libc::close(saved) };
+        close(saved);
         return -1;
     }
     saved
@@ -493,11 +524,15 @@ mod tests {
         }
 
         let (out_r, out_w) = pipe();
-        let (sink_r, sink_w) = pipe();
-        unsafe {
-            libc::close(sink_r);
-            libc::close(sink_w);
-        }
+        // A sentinel that is definitionally invalid as a dup2 target, rather
+        // than a real descriptor number recycled from a closed pipe: under
+        // the parallel test harness other threads churn fds constantly, and
+        // `fcntl(.., F_DUPFD_CLOEXEC, 3)` hands out the lowest free number,
+        // so a closed-and-reused sink could collide with a fd another thread
+        // just opened, making `dup2` succeed and the test flaky. `c_int::MAX`
+        // can never be allocated by that call, so `dup2` fails with `EBADF`
+        // deterministically.
+        let sink_w = libc::c_int::MAX;
 
         let claimed = ClaimedStdout::claim_on(out_w, sink_w);
         assert!(
@@ -515,58 +550,62 @@ mod tests {
         }
     }
 
-    /// `divert_fd`'s failure path (`fcntl` succeeds, `dup2` fails) must
-    /// close the descriptor it saved rather than leak it. `ClaimedStdout`
-    /// deliberately never hands that descriptor back to a caller on failure
-    /// (there is nothing legitimate to do with a half-diverted one), so a
-    /// single `libc::fcntl(saved, F_GETFD)` check on a known fd number is not
-    /// available from outside `divert_fd` — that opacity is the point of the
-    /// fix. Prove non-leak the way an external observer can instead: drive
-    /// many failed diversions through the same private helper the callers
-    /// use, then confirm the process's open-fd high-water mark has not
-    /// crept up by one per failure. A leaking `divert_fd` would push the
-    /// next free descriptor up by roughly `ATTEMPTS`; a closing one leaves
-    /// it essentially where it started.
+    /// `divert_fd`'s failure path (`fcntl`/save succeeds, `dup2` fails) must
+    /// close the descriptor it saved rather than leak it — the property
+    /// `claimed_stdout_refuses_a_partial_diversion` cannot observe from
+    /// outside. Proven here through `divert_fd_with`'s injected effects: a
+    /// fake `save` that hands back a fixed, unmistakable descriptor number,
+    /// a fake `dup2` that always fails, and a `close` that records every
+    /// descriptor it was asked to close. No real syscalls, no dependence on
+    /// process-global descriptor state.
     #[cfg(unix)]
     #[test]
-    fn divert_fd_closes_the_saved_copy_on_a_failed_dup2() {
-        fn pipe() -> (libc::c_int, libc::c_int) {
-            let mut fds = [0 as libc::c_int; 2];
-            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-            (fds[0], fds[1])
-        }
-
-        let (out_r, out_w) = pipe();
-        let (sink_r, sink_w) = pipe();
-        unsafe {
-            libc::close(sink_r);
-            libc::close(sink_w);
-        }
-
-        // Baseline: the fd this process would hand out right now for the
-        // same `F_DUPFD_CLOEXEC` request `divert_fd` makes internally.
-        let baseline = unsafe { libc::fcntl(out_w, libc::F_DUPFD_CLOEXEC, 3) };
-        assert!(baseline >= 3);
-        unsafe { libc::close(baseline) };
-
-        const ATTEMPTS: libc::c_int = 50;
-        for _ in 0..ATTEMPTS {
-            assert!(
-                divert_fd(out_w, sink_w) < 0,
-                "sink_w is closed; dup2 must fail so divert_fd must report failure"
-            );
-        }
-
-        let after = unsafe { libc::fcntl(out_w, libc::F_DUPFD_CLOEXEC, 3) };
-        assert!(after >= 3);
-        unsafe { libc::close(after) };
-        assert!(
-            after < baseline + ATTEMPTS,
-            "saved descriptors were not closed on failed dup2: baseline={baseline}, after={after}, attempts={ATTEMPTS}"
+    fn divert_fd_with_closes_the_saved_copy_on_a_failed_dup2() {
+        let closed = std::cell::RefCell::new(Vec::new());
+        let result = divert_fd_with(
+            1,
+            2,
+            |_target| 4242,
+            |_sink, _target| -1,
+            |fd| {
+                closed.borrow_mut().push(fd);
+            },
         );
 
-        for fd in [out_r, out_w] {
-            unsafe { libc::close(fd) };
-        }
+        assert!(
+            result < 0,
+            "a failed dup2 must be reported as a failed diversion"
+        );
+        assert_eq!(
+            closed.into_inner(),
+            vec![4242],
+            "the saved descriptor must be closed exactly once on the failed dup2 path"
+        );
+    }
+
+    /// The mirror case: when `dup2` succeeds, the saved descriptor is handed
+    /// back to the caller (who now owns it), not closed.
+    #[cfg(unix)]
+    #[test]
+    fn divert_fd_with_does_not_close_the_saved_copy_on_success() {
+        let closed = std::cell::RefCell::new(Vec::new());
+        let result = divert_fd_with(
+            1,
+            2,
+            |_target| 4242,
+            |_sink, _target| 0,
+            |fd| {
+                closed.borrow_mut().push(fd);
+            },
+        );
+
+        assert_eq!(
+            result, 4242,
+            "a successful diversion must return the saved descriptor"
+        );
+        assert!(
+            closed.into_inner().is_empty(),
+            "a successful diversion must not close the saved descriptor"
+        );
     }
 }
