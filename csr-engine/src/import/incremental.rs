@@ -175,70 +175,98 @@ pub(crate) async fn import_file_incremental(
     //
     // Fewer chunks than last time means either a genuine rewrite or a transient
     // short read (a concurrent writer's trailing line is incomplete and gets
-    // skipped). Wiping is destructive, so it needs corroboration: compare the
-    // head chunk's content. A rewrite changes it; a short read does not.
+    // skipped). Wiping is destructive, so it needs corroboration from the stored
+    // content: a rewrite changes it; a short read does not.
     let mut full_reimport = false;
     let rebuild_from = if stored_cursor.is_some() {
         // Everything the cursor handed back begins at the seam by construction,
         // and the cursor was only trusted after its head fingerprint matched.
         first_index
     } else {
-        // Full parse, so the head is in hand. Verify the prefix really is intact
-        // before trusting it: a rewrite changes chunk zero even when the chunk
-        // count does not move, and resuming at the seam would strand the old
-        // content in place. This also covers a cursor rejected as stale.
-        let head_changed = prev_count > 0
-            && ctx
+        // Full parse, so the whole prefix is in hand. Walk it against what is
+        // stored and rebuild from the first chunk that no longer matches.
+        //
+        // Comparing chunk zero alone was not enough. A compaction or an interior
+        // edit that leaves the head and the length alone reads as a plain append
+        // under that test, so the stale middle stays in place and keeps matching
+        // content the transcript no longer holds. The cursor's 4 KiB head
+        // fingerprint has the same blind spot, which is why the check lives here,
+        // on the path a rejected cursor also falls back to.
+        //
+        // The last stored chunk is excluded on purpose: it was flushed partial at
+        // EOF, so growth there is an append, not a rewrite. The walk costs one
+        // primary-key lookup per frozen chunk, but only on the full-parse path --
+        // a first import compares nothing, and every later pass resumes from the
+        // cursor and never reaches here.
+        let frozen = chunks.len().min(prev_count.saturating_sub(1));
+        let mut first_stale = None;
+        for (i, chunk) in chunks.iter().enumerate().take(frozen) {
+            let intact = ctx
                 .storage
-                .get_chunk_content(&chunks[0].id)?
-                .is_none_or(|stored| stored != chunks[0].content);
+                .get_chunk_content(&chunk.id)?
+                .is_some_and(|stored| stored == chunk.content);
+            if !intact {
+                first_stale = Some(i);
+                break;
+            }
+        }
 
-        if head_changed {
-            tracing::warn!(
-                conv = %conversation_id,
-                previous = prev_count,
-                current = n,
-                "transcript rewritten — wiping and rebuilding the conversation"
-            );
-            let old_ids = ctx
-                .storage
-                .get_chunk_ids_for_conversation(&conversation_id)?;
-            ctx.storage
-                .delete_chunks_for_conversation(&conversation_id)?;
-            {
-                let mut idx = ctx.search.write().await;
-                for id in &old_ids {
-                    idx.remove_chunk(id);
+        match first_stale {
+            Some(0) => {
+                // The head itself moved, so nothing of the old conversation can
+                // be trusted. Wipe rather than leave a stale prefix behind.
+                tracing::warn!(
+                    conv = %conversation_id,
+                    previous = prev_count,
+                    current = n,
+                    "transcript rewritten — wiping and rebuilding the conversation"
+                );
+                let old_ids = ctx
+                    .storage
+                    .get_chunk_ids_for_conversation(&conversation_id)?;
+                ctx.storage
+                    .delete_chunks_for_conversation(&conversation_id)?;
+                {
+                    let mut idx = ctx.search.write().await;
+                    for id in &old_ids {
+                        idx.remove_chunk(id);
+                    }
                 }
+                full_reimport = true;
+                0
             }
-            full_reimport = true;
-            0
-        } else if n < prev_count {
-            // Head intact but fewer chunks: keep the valid prefix, drop the
-            // orphan tail rather than wiping a conversation needlessly.
-            tracing::warn!(
-                conv = %conversation_id,
-                previous = prev_count,
-                current = n,
-                "transcript shrank with an intact head — dropping orphan tail chunks"
-            );
-            let orphans: Vec<String> = (n..prev_count)
-                .map(|i| import::generate_chunk_id(&conversation_id, i))
-                .collect();
-            ctx.storage.delete_chunks_by_ids(&orphans)?;
-            {
-                let mut idx = ctx.search.write().await;
-                for id in &orphans {
-                    idx.remove_chunk(id);
-                }
+            Some(from) => {
+                // The head survived but the middle did not. Keep the matching
+                // prefix and rebuild everything from the first stale chunk on.
+                tracing::warn!(
+                    conv = %conversation_id,
+                    previous = prev_count,
+                    current = n,
+                    from,
+                    "transcript rewritten below the head — rebuilding from the first stale chunk"
+                );
+                drop_orphan_chunks(ctx, &conversation_id, n..prev_count).await?;
+                from
             }
-            n.saturating_sub(1)
-        } else {
-            // The seam. `prev_count` counts chunks WRITTEN, and the last of those
-            // was a partial buffer flushed at EOF — on this pass it may have
-            // grown, so it must be rebuilt. Slicing from `prev_count` instead
-            // drops its new messages into no chunk at all.
-            prev_count.saturating_sub(1)
+            None if n < prev_count => {
+                // Prefix intact but fewer chunks: keep it and drop the orphan
+                // tail rather than wiping a conversation needlessly.
+                tracing::warn!(
+                    conv = %conversation_id,
+                    previous = prev_count,
+                    current = n,
+                    "transcript shrank with an intact head — dropping orphan tail chunks"
+                );
+                drop_orphan_chunks(ctx, &conversation_id, n..prev_count).await?;
+                n.saturating_sub(1)
+            }
+            None => {
+                // The seam. `prev_count` counts chunks WRITTEN, and the last of
+                // those was a partial buffer flushed at EOF — on this pass it may
+                // have grown, so it must be rebuilt. Slicing from `prev_count`
+                // instead drops its new messages into no chunk at all.
+                prev_count.saturating_sub(1)
+            }
         }
     };
 
@@ -368,6 +396,27 @@ pub(crate) async fn import_file_incremental(
     })
 }
 
+/// Drop stored chunks the transcript no longer has, from both SQLite and the
+/// vector index. An empty range is a no-op.
+async fn drop_orphan_chunks(
+    ctx: &ImportContext<'_>,
+    conversation_id: &str,
+    range: std::ops::Range<usize>,
+) -> Result<()> {
+    if range.is_empty() {
+        return Ok(());
+    }
+    let orphans: Vec<String> = range
+        .map(|i| import::generate_chunk_id(conversation_id, i))
+        .collect();
+    ctx.storage.delete_chunks_by_ids(&orphans)?;
+    let mut idx = ctx.search.write().await;
+    for id in &orphans {
+        idx.remove_chunk(id);
+    }
+    Ok(())
+}
+
 /// Whether a stored cursor still describes the file on disk.
 ///
 /// A shorter file means truncation. A changed head means the file was rewritten,
@@ -379,6 +428,12 @@ fn cursor_still_valid(cursor: &ParseCursor, path: &Path) -> bool {
         return false;
     };
     if meta.len() < cursor.file_len || meta.len() < cursor.byte_offset {
+        return false;
+    }
+    // An edit below the 4 KiB the fingerprint covers is invisible to it, but any
+    // edit that changes the length of the region it touches moves every byte
+    // after it, so the resume offset no longer starts a line.
+    if !import::resumes_on_a_line_boundary(path, cursor.byte_offset) {
         return false;
     }
     import::head_fingerprint(path) == cursor.head_fingerprint
@@ -828,6 +883,85 @@ mod tests {
                 "the reloaded cache must carry the rewritten vector, not the \
                  stale one (in memory {fresh}, reloaded {after_reload})"
             );
+        });
+    }
+
+    /// Comparing chunk zero alone read an interior rewrite as a plain append, so
+    /// the stale middle stayed in place matching content the transcript no longer
+    /// held. This is the full-parse path, which a rejected or absent cursor falls
+    /// back to.
+    #[test]
+    fn interior_rewrite_rebuilds_from_the_first_stale_chunk() {
+        rt().block_on(async {
+            let h = Harness::new("interior");
+            // c0(m0,m1) c1(m2,m3) c2(m4,m5) c3(m6,m7) c4(m8)
+            h.write(&msgs(9));
+            let first = h.import(SealPolicy::SealAll).await;
+            assert_eq!(first.total_chunks, 5, "fixture must produce 5 chunks");
+
+            // Rewrite chunk 2's two messages at identical lengths, so neither the
+            // head nor the file size moves.
+            let mut edited = msgs(9);
+            edited[4] = format!("EDT004-{}", "x".repeat(390));
+            edited[5] = format!("EDT005-{}", "x".repeat(390));
+            h.write(&edited);
+            h.storage.clear_parse_cursor_for_test(&h.path).unwrap();
+
+            let second = h.import(SealPolicy::SealAll).await;
+
+            assert!(
+                !second.full_reimport,
+                "the head survived, so the conversation must not be wiped"
+            );
+            assert!(
+                h.stored(2).unwrap().contains("EDT004"),
+                "the rewritten chunk must be rebuilt"
+            );
+            let all = h.all_stored().join("\n");
+            assert!(
+                !all.contains("MSG004") && !all.contains("MSG005"),
+                "no stale content may survive an interior rewrite"
+            );
+            assert!(
+                all.contains("MSG000") && all.contains("MSG008"),
+                "the matching prefix and the tail must both still be there"
+            );
+        });
+    }
+
+    /// The cursor's head fingerprint covers only 4 KiB, so an edit below that
+    /// window left it looking valid while every byte after the edit had moved.
+    /// Resuming at the stale offset stranded the rewritten region.
+    #[test]
+    fn interior_rewrite_below_the_cursor_forces_a_full_parse() {
+        rt().block_on(async {
+            let h = Harness::new("interior-cursor");
+            // Thirteen messages of ~500 bytes each put chunk 5 well past 4 KiB.
+            h.write(&msgs(13));
+            let first = h.import(SealPolicy::SealAll).await;
+            assert_eq!(first.total_chunks, 7, "fixture must produce 7 chunks");
+
+            // Rewrite message 10 (chunk 5) at a different length, so the cursor's
+            // byte offset no longer starts a line.
+            let mut edited = msgs(13);
+            edited[10] = format!("EDT010-{}", "x".repeat(430));
+            h.write(&edited);
+
+            let second = h.import(SealPolicy::SealAll).await;
+
+            assert!(
+                !second.full_reimport,
+                "the head survived, so the conversation must not be wiped"
+            );
+            assert!(
+                h.stored(5).unwrap().contains("EDT010"),
+                "the rewritten chunk must be rebuilt, not resumed past"
+            );
+            let all = h.all_stored().join("\n");
+            assert!(!all.contains("MSG010"), "no stale content may survive");
+            for i in (0..13).filter(|i| *i != 10) {
+                assert!(all.contains(&format!("MSG{i:03}")), "MSG{i:03} missing");
+            }
         });
     }
 

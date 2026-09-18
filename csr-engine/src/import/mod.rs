@@ -50,6 +50,29 @@ pub(crate) const PARSE_CURSOR_VERSION: u32 = 1;
 /// Size of the head sample used for `head_fingerprint`.
 const HEAD_FINGERPRINT_BYTES: usize = 4096;
 
+/// Whether `offset` still sits at the start of a line in `path`.
+///
+/// The head fingerprint only covers the first [`HEAD_FINGERPRINT_BYTES`], so a
+/// rewrite below that window leaves a cursor looking valid. Any such rewrite
+/// that changes the length of the region it touches shifts every byte after it,
+/// and the stored offset then lands mid-line. One byte read says so, and the
+/// full parse it forces compares the stored prefix and finds the real point of
+/// divergence. A rewrite that preserves length exactly still slips through: the
+/// only thing that can see that is a read of the whole file.
+pub(crate) fn resumes_on_a_line_boundary(path: &Path, offset: u64) -> bool {
+    if offset == 0 {
+        return true;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::Start(offset - 1)).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte).is_ok() && byte[0] == b'\n'
+}
+
 pub(crate) fn head_fingerprint(path: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut buf = vec![0u8; HEAD_FINGERPRINT_BYTES];
