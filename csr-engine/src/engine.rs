@@ -585,7 +585,18 @@ impl Engine {
     }
 
     /// Start the MCP server on stdio with background enrichment loops.
-    pub async fn serve_mcp(self) -> Result<()> {
+    ///
+    /// `stdout` is fd 1 already claimed for the JSON-RPC transport by
+    /// `main.rs`, before this engine's own construction had a chance to run
+    /// `hnsw_rs` through its index rebuild path. `Some` on unix routes the
+    /// transport's write half through that claimed descriptor instead of
+    /// `rmcp::transport::io::stdio()`'s own fd 1, so anything the process
+    /// still writes to fd 1 directly (the enrichment loops and `--watch`
+    /// importer started below, both of which insert into the same HNSW index)
+    /// lands on stderr rather than corrupting the protocol stream. `None`
+    /// (claim failed, or non-unix) falls back to the unmodified stdio
+    /// transport — the pre-existing behaviour.
+    pub async fn serve_mcp(self, stdout: Option<crate::hooks::ClaimedStdout>) -> Result<()> {
         // Spawn enrichment loops as background tasks (extraction, narrator, consolidation)
         let enrichment_handles = crate::daemon::spawn_enrichment_loops(
             self.storage.clone(),
@@ -600,7 +611,20 @@ impl Engine {
             self.projects_dir,
             self.index_dir,
         );
-        let service = server.serve(rmcp::transport::io::stdio()).await?;
+        #[cfg(unix)]
+        let service = match stdout {
+            Some(claimed) => {
+                server
+                    .serve((tokio::io::stdin(), claimed.into_async_writer()))
+                    .await?
+            }
+            None => server.serve(rmcp::transport::io::stdio()).await?,
+        };
+        #[cfg(not(unix))]
+        let service = {
+            let _ = stdout;
+            server.serve(rmcp::transport::io::stdio()).await?
+        };
         service.waiting().await?;
 
         // Clean up enrichment loops on MCP server exit
