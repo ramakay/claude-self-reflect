@@ -655,7 +655,7 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
     // Priority: JSONL summary > first user message > None
     let chunk_summary = summary.or(first_user_message);
 
-    let (chunks, mut evidence) = chunk_message_core_with_evidence(
+    let (chunks, mut parts_by_chunk) = chunk_message_core_with_evidence(
         &conversation_id,
         project_name,
         &timestamp,
@@ -665,20 +665,27 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
         &chunk_summary,
         Some(&message_evidence),
     );
+    // Scrub before the evidence exists. The spans and the tool-result share are
+    // measured against `chunk.content`, and `replace_chunk_evidence` re-derives
+    // the share from the persisted spans and refuses the chunk when the two
+    // disagree; evidence computed from the unscrubbed text failed that check on
+    // every trimmed tool result and aborted the file's import.
+    let mut evidence = HashMap::new();
     let chunks = chunks
         .into_iter()
         .filter_map(|mut chunk| {
-            scrub_contaminated_text(&chunk.content).map(|content| {
-                chunk.content = content;
-                chunk
-            })
+            let content = scrub_contaminated_text(&chunk.content)?;
+            let parts = parts_by_chunk.remove(&chunk.id).unwrap_or_default();
+            let parts = if content == chunk.content {
+                parts
+            } else {
+                realign_parts(parts, &content)
+            };
+            chunk.content = content;
+            attach_chunk_evidence(&chunk, parts, &mut evidence);
+            Some(chunk)
         })
         .collect::<Vec<_>>();
-    let retained = chunks
-        .iter()
-        .map(|chunk| chunk.id.as_str())
-        .collect::<HashSet<_>>();
-    evidence.retain(|chunk_id, _| retained.contains(chunk_id.as_str()));
 
     Ok(ParsedConversation {
         chunks,
@@ -754,15 +761,14 @@ fn chunk_message_core_with_evidence(
     message_sidechains: &[bool],
     summary: &Option<String>,
     message_evidence: Option<&[MessageEvidence]>,
-) -> (
-    Vec<ConversationChunk>,
-    HashMap<String, crate::provenance::ChunkEvidence>,
-) {
+) -> (Vec<ConversationChunk>, HashMap<String, Vec<EventPart>>) {
     debug_assert_eq!(messages.len(), message_authors.len());
     debug_assert_eq!(messages.len(), message_sidechains.len());
     debug_assert!(message_evidence.is_none_or(|evidence| evidence.len() == messages.len()));
     let mut chunks = Vec::new();
-    let mut evidence_by_chunk = HashMap::new();
+    // Event parts per chunk, not finished evidence: the caller still scrubs the
+    // chunk text, and spans have to be measured against what it persists.
+    let mut parts_by_chunk = HashMap::new();
     let mut buffer = String::new();
     let mut authors = Vec::new();
     let mut sidechains = Vec::new();
@@ -789,10 +795,10 @@ fn chunk_message_core_with_evidence(
                     chunk_author(&authors),
                     chunk_is_sidechain(&sidechains, conversation_id),
                 );
-                attach_chunk_evidence(
+                stash_chunk_parts(
                     chunks.last().expect("chunk was just pushed"),
                     std::mem::take(&mut buffered_parts),
-                    &mut evidence_by_chunk,
+                    &mut parts_by_chunk,
                 );
                 authors.clear();
                 sidechains.clear();
@@ -816,12 +822,12 @@ fn chunk_message_core_with_evidence(
                     *author,
                     chunk_is_sidechain(std::slice::from_ref(is_sidechain), conversation_id),
                 );
-                attach_chunk_evidence(
+                stash_chunk_parts(
                     chunks.last().expect("chunk was just pushed"),
                     source
                         .map(|evidence| slice_event_parts(evidence, start, end))
                         .unwrap_or_default(),
-                    &mut evidence_by_chunk,
+                    &mut parts_by_chunk,
                 );
                 start = end;
             }
@@ -840,10 +846,10 @@ fn chunk_message_core_with_evidence(
                 chunk_author(&authors),
                 chunk_is_sidechain(&sidechains, conversation_id),
             );
-            attach_chunk_evidence(
+            stash_chunk_parts(
                 chunks.last().expect("chunk was just pushed"),
                 std::mem::take(&mut buffered_parts),
-                &mut evidence_by_chunk,
+                &mut parts_by_chunk,
             );
             authors.clear();
             sidechains.clear();
@@ -872,13 +878,92 @@ fn chunk_message_core_with_evidence(
             chunk_author(&authors),
             chunk_is_sidechain(&sidechains, conversation_id),
         );
-        attach_chunk_evidence(
+        stash_chunk_parts(
             chunks.last().expect("chunk was just pushed"),
             buffered_parts,
-            &mut evidence_by_chunk,
+            &mut parts_by_chunk,
         );
     }
-    (chunks, evidence_by_chunk)
+    (chunks, parts_by_chunk)
+}
+
+fn stash_chunk_parts(
+    chunk: &ConversationChunk,
+    parts: Vec<EventPart>,
+    parts_by_chunk: &mut HashMap<String, Vec<EventPart>>,
+) {
+    if !parts.is_empty() {
+        parts_by_chunk.insert(chunk.id.clone(), parts);
+    }
+}
+
+/// Re-derive a chunk's event parts against the text that will actually be
+/// persisted. `scrub_contaminated_text` runs on the finished chunk and can trim
+/// its edges or cut wrappers and paragraphs out of the middle, so a part sliced
+/// from the unscrubbed message may no longer be literally present. Spans are
+/// later re-validated by slicing the event's extracted text at
+/// `[combined_start, combined_end)` and hashing it, and the persisted
+/// tool-result share is recomputed from the spans over `chunk.content`, so a
+/// span may only describe text that is both still in the chunk and contiguous
+/// in the source part. Parts are matched in order behind a moving cursor: the
+/// whole part first, then its wrapper-free paragraphs, each trimmed the way the
+/// chunk edges are. Whatever cannot be located is dropped from the evidence
+/// rather than described inaccurately.
+fn realign_parts(parts: Vec<EventPart>, content: &str) -> Vec<EventPart> {
+    let mut cursor = 0usize;
+    let mut kept = Vec::with_capacity(parts.len());
+    for part in parts {
+        let whole = [(0usize, part.text.as_str())];
+        let pieces;
+        let candidates: &[(usize, &str)] = if content[cursor..].contains(part.text.as_str()) {
+            &whole
+        } else {
+            pieces = surviving_pieces(&part.text);
+            &pieces
+        };
+        for &(byte_offset, piece) in candidates {
+            let Some(found) = content[cursor..].find(piece) else {
+                continue;
+            };
+            cursor += found + piece.len();
+            let start = part.combined_start + part.text[..byte_offset].chars().count();
+            kept.push(EventPart {
+                event: part.event.clone(),
+                text: piece.to_string(),
+                combined_start: start,
+                combined_end: start + piece.chars().count(),
+            });
+        }
+    }
+    kept
+}
+
+/// The runs of `text` that the chunk-level scrub can leave in place, as
+/// `(byte offset in text, run)`: wrapper matches are cut out, the remainder is
+/// split into paragraphs on the same `"\n\n"` boundary the scrub uses, and each
+/// run is trimmed of edge whitespace. Empty runs are skipped.
+fn surviving_pieces(text: &str) -> Vec<(usize, &str)> {
+    let mut gaps = Vec::new();
+    let mut gap_start = 0usize;
+    for wrapper in CSR_SYSTEM_REMINDER_RE.find_iter(text) {
+        gaps.push((gap_start, &text[gap_start..wrapper.start()]));
+        gap_start = wrapper.end();
+    }
+    gaps.push((gap_start, &text[gap_start..]));
+
+    let mut pieces = Vec::new();
+    for (gap_offset, gap) in gaps {
+        let mut paragraph_offset = 0usize;
+        for paragraph in gap.split("\n\n") {
+            let trimmed = paragraph.trim();
+            if !trimmed.is_empty() {
+                let lead = paragraph.len() - paragraph.trim_start().len();
+                pieces.push((gap_offset + paragraph_offset + lead, trimmed));
+            }
+            paragraph_offset += paragraph.len() + 2;
+        }
+    }
+    pieces
 }
 
 fn slice_event_parts(message: &MessageEvidence, start: usize, end: usize) -> Vec<EventPart> {
@@ -1831,6 +1916,138 @@ mod tests {
             .evidence
             .values()
             .any(|evidence| evidence.tool_result_share.is_some_and(|share| share > 0.0)));
+    }
+
+    /// The daemon failed ~900 imports a day with "provided tool-result share
+    /// does not match persisted spans": the chunk scrub trimmed the trailing
+    /// newline off a tool result after the share had been computed, so the
+    /// persisted text was one char shorter than the spans said. Run the exact
+    /// storage check the importer runs.
+    #[test]
+    fn scrubbed_chunk_evidence_survives_the_storage_consistency_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing-newline.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"type":"assistant","uuid":"a1","timestamp":"2026-09-17T00:00:01Z","message":{"content":[{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"ls"}}]}}"#,
+                r#"{"type":"user","uuid":"u1","timestamp":"2026-09-17T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":"Cargo.toml\nsrc\ntarget\n"}]}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_jsonl_file_with_stats(&path, "project").unwrap();
+        assert_eq!(parsed.chunks.len(), 1);
+        let chunk = &parsed.chunks[0];
+        assert!(
+            !chunk.content.ends_with('\n'),
+            "scrub trims the chunk edge: {:?}",
+            chunk.content
+        );
+        let evidence = parsed
+            .evidence
+            .get(&chunk.id)
+            .expect("evidence for the chunk");
+        assert_eq!(evidence.tool_result_share, Some(1.0));
+        let span_chars: usize = evidence
+            .spans
+            .iter()
+            .map(|span| span.end_char - span.start_char)
+            .sum();
+        assert_eq!(span_chars, chunk.content.chars().count());
+
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        storage.insert_chunk(chunk, &[0.0; 4]).unwrap();
+        storage
+            .replace_chunk_evidence(evidence)
+            .expect("persisted spans agree with the scrubbed content");
+    }
+
+    #[test]
+    fn realigned_parts_slice_the_source_text_and_sit_in_the_scrubbed_chunk() {
+        use crate::provenance::{validated_span_tier, ProvenanceEvent, TrustTier};
+
+        let original = "  alpha line\n\n<system-reminder>\nCSR PICKUP — this prompt matches a past episode\n</system-reminder>\n\nbeta line\n";
+        let event = ProvenanceEvent {
+            event_id: "evt-1".into(),
+            conversation_id: "conv".into(),
+            message_key: "u1".into(),
+            seq: 0,
+            channel: "tool_result:Bash".into(),
+            trust_tier: TrustTier::External,
+            parent_event_id: None,
+            receipt_kind: "jsonl".into(),
+            receipt_ref: None,
+            observed_at: "2026-09-17T00:00:00Z".into(),
+        };
+        let part = EventPart {
+            event: event.clone(),
+            text: original.to_string(),
+            combined_start: 0,
+            combined_end: original.chars().count(),
+        };
+        let scrubbed = scrub_contaminated_text(original).expect("not pure contamination");
+        // Wrapper cut out, edges trimmed, blank paragraphs left where it was.
+        assert_eq!(scrubbed, "alpha line\n\n\n\nbeta line");
+
+        let kept = realign_parts(vec![part], &scrubbed);
+        let texts: Vec<&str> = kept.iter().map(|part| part.text.as_str()).collect();
+        assert_eq!(texts, ["alpha line", "beta line"]);
+        for part in &kept {
+            assert!(scrubbed.contains(&part.text));
+            let span = crate::provenance::ChunkSpan {
+                chunk_id: "chunk".into(),
+                event_id: event.event_id.clone(),
+                start_char: part.combined_start,
+                end_char: part.combined_end,
+                content_hash: crate::provenance::content_hash(&part.text),
+            };
+            assert_eq!(
+                validated_span_tier(&event, &span, original),
+                TrustTier::External,
+                "span {}..{} must slice {:?} out of the source part",
+                span.start_char,
+                span.end_char,
+                part.text
+            );
+        }
+    }
+
+    #[test]
+    fn realign_drops_parts_the_scrub_removed_entirely() {
+        use crate::provenance::{ProvenanceEvent, TrustTier};
+
+        let event = |id: &str| ProvenanceEvent {
+            event_id: id.into(),
+            conversation_id: "conv".into(),
+            message_key: id.into(),
+            seq: 0,
+            channel: "text".into(),
+            trust_tier: TrustTier::UserHistory,
+            parent_event_id: None,
+            receipt_kind: "jsonl".into(),
+            receipt_ref: None,
+            observed_at: "2026-09-17T00:00:00Z".into(),
+        };
+        let parts = vec![
+            EventPart {
+                event: event("keep"),
+                text: "kept text".into(),
+                combined_start: 0,
+                combined_end: 9,
+            },
+            EventPart {
+                event: event("gone"),
+                text: "<system-reminder>\nEPISODE INDEX — earlier threads\n</system-reminder>"
+                    .into(),
+                combined_start: 0,
+                combined_end: 70,
+            },
+        ];
+        let kept = realign_parts(parts, "kept text");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].event.event_id, "keep");
     }
 
     #[test]
