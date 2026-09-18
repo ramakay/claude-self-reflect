@@ -27,6 +27,12 @@ struct Args {
     #[arg(long)]
     serve: bool,
 
+    /// Serve MCP over Streamable HTTP on this address instead of stdio, e.g.
+    /// 127.0.0.1:7391. One process, one index load, many Claude Code sessions.
+    /// Loopback only unless CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK=1.
+    #[arg(long, value_name = "ADDR")]
+    serve_http: Option<String>,
+
     /// Max conversations to import
     #[arg(long)]
     limit: Option<usize>,
@@ -90,6 +96,12 @@ enum Commands {
         /// Skip AI narrative generation (Layer 1+2 only, no API key needed)
         #[arg(long)]
         no_ai: bool,
+
+        /// Also host the MCP endpoint over Streamable HTTP on this address,
+        /// e.g. 127.0.0.1:7391, sharing the index the daemon already holds.
+        /// Loopback only unless CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK=1.
+        #[arg(long, value_name = "ADDR")]
+        serve_http: Option<String>,
     },
     /// Analyze code quality using AST patterns
     Quality {
@@ -309,8 +321,15 @@ async fn main() -> Result<()> {
         batch_size,
         batch_time,
         no_ai,
+        ref serve_http,
     }) = args.command
     {
+        // Parse the listen address before the index loads, so a typo fails in
+        // milliseconds instead of after a full startup.
+        let mcp_http_addr = match serve_http {
+            Some(raw) => Some(csr_engine::mcp::http::parse_listen_addr(raw)?),
+            None => None,
+        };
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -321,7 +340,7 @@ async fn main() -> Result<()> {
             batch_time_trigger_secs: batch_time * 60,
             batch_poll_interval_secs: 60,
         };
-        let daemon = csr_engine::daemon::Daemon::new(
+        let mut daemon = csr_engine::daemon::Daemon::new(
             eng.storage().clone(),
             eng.embeddings().clone(),
             eng.search().clone(),
@@ -330,6 +349,9 @@ async fn main() -> Result<()> {
             config,
             !no_ai,
         );
+        if let Some(addr) = mcp_http_addr {
+            daemon = daemon.with_mcp_http(addr);
+        }
         return daemon.run().await;
     }
 
@@ -636,7 +658,15 @@ async fn main() -> Result<()> {
     // that call is what triggers the index rebuild/backfill that can print
     // through hnsw_rs.
     let should_serve = args.serve
+        || args.serve_http.is_some()
         || (!args.import && !args.bench && !args.watch && !args.enrich && !args.backfill_saga);
+
+    // Parse the listen address before anything expensive happens, so a typo
+    // fails in milliseconds rather than after the whole index has loaded.
+    let mcp_http_addr = match args.serve_http.as_deref() {
+        Some(raw) => Some(csr_engine::mcp::http::parse_listen_addr(raw)?),
+        None => None,
+    };
 
     // MCP stdout is the JSON-RPC transport for the lifetime of this process,
     // not just for the duration of `Engine::new`: the server also runs
@@ -652,7 +682,9 @@ async fn main() -> Result<()> {
     // case the leaked descriptor dies with the process, since `--bench` (the
     // one branch that would otherwise return early past this point) has
     // already been handled above.
-    let jsonrpc_stdout = if should_serve {
+    // Only the stdio transport needs fd 1 reserved: over HTTP the JSON-RPC
+    // channel is the socket, so a stray library print to stdout is harmless.
+    let jsonrpc_stdout = if should_serve && mcp_http_addr.is_none() {
         csr_engine::hooks::ClaimedStdout::claim()
     } else {
         None
@@ -689,7 +721,10 @@ async fn main() -> Result<()> {
     };
 
     if should_serve {
-        eng.serve_mcp(jsonrpc_stdout).await?;
+        match mcp_http_addr {
+            Some(addr) => eng.serve_mcp_http(addr).await?,
+            None => eng.serve_mcp(jsonrpc_stdout).await?,
+        }
     } else if args.watch {
         // If watching (with or without import), keep the process alive
         tracing::info!("watching for new conversations. Press Ctrl+C to stop.");
@@ -697,4 +732,63 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_http_flag_captures_the_address() {
+        let args = Args::try_parse_from(["csr-engine", "--serve-http", "127.0.0.1:7391"]).unwrap();
+        assert_eq!(args.serve_http.as_deref(), Some("127.0.0.1:7391"));
+        assert!(!args.serve, "--serve-http should not imply --serve");
+    }
+
+    #[test]
+    fn serve_http_flag_is_absent_by_default() {
+        let args = Args::try_parse_from(["csr-engine"]).unwrap();
+        assert!(args.serve_http.is_none());
+    }
+
+    #[test]
+    fn serve_http_flag_requires_a_value() {
+        assert!(Args::try_parse_from(["csr-engine", "--serve-http"]).is_err());
+    }
+
+    #[test]
+    fn stdio_serve_flag_still_parses_alone() {
+        let args = Args::try_parse_from(["csr-engine", "--serve"]).unwrap();
+        assert!(args.serve);
+        assert!(args.serve_http.is_none());
+    }
+
+    #[test]
+    fn daemon_takes_its_own_serve_http_address() {
+        let args = Args::try_parse_from(["csr-engine", "daemon", "--serve-http", "127.0.0.1:7391"])
+            .unwrap();
+        match args.command {
+            Some(Commands::Daemon { serve_http, .. }) => {
+                assert_eq!(serve_http.as_deref(), Some("127.0.0.1:7391"));
+            }
+            other => panic!("expected the daemon subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_without_serve_http_stays_headless() {
+        let args = Args::try_parse_from(["csr-engine", "daemon"]).unwrap();
+        match args.command {
+            Some(Commands::Daemon { serve_http, .. }) => assert!(serve_http.is_none()),
+            other => panic!("expected the daemon subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_http_address_resolves_through_the_shared_parser() {
+        let args = Args::try_parse_from(["csr-engine", "--serve-http", "127.0.0.1:7391"]).unwrap();
+        let addr =
+            csr_engine::mcp::http::parse_listen_addr(args.serve_http.as_deref().unwrap()).unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:7391");
+    }
 }

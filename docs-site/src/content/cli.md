@@ -7,6 +7,17 @@ title: CLI Reference
 ### Default (no args)
 Starts MCP server (stdio mode).
 
+### --serve-http
+Serves MCP over Streamable HTTP from one process instead of one stdio process
+per session, so a single loaded index answers every session. Register the
+endpoint with `claude mcp add --transport http claude-self-reflect
+http://127.0.0.1:7391/mcp -s user` in place of the stdio entry.
+```bash
+csr-engine --serve-http 127.0.0.1:7391
+```
+Loopback only unless `CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK=1` is set: the endpoint
+is unauthenticated.
+
 ### setup
 One-shot: import + MCP registration + hook installation.
 ```bash
@@ -29,7 +40,10 @@ csr-engine hook session-start    # Run specific hook (called by Claude Code)
 Background enrichment for Layer 3 AI narratives.
 ```bash
 csr-engine daemon --batch-size 10 --no-ai
+csr-engine daemon --serve-http 127.0.0.1:7391  # also host the MCP endpoint
 ```
+With `--serve-http` the daemon hosts the MCP endpoint itself, sharing the
+storage, embeddings and index it has already loaded.
 
 ### eval
 ```bash
@@ -60,6 +74,7 @@ csr-engine quality src/main.rs
 | `--import` | Import conversations |
 | `--enrich` | Backfill enrichment |
 | `--watch` | Watch for new conversations |
+| `--serve-http <ADDR>` | Serve MCP over Streamable HTTP instead of stdio |
 | `--version` | Print version |
 
 ## Environment Variables
@@ -69,6 +84,7 @@ csr-engine quality src/main.rs
 | CSR_NARRATIVE_MODEL | (none) | Override AI narrative model (chain: this → `haiku` → CLI default) |
 | CSR_NO_AI_NARRATIVES | (none) | Set to `1` to disable AI narratives |
 | CSR_DB_PATH | ~/.claude-self-reflect/csr-engine.db | DB location |
+| CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK | (none) | Set to `1` to let `--serve-http` bind a non-loopback address |
 
 ## Data Locations
 

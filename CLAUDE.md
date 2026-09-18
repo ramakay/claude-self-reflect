@@ -6,7 +6,7 @@ Single Rust binary (`csr-engine`). No Python, no Docker, no Qdrant.
 
 ```
 csr-engine (44MB)
-  ├── MCP server (rmcp, 15 tools)
+  ├── MCP server (rmcp, 15 tools, stdio or Streamable HTTP)
   ├── Embeddings (FastEmbed, 384-dim, local)
   ├── Search (HNSW, <1ms p95)
   ├── Storage (SQLite)
@@ -40,11 +40,13 @@ SessionStart injects one causal paragraph instead of the fragment pile: `recap [
 ## Key Commands
 
 ```bash
-csr-engine                     # Start MCP server (default)
+csr-engine                     # Start MCP server (default, stdio)
+csr-engine --serve-http ADDR   # Serve MCP over Streamable HTTP (one shared process)
 csr-engine setup               # Import + register MCP + install hooks
 csr-engine status              # System status (JSON)
 csr-engine status --compact    # Statusline output
 csr-engine daemon              # Background enrichment (AI narratives)
+csr-engine daemon --serve-http ADDR # Daemon that also hosts the MCP endpoint
 csr-engine hook install --apply # Install/update hooks
 csr-engine eval                # Quick eval (5 tests, ~7ms)
 csr-engine eval --full         # Full eval (20 tests, ~200ms)

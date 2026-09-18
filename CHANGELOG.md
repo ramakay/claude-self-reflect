@@ -5,6 +5,25 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `--serve-http <ADDR>`: serve MCP over Streamable HTTP from one process
+  instead of one stdio process per session. The same `ServerHandler` and the
+  same 15 tools, mounted at `http://<ADDR>/mcp`. Every session that registers
+  the endpoint is answered by that one process, so the index is loaded once
+  rather than once per session. Loopback only unless
+  `CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK=1`.
+- `csr-engine daemon --serve-http <ADDR>`: the enrichment daemon hosts the
+  same endpoint, sharing the storage handle, embedding engine and search index
+  it already holds.
+- Registration: replace the stdio entry with
+  `{"type": "http", "url": "http://127.0.0.1:7391/mcp"}`, or run
+  `claude mcp add --transport http claude-self-reflect http://127.0.0.1:7391/mcp -s user`.
+  Prefer it when many sessions run at once; stdio stays the default and
+  remains simpler for a single session.
+
 ## [10.1.0] - 2026-08-08
 
 ### Dreaming and recap: memory that forgets on evidence and hands back one paragraph

@@ -162,6 +162,44 @@ csr-engine setup
 </details>
 
 <details>
+<summary><strong>One shared server for many sessions</strong>: MCP over Streamable HTTP</summary>
+
+Registered the default way, every Claude Code session spawns its own `csr-engine` stdio process, and every one of those loads the whole index before the first prompt. That is fine for two or three sessions. At a dozen the same index is paid for a dozen times, in resident memory and in startup latency.
+
+`--serve-http` serves the same 15 tools over MCP Streamable HTTP from a single process, so one loaded index answers every session:
+
+```bash
+csr-engine --serve-http 127.0.0.1:7391
+
+# or let the enrichment daemon host it, sharing the index it already holds
+csr-engine daemon --serve-http 127.0.0.1:7391
+```
+
+Then register the endpoint in place of the stdio entry:
+
+```bash
+claude mcp remove claude-self-reflect
+claude mcp add --transport http claude-self-reflect http://127.0.0.1:7391/mcp -s user
+```
+
+Which writes the `http` server entry that replaces the stdio one:
+
+```json
+{
+  "mcpServers": {
+    "claude-self-reflect": {
+      "type": "http",
+      "url": "http://127.0.0.1:7391/mcp"
+    }
+  }
+}
+```
+
+Prefer HTTP when several sessions run at once. Keep stdio for a single session: nothing has to be started in advance, and one process is simpler. The server has to be running before Claude Code connects, and the endpoint is unauthenticated, so it binds loopback addresses only. Set `CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK=1` to override that, and put your own authentication in front of it if you do. The 6 hooks are unaffected: they run as their own short-lived processes on either transport.
+
+</details>
+
+<details>
 <summary><strong>What You'll Ask</strong> — after install, just ask Claude naturally</summary>
 
 - *"How did we solve re-renders on this component?"*
@@ -256,11 +294,13 @@ csr-engine daemon
 <summary><strong>CLI Reference</strong></summary>
 
 ```
-csr-engine                     Start MCP server (default)
+csr-engine                     Start MCP server (default, stdio)
+csr-engine --serve-http ADDR   Serve MCP over Streamable HTTP, e.g. 127.0.0.1:7391
 csr-engine setup               One-shot setup: import + MCP + hooks
 csr-engine status              System status (JSON)
 csr-engine status --compact    One-line statusline output
 csr-engine daemon              Background enrichment daemon
+csr-engine daemon --serve-http ADDR  Daemon that also hosts the MCP endpoint
 csr-engine hook install --apply Install Claude Code hooks
 csr-engine eval                Quick eval (5 tests)
 csr-engine eval --full         Full eval (20 tests)
@@ -291,6 +331,7 @@ Your conversation data (`~/.claude/projects/`) is untouched. The new engine re-i
 | No search results | Run `csr-engine setup` |
 | MCP tools not available | Run `csr-engine setup`, restart Claude Code |
 | "spawn ENOENT" in MCP | Ensure `csr-engine` is in PATH |
+| HTTP endpoint refuses the connection | Nothing starts it for you: run `csr-engine --serve-http <addr>` before Claude Code connects |
 | Slow first startup | Normal (~14s for index rebuild, subsequent: ~150ms) |
 
 Full guide: [Documentation](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)

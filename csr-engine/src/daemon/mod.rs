@@ -13,6 +13,7 @@ pub mod consolidation;
 pub mod dream_cadence;
 pub mod ratification;
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -57,6 +58,9 @@ pub struct Daemon {
     index_dir: PathBuf,
     config: DaemonConfig,
     api_client: Option<AnthropicClient>,
+    /// When set, the daemon also hosts the MCP endpoint over Streamable HTTP
+    /// on this address, sharing the state it has already loaded.
+    mcp_http_addr: Option<SocketAddr>,
 }
 
 impl Daemon {
@@ -82,7 +86,20 @@ impl Daemon {
             index_dir,
             config,
             api_client,
+            mcp_http_addr: None,
         }
+    }
+
+    /// Also host the MCP endpoint over Streamable HTTP on `addr`.
+    ///
+    /// The daemon already holds the storage handle, the embedding engine and
+    /// the loaded search index, and the MCP handler is built from those same
+    /// `Arc`s, so the endpoint costs no second index load, and every session
+    /// that registers `http://<addr>/mcp` reads the index the enrichment
+    /// loops are already maintaining.
+    pub fn with_mcp_http(mut self, addr: SocketAddr) -> Self {
+        self.mcp_http_addr = Some(addr);
+        self
     }
 
     /// Acquire a lockfile to prevent multiple daemon instances.
@@ -427,6 +444,30 @@ impl Daemon {
         };
         tracing::info!("release-ancestry refresh loop started (TAD v2)");
 
+        // Optional MCP endpoint over Streamable HTTP, built from the state
+        // this daemon has already loaded. No second index in memory.
+        let mcp_http_handle = match self.mcp_http_addr {
+            Some(addr) => {
+                let server = crate::mcp::CsrServer::new(
+                    self.storage.clone(),
+                    self.embeddings.clone(),
+                    self.search.clone(),
+                    self.projects_dir.clone(),
+                    self.index_dir.clone(),
+                );
+                let listener = crate::mcp::http::bind(addr).await?;
+                let bound = listener.local_addr()?;
+                eprintln!("{}", crate::mcp::http::ready_line(bound));
+                tracing::info!(%bound, "MCP Streamable HTTP endpoint started in daemon");
+                Some(tokio::spawn(async move {
+                    if let Err(e) = crate::mcp::http::serve(server, listener).await {
+                        tracing::error!(error = %e, "MCP Streamable HTTP endpoint stopped");
+                    }
+                }))
+            }
+            None => None,
+        };
+
         // Wait for Ctrl+C
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down daemon gracefully");
@@ -466,6 +507,11 @@ impl Daemon {
         // if publication already began, await that bounded cycle fully.
         let _ = ancestry_handle.await;
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
+        if let Some(handle) = mcp_http_handle {
+            // The HTTP server parks on accept() and never observes the
+            // shutdown flag; stop taking requests before the index is flushed.
+            handle.abort();
+        }
 
         // Flush HNSW index to disk before exit
         let mut idx = self.search.write().await;
