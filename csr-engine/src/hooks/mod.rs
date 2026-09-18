@@ -496,6 +496,51 @@ pub fn is_import_only_hook(hook_name: &str) -> bool {
     matches!(hook_name, "precompact" | "session-end")
 }
 
+/// Whether a hook is allowed to persist HNSW changes to the on-disk cache
+/// after it runs. Persistence used to be an unconditional side effect of
+/// `dispatch_hook` — every hook dumped whatever its engine happened to be
+/// holding dirty, including the additive backfill `Engine::new` performs on
+/// EVERY start whenever the cache trails SQLite (see the backfill block
+/// there). That made a purely read-only hook pay to rewrite the entire HNSW
+/// graph (measured up to ~25s on a ~1GB index — see hook-timing.log)
+/// whenever it happened to run against a stale-but-additive cache.
+///
+/// `prompt-submit` and `post-tool-use` are on Claude Code's hook budget
+/// (30s) and, for `prompt-submit`, its stdout IS the context-injection
+/// channel — a hook killed at the budget silently loses its injection. They
+/// must never persist. `session-start` and `session-briefing` are equally
+/// injection-critical (recap / briefing content) and are excluded for the
+/// same reason, even though they query the index and could plausibly argue
+/// for writing back a backfill.
+///
+/// `stop` is the one hook that may persist: it runs after the response is
+/// already delivered (not on the injection path), it runs on a full engine
+/// (never import-only — see `is_import_only_hook`), and it is the hook most
+/// likely to have just inserted a reflection the user wants to find next
+/// session.
+///
+/// `precompact` and `session-end` are excluded by construction, not by this
+/// predicate: they run on `Engine::new_import_only`, whose
+/// `skip_index_persistence` flag already makes `flush_index` a no-op
+/// regardless of what this function returns — see that field's doc comment.
+///
+/// This is a role gate layered ON TOP of `flush_index`'s existing dirty
+/// check and `skip_index_persistence` guard: it answers "should this hook
+/// even attempt a flush", not "does it have anything to write". It is the
+/// SOLE allowlist — there is no staleness escape hatch for the excluded
+/// hooks (one existed briefly during review and was removed: with `stop`
+/// persisting unconditionally whenever dirty and the four injection-critical
+/// hooks excluded outright, a bounded exception could only ever have fired
+/// for `stop`, where it added nothing `stop` doesn't already do — dead
+/// code that only widened the allowlist for future unknown hook names,
+/// which is backwards for a safety valve). Persistence on this line is:
+/// `stop` (this predicate), the daemon's watcher batches and shutdown
+/// flush, the MCP server's `store_reflection`/`flush_index`, and the
+/// CLI import/enrichment paths — nothing else.
+pub fn hook_may_persist_index(hook_name: &str) -> bool {
+    matches!(hook_name, "stop")
+}
+
 pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     // Recursive-hook guard. The session-briefing hook spawns a nested `claude -p`
     // with CSR_DISABLE_RECURSIVE_HOOKS=1 in its env. That nested session inherits
@@ -543,10 +588,16 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     };
     let t_hook = t0.elapsed();
 
-    // Flush HNSW index if any hook modified it
+    // Persist HNSW changes only if this hook's role allows it — see
+    // `hook_may_persist_index`, the sole allowlist. Injection-critical hooks
+    // (prompt-submit, post-tool-use, session-start, session-briefing) skip
+    // this entirely, so their `flush=` timing below is ~0ms even when
+    // `Engine::new`'s additive backfill left the in-memory index dirty.
     // Nothing after the handler should reach stdout; see suppress_stdout.
     suppress_stdout();
-    engine.flush_index().await;
+    if hook_may_persist_index(hook_name) {
+        engine.flush_index().await;
+    }
     let t_total = t0.elapsed();
 
     // Resolve project name for logging
@@ -787,6 +838,39 @@ mod tests {
                 "{full} must not be treated as import-only"
             );
         }
+    }
+
+    #[test]
+    fn only_stop_may_persist_the_index() {
+        // Positive: the one hook the design assigns as the persister.
+        assert!(
+            hook_may_persist_index("stop"),
+            "stop must be allowed to persist — it's the designated hook persister"
+        );
+        // Negative cases: a future regression that adds any of these to the
+        // persist set would silently reintroduce full-size dumps on the
+        // Claude Code injection path (prompt-submit's stdout IS the
+        // injection channel) or on the hook-latency budget generally.
+        for readonly in [
+            "prompt-submit",
+            "post-tool-use",
+            "session-start",
+            "session-briefing",
+        ] {
+            assert!(
+                !hook_may_persist_index(readonly),
+                "{readonly} must never persist the HNSW index — it is injection-critical \
+                 or explicitly out of scope for this optimization"
+            );
+        }
+        // precompact/session-end are excluded by construction (import-only
+        // engine, skip_index_persistence) rather than by this predicate, but
+        // the predicate should still say no if asked.
+        for import_only in ["precompact", "session-end"] {
+            assert!(!hook_may_persist_index(import_only));
+        }
+        // Unknown hook names must not accidentally persist either.
+        assert!(!hook_may_persist_index("some-future-hook"));
     }
 
     #[test]
