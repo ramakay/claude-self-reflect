@@ -1110,6 +1110,23 @@ pub fn get_parse_cursor(conn: &Connection, path: &Path) -> Result<Option<String>
     .map_err(Into::into)
 }
 
+/// Whether the last import indexed the transcript's trailing chunk.
+///
+/// NULL means the row predates deferral, and every such row was written by a
+/// pass that indexed everything, so it reads as sealed. A missing row is also
+/// sealed: nothing has been imported, so nothing is owed.
+pub(crate) fn is_trailing_chunk_sealed(conn: &Connection, path: &Path) -> Result<bool> {
+    let path_str = path.to_string_lossy().to_string();
+    let stored: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT trailing_sealed FROM import_state WHERE file_path = ?1",
+            params![path_str],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?;
+    Ok(stored.flatten().map(|v| v != 0).unwrap_or(true))
+}
+
 /// Get file modification time as a string for comparison.
 fn file_mtime_str(path: &Path) -> String {
     path.metadata()
@@ -1157,17 +1174,24 @@ pub(crate) fn mark_file_imported_with_suppression(
     chunks: usize,
     suppression: CsrSuppressionStats,
 ) -> Result<()> {
-    mark_file_imported_with_cursor(conn, path, chunks, suppression, None)
+    // No chunks were produced, so there is no trailing chunk to owe a vector to.
+    mark_file_imported_with_cursor(conn, path, chunks, suppression, None, true)
 }
 
 /// Record an import together with the byte cursor to resume from next time.
 /// `cursor` of `None` writes SQL NULL, which forces a full parse.
+///
+/// `trailing_sealed` is false when this pass deliberately kept the transcript's
+/// last chunk out of the vector index because it is still growing. A later
+/// sealing pass has to know that debt exists: the mtime gate would otherwise
+/// short-circuit it and the chunk would never be indexed at all.
 pub(crate) fn mark_file_imported_with_cursor(
     conn: &mut Connection,
     path: &Path,
     chunks: usize,
     suppression: CsrSuppressionStats,
     cursor: Option<&str>,
+    trailing_sealed: bool,
 ) -> Result<()> {
     let tx = conn.transaction()?;
     let path_str = path.to_string_lossy().to_string();
@@ -1203,8 +1227,9 @@ pub(crate) fn mark_file_imported_with_cursor(
     tx.execute(
         "INSERT INTO import_state
          (file_path, conversation_id, chunks_imported, file_mtime,
-          csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed, parse_cursor)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+          csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed, parse_cursor,
+          trailing_sealed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(file_path) DO UPDATE SET
              conversation_id = excluded.conversation_id,
              chunks_imported = excluded.chunks_imported,
@@ -1212,6 +1237,7 @@ pub(crate) fn mark_file_imported_with_cursor(
              csr_tool_blocks_suppressed = excluded.csr_tool_blocks_suppressed,
              csr_hook_wrappers_scrubbed = excluded.csr_hook_wrappers_scrubbed,
              parse_cursor = excluded.parse_cursor,
+             trailing_sealed = excluded.trailing_sealed,
              -- INSERT OR REPLACE reset this via the column DEFAULT. An upsert
              -- leaves it alone, which would silently turn a last-import
              -- timestamp into a first-import one.
@@ -1223,7 +1249,8 @@ pub(crate) fn mark_file_imported_with_cursor(
             mtime,
             persisted_tool,
             persisted_wrappers,
-            cursor
+            cursor,
+            i64::from(trailing_sealed)
         ],
     )?;
 

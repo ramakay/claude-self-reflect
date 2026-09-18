@@ -100,8 +100,19 @@ pub(crate) async fn import_file_incremental(
     attribution: &ConversationAttribution,
     seal: SealPolicy,
 ) -> Result<ImportOutcome> {
+    // A pass that can seal owes the trailing chunk its vector whenever the last
+    // pass deferred it. Checking this before the mtime gate is the whole point:
+    // the watcher imports a live transcript with `DeferTrailing` and records the
+    // mtime, so once the session stops writing, every later `SealAll` matched the
+    // mtime and returned `unchanged` without ever looking at the seal policy. The
+    // conversation's last chunk, usually its conclusion, then stayed out of the
+    // running index for the life of the process.
+    let owes_seal = seal == SealPolicy::SealAll
+        && ctx.index_state == IndexState::Live
+        && !ctx.storage.is_trailing_chunk_sealed(file_path)?;
+
     // Cheap gate: nothing on disk changed since the last pass.
-    if ctx.storage.is_file_imported(file_path)? {
+    if ctx.storage.is_file_imported(file_path)? && !owes_seal {
         return Ok(ImportOutcome {
             unchanged: true,
             ..Default::default()
@@ -318,11 +329,17 @@ pub(crate) async fn import_file_incremental(
     let cursor_json = next_cursor
         .as_ref()
         .and_then(|c| serde_json::to_string(c).ok());
+    // The trailing chunk is settled only if this pass could actually put its
+    // vector somewhere that outlives the pass. `DeferTrailing` held it back on
+    // purpose; a detached index throws away everything inserted into it. Either
+    // way the debt is recorded so the next sealing pass bypasses the mtime gate.
+    let trailing_sealed = seal == SealPolicy::SealAll && ctx.index_state == IndexState::Live;
     ctx.storage.mark_file_imported_with_cursor(
         file_path,
         n,
         suppression,
         cursor_json.as_deref(),
+        trailing_sealed,
     )?;
 
     Ok(ImportOutcome {
@@ -722,6 +739,74 @@ mod tests {
         });
     }
 
+    /// The watcher imports a live transcript with `DeferTrailing` and records the
+    /// mtime. When the session stops writing, a `SealAll` pass has to promote the
+    /// held-back chunk -- but the mtime gate returned `unchanged` before the seal
+    /// policy was ever read, so the conversation's last chunk, usually its
+    /// conclusion, never reached the running index.
+    #[test]
+    fn seal_all_promotes_a_deferred_trailing_chunk() {
+        rt().block_on(async {
+            let h = Harness::new("promote");
+            h.write(&msgs(5));
+            let watched = h.import(SealPolicy::DeferTrailing).await;
+            assert_eq!(watched.total_chunks, 3);
+
+            let trailing = h.chunk_id(2);
+            assert!(
+                !h.search.read().await.has_chunk(&trailing),
+                "the live watcher must hold the growing chunk back"
+            );
+
+            // The session ended. Same bytes, same mtime, sealing pass.
+            let sealed = h.import(SealPolicy::SealAll).await;
+            assert!(
+                !sealed.unchanged,
+                "the mtime gate must not short-circuit a pass that owes a vector"
+            );
+            assert!(
+                h.search.read().await.has_chunk(&trailing),
+                "the deferred chunk must be indexed once the transcript settles"
+            );
+            assert_eq!(
+                sealed.written_chunks, 0,
+                "promotion indexes the chunk, it does not rewrite or restamp it"
+            );
+
+            // And the debt clears: a second sealing pass short-circuits again.
+            let again = h.import(SealPolicy::SealAll).await;
+            assert!(
+                again.unchanged,
+                "a settled transcript must go back to the cheap mtime gate"
+            );
+        });
+    }
+
+    /// A detached index cannot hold the promotion, so the debt has to survive the
+    /// hook rather than being marked paid by a pass that indexed nothing.
+    #[test]
+    fn detached_seal_pass_leaves_the_debt_for_a_live_one() {
+        rt().block_on(async {
+            let h = Harness::new("promote-detached");
+            h.write(&msgs(5));
+            h.import(SealPolicy::DeferTrailing).await;
+            let trailing = h.chunk_id(2);
+
+            h.detach_index().await;
+            h.import(SealPolicy::SealAll).await;
+            assert!(
+                !h.storage.is_trailing_chunk_sealed(&h.path).unwrap(),
+                "a pass with nowhere to put the vector must not claim it is sealed"
+            );
+
+            // A later process with a loaded index settles it.
+            h.index_state.set(IndexState::Live);
+            let sealed = h.import(SealPolicy::SealAll).await;
+            assert!(!sealed.unchanged);
+            assert!(h.search.read().await.has_chunk(&trailing));
+        });
+    }
+
     /// `precompact` and `session-end` run on an engine that never loads the HNSW
     /// cache (#304), so `has_chunk` answers false for every id and whatever is
     /// inserted dies with the process. Planning off that would re-embed the whole
@@ -1023,6 +1108,13 @@ mod tests {
                 .unwrap(),
             12,
             "the existing row must survive the ALTER"
+        );
+        assert!(
+            storage
+                .is_trailing_chunk_sealed(Path::new("/legacy.jsonl"))
+                .expect("the seal column must exist after migration"),
+            "a row written before deferral existed did index its trailing chunk, \
+             so NULL must read as sealed rather than forcing a reseal of the corpus"
         );
     }
 }

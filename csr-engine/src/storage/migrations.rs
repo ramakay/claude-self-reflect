@@ -45,7 +45,8 @@ pub fn run(conn: &Connection) -> Result<()> {
             file_mtime TEXT,
             csr_tool_blocks_suppressed INTEGER NOT NULL DEFAULT 0,
             csr_hook_wrappers_scrubbed INTEGER NOT NULL DEFAULT 0,
-            parse_cursor TEXT
+            parse_cursor TEXT,
+            trailing_sealed INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_import_conversation_id
@@ -491,6 +492,19 @@ pub fn run(conn: &Connection) -> Result<()> {
         .is_ok();
     if !has_parse_cursor_col {
         conn.execute_batch("ALTER TABLE import_state ADD COLUMN parse_cursor TEXT;")?;
+    }
+
+    // Whether the last import put the trailing chunk's vector into a live index.
+    // A live session's trailing chunk is held back until it stops growing, and the
+    // mtime gate would otherwise let a later sealing pass return `unchanged`
+    // without ever promoting it. Nullable with no default, so the ALTER is
+    // metadata-only; NULL reads as sealed, which is what every row written before
+    // deferral existed actually was.
+    let has_trailing_sealed_col = conn
+        .prepare("SELECT trailing_sealed FROM import_state LIMIT 0")
+        .is_ok();
+    if !has_trailing_sealed_col {
+        conn.execute_batch("ALTER TABLE import_state ADD COLUMN trailing_sealed INTEGER;")?;
     }
 
     // Migration: add summary column to chunks table if missing (for timeline display)

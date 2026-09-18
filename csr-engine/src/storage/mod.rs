@@ -739,9 +739,24 @@ impl Storage {
         chunks: usize,
         suppression: crate::import::CsrSuppressionStats,
         cursor: Option<&str>,
+        trailing_sealed: bool,
     ) -> Result<()> {
         let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::mark_file_imported_with_cursor(&mut conn, path, chunks, suppression, cursor)
+        queries::mark_file_imported_with_cursor(
+            &mut conn,
+            path,
+            chunks,
+            suppression,
+            cursor,
+            trailing_sealed,
+        )
+    }
+
+    /// Whether the last import indexed this transcript's trailing chunk.
+    /// See `queries::is_trailing_chunk_sealed`.
+    pub(crate) fn is_trailing_chunk_sealed(&self, path: &Path) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::is_trailing_chunk_sealed(&conn, path)
     }
 
     /// Byte cursor to resume parsing this transcript from, if one is stored.
