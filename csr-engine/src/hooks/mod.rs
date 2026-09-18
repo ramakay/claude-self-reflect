@@ -329,15 +329,7 @@ impl StdoutQuarantine {
 
     #[cfg(unix)]
     fn begin_on(target: libc::c_int, sink: libc::c_int) -> Self {
-        // SAFETY: fcntl/dup2 on this process's own descriptors. CLOEXEC keeps the
-        // saved copy out of any child spawned while the guard is held. If the
-        // save fails nothing is redirected: a leak beats a lost injection.
-        let saved = unsafe { libc::fcntl(target, libc::F_DUPFD_CLOEXEC, 3) };
-        if saved >= 0 {
-            unsafe {
-                libc::dup2(sink, target);
-            }
-        }
+        let saved = divert_fd(target, sink);
         Self { target, saved }
     }
 }
@@ -356,6 +348,114 @@ impl Drop for StdoutQuarantine {
                 libc::close(self.saved);
             }
         }
+    }
+}
+
+/// Save `target` and point it at `sink`, returning the saved descriptor.
+/// Shared by [`StdoutQuarantine`] and [`ClaimedStdout`] so the fcntl/dup2 pair
+/// exists in exactly one place.
+///
+/// All-or-nothing: a non-negative return means both steps landed, `target`
+/// now points at `sink`, and the caller owns the returned descriptor (it must
+/// eventually be restored or closed). A negative return means `target` was
+/// left exactly as it was and there is nothing to close. Reporting success
+/// after only the `fcntl` half worked would leave `target` on the *original*
+/// stream while callers believe it is diverted — for [`ClaimedStdout`] that
+/// means JSON-RPC frames written through the saved descriptor and library
+/// `println!`s would both land on the same real fd 1, corrupting the
+/// protocol stream, which is the exact failure this diversion exists to
+/// prevent. A half-applied diversion is worse than none, so on a failed
+/// `dup2` the saved copy is closed and the caller is told nothing happened.
+#[cfg(unix)]
+fn divert_fd(target: libc::c_int, sink: libc::c_int) -> libc::c_int {
+    // SAFETY: fcntl/dup2 on this process's own descriptors. CLOEXEC keeps the
+    // saved copy out of any child spawned while the guard is held.
+    let saved = unsafe { libc::fcntl(target, libc::F_DUPFD_CLOEXEC, 3) };
+    if saved < 0 {
+        return saved;
+    }
+    if unsafe { libc::dup2(sink, target) } < 0 {
+        // `target` is unchanged; the saved copy is now useless, close it
+        // rather than leak it.
+        unsafe { libc::close(saved) };
+        return -1;
+    }
+    saved
+}
+
+/// Claims real fd 1 for the JSON-RPC transport, for the lifetime of the MCP
+/// server process, and sends everything else that would have landed on stdout
+/// to stderr instead.
+///
+/// Unlike [`StdoutQuarantine`], which is scoped to a single hook invocation,
+/// this has to hold for as long as the process serves MCP: the server is
+/// long-lived, `Engine::new` rebuilds or backfills the HNSW index at startup
+/// (the same `hnsw_rs` `println!` covered by `StdoutQuarantine`'s doc comment),
+/// and `spawn_enrichment_loops` plus `--watch` importers keep inserting into
+/// that index *while the server is running*, so the 50,000-point boundary can
+/// fire mid-session, long after any scoped guard would have been dropped.
+/// stdout is the MCP JSON-RPC channel, so any of those prints reaching it
+/// corrupts the protocol stream. Claim it once, before `Engine::new` runs, and
+/// hold it for the rest of the process; there is deliberately no restore.
+///
+/// Everything that used to reach stdout now reaches stderr instead, which
+/// Claude Code captures into its own MCP server logs — the noise moves to
+/// where it belongs rather than disappearing. The saved descriptor is
+/// `CLOEXEC`, so children spawned after the claim (narrator `claude -p`
+/// subprocesses, `--watch` helpers) never inherit the real JSON-RPC channel.
+pub struct ClaimedStdout {
+    #[cfg(unix)]
+    saved: libc::c_int,
+}
+
+impl ClaimedStdout {
+    /// Flushes Rust's stdout buffer, then diverts fd 1 to fd 2 and hands back a
+    /// handle to the saved original. Returns `None` (nothing redirected, the
+    /// caller falls back to the existing `rmcp::transport::io::stdio()` path)
+    /// when `divert_fd` fails to fully apply the diversion, or unconditionally
+    /// on non-unix, where Rust's stdout does not go through a CRT fd `dup2`
+    /// can redirect.
+    pub fn claim() -> Option<Self> {
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        #[cfg(unix)]
+        {
+            Self::claim_on(libc::STDOUT_FILENO, libc::STDERR_FILENO)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    fn claim_on(target: libc::c_int, sink: libc::c_int) -> Option<Self> {
+        let saved = divert_fd(target, sink);
+        if saved < 0 {
+            return None;
+        }
+        Some(Self { saved })
+    }
+
+    /// The saved raw descriptor, for tests that claim on pipes instead of the
+    /// real fd 1.
+    #[cfg(all(unix, test))]
+    fn saved_fd(&self) -> libc::c_int {
+        self.saved
+    }
+
+    /// Hands ownership of the saved descriptor to a `tokio::fs::File` so it can
+    /// back the MCP transport's write half. Consumes `self` on purpose: the
+    /// claim is meant to last for the process lifetime, so there is no `Drop`
+    /// impl to race with this handoff, and the descriptor must not be closed
+    /// out from under the file that now owns it.
+    #[cfg(unix)]
+    pub fn into_async_writer(self) -> tokio::fs::File {
+        use std::os::unix::io::FromRawFd;
+        // SAFETY: `saved` came from `F_DUPFD_CLOEXEC` in `divert_fd` and is
+        // owned solely by this `ClaimedStdout` (no `Drop` impl closes it), so
+        // handing it to `std::fs::File` does not create a double-close or use
+        // of a descriptor still held elsewhere.
+        tokio::fs::File::from_std(unsafe { std::fs::File::from_raw_fd(self.saved) })
     }
 }
 
@@ -512,6 +612,155 @@ mod tests {
             unsafe { libc::close(fd) };
         }
     }
+
+    /// The MCP claim must behave like the hook quarantine's diversion half:
+    /// once claimed, library writes to the target land on the sink, and the
+    /// caller can still reach the original stream through the saved
+    /// descriptor. Run on pipes so the test process's real fd 1 is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn claimed_stdout_diverts_target_to_sink() {
+        fn pipe() -> (libc::c_int, libc::c_int) {
+            let mut fds = [0 as libc::c_int; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            (fds[0], fds[1])
+        }
+        fn write_fd(fd: libc::c_int, bytes: &[u8]) {
+            let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            assert_eq!(n, bytes.len() as isize);
+        }
+        fn read_fd(fd: libc::c_int) -> String {
+            let mut buf = [0u8; 64];
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            assert!(n > 0, "nothing arrived on fd {fd}");
+            String::from_utf8_lossy(&buf[..n as usize]).into_owned()
+        }
+
+        let (out_r, out_w) = pipe();
+        let (sink_r, sink_w) = pipe();
+
+        let claimed = ClaimedStdout::claim_on(out_w, sink_w).expect("claim_on should succeed");
+
+        // Library code still writing to the (now-diverted) target lands on the sink.
+        write_fd(out_w, b"library noise");
+        assert_eq!(read_fd(sink_r), "library noise");
+
+        // The saved descriptor still reaches the original reader.
+        let saved = claimed.saved_fd();
+        write_fd(saved, b"jsonrpc");
+        assert_eq!(read_fd(out_r), "jsonrpc");
+
+        unsafe { libc::close(saved) };
+        for fd in [out_r, out_w, sink_r, sink_w] {
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// A failed `dup2` half of `divert_fd` must not be reported as a
+    /// successful claim: `sink_w` is closed up front, which is a bad fd for
+    /// `dup2`, so the `fcntl` save succeeds but the `dup2` fails with
+    /// `EBADF`. `claim_on` must refuse the claim rather than hand back a
+    /// `ClaimedStdout` whose saved descriptor still points at the *original*
+    /// stream while `target` was never actually repointed — and `target`
+    /// itself must be provably untouched: still readable by its original
+    /// reader, not silently left on a stream nobody can read.
+    #[cfg(unix)]
+    #[test]
+    fn claimed_stdout_refuses_a_partial_diversion() {
+        fn pipe() -> (libc::c_int, libc::c_int) {
+            let mut fds = [0 as libc::c_int; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            (fds[0], fds[1])
+        }
+        fn write_fd(fd: libc::c_int, bytes: &[u8]) {
+            let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            assert_eq!(n, bytes.len() as isize);
+        }
+        fn read_fd(fd: libc::c_int) -> String {
+            let mut buf = [0u8; 64];
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            assert!(n > 0, "nothing arrived on fd {fd}");
+            String::from_utf8_lossy(&buf[..n as usize]).into_owned()
+        }
+
+        let (out_r, out_w) = pipe();
+        let (sink_r, sink_w) = pipe();
+        unsafe {
+            libc::close(sink_r);
+            libc::close(sink_w);
+        }
+
+        let claimed = ClaimedStdout::claim_on(out_w, sink_w);
+        assert!(
+            claimed.is_none(),
+            "a partial diversion (fcntl ok, dup2 EBADF) must not be reported as a successful claim"
+        );
+
+        // `target` must be exactly as it was: still reachable by its original
+        // reader, not silently repointed at a stream nobody can read.
+        write_fd(out_w, b"jsonrpc");
+        assert_eq!(read_fd(out_r), "jsonrpc");
+
+        for fd in [out_r, out_w] {
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// `divert_fd`'s failure path (`fcntl` succeeds, `dup2` fails) must
+    /// close the descriptor it saved rather than leak it. `ClaimedStdout`
+    /// deliberately never hands that descriptor back to a caller on failure
+    /// (there is nothing legitimate to do with a half-diverted one), so a
+    /// single `libc::fcntl(saved, F_GETFD)` check on a known fd number is not
+    /// available from outside `divert_fd` — that opacity is the point of the
+    /// fix. Prove non-leak the way an external observer can instead: drive
+    /// many failed diversions through the same private helper the callers
+    /// use, then confirm the process's open-fd high-water mark has not
+    /// crept up by one per failure. A leaking `divert_fd` would push the
+    /// next free descriptor up by roughly `ATTEMPTS`; a closing one leaves
+    /// it essentially where it started.
+    #[cfg(unix)]
+    #[test]
+    fn divert_fd_closes_the_saved_copy_on_a_failed_dup2() {
+        fn pipe() -> (libc::c_int, libc::c_int) {
+            let mut fds = [0 as libc::c_int; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            (fds[0], fds[1])
+        }
+
+        let (out_r, out_w) = pipe();
+        let (sink_r, sink_w) = pipe();
+        unsafe {
+            libc::close(sink_r);
+            libc::close(sink_w);
+        }
+
+        // Baseline: the fd this process would hand out right now for the
+        // same `F_DUPFD_CLOEXEC` request `divert_fd` makes internally.
+        let baseline = unsafe { libc::fcntl(out_w, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(baseline >= 3);
+        unsafe { libc::close(baseline) };
+
+        const ATTEMPTS: libc::c_int = 50;
+        for _ in 0..ATTEMPTS {
+            assert!(
+                divert_fd(out_w, sink_w) < 0,
+                "sink_w is closed; dup2 must fail so divert_fd must report failure"
+            );
+        }
+
+        let after = unsafe { libc::fcntl(out_w, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(after >= 3);
+        unsafe { libc::close(after) };
+        assert!(
+            after < baseline + ATTEMPTS,
+            "saved descriptors were not closed on failed dup2: baseline={baseline}, after={after}, attempts={ATTEMPTS}"
+        );
+
+        for fd in [out_r, out_w] {
+            unsafe { libc::close(fd) };
+        }
+    }
+
     use std::time::{Duration, Instant};
 
     #[test]
