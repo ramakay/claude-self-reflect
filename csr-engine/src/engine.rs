@@ -91,6 +91,20 @@ impl Engine {
         let search = if let Some(cached) =
             SearchEngine::load_from_disk(&index_dir, chunk_count, reflection_count)
         {
+            // Track the additive-backfill delta and the loaded cache's
+            // on-disk age purely as a staleness diagnostic (logged below) —
+            // how far behind SQLite the on-disk HNSW cache was at load time,
+            // and how long it's been since anything last flushed it. Local
+            // to this branch; nothing downstream of `Engine::new` reads
+            // either value (there is no cache staleness to report on the
+            // rebuild path below — a fresh dump has zero drift and zero age
+            // by construction).
+            let mut backfill_added = 0usize;
+            let cache_age = std::fs::metadata(index_dir.join("manifest.json"))
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok());
+
             let t_total = t0.elapsed();
             let startup_line = format!(
                 "CSR startup: storage={:.0}ms embed={:.0}ms cache_load={:.0}ms total={:.0}ms ({} chunks, cached)",
@@ -133,6 +147,7 @@ impl Engine {
                         if added > 0 {
                             tracing::info!(added, "backfilled missing reflections into HNSW cache");
                         }
+                        backfill_added += added;
                     }
                 }
             }
@@ -153,14 +168,24 @@ impl Engine {
                         if added > 0 {
                             tracing::info!(added, "backfilled missing chunks into HNSW cache");
                         }
+                        backfill_added += added;
                     }
                 }
+            }
+            if backfill_added > 0 {
+                tracing::info!(
+                    backfill_added,
+                    cache_age_secs = cache_age.map(|d| d.as_secs()),
+                    "HNSW cache behind DB at startup — additive backfill applied"
+                );
             }
             search
         } else {
             // Cache miss — rebuild from SQLite vectors, streaming in bounded
             // batches so peak transient memory is O(batch) instead of
             // O(corpus) (no `load_all_chunk_vectors()` + clone-into-index).
+            // The dump below writes a brand-new manifest, so there is no drift
+            // and no stale age to report.
             tracing::info!("building search index from stored vectors");
 
             let (mut search, chunk_total, reflection_total) =
