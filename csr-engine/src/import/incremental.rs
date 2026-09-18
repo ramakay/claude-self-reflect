@@ -426,7 +426,7 @@ mod tests {
     }
 
     struct Harness {
-        _dir: TempDir,
+        dir: TempDir,
         path: PathBuf,
         storage: Arc<Storage>,
         embeddings: Arc<EmbeddingEngine>,
@@ -439,7 +439,7 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join(format!("{name}.jsonl"));
             Self {
-                _dir: dir,
+                dir,
                 path,
                 storage: Arc::new(Storage::open_memory().unwrap()),
                 embeddings: embeddings(),
@@ -522,6 +522,20 @@ mod tests {
                 .clone()
         }
 
+        fn embed(&self, text: &str) -> Vec<f32> {
+            self.embeddings.embed_single(text).unwrap()
+        }
+
+        /// This chunk's cosine score against `query`, or `None` when the index
+        /// does not answer for it at all.
+        fn score_of(index: &SearchEngine, query: &[f32], chunk_id: &str) -> Option<f32> {
+            index
+                .search_chunks(query, 16, -1.0)
+                .into_iter()
+                .find(|r| r.id == chunk_id)
+                .map(|r| r.score)
+        }
+
         /// Every stored chunk of this conversation, by index.
         fn all_stored(&self) -> Vec<String> {
             let mut out = Vec::new();
@@ -539,6 +553,17 @@ mod tests {
         (0..n)
             .map(|i| format!("MSG{i:03}-{}", "x".repeat(390)))
             .collect()
+    }
+
+    /// ~400 chars on one subject, so the message's embedding is dominated by
+    /// that subject and a query for a different one separates them.
+    fn topical(subject: &str) -> String {
+        let mut out = String::new();
+        while out.len() < 390 {
+            out.push_str(subject);
+            out.push_str(". ");
+        }
+        out
     }
 
     fn rt() -> tokio::runtime::Runtime {
@@ -715,27 +740,78 @@ mod tests {
 
     /// Regression for the discarded-vector bug: re-inserting a changed chunk under
     /// its existing id is silently skipped, so the seam must be removed first.
+    ///
+    /// Asserted against the vector, not against `has_chunk`: the id is present
+    /// either way, so an id check passes while the slot still holds the vector of
+    /// the seam's first fragment. The discriminator is a query for a subject that
+    /// only appears in the appended half, scored before and after the append. If
+    /// the stale vector survives, the two scores are identical.
     #[test]
     fn sealed_seam_replaces_stale_vector() {
         rt().block_on(async {
             let h = Harness::new("stale-vector");
-            h.write(&msgs(5));
+            // c0(m0,m1) c1(m2,m3) c2(m4).
+            let before = vec![
+                topical("quarterly revenue forecast spreadsheet"),
+                topical("quarterly revenue forecast spreadsheet"),
+                topical("database migration rollback plan"),
+                topical("database migration rollback plan"),
+                topical("espresso machine descaling procedure"),
+            ];
+            h.write(&before);
             // SealAll indexes the partial c2 straight away -- the situation the
             // hook path creates and DeferTrailing avoids.
             h.import(SealPolicy::SealAll).await;
             let seam = h.chunk_id(2);
             assert!(h.search.read().await.has_chunk(&seam));
 
-            h.write(&msgs(7));
+            let query = h.embed("kayak paddle feathering angle");
+            let stale = Harness::score_of(&*h.search.read().await, &query, &seam)
+                .expect("the seam must be in the index before it grows");
+
+            // c2 grows to (m4,m5), so its content now covers a subject its stored
+            // vector has never seen. m6 becomes c3.
+            let mut after = before.clone();
+            after.push(topical("kayak paddle feathering angle"));
+            after.push(topical("sourdough starter hydration ratio"));
+            h.write(&after);
             let second = h.import(SealPolicy::SealAll).await;
 
             assert!(
                 second.indexed_chunks > 0,
                 "the grown seam must be re-indexed, not skipped"
             );
-            // The index slot must now be backed by the grown content.
-            assert!(h.stored(2).unwrap().contains("MSG005"));
-            assert!(h.search.read().await.has_chunk(&seam));
+            assert!(
+                h.stored(2).unwrap().contains("kayak"),
+                "the appended message must be in the seam chunk's content"
+            );
+
+            let fresh = Harness::score_of(&*h.search.read().await, &query, &seam)
+                .expect("the seam must still be reachable after the rewrite");
+            assert!(
+                fresh > stale + 0.1,
+                "the seam's vector still represents only its first fragment \
+                 (stale {stale}, after the append {fresh})"
+            );
+
+            // The same must hold for the next process, which comes up on the
+            // dumped cache rather than on this in-memory index.
+            let index_dir = h.dir.path().join("index");
+            let db_chunks = h.storage.count_chunk_embeddings().unwrap();
+            h.search
+                .write()
+                .await
+                .dump_to_disk(&index_dir, db_chunks, 0)
+                .expect("dump");
+            let reloaded =
+                SearchEngine::load_from_disk(&index_dir, db_chunks, 0).expect("cache must reload");
+            let after_reload = Harness::score_of(&reloaded, &query, &seam)
+                .expect("the seam must survive a dump and reload");
+            assert!(
+                (after_reload - fresh).abs() < 1e-3,
+                "the reloaded cache must carry the rewritten vector, not the \
+                 stale one (in memory {fresh}, reloaded {after_reload})"
+            );
         });
     }
 
