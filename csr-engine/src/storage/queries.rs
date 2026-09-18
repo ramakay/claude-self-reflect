@@ -261,6 +261,14 @@ pub fn rescope_sidechain_conversation(
 /// change, and the document can shrink — overwriting by deterministic chunk id alone
 /// would leave stale tail chunks (and their embeddings) orphaned in search forever, so
 /// a full wipe-then-rebuild is required for idempotent reimport.
+/// Four statements per chunk across four tables, so a failure partway through
+/// leaves the chunk half-deleted: the FTS row gone while the owning `chunks` row
+/// survives, or an embedding still loading into the vector index for a chunk
+/// with no content. One transaction per call makes the whole set atomic.
+///
+/// `unchecked_transaction` rather than `transaction`: the callers hold a
+/// `&Connection` out of the storage mutex, and neither of these is ever reached
+/// from inside another transaction.
 pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) -> Result<()> {
     let mut stmt = conn.prepare("SELECT id FROM chunks WHERE conversation_id = ?1")?;
     let ids: Vec<String> = stmt
@@ -268,25 +276,52 @@ pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) 
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
 
+    let tx = conn.unchecked_transaction()?;
     for id in &ids {
-        // chunks_fts has no FK on chunks.id (it's rowid-addressed), so its row must be
-        // dropped before the owning chunks row disappears and the rowid lookup goes stale.
-        conn.execute(
-            "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
-            params![id],
-        )?;
-        conn.execute(
-            "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
-            params![id],
-        )?;
-        conn.execute(
-            "DELETE FROM chunk_provenance WHERE chunk_id = ?1",
-            params![id],
-        )?;
+        delete_one_chunks_row_set(&tx, id)?;
     }
-    conn.execute(
+    tx.execute(
         "DELETE FROM chunks WHERE conversation_id = ?1",
         params![conversation_id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Delete specific chunks by id, with the same table ordering as
+/// [`delete_chunks_for_conversation`]. Used when a transcript shrinks with an
+/// intact head: the valid prefix is kept and only the orphan tail is dropped.
+pub fn delete_chunks_by_ids(conn: &Connection, ids: &[String]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    for id in ids {
+        delete_one_chunks_row_set(&tx, id)?;
+        tx.execute("DELETE FROM chunks WHERE id = ?1", params![id])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Every satellite row belonging to one chunk, in the order the schema requires.
+/// The owning `chunks` row is left to the caller, which deletes it either by id
+/// or by conversation.
+fn delete_one_chunks_row_set(conn: &Connection, id: &str) -> Result<()> {
+    // chunks_fts has no FK on chunks.id (it is rowid-addressed), so its row must
+    // be dropped before the owning chunks row disappears and the rowid lookup
+    // goes stale.
+    conn.execute(
+        "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM chunk_provenance WHERE chunk_id = ?1",
+        params![id],
     )?;
     Ok(())
 }
@@ -1073,8 +1108,38 @@ pub fn is_file_imported(conn: &Connection, path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Read the stored resume cursor for a transcript, if any.
+pub fn get_parse_cursor(conn: &Connection, path: &Path) -> Result<Option<String>> {
+    let path_str = path.to_string_lossy().to_string();
+    conn.query_row(
+        "SELECT parse_cursor FROM import_state WHERE file_path = ?1",
+        params![path_str],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(Option::flatten)
+    .map_err(Into::into)
+}
+
+/// Whether the last import indexed the transcript's trailing chunk.
+///
+/// NULL means the row predates deferral, and every such row was written by a
+/// pass that indexed everything, so it reads as sealed. A missing row is also
+/// sealed: nothing has been imported, so nothing is owed.
+pub(crate) fn is_trailing_chunk_sealed(conn: &Connection, path: &Path) -> Result<bool> {
+    let path_str = path.to_string_lossy().to_string();
+    let stored: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT trailing_sealed FROM import_state WHERE file_path = ?1",
+            params![path_str],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?;
+    Ok(stored.flatten().map(|v| v != 0).unwrap_or(true))
+}
+
 /// Get file modification time as a string for comparison.
-fn file_mtime_str(path: &Path) -> String {
+pub(crate) fn file_mtime_str(path: &Path) -> String {
     path.metadata()
         .and_then(|m| m.modified())
         .map(|t| {
@@ -1101,7 +1166,8 @@ pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Resu
          ON CONFLICT(file_path) DO UPDATE SET
              conversation_id = excluded.conversation_id,
              chunks_imported = excluded.chunks_imported,
-             file_mtime = excluded.file_mtime",
+             file_mtime = excluded.file_mtime,
+             parse_cursor = NULL",
         params![path_str, conv_id, chunks as i64, mtime],
     )?;
     Ok(())
@@ -1110,11 +1176,41 @@ pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Resu
 /// Atomically persist import state and apply only newly observed per-file CSR
 /// suppression totals. The import-state row is written before counter deltas;
 /// any failure rolls both back.
+/// Record an import, leaving no resume cursor. Callers that do not understand
+/// cursors must clear rather than preserve one: a stale offset is worse than a
+/// full reparse.
 pub(crate) fn mark_file_imported_with_suppression(
     conn: &mut Connection,
     path: &Path,
     chunks: usize,
     suppression: CsrSuppressionStats,
+) -> Result<()> {
+    // No chunks were produced, so there is no trailing chunk to owe a vector to.
+    mark_file_imported_with_cursor(conn, path, chunks, suppression, None, true, None)
+}
+
+/// Record an import together with the byte cursor to resume from next time.
+/// `cursor` of `None` writes SQL NULL, which forces a full parse.
+///
+/// `trailing_sealed` is false when this pass deliberately kept the transcript's
+/// last chunk out of the vector index because it is still growing. A later
+/// sealing pass has to know that debt exists: the mtime gate would otherwise
+/// short-circuit it and the chunk would never be indexed at all.
+///
+/// `observed_mtime` is the mtime the caller read BEFORE it started parsing.
+/// Reading it here instead describes bytes the parser never saw when the writer
+/// appends between EOF and this call, and the mtime gate then skips them. Pass
+/// the earlier value and a racing append reads as changed, which costs one cheap
+/// cursor resume and loses nothing. `None` falls back to reading it now, which
+/// is correct for a caller that has nothing to race with.
+pub(crate) fn mark_file_imported_with_cursor(
+    conn: &mut Connection,
+    path: &Path,
+    chunks: usize,
+    suppression: CsrSuppressionStats,
+    cursor: Option<&str>,
+    trailing_sealed: bool,
+    observed_mtime: Option<&str>,
 ) -> Result<()> {
     let tx = conn.transaction()?;
     let path_str = path.to_string_lossy().to_string();
@@ -1142,20 +1238,40 @@ pub(crate) fn mark_file_imported_with_suppression(
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_default();
-    let mtime = file_mtime_str(path);
+    let mtime = observed_mtime
+        .map(str::to_string)
+        .unwrap_or_else(|| file_mtime_str(path));
 
+    // Deliberately not INSERT OR REPLACE: that deletes the row and reinserts it,
+    // so every column absent from the VALUES list silently becomes NULL. An
+    // upsert names exactly what it changes and leaves anything added later alone.
     tx.execute(
-        "INSERT OR REPLACE INTO import_state
+        "INSERT INTO import_state
          (file_path, conversation_id, chunks_imported, file_mtime,
-          csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+          csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed, parse_cursor,
+          trailing_sealed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(file_path) DO UPDATE SET
+             conversation_id = excluded.conversation_id,
+             chunks_imported = excluded.chunks_imported,
+             file_mtime = excluded.file_mtime,
+             csr_tool_blocks_suppressed = excluded.csr_tool_blocks_suppressed,
+             csr_hook_wrappers_scrubbed = excluded.csr_hook_wrappers_scrubbed,
+             parse_cursor = excluded.parse_cursor,
+             trailing_sealed = excluded.trailing_sealed,
+             -- INSERT OR REPLACE reset this via the column DEFAULT. An upsert
+             -- leaves it alone, which would silently turn a last-import
+             -- timestamp into a first-import one.
+             imported_at = datetime('now')",
         params![
             path_str,
             conv_id,
             chunks as i64,
             mtime,
             persisted_tool,
-            persisted_wrappers
+            persisted_wrappers,
+            cursor,
+            i64::from(trailing_sealed)
         ],
     )?;
 
@@ -1213,8 +1329,17 @@ pub fn upsert_import_state_explicit(
     chunks: usize,
     mtime: &str,
 ) -> Result<()> {
+    // Upsert, not INSERT OR REPLACE: the latter deletes the row and reinserts it,
+    // zeroing the suppression counters and dropping any parse cursor simply
+    // because this statement does not name them.
     conn.execute(
-        "INSERT OR REPLACE INTO import_state (file_path, conversation_id, chunks_imported, file_mtime) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO import_state (file_path, conversation_id, chunks_imported, file_mtime)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(file_path) DO UPDATE SET
+             conversation_id = excluded.conversation_id,
+             chunks_imported = excluded.chunks_imported,
+             file_mtime = excluded.file_mtime,
+             imported_at = datetime('now')",
         params![file_path, conversation_id, chunks as i64, mtime],
     )?;
     Ok(())
@@ -2575,6 +2700,96 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrations::run(&conn).unwrap();
         conn
+    }
+
+    fn chunk_fixture(id: &str, conversation_id: &str, seq: usize) -> ConversationChunk {
+        ConversationChunk {
+            id: id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-02-22T10:00:00Z".to_string(),
+            content: format!("content of {id}"),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq,
+            is_sidechain: false,
+        }
+    }
+
+    fn fts_row_exists(conn: &Connection, id: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM chunks_fts
+             WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
+            params![id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
+    /// Four statements per chunk across four tables. Without one transaction a
+    /// failure partway leaves the FTS row gone while the owning `chunks` row
+    /// survives, so the chunk stays reachable through the vector path with no
+    /// FTS entry behind it.
+    #[test]
+    fn delete_chunks_by_ids_is_all_or_nothing() {
+        let conn = mem();
+        for (i, id) in ["keep-me", "poison"].iter().enumerate() {
+            insert_chunk(&conn, &chunk_fixture(id, "conv-atomic", i), &[0.5f32; 4]).unwrap();
+        }
+        assert!(fts_row_exists(&conn, "keep-me"));
+
+        // Fail on the second statement of the SECOND id, so the first id is
+        // already fully deleted and the second is already half deleted by the
+        // time the error is raised.
+        conn.execute_batch(
+            "CREATE TRIGGER poison_guard BEFORE DELETE ON chunk_embeddings
+             WHEN OLD.chunk_id = 'poison'
+             BEGIN SELECT RAISE(ABORT, 'poisoned'); END;",
+        )
+        .unwrap();
+
+        let err = delete_chunks_by_ids(&conn, &["keep-me".to_string(), "poison".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("poisoned"), "got: {err}");
+
+        assert!(
+            get_chunk_content(&conn, "keep-me").unwrap().is_some(),
+            "a failed batch must roll back the chunks it had already deleted"
+        );
+        assert!(
+            fts_row_exists(&conn, "keep-me"),
+            "the FTS row must come back with its chunk, or the chunk is \
+             searchable by vector with nothing behind it in FTS"
+        );
+        assert!(
+            get_chunk_content(&conn, "poison").unwrap().is_some(),
+            "the chunk that raised must be untouched too"
+        );
+        assert!(fts_row_exists(&conn, "poison"));
+    }
+
+    /// Same contract for the whole-conversation wipe, which carries the same
+    /// four-statements-per-chunk exposure.
+    #[test]
+    fn delete_chunks_for_conversation_is_all_or_nothing() {
+        let conn = mem();
+        for (i, id) in ["conv-keep", "conv-poison"].iter().enumerate() {
+            insert_chunk(&conn, &chunk_fixture(id, "conv-wipe", i), &[0.5f32; 4]).unwrap();
+        }
+        conn.execute_batch(
+            "CREATE TRIGGER poison_guard BEFORE DELETE ON chunk_embeddings
+             WHEN OLD.chunk_id = 'conv-poison'
+             BEGIN SELECT RAISE(ABORT, 'poisoned'); END;",
+        )
+        .unwrap();
+
+        let err = delete_chunks_for_conversation(&conn, "conv-wipe").unwrap_err();
+        assert!(err.to_string().contains("poisoned"), "got: {err}");
+
+        assert!(get_chunk_content(&conn, "conv-keep").unwrap().is_some());
+        assert!(fts_row_exists(&conn, "conv-keep"));
     }
 
     #[test]
