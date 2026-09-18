@@ -196,6 +196,9 @@ impl FileWatcher {
             storage: &self.storage,
             embeddings: &self.embeddings,
             search: &self.search,
+            // The daemon loads the HNSW cache and dumps it after each batch, so
+            // what it inserts survives and `has_chunk` is meaningful.
+            index_state: import::incremental::IndexState::Live,
         };
         // A watched transcript belongs to a live session, so its trailing chunk is
         // still growing. Its content reaches SQLite and FTS immediately, but it

@@ -293,6 +293,21 @@ impl Engine {
         })
     }
 
+    /// Whether this engine's in-memory index describes the corpus.
+    ///
+    /// The same condition as [`Self::skip_index_persistence`], read from the
+    /// other end: an engine that never loads the cache also never dumps it, so
+    /// its index is empty for the whole process and `has_chunk` answers false
+    /// for every id. The incremental importer plans off `has_chunk`, so it has
+    /// to be told rather than left to draw the wrong conclusion.
+    fn index_state(&self) -> import::incremental::IndexState {
+        if self.skip_index_persistence {
+            import::incremental::IndexState::Detached
+        } else {
+            import::incremental::IndexState::Live
+        }
+    }
+
     /// Import conversations from the Claude projects directory.
     /// Uses batch embedding for ~3.4x speedup over single embeds.
     pub async fn import_conversations(&self, limit: Option<usize>) -> Result<usize> {
@@ -358,6 +373,7 @@ impl Engine {
             storage: &self.storage,
             embeddings: &self.embeddings,
             search: &self.search,
+            index_state: self.index_state(),
         };
         // Driven by the Stop hook and by bulk import, where the transcript is
         // final — so the trailing chunk is sealed and indexed in the same pass.

@@ -38,6 +38,20 @@ pub(crate) struct ImportContext<'a> {
     pub storage: &'a Arc<Storage>,
     pub embeddings: &'a Arc<EmbeddingEngine>,
     pub search: &'a Arc<RwLock<SearchEngine>>,
+    pub index_state: IndexState,
+}
+
+/// Whether the in-memory vector index the caller handed us describes the corpus.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IndexState {
+    /// The HNSW cache was loaded, so `has_chunk` is meaningful and an insert
+    /// lands in the index this process searches and may dump.
+    Live,
+    /// The process skipped loading the cache. `Engine::new_import_only` (the
+    /// `precompact` and `session-end` hooks) starts from an empty index that is
+    /// never dumped, so `has_chunk` answers false for every id and an insert is
+    /// discarded at exit. The plan must not read anything into that.
+    Detached,
 }
 
 /// Whether the trailing (still-growing) chunk may enter the vector index.
@@ -202,6 +216,14 @@ pub(crate) async fn import_file_incremental(
     };
 
     // ── Plan: what actually needs work ───────────────────────────────────────
+    // A detached index is thrown away when the process exits, so a vector put
+    // into it helps nobody, and `has_chunk` answers false for every id. Planning
+    // off that would embed every chunk of the transcript on every `precompact`
+    // and `session-end` hook — the exact cost this module exists to remove.
+    // Content and its embedding still reach SQLite, and the next process that
+    // loads the index picks them up through the additive backfill in
+    // `Engine::new`.
+    let detached = ctx.index_state == IndexState::Detached;
     let mut plans: Vec<ChunkPlan> = Vec::new();
     {
         let idx = ctx.search.read().await;
@@ -211,8 +233,8 @@ pub(crate) async fn import_file_incremental(
                 continue;
             }
             let is_trailing = i + 1 == n;
-            let index_it = !is_trailing || seal == SealPolicy::SealAll;
-            let indexed = idx.has_chunk(&chunk.id);
+            let index_it = !detached && (!is_trailing || seal == SealPolicy::SealAll);
+            let indexed = !detached && idx.has_chunk(&chunk.id);
 
             let content_same = ctx
                 .storage
@@ -392,6 +414,7 @@ mod tests {
         storage: Arc<Storage>,
         embeddings: Arc<EmbeddingEngine>,
         search: Arc<RwLock<SearchEngine>>,
+        index_state: std::cell::Cell<IndexState>,
     }
 
     impl Harness {
@@ -404,6 +427,7 @@ mod tests {
                 storage: Arc::new(Storage::open_memory().unwrap()),
                 embeddings: embeddings(),
                 search: Arc::new(RwLock::new(SearchEngine::new(256))),
+                index_state: std::cell::Cell::new(IndexState::Live),
             }
         }
 
@@ -412,7 +436,15 @@ mod tests {
                 storage: &self.storage,
                 embeddings: &self.embeddings,
                 search: &self.search,
+                index_state: self.index_state.get(),
             }
+        }
+
+        /// Stand in for a write-only hook process: the same database, an index
+        /// that was never loaded and will never be dumped.
+        async fn detach_index(&self) {
+            self.index_state.set(IndexState::Detached);
+            *self.search.write().await = SearchEngine::new(256);
         }
 
         fn conv_id(&self) -> String {
@@ -687,6 +719,66 @@ mod tests {
             // The index slot must now be backed by the grown content.
             assert!(h.stored(2).unwrap().contains("MSG005"));
             assert!(h.search.read().await.has_chunk(&seam));
+        });
+    }
+
+    /// `precompact` and `session-end` run on an engine that never loads the HNSW
+    /// cache (#304), so `has_chunk` answers false for every id and whatever is
+    /// inserted dies with the process. Planning off that would re-embed the whole
+    /// transcript on every one of those hooks.
+    #[test]
+    fn detached_index_does_not_re_embed_a_settled_transcript() {
+        rt().block_on(async {
+            let h = Harness::new("detached");
+            h.write(&msgs(5));
+            let first = h.import(SealPolicy::SealAll).await;
+            assert_eq!(first.total_chunks, 3);
+
+            h.detach_index().await;
+            // Identical content, fresh mtime: the hook re-reads but owes no work.
+            h.write(&msgs(5));
+            let hook_pass = h.import(SealPolicy::SealAll).await;
+
+            assert_eq!(
+                hook_pass.written_chunks, 0,
+                "settled content must not be rewritten"
+            );
+            assert_eq!(
+                hook_pass.indexed_chunks, 0,
+                "a throwaway index must not be fed, and feeding it costs an \
+                 embedding per chunk of the whole transcript"
+            );
+        });
+    }
+
+    /// The other half: a detached index must not turn the hook into a no-op.
+    /// New content still has to reach SQLite, which is where the next process
+    /// that loads the index backfills from.
+    #[test]
+    fn detached_index_still_writes_new_content() {
+        rt().block_on(async {
+            let h = Harness::new("detached-writes");
+            h.write(&msgs(5));
+            h.import(SealPolicy::SealAll).await;
+
+            h.detach_index().await;
+            h.write(&msgs(7));
+            let hook_pass = h.import(SealPolicy::SealAll).await;
+
+            assert!(
+                hook_pass.written_chunks > 0,
+                "appended content must still be stored"
+            );
+            assert_eq!(hook_pass.indexed_chunks, 0);
+            let all = h.all_stored().join("\n");
+            for i in 0..7 {
+                assert!(all.contains(&format!("MSG{i:03}")), "MSG{i:03} missing");
+            }
+            let vectors = h.storage.load_all_chunk_vectors().unwrap();
+            assert!(
+                vectors.iter().any(|(id, _)| id == &h.chunk_id(3)),
+                "the embedding must be in SQLite for the next loader to pick up"
+            );
         });
     }
 
