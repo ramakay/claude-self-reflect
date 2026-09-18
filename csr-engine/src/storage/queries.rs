@@ -261,6 +261,14 @@ pub fn rescope_sidechain_conversation(
 /// change, and the document can shrink — overwriting by deterministic chunk id alone
 /// would leave stale tail chunks (and their embeddings) orphaned in search forever, so
 /// a full wipe-then-rebuild is required for idempotent reimport.
+/// Four statements per chunk across four tables, so a failure partway through
+/// leaves the chunk half-deleted: the FTS row gone while the owning `chunks` row
+/// survives, or an embedding still loading into the vector index for a chunk
+/// with no content. One transaction per call makes the whole set atomic.
+///
+/// `unchecked_transaction` rather than `transaction`: the callers hold a
+/// `&Connection` out of the storage mutex, and neither of these is ever reached
+/// from inside another transaction.
 pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) -> Result<()> {
     let mut stmt = conn.prepare("SELECT id FROM chunks WHERE conversation_id = ?1")?;
     let ids: Vec<String> = stmt
@@ -268,26 +276,15 @@ pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) 
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
 
+    let tx = conn.unchecked_transaction()?;
     for id in &ids {
-        // chunks_fts has no FK on chunks.id (it's rowid-addressed), so its row must be
-        // dropped before the owning chunks row disappears and the rowid lookup goes stale.
-        conn.execute(
-            "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
-            params![id],
-        )?;
-        conn.execute(
-            "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
-            params![id],
-        )?;
-        conn.execute(
-            "DELETE FROM chunk_provenance WHERE chunk_id = ?1",
-            params![id],
-        )?;
+        delete_one_chunks_row_set(&tx, id)?;
     }
-    conn.execute(
+    tx.execute(
         "DELETE FROM chunks WHERE conversation_id = ?1",
         params![conversation_id],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -295,23 +292,37 @@ pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) 
 /// [`delete_chunks_for_conversation`]. Used when a transcript shrinks with an
 /// intact head: the valid prefix is kept and only the orphan tail is dropped.
 pub fn delete_chunks_by_ids(conn: &Connection, ids: &[String]) -> Result<()> {
-    for id in ids {
-        // chunks_fts is rowid-addressed with no FK, so it must go before the
-        // owning chunks row disappears and the rowid lookup goes stale.
-        conn.execute(
-            "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
-            params![id],
-        )?;
-        conn.execute(
-            "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
-            params![id],
-        )?;
-        conn.execute(
-            "DELETE FROM chunk_provenance WHERE chunk_id = ?1",
-            params![id],
-        )?;
-        conn.execute("DELETE FROM chunks WHERE id = ?1", params![id])?;
+    if ids.is_empty() {
+        return Ok(());
     }
+    let tx = conn.unchecked_transaction()?;
+    for id in ids {
+        delete_one_chunks_row_set(&tx, id)?;
+        tx.execute("DELETE FROM chunks WHERE id = ?1", params![id])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Every satellite row belonging to one chunk, in the order the schema requires.
+/// The owning `chunks` row is left to the caller, which deletes it either by id
+/// or by conversation.
+fn delete_one_chunks_row_set(conn: &Connection, id: &str) -> Result<()> {
+    // chunks_fts has no FK on chunks.id (it is rowid-addressed), so its row must
+    // be dropped before the owning chunks row disappears and the rowid lookup
+    // goes stale.
+    conn.execute(
+        "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM chunk_provenance WHERE chunk_id = ?1",
+        params![id],
+    )?;
     Ok(())
 }
 
@@ -2679,6 +2690,96 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrations::run(&conn).unwrap();
         conn
+    }
+
+    fn chunk_fixture(id: &str, conversation_id: &str, seq: usize) -> ConversationChunk {
+        ConversationChunk {
+            id: id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-02-22T10:00:00Z".to_string(),
+            content: format!("content of {id}"),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq,
+            is_sidechain: false,
+        }
+    }
+
+    fn fts_row_exists(conn: &Connection, id: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM chunks_fts
+             WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
+            params![id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
+    /// Four statements per chunk across four tables. Without one transaction a
+    /// failure partway leaves the FTS row gone while the owning `chunks` row
+    /// survives, so the chunk stays reachable through the vector path with no
+    /// FTS entry behind it.
+    #[test]
+    fn delete_chunks_by_ids_is_all_or_nothing() {
+        let conn = mem();
+        for (i, id) in ["keep-me", "poison"].iter().enumerate() {
+            insert_chunk(&conn, &chunk_fixture(id, "conv-atomic", i), &[0.5f32; 4]).unwrap();
+        }
+        assert!(fts_row_exists(&conn, "keep-me"));
+
+        // Fail on the second statement of the SECOND id, so the first id is
+        // already fully deleted and the second is already half deleted by the
+        // time the error is raised.
+        conn.execute_batch(
+            "CREATE TRIGGER poison_guard BEFORE DELETE ON chunk_embeddings
+             WHEN OLD.chunk_id = 'poison'
+             BEGIN SELECT RAISE(ABORT, 'poisoned'); END;",
+        )
+        .unwrap();
+
+        let err = delete_chunks_by_ids(&conn, &["keep-me".to_string(), "poison".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("poisoned"), "got: {err}");
+
+        assert!(
+            get_chunk_content(&conn, "keep-me").unwrap().is_some(),
+            "a failed batch must roll back the chunks it had already deleted"
+        );
+        assert!(
+            fts_row_exists(&conn, "keep-me"),
+            "the FTS row must come back with its chunk, or the chunk is \
+             searchable by vector with nothing behind it in FTS"
+        );
+        assert!(
+            get_chunk_content(&conn, "poison").unwrap().is_some(),
+            "the chunk that raised must be untouched too"
+        );
+        assert!(fts_row_exists(&conn, "poison"));
+    }
+
+    /// Same contract for the whole-conversation wipe, which carries the same
+    /// four-statements-per-chunk exposure.
+    #[test]
+    fn delete_chunks_for_conversation_is_all_or_nothing() {
+        let conn = mem();
+        for (i, id) in ["conv-keep", "conv-poison"].iter().enumerate() {
+            insert_chunk(&conn, &chunk_fixture(id, "conv-wipe", i), &[0.5f32; 4]).unwrap();
+        }
+        conn.execute_batch(
+            "CREATE TRIGGER poison_guard BEFORE DELETE ON chunk_embeddings
+             WHEN OLD.chunk_id = 'conv-poison'
+             BEGIN SELECT RAISE(ABORT, 'poisoned'); END;",
+        )
+        .unwrap();
+
+        let err = delete_chunks_for_conversation(&conn, "conv-wipe").unwrap_err();
+        assert!(err.to_string().contains("poisoned"), "got: {err}");
+
+        assert!(get_chunk_content(&conn, "conv-keep").unwrap().is_some());
+        assert!(fts_row_exists(&conn, "conv-keep"));
     }
 
     #[test]
