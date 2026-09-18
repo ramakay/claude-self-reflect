@@ -1,0 +1,8 @@
+{
+  "name": "csr-decide",
+  "version": "0.0.1",
+  "description": "Spike: typed decisions for Claude Self-Reflect as a Claude Mod. prompt.submit classifies the user's reaction to the last assistant turn (shadow mode, injects nothing); session.compact keeps or drops tool calls through a local System One endpoint instead of summarizing. Needs CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 and a local endpoint speaking Jev's wire format; with the endpoint down every hook fails open.",
+  "author": { "name": "ramakay" },
+  "license": "MIT",
+  "keywords": ["memory", "decisions", "compaction", "function-hooks", "claude-self-reflect"]
+}
