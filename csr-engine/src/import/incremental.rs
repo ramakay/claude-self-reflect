@@ -126,17 +126,33 @@ pub(crate) async fn import_file_incremental(
         .to_string();
 
     // Resume from the stored byte cursor when it still describes this file.
-    let stored_cursor = ctx
+    let mut stored_cursor = ctx
         .storage
         .get_parse_cursor(file_path)?
         .and_then(|json| serde_json::from_str::<ParseCursor>(&json).ok())
         .filter(|c| c.v == PARSE_CURSOR_VERSION && cursor_still_valid(c, file_path));
 
-    let parsed = import::parse_jsonl_file_from_cursor(
+    let mut parsed = import::parse_jsonl_file_from_cursor(
         file_path,
         &attribution.project_name,
         stored_cursor.as_ref(),
     )?;
+
+    // A resume that produced nothing is not evidence the transcript is empty --
+    // the prefix the cursor skipped over is still on disk. Recording zero chunks
+    // and clearing the cursor reported an imported conversation as unimported,
+    // and the next changed-file pass then rebuilt it from scratch and called it a
+    // first import. Re-read from the head instead: only a full parse can tell a
+    // genuinely empty transcript from a resume that landed badly.
+    if parsed.chunks.is_empty() && stored_cursor.is_some() {
+        tracing::debug!(
+            file = %file_path.display(),
+            "cursor resume produced no chunks — retrying with a full parse"
+        );
+        stored_cursor = None;
+        parsed = import::parse_jsonl_file_from_cursor(file_path, &attribution.project_name, None)?;
+    }
+
     let suppression = parsed.suppression;
     let next_cursor = parsed.next_cursor;
     let chunks = parsed.chunks;
@@ -812,6 +828,64 @@ mod tests {
                 "the reloaded cache must carry the rewritten vector, not the \
                  stale one (in memory {fresh}, reloaded {after_reload})"
             );
+        });
+    }
+
+    /// A cursor resume that yields no chunks is not evidence the transcript is
+    /// empty. Recording zero chunks and clearing the cursor reported an imported
+    /// conversation as unimported, so the next pass rebuilt it from scratch,
+    /// called itself a first import, and never noticed the orphan tail.
+    #[test]
+    fn empty_cursor_resume_retries_a_full_parse() {
+        rt().block_on(async {
+            let h = Harness::new("empty-resume");
+            // Thirteen messages put the seam past the 4 KiB the cursor's head
+            // fingerprint covers, so the head below stays byte-identical.
+            h.write(&msgs(13));
+            let first = h.import(SealPolicy::SealAll).await;
+            assert_eq!(first.total_chunks, 7, "fixture must produce 7 chunks");
+            let original_len = std::fs::metadata(&h.path).unwrap().len() as usize;
+
+            // Keep every byte before the seam, then replace the trailing chunk's
+            // region with lines the parser skips outright.
+            let raw = std::fs::read_to_string(&h.path).unwrap();
+            let mut kept: Vec<String> = raw.lines().take(12).map(str::to_string).collect();
+            while kept.join("\n").len() < original_len {
+                kept.push(
+                    serde_json::json!({"type": "summary", "summary": "NO MESSAGE CONTENT"})
+                        .to_string(),
+                );
+            }
+            h.write_bytes(kept.join("\n").as_bytes());
+
+            let second = h.import(SealPolicy::SealAll).await;
+
+            assert_eq!(
+                second.total_chunks, 6,
+                "the retry must see the six chunks the file still holds"
+            );
+            assert!(
+                !second.first_import,
+                "a conversation with stored chunks is never a first import"
+            );
+            assert_ne!(
+                h.storage.get_imported_chunk_count(&h.path).unwrap(),
+                0,
+                "the stored chunk count must not be reset to zero"
+            );
+            assert!(
+                h.storage.get_parse_cursor(&h.path).unwrap().is_some(),
+                "the cursor must be replaced, not cleared"
+            );
+            assert!(
+                h.stored(6).is_none(),
+                "the orphan tail must be dropped, which the empty-result path \
+                 returned too early to do"
+            );
+            let all = h.all_stored().join("\n");
+            for i in 0..12 {
+                assert!(all.contains(&format!("MSG{i:03}")), "MSG{i:03} missing");
+            }
         });
     }
 
