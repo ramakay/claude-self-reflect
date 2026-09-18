@@ -437,10 +437,16 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     };
     let t_hook = t0.elapsed();
 
-    // Flush HNSW index if any hook modified it
     // Nothing after the handler should reach stdout; see suppress_stdout.
     suppress_stdout();
-    engine.flush_index().await;
+    // Hooks never persist the index. `Engine::new` marks it dirty whenever the
+    // on-disk cache trails SQLite (every `stop` writes reflections that no
+    // long-lived process reconciles until it restarts), and one dirty flag
+    // covers both indexes, so flushing here rewrote the whole chunk graph and
+    // data (~1GB on a 150k-chunk corpus) on every prompt. With a few sessions
+    // open that ran past Claude Code's 30s hook budget and the injection was
+    // discarded. A hook only needs its in-memory reconciliation; the daemon's
+    // watcher and the MCP server own persistence.
     let t_total = t0.elapsed();
 
     // Resolve project name for logging
