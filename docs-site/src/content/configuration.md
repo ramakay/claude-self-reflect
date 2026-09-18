@@ -9,6 +9,32 @@ Automatic via `csr-engine setup`. Manual:
 claude mcp add claude-self-reflect "csr-engine" -s user
 ```
 
+### Shared HTTP server
+
+One stdio process per session means one loaded index per session. Run a single
+server instead and point every session at it:
+```bash
+csr-engine --serve-http 127.0.0.1:7391          # standalone
+csr-engine daemon --serve-http 127.0.0.1:7391   # or inside the enrichment daemon
+
+claude mcp remove claude-self-reflect
+claude mcp add --transport http claude-self-reflect http://127.0.0.1:7391/mcp -s user
+```
+The entry that replaces the stdio one:
+```json
+{
+  "mcpServers": {
+    "claude-self-reflect": {
+      "type": "http",
+      "url": "http://127.0.0.1:7391/mcp"
+    }
+  }
+}
+```
+Worth it when several sessions run at once. The server must already be running
+when Claude Code connects, and the endpoint is unauthenticated, so it binds
+loopback addresses only unless `CSR_SERVE_HTTP_ALLOW_NON_LOOPBACK=1` is set.
+
 ## Hooks
 
 Configured in `~/.claude/settings.json` via `csr-engine hook install --apply`.
