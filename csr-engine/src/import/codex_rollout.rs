@@ -2,6 +2,7 @@
 //! direct messages are normalized into the same message shape used by Claude
 //! transcripts, then passed through the shared CSR sanitizer before embedding.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -692,14 +693,28 @@ pub(crate) fn import_changed_rollouts(engine: &Engine, root: &Path) -> Result<Ro
 
         // A rollout that shrank leaves orphan tail chunks still matching content
         // that no longer exists. The wholesale delete used to cover this.
-        if outcome.chunks < prev_count {
-            let orphans = (outcome.chunks..prev_count)
-                .map(|seq| super::generate_chunk_id(&metadata.conversation_id, seq))
-                .collect::<Vec<_>>();
+        //
+        // Derived from the ids actually in the database, not from
+        // `import_state.chunks_imported`: that row is written at the very end of
+        // this loop body, so a crash or a vanished file before it leaves the count
+        // at zero while the chunks are all still stored. `outcome.chunks <
+        // prev_count` is then false no matter how far the rollout shrank, and the
+        // stale tail survives every later pass. A set difference cannot be fooled
+        // that way, and it also catches a tail left behind by an older build.
+        let live: HashSet<String> = (0..outcome.chunks)
+            .map(|seq| super::generate_chunk_id(&metadata.conversation_id, seq))
+            .collect();
+        let orphans = storage
+            .get_chunk_ids_for_conversation(&metadata.conversation_id)?
+            .into_iter()
+            .filter(|id| !live.contains(id))
+            .collect::<Vec<_>>();
+        if !orphans.is_empty() {
             tracing::warn!(
                 conv = %metadata.conversation_id,
                 previous = prev_count,
                 current = outcome.chunks,
+                orphans = orphans.len(),
                 "codex rollout shrank — dropping orphan tail chunks"
             );
             storage.delete_chunks_by_ids(&orphans)?;
@@ -874,6 +889,65 @@ mod tests {
             stored.len(),
             small.chunks_imported,
             "no orphan tail chunks may survive a shrink"
+        );
+        let text = stored
+            .iter()
+            .filter_map(|id| engine.storage().get_chunk_content(id).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("ROLLOUT005"), "dropped content must be gone");
+    }
+
+    /// Orphan deletion used to be derived from `import_state.chunks_imported`,
+    /// which is written at the very end of the import. A crash before that leaves
+    /// the count at zero while the chunks are all still stored, so
+    /// `outcome.chunks < prev_count` reads false no matter how far the rollout
+    /// shrank and the stale tail survives every later pass.
+    #[test]
+    fn orphan_chunks_are_dropped_even_with_a_lost_import_state_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let rollout = root.join("rollout-2026-08-06T12-00-00-crash.jsonl");
+
+        let engine = crate::engine::Engine::from_parts(
+            Arc::new(crate::storage::Storage::open_memory().unwrap()),
+            Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
+                256,
+            ))),
+            dir.path().to_path_buf(),
+        );
+
+        write_rollout(&rollout, "crash-fixture", 6);
+        let big = import_changed_rollouts(&engine, &root).unwrap();
+        assert!(big.chunks_imported > 4, "fixture must yield several chunks");
+
+        // The crash: the row that records how many chunks were imported never
+        // got written, so the next pass reads zero.
+        engine
+            .storage()
+            .upsert_import_state_explicit(
+                &rollout.to_string_lossy(),
+                "codex:crash-fixture",
+                0,
+                "1970-01-01T00:00:00+00:00",
+            )
+            .unwrap();
+
+        write_rollout(&rollout, "crash-fixture", 2);
+        let small = import_changed_rollouts(&engine, &root).unwrap();
+        assert!(small.chunks_imported < big.chunks_imported);
+
+        let stored = engine
+            .storage()
+            .get_chunk_ids_for_conversation("codex:crash-fixture")
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            small.chunks_imported,
+            "the orphan tail must be found by set difference, not by a count \
+             the crash never wrote"
         );
         let text = stored
             .iter()
