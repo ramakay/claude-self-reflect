@@ -172,7 +172,13 @@ pub(crate) struct CsrSuppressionStats {
 
 #[derive(Default)]
 struct CsrMessageSanitizer {
+    /// CSR tool calls seen but not yet answered by their `tool_result`. Only
+    /// these have to ride a `ParseCursor` across a seam.
     suppressed_tool_use_ids: HashSet<String>,
+    /// CSR tool calls whose result has already arrived. A transcript that
+    /// repeats a `tool_result` would otherwise leak the second copy into the
+    /// index, since the first one consumed the id.
+    answered_tool_use_ids: HashSet<String>,
     stats: CsrSuppressionStats,
 }
 
@@ -935,13 +941,21 @@ fn sanitize_content(
                     .get("tool_use_id")
                     .and_then(|value| value.as_str())
                     .map(str::to_string);
-                // Consume the id rather than just testing it. A tool_result is only
-                // ever matched by its own tool_use, so this is a no-op for a full
-                // parse -- but it keeps the live set down to the handful of calls
-                // still awaiting a result, which is what makes it cheap to carry
-                // across a resumed parse.
-                let is_csr_result =
-                    tool_use_id.is_some_and(|id| sanitizer.suppressed_tool_use_ids.remove(&id));
+                // Consume the id from the open set rather than just testing it:
+                // that keeps the set down to the handful of calls still awaiting
+                // a result, which is what makes it cheap to carry across a
+                // resumed parse. It then moves to the answered set, because a
+                // transcript that repeats a `tool_result` would otherwise have
+                // its second copy retained and indexed. `main` suppressed the
+                // duplicate only because it never removed anything.
+                let is_csr_result = tool_use_id.is_some_and(|id| {
+                    if sanitizer.suppressed_tool_use_ids.remove(&id) {
+                        sanitizer.answered_tool_use_ids.insert(id);
+                        true
+                    } else {
+                        sanitizer.answered_tool_use_ids.contains(&id)
+                    }
+                });
                 if is_csr_result {
                     sanitizer.stats.csr_tool_blocks_suppressed += 1;
                     continue;
@@ -1468,6 +1482,69 @@ mod tests {
             }
         });
         assert!(extract_tool_context(&msg).is_empty());
+    }
+
+    /// The open-id set is consumed on the first matching result so a cursor only
+    /// carries calls still awaiting one. A repeated result for the same call must
+    /// still be recognised as CSR's own, or the second copy reaches the index.
+    #[test]
+    fn repeated_csr_tool_result_stays_suppressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("csr-duplicate.jsonl");
+        let result = |text: &str| {
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-08-06T12:00:01Z",
+                "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "csr-call", "content": text},
+                    {"type": "text", "text": "USER PROSE KEPT"}
+                ]}
+            })
+        };
+        let lines = [
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-08-06T12:00:00Z",
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "csr-call",
+                    "name": "mcp__claude-self-reflect__csr_reflect_on_past",
+                    "input": {"query": "SECRET RETRIEVAL QUERY"}
+                }]}
+            }),
+            result("FIRST COPY OF THE RESULT"),
+            result("SECOND COPY OF THE RESULT"),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        let content = parsed
+            .chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !content.contains("SECOND COPY"),
+            "a repeated CSR tool_result must stay suppressed"
+        );
+        assert!(!content.contains("FIRST COPY"));
+        assert!(
+            content.contains("USER PROSE KEPT"),
+            "sibling blocks in the same message must survive"
+        );
+        assert_eq!(
+            parsed.suppression.csr_tool_blocks_suppressed, 3,
+            "the call and both copies of its result are all counted"
+        );
     }
 
     #[test]
