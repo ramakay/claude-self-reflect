@@ -125,6 +125,15 @@ pub(crate) async fn import_file_incremental(
         .to_string_lossy()
         .to_string();
 
+    // Read before parsing, not at commit. A live session's writer can append
+    // between the parser reaching EOF and the row being written, and an mtime
+    // read at that point describes bytes nothing has read. The gate above would
+    // then skip them until the next append moved the mtime again, and if the
+    // session ended there they would never be imported at all. Recording the
+    // earlier value makes a racing append read as changed, which costs one cheap
+    // cursor resume.
+    let mtime_before_parse = Storage::current_file_mtime(file_path);
+
     // Resume from the stored byte cursor when it still describes this file.
     let mut stored_cursor = ctx
         .storage
@@ -384,6 +393,7 @@ pub(crate) async fn import_file_incremental(
         suppression,
         cursor_json.as_deref(),
         trailing_sealed,
+        Some(&mtime_before_parse),
     )?;
 
     Ok(ImportOutcome {
@@ -1356,6 +1366,39 @@ mod tests {
                 assert!(all.contains(&format!("MSG{i:03}")), "MSG{i:03} missing");
             }
         });
+    }
+
+    /// The mtime recorded by an import has to describe the bytes the parser
+    /// actually read. Read at commit instead, it can describe an append that
+    /// landed after EOF, and the mtime gate then skips those bytes until the
+    /// next append moves the mtime again -- or forever, if the session ended.
+    #[test]
+    fn recorded_mtime_describes_the_bytes_that_were_read() {
+        let h = Harness::new("mtime-race");
+        h.write(&msgs(5));
+        let before_parse = Storage::current_file_mtime(&h.path);
+
+        // Stand in for the writer appending between EOF and the commit.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&h.path, "x").unwrap();
+        assert_ne!(before_parse, Storage::current_file_mtime(&h.path));
+
+        h.storage
+            .mark_file_imported_with_cursor(
+                &h.path,
+                3,
+                Default::default(),
+                None,
+                true,
+                Some(&before_parse),
+            )
+            .unwrap();
+
+        assert!(
+            !h.storage.is_file_imported(&h.path).unwrap(),
+            "a file that moved during the pass must read as changed, so the \
+             bytes the parser never saw get another chance"
+        );
     }
 
     /// The migration must be additive on a database that predates the column.

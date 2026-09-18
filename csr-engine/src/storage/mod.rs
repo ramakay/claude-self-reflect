@@ -740,6 +740,7 @@ impl Storage {
         suppression: crate::import::CsrSuppressionStats,
         cursor: Option<&str>,
         trailing_sealed: bool,
+        observed_mtime: Option<&str>,
     ) -> Result<()> {
         let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::mark_file_imported_with_cursor(
@@ -749,7 +750,15 @@ impl Storage {
             suppression,
             cursor,
             trailing_sealed,
+            observed_mtime,
         )
+    }
+
+    /// The mtime string this storage compares against in `is_file_imported`.
+    /// Callers read it before parsing so the value they record describes the
+    /// bytes they actually read. See `queries::mark_file_imported_with_cursor`.
+    pub(crate) fn current_file_mtime(path: &Path) -> String {
+        queries::file_mtime_str(path)
     }
 
     /// Whether the last import indexed this transcript's trailing chunk.

@@ -1139,7 +1139,7 @@ pub(crate) fn is_trailing_chunk_sealed(conn: &Connection, path: &Path) -> Result
 }
 
 /// Get file modification time as a string for comparison.
-fn file_mtime_str(path: &Path) -> String {
+pub(crate) fn file_mtime_str(path: &Path) -> String {
     path.metadata()
         .and_then(|m| m.modified())
         .map(|t| {
@@ -1186,7 +1186,7 @@ pub(crate) fn mark_file_imported_with_suppression(
     suppression: CsrSuppressionStats,
 ) -> Result<()> {
     // No chunks were produced, so there is no trailing chunk to owe a vector to.
-    mark_file_imported_with_cursor(conn, path, chunks, suppression, None, true)
+    mark_file_imported_with_cursor(conn, path, chunks, suppression, None, true, None)
 }
 
 /// Record an import together with the byte cursor to resume from next time.
@@ -1196,6 +1196,13 @@ pub(crate) fn mark_file_imported_with_suppression(
 /// last chunk out of the vector index because it is still growing. A later
 /// sealing pass has to know that debt exists: the mtime gate would otherwise
 /// short-circuit it and the chunk would never be indexed at all.
+///
+/// `observed_mtime` is the mtime the caller read BEFORE it started parsing.
+/// Reading it here instead describes bytes the parser never saw when the writer
+/// appends between EOF and this call, and the mtime gate then skips them. Pass
+/// the earlier value and a racing append reads as changed, which costs one cheap
+/// cursor resume and loses nothing. `None` falls back to reading it now, which
+/// is correct for a caller that has nothing to race with.
 pub(crate) fn mark_file_imported_with_cursor(
     conn: &mut Connection,
     path: &Path,
@@ -1203,6 +1210,7 @@ pub(crate) fn mark_file_imported_with_cursor(
     suppression: CsrSuppressionStats,
     cursor: Option<&str>,
     trailing_sealed: bool,
+    observed_mtime: Option<&str>,
 ) -> Result<()> {
     let tx = conn.transaction()?;
     let path_str = path.to_string_lossy().to_string();
@@ -1230,7 +1238,9 @@ pub(crate) fn mark_file_imported_with_cursor(
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_default();
-    let mtime = file_mtime_str(path);
+    let mtime = observed_mtime
+        .map(str::to_string)
+        .unwrap_or_else(|| file_mtime_str(path));
 
     // Deliberately not INSERT OR REPLACE: that deletes the row and reinserts it,
     // so every column absent from the VALUES list silently becomes NULL. An
