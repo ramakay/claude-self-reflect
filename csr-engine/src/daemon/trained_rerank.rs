@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Result;
 use tokio::sync::{RwLock, Semaphore};
@@ -31,6 +31,12 @@ pub struct HarvestSummary {
     pub contaminated: usize,
     pub labels: usize,
     pub embed_batches: usize,
+    /// True when this call stopped early because [`HARVEST_WALL_CLOCK_BUDGET`]
+    /// elapsed, not because the source list or the embed-batch cap was
+    /// exhausted. The backlog is resumable (state is written per session as
+    /// it harvests), so the next nightly cycle picks up where this one left
+    /// off.
+    pub stopped_on_time_budget: bool,
 }
 
 const TRAIN_SEED: u64 = 0x4353_525F_4C54_5231;
@@ -58,6 +64,21 @@ const ASSISTANT_TAIL_CHARS: usize = 1_000;
 /// 20,052/20,112 zero-label), so counting sources visited instead of embed
 /// batches run made the cap ~58 nightly cycles to refill after a hash bump.
 const HARVEST_EMBED_BATCHES_PER_CYCLE: usize = 500;
+/// Wall-clock budget for one [`harvest_reactions`] call, checked at the top
+/// of the loop before starting a source — alongside, not instead of,
+/// `HARVEST_EMBED_BATCHES_PER_CYCLE` above. That cap only counts sources
+/// that reach an actual embed batch; a contaminated or zero-pair source
+/// never trips it (by design — see the doc comment above), but every source
+/// still pays a SQL lookup plus a `parse_transcript` pass. After a
+/// `classifier_hash` bump (e.g. `REACTION_TURN_FILTER_VERSION`), every
+/// `rerank_harvest_state` row goes stale at once — ~28,000 sources measured
+/// on the live corpus, ~6GB of JSONL — so without a second, time-based cap
+/// one cycle can burn through the whole backlog re-parsing transcripts
+/// before it ever hits the embed-batch limit, holding the daemon's training
+/// lane for the duration. 10 minutes bounds that per cycle; the harvest is
+/// already resumable (state is written per session as it harvests), so
+/// stopping early here is safe and the next nightly cycle drains more.
+const HARVEST_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(600);
 #[derive(Debug, Clone)]
 struct PreparedCandidate {
     memory_id: String,
@@ -109,6 +130,11 @@ fn plumbing_substantive(text: &str) -> bool {
 
 fn substantive_user(entry: &Entry) -> bool {
     entry.role == Role::User
+        // A `isMeta: true` user row is hook/harness-injected — the human
+        // never typed it — so it can never stand in as the reaction or as
+        // the `preceding_user_text` anchor (review finding: injected rows
+        // winning the dedupe).
+        && !entry.is_meta
         && plumbing_substantive(&entry.text)
         && !crate::transcript::instrumentation::is_noisy_steer_text(&entry.text)
         && !entry.text.trim_start().starts_with("<local-command-")
@@ -138,7 +164,14 @@ fn assistant_tail(text: &str) -> String {
 fn reaction_turn_pairs(entries: &[Entry]) -> Vec<ReactionTurnPair> {
     let mut pairs = Vec::new();
     for (assistant_index, assistant) in entries.iter().enumerate() {
-        if assistant.role != Role::Assistant || assistant.text.trim().is_empty() {
+        // `is_meta` assistant rows are hook/harness-injected output (not
+        // something the human saw as the assistant's answer) — never
+        // eligible to be the pair's assistant entry, so they can never win
+        // the last-assistant-before-a-human-turn dedupe below either.
+        if assistant.role != Role::Assistant
+            || assistant.text.trim().is_empty()
+            || assistant.is_meta
+        {
             continue;
         }
         let Some(assistant_time) = assistant
@@ -231,16 +264,44 @@ pub async fn harvest_reactions(
     embeddings: &Arc<EmbeddingEngine>,
     shutdown: &AtomicBool,
 ) -> Result<HarvestSummary> {
-    let Some(probes) = ProbeSet::load_or_build(embeddings).await else {
-        anyhow::bail!("reaction exemplar probes could not be loaded or built");
-    };
+    let deadline = Instant::now() + HARVEST_WALL_CLOCK_BUDGET;
+    harvest_reactions_until(storage, embeddings, shutdown, deadline).await
+}
+
+/// [`harvest_reactions`]'s loop, with the wall-clock deadline injected so
+/// tests can drive it with an already-expired one instead of sleeping.
+///
+/// Note: this cannot be exercised end-to-end without the embedding model
+/// *if* any source in the run has reaction pairs — `ProbeSet::load_or_build`
+/// (called below, lazily) calls `EmbeddingEngine::embed_single`, which
+/// downloads the ~30MB ONNX model on first use (same constraint as the
+/// existing `#[ignore]`d `harvest_reactions_bounds_work_per_cycle_and_resumes`
+/// test). Probes are loaded lazily, only the first time a source actually
+/// needs an embed batch, so a run over only contaminated/pair-less sources —
+/// exactly what the deadline check needs to prove — never touches the model
+/// at all; the non-ignored test for this budget relies on that seam.
+async fn harvest_reactions_until(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    shutdown: &AtomicBool,
+    deadline: Instant,
+) -> Result<HarvestSummary> {
     let classifier_hash = reaction::classifier_hash();
+    // Built lazily on first source that actually has reaction pairs to
+    // embed — a contaminated or pair-less source (~99% of a re-harvest
+    // cycle, see `HARVEST_EMBED_BATCHES_PER_CYCLE`'s doc comment) never
+    // needs it.
+    let mut probes: Option<ProbeSet> = None;
     let mut summary = HarvestSummary::default();
     for source in storage.list_rerank_harvest_sources()? {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
         if summary.embed_batches >= HARVEST_EMBED_BATCHES_PER_CYCLE {
+            break;
+        }
+        if Instant::now() >= deadline {
+            summary.stopped_on_time_budget = true;
             break;
         }
         summary.sources_seen += 1;
@@ -256,6 +317,11 @@ pub async fn harvest_reactions(
             continue;
         };
         let harvested_at = chrono::Utc::now().to_rfc3339();
+        // Never short-circuited by a previously stored `contaminated` flag:
+        // `rerank_harvest_is_current` above already gates on `mtime` +
+        // `classifier_hash`, and the contamination predicate itself is
+        // still under investigation, so a re-harvest always re-evaluates it
+        // from the current transcript rather than trusting the old verdict.
         let contaminated = conversation_is_contaminated(
             &parsed.entries,
             source.csr_tool_blocks_suppressed,
@@ -287,6 +353,12 @@ pub async fn harvest_reactions(
         let vectors = if texts.is_empty() {
             Vec::new()
         } else {
+            if probes.is_none() {
+                let Some(loaded) = ProbeSet::load_or_build(embeddings).await else {
+                    anyhow::bail!("reaction exemplar probes could not be loaded or built");
+                };
+                probes = Some(loaded);
+            }
             let engine = embeddings.clone();
             let embedded = tokio::task::spawn_blocking(move || {
                 let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
@@ -303,6 +375,10 @@ pub async fn harvest_reactions(
                 vectors.len()
             );
         }
+        // Only reached when `pairs` is non-empty (the loop body below is a
+        // no-op otherwise), which means `texts` was non-empty too, which
+        // means the `else` branch above already loaded `probes` — so
+        // `.expect()` here never actually sees `None`.
         let mut labels = Vec::with_capacity(pairs.len());
         for (index, pair) in pairs.into_iter().enumerate() {
             let next_vector = &vectors[index * 2];
@@ -310,12 +386,15 @@ pub async fn harvest_reactions(
             let pickup_similarity =
                 reaction::pickup_is_eligible(&pair.next_user_text, &pair.preceding_user_text)
                     .then(|| cosine_sim(next_vector, prompt_vector));
-            let decision = probes.classify(
-                &pair.next_user_text,
-                &pair.preceding_user_text,
-                next_vector,
-                pickup_similarity,
-            );
+            let decision = probes
+                .as_ref()
+                .expect("loaded above whenever pairs is non-empty")
+                .classify(
+                    &pair.next_user_text,
+                    &pair.preceding_user_text,
+                    next_vector,
+                    pickup_similarity,
+                );
             labels.push(ReactionLabel {
                 session_id: source.session_id.clone(),
                 assistant_turn: pair.assistant_turn as i64,
@@ -814,7 +893,17 @@ pub async fn run_training_cycle(
     search: &Arc<RwLock<SearchEngine>>,
     shutdown: &AtomicBool,
 ) -> Result<ModelAttempt> {
-    let _harvest = harvest_reactions(storage, embeddings, shutdown).await?;
+    let harvest = harvest_reactions(storage, embeddings, shutdown).await?;
+    tracing::info!(
+        sources_seen = harvest.sources_seen,
+        sources_harvested = harvest.sources_harvested,
+        sources_unchanged = harvest.sources_unchanged,
+        contaminated = harvest.contaminated,
+        labels = harvest.labels,
+        embed_batches = harvest.embed_batches,
+        stopped_on_time_budget = harvest.stopped_on_time_budget,
+        "reaction harvest cycle completed"
+    );
     let _legacy_impressions = backfill_legacy_exposures(storage)?;
     let classifier_hash = reaction::classifier_hash();
     let counts = storage.rerank_reaction_label_counts(&classifier_hash)?;
@@ -1164,9 +1253,20 @@ mod tests {
             timestamp: Some(format!("2026-08-24T00:00:{turn:02}Z")),
             uuid: None,
             is_sidechain: false,
+            is_meta: false,
             text: text.into(),
             tool_uses: Vec::new(),
             tool_results: Vec::new(),
+        }
+    }
+
+    /// [`entry`] plus `is_meta: true` — a hook/harness-injected row (setup
+    /// text, injected tool output) the human never actually typed or read
+    /// as the assistant's answer.
+    fn meta_entry(turn: usize, role: Role, text: &str) -> Entry {
+        Entry {
+            is_meta: true,
+            ..entry(turn, role, text)
         }
     }
 
@@ -1412,6 +1512,61 @@ mod tests {
         assert_eq!(pairs[0].next_user_turn, 4);
     }
 
+    // --- review finding: injected (`isMeta: true`) rows must never win
+    // the dedupe or stand in as a human turn ---
+
+    #[test]
+    fn a_meta_assistant_row_never_wins_the_last_assistant_dedupe() {
+        // Real assistant answer, then a hook/harness-injected assistant row
+        // (isMeta:true) before the human replies. Before this fix the
+        // dedupe kept the LAST assistant entry regardless of `is_meta`, so
+        // the injected row's text and turn were stored as the reaction
+        // pair's assistant side.
+        let entries = vec![
+            entry(1, Role::User, "why is the parser failing?"),
+            entry(2, Role::Assistant, "because of a stray token"),
+            meta_entry(3, Role::Assistant, "Injected hook output."),
+            entry(4, Role::User, "no, that is not the actual cause"),
+        ];
+
+        let pairs = reaction_turn_pairs(&entries);
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].assistant_turn, 2);
+        assert_eq!(pairs[0].assistant_text, "because of a stray token");
+    }
+
+    #[test]
+    fn a_meta_user_row_is_skipped_and_the_real_reply_becomes_the_reaction() {
+        let entries = vec![
+            entry(1, Role::User, "why is the parser failing?"),
+            entry(2, Role::Assistant, "because of a stray token"),
+            meta_entry(3, Role::User, "Injected setup text."),
+            entry(4, Role::User, "no, that is not the actual cause"),
+        ];
+
+        let pairs = reaction_turn_pairs(&entries);
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].next_user_turn, 4);
+        assert_eq!(pairs[0].next_user_text, "no, that is not the actual cause");
+    }
+
+    #[test]
+    fn a_meta_user_row_is_never_chosen_as_preceding_user_text() {
+        let entries = vec![
+            entry(1, Role::User, "why is the parser failing?"),
+            meta_entry(2, Role::User, "Injected setup text."),
+            entry(3, Role::Assistant, "because of a stray token"),
+            entry(4, Role::User, "no, that is not the actual cause"),
+        ];
+
+        let pairs = reaction_turn_pairs(&entries);
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].preceding_user_text, "why is the parser failing?");
+    }
+
     #[test]
     fn preceding_user_text_skips_plumbing_only_turns() {
         // A `<system-reminder>`-only turn between the real prior question
@@ -1460,6 +1615,33 @@ mod tests {
         assert!(reaction::is_question_like_prior(
             &pairs[0].preceding_user_text
         ));
+    }
+
+    #[test]
+    fn preceding_user_text_resolves_to_a_real_path_leading_prompt_not_an_older_turn() {
+        // Review finding: the old bare `"/"` prefix in `NON_REACTION_PREFIXES`
+        // rejected every slash-leading human turn, so a real request that
+        // happens to start with an absolute path was skipped as if it were
+        // a slash command, and the walk fell back to an older, unrelated
+        // question instead.
+        let entries = vec![
+            entry(1, Role::User, "why is the build slow?"),
+            entry(
+                2,
+                Role::User,
+                "/Users/me/app.rs is failing; can you fix it?",
+            ),
+            entry(3, Role::Assistant, "found the bug"),
+            entry(4, Role::User, "no, that did not fix it"),
+        ];
+
+        let pairs = reaction_turn_pairs(&entries);
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            pairs[0].preceding_user_text,
+            "/Users/me/app.rs is failing; can you fix it?"
+        );
     }
 
     #[test]
@@ -1632,6 +1814,18 @@ mod tests {
             .to_string()
     }
 
+    /// One JSONL transcript line whose text trips `contamination_reason` (a
+    /// CSR machine sentinel, same text `contamination_is_a_predicate_not_a_hard_coded_session_list`
+    /// uses above) — like a pair-less source, this is resolved before
+    /// `reaction_turn_pairs` even runs, so it never reaches the embedding
+    /// branch either.
+    fn contaminated_source_line() -> String {
+        "{\"type\":\"assistant\",\"timestamp\":\"2026-08-24T00:00:00Z\",\
+         \"message\":{\"content\":\
+         [{\"type\":\"text\",\"text\":\"CSR ENDLESS MEMORY ACTIVE \u{2014} prior context\"}]}}\n"
+            .to_string()
+    }
+
     /// Two JSONL transcript lines forming exactly one reaction pair: an
     /// assistant turn followed by a substantive human reply inside
     /// `MAX_REACTION_GAP_SECONDS`, so `harvest_reactions` runs exactly one
@@ -1644,6 +1838,71 @@ mod tests {
          \"message\":{\"content\":[{\"type\":\"text\",\
          \"text\":\"yes, that solved it\"}]}}\n"
             .to_string()
+    }
+
+    #[test]
+    fn harvest_time_budget_stops_before_any_source_and_resumes_with_a_fresh_deadline() {
+        // Review finding: contaminated and zero-pair sources still ran
+        // `parse_transcript` with no budget, so a corpus-wide re-harvest
+        // (e.g. right after a `classifier_hash` bump, when every source is
+        // stale at once) could scan the whole backlog before the
+        // embed-batch cap ever engaged — that cap only counts sources that
+        // reach an actual embed batch, and neither source below does.
+        // Because neither is an embedding source, this never touches the
+        // FastEmbed model (probes are loaded lazily, only when a source
+        // actually has pairs to embed) — no `#[ignore]` needed.
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let transcripts = tempfile::TempDir::new().unwrap();
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let shutdown = AtomicBool::new(false);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let cheap_sources = [
+            ("session-cheap-contaminated", contaminated_source_line()),
+            ("session-cheap-pairless", cheap_source_line()),
+        ];
+        for (session_id, contents) in &cheap_sources {
+            let path = transcripts.path().join(format!("{session_id}.jsonl"));
+            std::fs::write(&path, contents).unwrap();
+            storage
+                .upsert_import_state_explicit(&path.to_string_lossy(), session_id, 0, "1")
+                .unwrap();
+        }
+
+        // Already-expired deadline: the top-of-loop check must stop before
+        // even the first source is opened.
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("process has run for over a second by the time a test executes");
+        let stopped_early = rt
+            .block_on(harvest_reactions_until(
+                &storage,
+                &embeddings,
+                &shutdown,
+                expired,
+            ))
+            .unwrap();
+        assert!(stopped_early.stopped_on_time_budget);
+        assert_eq!(stopped_early.sources_seen, 0);
+        assert_eq!(stopped_early.sources_harvested, 0);
+        assert_eq!(stopped_early.embed_batches, 0);
+
+        // A second call with a live deadline processes both — nothing was
+        // consumed by the first, time-boxed call.
+        let live_deadline = Instant::now() + HARVEST_WALL_CLOCK_BUDGET;
+        let resumed = rt
+            .block_on(harvest_reactions_until(
+                &storage,
+                &embeddings,
+                &shutdown,
+                live_deadline,
+            ))
+            .unwrap();
+        assert!(!resumed.stopped_on_time_budget);
+        assert_eq!(resumed.sources_seen, cheap_sources.len());
+        assert_eq!(resumed.sources_harvested, cheap_sources.len());
+        assert_eq!(resumed.contaminated, 1);
+        assert_eq!(resumed.embed_batches, 0);
     }
 
     #[test]

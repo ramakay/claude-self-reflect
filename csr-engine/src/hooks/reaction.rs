@@ -34,7 +34,17 @@ pub const REASK_PICKUP_SIMILARITY: f32 = 0.82;
 /// log in a fence resolved to empty and was rejected as if it were harness
 /// plumbing. That can move which turn a pair resolves to (a fence-only or
 /// blockquote-only turn that used to be skipped can now anchor a pair), so
-/// v3 rows must not be read as if they used this filter.
+/// v3 rows must not be read as if they used this filter. v4 also covers two
+/// later fix-round findings folded into the same bump instead of a new one:
+/// `substantive_user`/`reaction_turn_pairs` now reject a row with
+/// `isMeta: true` on either side (a hook/harness-injected assistant or user
+/// row can no longer win the last-assistant dedupe or stand in as the
+/// reaction/`preceding_user_text` anchor), and `NON_REACTION_PREFIXES`
+/// dropped the bare `"/"` prefix in favor of `is_slash_command` — a real
+/// human turn that starts with an absolute path (`/Users/me/app.rs is
+/// failing`) is no longer misread as a slash command. Both changes can move
+/// which turn a pair resolves to, so pre-fix v4 rows must not be read as if
+/// they used this filter either.
 pub const REACTION_TURN_FILTER_VERSION: u32 = 4;
 pub const PICKUP_QUESTION_FILTER_VERSION: u32 = 1;
 const NEAR_MISS_FLOOR_GAP: f32 = 0.05;
@@ -42,9 +52,29 @@ const CACHE_SCHEMA: u32 = 1;
 
 const NON_REACTION_PREFIXES: &[&str] = &[
     "Base directory for this skill:",
-    "/",
     "[Request interrupted by user",
 ];
+
+/// True when `text`'s first whitespace-delimited token is an actual slash
+/// command (`/compact`, `/codex:review focus text`, `/gsd-plan`) rather than
+/// human text that happens to start with `/` (an absolute path: `/Users/me/app.rs
+/// is failing`, `/tmp/x.log shows the error`, or the lone-root edge case `/
+/// is the root`). A command's token starts with `/` followed by a letter and
+/// contains no further `/`; a path token contains at least one more `/`
+/// after the first, and the bare `/` token has no letter after it at all.
+/// Fixes the review finding that the old bare `"/"` prefix in
+/// `NON_REACTION_PREFIXES` rejected every slash-leading human turn, not just
+/// commands.
+fn is_slash_command(text: &str) -> bool {
+    let Some(first_token) = text.split_whitespace().next() else {
+        return false;
+    };
+    let Some(rest) = first_token.strip_prefix('/') else {
+        return false;
+    };
+    rest.chars().next().is_some_and(char::is_alphabetic) && !rest.contains('/')
+}
+
 const QUESTION_LIKE_PREFIXES: &[&str] = &[
     "who ",
     "what ",
@@ -95,6 +125,7 @@ pub fn is_substantive_reaction_text(text: &str) -> bool {
     !text.is_empty()
         && !is_queued_message(text)
         && !is_image_only_payload(text)
+        && !is_slash_command(text)
         && !NON_REACTION_PREFIXES
             .iter()
             .any(|prefix| text.starts_with(prefix))
@@ -561,6 +592,34 @@ mod tests {
         assert_eq!(repeated_approval.pickup_similarity, None);
         assert_eq!(repeated_question.reaction, Some(Reaction::Reask));
         assert_eq!(repeated_question.pickup_similarity, Some(0.95));
+    }
+
+    #[test]
+    fn is_slash_command_rejects_only_real_commands() {
+        assert!(is_slash_command("/compact"));
+        assert!(is_slash_command("/codex:review focus text"));
+        assert!(is_slash_command("/gsd-plan"));
+    }
+
+    #[test]
+    fn is_slash_command_accepts_path_leading_human_text() {
+        assert!(!is_slash_command(
+            "/Users/me/app.rs is failing; can you fix it?"
+        ));
+        assert!(!is_slash_command("/tmp/x.log shows the error"));
+        assert!(!is_slash_command("/ is the root"));
+    }
+
+    #[test]
+    fn substantive_reaction_text_agrees_with_is_slash_command() {
+        assert!(!is_substantive_reaction_text("/compact"));
+        assert!(!is_substantive_reaction_text("/codex:review focus text"));
+        assert!(!is_substantive_reaction_text("/gsd-plan"));
+        assert!(is_substantive_reaction_text(
+            "/Users/me/app.rs is failing; can you fix it?"
+        ));
+        assert!(is_substantive_reaction_text("/tmp/x.log shows the error"));
+        assert!(is_substantive_reaction_text("/ is the root"));
     }
 
     #[test]

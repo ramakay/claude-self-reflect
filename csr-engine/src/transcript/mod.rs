@@ -102,6 +102,13 @@ pub struct Entry {
     pub timestamp: Option<String>,
     pub uuid: Option<String>,
     pub is_sidechain: bool,
+    /// True when the source line carried `"isMeta": true` — a hook- or
+    /// harness-injected row (setup text, injected tool output) the human
+    /// never actually typed or read as the assistant's answer. Absent
+    /// (older transcripts, synthetic fixtures) reads as `false`. Only the
+    /// reaction-labeling path (`daemon::trained_rerank`) consults this
+    /// today; every other `Entry` consumer treats it as ordinary text.
+    pub is_meta: bool,
     pub text: String,
     pub tool_uses: Vec<ToolUse>,
     pub tool_results: Vec<ToolResult>,
@@ -280,6 +287,10 @@ fn build_message_entry(type_str: &str, value: &serde_json::Value) -> Entry {
         .get("isSidechain")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let is_meta = value
+        .get("isMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let mut text = String::new();
     let mut tool_uses = Vec::new();
@@ -312,6 +323,7 @@ fn build_message_entry(type_str: &str, value: &serde_json::Value) -> Entry {
         timestamp,
         uuid,
         is_sidechain,
+        is_meta,
         text,
         tool_uses,
         tool_results,
@@ -350,6 +362,7 @@ fn classify_queue_operation(
         timestamp,
         uuid: None,
         is_sidechain: false,
+        is_meta: false,
         text: format!("[queued] {}", strip_control_chars(content)),
         tool_uses: vec![],
         tool_results: vec![],
@@ -401,6 +414,7 @@ fn classify_attachment(
             .get("isSidechain")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        is_meta: false,
         text: format!("[queued] {}", strip_control_chars(prompt)),
         tool_uses: vec![],
         tool_results: vec![],
@@ -438,6 +452,7 @@ fn classify_file_history_delta(value: &serde_json::Value) -> LineOutcome {
         timestamp,
         uuid: None,
         is_sidechain: false,
+        is_meta: false,
         text: format!("[file-history] {tracking_path}"),
         tool_uses: vec![ToolUse {
             id: None,
@@ -862,4 +877,25 @@ pub fn run(projects_dir: &Path, req: &TranscriptRequest) -> String {
     };
 
     query::render_view(&parsed, &path, &project, req)
+}
+
+#[cfg(test)]
+mod entry_is_meta_tests {
+    use super::*;
+
+    #[test]
+    fn is_meta_true_round_trips_into_the_entry() {
+        let raw = r#"{"type":"assistant","timestamp":"2026-08-24T00:00:00Z","isMeta":true,"message":{"role":"assistant","content":[{"type":"text","text":"Injected hook output."}]}}"#;
+        let parsed = parse_transcript_fragment(raw);
+        assert_eq!(parsed.entries.len(), 1);
+        assert!(parsed.entries[0].is_meta);
+    }
+
+    #[test]
+    fn absent_is_meta_reads_false() {
+        let raw = r#"{"type":"assistant","timestamp":"2026-08-24T00:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}"#;
+        let parsed = parse_transcript_fragment(raw);
+        assert_eq!(parsed.entries.len(), 1);
+        assert!(!parsed.entries[0].is_meta);
+    }
 }

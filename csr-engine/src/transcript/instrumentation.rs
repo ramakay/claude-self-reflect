@@ -253,6 +253,7 @@ mod tests {
             timestamp: None,
             uuid: None,
             is_sidechain: false,
+            is_meta: false,
             text: text.to_string(),
             tool_uses: vec![],
             tool_results: vec![],
@@ -266,6 +267,7 @@ mod tests {
             timestamp: None,
             uuid: None,
             is_sidechain: false,
+            is_meta: false,
             text: String::new(),
             tool_uses: vec![ToolUse {
                 id: Some(id.to_string()),
@@ -292,6 +294,7 @@ mod tests {
             timestamp: None,
             uuid: None,
             is_sidechain: false,
+            is_meta: false,
             text: String::new(),
             tool_uses: vec![],
             tool_results: vec![ToolResult {
