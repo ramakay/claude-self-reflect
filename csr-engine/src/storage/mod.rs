@@ -836,12 +836,25 @@ impl Storage {
 
     /// Atomically remove one conversation that should never have been corpus.
     /// See `queries::purge_conversation`. Returns the number of chunks removed.
+    ///
+    /// IMMEDIATE, not deferred: the purge reads before it writes, and a deferred
+    /// transaction whose snapshot goes stale between the two (a hook in a live
+    /// session commits) fails at once with SQLITE_BUSY, which no busy timeout
+    /// covers. Taking the write lock first makes contention a wait instead.
     pub fn purge_conversation(&self, conversation_id: &str) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        let tx = conn.unchecked_transaction()?;
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let chunks = queries::purge_conversation(&tx, conversation_id)?;
         tx.commit()?;
         Ok(chunks)
+    }
+
+    /// How long this connection waits for another writer before SQLITE_BUSY.
+    /// Maintenance commands raise it: they share the database with live hooks.
+    pub fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.busy_timeout(timeout)?;
+        Ok(())
     }
 
     /// See `queries::enrichment_reflection_refs`.
@@ -858,8 +871,8 @@ impl Storage {
 
     /// Atomically delete a batch of reflections. See `queries::purge_reflections`.
     pub fn purge_reflections(&self, ids: &[String]) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        let tx = conn.unchecked_transaction()?;
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let deleted = queries::purge_reflections(&tx, ids)?;
         tx.commit()?;
         Ok(deleted)
