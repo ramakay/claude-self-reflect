@@ -34,10 +34,16 @@
 /// ratification) MUST have its prompt's opening line registered here in the
 /// same commit — a missing entry let 4,700 ratification-extractor transcripts
 /// into the corpus (82% of all conversations) before detection.
-pub const AGENT_PROMPT_SIGNATURES: [&str; 3] = [
+///
+/// The last entry is the preamble out-of-tree narrators (the intent-narrator
+/// Stop hook) lead their prompt with. It is the whole preamble, not the bare
+/// sentinel: `csr-engine lessons` output legitimately begins with a sentinel,
+/// and a user who opens a session by pasting it must keep that session.
+pub const AGENT_PROMPT_SIGNATURES: [&str; 4] = [
     "You are CSR Episode Analyst",
     "You are summarizing a coding session",
     "# Ratification Dialog-Act Extraction",
+    "[[CSR:RECAP]] machine-marker:",
 ];
 
 /// Block headers CSR emits, one per formatter:

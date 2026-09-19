@@ -234,6 +234,24 @@ impl SearchEngine {
         blanked
     }
 
+    /// Blank chunk IDs in the map that are not present in the given DB ID set:
+    /// vectors whose rows were deleted after the process that dumped this cache
+    /// loaded them. Returns the number blanked. Marks the index dirty if any were.
+    pub fn blank_orphan_chunks(&mut self, db_ids: &std::collections::HashSet<&str>) -> usize {
+        let mut blanked = 0;
+        for entry in &mut self.chunk_id_map {
+            if !entry.is_empty() && !db_ids.contains(entry.as_str()) {
+                self.chunk_id_set.remove(entry.as_str());
+                *entry = String::new();
+                blanked += 1;
+            }
+        }
+        if blanked > 0 {
+            self.chunk_dirty = true;
+        }
+        blanked
+    }
+
     /// Search chunk index. Returns results sorted by descending score.
     pub fn search_chunks(
         &self,
@@ -1160,6 +1178,21 @@ mod tests {
     fn test_file_identity(metadata: &std::fs::Metadata) -> u64 {
         use std::os::windows::fs::MetadataExt;
         metadata.creation_time()
+    }
+
+    #[test]
+    fn blank_orphan_chunks_hides_rows_deleted_from_the_db() {
+        let mut engine = SearchEngine::new(4);
+        engine.insert_chunk("kept".into(), vec![1.0, 0.0, 0.0, 0.0]);
+        engine.insert_chunk("purged".into(), vec![0.0, 1.0, 0.0, 0.0]);
+        let db_ids = std::collections::HashSet::from(["kept"]);
+        assert_eq!(engine.blank_orphan_chunks(&db_ids), 1);
+        assert!(engine.has_chunk("kept"));
+        assert!(!engine.has_chunk("purged"));
+        assert!(engine.is_dirty());
+        let hits = engine.search_chunks(&[0.0, 1.0, 0.0, 0.0], 2, -1.0);
+        assert!(hits.iter().all(|hit| hit.id != "purged"));
+        assert_eq!(engine.blank_orphan_chunks(&db_ids), 0);
     }
 
     #[test]

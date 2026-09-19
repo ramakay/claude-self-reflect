@@ -674,6 +674,90 @@ pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) 
     Ok(())
 }
 
+/// Remove the state of a conversation that should never have been corpus (a
+/// CSR agent transcript): its chunks with their embeddings, FTS rows, spans and
+/// provenance edges, and its enrichment and ratification rows with the
+/// ratification receipts, which are keyed by conversation id. Reflections and
+/// their receipts go separately (`purge_reflections`), only once nothing kept
+/// cites them. Append-only history (`provenance_events`, retrieval and exposure
+/// logs) stays as recorded. Returns the number of chunks removed.
+pub fn purge_conversation(conn: &Connection, conversation_id: &str) -> Result<usize> {
+    let chunks: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM chunks WHERE conversation_id = ?1",
+        params![conversation_id],
+        |row| row.get(0),
+    )?;
+    delete_chunks_for_conversation(conn, conversation_id)?;
+    conn.execute(
+        "DELETE FROM artifact_derivations WHERE artifact_kind = 'ratification' AND artifact_id = ?1",
+        params![conversation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM ratification_scores WHERE conversation_id = ?1",
+        params![conversation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM enrichment_state WHERE conversation_id = ?1",
+        params![conversation_id],
+    )?;
+    Ok(chunks as usize)
+}
+
+/// `(conversation id, reflection id)` for every enrichment row that produced
+/// a reflection.
+pub fn enrichment_reflection_refs(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT conversation_id, reflection_id FROM enrichment_state WHERE reflection_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+/// `(reflection id, conversation ids)` for every reflection carrying at least
+/// one `conv_<id>` tag, the tag each conversation-derived reflection is stored
+/// with (episodes, V3 extractions, heuristics, stories).
+pub fn reflection_conversation_tags(conn: &Connection) -> Result<Vec<(String, Vec<String>)>> {
+    let mut stmt = conn.prepare("SELECT id, tags FROM reflections WHERE tags LIKE '%\"conv_%'")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut tagged = Vec::new();
+    for row in rows {
+        let (id, tags) = row?;
+        let conversations: Vec<String> = serde_json::from_str::<Vec<String>>(&tags)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|tag| tag.strip_prefix("conv_").map(str::to_string))
+            .collect();
+        if !conversations.is_empty() {
+            tagged.push((id, conversations));
+        }
+    }
+    Ok(tagged)
+}
+
+/// Delete reflections with their embeddings and derivation receipts. A
+/// reflection some enrichment row still cites is left alone: the caller removes
+/// the rows of the conversations it purges first, so a surviving citation
+/// belongs to a conversation that is being kept. Returns the number deleted.
+pub fn purge_reflections(conn: &Connection, ids: &[String]) -> Result<usize> {
+    let cited = enrichment_reflection_refs(conn)?
+        .into_iter()
+        .map(|(_, reflection_id)| reflection_id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut deleted = 0;
+    for id in ids.iter().filter(|id| !cited.contains(*id)) {
+        conn.execute(
+            "DELETE FROM artifact_derivations WHERE artifact_kind = 'reflection' AND artifact_id = ?1",
+            params![id],
+        )?;
+        delete_reflection(conn, id)?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
 pub fn delete_chunk(conn: &Connection, chunk_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
