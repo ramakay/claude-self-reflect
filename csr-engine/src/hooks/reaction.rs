@@ -10,7 +10,24 @@ use crate::hooks::intent::cosine_sim;
 
 pub const MIN_MARGIN: f32 = 0.08;
 pub const REASK_PICKUP_SIMILARITY: f32 = 0.82;
-pub const REACTION_TURN_FILTER_VERSION: u32 = 1;
+/// Bump this when `reaction_turn_pairs` changes which entries it turns into
+/// pairs, so a changed classifier_hash forces a re-harvest under a fresh
+/// hash and old rows are never mixed with new ones. v2: one pair per human
+/// turn — a tool-use run of assistant entries before a single human reply
+/// now collapses to the last assistant entry (the one the human actually
+/// replied to) instead of emitting one duplicate pair per assistant entry.
+/// v3 (D3): `substantive_user` now gates on
+/// `extraction::provenance::extractable`, so a harness turn (a bare
+/// `<system-reminder>`, `<command-message>`, or other plumbing-only text)
+/// can no longer stand in as the reaction or as the `preceding_user_text`
+/// anchor; `preceding_user_text` also now requires
+/// `substantive_reaction_user` (not just `substantive_user`), so an
+/// interrupt marker or bare slash command between two assistant turns in a
+/// tool-use run is skipped in favor of the real prior question underneath
+/// it. Both changes can move which turn a pair resolves to, so old rows
+/// harvested under v1/v2 filtering must not be read as if they used this
+/// filter.
+pub const REACTION_TURN_FILTER_VERSION: u32 = 3;
 pub const PICKUP_QUESTION_FILTER_VERSION: u32 = 1;
 const NEAR_MISS_FLOOR_GAP: f32 = 0.05;
 const CACHE_SCHEMA: u32 = 1;

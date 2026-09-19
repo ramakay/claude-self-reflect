@@ -408,7 +408,7 @@ const REACTION_SELECT: &str =
             reaction, proposed_reaction, confidence, runner_up_score, margin,
             pickup_similarity, next_user_text, near_miss, classifier_hash,
             transcript_mtime, harvested_at, assistant_text
-     FROM rerank_reaction_labels";
+     FROM rerank_reaction_labels label";
 
 fn write_exposure(conn: &rusqlite::Connection, impression: &ExposureImpression) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
@@ -665,9 +665,21 @@ impl Storage {
     ) -> Result<ReactionLabelCounts> {
         self.with_connection(|conn| {
             let mut counts = ReactionLabelCounts::default();
+            // Rows are keyed by (session_id, assistant_turn, classifier_hash),
+            // so a human turn that follows several assistant entries in the
+            // same tool-use run can still carry rows from an earlier
+            // classifier_hash generation that predates the harvest-side
+            // dedupe. Collapse to the row with the highest assistant_turn per
+            // (session_id, next_user_turn) group before counting — SQLite's
+            // documented bare-column-with-MAX() rule returns the reaction and
+            // near_miss from that same row.
             let mut stmt = conn.prepare(
-                "SELECT reaction, COUNT(*), COALESCE(SUM(near_miss), 0)
-                 FROM rerank_reaction_labels WHERE classifier_hash = ?1 GROUP BY reaction",
+                "SELECT reaction, COUNT(*), COALESCE(SUM(near_miss), 0) FROM (
+                    SELECT reaction, near_miss, MAX(assistant_turn)
+                    FROM rerank_reaction_labels
+                    WHERE classifier_hash = ?1
+                    GROUP BY session_id, next_user_turn
+                 ) GROUP BY reaction",
             )?;
             let rows = stmt.query_map([classifier_hash], |row| {
                 Ok((
@@ -700,9 +712,21 @@ impl Storage {
     ) -> Result<Vec<ReactionLabel>> {
         self.with_connection(|conn| {
             let mut out = Vec::new();
+            // Same group-max collapse as `rerank_reaction_label_counts`: only
+            // the row with the highest assistant_turn per (session_id,
+            // next_user_turn) group is the one the current harvester would
+            // emit, so the audit sample must not spend its LIMIT on repeats
+            // of the same human turn.
+            let one_row_per_human_turn = "label.assistant_turn = (
+                SELECT MAX(duplicate.assistant_turn)
+                FROM rerank_reaction_labels duplicate
+                WHERE duplicate.session_id = label.session_id
+                  AND duplicate.next_user_turn = label.next_user_turn
+                  AND duplicate.classifier_hash = label.classifier_hash)";
             let class_sql = format!(
-                "{REACTION_SELECT} WHERE classifier_hash = ?1 AND reaction = ?2
-                 ORDER BY session_id, assistant_turn LIMIT ?3"
+                "{REACTION_SELECT} WHERE label.classifier_hash = ?1 AND label.reaction = ?2
+                 AND {one_row_per_human_turn}
+                 ORDER BY label.session_id, label.assistant_turn LIMIT ?3"
             );
             for reaction in ["acceptance", "correction", "reask", "redirect"] {
                 let mut stmt = conn.prepare(&class_sql)?;
@@ -713,8 +737,9 @@ impl Storage {
                 out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
             }
             let near_sql = format!(
-                "{REACTION_SELECT} WHERE classifier_hash = ?1 AND reaction = 'abstain'
-                 AND near_miss = 1 ORDER BY session_id, assistant_turn LIMIT ?2"
+                "{REACTION_SELECT} WHERE label.classifier_hash = ?1 AND label.reaction = 'abstain'
+                 AND label.near_miss = 1 AND {one_row_per_human_turn}
+                 ORDER BY label.session_id, label.assistant_turn LIMIT ?2"
             );
             let mut stmt = conn.prepare(&near_sql)?;
             let rows = stmt.query_map(
@@ -1312,6 +1337,113 @@ mod tests {
 
         assert_eq!(labels.len(), 1);
         assert_eq!(labels[0].assistant_text, "the assistant tail");
+    }
+
+    fn duplicate_reaction_label(assistant_turn: i64) -> ReactionLabel {
+        ReactionLabel {
+            session_id: "session".into(),
+            assistant_turn,
+            next_user_turn: 9,
+            assistant_ts: Some(format!("2026-08-24T00:00:0{assistant_turn}Z")),
+            next_user_ts: Some("2026-08-24T00:00:09Z".into()),
+            reaction: "correction".into(),
+            proposed_reaction: Some("correction".into()),
+            confidence: 0.9,
+            runner_up_score: 0.1,
+            margin: 0.8,
+            pickup_similarity: None,
+            next_user_text: "no, that is wrong".into(),
+            near_miss: false,
+            classifier_hash: "classifier".into(),
+            transcript_mtime: 1,
+            harvested_at: "2026-08-24T00:01:00Z".into(),
+            assistant_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn counts_and_audit_collapse_duplicate_rows_for_one_human_turn() {
+        let storage = Storage::open_memory().unwrap();
+        for assistant_turn in [5, 6, 7] {
+            storage
+                .upsert_rerank_reaction_label(&duplicate_reaction_label(assistant_turn))
+                .unwrap();
+        }
+
+        let counts = storage.rerank_reaction_label_counts("classifier").unwrap();
+        assert_eq!(counts.correction, 1);
+
+        let audited = storage
+            .audit_rerank_reaction_labels("classifier", 10, 10)
+            .unwrap();
+        assert_eq!(audited.len(), 1);
+        assert_eq!(audited[0].assistant_turn, 7);
+
+        // Reading deduped must never delete: all three rows are still on disk.
+        let raw_count: i64 = storage
+            .with_connection(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM rerank_reaction_labels", [], |row| {
+                    row.get(0)
+                })
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(raw_count, 3);
+    }
+
+    #[test]
+    fn exposure_join_matches_when_only_the_last_assistant_turn_is_labeled() {
+        let storage = Storage::open_memory().unwrap();
+        let mut impression = empty_impression();
+        impression.shown_at = "2026-08-24T00:00:30Z".into();
+        impression.items.push(ExposureItem {
+            rank: 0,
+            memory_id: "memory".into(),
+            conversation_id: None,
+            source_type: "chunk".into(),
+            baseline_score: Some(0.5),
+            cosine: Some(0.5),
+            recency: Some(0.5),
+            graph_proximity: None,
+            author: Some("user".into()),
+            is_scaffold: false,
+            is_mechanic: false,
+            supersedes: false,
+        });
+        storage.record_rerank_exposure(&impression).unwrap();
+        storage
+            .upsert_rerank_reaction_label(&ReactionLabel {
+                session_id: impression.session_id,
+                assistant_turn: 8,
+                next_user_turn: 9,
+                assistant_ts: Some("2026-08-24T00:01:00Z".into()),
+                next_user_ts: Some("2026-08-24T00:02:00Z".into()),
+                reaction: "acceptance".into(),
+                proposed_reaction: Some("acceptance".into()),
+                confidence: 0.9,
+                runner_up_score: 0.1,
+                margin: 0.8,
+                pickup_similarity: None,
+                next_user_text: "yes".into(),
+                near_miss: false,
+                classifier_hash: "classifier".into(),
+                transcript_mtime: 1,
+                harvested_at: "2026-08-24T00:03:00Z".into(),
+                assistant_text: String::new(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .load_labeled_rerank_exposures("classifier")
+                .unwrap()
+                .len(),
+            1
+        );
+        let stats = storage
+            .get_rerank_reaction_stats_batch("classifier", &["memory"])
+            .unwrap();
+        assert_eq!(stats["memory"].acceptance, 1);
     }
 
     #[test]

@@ -37,6 +37,22 @@ const MIN_EVAL_SESSIONS: usize = 5;
 /// One MiniLM window (the 384-dim embedder truncates at 256 tokens), so a
 /// future labeler can embed the tail without truncating it again.
 const ASSISTANT_TAIL_CHARS: usize = 1_000;
+/// Cap on sessions actually re-parsed and re-embedded in one
+/// [`harvest_reactions`] call. Bumping `classifier_hash` (e.g. a
+/// `REACTION_TURN_FILTER_VERSION` change) invalidates every
+/// `rerank_harvest_state` row under the old hash at once — 28,555 sources /
+/// 17,297 state rows measured on the live corpus — and each source that
+/// actually needs re-harvesting costs a blocking FastEmbed batch with no
+/// interruption point but `shutdown`. Without a cap, the first
+/// `run_training_cycle` after a hash bump would re-parse and re-embed the
+/// entire backlog in one uninterrupted loop, holding the daemon's training
+/// lane for hours before anything is trained. `rerank_harvest_is_current`
+/// already makes the backlog resumable (state is written per session as it
+/// harvests), so bound the real work here and let the next nightly cycle
+/// drain more of it instead of racing to finish in one pass. Counts only
+/// sessions that did real work (`sources_harvested`), not ones skipped as
+/// already current — those are a cheap SQL lookup, not an embedding batch.
+const HARVEST_SOURCES_PER_CYCLE: usize = 500;
 #[derive(Debug, Clone)]
 struct PreparedCandidate {
     memory_id: String,
@@ -63,10 +79,20 @@ struct ReactionTurnPair {
     next_user_text: String,
 }
 
+// D3: about a third of stored "user turns" measured on the live corpus are
+// harness plumbing, not something a human typed — tool results, system
+// reminders, hook-injected blocks, slash-command wrappers, CSR's own
+// emitted blocks. `extractable` already runs `strip_plumbing` over the
+// Claude Code command/reminder tag set and rejects empties and CSR
+// emissions on the cleaned text, so gate on it here instead of hand-rolling
+// a second regex pile. `is_noisy_steer_text` and the `<local-command-`
+// prefix check stay: they catch harness tags `extractable`'s tag list does
+// not own (`<task-notification>`, `[SYSTEM NOTIFICATION`, and any
+// `<local-command-*>` variant beyond caveat/stdout). `entry.text` itself is
+// never rewritten — only the gate looks at the cleaned text.
 fn substantive_user(entry: &Entry) -> bool {
     entry.role == Role::User
-        && !entry.text.trim().is_empty()
-        && !crate::extraction::provenance::is_csr_emission(&entry.text)
+        && crate::extraction::provenance::extractable(&entry.text).is_some()
         && !crate::transcript::instrumentation::is_noisy_steer_text(&entry.text)
         && !entry.text.trim_start().starts_with("<local-command-")
 }
@@ -124,10 +150,18 @@ fn reaction_turn_pairs(entries: &[Entry]) -> Vec<ReactionTurnPair> {
         let Some(next_user_ts) = canonical_timestamp(next_user.timestamp.as_deref()) else {
             continue;
         };
+        // `substantive_reaction_user`, not plain `substantive_user`: the
+        // anchor this walk resolves to feeds `pickup_is_eligible` /
+        // `is_question_like_prior` downstream, so it must be held to the
+        // same "is this actually a reaction-worthy human turn" bar as the
+        // next-user side — otherwise an interrupt marker
+        // (`[Request interrupted by user...]`), a bare slash command, or a
+        // reminder-only turn can win the walk over the real prior question
+        // it sits in front of, silently flipping a reask/correction label.
         let preceding_user_text = entries[..assistant_index]
             .iter()
             .rev()
-            .find(|entry| substantive_user(entry))
+            .find(|entry| substantive_reaction_user(entry))
             .map_or_else(String::new, |entry| entry.text.clone());
         pairs.push(ReactionTurnPair {
             assistant_turn: assistant.turn,
@@ -139,7 +173,23 @@ fn reaction_turn_pairs(entries: &[Entry]) -> Vec<ReactionTurnPair> {
             next_user_text: next_user.text.clone(),
         });
     }
-    pairs
+    // One human turn, one pair. Every assistant entry in a tool-use run
+    // resolves to the same next human turn, so the loop above emits the run
+    // once per entry; keep the LAST assistant entry, the one the human was
+    // actually replying to. Entries are visited in index order, so a run's
+    // pairs are contiguous and collapsing against the previous element is
+    // enough.
+    let mut deduped: Vec<ReactionTurnPair> = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        if deduped
+            .last()
+            .is_some_and(|previous| previous.next_user_turn == pair.next_user_turn)
+        {
+            deduped.pop();
+        }
+        deduped.push(pair);
+    }
+    deduped
 }
 
 fn conversation_is_contaminated(
@@ -171,6 +221,9 @@ pub async fn harvest_reactions(
     let mut summary = HarvestSummary::default();
     for source in storage.list_rerank_harvest_sources()? {
         if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        if summary.sources_harvested >= HARVEST_SOURCES_PER_CYCLE {
             break;
         }
         summary.sources_seen += 1;
@@ -1099,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn reaction_alignment_skips_tool_result_only_user_entries() {
+    fn reaction_alignment_emits_one_pair_per_human_turn() {
         let mut tool_result = entry(3, Role::User, "");
         tool_result.tool_results.push(ToolResult {
             tool_use_id: Some("tool-1".into()),
@@ -1117,10 +1170,29 @@ mod tests {
 
         let pairs = reaction_turn_pairs(&entries);
 
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0].assistant_turn, 2);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].assistant_turn, 4);
         assert_eq!(pairs[0].next_user_turn, 5);
         assert_eq!(pairs[0].preceding_user_text, "original request");
+        assert_eq!(pairs[0].assistant_text, "tool follow-up");
+    }
+
+    #[test]
+    fn each_human_turn_keeps_its_own_pair() {
+        let entries = vec![
+            entry(1, Role::User, "request"),
+            entry(2, Role::Assistant, "first"),
+            entry(3, Role::Assistant, "second"),
+            entry(4, Role::User, "no, that is wrong"),
+            entry(5, Role::Assistant, "third"),
+            entry(6, Role::User, "yes, better"),
+        ];
+
+        let pairs = reaction_turn_pairs(&entries);
+
+        assert_eq!(pairs.len(), 2);
+        assert_eq!((pairs[0].assistant_turn, pairs[0].next_user_turn), (3, 4));
+        assert_eq!((pairs[1].assistant_turn, pairs[1].next_user_turn), (5, 6));
     }
 
     #[test]
@@ -1207,6 +1279,124 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].next_user_turn, 8);
         assert_eq!(pairs[0].next_user_text, "No, the server is still down.");
+    }
+
+    // --- D3: harness plumbing must never stand in for a human reaction ---
+
+    #[test]
+    fn substantive_user_rejects_system_reminder_only_turn() {
+        let reminder = entry(
+            1,
+            Role::User,
+            "<system-reminder>be concise</system-reminder>",
+        );
+        assert!(!substantive_user(&reminder));
+        assert!(!substantive_reaction_user(&reminder));
+    }
+
+    #[test]
+    fn substantive_user_rejects_command_message_only_turn() {
+        let command = entry(
+            1,
+            Role::User,
+            "<command-message>memory-feedback</command-message>\n\
+             <command-name>/memory-feedback</command-name>",
+        );
+        assert!(!substantive_user(&command));
+    }
+
+    #[test]
+    fn reaction_alignment_skips_a_system_reminder_and_finds_the_real_reaction() {
+        // The scenario from the D3 review finding: a `<system-reminder>`-only
+        // turn sits directly after the assistant turn, ahead of the human's
+        // actual reply. Before the `extractable` gate this turn passed every
+        // check and was stored as the reaction while the real reply after it
+        // was never labeled at all.
+        let entries = vec![
+            entry(1, Role::User, "why is the parser failing?"),
+            entry(2, Role::Assistant, "because of a stray token"),
+            entry(
+                3,
+                Role::User,
+                "<system-reminder>be concise</system-reminder>",
+            ),
+            entry(4, Role::User, "no, that is not the actual cause"),
+        ];
+
+        let pairs = reaction_turn_pairs(&entries);
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].next_user_turn, 4);
+        assert_eq!(pairs[0].next_user_text, "no, that is not the actual cause");
+    }
+
+    #[test]
+    fn reaction_alignment_skips_a_command_message_only_turn() {
+        let entries = vec![
+            entry(1, Role::User, "why is the parser failing?"),
+            entry(2, Role::Assistant, "because of a stray token"),
+            entry(
+                3,
+                Role::User,
+                "<command-message>memory-feedback</command-message>",
+            ),
+            entry(4, Role::User, "no, that is not the actual cause"),
+        ];
+
+        let pairs = reaction_turn_pairs(&entries);
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].next_user_turn, 4);
+    }
+
+    #[test]
+    fn preceding_user_text_skips_plumbing_only_turns() {
+        // A `<system-reminder>`-only turn between the real prior question
+        // and the assistant turn must not become the resolved
+        // `preceding_user_text` anchor — it must walk past it to the real
+        // question underneath.
+        let entries = vec![
+            entry(1, Role::User, "why is the parser failing?"),
+            entry(
+                2,
+                Role::User,
+                "<system-reminder>be concise</system-reminder>",
+            ),
+            entry(3, Role::Assistant, "because of a stray token"),
+            entry(4, Role::User, "why is the parser failing?"),
+        ];
+
+        let pairs = reaction_turn_pairs(&entries);
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].preceding_user_text, "why is the parser failing?");
+    }
+
+    #[test]
+    fn preceding_user_text_skips_an_interrupt_marker_mid_run() {
+        // D2 review finding regression: dedupe collapses a tool-use run to
+        // its LAST assistant entry, so `preceding_user_text` must resolve
+        // past an interrupt marker sitting between the two assistant turns
+        // to the real prior question — otherwise a genuine re-ask
+        // (`is_question_like_prior` true on the real prior, false on the
+        // interrupt marker) silently loses its `pickup_reask` label after
+        // dedupe collapses the run.
+        let entries = vec![
+            entry(1, Role::User, "why is the parser failing?"),
+            entry(2, Role::Assistant, "because X"),
+            entry(3, Role::User, "[Request interrupted by user for tool use]"),
+            entry(4, Role::Assistant, "here's more detail"),
+            entry(5, Role::User, "why is the parser failing?"),
+        ];
+
+        let pairs = reaction_turn_pairs(&entries);
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].assistant_turn, 4);
+        assert_eq!(pairs[0].preceding_user_text, "why is the parser failing?");
+        assert!(reaction::is_question_like_prior(
+            &pairs[0].preceding_user_text
+        ));
     }
 
     #[test]
@@ -1335,5 +1525,74 @@ mod tests {
     fn chronological_gate_needs_ten_valid_clusters_spanning_five_sessions() {
         assert!(!evaluation_floor_is_met(learning::MIN_EVAL_CLUSTERS, 4));
         assert!(evaluation_floor_is_met(learning::MIN_EVAL_CLUSTERS, 5));
+    }
+
+    // Serializes `HOME` mutation across this test and any other test in the
+    // process that touches it — `cargo test` runs tests on multiple threads
+    // in one process, and `dirs::home_dir` (via `ProbeSet`'s cache path) and
+    // `std::env::var` are both process-global.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    #[ignore = "downloads the ~30MB ONNX model on first run; run with --ignored"]
+    fn harvest_reactions_bounds_work_per_cycle_and_resumes() {
+        // D2/D4 review finding: bumping `classifier_hash` invalidates every
+        // `rerank_harvest_state` row at once, and `harvest_reactions` had no
+        // per-cycle budget — the first cycle after a bump would re-parse and
+        // re-embed the entire backlog in one uninterrupted loop. Redirect
+        // `HOME` so `ProbeSet`'s on-disk cache never touches the real
+        // `~/.claude-self-reflect`.
+        let _guard = HOME_LOCK.lock().unwrap();
+        let previous_home = std::env::var("HOME").ok();
+        let home_dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", home_dir.path());
+
+        let transcripts = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        // No assistant turn in any transcript, so `reaction_turn_pairs` is
+        // empty and no per-source embedding batch runs — only the one-time
+        // exemplar-probe build pays the real model cost, keeping this test
+        // proportional to what it is checking (the loop bound), not to a
+        // corpus-sized embedding workload.
+        let total_sources = HARVEST_SOURCES_PER_CYCLE + 3;
+        for index in 0..total_sources {
+            let path = transcripts.path().join(format!("session-{index:04}.jsonl"));
+            std::fs::write(
+                &path,
+                "{\"type\":\"user\",\"message\":{\"content\":\
+                 [{\"type\":\"text\",\"text\":\"hello\"}]},\
+                 \"timestamp\":\"2026-08-24T00:00:00Z\"}\n",
+            )
+            .unwrap();
+            storage
+                .upsert_import_state_explicit(
+                    &path.to_string_lossy(),
+                    &format!("session-{index:04}"),
+                    0,
+                    "1",
+                )
+                .unwrap();
+        }
+
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let shutdown = AtomicBool::new(false);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let first = rt
+            .block_on(harvest_reactions(&storage, &embeddings, &shutdown))
+            .unwrap();
+        assert_eq!(first.sources_seen, HARVEST_SOURCES_PER_CYCLE);
+        assert_eq!(first.sources_harvested, HARVEST_SOURCES_PER_CYCLE);
+
+        let second = rt
+            .block_on(harvest_reactions(&storage, &embeddings, &shutdown))
+            .unwrap();
+        assert_eq!(second.sources_harvested, 3);
+        assert_eq!(second.sources_unchanged, HARVEST_SOURCES_PER_CYCLE);
+
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }
