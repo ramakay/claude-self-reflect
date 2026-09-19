@@ -34,6 +34,9 @@ pub struct HarvestSummary {
 
 const TRAIN_SEED: u64 = 0x4353_525F_4C54_5231;
 const MIN_EVAL_SESSIONS: usize = 5;
+/// One MiniLM window (the 384-dim embedder truncates at 256 tokens), so a
+/// future labeler can embed the tail without truncating it again.
+const ASSISTANT_TAIL_CHARS: usize = 1_000;
 #[derive(Debug, Clone)]
 struct PreparedCandidate {
     memory_id: String,
@@ -56,6 +59,7 @@ struct ReactionTurnPair {
     assistant_ts: Option<String>,
     next_user_ts: Option<String>,
     preceding_user_text: String,
+    assistant_text: String,
     next_user_text: String,
 }
 
@@ -75,6 +79,17 @@ fn canonical_timestamp(timestamp: Option<&str>) -> Option<String> {
     timestamp
         .and_then(crate::temporal::parse_timestamp)
         .map(|value| value.to_rfc3339())
+}
+
+/// Last [`ASSISTANT_TAIL_CHARS`] characters of the assistant turn the
+/// human reacted to. The tail, not the head: a reaction answers the end
+/// of a turn (the claim, the question, the summary), while the head is
+/// often a restatement of the prompt. Char-counted, so multi-byte text
+/// never splits mid-codepoint.
+fn assistant_tail(text: &str) -> String {
+    let trimmed = text.trim();
+    let skip = trimmed.chars().count().saturating_sub(ASSISTANT_TAIL_CHARS);
+    trimmed.chars().skip(skip).collect()
 }
 
 fn reaction_turn_pairs(entries: &[Entry]) -> Vec<ReactionTurnPair> {
@@ -120,6 +135,7 @@ fn reaction_turn_pairs(entries: &[Entry]) -> Vec<ReactionTurnPair> {
             assistant_ts: Some(assistant_ts),
             next_user_ts: Some(next_user_ts),
             preceding_user_text,
+            assistant_text: assistant_tail(&assistant.text),
             next_user_text: next_user.text.clone(),
         });
     }
@@ -249,6 +265,7 @@ pub async fn harvest_reactions(
                 classifier_hash: classifier_hash.clone(),
                 transcript_mtime: mtime,
                 harvested_at: harvested_at.clone(),
+                assistant_text: pair.assistant_text,
             });
         }
         storage.replace_rerank_session_labels(
@@ -1104,6 +1121,34 @@ mod tests {
         assert_eq!(pairs[0].assistant_turn, 2);
         assert_eq!(pairs[0].next_user_turn, 5);
         assert_eq!(pairs[0].preceding_user_text, "original request");
+    }
+
+    #[test]
+    fn reaction_pair_carries_the_bounded_assistant_tail() {
+        let assistant_text = format!("{} the final claim", "x".repeat(1_500));
+        let entries = vec![
+            entry(1, Role::User, "original request"),
+            entry(2, Role::Assistant, &assistant_text),
+            entry(3, Role::User, "no, that is wrong"),
+        ];
+
+        let pairs = reaction_turn_pairs(&entries);
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            pairs[0].assistant_text.chars().count(),
+            ASSISTANT_TAIL_CHARS
+        );
+        assert!(pairs[0].assistant_text.ends_with("the final claim"));
+    }
+
+    #[test]
+    fn assistant_tail_is_char_safe_and_keeps_short_turns_whole() {
+        assert_eq!(
+            assistant_tail(&"é".repeat(1_500)).chars().count(),
+            ASSISTANT_TAIL_CHARS
+        );
+        assert_eq!(assistant_tail("  short answer  "), "short answer");
     }
 
     #[test]

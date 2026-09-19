@@ -75,6 +75,7 @@ fn trained_rerank_persistence_is_auditable_and_batched() {
             classifier_hash: "classifier-1".into(),
             transcript_mtime: 42,
             harvested_at: "2026-08-01T11:00:00Z".into(),
+            assistant_text: "Here is the final answer.".into(),
         })
         .unwrap();
     storage
@@ -95,6 +96,7 @@ fn trained_rerank_persistence_is_auditable_and_batched() {
             classifier_hash: "classifier-1".into(),
             transcript_mtime: 43,
             harvested_at: "2026-08-02T11:00:00Z".into(),
+            assistant_text: "The change is in place.".into(),
         })
         .unwrap();
 

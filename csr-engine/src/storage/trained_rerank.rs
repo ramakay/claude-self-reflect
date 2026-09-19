@@ -70,6 +70,10 @@ pub struct ReactionLabel {
     pub classifier_hash: String,
     pub transcript_mtime: i64,
     pub harvested_at: String,
+    /// Bounded tail of the assistant turn this reaction answers. Empty for
+    /// rows harvested before the tail was captured — readers must treat `""`
+    /// as "not captured", never as "the assistant said nothing".
+    pub assistant_text: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +225,7 @@ fn row_to_reaction_label(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReactionLa
         classifier_hash: row.get(13)?,
         transcript_mtime: row.get(14)?,
         harvested_at: row.get(15)?,
+        assistant_text: row.get(16)?,
     })
 }
 
@@ -284,8 +289,8 @@ fn write_reaction_label(conn: &rusqlite::Connection, label: &ReactionLabel) -> R
          (session_id, assistant_turn, next_user_turn, assistant_ts, next_user_ts,
           reaction, proposed_reaction, confidence, runner_up_score, margin,
           pickup_similarity, next_user_text, near_miss, classifier_hash,
-          transcript_mtime, harvested_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+          transcript_mtime, harvested_at, assistant_text)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
          ON CONFLICT(session_id, assistant_turn, classifier_hash) DO UPDATE SET
           next_user_turn=excluded.next_user_turn,
           assistant_ts=excluded.assistant_ts, next_user_ts=excluded.next_user_ts,
@@ -293,7 +298,8 @@ fn write_reaction_label(conn: &rusqlite::Connection, label: &ReactionLabel) -> R
           confidence=excluded.confidence, runner_up_score=excluded.runner_up_score,
           margin=excluded.margin, pickup_similarity=excluded.pickup_similarity,
           next_user_text=excluded.next_user_text, near_miss=excluded.near_miss,
-          transcript_mtime=excluded.transcript_mtime, harvested_at=excluded.harvested_at",
+          transcript_mtime=excluded.transcript_mtime, harvested_at=excluded.harvested_at,
+          assistant_text=excluded.assistant_text",
         params![
             label.session_id,
             label.assistant_turn,
@@ -311,6 +317,7 @@ fn write_reaction_label(conn: &rusqlite::Connection, label: &ReactionLabel) -> R
             label.classifier_hash,
             label.transcript_mtime,
             label.harvested_at,
+            label.assistant_text,
         ],
     )?;
     Ok(())
@@ -400,7 +407,7 @@ const REACTION_SELECT: &str =
     "SELECT session_id, assistant_turn, next_user_turn, assistant_ts, next_user_ts,
             reaction, proposed_reaction, confidence, runner_up_score, margin,
             pickup_similarity, next_user_text, near_miss, classifier_hash,
-            transcript_mtime, harvested_at
+            transcript_mtime, harvested_at, assistant_text
      FROM rerank_reaction_labels";
 
 fn write_exposure(conn: &rusqlite::Connection, impression: &ExposureImpression) -> Result<()> {
@@ -1206,6 +1213,7 @@ mod tests {
                 classifier_hash: "classifier".into(),
                 transcript_mtime: 1,
                 harvested_at: "2026-08-24T06:00:00Z".into(),
+                assistant_text: String::new(),
             })
             .unwrap();
 
@@ -1258,6 +1266,7 @@ mod tests {
                     classifier_hash: "classifier".into(),
                     transcript_mtime: 1,
                     harvested_at: "2026-08-24T06:00:00Z".into(),
+                    assistant_text: String::new(),
                 })
                 .unwrap();
         }
@@ -1270,6 +1279,39 @@ mod tests {
             .get_rerank_reaction_stats_batch("classifier", &["memory-late", "memory-negative"])
             .unwrap();
         assert!(stats.is_empty());
+    }
+
+    #[test]
+    fn reaction_label_round_trips_the_assistant_text() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .upsert_rerank_reaction_label(&ReactionLabel {
+                session_id: "session".into(),
+                assistant_turn: 2,
+                next_user_turn: 3,
+                assistant_ts: Some("2026-08-24T05:00:01Z".into()),
+                next_user_ts: Some("2026-08-24T05:00:02Z".into()),
+                reaction: "acceptance".into(),
+                proposed_reaction: Some("acceptance".into()),
+                confidence: 0.9,
+                runner_up_score: 0.1,
+                margin: 0.8,
+                pickup_similarity: None,
+                next_user_text: "yes".into(),
+                near_miss: false,
+                classifier_hash: "classifier".into(),
+                transcript_mtime: 1,
+                harvested_at: "2026-08-24T06:00:00Z".into(),
+                assistant_text: "the assistant tail".into(),
+            })
+            .unwrap();
+
+        let labels = storage
+            .audit_rerank_reaction_labels("classifier", 1, 0)
+            .unwrap();
+
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].assistant_text, "the assistant tail");
     }
 
     #[test]

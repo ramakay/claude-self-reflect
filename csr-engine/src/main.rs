@@ -747,6 +747,9 @@ async fn run() -> Result<()> {
                     label.near_miss,
                     label.next_user_text
                 );
+                if !label.assistant_text.is_empty() {
+                    println!("--- assistant tail ---\n{}", label.assistant_text);
+                }
             }
         }
         return Ok(());

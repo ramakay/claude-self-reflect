@@ -1572,6 +1572,7 @@ pub fn run(conn: &Connection) -> Result<()> {
             margin REAL NOT NULL,
             pickup_similarity REAL,
             next_user_text TEXT NOT NULL,
+            assistant_text TEXT NOT NULL DEFAULT '',
             near_miss INTEGER NOT NULL DEFAULT 0,
             classifier_hash TEXT NOT NULL,
             transcript_mtime INTEGER NOT NULL,
@@ -1670,6 +1671,14 @@ pub fn run(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE rerank_gate_clusters
              ADD COLUMN distinct_session_count INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    // Assistant tail captured with each reaction (D1). Additive: SQLite's
+    // ADD COLUMN with a constant default rewrites no rows.
+    if !has_column(conn, "rerank_reaction_labels", "assistant_text")? {
+        conn.execute_batch(
+            "ALTER TABLE rerank_reaction_labels
+             ADD COLUMN assistant_text TEXT NOT NULL DEFAULT '';",
         )?;
     }
     conn.execute(
@@ -2470,6 +2479,22 @@ mod tests {
         run(&conn).expect("second migrations::run (idempotent)");
         assert!(has_column(&conn, "narrative_usage", "ref_id").unwrap());
         assert!(has_index(&conn, "narrative_usage", "idx_narrative_usage_ref").unwrap());
+    }
+
+    #[test]
+    fn reaction_label_assistant_text_column_is_added_and_is_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).expect("first migrations::run");
+        assert!(has_column(&conn, "rerank_reaction_labels", "assistant_text").unwrap());
+
+        conn.execute_batch("ALTER TABLE rerank_reaction_labels DROP COLUMN assistant_text")
+            .expect("drop column to simulate a pre-existing database");
+        assert!(!has_column(&conn, "rerank_reaction_labels", "assistant_text").unwrap());
+
+        run(&conn).expect("second migrations::run (repair)");
+        assert!(has_column(&conn, "rerank_reaction_labels", "assistant_text").unwrap());
+        run(&conn).expect("third migrations::run (idempotent)");
+        assert!(has_column(&conn, "rerank_reaction_labels", "assistant_text").unwrap());
     }
 
     #[test]
