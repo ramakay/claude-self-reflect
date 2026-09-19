@@ -427,6 +427,37 @@ async fn replace_vector(engine: &Engine, chunk: &ConversationChunk, embedding: V
 /// Reflections deleted per transaction during an agent-transcript purge.
 const PURGE_REFLECTION_BATCH: usize = 500;
 
+/// A purge shares the database with hooks firing in live sessions. It waits
+/// for them rather than dying part-way with the index manifest already gone.
+const MAINTENANCE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const BUSY_RETRIES: usize = 10;
+
+fn is_database_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(failure, _))
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    })
+}
+
+async fn retry_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempt = 0;
+    loop {
+        match operation() {
+            Err(error) if attempt < BUSY_RETRIES && is_database_busy(&error) => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 pub async fn run_scrub(
     engine: &Engine,
     dry_run: bool,
@@ -438,6 +469,9 @@ pub async fn run_scrub(
     }
 
     let mut report = ScrubReport::default();
+    engine
+        .storage()
+        .set_busy_timeout(MAINTENANCE_BUSY_TIMEOUT)?;
     let agents = agent_transcripts(engine.storage(), conversation)?;
     if !agents.is_empty() {
         engine.invalidate_index_manifest()?;
@@ -449,11 +483,9 @@ pub async fn run_scrub(
     // so an interrupted run never leaves a row pointing at a deleted reflection.
     for agent in &agents {
         summarize_agent_transcript(agent, &mut report);
-        engine
-            .storage()
-            .purge_conversation(&agent.conversation_id)?;
+        retry_busy(|| engine.storage().purge_conversation(&agent.conversation_id)).await?;
         for path in &agent.source_paths {
-            engine.storage().mark_file_imported(path, 0)?;
+            retry_busy(|| engine.storage().mark_file_imported(path, 0)).await?;
         }
     }
     let reflection_ids = agents
@@ -464,7 +496,7 @@ pub async fn run_scrub(
     // reflection a kept conversation came to cite since the plan was read.
     let mut reflections_deleted = 0;
     for batch in reflection_ids.chunks(PURGE_REFLECTION_BATCH) {
-        reflections_deleted += engine.storage().purge_reflections(batch)?;
+        reflections_deleted += retry_busy(|| engine.storage().purge_reflections(batch)).await?;
     }
     report.agent_reflections_purged = reflections_deleted;
 
@@ -1139,6 +1171,40 @@ mod tests {
         // Second run finds nothing: the purge is idempotent.
         let again = super::run_scrub(&engine, false, None, true).await.unwrap();
         assert_eq!(again.agent_transcripts_purged, 0);
+    }
+
+    #[tokio::test]
+    async fn busy_database_is_retried_and_other_errors_are_not() {
+        let busy = || {
+            anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some("database is locked".into()),
+            ))
+            .context("purging")
+        };
+        assert!(super::is_database_busy(&busy()));
+        assert!(!super::is_database_busy(&anyhow::anyhow!("no such table")));
+
+        let mut calls = 0;
+        let result = super::retry_busy(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(busy())
+            } else {
+                Ok(calls)
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 3);
+
+        let mut calls = 0;
+        let failed: anyhow::Result<()> = super::retry_busy(|| {
+            calls += 1;
+            Err(anyhow::anyhow!("no such table"))
+        })
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[tokio::test]
