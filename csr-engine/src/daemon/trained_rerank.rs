@@ -30,6 +30,7 @@ pub struct HarvestSummary {
     pub sources_unchanged: usize,
     pub contaminated: usize,
     pub labels: usize,
+    pub embed_batches: usize,
 }
 
 const TRAIN_SEED: u64 = 0x4353_525F_4C54_5231;
@@ -37,22 +38,26 @@ const MIN_EVAL_SESSIONS: usize = 5;
 /// One MiniLM window (the 384-dim embedder truncates at 256 tokens), so a
 /// future labeler can embed the tail without truncating it again.
 const ASSISTANT_TAIL_CHARS: usize = 1_000;
-/// Cap on sessions actually re-parsed and re-embedded in one
-/// [`harvest_reactions`] call. Bumping `classifier_hash` (e.g. a
-/// `REACTION_TURN_FILTER_VERSION` change) invalidates every
-/// `rerank_harvest_state` row under the old hash at once — 28,555 sources /
-/// 17,297 state rows measured on the live corpus — and each source that
-/// actually needs re-harvesting costs a blocking FastEmbed batch with no
-/// interruption point but `shutdown`. Without a cap, the first
-/// `run_training_cycle` after a hash bump would re-parse and re-embed the
-/// entire backlog in one uninterrupted loop, holding the daemon's training
-/// lane for hours before anything is trained. `rerank_harvest_is_current`
-/// already makes the backlog resumable (state is written per session as it
-/// harvests), so bound the real work here and let the next nightly cycle
-/// drain more of it instead of racing to finish in one pass. Counts only
-/// sessions that did real work (`sources_harvested`), not ones skipped as
-/// already current — those are a cheap SQL lookup, not an embedding batch.
-const HARVEST_SOURCES_PER_CYCLE: usize = 500;
+/// Cap on blocking FastEmbed batches actually run in one [`harvest_reactions`]
+/// call. Bumping `classifier_hash` (e.g. a `REACTION_TURN_FILTER_VERSION`
+/// change) invalidates every `rerank_harvest_state` row under the old hash at
+/// once — 28,555 sources / 17,297 state rows measured on the live corpus —
+/// and the only expensive step per source is the embed batch inside
+/// `tokio::task::spawn_blocking`, with no interruption point but `shutdown`.
+/// Without a cap, the first `run_training_cycle` after a hash bump would
+/// re-embed the entire backlog in one uninterrupted loop, holding the
+/// daemon's training lane for hours before anything is trained.
+/// `rerank_harvest_is_current` already makes the backlog resumable (state is
+/// written per session as it harvests), so bound the real work here and let
+/// the next nightly cycle drain more of it instead of racing to finish in
+/// one pass. Counts only sources that actually ran an embed batch
+/// (`embed_batches`), not every source visited: a contaminated source or one
+/// with zero reaction pairs is a cheap SQL lookup plus a parse, never an
+/// embedding batch, and must not eat this budget — on the live corpus 99% of
+/// re-harvested sources take that cheap path (19,886/20,112 contaminated,
+/// 20,052/20,112 zero-label), so counting sources visited instead of embed
+/// batches run made the cap ~58 nightly cycles to refill after a hash bump.
+const HARVEST_EMBED_BATCHES_PER_CYCLE: usize = 500;
 #[derive(Debug, Clone)]
 struct PreparedCandidate {
     memory_id: String,
@@ -82,17 +87,29 @@ struct ReactionTurnPair {
 // D3: about a third of stored "user turns" measured on the live corpus are
 // harness plumbing, not something a human typed — tool results, system
 // reminders, hook-injected blocks, slash-command wrappers, CSR's own
-// emitted blocks. `extractable` already runs `strip_plumbing` over the
-// Claude Code command/reminder tag set and rejects empties and CSR
-// emissions on the cleaned text, so gate on it here instead of hand-rolling
-// a second regex pile. `is_noisy_steer_text` and the `<local-command-`
-// prefix check stay: they catch harness tags `extractable`'s tag list does
-// not own (`<task-notification>`, `[SYSTEM NOTIFICATION`, and any
-// `<local-command-*>` variant beyond caveat/stdout). `entry.text` itself is
-// never rewritten — only the gate looks at the cleaned text.
+// emitted blocks. D3's job is to reject THAT, and nothing more, so gate on
+// `strip_plumbing` (Claude Code's command/reminder tag set) plus
+// `is_csr_emission` on what is left, not the full `extractable` pipeline:
+// `extractable` also runs `strip_quoted`, which deletes fenced code blocks,
+// long inline code, and blockquote lines as "mentions" — right for episode
+// extraction, wrong here, because a human turn that is ONLY a pasted error
+// log in a ``` fence right after the assistant claims success is the
+// archetypal correction and must stay a reaction candidate, not clean to
+// empty and get rejected as if it were plumbing. `is_noisy_steer_text` and
+// the `<local-command-` prefix check stay: they catch harness tags
+// `strip_plumbing`'s tag list does not own (`<task-notification>`,
+// `[SYSTEM NOTIFICATION`, and any `<local-command-*>` variant beyond
+// caveat/stdout). `entry.text` itself is never rewritten — only the gate
+// looks at the cleaned text.
+fn plumbing_substantive(text: &str) -> bool {
+    let unplumbed = crate::extraction::provenance::strip_plumbing(text);
+    let cleaned = unplumbed.trim();
+    !cleaned.is_empty() && !crate::extraction::provenance::is_csr_emission(cleaned)
+}
+
 fn substantive_user(entry: &Entry) -> bool {
     entry.role == Role::User
-        && crate::extraction::provenance::extractable(&entry.text).is_some()
+        && plumbing_substantive(&entry.text)
         && !crate::transcript::instrumentation::is_noisy_steer_text(&entry.text)
         && !entry.text.trim_start().starts_with("<local-command-")
 }
@@ -223,7 +240,7 @@ pub async fn harvest_reactions(
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
-        if summary.sources_harvested >= HARVEST_SOURCES_PER_CYCLE {
+        if summary.embed_batches >= HARVEST_EMBED_BATCHES_PER_CYCLE {
             break;
         }
         summary.sources_seen += 1;
@@ -271,11 +288,13 @@ pub async fn harvest_reactions(
             Vec::new()
         } else {
             let engine = embeddings.clone();
-            tokio::task::spawn_blocking(move || {
+            let embedded = tokio::task::spawn_blocking(move || {
                 let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
                 engine.embed(&refs)
             })
-            .await??
+            .await??;
+            summary.embed_batches += 1;
+            embedded
         };
         if vectors.len() != pairs.len() * 2 {
             anyhow::bail!(
@@ -1306,6 +1325,50 @@ mod tests {
     }
 
     #[test]
+    fn substantive_user_keeps_a_fence_only_pasted_log_turn() {
+        // The fix-round regression: a human turn that is ONLY a pasted error
+        // log in a ``` fence right after the assistant claims success is the
+        // archetypal correction. The full `extractable` pipeline's
+        // `strip_quoted` step used to clean this to empty and reject it as
+        // if it were harness plumbing; `plumbing_substantive` must not.
+        let pasted_log = entry(
+            1,
+            Role::User,
+            "```\ntraceback (most recent call last):\n  File \"app.py\", line 12\nValueError: boom\n```",
+        );
+        assert!(substantive_user(&pasted_log));
+        assert!(substantive_reaction_user(&pasted_log));
+    }
+
+    #[test]
+    fn substantive_user_keeps_a_blockquote_only_turn() {
+        let quoted = entry(
+            1,
+            Role::User,
+            "> this is the exact error the pipeline printed and it is still wrong",
+        );
+        assert!(substantive_user(&quoted));
+    }
+
+    #[test]
+    fn substantive_user_rejects_a_system_notification_turn() {
+        // Not covered by `strip_plumbing`'s tag list — `is_noisy_steer_text`
+        // still owns this one, and must keep rejecting it.
+        let notification = entry(
+            1,
+            Role::User,
+            "[SYSTEM NOTIFICATION - NOT USER INPUT]\nbackground task finished",
+        );
+        assert!(!substantive_user(&notification));
+    }
+
+    #[test]
+    fn substantive_user_rejects_a_csr_emission_turn() {
+        let echoed = entry(1, Role::User, "## CSR Memory Feedback\nsome probe output");
+        assert!(!substantive_user(&echoed));
+    }
+
+    #[test]
     fn reaction_alignment_skips_a_system_reminder_and_finds_the_real_reaction() {
         // The scenario from the D3 review finding: a `<system-reminder>`-only
         // turn sits directly after the assistant turn, ahead of the human's
@@ -1533,44 +1596,100 @@ mod tests {
     // `std::env::var` are both process-global.
     static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Restores `HOME` to whatever it was before [`HomeGuard::set`] on drop
+    /// — including on an early return via a panicking `assert!`. A
+    /// straight-line "restore at the end of the function" leaves `HOME`
+    /// pointing at a tempdir that is about to be deleted (the `TempDir`
+    /// guard above it also drops on unwind) whenever an assertion earlier in
+    /// the test fails, poisoning every later test in the process that reads
+    /// `HOME`.
+    struct HomeGuard(Option<std::ffi::OsString>);
+
+    impl HomeGuard {
+        fn set(new_home: &Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", new_home);
+            Self(previous)
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// One JSONL transcript line for a cheap, pair-less source: a single
+    /// user turn with no assistant reply, so `reaction_turn_pairs` is empty
+    /// and `harvest_reactions` never reaches the embedding branch for it.
+    fn cheap_source_line() -> String {
+        "{\"type\":\"user\",\"message\":{\"content\":\
+         [{\"type\":\"text\",\"text\":\"hello\"}]},\
+         \"timestamp\":\"2026-08-24T00:00:00Z\"}\n"
+            .to_string()
+    }
+
+    /// Two JSONL transcript lines forming exactly one reaction pair: an
+    /// assistant turn followed by a substantive human reply inside
+    /// `MAX_REACTION_GAP_SECONDS`, so `harvest_reactions` runs exactly one
+    /// blocking embed batch for this source.
+    fn embed_source_lines() -> String {
+        "{\"type\":\"assistant\",\"timestamp\":\"2026-08-24T00:00:00Z\",\
+         \"message\":{\"role\":\"assistant\",\"content\":\
+         [{\"type\":\"text\",\"text\":\"done, tests pass\"}]}}\n\
+         {\"type\":\"user\",\"timestamp\":\"2026-08-24T00:00:01Z\",\
+         \"message\":{\"content\":[{\"type\":\"text\",\
+         \"text\":\"yes, that solved it\"}]}}\n"
+            .to_string()
+    }
+
     #[test]
     #[ignore = "downloads the ~30MB ONNX model on first run; run with --ignored"]
     fn harvest_reactions_bounds_work_per_cycle_and_resumes() {
-        // D2/D4 review finding: bumping `classifier_hash` invalidates every
-        // `rerank_harvest_state` row at once, and `harvest_reactions` had no
-        // per-cycle budget — the first cycle after a bump would re-parse and
-        // re-embed the entire backlog in one uninterrupted loop. Redirect
-        // `HOME` so `ProbeSet`'s on-disk cache never touches the real
-        // `~/.claude-self-reflect`.
-        let _guard = HOME_LOCK.lock().unwrap();
-        let previous_home = std::env::var("HOME").ok();
+        // Fix-round review finding: the per-cycle budget counted every
+        // source visited (`sources_harvested`), including contaminated and
+        // pair-less sources that never reach the expensive step — the
+        // blocking FastEmbed batch. Measured on the live corpus, ~99% of
+        // re-harvested sources take that cheap path, so the old cap left the
+        // real bottleneck (embed batches) effectively unbounded per cycle
+        // while starving the *actual* backlog drain rate. Prove the new
+        // contract instead: cheap sources (pair-less here) never count
+        // against `HARVEST_EMBED_BATCHES_PER_CYCLE`, no matter how many of
+        // them run ahead of the embedding sources, and only real embed
+        // batches trip the cap. Redirect `HOME` so `ProbeSet`'s on-disk
+        // cache never touches the real `~/.claude-self-reflect`.
+        let _lock = HOME_LOCK.lock().unwrap();
         let home_dir = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", home_dir.path());
+        let _home_guard = HomeGuard::set(home_dir.path());
 
         let transcripts = tempfile::TempDir::new().unwrap();
         let storage = Arc::new(Storage::open_memory().unwrap());
-        // No assistant turn in any transcript, so `reaction_turn_pairs` is
-        // empty and no per-source embedding batch runs — only the one-time
-        // exemplar-probe build pays the real model cost, keeping this test
-        // proportional to what it is checking (the loop bound), not to a
-        // corpus-sized embedding workload.
-        let total_sources = HARVEST_SOURCES_PER_CYCLE + 3;
-        for index in 0..total_sources {
-            let path = transcripts.path().join(format!("session-{index:04}.jsonl"));
-            std::fs::write(
-                &path,
-                "{\"type\":\"user\",\"message\":{\"content\":\
-                 [{\"type\":\"text\",\"text\":\"hello\"}]},\
-                 \"timestamp\":\"2026-08-24T00:00:00Z\"}\n",
-            )
-            .unwrap();
+
+        // More cheap (pair-less) sources than the embed-batch cap. Named to
+        // sort before the embedding sources (`list_rerank_harvest_sources`
+        // orders by `conversation_id`), so the loop visits every cheap
+        // source first and none of them may consume any of the budget.
+        let cheap_count = HARVEST_EMBED_BATCHES_PER_CYCLE + 3;
+        for index in 0..cheap_count {
+            let session_id = format!("session-a-cheap-{index:04}");
+            let path = transcripts.path().join(format!("{session_id}.jsonl"));
+            std::fs::write(&path, cheap_source_line()).unwrap();
             storage
-                .upsert_import_state_explicit(
-                    &path.to_string_lossy(),
-                    &format!("session-{index:04}"),
-                    0,
-                    "1",
-                )
+                .upsert_import_state_explicit(&path.to_string_lossy(), &session_id, 0, "1")
+                .unwrap();
+        }
+        // More embedding sources than the cap too, so the first call must
+        // stop partway through them instead of draining the whole backlog.
+        let embed_count = HARVEST_EMBED_BATCHES_PER_CYCLE + 3;
+        for index in 0..embed_count {
+            let session_id = format!("session-b-embed-{index:04}");
+            let path = transcripts.path().join(format!("{session_id}.jsonl"));
+            std::fs::write(&path, embed_source_lines()).unwrap();
+            storage
+                .upsert_import_state_explicit(&path.to_string_lossy(), &session_id, 0, "1")
                 .unwrap();
         }
 
@@ -1581,18 +1700,80 @@ mod tests {
         let first = rt
             .block_on(harvest_reactions(&storage, &embeddings, &shutdown))
             .unwrap();
-        assert_eq!(first.sources_seen, HARVEST_SOURCES_PER_CYCLE);
-        assert_eq!(first.sources_harvested, HARVEST_SOURCES_PER_CYCLE);
+        // All cheap sources got through — the cap never saw them — plus
+        // exactly the embed-batch budget's worth of embedding sources.
+        assert_eq!(first.embed_batches, HARVEST_EMBED_BATCHES_PER_CYCLE);
+        assert_eq!(
+            first.sources_seen,
+            cheap_count + HARVEST_EMBED_BATCHES_PER_CYCLE
+        );
+        assert_eq!(
+            first.sources_harvested,
+            cheap_count + HARVEST_EMBED_BATCHES_PER_CYCLE
+        );
+        assert_eq!(first.labels, HARVEST_EMBED_BATCHES_PER_CYCLE);
 
         let second = rt
             .block_on(harvest_reactions(&storage, &embeddings, &shutdown))
             .unwrap();
+        // Resumes on exactly the leftover embedding sources; everything
+        // already harvested is now current and skipped.
+        assert_eq!(second.embed_batches, 3);
         assert_eq!(second.sources_harvested, 3);
-        assert_eq!(second.sources_unchanged, HARVEST_SOURCES_PER_CYCLE);
+        assert_eq!(
+            second.sources_unchanged,
+            cheap_count + HARVEST_EMBED_BATCHES_PER_CYCLE
+        );
+    }
 
-        match previous_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+    /// Pure mirror of the per-cycle loop's cap decision in
+    /// [`harvest_reactions`] (loop-top check on `summary.embed_batches`,
+    /// incremented only when a source's text batch is non-empty and an
+    /// embed actually runs) — isolated from `ProbeSet`/`EmbeddingEngine` so
+    /// the budget contract is checkable without the ONNX model. `costs` is
+    /// the sequence of per-source costs the real loop would see, in visit
+    /// order; returns `(sources_processed, embed_batches_run)`.
+    fn run_capped_by_embed_batches(costs: &[bool], cap: usize) -> (usize, usize) {
+        let mut processed = 0;
+        let mut embed_batches = 0;
+        for &runs_embed_batch in costs {
+            if embed_batches >= cap {
+                break;
+            }
+            processed += 1;
+            if runs_embed_batch {
+                embed_batches += 1;
+            }
         }
+        (processed, embed_batches)
+    }
+
+    #[test]
+    fn embed_batch_cap_never_counts_cheap_sources() {
+        // An arbitrarily long run of cheap sources (contaminated or
+        // pair-less — `false` here) ahead of the cap's worth of embedding
+        // sources (`true`) must all get processed; the cap only starts
+        // counting once an embed batch actually runs.
+        let mut costs = vec![false; HARVEST_EMBED_BATCHES_PER_CYCLE * 3];
+        costs.extend(vec![true; HARVEST_EMBED_BATCHES_PER_CYCLE + 5]);
+
+        let (processed, embed_batches) =
+            run_capped_by_embed_batches(&costs, HARVEST_EMBED_BATCHES_PER_CYCLE);
+
+        assert_eq!(embed_batches, HARVEST_EMBED_BATCHES_PER_CYCLE);
+        assert_eq!(
+            processed,
+            HARVEST_EMBED_BATCHES_PER_CYCLE * 3 + HARVEST_EMBED_BATCHES_PER_CYCLE
+        );
+    }
+
+    #[test]
+    fn embed_batch_cap_stops_before_the_next_embed_batch_once_spent() {
+        let costs = vec![true; HARVEST_EMBED_BATCHES_PER_CYCLE + 1];
+
+        let (processed, embed_batches) = run_capped_by_embed_batches(&costs, 1);
+
+        assert_eq!(embed_batches, 1);
+        assert_eq!(processed, 1);
     }
 }

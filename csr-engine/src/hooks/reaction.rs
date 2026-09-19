@@ -27,7 +27,15 @@ pub const REASK_PICKUP_SIMILARITY: f32 = 0.82;
 /// it. Both changes can move which turn a pair resolves to, so old rows
 /// harvested under v1/v2 filtering must not be read as if they used this
 /// filter.
-pub const REACTION_TURN_FILTER_VERSION: u32 = 3;
+/// v4: `substantive_user` gates on plumbing-strip + CSR-emission check only
+/// (`plumbing_substantive`), not the full `extractable` pipeline —
+/// `extractable`'s `strip_quoted` step deleted fenced code, long inline
+/// code, and blockquote lines, so a human turn that was only a pasted error
+/// log in a fence resolved to empty and was rejected as if it were harness
+/// plumbing. That can move which turn a pair resolves to (a fence-only or
+/// blockquote-only turn that used to be skipped can now anchor a pair), so
+/// v3 rows must not be read as if they used this filter.
+pub const REACTION_TURN_FILTER_VERSION: u32 = 4;
 pub const PICKUP_QUESTION_FILTER_VERSION: u32 = 1;
 const NEAR_MISS_FLOOR_GAP: f32 = 0.05;
 const CACHE_SCHEMA: u32 = 1;
