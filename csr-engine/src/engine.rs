@@ -125,10 +125,14 @@ impl Engine {
             // 1. Blank orphan entries (deleted from DB since last dump)
             // 2. Backfill missing entries (added to DB since last dump)
             let mut search = cached;
+            // Orphan share of each index, measured against the id set read for
+            // this reconciliation (not the earlier count, which writers can move).
+            let mut orphans_material = false;
             if let Ok(db_ids) = storage.load_all_reflection_ids() {
                 let db_id_set: std::collections::HashSet<&str> =
                     db_ids.iter().map(|s| s.as_str()).collect();
                 let blanked = search.blank_orphan_reflections(&db_id_set);
+                orphans_material |= blanked * ORPHAN_REBUILD_DIVISOR > db_id_set.len().max(1);
                 if blanked > 0 {
                     tracing::info!(blanked, "blanked orphan reflection entries in HNSW cache");
                 }
@@ -159,6 +163,17 @@ impl Engine {
             // full HNSW rebuild (~tens of seconds), while keeping peak transient
             // memory O(batch) rather than O(corpus).
             if let Ok(db_chunk_ids) = storage.load_all_chunk_ids() {
+                // The manifest count is written by whoever dumps, from the DB at
+                // dump time. A long-running process that loaded before a purge
+                // and dumps after it persists every purged vector under a count
+                // that matches the DB, so the count check above accepts it.
+                let db_id_set: std::collections::HashSet<&str> =
+                    db_chunk_ids.iter().map(|s| s.as_str()).collect();
+                let orphan_chunks = search.blank_orphan_chunks(&db_id_set);
+                orphans_material |= orphan_chunks * ORPHAN_REBUILD_DIVISOR > db_id_set.len().max(1);
+                if orphan_chunks > 0 {
+                    tracing::info!(orphan_chunks, "blanked orphan chunk entries in HNSW cache");
+                }
                 let missing: Vec<String> = db_chunk_ids
                     .into_iter()
                     .filter(|id| !search.has_chunk(id))
@@ -178,6 +193,21 @@ impl Engine {
                     cache_age_secs = cache_age.map(|d| d.as_secs()),
                     "HNSW cache behind DB at startup — additive backfill applied"
                 );
+            }
+            // hnsw_rs cannot delete. A blanked slot still takes a neighbour
+            // position and search does not over-fetch, so a cache that is
+            // materially tombstones returns short result lists: rebuild it.
+            if orphans_material {
+                tracing::info!("HNSW cache holds purged vectors — rebuilding");
+                let (mut fresh, _, _) = rebuild_search_index_streaming(&storage, RECONCILE_BATCH)?;
+                let chunk_count = storage.count_chunk_embeddings().unwrap_or(chunk_count);
+                let reflection_count = storage
+                    .count_reflection_embeddings()
+                    .unwrap_or(reflection_count);
+                if let Err(e) = fresh.dump_to_disk(&index_dir, chunk_count, reflection_count) {
+                    tracing::warn!(error = %e, "failed to cache HNSW index (non-fatal)");
+                }
+                search = fresh;
             }
             search
         } else {
@@ -717,6 +747,10 @@ impl Engine {
         Ok(())
     }
 }
+
+/// A loaded cache is rebuilt when orphan slots in either index exceed 1/N of
+/// its live rows (5%). Below that the blanked slots cost less than a rebuild.
+const ORPHAN_REBUILD_DIVISOR: usize = 20;
 
 /// Batch size for reconciling the HNSW cache against SQLite: both the
 /// additive-drift backfill (missing ids only) and the cache-miss full

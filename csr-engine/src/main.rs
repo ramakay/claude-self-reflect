@@ -387,6 +387,10 @@ enum BackfillAction {
         /// Restrict remediation to one contaminated conversation.
         #[arg(long)]
         conversation: Option<String>,
+        /// Only purge conversations whose transcript is a CSR agent prompt
+        /// (narrator, ratification, briefing children); skip the emission scrub.
+        #[arg(long)]
+        agent_transcripts: bool,
     },
 }
 
@@ -1087,18 +1091,30 @@ async fn run() -> Result<()> {
     }
 
     if let Some(Commands::Backfill {
-        action: BackfillAction::Scrub {
-            dry_run,
-            conversation,
-        },
+        action:
+            BackfillAction::Scrub {
+                dry_run,
+                conversation,
+                agent_transcripts,
+            },
     }) = &args.command
     {
         let report = if *dry_run {
             let storage = csr_engine::storage::Storage::open_read_only(&args.db_path)?;
-            csr_engine::import::scrub::dry_run_scrub(&storage, conversation.as_deref())?
+            csr_engine::import::scrub::dry_run_scrub(
+                &storage,
+                conversation.as_deref(),
+                *agent_transcripts,
+            )?
         } else {
             let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-            csr_engine::import::scrub::run_scrub(&eng, false, conversation.as_deref()).await?
+            csr_engine::import::scrub::run_scrub(
+                &eng,
+                false,
+                conversation.as_deref(),
+                *agent_transcripts,
+            )
+            .await?
         };
         print!("{}", report.format_text(*dry_run));
         if !dry_run {

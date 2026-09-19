@@ -834,6 +834,37 @@ impl Storage {
         Ok(())
     }
 
+    /// Atomically remove one conversation that should never have been corpus.
+    /// See `queries::purge_conversation`. Returns the number of chunks removed.
+    pub fn purge_conversation(&self, conversation_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.unchecked_transaction()?;
+        let chunks = queries::purge_conversation(&tx, conversation_id)?;
+        tx.commit()?;
+        Ok(chunks)
+    }
+
+    /// See `queries::enrichment_reflection_refs`.
+    pub fn enrichment_reflection_refs(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::enrichment_reflection_refs(&conn)
+    }
+
+    /// See `queries::reflection_conversation_tags`.
+    pub fn reflection_conversation_tags(&self) -> Result<Vec<(String, Vec<String>)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::reflection_conversation_tags(&conn)
+    }
+
+    /// Atomically delete a batch of reflections. See `queries::purge_reflections`.
+    pub fn purge_reflections(&self, ids: &[String]) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.unchecked_transaction()?;
+        let deleted = queries::purge_reflections(&tx, ids)?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     /// Record a task-derived resolution proposal. Proposals are NOT verdicts:
     /// they live in their own table, invisible to search annotation, until a
     /// human promotes one via csr_resolve (Codex adversarial review — automatic
