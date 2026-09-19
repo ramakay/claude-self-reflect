@@ -12,10 +12,12 @@ Two lifecycle points:
   (`csr-engine/src/daemon/trained_rerank.rs`), a third of transcript "user" turns are harness text, and one
   user turn is stored once per assistant entry. Here `e.text` is what the human typed,
   `$.session.messages()` holds the assistant turn, and the hook fires once per prompt.
-- `session.compact`: keeps or drops old tool calls instead of summarizing, using
-  [fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) (MIT) unchanged, with its fetch
-  redirected to the local endpoint. Falls back to the built-in summary on any error or under 25% reduction.
-  Every truncated result gets a pointer to `csr_transcript`, so a wrong drop costs one recall, not the fact.
+- `session.compact`: truncates old tool results instead of summarizing, using
+  [fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) (MIT) unchanged. By default a rule
+  answers the library's questions in-process (every old call stays, every old result is truncated): no model,
+  no endpoint, no network. `CSR_DECIDE_COMPACT=model` sends them to the local endpoint instead. Falls back to
+  the built-in summary on any error or under 25% reduction. Every truncated result gets a pointer to
+  `csr_transcript`, so a truncation costs one recall, not the fact.
 
 With the endpoint down, slow, or answering garbage, both hooks pass the event on untouched.
 
@@ -40,6 +42,7 @@ grep -E 'csr-decide|hook failed' /tmp/csr-decide.log
 | env | default | what |
 |---|---|---|
 | `CSR_DECIDE_URL` | `http://127.0.0.1:8765/v1/systemone` | the local System One endpoint |
+| `CSR_DECIDE_COMPACT` | rule | `model`: ask the endpoint per old call instead of applying the rule (scored below the rule, see the table further down) |
 | `CSR_DECIDE_ESCALATE` | off | `1`: below confidence 0.6, ask the same question through `$.model.classify` and log agreement; `always`: every prompt (proof aid) |
 | `CSR_DECIDE_PROBE` | off | `1`: also time a `$.mcp.call` to CSR's MCP server, as the transport baseline |
 | `CSR_DECIDE_FORCE_COMPACT` | off | `1`: request one compaction after the first turn, to exercise the hook under `-p` |
@@ -62,6 +65,7 @@ grep -E 'csr-decide|hook failed' /tmp/csr-decide.log
 | `$.session.compact()` from `turn.complete` | refused under `-p`: "not available in a headless (-p / SDK) session yet" |
 | `/compact` as a `-p` prompt on a session with 8 Read calls | `session.compact kept 27/27 messages, no summary (44% reduction; 1 kept, 5 results truncated, 2 pinned; state ~1156 tokens) in 611ms`; engine: `a hook's 27 messages stand … core never ran` |
 | transcript after compaction | 3 truncated results carry the fast-jev note plus the `csr_transcript` pointer |
+| the rule (default), same shape of session, nothing listening on 8765 | `session.compact kept 27/27 messages, no summary (58% reduction; 6 results truncated, 2 pinned; state ~1156 tokens) in 1ms via rule`; zero `$.http.fetch` lines in the debug log; engine: `core never ran`; 4 of 4 truncation notes in the transcript carry the pointer |
 
 ## What the endpoint's answers are worth (2026-09-18): not much yet
 
@@ -76,8 +80,10 @@ logits, no tuning:
 | the same judge vs no model at all | the judge dropped the verbatim result on 55 of 60 calls: "truncate every old result, leave the pointer" agrees 92% on keep-result, above both models (48%, 88%) |
 | reactions with the assistant turn, 200-text gold set, 0.90-precision gate | fails: dev accuracy 0.18 to 0.45, no threshold reaches 0.90; neutral follow-ups read as `acceptance` (46 of 76), 6 of 38 corrections caught zero-shot. The 8 ms fixed-label head (Brier 0.375) beats every variant (0.43 to 0.47) |
 
-So: `prompt.submit` stays shadow-only, and `session.compact` should not trust this decider. Because every
-truncated result keeps a `csr_transcript` pointer, the rule with no model is the better compaction today.
+So: `prompt.submit` stays shadow-only, and `session.compact` does not trust this decider. Because every
+truncated result keeps a `csr_transcript` pointer, the rule with no model is the better compaction today, and
+it is the default. The rule keeps every call where the judge would drop 42 of 60: the call is what the pointer
+hangs on, and inputs are small next to results.
 
 ## Validator rules learned the hard way
 

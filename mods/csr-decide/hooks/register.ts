@@ -3,8 +3,8 @@ import type { Register } from 'claude-code'
 // fast-jev-compaction (MIT, tamaratran/fast-jev-compaction) does the compaction work: it pairs every tool call
 // with its result, asks two yes/no questions per old call over the whole conversation, and deletes or truncates
 // what is no longer needed. Nothing is rewritten. Its adapter takes an injectable fetch, so the only change
-// here is WHERE the questions go: a local System One endpoint instead of api.typesafe.ai. Not vendored into
-// this repo; see the README for the one-line clone into vendor/.
+// here is WHO answers: a rule in-process by default (ask.ts ruleReply), or a local System One endpoint instead
+// of api.typesafe.ai. Not vendored into this repo; see the README for the one-line clone into vendor/.
 import {
   compactSession,
   decisionLogLines,
@@ -13,7 +13,7 @@ import {
 } from '../vendor/fast-jev-compaction/hooks/fast-jev.js'
 import { reductionRatio } from '../vendor/fast-jev-compaction/src/index.js'
 
-import { DEFAULT_URL, REACTION, parseReply, requestInit } from './ask.js'
+import { DEFAULT_URL, REACTION, parseReply, requestInit, ruleReply } from './ask.js'
 
 // csr-decide, a spike: typed decisions from a LOCAL endpoint at two points of the session lifecycle.
 //
@@ -24,7 +24,7 @@ import { DEFAULT_URL, REACTION, parseReply, requestInit } from './ask.js'
 // entry. Here e.text is what the human typed, $.session.messages() holds the assistant turn, and the hook
 // fires once per prompt.
 //
-// session.compact: keep or drop old tool calls instead of summarizing them.
+// session.compact: truncate old tool results instead of summarizing them. No model and no endpoint by default.
 //
 // With the endpoint down, slow, or answering garbage, both hooks pass the event on untouched.
 
@@ -120,15 +120,19 @@ export const register: Register = (on, options) => {
   on('session.compact', async ($, e, next) => {
     const t0 = Date.now()
     try {
+      // Default is the rule: untuned local deciders scored below it against a blind judge (README). The endpoint
+      // stays reachable with CSR_DECIDE_COMPACT=model, for when a decider earns it.
+      const useModel = (await $.env.get('CSR_DECIDE_COMPACT')) === 'model'
       const url = (await $.env.get('CSR_DECIDE_URL')) || DEFAULT_URL
       // The library only checks that a key exists; the local endpoint ignores the header.
       const config = { ...configured, apiKey: 'local' }
       const { result, messages } = await compactSession(e.messages, config, async (_cloudUrl, init) => {
+        if (!useModel) return { status: 200, ok: true, text: ruleReply(init.body) }
         const r = await $.http.fetch(url, init)
         return { status: r.status, ok: r.ok, text: r.text }
       })
-      for (const line of decisionLogLines(result)) $.ui.log(`csr-decide: ${line}`)
-      const took = `${Date.now() - t0}ms via ${url}`
+      if (useModel) for (const line of decisionLogLines(result)) $.ui.log(`csr-decide: ${line}`)
+      const took = `${Date.now() - t0}ms via ${useModel ? url : 'rule'}`
       if (reductionRatio(result) < config.minReductionRatio) {
         $.ui.log(`csr-decide: session.compact fallback to built-in summary (${summarize(result)}) in ${took}`)
         return next(e)

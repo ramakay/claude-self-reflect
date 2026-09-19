@@ -39,6 +39,18 @@ export function parseReply(ok: boolean, text: string): Reply | undefined {
   }
 }
 
+/**
+ * The compaction rule, as a System One reply: every old call stays, every old result is truncated. Answers
+ * fast-jev's own `call_<id>` / `result_<id>` questions in-process, so the library runs unchanged with no endpoint.
+ * A blind judge dropped the verbatim result on 55 of 60 sampled calls; this agrees 92%, above both local models.
+ */
+export function ruleReply(body: string): string {
+  const { questions } = JSON.parse(body) as { questions: Record<string, unknown> }
+  const answers: Record<string, Answer> = {}
+  for (const name of Object.keys(questions)) answers[name] = { noul: name.startsWith('result_') ? 0 : 1 }
+  return JSON.stringify({ answers })
+}
+
 // Same wording as the offline arm (experiments: a3_react.py), so the mod and the benchmark ask one question.
 export const REACTION: Record<string, Question> = {
   reaction: {
