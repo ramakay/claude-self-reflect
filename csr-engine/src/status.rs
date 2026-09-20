@@ -38,8 +38,10 @@ pub struct StatusReport {
     pub db_size_bytes: u64,
     pub db_path: String,
     pub healthy: bool,
-    /// True when a live MCP server is running an older build than the binary now
-    /// on disk — the connection must be re-established for the upgrade to apply.
+    /// True when the most recently started MCP server recorded a different
+    /// build than the binary now on disk. One stamp for all sessions (see
+    /// `binary_stamp`), so it says nothing about any particular session and is
+    /// kept out of the statusline.
     pub mcp_binary_stale: bool,
     /// Aux corpus coverage (session_registry vs chunks) — never injected into search.
     pub aux: AuxStatus,
@@ -1658,12 +1660,12 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
             report.contamination.conversations
         ));
     }
-    // A newer binary is installed but the live MCP server predates it. Say so
-    // on the statusline the user already watches, rather than leaving them to
-    // discover it from stale behaviour.
-    if report.mcp_binary_stale {
-        out.push_str(" | ⟳ reconnect mcp");
-    }
+    // `mcp_binary_stale` is deliberately not rendered here. The stamp behind it
+    // is one file shared by every session's MCP server, last writer wins, so
+    // the marker lit up in every session on each local reinstall and cleared
+    // in all of them the moment any one reconnected, while the rest still ran
+    // the old build. A statusline prompt has to be true for the session
+    // showing it; this one could not be. It stays in the JSON report.
     out
 }
 
@@ -2040,16 +2042,15 @@ mod tests {
     }
 
     #[test]
-    fn test_compact_dream_segment_coexists_with_stale_marker() {
+    fn test_compact_never_asks_for_an_mcp_reconnect() {
         let mut report = base_report();
         report.dream.dreams.unfinished = 2;
         report.mcp_binary_stale = true;
         let line = format_compact(&report, 0);
-        let dreams = line.find("☾ 2 dreams").expect("dreams segment present");
-        let stale = line.find("⟳ reconnect mcp").expect("stale marker present");
+        assert!(line.contains("☾ 2 dreams"), "{line:?}");
         assert!(
-            dreams < stale,
-            "dreams renders before stale marker: {line:?}"
+            !line.contains("reconnect"),
+            "the stamp is shared across sessions, so it must not prompt any one of them: {line:?}"
         );
     }
 
