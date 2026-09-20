@@ -388,8 +388,15 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
 
     // 2. Search chunks (past conversations) — scoped to current project
     // Over-fetch to compensate for project filtering (Codex M-1 fix)
-    let chunk_results =
-        search_chunks_with_vec(engine, &query_vec, 15, 0.55, &current_project).await;
+    let chunk_results = search_chunks_with_vec(
+        engine,
+        &query_vec,
+        15,
+        0.55,
+        &current_project,
+        input.session_id.as_deref(),
+    )
+    .await;
 
     // 3. Search reflections (stored insights) — scoped to current project
     let reflection_results =
@@ -1095,14 +1102,39 @@ fn detect_continued_session_id(engine: &Engine, cwd: &Path) -> Option<String> {
     Some(session.conversation_id)
 }
 
+/// Openings of blocks the harness writes into the user channel. A chunk that
+/// starts with one renders as nothing but that block in a 300-char excerpt.
+const HARNESS_BLOCK_OPENINGS: [&str; 4] = [
+    "<task-notification>",
+    "[SYSTEM NOTIFICATION",
+    "<cross-session-message",
+    "Another Claude session sent a message:",
+];
+
+/// A chunk the hook must never hand back as "past context": the session that
+/// is asking (its own last turns are already in the model's context, and the
+/// watcher indexes them within minutes), or a harness block indexed before the
+/// importer learnt to drop those rows.
+fn is_self_echo(chunk: &crate::import::ConversationChunk, current_session: Option<&str>) -> bool {
+    if current_session.is_some_and(|session| session == chunk.conversation_id) {
+        return true;
+    }
+    let opening = chunk.content.trim_start();
+    HARNESS_BLOCK_OPENINGS
+        .iter()
+        .any(|block| opening.starts_with(block))
+}
+
 /// Search chunks using a pre-computed embedding vector (P-1 optimization).
-/// Scoped to `project` — chunks from other projects are filtered out.
+/// Scoped to `project` — chunks from other projects are filtered out, and so
+/// is anything `is_self_echo` names.
 async fn search_chunks_with_vec(
     engine: &Engine,
     query_vec: &[f32],
     limit: usize,
     min_score: f32,
     project: &str,
+    current_session: Option<&str>,
 ) -> Vec<RawResult> {
     let search = engine.search();
     let storage = engine.storage();
@@ -1143,6 +1175,10 @@ async fn search_chunks_with_vec(
             if let Some(chunk) = chunk_by_id.remove(&result.id) {
                 // Project scope filter: skip chunks from other projects
                 if !project.is_empty() && chunk.project_name != project {
+                    continue;
+                }
+
+                if is_self_echo(&chunk, current_session) {
                     continue;
                 }
 
@@ -1698,13 +1734,73 @@ mod tests {
             root.path().to_path_buf(),
         );
 
-        let results = search_chunks_with_vec(&engine, &[1.0, 0.0], 1, 0.0, "project").await;
+        let results = search_chunks_with_vec(&engine, &[1.0, 0.0], 1, 0.0, "project", None).await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].min_trust,
             crate::provenance::TrustTier::UserHistory
         );
+    }
+
+    #[tokio::test]
+    async fn chunk_search_never_echoes_the_asking_session_or_a_harness_block() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        let rows = [
+            ("own-turn", "live-session", "grep output from two minutes ago"),
+            (
+                "harness-block",
+                "older-session",
+                "<task-notification>\n<task-id>a0b2</task-id>\n<status>completed</status>\n</task-notification>\nRead the output file.",
+            ),
+            ("past-work", "older-session", "we moved the index load out of the hook"),
+        ];
+        for (id, conversation_id, content) in rows {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation_id.into(),
+                project_name: "project".into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            search.insert_chunk(chunk.id.clone(), vec![1.0, 0.0]);
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+
+        let recalled = |session: Option<&'static str>| {
+            let engine = &engine;
+            async move {
+                let mut ids: Vec<String> =
+                    search_chunks_with_vec(engine, &[1.0, 0.0], 10, 0.0, "project", session)
+                        .await
+                        .into_iter()
+                        .filter_map(|result| result.memory_id)
+                        .collect();
+                ids.sort();
+                ids
+            }
+        };
+
+        assert_eq!(recalled(Some("live-session")).await, ["past-work"]);
+        // Another session asking still sees that turn; the harness block never returns.
+        assert_eq!(
+            recalled(Some("someone-else")).await,
+            ["own-turn", "past-work"]
+        );
+        assert_eq!(recalled(None).await, ["own-turn", "past-work"]);
     }
 
     #[test]
