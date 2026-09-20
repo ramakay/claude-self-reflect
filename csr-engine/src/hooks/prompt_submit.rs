@@ -1167,14 +1167,52 @@ async fn search_chunks_with_vec(
                 .flatten()
                 .collect()
         });
+    // Hook-scope evidence: a candidate whose stored `project_name` (derived
+    // from the dash-encoded transcript folder) doesn't match the asking
+    // project can still be a same-project hit if its OWN recorded `cwd`
+    // resolves to that project — the exact scenario a subdirectory-scoped
+    // session produces. One batched lookup for every mismatched candidate,
+    // never per-chunk. Empty when there's nothing to look up (nothing
+    // mismatched, or `project` itself is empty) — no wasted query.
+    let mismatched_conversation_ids: Vec<String> = if project.is_empty() {
+        Vec::new()
+    } else {
+        fetched
+            .iter()
+            .filter(|c| c.project_name != project)
+            .map(|c| c.conversation_id.clone())
+            .collect()
+    };
+    let scopes: std::collections::HashMap<String, String> =
+        if mismatched_conversation_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            storage
+                .conversation_scopes(&mismatched_conversation_ids)
+                .unwrap_or_else(|e| {
+                    // Fail closed: on a lookup error, fall back to exact
+                    // project-name matching only (as if no scope evidence exists)
+                    // rather than either widening or dropping the whole search.
+                    tracing::warn!(
+                        error = %e,
+                        "conversation_scopes lookup failed; falling back to exact project matching"
+                    );
+                    std::collections::HashMap::new()
+                })
+        };
+
     let mut chunk_by_id: std::collections::HashMap<String, _> =
         fetched.into_iter().map(|c| (c.id.clone(), c)).collect();
 
     for result in &results {
         {
             if let Some(chunk) = chunk_by_id.remove(&result.id) {
-                // Project scope filter: skip chunks from other projects
-                if !project.is_empty() && chunk.project_name != project {
+                // Project scope filter: exact name match, or the chunk's own
+                // conversation has recorded-cwd evidence naming this project.
+                let in_scope = project.is_empty()
+                    || chunk.project_name == project
+                    || scopes.get(&chunk.conversation_id).map(String::as_str) == Some(project);
+                if !in_scope {
                     continue;
                 }
 
@@ -1801,6 +1839,120 @@ mod tests {
             ["own-turn", "past-work"]
         );
         assert_eq!(recalled(None).await, ["own-turn", "past-work"]);
+    }
+
+    // --- hook-scope evidence (recall by the project a chunk's cwd resolved to) ---
+
+    /// `rows`: (chunk_id, conversation_id, project_name). `scopes`:
+    /// (conversation_id, scope_project) rows to seed `conversation_scope`
+    /// with. Returns the sorted memory ids `search_chunks_with_vec` recalled
+    /// for `project`. Never touches the filesystem — the scope rows are
+    /// inserted directly, exactly as `resolve_conversation_scope` would have
+    /// written them from a real transcript's cwd.
+    async fn recall_for(
+        rows: &[(&str, &str, &str)],
+        scopes: &[(&str, &str)],
+        project: &str,
+    ) -> Vec<String> {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        for (id, conversation_id, project_name) in rows {
+            let chunk = crate::import::ConversationChunk {
+                id: (*id).into(),
+                conversation_id: (*conversation_id).into(),
+                project_name: (*project_name).into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: format!("content for {id}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            search.insert_chunk(chunk.id.clone(), vec![1.0, 0.0]);
+        }
+        for (conversation_id, scope_project) in scopes {
+            storage
+                .insert_conversation_scope(conversation_id, "/irrelevant/cwd", scope_project)
+                .unwrap();
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+        let mut ids: Vec<String> =
+            search_chunks_with_vec(&engine, &[1.0, 0.0], 10, 0.0, project, None)
+                .await
+                .into_iter()
+                .filter_map(|r| r.memory_id)
+                .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn alias_named_chunk_with_matching_scope_row_is_recalled() {
+        // Stored under the dash-decoded subdirectory folder name
+        // ("csr-engine-sub"), but the transcript's own recorded cwd resolved
+        // to "csr" — the hook must recall it when asked as "csr".
+        let rows = [("chunk-1", "conv-1", "csr-engine-sub")];
+        let scopes = [("conv-1", "csr")];
+        assert_eq!(recall_for(&rows, &scopes, "csr").await, ["chunk-1"]);
+    }
+
+    #[tokio::test]
+    async fn alias_named_chunk_with_no_scope_row_is_dropped() {
+        // No evidence row at all: fail closed, exact-name matching only.
+        let rows = [("chunk-1", "conv-1", "csr-engine-sub")];
+        assert_eq!(recall_for(&rows, &[], "csr").await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn sibling_project_scope_row_never_widens_to_the_parent_name() {
+        // A chunk stored (and scoped) under "anukriti-meta-campaigns" must
+        // stay invisible to a session asking as the sibling "anukriti" — the
+        // scope row names a DIFFERENT project than the asker, so it is not
+        // a match.
+        let rows = [("chunk-1", "conv-1", "anukriti-meta-campaigns")];
+        let scopes = [("conv-1", "anukriti-meta-campaigns")];
+        assert_eq!(
+            recall_for(&rows, &scopes, "anukriti").await,
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_sibling_directory_scope_row_still_never_widens() {
+        // Same shape as the sibling case, but for a project name whose
+        // directory no longer exists anywhere on disk (simulated purely via
+        // the scope row — this test never touches the filesystem). The
+        // decision is made entirely from the recorded evidence, so a
+        // deleted directory changes nothing.
+        let rows = [("chunk-1", "conv-1", "anukriti-mvp-expo")];
+        let scopes = [("conv-1", "anukriti-mvp-expo")];
+        assert_eq!(
+            recall_for(&rows, &scopes, "anukriti").await,
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_name_chunk_returned_with_no_scope_row() {
+        let rows = [("chunk-1", "conv-1", "csr")];
+        assert_eq!(recall_for(&rows, &[], "csr").await, ["chunk-1"]);
+    }
+
+    #[tokio::test]
+    async fn empty_project_returns_everything_as_before() {
+        let rows = [
+            ("chunk-1", "conv-1", "proj-a"),
+            ("chunk-2", "conv-2", "proj-b"),
+        ];
+        assert_eq!(recall_for(&rows, &[], "").await, ["chunk-1", "chunk-2"]);
     }
 
     #[test]
