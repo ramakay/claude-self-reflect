@@ -40,65 +40,65 @@ pub fn model_candidates() -> Vec<Option<String>> {
 /// Whether headless children keep loading the user's settings files.
 ///
 /// `CSR_HEADLESS_USER_SETTINGS=1` forces it and `=0` forces full isolation.
-/// Unset, the settings file decides: one that carries what the child needs to
-/// reach the API is kept, because dropping it turns every call into an
-/// authentication failure. Hooks are switched off either way.
+/// Unset, the settings files decide, and the doubt goes to keeping them:
+/// dropping a file that carried the child's way to the API turns every call
+/// into an authentication failure, while keeping one costs only some
+/// isolation. Hooks are switched off either way.
 fn headless_keeps_user_settings() -> bool {
     match std::env::var("CSR_HEADLESS_USER_SETTINGS") {
         Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
         Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
-        _ => user_settings_path()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .is_some_and(|text| settings_carry_api_access(&text)),
+        _ => settings_paths().iter().any(|path| {
+            std::fs::read_to_string(path).is_ok_and(|text| settings_may_carry_api_access(&text))
+        }),
     }
 }
 
-fn user_settings_path() -> Option<std::path::PathBuf> {
+/// Every settings file `--setting-sources ""` would stop the child loading:
+/// the user's, and the project and local ones of the directory it starts in.
+fn settings_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::with_capacity(3);
     match std::env::var_os("CLAUDE_CONFIG_DIR") {
-        Some(dir) if !dir.is_empty() => Some(std::path::PathBuf::from(dir).join("settings.json")),
-        _ => dirs::home_dir().map(|h| h.join(".claude").join("settings.json")),
+        Some(dir) if !dir.is_empty() => {
+            paths.push(std::path::PathBuf::from(dir).join("settings.json"))
+        }
+        _ => paths.extend(dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))),
     }
+    if let Ok(cwd) = std::env::current_dir() {
+        paths.push(cwd.join(".claude").join("settings.json"));
+        paths.push(cwd.join(".claude").join("settings.local.json"));
+    }
+    paths
 }
 
-/// True when a Claude Code settings file holds something a headless child
-/// cannot reach the API without: a credential helper, or an `env` entry that
-/// selects a provider, carries a token, or routes the connection (proxy, CA
-/// bundle). Anything else in `env` (telemetry switches and the like) does not
-/// count, and an unreadable file counts as nothing.
-fn settings_carry_api_access(settings_json: &str) -> bool {
-    const HELPERS: [&str; 3] = ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport"];
-    const ENV_PREFIXES: [&str; 7] = [
-        "ANTHROPIC_",
-        "AWS_",
-        "CLAUDE_CODE_USE_",
-        "CLAUDE_CODE_SKIP_",
-        "GOOGLE_",
-        "CLOUD_ML_",
-        "VERTEX_",
-    ];
-    const ENV_NAMES: [&str; 5] = [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "NO_PROXY",
-        "NODE_EXTRA_CA_CERTS",
-        "SSL_CERT_FILE",
-    ];
-    let Ok(settings) = serde_json::from_str::<Value>(settings_json) else {
-        return false;
+/// False only when a settings file provably holds nothing the child could
+/// need to reach the API. There is deliberately no list of credential
+/// variables here: Claude Code keeps adding them (API keys, OAuth tokens,
+/// provider switches, proxies, client certificates), and a name missing from
+/// such a list would silently break a working install. So the test runs the
+/// other way. A file is safe to drop when every `env` entry is a telemetry
+/// switch and no top-level key is named like a credential helper; a file that
+/// cannot be parsed, or holds anything else, is kept.
+fn settings_may_carry_api_access(settings_json: &str) -> bool {
+    let Ok(Value::Object(settings)) = serde_json::from_str::<Value>(settings_json) else {
+        return true;
     };
-    HELPERS
-        .iter()
-        .any(|key| settings.get(key).is_some_and(|v| !v.is_null()))
-        || settings
-            .get("env")
-            .and_then(Value::as_object)
-            .is_some_and(|env| {
-                env.keys().any(|name| {
-                    let name = name.to_ascii_uppercase();
-                    ENV_PREFIXES.iter().any(|p| name.starts_with(p))
-                        || ENV_NAMES.contains(&name.as_str())
-                })
-            })
+    let helper_like = settings.iter().any(|(key, value)| {
+        let key = key.to_ascii_lowercase();
+        !value.is_null()
+            && ["helper", "auth", "credential", "apikey", "token"]
+                .iter()
+                .any(|needle| key.contains(needle))
+    });
+    let env_beyond_telemetry = match settings.get("env") {
+        None | Some(Value::Null) => false,
+        Some(Value::Object(env)) => env.keys().any(|name| {
+            let name = name.to_ascii_uppercase();
+            !(name.contains("TELEMETRY") || name == "DO_NOT_TRACK")
+        }),
+        Some(_) => true,
+    };
+    helper_like || env_beyond_telemetry
 }
 
 /// Argv that cuts a headless `claude -p` child off from the machine's Claude
@@ -336,32 +336,39 @@ mod tests {
     }
 
     #[test]
-    fn settings_that_carry_api_access_are_kept() {
+    fn settings_that_may_carry_api_access_are_kept() {
         for settings in [
             r#"{"apiKeyHelper":"/usr/local/bin/key.sh"}"#,
             r#"{"awsAuthRefresh":"aws sso login"}"#,
+            r#"{"awsCredentialExport":"/usr/local/bin/creds"}"#,
             r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1","AWS_REGION":"us-east-1"}}"#,
             r#"{"env":{"CLAUDE_CODE_USE_VERTEX":"1"}}"#,
             r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example"}}"#,
+            r#"{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"token"}}"#,
+            r#"{"env":{"CLAUDE_CODE_CLIENT_CERT":"/etc/ssl/client.pem","CLAUDE_CODE_CLIENT_KEY":"/etc/ssl/client.key"}}"#,
             r#"{"env":{"https_proxy":"http://proxy.example:8080"}}"#,
             r#"{"env":{"NODE_EXTRA_CA_CERTS":"/etc/ssl/corp.pem"}}"#,
+            // A variable this code has never heard of is kept, not dropped.
+            r#"{"env":{"DO_NOT_TRACK":"1","SOME_FUTURE_CREDENTIAL":"x"}}"#,
+            r#"{"env":"not an object"}"#,
+            "not json",
+            "[]",
         ] {
-            assert!(settings_carry_api_access(settings), "{settings}");
+            assert!(settings_may_carry_api_access(settings), "{settings}");
         }
     }
 
     #[test]
-    fn settings_without_api_access_are_dropped() {
+    fn settings_with_nothing_access_related_are_dropped() {
         for settings in [
-            "",
-            "not json",
             "{}",
             r#"{"apiKeyHelper":null}"#,
             r#"{"env":{}}"#,
-            r#"{"env":{"DO_NOT_TRACK":"1","SOME_PLUGIN_TELEMETRY":"0"}}"#,
-            r#"{"model":"opus","hooks":{},"enabledPlugins":{"x@y":true}}"#,
+            r#"{"env":null}"#,
+            r#"{"env":{"DO_NOT_TRACK":"1","SOME_PLUGIN_TELEMETRY":"0","X_NO_TELEMETRY":"1"}}"#,
+            r#"{"model":"opus","hooks":{},"enabledPlugins":{"x@y":true},"autoUpdatesChannel":"latest","permissions":{}}"#,
         ] {
-            assert!(!settings_carry_api_access(settings), "{settings}");
+            assert!(!settings_may_carry_api_access(settings), "{settings}");
         }
     }
 

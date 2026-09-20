@@ -44,20 +44,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were retrieved memory. The MCP server now claims fd 1 for JSON-RPC before the
   engine is built, and hooks quarantine stdout across engine construction and
   after their injection is written. Unix only; other platforms are unchanged.
-- **Headless `claude -p` children load no user settings and leave no
+- **Headless `claude -p` children stop firing the user's hooks and leave no
   transcript.** Narration, ratification and briefing children now run with
-  `--setting-sources ""` and `--no-session-persistence`, so they stop firing the
-  user's hooks and stop adding their own sessions to the corpus. Each option is
-  passed only when `claude --help` lists it, checked once per narrative call, so
-  an older CLI behaves as before and a CLI upgrade is picked up without a daemon
-  restart. User settings are kept automatically when `settings.json` holds what
-  the child needs to reach the API: `apiKeyHelper`, `awsAuthRefresh`,
-  `awsCredentialExport`, or an `env` entry that selects a provider, carries a
-  token or routes the connection (`ANTHROPIC_*`, `AWS_*`, `CLAUDE_CODE_USE_*`,
-  `GOOGLE_*`, `CLOUD_ML_*`, `VERTEX_*`, proxy and CA-bundle variables). In that
-  mode hooks are switched off with `--settings '{"disableAllHooks":true}'`
-  where the CLI lists `--settings`. `CSR_HEADLESS_USER_SETTINGS=1` forces
-  keeping user settings and `=0` forces dropping them.
+  `--no-session-persistence`, so they stop adding their own sessions to the
+  corpus, and with one of two settings modes. When no settings file the child
+  would load (user, project, local) holds anything access-related, it runs
+  with `--setting-sources ""`: no user settings, plugins or hooks at all.
+  Otherwise the settings stay loaded and hooks are switched off with
+  `--settings '{"disableAllHooks":true}'`. The doubt goes to keeping them: a
+  file is dropped only when every `env` entry is a telemetry switch and no
+  top-level key is named like a credential helper, so an API key, OAuth token,
+  provider switch, proxy, CA bundle or client certificate configured in
+  `settings.json` keeps working after the upgrade. Each option is passed only
+  when `claude --help` lists it, checked once per narrative call, so an older
+  CLI behaves as before and a CLI upgrade is picked up without a daemon
+  restart. `CSR_HEADLESS_USER_SETTINGS=1` forces keeping settings and `=0`
+  forces dropping them.
 - **The crate builds on Windows.** `file_identity()` called the Unix-only
   `MetadataExt::ino()` unconditionally. Unix keeps the inode; Windows uses the
   file's creation time (#271).
